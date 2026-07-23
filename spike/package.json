@@ -1,0 +1,20 @@
+{
+  "name": "tomverse-code-phase0-spike",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase 0 hypothesis spike: does OpenAI-draft + Claude-review cross-verification beat a single-model (Claude-only) fix on small bug-fix tasks?",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "spike": "npm run build && node dist/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
+    "dotenv": "^17.2.3",
+    "openai": "^6.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.0",
+    "typescript": "^5.9.3"
+  }
+}
