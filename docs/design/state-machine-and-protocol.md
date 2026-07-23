@@ -22,14 +22,17 @@ stateDiagram-v2
     TRIAGE --> SINGLE_MODEL_FIX: complexityTier = simple
 
     DRAFTING --> REVIEWING
-    SINGLE_MODEL_FIX --> PLANNING
+
+    SINGLE_MODEL_FIX --> PLANNING: ACCEPT
+    SINGLE_MODEL_FIX --> REJECTED: REJECT
+    SINGLE_MODEL_FIX --> AWAITING_USER_INPUT: NEED_USER_INPUT (clarificationRounds++, tier를 standard로 승격)
 
     REVIEWING --> PLANNING: ACCEPT
     REVIEWING --> PLANNING: REVISE (reviseRounds++)
     REVIEWING --> REJECTED: REJECT
     REVIEWING --> AWAITING_USER_INPUT: NEED_USER_INPUT (clarificationRounds++)
 
-    AWAITING_USER_INPUT --> DRAFTING: 사용자 응답 수신
+    AWAITING_USER_INPUT --> DRAFTING: 사용자 응답 수신 (이후 항상 standard 경로)
     AWAITING_USER_INPUT --> CANCELLED: 사용자 취소
 
     PLANNING --> AWAITING_APPROVAL: 승인 필요 ToolRequest 존재
@@ -62,7 +65,7 @@ stateDiagram-v2
     REJECTED --> [*]
 ```
 
-`TRIAGE`/`SINGLE_MODEL_FIX`는 13절(Phase 0 스파이크 결과 반영)에서 추가된 상태다 — 원래 설계에는 없었고, 스파이크가 "쉬운 태스크에서는 교차검증이 정확도 이득 없이 비용/지연만 늘린다"는 걸 실측으로 보여준 뒤 반영되었다.
+`TRIAGE`/`SINGLE_MODEL_FIX`는 13절(Phase 0 스파이크 결과 반영)에서 추가된 상태다 — 원래 설계에는 없었고, 스파이크가 "쉬운 태스크에서는 교차검증이 정확도 이득 없이 비용/지연만 늘린다"는 걸 실측으로 보여준 뒤 반영되었다. `SINGLE_MODEL_FIX`의 verdict 처리(REJECT/NEED_USER_INPUT 분기, tier 승격 규칙)는 14.1절에서 마무리했다.
 
 ### 2.1 Phase 설명 및 종료 조건
 
@@ -72,9 +75,9 @@ stateDiagram-v2
 | `SNAPSHOTTING` | Context Engine | - | WorkspaceSnapshot 생성 완료 → TRIAGE |
 | `TRIAGE` | Orchestrator | WorkspaceSnapshot 완료 | 13.2절 규칙으로 `complexityTier` 결정 → standard면 DRAFTING, simple이면 SINGLE_MODEL_FIX |
 | `DRAFTING` | OpenAI Provider | Snapshot + (재질문 시) 사용자 답변 | DraftProposal 수신 → REVIEWING |
-| `SINGLE_MODEL_FIX` | Claude Provider | Snapshot (OpenAI 초안 없음) | Claude가 직접 수정안 생성 → PLANNING (verdict 없음, ACCEPT와 동일하게 취급) |
+| `SINGLE_MODEL_FIX` | Claude Provider | Snapshot (OpenAI 초안 없음) | `SingleModelFixResult.verdict`(REVISE 없이 ACCEPT/NEED_USER_INPUT/REJECT 중 하나)에 따라 PLANNING/AWAITING_USER_INPUT/REJECTED로 분기 |
 | `REVIEWING` | Claude Provider | DraftProposal + 동일 Snapshot | ReviewDecision.verdict에 따라 4갈래 분기 |
-| `AWAITING_USER_INPUT` | UI | verdict = NEED_USER_INPUT | 사용자 응답 → DRAFTING, 취소 → CANCELLED |
+| `AWAITING_USER_INPUT` | UI | verdict = NEED_USER_INPUT (REVIEWING 또는 SINGLE_MODEL_FIX 양쪽에서 진입 가능) | 사용자 응답 → DRAFTING(항상 standard 경로, 14.1절), 취소 → CANCELLED |
 | `PLANNING` | Orchestrator | ACCEPT/REVISE 확정, SINGLE_MODEL_FIX 완료, 또는 FIX_LOOP에서 복귀 | 결과를 ExecutionPlan(ToolRequest[])으로 변환 |
 | `AWAITING_APPROVAL` | Policy Gate + UI | ExecutionPlan 내 riskTier != auto | 사용자 승인/거부 |
 | `EXECUTING` | Tool Runtime | 승인 완료 | 각 ToolRequest 순차 실행, 전부 완료 시 VERIFYING |
@@ -171,6 +174,22 @@ interface ReviewDecision {
   revisedPatch?: string;
   questionsForUser?: string[]; // verdict = NEED_USER_INPUT
   rejectionReason?: string;    // verdict = REJECT
+  model: string;
+  createdAt: ISODateTime;
+}
+
+// ---- 4b. SingleModelFixResult (SINGLE_MODEL_FIX 산출물, 13.2절 TRIAGE로 진입) ----
+// ReviewDecision과 구조는 비슷하지만 리뷰 대상 DraftProposal이 없으므로 별도 타입으로 둔다.
+// verdict는 REVISE를 쓰지 않는다 — 검토할 초안이 없으므로 "수정 요청"이라는 개념 자체가 성립하지 않고,
+// Claude가 곧바로 최종안(ACCEPT)이거나 모호함(NEED_USER_INPUT)이거나 불가/위험(REJECT) 중 하나로 판정한다.
+interface SingleModelFixResult {
+  taskId: string;
+  verdict: Exclude<Verdict, "REVISE">;
+  rationale: string;
+  plan?: PlanStep[];           // verdict = ACCEPT
+  patch?: string;               // verdict = ACCEPT
+  questionsForUser?: string[];  // verdict = NEED_USER_INPUT
+  rejectionReason?: string;     // verdict = REJECT
   model: string;
   createdAt: ISODateTime;
 }
@@ -473,7 +492,21 @@ CREATE TABLE snapshots (
   meta_json      TEXT NOT NULL,       -- projectMeta, tokenBudget 등. relevantFiles 본문은 artifact로
   created_at     TEXT NOT NULL
 );
+
+-- 10절 FileMutationRecord — 롤백 UX가 조회하는 테이블. request_id 1개당 파일 1개.
+CREATE TABLE file_mutations (
+  request_id       TEXT NOT NULL REFERENCES tool_requests(request_id),
+  path             TEXT NOT NULL,
+  pre_existed      INTEGER NOT NULL,   -- boolean (0/1)
+  pre_content_ref  TEXT,               -- artifact 경로, pre_existed=0이면 NULL
+  post_existed     INTEGER NOT NULL,
+  post_content_ref TEXT,
+  PRIMARY KEY (request_id, path)
+);
+CREATE INDEX idx_file_mutations_request ON file_mutations(request_id);
 ```
+
+롤백(10절)은 `tool_requests.task_id`로 해당 태스크의 모든 `request_id`를 찾고, `file_mutations`를 조인해 `path`별 최신 `pre_image`를 역방향 patch로 변환한다.
 
 `task_events.event_type` 값: `TASK_CREATED`, `SNAPSHOT_CREATED`, `DRAFT_RECEIVED`, `REVIEW_RECEIVED`, `PLAN_CREATED`, `APPROVAL_REQUESTED`, `APPROVAL_GRANTED`, `APPROVAL_DENIED`, `TOOL_REQUESTED`, `TOOL_COMPLETED`, `VERIFICATION_COMPLETED`, `FIX_LOOP_STARTED`, `PHASE_CHANGED`, `USER_MESSAGE_RECEIVED`, `TASK_COMPLETED`, `TASK_FAILED`, `TASK_CANCELLED`, `TASK_REJECTED`.
 
@@ -552,7 +585,7 @@ interface FileMutationRecord {
 }
 ```
 
-- `ToolResult.output`의 일부로 저장하거나 별도 `file_mutations` 테이블로 분리(쿼리 편의상 후자 권장, 7절 스키마에 추가 예정).
+- `ToolResult.output`이 아니라 별도 `file_mutations` 테이블에 저장(7절 스키마에 DDL 포함, `request_id`로 `tool_requests`와 조인).
 - UI: `FAILED`/`CANCELLED` 화면에 "이 작업이 변경한 N개 파일" 목록과 "되돌리기" 버튼. `FAILED`는 되돌리기가 기본 추천(깨진 상태 방치 방지), `CANCELLED`는 사용자 선택에 맡긴다(부분 진행 결과를 원할 수도 있음).
 - **되돌리기도 일반 `ToolRequest` 경로를 그대로 탄다** — pre-image를 역방향 patch로 만들어 `apply_patch`/`create_file`/`delete_file`을 다시 큐잉하고 정상적으로 이벤트 로그에 남긴다. 감사 추적에 예외가 없어야 한다.
 
@@ -571,10 +604,10 @@ interface FileMutationRecord {
 
 - ~~멀티턴 세션에서 `WorkspaceSnapshot`을 태스크마다 새로 만들지, 세션 내에서 재사용/증분 갱신할지~~ → [context-engine.md](./context-engine.md)에서 "세션 스코프 `WorkspaceIndex` + 태스크 스코프 `WorkspaceSnapshot`" 2계층 구조로 해결
 - ~~OpenAI Responses API / Anthropic Messages API 필드를 `DraftProposal`/`ReviewDecision`으로 매핑하는 실제 어댑터 계약~~ → 13.3절에서 Phase 0 스파이크 코드로 검증 완료
-- `file_mutations` 테이블 DDL과 7절 스키마 통합
+- ~~`file_mutations` 테이블 DDL과 7절 스키마 통합~~ → 7절에 DDL 추가 완료(14.2절)
+- ~~`SINGLE_MODEL_FIX`가 모호성을 감지했을 때 어떻게 할지~~ → 14.1절에서 `SingleModelFixResult` verdict로 해결
 - UI 와이어프레임 (단계 표시, diff 미리보기, 승인 모달)
 - 13.2절 TRIAGE 규칙의 실제 임계값(파일 개수, 키워드 목록) — 스파이크의 5개 초소형 태스크만으로는 튜닝 근거가 부족함. "어려운" 태스크 세트로 스파이크를 재실행해 규칙을 검증/조정 필요
-- `SINGLE_MODEL_FIX`가 `NEED_USER_INPUT`에 해당하는 모호성을 감지했을 때 어떻게 할지 — 현재는 verdict 개념이 없어 애매한 요청도 그냥 수정을 시도함. REVIEWING과 동일하게 verdict를 갖게 할지, 아니면 TRIAGE 단계에서 모호성도 함께 걸러낼지 결정 필요
 
 ## 13. Phase 0 스파이크 결과 반영
 
@@ -609,3 +642,19 @@ interface FileMutationRecord {
 - **Anthropic (검수/REVIEWING, SINGLE_MODEL_FIX):** Messages API, `tool_choice: { type: "tool", name: "..." }`로 특정 도구 호출을 강제해 구조화된 판정(`verdict`/`rationale`/`finalFile`)을 받음(`spike/src/providers/anthropic.ts`). REJECT일 때 `finalFile`을 생략할 수 있도록 스키마의 `required`에서 제외.
 - **모델 선택 관련 실전 이슈:** `gpt-5`/`gpt-5.5` 같은 reasoning 모델은 OpenAI Organization Verification이 필요해 계정에 따라 즉시 사용이 막힐 수 있다(스파이크 실행 중 실제로 발생). 프로덕션에서는 조직 인증 여부를 사전에 확인하거나, 인증이 안 된 조직을 위한 폴백 모델(`gpt-4.1` 등)을 Provider Adapter 레벨에서 자동 선택하는 로직이 필요 — 단순 설정값이 아니라 "인증 상태에 따른 모델 가용성"이라는 새로운 축으로 다뤄야 한다.
 - **아직 스파이크가 다루지 않은 것:** `apply_patch`(unified diff) 방식은 검증 안 됨 — 스파이크는 파일 전체 교체만 사용. `ToolRequest`/`ToolResult` 루프, REVISE 다회차, FIX_LOOP는 실제 구현 전이라 여전히 설계 단계.
+
+## 14. 남은 간극 마무리: `SINGLE_MODEL_FIX` 모호성 처리 & `file_mutations` DDL
+
+12절에 남아있던 두 개의 작은 미해결 항목을 정리한다.
+
+### 14.1 `SINGLE_MODEL_FIX`의 모호성 처리
+
+TRIAGE가 추가되면서 생긴 구멍: `SINGLE_MODEL_FIX`가 verdict 개념이 없으면, 원래 `REVIEWING`이라면 `NEED_USER_INPUT`으로 재질문했을 모호한 요청도 그냥 밀어붙여 수정을 시도하게 된다. 이건 REVIEWING 경로가 갖고 있던 안전장치를 TRIAGE가 우회시키는 셈이라 그대로 둘 수 없었다.
+
+**해결:** `SINGLE_MODEL_FIX`도 3절의 `SingleModelFixResult`를 통해 `REVIEWING`과 동일한 3가지 종결 방식을 갖는다 — `ACCEPT`(수정안 확정 → PLANNING), `NEED_USER_INPUT`(모호함 → AWAITING_USER_INPUT), `REJECT`(불가능/위험한 요청 → REJECTED). `REVISE`만 없다 — 검토 대상 초안이 없으므로 "수정 요청"이 성립하지 않는다(2절 상태 다이어그램 갱신 완료).
+
+**tier 승격 규칙:** 일단 `NEED_USER_INPUT`을 거치면(REVIEWING에서든 SINGLE_MODEL_FIX에서든), 사용자 응답 후 재시도는 항상 `DRAFTING`(즉 `standard` 경로)으로 간다 — `TRIAGE`로 돌아가 재분류하지 않는다. 근거: 사용자에게 재질문이 필요할 정도로 모호했다는 사실 자체가 "이 태스크는 애초에 simple이 아니었다"는 강한 신호이므로, 같은 휴리스틱으로 다시 TRIAGE했다가 또 simple로 잘못 분류될 위험을 감수할 이유가 없다. 이 규칙은 `TaskState`에 별도 필드 없이도 구현 가능하다 — `AWAITING_USER_INPUT`에서 나가는 전이가 항상 `DRAFTING` 하나뿐이므로(2절), tier를 명시적으로 덮어쓸 필요 없이 상태 머신 구조 자체가 승격을 강제한다.
+
+### 14.2 `file_mutations` 테이블
+
+10절의 `FileMutationRecord`를 저장할 DDL을 7절 SQLite 스키마에 추가했다 — `tool_requests.request_id`를 외래키로 갖는 `(request_id, path)` 복합 PK 테이블. 롤백 시 태스크의 모든 `tool_requests`를 조회한 뒤 조인해서 각 파일의 `pre_image`를 역방향으로 적용한다(7절/10절 참조).
