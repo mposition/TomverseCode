@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>Tomverse Code — 메인 작업 화면 (와이어프레임)</title>
+<style>
+  :root {
+    --line: #9a9a9a;
+    --line-light: #cfcfcf;
+    --bg: #ffffff;
+    --panel: #f2f2f2;
+    --text: #2b2b2b;
+    --muted: #7a7a7a;
+    --accent: #4a4a4a;
+    --highlight: #dfe7f2;
+    --warn: #f2e6d0;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    font-family: "Segoe UI", -apple-system, sans-serif;
+    color: var(--text); background: var(--bg);
+    font-size: 13px;
+  }
+  .note {
+    padding: 6px 12px; background: #fffbe6; border-bottom: 1px solid var(--line-light);
+    font-size: 12px; color: var(--muted);
+  }
+  .app {
+    display: grid;
+    grid-template-columns: 200px 1fr 280px;
+    grid-template-rows: 44px 1fr;
+    height: calc(100% - 30px);
+  }
+  .topbar {
+    grid-column: 1 / 4;
+    display: flex; align-items: center; gap: 16px;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .topbar .brand { font-weight: 600; }
+  .dropdown {
+    border: 1px solid var(--line); border-radius: 4px;
+    padding: 4px 10px; background: var(--bg); color: var(--text);
+  }
+  .spacer { flex: 1; }
+  .icon-btn {
+    width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 4px;
+    display: flex; align-items: center; justify-content: center; background: var(--bg);
+  }
+
+  .sidebar {
+    border-right: 1px solid var(--line);
+    padding: 10px 8px;
+    display: flex; flex-direction: column; gap: 4px;
+    background: var(--panel);
+  }
+  .sidebar h4 { margin: 4px 6px 8px; font-size: 11px; text-transform: uppercase; color: var(--muted); }
+  .session-item {
+    padding: 8px 10px; border-radius: 4px; border: 1px solid transparent;
+    color: var(--text);
+  }
+  .session-item.active {
+    background: var(--highlight); border-color: var(--line-light); font-weight: 600;
+  }
+  .session-item .dot { color: #4a7; margin-right: 6px; }
+  .new-session-btn {
+    margin-top: auto; border: 1px dashed var(--line); border-radius: 4px;
+    padding: 8px; text-align: center; color: var(--muted);
+  }
+
+  .main {
+    display: flex; flex-direction: column;
+    border-right: 1px solid var(--line);
+    overflow: hidden;
+  }
+
+  .phase-stepper {
+    display: flex; align-items: center; gap: 0;
+    padding: 12px 16px; border-bottom: 1px solid var(--line-light);
+    background: #fafafa;
+  }
+  .step { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  .step .bubble {
+    width: 20px; height: 20px; border-radius: 50%; border: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: center; font-size: 11px;
+    background: var(--bg);
+  }
+  .step.done .bubble { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .step.done { color: var(--text); }
+  .step.current .bubble { border-color: #2b6cb0; color: #2b6cb0; font-weight: 700; }
+  .step.current { color: #2b6cb0; font-weight: 600; }
+  .connector { width: 24px; height: 1px; background: var(--line-light); margin: 0 4px; }
+
+  .timeline {
+    flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .msg { max-width: 80%; }
+  .msg.user { align-self: flex-end; }
+  .msg .bubble-text {
+    border: 1px solid var(--line-light); border-radius: 8px; padding: 10px 12px;
+    background: var(--bg);
+  }
+  .msg.user .bubble-text { background: var(--highlight); }
+  .msg .role { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+
+  .awaiting-card {
+    border: 1px solid #c9a35a; background: var(--warn); border-radius: 8px; padding: 12px 14px;
+  }
+  .awaiting-card .tag {
+    display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: .03em;
+    background: #c9a35a; color: #fff; border-radius: 3px; padding: 2px 6px; margin-bottom: 6px;
+  }
+  .answer-row { display: flex; gap: 8px; margin-top: 10px; }
+  .answer-row input {
+    flex: 1; border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px;
+    font-family: inherit; font-size: 12px;
+  }
+  .btn {
+    border: 1px solid var(--accent); background: var(--accent); color: #fff;
+    border-radius: 4px; padding: 6px 14px; font-size: 12px; cursor: default;
+  }
+  .btn.secondary { background: var(--bg); color: var(--text); border-color: var(--line); }
+
+  .composer {
+    border-top: 1px solid var(--line-light); padding: 10px 16px; display: flex; gap: 8px;
+  }
+  .composer input {
+    flex: 1; border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; font-family: inherit;
+  }
+
+  .right-panel { display: flex; flex-direction: column; overflow: hidden; }
+  .panel-section { border-bottom: 1px solid var(--line-light); padding: 12px 14px; }
+  .panel-section h4 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; color: var(--muted); }
+  .file-row {
+    display: flex; justify-content: space-between; padding: 5px 0; font-size: 12px;
+    border-bottom: 1px dashed var(--line-light);
+  }
+  .file-row .path { color: var(--text); }
+  .file-row .stat { color: var(--muted); }
+  .file-row .stat .plus { color: #2f855a; }
+  .file-row .stat .minus { color: #c53030; }
+
+  .empty-hint { color: var(--muted); font-style: italic; font-size: 12px; }
+
+  .cost-widget { padding: 12px 14px; margin-top: auto; background: var(--panel); }
+  .cost-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
+  .cost-row .label { color: var(--muted); }
+  .tier-note { font-size: 11px; color: var(--muted); margin-top: 6px; }
+</style>
+</head>
+<body>
+  <div class="note">
+    저해상도 와이어프레임 — 레이아웃/상태 전이 확인용, 실제 색상·타이포그래피 아님. docs/design/ui-wireframes.md 3.1절 대응.
+  </div>
+  <div class="app">
+    <div class="topbar">
+      <div class="brand">☰ Tomverse Code</div>
+      <div class="dropdown">워크스페이스: my-app ▾</div>
+      <div class="dropdown">브랜치: main ▾</div>
+      <div class="spacer"></div>
+      <div class="icon-btn">⚙</div>
+    </div>
+
+    <div class="sidebar">
+      <h4>세션</h4>
+      <div class="session-item active"><span class="dot">●</span>세션 A (진행 중)</div>
+      <div class="session-item">세션 B</div>
+      <div class="session-item">세션 C</div>
+      <div class="new-session-btn">+ 새 세션</div>
+    </div>
+
+    <div class="main">
+      <div class="phase-stepper">
+        <div class="step done"><span class="bubble">✓</span>분석</div>
+        <div class="connector"></div>
+        <div class="step done"><span class="bubble">✓</span>검수</div>
+        <div class="connector"></div>
+        <div class="step current"><span class="bubble">●</span>확인 필요</div>
+        <div class="connector"></div>
+        <div class="step"><span class="bubble">4</span>승인</div>
+        <div class="connector"></div>
+        <div class="step"><span class="bubble">5</span>실행</div>
+        <div class="connector"></div>
+        <div class="step"><span class="bubble">6</span>검증</div>
+      </div>
+
+      <div class="timeline">
+        <div class="msg user">
+          <div class="role">사용자</div>
+          <div class="bubble-text">로그인 버튼이 안 눌려요</div>
+        </div>
+
+        <div class="msg">
+          <div class="role">Claude · 검수</div>
+          <div class="awaiting-card">
+            <span class="tag">확인 필요</span>
+            <div>버튼 클릭 시 어떤 폼 필드를 검증해야 하는지 명확하지 않습니다. 이메일만 확인하면 될까요, 비밀번호도 포함해야 할까요?</div>
+            <div class="answer-row">
+              <input type="text" placeholder="답변 입력…" />
+              <button class="btn">전송</button>
+              <button class="btn secondary">취소</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <input type="text" placeholder="메시지 입력…" disabled />
+        <button class="btn secondary">전송</button>
+      </div>
+    </div>
+
+    <div class="right-panel">
+      <div class="panel-section">
+        <h4>변경된 파일 (미리보기 — 아직 미적용)</h4>
+        <div class="file-row">
+          <span class="path">src/Login.tsx</span>
+          <span class="stat"><span class="plus">+12</span> <span class="minus">−3</span></span>
+        </div>
+        <div class="file-row">
+          <span class="path">src/api.ts</span>
+          <span class="stat"><span class="plus">+4</span> <span class="minus">−0</span></span>
+        </div>
+      </div>
+
+      <div class="panel-section">
+        <h4>검증 결과</h4>
+        <div class="empty-hint">아직 실행 전 — 승인 후 검증이 시작됩니다.</div>
+      </div>
+
+      <div class="cost-widget">
+        <h4>이번 태스크</h4>
+        <div class="cost-row"><span class="label">비용</span><span>$0.0068</span></div>
+        <div class="cost-row"><span class="label">토큰</span><span>1.2k in / 0.6k out</span></div>
+        <div class="cost-row"><span class="label">경과</span><span>4.2s</span></div>
+        <div class="cost-row"><span class="label">예상 남은 시간</span><span>~8s (평균 기반)</span></div>
+        <div class="tier-note">complexityTier: standard — 교차검증 진행 중</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
