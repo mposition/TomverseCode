@@ -164,4 +164,4 @@ CREATE TABLE workspace_index (
 - 정확한 토큰 카운팅(현재는 문자 수 근사) — provider별 tokenizer 라이브러리 도입 여부
 - 심볼 인덱스 갱신과 `apply_patch` 적용 사이의 원자성 — 파싱 실패 시(문법 오류가 있는 중간 상태) 인덱스를 어떻게 다루는지
 - 멀티 워크스페이스(여러 프로젝트를 동시에 열어둔 경우) `WorkspaceIndex` 동시 보관/전환 전략
-- Rust core와 Node sidecar 중 어디가 `WorkspaceIndex` 구축을 실제로 수행할지 — Tree-sitter 바인딩은 두 런타임 모두 있지만, 이 파이프라인 전체를 어느 쪽 프로세스가 소유하는지는 아직 미정 (4절 Provider Adapter 계약과 마찬가지로 실제 스파이크가 필요할 수 있음)
+- ~~Rust core와 Node sidecar 중 어디가 `WorkspaceIndex` 구축을 실제로 수행할지~~ → [process-architecture.md](./process-architecture.md) 6절에서 Node로 결정 (Tree-sitter npm 생태계 성숙도, 권한 불필요 작업은 Node에 두는 일관성, 대용량 데이터 프로세스 간 전송 회피가 근거)
