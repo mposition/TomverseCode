@@ -16,8 +16,13 @@ status: draft
 stateDiagram-v2
     [*] --> CREATED
     CREATED --> SNAPSHOTTING
-    SNAPSHOTTING --> DRAFTING
+    SNAPSHOTTING --> TRIAGE
+
+    TRIAGE --> DRAFTING: complexityTier = standard
+    TRIAGE --> SINGLE_MODEL_FIX: complexityTier = simple
+
     DRAFTING --> REVIEWING
+    SINGLE_MODEL_FIX --> PLANNING
 
     REVIEWING --> PLANNING: ACCEPT
     REVIEWING --> PLANNING: REVISE (reviseRounds++)
@@ -44,7 +49,9 @@ stateDiagram-v2
     FIX_LOOP --> FAILED: fixLoopRounds > max
 
     CREATED --> CANCELLED
+    TRIAGE --> CANCELLED
     DRAFTING --> CANCELLED
+    SINGLE_MODEL_FIX --> CANCELLED
     REVIEWING --> CANCELLED
     PLANNING --> CANCELLED
     EXECUTING --> CANCELLED
@@ -55,20 +62,24 @@ stateDiagram-v2
     REJECTED --> [*]
 ```
 
+`TRIAGE`/`SINGLE_MODEL_FIX`는 13절(Phase 0 스파이크 결과 반영)에서 추가된 상태다 — 원래 설계에는 없었고, 스파이크가 "쉬운 태스크에서는 교차검증이 정확도 이득 없이 비용/지연만 늘린다"는 걸 실측으로 보여준 뒤 반영되었다.
+
 ### 2.1 Phase 설명 및 종료 조건
 
 | Phase | 담당 | 진입 조건 | 종료/전이 |
 |---|---|---|---|
 | `CREATED` | Orchestrator | TaskRequest 수신 | 즉시 SNAPSHOTTING |
-| `SNAPSHOTTING` | Context Engine | - | WorkspaceSnapshot 생성 완료 → DRAFTING |
+| `SNAPSHOTTING` | Context Engine | - | WorkspaceSnapshot 생성 완료 → TRIAGE |
+| `TRIAGE` | Orchestrator | WorkspaceSnapshot 완료 | 13.2절 규칙으로 `complexityTier` 결정 → standard면 DRAFTING, simple이면 SINGLE_MODEL_FIX |
 | `DRAFTING` | OpenAI Provider | Snapshot + (재질문 시) 사용자 답변 | DraftProposal 수신 → REVIEWING |
+| `SINGLE_MODEL_FIX` | Claude Provider | Snapshot (OpenAI 초안 없음) | Claude가 직접 수정안 생성 → PLANNING (verdict 없음, ACCEPT와 동일하게 취급) |
 | `REVIEWING` | Claude Provider | DraftProposal + 동일 Snapshot | ReviewDecision.verdict에 따라 4갈래 분기 |
 | `AWAITING_USER_INPUT` | UI | verdict = NEED_USER_INPUT | 사용자 응답 → DRAFTING, 취소 → CANCELLED |
-| `PLANNING` | Orchestrator | ACCEPT/REVISE 확정, 또는 FIX_LOOP에서 복귀 | ReviewDecision(or 수정본)을 ExecutionPlan(ToolRequest[])으로 변환 |
+| `PLANNING` | Orchestrator | ACCEPT/REVISE 확정, SINGLE_MODEL_FIX 완료, 또는 FIX_LOOP에서 복귀 | 결과를 ExecutionPlan(ToolRequest[])으로 변환 |
 | `AWAITING_APPROVAL` | Policy Gate + UI | ExecutionPlan 내 riskTier != auto | 사용자 승인/거부 |
 | `EXECUTING` | Tool Runtime | 승인 완료 | 각 ToolRequest 순차 실행, 전부 완료 시 VERIFYING |
 | `VERIFYING` | Verify 서브시스템 | ExecutionPlan 적용 완료 | build/test/lint/diff 결과 종합 |
-| `FIX_LOOP` | Claude Provider | VerificationReport.overall = fail | VerificationReport를 Claude에 다시 전달, 수정된 ReviewDecision 요청 |
+| `FIX_LOOP` | Claude Provider | VerificationReport.overall = fail | VerificationReport를 Claude에 다시 전달, 수정된 결과 요청 (원래 tier와 무관하게 항상 Claude 단독 호출이므로 tier 재분류 불필요) |
 | `COMPLETED` / `FAILED` / `CANCELLED` / `REJECTED` | - | 터미널 상태 | FinalResult 생성, UI에 전달 |
 
 ### 2.2 루프 상한 (기본값, 설정 가능해야 함)
@@ -219,14 +230,17 @@ interface VerificationReport {
 
 // ---- 7. TaskState (오케스트레이터 내부 상태, append-only 이벤트 로그와 함께 저장) ----
 type TaskPhase =
-  | "CREATED" | "SNAPSHOTTING" | "DRAFTING" | "REVIEWING"
+  | "CREATED" | "SNAPSHOTTING" | "TRIAGE" | "DRAFTING" | "SINGLE_MODEL_FIX" | "REVIEWING"
   | "AWAITING_USER_INPUT" | "PLANNING" | "AWAITING_APPROVAL"
   | "EXECUTING" | "VERIFYING" | "FIX_LOOP"
   | "COMPLETED" | "FAILED" | "CANCELLED" | "REJECTED";
 
+type ComplexityTier = "simple" | "standard";
+
 interface TaskState {
   taskId: string;
   phase: TaskPhase;
+  complexityTier: ComplexityTier | null; // TRIAGE 완료 전에는 null
   counters: {
     clarificationRounds: number;
     reviseRounds: number;
@@ -503,6 +517,7 @@ interface PackageScripts {
 interface TaskState {
   taskId: string;
   phase: TaskPhase;
+  complexityTier: ComplexityTier | null;
   counters: {
     clarificationRounds: number;
     reviseRounds: number;
@@ -555,6 +570,42 @@ interface FileMutationRecord {
 ## 12. 다음으로 구체화할 것
 
 - 멀티턴 세션에서 `WorkspaceSnapshot`을 태스크마다 새로 만들지, 세션 내에서 재사용/증분 갱신할지 — 후자를 택하면 11절의 "스냅샷은 태스크 전용" 가정과 GC 로직을 다시 손봐야 함
-- OpenAI Responses API / Anthropic Messages API 필드를 `DraftProposal`/`ReviewDecision`으로 매핑하는 실제 어댑터 계약 (구조화된 출력 스키마 강제 방식: JSON mode vs tool-use 강제 vs response format)
+- ~~OpenAI Responses API / Anthropic Messages API 필드를 `DraftProposal`/`ReviewDecision`으로 매핑하는 실제 어댑터 계약~~ → 13.3절에서 Phase 0 스파이크 코드로 검증 완료
 - `file_mutations` 테이블 DDL과 7절 스키마 통합
 - UI 와이어프레임 (단계 표시, diff 미리보기, 승인 모달)
+- 13.2절 TRIAGE 규칙의 실제 임계값(파일 개수, 키워드 목록) — 스파이크의 5개 초소형 태스크만으로는 튜닝 근거가 부족함. "어려운" 태스크 세트로 스파이크를 재실행해 규칙을 검증/조정 필요
+- `SINGLE_MODEL_FIX`가 `NEED_USER_INPUT`에 해당하는 모호성을 감지했을 때 어떻게 할지 — 현재는 verdict 개념이 없어 애매한 요청도 그냥 수정을 시도함. REVIEWING과 동일하게 verdict를 갖게 할지, 아니면 TRIAGE 단계에서 모호성도 함께 걸러낼지 결정 필요
+
+## 13. Phase 0 스파이크 결과 반영
+
+`spike/`(커밋 `b3eaf87`)에서 CLI 하네스로 실측한 결과를 바탕으로 한 설계 변경. 원본 스파이크 코드는 저장소의 `spike/src/`에 있다.
+
+### 13.1 측정 결과
+
+작은 단일 파일·단일 함수 버그 5개(오프바이원, 경계값 비교, null 가드 누락, `await` 누락, 불리언 역전)에 대해 `gpt-4.1`(초안) + `claude-sonnet-5`(검수) 교차검증과 `claude-sonnet-5` 단독 수정을 비교:
+
+| | 통과율 | 총비용 | 총지연시간 |
+|---|---|---|---|
+| dual_verification (초안+검수) | 100% (5/5) | $0.0324 | 24.7s |
+| baseline_single_model (Claude 단독) | 100% (5/5) | $0.0198 | 14.5s |
+
+두 파이프라인 모두 5개 전부 통과 — 이 난이도에서는 교차검증이 정확도를 전혀 끌어올리지 못했고, 비용은 1.63배, 지연시간은 1.70배로만 늘었다. `docs/design/state-machine-and-protocol.md`를 처음 설계하기 전 아키텍처 리뷰에서 지적했던 우려("교차검증의 가치가 검증되지 않았다")가 부분적으로 확인된 셈이다 — 다만 이건 가설 기각이 아니라 "쉬운 태스크에는 교차검증이 안 맞는다"는 훨씬 실행 가능한 결론이다. 단일 모델이 실제로 틀릴 만한 난이도(다중 파일, 모호한 요구사항, 미묘한 경계값)의 태스크로 재실험해야 가설의 진짜 검증이 된다 (12절 미해결 항목).
+
+### 13.2 설계 반영: TRIAGE 단계와 `complexityTier`
+
+13.1의 실측을 반영해 상태 머신에 `TRIAGE`/`SINGLE_MODEL_FIX`를 추가했다(2절). 핵심 원칙:
+
+- **결정론적 검증(VERIFYING)은 절대 생략하지 않는다.** TRIAGE가 건너뛰는 건 OpenAI 초안 + Claude 검수라는 "LLM 대 LLM" 이중 판단뿐이다. build/test/lint 같은 제3의 판정자는 tier와 무관하게 항상 돈다 — 프로젝트의 핵심 원칙("재현 가능한 검증이 모델 의견보다 우선")을 TRIAGE가 훼손하지 않는다.
+- **TRIAGE는 LLM 호출이 아니라 규칙 기반 휴리스틱이다.** 분류 자체에 모델을 쓰면 모든 태스크에 세 번째 호출이 추가되어 "쉬운 태스크의 비용 절감"이라는 목적과 모순된다. SNAPSHOTTING 완료 시점에 이미 있는 신호(`WorkspaceSnapshot.relevantFiles.length`, `gitDiffSummary` 유무, `TaskRequest.userMessage`의 키워드 매칭)만으로 판정한다.
+  - 기본 규칙(초안, 12절에서 튜닝 필요 표시): `relevantFiles.length <= 1` AND 다른 미커밋 변경 없음(`gitDiffSummary` 비어있음) AND userMessage가 고위험 키워드(아키텍처/리팩터/마이그레이션/보안/인증/결제/삭제 등)에 매칭되지 않음 → `simple`. 그 외 전부 `standard`.
+- **잘못된 `simple` 분류는 VERIFYING이 걸러낸다.** `simple`로 분류됐지만 `SINGLE_MODEL_FIX`의 결과가 테스트를 통과하지 못하면 FIX_LOOP로 빠지고, FIX_LOOP는 (13.1 이전부터) 항상 Claude를 다시 호출해 VerificationReport 기반으로 수정한다 — 이 시점부터는 사실상 "실패를 알고 재시도하는 Claude"이므로 tier를 다시 매길 필요가 없다. 즉 분류 오류의 비용은 재시도 1회로 국한되고, 최종 결과의 정확성은 tier 판정 정확도에 의존하지 않는다.
+- **사용자가 정책으로 override 가능해야 한다.** `TaskPolicy`에 `forceComplexityTier: "standard" | null` 같은 옵션을 두어, 특정 워크스페이스(예: 프로덕션 결제 코드)는 TRIAGE 결과와 무관하게 항상 `standard`로 강제할 수 있게 한다(4절 Policy Gate와 같은 워크스페이스별 override 패턴).
+
+### 13.3 Provider 어댑터 계약 (스파이크 코드로 검증됨)
+
+12절에 있던 미해결 항목("실제 어댑터 계약")이 스파이크 구현으로 해소되었다. 실제 동작이 검증된 패턴:
+
+- **OpenAI (초안/DRAFTING, SINGLE_MODEL_FIX 아님):** Responses API, `text.format = { type: "json_schema", strict: true, schema: {...} }`로 구조화된 JSON 출력을 강제. `response.output_text`에서 파싱(`spike/src/providers/openai.ts`).
+- **Anthropic (검수/REVIEWING, SINGLE_MODEL_FIX):** Messages API, `tool_choice: { type: "tool", name: "..." }`로 특정 도구 호출을 강제해 구조화된 판정(`verdict`/`rationale`/`finalFile`)을 받음(`spike/src/providers/anthropic.ts`). REJECT일 때 `finalFile`을 생략할 수 있도록 스키마의 `required`에서 제외.
+- **모델 선택 관련 실전 이슈:** `gpt-5`/`gpt-5.5` 같은 reasoning 모델은 OpenAI Organization Verification이 필요해 계정에 따라 즉시 사용이 막힐 수 있다(스파이크 실행 중 실제로 발생). 프로덕션에서는 조직 인증 여부를 사전에 확인하거나, 인증이 안 된 조직을 위한 폴백 모델(`gpt-4.1` 등)을 Provider Adapter 레벨에서 자동 선택하는 로직이 필요 — 단순 설정값이 아니라 "인증 상태에 따른 모델 가용성"이라는 새로운 축으로 다뤄야 한다.
+- **아직 스파이크가 다루지 않은 것:** `apply_patch`(unified diff) 방식은 검증 안 됨 — 스파이크는 파일 전체 교체만 사용. `ToolRequest`/`ToolResult` 루프, REVISE 다회차, FIX_LOOP는 실제 구현 전이라 여전히 설계 단계.

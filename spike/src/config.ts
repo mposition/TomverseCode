@@ -9,6 +9,7 @@ import "dotenv/config";
 export const PRICING = {
   "gpt-5": { input: 1.25, output: 10.0 },
   "gpt-5.5": { input: 5.0, output: 30.0 },
+  "gpt-4.1": { input: 2.0, output: 8.0 },
   "claude-sonnet-5": { input: 2.0, output: 10.0 },
   "claude-opus-4-8": { input: 5.0, output: 25.0 },
 } as const;
@@ -18,7 +19,11 @@ export type KnownModel = keyof typeof PRICING;
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
 export const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY ?? "";
 
-export const OPENAI_MODEL = (process.env.OPENAI_MODEL ?? "gpt-5") as KnownModel;
+// gpt-5/gpt-5.5 are reasoning models gated behind OpenAI's Organization
+// Verification (https://platform.openai.com/settings/organization/general).
+// Defaulting to gpt-4.1 so the spike runs without waiting on that approval —
+// override via OPENAI_MODEL once your org is verified, if you want to compare.
+export const OPENAI_MODEL = (process.env.OPENAI_MODEL ?? "gpt-4.1") as KnownModel;
 export const ANTHROPIC_MODEL = (process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5") as KnownModel;
 
 export function costUsd(model: KnownModel, usage: { inputTokens: number; outputTokens: number }): number {
