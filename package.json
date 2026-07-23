@@ -1,0 +1,17 @@
+{
+  "name": "tomverse-code",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tomverse Code — AI coding assistant desktop app (Windows). See docs/design/ for architecture docs.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
