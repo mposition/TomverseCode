@@ -87,6 +87,8 @@ cargo build
 - **Tauri `setup()` 훅 안에서 `tokio::spawn`은 패닉한다** ("there is no reactor running"). `tauri::async_runtime::spawn`을 쓸 것.
 - **Node의 stdout 쓰기 실패(EPIPE)는 프로세스 전체를 죽인다.** 상대(Rust)가 먼저 종료되면 발생하므로 스트림에 `.on("error", () => {})`가 필요하다.
 - **`gpt-5`/`gpt-5.5`는 OpenAI Organization Verification이 필요하다.** 미인증 계정에서 `model_not_found`로 실패한다 — 모델 가용성이 전역 사실이 아니라 **자격증명별 사실**이라는 뜻이고, 이게 Model Registry에 `requiresOrgVerification` 축이 있는 이유다.
+- **Git for Windows의 GNU `link.exe`가 MSVC `link.exe`를 PATH에서 가린다.** Rust 링크 실패 시 `link: extra operand ... Try 'link --help'`가 나오면 이건 MSVC가 아니라 **coreutils의 하드링크 유틸리티**가 호출된 것이다. rustc가 붙이는 "Visual Studio에서 C++ 빌드 도구를 선택하라"는 힌트는 이 경우 오도할 수 있다. `vcvarsall.bat`를 거치면 MSVC 경로가 앞에 오므로 해결된다.
+- **Bash를 먼저 잡는 습관을 경계할 것.** 이 저장소에서 Windows 네이티브 툴체인(MSVC/MSBuild/VS)을 다룰 때는 PowerShell + `.bat` 래퍼가 기본이다. Bash(MinGW)를 쓰면 위 `link.exe` 같은 Unix 도구 충돌에 걸린다 — 이 편향은 product-strategy.md 12.3절이 우리 제품에서 구조적으로 교정하려는 대상이기도 하다.
 - **파일이 LF로 저장되면 git이 CRLF 경고를 낸다** — 정상이며 무시해도 된다.
 
 ## 관련 프로젝트
