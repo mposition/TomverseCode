@@ -6,7 +6,8 @@
   "description": "Phase 0 hypothesis spike: does OpenAI-draft + Claude-review cross-verification beat a single-model (Claude-only) fix on small bug-fix tasks?",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "spike": "npm run build && node dist/index.js"
+    "spike": "npm run build && node dist/index.js",
+    "probe:anchoring": "npm run build && node dist/anchoringProbe.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.68.0",

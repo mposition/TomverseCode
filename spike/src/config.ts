@@ -34,6 +34,15 @@ export function costUsd(model: KnownModel, usage: { inputTokens: number; outputT
   return (usage.inputTokens / 1_000_000) * rate.input + (usage.outputTokens / 1_000_000) * rate.output;
 }
 
+// anchoringProbe는 OpenAI를 호출하지 않으므로(합성 초안 사용) Anthropic 키만 요구한다.
+export function requireAnthropicKey(): void {
+  if (!ANTHROPIC_API_KEY) {
+    throw new Error(
+      "Missing required environment variable: ANTHROPIC_API_KEY. Copy .env.example to .env and fill it in."
+    );
+  }
+}
+
 export function requireApiKeys(): void {
   const missing: string[] = [];
   if (!OPENAI_API_KEY) missing.push("OPENAI_API_KEY");

@@ -1,4 +1,4 @@
-import type { ISODateTime, Verdict } from "./common.js";
+import type { ISODateTime, ReviewMode, Verdict } from "./common.js";
 
 export interface PlanStep {
   stepId: string;
@@ -27,6 +27,9 @@ export interface DraftProposal {
 export interface ReviewDecision {
   taskId: string;
   proposalId: string;
+  // 어떤 정보를 보고 내린 판정인지. Agent Trace(product-strategy.md 6절)의
+  // "제공된 컨텍스트" 기록이자, blind/informed 판정 불일치율 지표(14절)의 근거.
+  reviewMode: ReviewMode;
   verdict: Verdict;
   rationale: string;
   revisedPlan?: PlanStep[];
