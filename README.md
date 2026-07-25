@@ -6,6 +6,8 @@ Windows 데스크톱 AI 코딩 어시스턴트.
 
 대부분의 AI 코딩 도구는 모델의 출력을 그대로 제안한다. Tomverse Code는 서로 다른 공급자의 모델이 독립적으로 판단하게 하고, **그 불일치를 숨기지 않고 보여준 뒤, 최종 판정은 LLM이 아니라 테스트·빌드·정적 분석에 맡긴다.**
 
+**동시에 기능을 포기하지 않는다.** GitHub Copilot이 제공하는 기능(MCP, Hooks, 커스텀 에이전트, Plan·Autopilot, worktree 격리, 병렬 실행, PR 연동 등)을 기본적으로 모두 커버하는 것을 제품 명제로 삼는다. 검증 우위를 얻기 위해 이미 쓰던 기능을 포기해야 하는 도구는 애초에 선택지가 되지 못하기 때문이다.
+
 ## 무엇이 다른가
 
 | | 일반적인 AI 코딩 도구 | Tomverse Code |
@@ -31,6 +33,14 @@ Tauri 2 + React (데스크톱 UI) · Rust (정책·실행·저장 신뢰 경계)
 
 3프로세스 구조와 그 근거는 [docs/design/process-architecture.md](./docs/design/process-architecture.md).
 
+## 기능 범위
+
+출시(v1) 목표는 Copilot 기능 영역 전체를 **커버**하는 것이다. 단 "커버"와 "패리티"를 구분한다 — 각 기능은 *일반적인 사용 사례에서 동작*하는 수준으로 출시하고, 엣지 케이스까지의 깊이는 실사용이 요구할 때 채운다. **차별화 기능(검증 투명성, Blind Review, 불일치 화면, Verified 리포트)만은 처음부터 깊게** 만든다.
+
+기능별 "출시 기준"은 [product-strategy.md 8.2절](./docs/design/product-strategy.md)에 표로 정의되어 있다.
+
+의도적으로 넣지 않는 것은 **클라우드 실행**(로컬 우선 약속과 충돌)과 **인라인 자동완성**(사실상 다른 제품 형태) 둘뿐이며, 그 근거도 같은 문서 8.3절에 적혀 있다.
+
 ## 현재 상태
 
 **개발 초기 단계.** 설계 문서가 먼저 작성되었고, 모노레포 스캐폴딩과 프로세스 간 통신 배관이 동작하는 단계다.
@@ -38,7 +48,7 @@ Tauri 2 + React (데스크톱 UI) · Rust (정책·실행·저장 신뢰 경계)
 - 동작함: 공유 프로토콜 타입 패키지, Node sidecar(stdio+NDJSON IPC, 위험도 분류), Tauri 앱이 sidecar를 spawn하고 통신
 - 미구현: Tool Runtime, Policy Gate 실행부, Context Engine, 모델 어댑터 연결, 검증 루프
 
-로드맵(M0~M5)과 각 단계의 완료 기준은 [docs/design/product-strategy.md](./docs/design/product-strategy.md) 13절.
+로드맵(M0~M6)과 각 단계의 완료 기준은 [docs/design/product-strategy.md](./docs/design/product-strategy.md) 13절.
 
 ### 검증되지 않은 가설을 공개해 둡니다
 

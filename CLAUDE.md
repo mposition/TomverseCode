@@ -1,6 +1,13 @@
 # Tomverse Code — 작업 지침
 
-Windows 데스크톱 AI 코딩 어시스턴트. **차별화는 기능 개수가 아니라 검증 신뢰성**이다 — 자세한 근거는 [docs/design/product-strategy.md](./docs/design/product-strategy.md).
+Windows 데스크톱 AI 코딩 어시스턴트.
+
+**두 가지를 동시에 만족해야 한다** — 자세한 근거는 [docs/design/product-strategy.md](./docs/design/product-strategy.md).
+
+1. **차별화는 검증 신뢰성에서 나온다.** 기능 개수로 GitHub와 싸워 이길 수 없다.
+2. **그러나 기능을 포기하지도 않는다.** Copilot 기능 전체 커버가 제품 명제다(8절). 사용자가 쓰던 기능을 포기해야 하면 차별화를 볼 기회조차 없다.
+
+이 둘의 긴장을 푸는 규칙: **커버(범위)와 패리티(깊이)를 분리한다.** 패리티 기능은 "일반 사례 동작 + 한계 명시"로 시작하고, **차별화 기능만 처음부터 깊게** 만든다. 우선순위가 충돌하면 **패리티의 깊이를 희생하고 차별화의 깊이를 지킨다.** 기능별 출시 기준은 product-strategy.md 8.2절 표에 있다 — 새 기능을 만들 때 "어디까지 하면 되는가"는 그 표를 볼 것.
 
 ## 설계 문서 지도
 
@@ -8,7 +15,7 @@ Windows 데스크톱 AI 코딩 어시스턴트. **차별화는 기능 개수가 
 
 | 문서 | 다루는 것 |
 |---|---|
-| [product-strategy.md](./docs/design/product-strategy.md) | 제품 포지셔닝, 로드맵(M0~M5), 북극성 지표, **가설 게이트** |
+| [product-strategy.md](./docs/design/product-strategy.md) | 제품 포지셔닝, **기능 커버 범위와 출시 기준(8절)**, 로드맵(M0~M6), 북극성 지표, **가설 게이트** |
 | [state-machine-and-protocol.md](./docs/design/state-machine-and-protocol.md) | 태스크 상태 머신, 공통 프로토콜 타입, Policy Gate, `run_command` allowlist, SQLite 스키마, 롤백 |
 | [context-engine.md](./docs/design/context-engine.md) | `WorkspaceIndex`(세션) vs `WorkspaceSnapshot`(태스크), 관련 파일 선정, 토큰 예산, secret 제외 |
 | [multi-engine-routing.md](./docs/design/multi-engine-routing.md) | Model Registry, Role 추상화, 검수자 독립성 불변식, 라우터 부트스트랩 |
