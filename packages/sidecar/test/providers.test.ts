@@ -26,7 +26,7 @@ function ctx(overrides: Partial<ProviderCallContext> = {}): ProviderCallContext 
 // ---- 런타임 검증 (LLM 출력을 신뢰하지 않는다) ----
 
 test("DraftProposal 검증: 필수 필드가 없으면 거부한다", () => {
-  const meta = { taskId: "t", proposalId: "p", model: "m", createdAt: "now" };
+  const meta = { taskId: "t", proposalId: "p", model: "m", createdAt: "now", reviewMode: "informed" as const };
   assert.throws(() => validateDraftProposal({}, meta), ValidationError);
   assert.throws(() => validateDraftProposal({ interpretation: "" }, meta), ValidationError);
   // 타입이 틀린 경우도 거부한다 — 모델이 스키마를 어길 수 있다.
@@ -45,7 +45,7 @@ test("DraftProposal 검증: 최소 형태를 통과시키고 기본값을 채운
 });
 
 test("ReviewDecision 검증: 알 수 없는 verdict를 거부한다", () => {
-  const meta = { taskId: "t", proposalId: "p", model: "m", createdAt: "now" };
+  const meta = { taskId: "t", proposalId: "p", model: "m", createdAt: "now", reviewMode: "informed" as const };
   assert.throws(
     () => validateReviewDecision({ verdict: "LOOKS_GOOD_TO_ME", rationale: "ok" }, meta),
     ValidationError
@@ -54,7 +54,7 @@ test("ReviewDecision 검증: 알 수 없는 verdict를 거부한다", () => {
 
 test("NEED_USER_INPUT인데 질문이 없으면 거부한다", () => {
   // 통과시키면 사용자에게 빈 확인 카드를 보여주게 된다.
-  const meta = { taskId: "t", proposalId: "p", model: "m", createdAt: "now" };
+  const meta = { taskId: "t", proposalId: "p", model: "m", createdAt: "now", reviewMode: "informed" as const };
   assert.throws(
     () => validateReviewDecision({ verdict: "NEED_USER_INPUT", rationale: "모호함" }, meta),
     ValidationError

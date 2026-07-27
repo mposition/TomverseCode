@@ -41,5 +41,11 @@ regex = "1"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 thiserror = "2"
 
+# 프로세스 그룹 종료(`killpg`)에만 쓴다. 취소 시 손자 프로세스까지 죽이려면 그룹 시그널이
+# 필요하고, std에는 그 API가 없다. Windows는 내장 `taskkill /T`를 쓰므로 의존성이 없다
+# (자세한 근거와 한계는 src/proctree.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

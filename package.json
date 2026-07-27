@@ -15,8 +15,8 @@
     "test:e2e": "npm run test:e2e --workspace=@tomverse/sidecar",
     "core:build": "cargo build --manifest-path apps/desktop/src-tauri/core/Cargo.toml",
     "core:test": "cargo test --manifest-path apps/desktop/src-tauri/core/Cargo.toml",
-    "//verify": "M0 전체 검증 — Node 타입/빌드/테스트 + Rust 테스트 + 실제 구성요소 e2e.",
-    "verify": "npm run typecheck && npm run build && npm run test && npm run core:test && npm run core:build && npm run test:e2e"
+    "//verify": "전체 검증 — Node 빌드/타입/테스트 + Rust 테스트 + 실제 구성요소 e2e. build가 typecheck보다 먼저인 이유: sidecar는 protocol의 **빌드 산출물**(dist)에 대해 타입 검사하므로, 먼저 빌드하지 않으면 낡은 dist를 보고 통과/실패한다.",
+    "verify": "npm run build && npm run typecheck && npm run test && npm run core:test && npm run core:build && npm run test:e2e"
   },
   "engines": {
     "node": ">=20"

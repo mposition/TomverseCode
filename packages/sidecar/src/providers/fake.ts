@@ -135,6 +135,8 @@ export class FakeProviderAdapter implements ProviderAdapter {
       value: validateReviewDecision(payload, {
         taskId: ctx.taskId,
         proposalId: input.draft.proposalId,
+        // 프롬프트를 어떻게 구성했는지에 대한 사실이므로 우리가 기록한다 — 모델에게 묻지 않는다.
+        reviewMode: input.blind ? "blind" : "informed",
         model: this.modelId,
         createdAt: new Date().toISOString(),
       }),

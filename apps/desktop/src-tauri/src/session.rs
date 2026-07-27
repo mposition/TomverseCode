@@ -18,8 +18,9 @@ use tomverse_core::artifacts::ArtifactStore;
 use tomverse_core::host::{ApprovalGateway, ApprovalOutcome, EventSink, TaskHost};
 use tomverse_core::sidecar::{SidecarClient, SpawnConfig};
 use tomverse_core::store::Store;
+use tomverse_core::store::TaskRow;
 use tomverse_core::types::{ApprovalRequest, ExecutionMode, TaskPolicy};
-use tomverse_core::{available_providers, credential_env, WorkspaceRoot, PROTOCOL_VERSION};
+use tomverse_core::{available_providers, credential_env, CancellationRegistry, WorkspaceRoot, PROTOCOL_VERSION};
 
 /// UI에 승인 요청을 emit하고 사용자 응답을 기다린다.
 ///
@@ -95,18 +96,110 @@ pub struct ActiveWorkspace {
 pub struct SessionState {
     inner: Mutex<Option<ActiveWorkspace>>,
     pub pending_approvals: Arc<Mutex<HashMap<String, mpsc::Sender<ApprovalOutcome>>>>,
+    /// 저장 계층은 **워크스페이스와 독립적으로** 살아 있어야 한다.
+    ///
+    /// 앱을 켜자마자(워크스페이스를 열기 전) 최근 작업 목록과 중단된 작업을 보여줘야 하기 때문이다.
+    /// 워크스페이스를 열 때 Store를 만들면 그 화면을 그릴 수 없다.
+    store: Mutex<Option<Arc<Mutex<Store>>>>,
+    artifacts: Mutex<Option<ArtifactStore>>,
+    /// 앱 수명 동안 유지되는 취소 registry. 워크스페이스를 바꿔도 진행 중이던 태스크의
+    /// 취소 신호가 유실되면 안 된다.
+    cancels: Arc<CancellationRegistry>,
 }
 
 impl SessionState {
+    /// 앱 시작 시 1회. 저장 계층을 열고 **비정상 종료된 작업을 INTERRUPTED로 확정한다.**
+    ///
+    /// 자동 재실행하지 않는다(state-machine-and-protocol.md 7절): 부분 실행된 도구의 재개는
+    /// 멱등성 보장이 없으면 위험하다. 사용자에게 되돌리기/재실행 선택을 준다.
+    pub fn initialize(&self) -> Result<Value, String> {
+        let state_dir = app_state_dir();
+        let artifacts = ArtifactStore::new(state_dir.join("artifacts"))
+            .map_err(|e| format!("artifact 저장소를 만들 수 없습니다: {e}"))?;
+        let mut store = Store::open(state_dir.join("state.db"), artifacts.clone())
+            .map_err(|e| format!("로컬 DB를 열 수 없습니다: {e}"))?;
+
+        let interrupted = store
+            .mark_unfinished_as_interrupted()
+            .map_err(|e| format!("중단된 작업을 정리할 수 없습니다: {e}"))?;
+
+        *self.store.lock().unwrap() = Some(Arc::new(Mutex::new(store)));
+        *self.artifacts.lock().unwrap() = Some(artifacts);
+
+        Ok(json!({
+            "interruptedTasks": interrupted,
+            "stateDir": state_dir.to_string_lossy(),
+        }))
+    }
+
+    fn store(&self) -> Result<Arc<Mutex<Store>>, String> {
+        self.store
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "저장 계층이 아직 초기화되지 않았습니다".to_string())
+    }
+
+    fn artifacts(&self) -> Result<ArtifactStore, String> {
+        self.artifacts
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "artifact 저장소가 아직 초기화되지 않았습니다".to_string())
+    }
+
+    pub fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> T) -> Result<T, String> {
+        let store = self.store()?;
+        let mut guard = store.lock().unwrap();
+        Ok(f(&mut guard))
+    }
+
+    // ---- 조회 (UI는 DB에 직접 접근하지 않는다 — 전부 이 경로를 지난다) ----
+
+    pub fn list_tasks(
+        &self,
+        workspace_path: Option<&str>,
+        limit: i64,
+        cursor: Option<&str>,
+    ) -> Result<Vec<TaskRow>, String> {
+        self.with_store(|s| s.list_tasks(workspace_path, limit, cursor))?
+            .map_err(|e| format!("작업 목록을 읽을 수 없습니다: {e}"))
+    }
+
+    pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>, String> {
+        self.with_store(|s| s.get_task(task_id))?
+            .map_err(|e| format!("작업을 읽을 수 없습니다: {e}"))
+    }
+
+    pub fn get_task_events(&self, task_id: &str, after_event_id: Option<i64>) -> Result<Value, String> {
+        let events = self
+            .with_store(|s| s.events_after(task_id, after_event_id))?
+            .map_err(|e| format!("이벤트를 읽을 수 없습니다: {e}"))?;
+        Ok(json!(events
+            .into_iter()
+            .map(|e| json!({
+                "eventId": e.event_id,
+                "seq": e.seq,
+                "type": e.event_type,
+                "phase": e.phase,
+                "payload": e.payload,
+                "createdAt": e.created_at,
+            }))
+            .collect::<Vec<_>>()))
+    }
+
+    /// 저장된 mutation 목록 — INTERRUPTED 작업의 "되돌리기" 버튼이 이걸 보고 판단한다.
+    pub fn task_mutations(&self, task_id: &str) -> Result<Vec<String>, String> {
+        self.with_store(|s| s.mutated_paths(task_id))?
+            .map_err(|e| format!("변경 목록을 읽을 수 없습니다: {e}"))
+    }
+
     /// 워크스페이스를 열고 sidecar를 spawn한다. 이미 열려 있으면 교체한다.
     pub fn open_workspace(&self, app: &AppHandle, path: &str, policy: TaskPolicy) -> Result<Value, String> {
         let root = WorkspaceRoot::new(path).map_err(|e| format!("워크스페이스를 열 수 없습니다: {e}"))?;
 
-        let state_dir = app_state_dir();
-        let artifacts = ArtifactStore::new(state_dir.join("artifacts"))
-            .map_err(|e| format!("artifact 저장소를 만들 수 없습니다: {e}"))?;
-        let store = Store::open(state_dir.join("state.db"), artifacts.clone())
-            .map_err(|e| format!("로컬 DB를 열 수 없습니다: {e}"))?;
+        let artifacts = self.artifacts()?;
+        let store = self.store()?;
 
         let workspace_id = format!("ws-{}", short_hash(&root.display()));
         let name = root
@@ -115,18 +208,28 @@ impl SessionState {
             .and_then(|n| n.to_str())
             .unwrap_or("workspace")
             .to_string();
-        store
-            .upsert_workspace(&workspace_id, &root.display(), &name)
-            .map_err(|e| format!("워크스페이스 기록 실패: {e}"))?;
-
         let session_id = format!("sess-{}", uuid::Uuid::new_v4());
-        store
-            .upsert_session(&session_id, &workspace_id, Some(&name))
-            .map_err(|e| format!("세션 기록 실패: {e}"))?;
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .upsert_workspace(&workspace_id, &root.display(), &name)
+                .map_err(|e| format!("워크스페이스 기록 실패: {e}"))?;
+            guard
+                .upsert_session(&session_id, &workspace_id, Some(&name))
+                .map_err(|e| format!("세션 기록 실패: {e}"))?;
+        }
 
         let approvals = Arc::new(UiApprovalGateway::new(app.clone(), self.pending_approvals.clone()));
         let sink = Arc::new(TauriSink { app: app.clone() });
-        let host = Arc::new(TaskHost::new(root.clone(), policy, store, artifacts, approvals, sink));
+        let host = Arc::new(TaskHost::new(
+            root.clone(),
+            policy,
+            store,
+            artifacts,
+            approvals,
+            sink,
+            self.cancels.clone(),
+        ));
 
         // sidecar spawn: 여기서 API 키가 자식 환경으로 1회 주입된다.
         // 값은 UI로도 로그로도 나가지 않는다.
@@ -205,7 +308,15 @@ impl SessionState {
         })?;
 
         let task_id = format!("task-{}", uuid::Uuid::new_v4());
-        host.with_store(|s| s.create_task(&task_id, &session_id, &workspace_id, message))
+        let workspace_path = self
+            .info()
+            .and_then(|i| i["rootPath"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        let mode_str = match mode {
+            ExecutionMode::Fast => "fast",
+            ExecutionMode::Verified => "verified",
+        };
+        host.with_store(|s| s.create_task(&task_id, &session_id, &workspace_id, &workspace_path, mode_str, message))
             .map_err(|e| format!("태스크를 만들 수 없습니다: {e}"))?;
 
         let params = json!({
@@ -226,6 +337,24 @@ impl SessionState {
         let result = sidecar.request("task.start", params, timeout);
         match result {
             Ok(mut value) => {
+                // Node가 보고한 최종 상태를 **호스트가 원자적으로 확정한다.** Node의 주장을
+                // 그대로 믿으면 완료/취소 경쟁에서 두 terminal이 기록될 수 있다.
+                let status = value.get("status").and_then(Value::as_str).unwrap_or("failed");
+                let terminal = match status {
+                    "completed" => "COMPLETED",
+                    "cancelled" => "CANCELLED",
+                    "rejected" => "REJECTED",
+                    _ => "FAILED",
+                };
+                let summary = value.get("summary").and_then(Value::as_str).unwrap_or("").to_string();
+                let _ = host.finish_task(
+                    &task_id,
+                    terminal,
+                    &format!("TASK_{terminal}"),
+                    if terminal == "FAILED" { Some(&summary) } else { None },
+                    json!({ "status": status, "summary": summary, "source": "host-confirm" }),
+                );
+
                 if let Some(obj) = value.as_object_mut() {
                     let mutated = host.with_store(|s| s.mutated_paths(&task_id)).unwrap_or_default();
                     obj.insert("mutatedPaths".to_string(), json!(mutated));
@@ -236,9 +365,11 @@ impl SessionState {
             }
             Err(message) => {
                 // sidecar가 죽어도 이벤트 로그로 상태를 설명할 수 있어야 한다.
-                let _ = host.append_event(
+                let _ = host.finish_task(
                     &task_id,
+                    "FAILED",
                     "TASK_FAILED",
+                    Some(&message),
                     json!({ "status": "failed", "summary": message.clone() }),
                 );
                 Err(message)
@@ -246,17 +377,48 @@ impl SessionState {
         }
     }
 
+    /// 저장된 작업을 **새 task_id로 다시 실행한다.**
+    ///
+    /// 이전 명령을 자동 재개하지 않는 이유(state-machine-and-protocol.md 7절): 부분 실행된
+    /// `ToolRequest`의 재개는 멱등성 보장이 없으면 위험하다. 같은 요청 문구로 처음부터 다시 돈다.
+    pub fn restart_task(&self, task_id: &str, timeout: Duration) -> Result<Value, String> {
+        let task = self
+            .get_task(task_id)?
+            .ok_or_else(|| format!("작업을 찾을 수 없습니다: {task_id}"))?;
+        let mode = match task.mode.as_deref() {
+            Some("fast") => ExecutionMode::Fast,
+            _ => ExecutionMode::Verified,
+        };
+        self.start_task(&task.user_message, mode, timeout)
+    }
+
+    /// 취소 요청. **두 방향 모두 필요하다:**
+    ///  - Rust(`TaskHost`): 실행 중인 자식 프로세스를 죽이고 이후 도구 실행을 거부한다
+    ///  - Node(`task.cancel`): 진행 중인 공급자 HTTP 호출을 abort한다
+    ///
+    /// 한쪽만 하면 취소가 절반만 된다 — Rust만 하면 모델 호출이 계속 돌고,
+    /// Node만 하면 이미 시작된 `npm test`가 끝까지 실행된다.
     pub fn cancel_task(&self, task_id: &str) -> Result<Value, String> {
-        self.with_active(|active| {
-            // 두 방향 모두 필요하다: Node는 진행 중인 공급자 호출을 끊고,
-            // Rust는 이후 도구 실행을 거부한다.
-            active.host.cancel();
-            let node = active
-                .sidecar
-                .request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5))
-                .unwrap_or(Value::Null);
-            Ok(json!({ "cancelled": true, "sidecar": node }))
-        })
+        let guard = self.inner.lock().unwrap();
+        let Some(active) = guard.as_ref() else {
+            return Err("먼저 워크스페이스를 선택하세요.".to_string());
+        };
+        let host = active.host.clone();
+        let sidecar = active.sidecar.clone();
+        drop(guard);
+
+        // 순서: Rust 먼저. 토큰이 켜져야 진행 중인 프로세스가 죽고 새 도구가 시작되지 않는다.
+        let rust_outcome = host.cancel_task(task_id)?;
+        let node_outcome = sidecar
+            .request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5))
+            .unwrap_or(Value::Null);
+
+        Ok(json!({
+            "accepted": rust_outcome.get("accepted").and_then(Value::as_bool).unwrap_or(false),
+            "outcome": rust_outcome.get("outcome"),
+            "host": rust_outcome,
+            "sidecar": node_outcome,
+        }))
     }
 
     pub fn provide_user_input(&self, task_id: &str, message: &str) -> Result<Value, String> {

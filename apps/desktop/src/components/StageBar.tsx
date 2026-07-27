@@ -32,6 +32,7 @@ export function StageBar({
         })}
       </ol>
       {current === "확인 필요" && <p className="warn small">사용자 입력을 기다리고 있습니다.</p>}
+      {current === "취소 중" && <p className="warn small">취소 요청을 처리하는 중입니다 — 실행 중인 명령을 종료합니다.</p>}
       {devMode && (
         <p className="muted small">
           내부 phase: <code>{phase}</code>

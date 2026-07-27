@@ -12,19 +12,29 @@
 //! tomverse-host run --workspace <path> --message "..." [--mode fast|verified]
 //!                   [--approve auto|deny] [--db <path>] [--artifacts <path>]
 //!                   [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit]
+//!                   [--cancel-after-ms <n>] [--verbose]
 //! tomverse-host rollback --workspace <path> --task <taskId> --db <path> [--artifacts <path>]
+//! tomverse-host recover  --workspace <path> --db <path>
+//! tomverse-host tasks    --workspace <path> --db <path>
+//! tomverse-host show     --workspace <path> --task <taskId> --db <path>
 //! ```
+//!
+//! M0.1에서 `recover`/`tasks`/`show`가 추가된 이유: 영속화가 실제로 되는지 검증하려면
+//! **호스트가 죽은 뒤 새 프로세스가 DB만 열어서** 같은 사실을 읽을 수 있어야 한다.
+//! 같은 프로세스 안에서 확인하면 "메모리에 남아 있었다"와 구별되지 않는다.
+//! 이 세 명령은 Tauri 앱이 부르는 것과 **같은 Store 메서드**를 호출한다 — 테스트 전용 경로가 아니다.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tomverse_core::artifacts::ArtifactStore;
 use tomverse_core::host::{AlwaysDeny, ApprovalGateway, AutoApprove, EventSink, TaskHost};
 use tomverse_core::sidecar::{SidecarClient, SpawnConfig};
-use tomverse_core::store::Store;
+use tomverse_core::store::{Store, TerminalOutcome};
 use tomverse_core::types::{ExecutionMode, TaskPolicy};
+use tomverse_core::CancellationRegistry;
 use tomverse_core::{available_providers, credential_env, WorkspaceRoot, PROTOCOL_VERSION};
 
 /// 이벤트를 stderr로 흘린다. stdout은 최종 결과 JSON 전용이므로 섞지 않는다 —
@@ -72,6 +82,11 @@ struct Args {
     allow_git_commit: bool,
     timeout_secs: u64,
     verbose: bool,
+    /// 시나리오 A용: 실행 시작 후 N ms 뒤에 스스로 취소를 요청한다.
+    ///
+    /// 테스트 편의 기능이지만, **실행되는 취소 경로는 실제 경로와 동일하다** —
+    /// 같은 registry, 같은 토큰, 같은 프로세스 트리 종료 코드를 탄다. 별도 mock이 아니다.
+    cancel_after_ms: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -92,6 +107,7 @@ fn parse_args() -> Result<Args, String> {
         allow_git_commit: false,
         timeout_secs: 600,
         verbose: false,
+        cancel_after_ms: None,
     };
 
     while let Some(flag) = raw.next() {
@@ -118,6 +134,13 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--timeout-secs는 정수여야 합니다".to_string())?
             }
+            "--cancel-after-ms" => {
+                args.cancel_after_ms = Some(
+                    value()?
+                        .parse()
+                        .map_err(|_| "--cancel-after-ms는 정수여야 합니다".to_string())?,
+                )
+            }
             "--verbose" => args.verbose = true,
             other => return Err(format!("알 수 없는 인자: {other}\n\n{}", usage())),
         }
@@ -126,9 +149,13 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback> --workspace <path> [--message <text>] [--task <id>] \
-     [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
-     [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--verbose]"
+    "usage: tomverse-host <run|rollback|recover|tasks|show> --workspace <path> [--message <text>] \
+     [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
+     [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>] [--verbose]\n\
+     \n\
+     recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
+     tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
+     show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다"
         .to_string()
 }
 
@@ -155,10 +182,14 @@ fn real_main() -> Result<i32, String> {
         .db
         .clone()
         .unwrap_or_else(|| artifacts_root.parent().unwrap_or(&artifacts_root).join("state.db"));
-    let mut store = Store::open(&db_path, artifacts.clone()).map_err(|e| format!("SQLite 오류: {e}"))?;
+    let store = Arc::new(Mutex::new(
+        Store::open(&db_path, artifacts.clone()).map_err(|e| format!("SQLite 오류: {e}"))?,
+    ));
 
     let workspace_id = format!("ws-{}", short_hash(&root.display()));
     store
+        .lock()
+        .unwrap()
         .upsert_workspace(&workspace_id, &root.display(), workspace_name(&root))
         .map_err(|e| format!("워크스페이스 기록 실패: {e}"))?;
 
@@ -186,14 +217,35 @@ fn real_main() -> Result<i32, String> {
                 .task_id
                 .clone()
                 .unwrap_or_else(|| format!("task-{}", uuid::Uuid::new_v4()));
-            store
-                .upsert_session(&session_id, &workspace_id, Some("headless"))
-                .map_err(|e| format!("세션 기록 실패: {e}"))?;
-            store
-                .create_task(&task_id, &session_id, &workspace_id, &args.message)
-                .map_err(|e| format!("태스크 생성 실패: {e}"))?;
+            {
+                let mut guard = store.lock().unwrap();
+                guard
+                    .upsert_session(&session_id, &workspace_id, Some("headless"))
+                    .map_err(|e| format!("세션 기록 실패: {e}"))?;
+                guard
+                    .create_task(
+                        &task_id,
+                        &session_id,
+                        &workspace_id,
+                        &root.display(),
+                        match args.mode {
+                            ExecutionMode::Fast => "fast",
+                            ExecutionMode::Verified => "verified",
+                        },
+                        &args.message,
+                    )
+                    .map_err(|e| format!("태스크 생성 실패: {e}"))?;
+            }
 
-            let host = Arc::new(TaskHost::new(root, policy, store, artifacts, approvals, sink));
+            let host = Arc::new(TaskHost::new(
+                root,
+                policy,
+                store.clone(),
+                artifacts,
+                approvals,
+                sink,
+                Arc::new(CancellationRegistry::new()),
+            ));
             let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id)?;
 
             // stdout에는 최종 결과만. 호출자(테스트)가 그대로 파싱한다.
@@ -217,7 +269,15 @@ fn real_main() -> Result<i32, String> {
                 .task_id
                 .clone()
                 .ok_or_else(|| "rollback에는 --task가 필요합니다".to_string())?;
-            let host = TaskHost::new(root, policy, store, artifacts, approvals, sink);
+            let host = TaskHost::new(
+                root,
+                policy,
+                store,
+                artifacts,
+                approvals,
+                sink,
+                Arc::new(CancellationRegistry::new()),
+            );
             let result = host.rollback(&task_id)?;
             println!("{result}");
             let failed = result
@@ -226,6 +286,60 @@ fn real_main() -> Result<i32, String> {
                 .map(|a| a.len())
                 .unwrap_or(0);
             Ok(if failed == 0 { 0 } else { 1 })
+        }
+
+        // 앱 재시작 시나리오. Tauri `setup()`이 `SessionState::initialize()`에서 부르는 것과
+        // **같은 Store 메서드**를 그대로 호출한다 — 테스트용 별도 경로가 아니다.
+        "recover" => {
+            let marked = store
+                .lock()
+                .unwrap()
+                .mark_unfinished_as_interrupted()
+                .map_err(|e| format!("복구 실패: {e}"))?;
+            println!(
+                "{}",
+                json!({ "interruptedTasks": marked, "dbPath": db_path.to_string_lossy() })
+            );
+            Ok(0)
+        }
+
+        "tasks" => {
+            let guard = store.lock().unwrap();
+            let rows = guard
+                .list_tasks(Some(&root.display()), 200, None)
+                .map_err(|e| format!("작업 목록 조회 실패: {e}"))?;
+            println!("{}", json!({ "tasks": rows }));
+            Ok(0)
+        }
+
+        // 재시작 후에도 기록이 남아 있는지 확인하는 통로. DB만 읽고 아무것도 실행하지 않는다.
+        "show" => {
+            let task_id = args
+                .task_id
+                .clone()
+                .ok_or_else(|| "show에는 --task가 필요합니다".to_string())?;
+            let guard = store.lock().unwrap();
+            let task = guard.get_task(&task_id).map_err(|e| format!("작업 조회 실패: {e}"))?;
+            let events = guard
+                .events_after(&task_id, None)
+                .map_err(|e| format!("이벤트 조회 실패: {e}"))?;
+            let output = json!({
+                "task": task,
+                "events": events.iter().map(|e| json!({
+                    "eventId": e.event_id,
+                    "seq": e.seq,
+                    "type": e.event_type,
+                    "phase": e.phase,
+                    "payload": e.payload,
+                    "createdAt": e.created_at,
+                })).collect::<Vec<_>>(),
+                "eventTypes": events.iter().map(|e| e.event_type.clone()).collect::<Vec<_>>(),
+                "mutations": guard.mutation_records(&task_id).map_err(|e| format!("변경 조회 실패: {e}"))?,
+                "toolExecutions": guard.tool_executions(&task_id).map_err(|e| format!("도구 조회 실패: {e}"))?,
+                "verificationChecks": guard.verification_checks(&task_id).map_err(|e| format!("검증 조회 실패: {e}"))?,
+            });
+            println!("{output}");
+            Ok(if task.is_some() { 0 } else { 1 })
         }
 
         other => Err(format!("알 수 없는 명령: {other}\n\n{}", usage())),
@@ -317,16 +431,57 @@ fn run_task(
         "availableProviders": providers,
     });
 
+    // 시나리오 A: 실행 중 취소를 스스로 트리거한다. **취소 경로는 UI의 것과 동일하다** —
+    // `TaskHost::cancel_task`를 그대로 부르고 Node에도 `task.cancel`을 보낸다. 별도 mock이 아니다.
+    if let Some(delay_ms) = args.cancel_after_ms {
+        let host_for_cancel = host.clone();
+        let client_for_cancel = client.clone();
+        let task = task_id.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            // Rust 쪽: 실행 중인 자식 프로세스를 죽이고 이후 도구 실행을 막는다.
+            if let Err(message) = host_for_cancel.cancel_task(&task) {
+                eprintln!("취소 요청 실패: {message}");
+            }
+            // Node 쪽: 진행 중인 공급자 호출을 abort한다.
+            let _ = client_for_cancel.request("task.cancel", json!({ "taskId": task }), Duration::from_secs(5));
+        });
+    }
+
     let outcome = client.request("task.start", params, Duration::from_secs(args.timeout_secs));
     client.shutdown(Duration::from_secs(3));
 
     match outcome {
-        Ok(value) => Ok(value),
+        Ok(value) => {
+            // Node가 보고한 최종 상태를 **호스트가 확정한다.** Node의 주장을 그대로 믿지 않고
+            // 원자적 terminal 규칙을 통과시켜야 경쟁 상황에서도 하나만 남는다.
+            let status = value.get("status").and_then(Value::as_str).unwrap_or("failed");
+            let terminal = match status {
+                "completed" => "COMPLETED",
+                "cancelled" => "CANCELLED",
+                "rejected" => "REJECTED",
+                _ => "FAILED",
+            };
+            let summary = value.get("summary").and_then(Value::as_str).unwrap_or("");
+            match host.finish_task(
+                task_id,
+                terminal,
+                &format!("TASK_{terminal}"),
+                if terminal == "FAILED" { Some(summary) } else { None },
+                json!({ "status": status, "summary": summary, "source": "host-confirm" }),
+            ) {
+                Ok(TerminalOutcome::Recorded { .. }) | Ok(TerminalOutcome::AlreadyTerminal { .. }) => {}
+                Err(message) => eprintln!("terminal 확정 실패: {message}"),
+            }
+            Ok(value)
+        }
         Err(message) => {
             // sidecar가 죽었어도 이벤트 로그로 마지막 상태를 설명할 수 있어야 한다.
-            let _ = host.append_event(
+            let _ = host.finish_task(
                 task_id,
+                "FAILED",
                 "TASK_FAILED",
+                Some(&message),
                 json!({ "status": "failed", "summary": message.clone() }),
             );
             Ok(json!({ "status": "failed", "summary": message, "taskId": task_id }))

@@ -8,8 +8,10 @@
 pub mod patch;
 
 use crate::artifacts::ArtifactStore;
+use crate::cancel::CancellationToken;
 use crate::paths::WorkspaceRoot;
 use crate::policy::parse_run_command;
+use crate::proctree;
 use crate::time::{elapsed_ms, now_iso};
 use crate::types::{
     Decision, FileMutationRecord, ImageRef, PolicyDecision, RunCommandArgs, ToolName, ToolRequest, ToolResult,
@@ -67,7 +69,15 @@ impl ToolRuntime {
     ///
     /// `decision`은 Policy Gate의 판단이며, `Deny`거나 승인이 필요한데 아직 승인되지 않았으면
     /// 실행하지 않는다. 승인 여부(`approved`)는 host가 사용자 응답을 받아 넘긴다.
-    pub fn execute(&self, request: &ToolRequest, decision: &PolicyDecision, approved: bool) -> ToolOutcome {
+    /// `cancel`은 태스크의 취소 신호다. 실행 직전과 (파일 도구의 경우) 기록 직전에 검사하며,
+    /// `run_command`는 실행 **중에도** 감시한다.
+    pub fn execute(
+        &self,
+        request: &ToolRequest,
+        decision: &PolicyDecision,
+        approved: bool,
+        cancel: &CancellationToken,
+    ) -> ToolOutcome {
         let start = Instant::now();
 
         if matches!(decision.decision, Decision::Deny) {
@@ -80,8 +90,13 @@ impl ToolRuntime {
                 &format!("사용자 승인이 필요하지만 승인되지 않았음: {}", decision.reason),
             );
         }
+        // 취소된 태스크의 도구는 시작하지 않는다. `Denied`가 아니라 `Cancelled`로 보고해야
+        // 호출자가 "정책이 막았다"와 "사용자가 멈췄다"를 구별할 수 있다.
+        if cancel.is_cancelled() {
+            return self.cancelled(request, start, "취소된 태스크의 도구 실행을 시작하지 않음");
+        }
 
-        match self.dispatch(request, start) {
+        match self.dispatch(request, start, cancel) {
             Ok(outcome) => outcome,
             Err(message) => ToolOutcome {
                 result: ToolResult {
@@ -115,17 +130,38 @@ impl ToolRuntime {
         }
     }
 
-    fn dispatch(&self, request: &ToolRequest, start: Instant) -> Result<ToolOutcome, String> {
+    fn cancelled(&self, request: &ToolRequest, start: Instant, reason: &str) -> ToolOutcome {
+        ToolOutcome {
+            result: ToolResult {
+                request_id: request.request_id.clone(),
+                status: ToolStatus::Cancelled,
+                output: None,
+                error: Some(reason.to_string()),
+                duration_ms: elapsed_ms(start),
+                completed_at: now_iso(),
+            },
+            mutation: None,
+            output_ref: None,
+            diff: None,
+        }
+    }
+
+    fn dispatch(
+        &self,
+        request: &ToolRequest,
+        start: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, String> {
         match request.tool {
             ToolName::ListFiles => self.list_files(request, start),
             ToolName::SearchText => self.search_text(request, start),
             ToolName::ReadFile => self.read_file(request, start),
-            ToolName::CreateFile => self.create_file(request, start),
-            ToolName::ApplyPatch => self.apply_patch(request, start),
-            ToolName::DeleteFile => self.delete_file(request, start),
-            ToolName::RunCommand | ToolName::RunTests => self.run_command(request, start),
-            ToolName::GitStatus => self.git(request, start, &["status", "--porcelain=v1", "--branch"]),
-            ToolName::GitDiff => self.git_diff(request, start),
+            ToolName::CreateFile => self.create_file(request, start, cancel),
+            ToolName::ApplyPatch => self.apply_patch(request, start, cancel),
+            ToolName::DeleteFile => self.delete_file(request, start, cancel),
+            ToolName::RunCommand | ToolName::RunTests => self.run_command(request, start, cancel),
+            ToolName::GitStatus => self.git(request, start, &["status", "--porcelain=v1", "--branch"], cancel),
+            ToolName::GitDiff => self.git_diff(request, start, cancel),
         }
     }
 
@@ -286,7 +322,12 @@ impl ToolRuntime {
 
     // ---- 파일 변경 도구 ----
 
-    fn create_file(&self, request: &ToolRequest, start: Instant) -> Result<ToolOutcome, String> {
+    fn create_file(
+        &self,
+        request: &ToolRequest,
+        start: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, String> {
         let path = require_str_arg(request, "path")?;
         let content = request
             .args
@@ -307,6 +348,11 @@ impl ToolRuntime {
             String::new()
         };
 
+        // mutation 기록 직전 취소 검사. 여기서 걸러야 "취소했는데 파일이 바뀌었다"가 안 생긴다.
+        // 검사와 쓰기 사이의 창은 원자적으로 없앨 수 없으므로(파일 쓰기는 취소 불가) 최소화한다.
+        if cancel.is_cancelled() {
+            return Ok(self.cancelled(request, start, "취소 요청으로 파일 변경을 적용하지 않음"));
+        }
         let pre_image = self.capture_pre_image(request, safe.relative(), existed, &before)?;
 
         if let Some(parent) = safe.absolute().parent() {
@@ -346,7 +392,12 @@ impl ToolRuntime {
         Ok(outcome)
     }
 
-    fn apply_patch(&self, request: &ToolRequest, start: Instant) -> Result<ToolOutcome, String> {
+    fn apply_patch(
+        &self,
+        request: &ToolRequest,
+        start: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, String> {
         let path = require_str_arg(request, "path")?;
         let patch_text = request
             .args
@@ -366,6 +417,11 @@ impl ToolRuntime {
         let after = patch::apply_unified_diff(&before, patch_text)
             .map_err(|e| format!("{}에 patch를 적용할 수 없음: {e}", safe.relative()))?;
 
+        // mutation 기록 직전 취소 검사. 여기서 걸러야 "취소했는데 파일이 바뀌었다"가 안 생긴다.
+        // 검사와 쓰기 사이의 창은 원자적으로 없앨 수 없으므로(파일 쓰기는 취소 불가) 최소화한다.
+        if cancel.is_cancelled() {
+            return Ok(self.cancelled(request, start, "취소 요청으로 파일 변경을 적용하지 않음"));
+        }
         let pre_image = self.capture_pre_image(request, safe.relative(), existed, &before)?;
 
         if let Some(parent) = safe.absolute().parent() {
@@ -409,7 +465,12 @@ impl ToolRuntime {
         Ok(outcome)
     }
 
-    fn delete_file(&self, request: &ToolRequest, start: Instant) -> Result<ToolOutcome, String> {
+    fn delete_file(
+        &self,
+        request: &ToolRequest,
+        start: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, String> {
         let path = require_str_arg(request, "path")?;
         let safe = self.root.resolve_existing(&path).map_err(|e| e.to_string())?;
 
@@ -423,6 +484,9 @@ impl ToolRuntime {
         }
 
         let before = std::fs::read_to_string(safe.absolute()).unwrap_or_default();
+        if cancel.is_cancelled() {
+            return Ok(self.cancelled(request, start, "취소 요청으로 파일 삭제를 수행하지 않음"));
+        }
         let pre_image = self.capture_pre_image(request, safe.relative(), true, &before)?;
         std::fs::remove_file(safe.absolute()).map_err(|e| e.to_string())?;
 
@@ -476,7 +540,12 @@ impl ToolRuntime {
 
     // ---- 명령 실행 ----
 
-    fn run_command(&self, request: &ToolRequest, start: Instant) -> Result<ToolOutcome, String> {
+    fn run_command(
+        &self,
+        request: &ToolRequest,
+        start: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, String> {
         // Policy Gate가 이미 검증했지만 다시 파싱한다 — 같은 args에서 같은 결론이 나와야 하고,
         // 여기서 별도 경로로 argv를 조립하면 "승인된 것과 실행되는 것"이 갈라질 수 있다.
         let cmd = parse_run_command(&request.args)?;
@@ -486,22 +555,33 @@ impl ToolRuntime {
             .map(Duration::from_millis)
             .unwrap_or(self.default_timeout);
 
-        let execution = run_process(&cmd, cwd.absolute(), timeout)?;
+        let execution = run_process(&cmd, cwd.absolute(), timeout, cancel)?;
         self.finish_command(request, start, &cmd, execution)
     }
 
-    fn git(&self, request: &ToolRequest, start: Instant, args: &[&str]) -> Result<ToolOutcome, String> {
+    fn git(
+        &self,
+        request: &ToolRequest,
+        start: Instant,
+        args: &[&str],
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, String> {
         let cmd = RunCommandArgs {
             program: "git".to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: ".".to_string(),
             timeout_ms: None,
         };
-        let execution = run_process(&cmd, self.root.path(), self.default_timeout)?;
+        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel)?;
         self.finish_command(request, start, &cmd, execution)
     }
 
-    fn git_diff(&self, request: &ToolRequest, start: Instant) -> Result<ToolOutcome, String> {
+    fn git_diff(
+        &self,
+        request: &ToolRequest,
+        start: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, String> {
         let mut args = vec!["diff".to_string()];
         if request.args.get("staged").and_then(|v| v.as_bool()).unwrap_or(false) {
             args.push("--staged".to_string());
@@ -521,7 +601,7 @@ impl ToolRuntime {
             cwd: ".".to_string(),
             timeout_ms: None,
         };
-        let execution = run_process(&cmd, self.root.path(), self.default_timeout)?;
+        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel)?;
         self.finish_command(request, start, &cmd, execution)
     }
 
@@ -560,15 +640,30 @@ impl ToolRuntime {
             (None, execution.stdout.clone(), execution.stderr.clone(), false)
         };
 
-        let status = if execution.timed_out {
-            ToolStatus::Timeout
-        } else if execution.exit_code == Some(0) {
-            ToolStatus::Ok
-        } else {
+        // 세 종료 유형을 구별해 보고한다. 취소를 타임아웃으로 보고하면 재시도 정책이
+        // 사용자 의사를 무시하고 명령을 다시 실행한다.
+        let (status, error) = match &execution.termination {
+            Termination::TimedOut => (
+                ToolStatus::Timeout,
+                Some(format!("명령이 {}ms 후 타임아웃됨", execution.duration_ms)),
+            ),
+            Termination::Cancelled {
+                tree_guaranteed,
+                method,
+            } => (
+                ToolStatus::Cancelled,
+                Some(if *tree_guaranteed {
+                    format!("사용자 취소로 중단됨 (프로세스 트리 종료: {method})")
+                } else {
+                    // 보장하지 못한다는 사실을 감추지 않는다 — 사용자가 남은 프로세스를
+                    // 직접 확인해야 할 수도 있다.
+                    format!("사용자 취소로 중단됨 (프로세스 종료: {method} — 하위 프로세스 종료를 보장하지 못함)")
+                }),
+            ),
             // 0이 아닌 종료 코드는 "도구 실행 실패"가 아니라 "명령이 실패했다"는 사실이다.
             // 검증 러너가 이 구분을 필요로 하므로 status는 Ok로 두고 exitCode를 그대로 전달한다.
-            // 다만 실행 자체가 안 된 경우(spawn 실패)는 dispatch에서 Err로 처리된다.
-            ToolStatus::Ok
+            // 실행 자체가 안 된 경우(spawn 실패)는 dispatch에서 Err로 처리된다.
+            Termination::Exited => (ToolStatus::Ok, None),
         };
 
         let output = json!({
@@ -576,7 +671,14 @@ impl ToolRuntime {
             "exitCode": execution.exit_code,
             "stdout": stdout_preview,
             "stderr": stderr_preview,
-            "timedOut": execution.timed_out,
+            "timedOut": matches!(execution.termination, Termination::TimedOut),
+            "cancelled": matches!(execution.termination, Termination::Cancelled { .. }),
+            "treeKill": match &execution.termination {
+                Termination::Cancelled { tree_guaranteed, method } => {
+                    json!({ "guaranteed": tree_guaranteed, "method": method })
+                }
+                _ => serde_json::Value::Null,
+            },
             "outputTruncated": output_truncated,
             "outputRef": output_ref,
             "durationMs": execution.duration_ms,
@@ -587,11 +689,7 @@ impl ToolRuntime {
                 request_id: request.request_id.clone(),
                 status,
                 output: Some(output),
-                error: if execution.timed_out {
-                    Some(format!("명령이 {}ms 후 타임아웃됨", execution.duration_ms))
-                } else {
-                    None
-                },
+                error,
                 duration_ms: elapsed_ms(start),
                 completed_at: now_iso(),
             },
@@ -677,11 +775,25 @@ impl ToolRuntime {
     }
 }
 
+/// 프로세스가 어떻게 끝났는가. 세 경우를 구별하는 것이 이 타입의 목적이다 —
+/// `bool timed_out` 하나로는 취소를 표현할 수 없고, 취소를 타임아웃으로 보고하면
+/// 재시도 정책이 사용자 의사를 무시하게 된다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Termination {
+    /// 스스로 종료했다 (exit code가 0이 아니어도 여기에 해당한다).
+    Exited,
+    TimedOut,
+    Cancelled {
+        tree_guaranteed: bool,
+        method: &'static str,
+    },
+}
+
 struct Execution {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
-    timed_out: bool,
+    termination: Termination,
     duration_ms: u64,
 }
 
@@ -689,10 +801,30 @@ struct Execution {
 ///
 /// `Command`에 program/args를 그대로 넘긴다 — 셸을 경유하지 않으므로 인자 안의 공백이나
 /// 메타문자가 재해석되지 않는다. 이게 승인 모달의 표시가 실제 실행과 일치한다는 보장의 실체다.
-fn run_process(cmd: &RunCommandArgs, cwd: &Path, timeout: Duration) -> Result<Execution, String> {
+fn run_process(
+    cmd: &RunCommandArgs,
+    cwd: &Path,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Execution, String> {
     let start = Instant::now();
 
-    let mut child = Command::new(&cmd.program)
+    // 실행 직전 취소 검사 — spawn과 검사 사이의 창을 최소화한다.
+    if cancel.is_cancelled() {
+        return Ok(Execution {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            termination: Termination::Cancelled {
+                tree_guaranteed: true, // 아예 시작하지 않았으므로 남은 프로세스가 없다
+                method: "not-started",
+            },
+            duration_ms: 0,
+        });
+    }
+
+    let mut command = Command::new(&cmd.program);
+    command
         .args(&cmd.args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -713,7 +845,10 @@ fn run_process(cmd: &RunCommandArgs, cwd: &Path, timeout: Duration) -> Result<Ex
         // 종류의 버그다. `NODE_OPTIONS`도 같은 이유로 제거한다(로더/힙 설정이 결과를 바꿀 수 있음).
         .env_remove("NODE_TEST_CONTEXT")
         .env_remove("NODE_OPTIONS")
-        .env_remove("NODE_V8_COVERAGE")
+        .env_remove("NODE_V8_COVERAGE");
+    // 취소 시 손자 프로세스까지 죽이려면 spawn 전에 그룹을 설정해야 한다 (proctree.rs).
+    proctree::configure_group(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("{}를 실행할 수 없음: {e}", cmd.program))?;
 
@@ -739,15 +874,24 @@ fn run_process(cmd: &RunCommandArgs, cwd: &Path, timeout: Duration) -> Result<Ex
         let _ = tx_err.send(buf);
     });
 
-    let mut timed_out = false;
+    // 타임아웃과 취소를 **동시에** 감시한다. 폴링 간격이 곧 취소 응답 지연이므로 짧게 유지한다.
+    let mut termination = Termination::Exited;
     let exit_status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
+                if cancel.is_cancelled() {
+                    let outcome = proctree::terminate_tree(&mut child);
+                    termination = Termination::Cancelled {
+                        tree_guaranteed: outcome.tree_guaranteed,
+                        method: outcome.method,
+                    };
+                    break None;
+                }
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
+                    // 타임아웃도 트리 종료를 쓴다 — npm이 타임아웃됐는데 node가 남는 것도 같은 문제다.
+                    let _ = proctree::terminate_tree(&mut child);
+                    termination = Termination::TimedOut;
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -756,16 +900,33 @@ fn run_process(cmd: &RunCommandArgs, cwd: &Path, timeout: Duration) -> Result<Ex
         }
     };
 
-    let stdout = rx_out.recv().unwrap_or_default();
-    let stderr = rx_err.recv().unwrap_or_default();
-    let _ = out_handle.join();
-    let _ = err_handle.join();
+    // 출력 수집으로 무기한 대기하지 않는다.
+    //
+    // 왜 상한이 필요한가: 손자 프로세스가 파이프를 물고 살아 있으면 `read_to_end`가 EOF를 보지
+    // 못한다. Windows처럼 트리 종료를 보장하지 못하는 플랫폼에서 이게 실제로 발생하며,
+    // 그러면 "취소했는데 UI가 멈춘다"가 된다. 부분 출력을 잃는 편이 낫다.
+    let collect_timeout = if matches!(termination, Termination::Exited) {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_millis(500)
+    };
+    let stdout = rx_out.recv_timeout(collect_timeout).unwrap_or_default();
+    let stderr = rx_err.recv_timeout(collect_timeout).unwrap_or_default();
+    // 스레드가 아직 파이프에 매달려 있어도 join으로 기다리지 않는다 — 그게 무기한 대기의 원인이다.
+    // 프로세스 종료 시 파이프가 닫히면 스레드는 스스로 끝난다.
+    if matches!(termination, Termination::Exited) {
+        let _ = out_handle.join();
+        let _ = err_handle.join();
+    } else {
+        drop(out_handle);
+        drop(err_handle);
+    }
 
     Ok(Execution {
         exit_code: exit_status.and_then(|s| s.code()),
         stdout: String::from_utf8_lossy(&stdout).to_string(),
         stderr: String::from_utf8_lossy(&stderr).to_string(),
-        timed_out,
+        termination,
         duration_ms: elapsed_ms(start),
     })
 }
@@ -900,17 +1061,215 @@ mod tests {
         fn run(&self, request: &ToolRequest) -> ToolOutcome {
             let decision = self.gate.evaluate(request, self.runtime.root(), &self.policy);
             let approved = decision.requires_user_approval;
-            self.runtime.execute(request, &decision, approved)
+            self.runtime
+                .execute(request, &decision, approved, &CancellationToken::new())
         }
 
         fn run_unapproved(&self, request: &ToolRequest) -> ToolOutcome {
             let decision = self.gate.evaluate(request, self.runtime.root(), &self.policy);
-            self.runtime.execute(request, &decision, false)
+            self.runtime
+                .execute(request, &decision, false, &CancellationToken::new())
         }
 
         fn read(&self, rel: &str) -> String {
             std::fs::read_to_string(self.root_path.join(rel)).unwrap()
         }
+    }
+
+    /// 취소 토큰을 명시적으로 넘겨 실행한다 (취소 경로 테스트 전용 헬퍼).
+    impl Harness {
+        fn run_with_cancel(&self, request: &ToolRequest, cancel: &CancellationToken) -> ToolOutcome {
+            let decision = self.gate.evaluate(request, self.runtime.root(), &self.policy);
+            let approved = decision.requires_user_approval;
+            self.runtime.execute(request, &decision, approved, cancel)
+        }
+    }
+
+    #[test]
+    fn run_command_is_cancelled_mid_execution() {
+        let h = harness();
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+
+        // 60초짜리 명령을 시작하고 300ms 뒤에 취소한다.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            token.cancel();
+        });
+
+        let started = Instant::now();
+        let out = h.run_with_cancel(
+            &req(
+                ToolName::RunCommand,
+                json!({ "program": "node", "args": ["-e", "setTimeout(() => {}, 60000)"], "cwd": "." }),
+            ),
+            &cancel,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(out.result.status, ToolStatus::Cancelled);
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "취소가 실제로 프로세스를 끊지 못했습니다 ({elapsed:?})"
+        );
+        let output = out.result.output.unwrap();
+        assert_eq!(output["cancelled"].as_bool().unwrap(), true);
+        assert_eq!(output["timedOut"].as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn cancellation_and_timeout_are_distinguished() {
+        let h = harness();
+
+        // 타임아웃
+        let timed_out = h.run_with_cancel(
+            &req(
+                ToolName::RunCommand,
+                json!({ "program": "node", "args": ["-e", "setTimeout(() => {}, 60000)"], "cwd": ".", "timeoutMs": 300 }),
+            ),
+            &CancellationToken::new(),
+        );
+        assert_eq!(timed_out.result.status, ToolStatus::Timeout);
+        assert!(timed_out.result.error.unwrap().contains("타임아웃"));
+
+        // 취소
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let cancelled = h.run_with_cancel(
+            &req(
+                ToolName::RunCommand,
+                json!({ "program": "node", "args": ["-e", "setTimeout(() => {}, 60000)"], "cwd": "." }),
+            ),
+            &cancel,
+        );
+        assert_eq!(cancelled.result.status, ToolStatus::Cancelled);
+        assert!(cancelled.result.error.unwrap().contains("취소"));
+    }
+
+    #[test]
+    fn cancellation_kills_the_process_tree_not_just_the_direct_child() {
+        // npm처럼 자식을 다시 spawn하는 명령을 흉내낸다.
+        let h = harness();
+        let pid_file = h.root_path.join("grandchild.pid");
+        let script = format!(
+            r#"
+            const {{ spawn }} = require("node:child_process");
+            const fs = require("node:fs");
+            const child = spawn(process.execPath, ["-e", "setInterval(() => {{}}, 1000)"], {{ stdio: "ignore" }});
+            fs.writeFileSync({pid:?}, String(child.pid));
+            setInterval(() => {{}}, 1000);
+            "#,
+            pid = pid_file.to_string_lossy()
+        );
+
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let watch_file = pid_file.clone();
+        std::thread::spawn(move || {
+            // 손자가 뜰 때까지 기다렸다가 취소한다.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                if watch_file.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            token.cancel();
+        });
+
+        let out = h.run_with_cancel(
+            &req(
+                ToolName::RunCommand,
+                json!({ "program": "node", "args": ["-e", script], "cwd": "." }),
+            ),
+            &cancel,
+        );
+        assert_eq!(out.result.status, ToolStatus::Cancelled);
+
+        let grandchild: u32 = std::fs::read_to_string(&pid_file)
+            .expect("손자 pid 파일이 없습니다")
+            .trim()
+            .parse()
+            .unwrap();
+
+        let output = out.result.output.unwrap();
+        if output["treeKill"]["guaranteed"].as_bool().unwrap_or(false) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while crate::proctree::is_alive(grandchild) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !crate::proctree::is_alive(grandchild),
+                "취소했는데 손자 프로세스가 살아 있습니다"
+            );
+        } else {
+            // 보장하지 않는다고 선언한 플랫폼에서는 단정하지 않되, 그 사실이 결과에 드러나야 한다.
+            assert!(out.result.error.unwrap().contains("보장하지 못함"));
+        }
+    }
+
+    #[test]
+    fn cancelled_command_does_not_hang_collecting_output() {
+        // 손자가 파이프를 물고 있으면 read_to_end가 EOF를 못 본다. 그래도 반환은 빨라야 한다.
+        let h = harness();
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            token.cancel();
+        });
+
+        let started = Instant::now();
+        let out = h.run_with_cancel(
+            &req(
+                ToolName::RunCommand,
+                json!({
+                    "program": "node",
+                    "args": ["-e", "const {spawn} = require('node:child_process'); spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {stdio: 'inherit'}); setInterval(()=>{},1000);"],
+                    "cwd": "."
+                }),
+            ),
+            &cancel,
+        );
+        assert_eq!(out.result.status, ToolStatus::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "출력 수집에서 무기한 대기했습니다 ({:?})",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn file_tools_do_not_mutate_after_cancellation() {
+        let h = harness();
+        let before = h.read("src/app.ts");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let out = h.run_with_cancel(
+            &req(
+                ToolName::ApplyPatch,
+                json!({ "path": "src/app.ts", "patch": "@@ -1,1 +1,1 @@\n-line one\n+CHANGED\n" }),
+            ),
+            &cancel,
+        );
+        assert_eq!(out.result.status, ToolStatus::Cancelled);
+        assert!(out.mutation.is_none(), "취소됐는데 mutation이 기록되었습니다");
+        assert_eq!(h.read("src/app.ts"), before, "취소됐는데 파일이 변경되었습니다");
+    }
+
+    #[test]
+    fn delete_is_not_performed_after_cancellation() {
+        let h = harness();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let out = h.run_with_cancel(&req(ToolName::DeleteFile, json!({ "path": "src/app.ts" })), &cancel);
+        assert_eq!(out.result.status, ToolStatus::Cancelled);
+        assert!(
+            h.root_path.join("src/app.ts").exists(),
+            "취소됐는데 파일이 삭제되었습니다"
+        );
     }
 
     #[test]

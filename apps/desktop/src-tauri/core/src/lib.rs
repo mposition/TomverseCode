@@ -13,9 +13,11 @@
 //! `tauri`에 의존하지 않으므로 GUI 시스템 라이브러리 없이 `cargo test`가 돌아간다.
 
 pub mod artifacts;
+pub mod cancel;
 pub mod host;
 pub mod paths;
 pub mod policy;
+pub mod proctree;
 pub mod sidecar;
 pub mod store;
 pub mod time;
@@ -24,6 +26,7 @@ pub mod types;
 pub mod verify;
 
 pub use artifacts::ArtifactStore;
+pub use cancel::{CancelOutcome, CancellationRegistry, CancellationToken};
 pub use host::{ApprovalGateway, ApprovalOutcome, AutoApprove, EventSink, TaskHost};
 pub use paths::{PathViolation, SafePath, WorkspaceRoot};
 pub use policy::PolicyGate;

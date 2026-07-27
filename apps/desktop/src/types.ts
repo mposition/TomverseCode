@@ -22,13 +22,17 @@ export type TaskPhase =
   | "EXECUTING"
   | "VERIFYING"
   | "FIX_LOOP"
+  | "CANCELLING"
   | "COMPLETED"
   | "FAILED"
   | "CANCELLED"
+  | "INTERRUPTED"
   | "REJECTED";
 
+export const TERMINAL_PHASES: TaskPhase[] = ["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "REJECTED"];
+
 /** ui-wireframes.md 2절 — 내부 14 phase를 사용자에게 보이는 단계로 압축한다. */
-export type UserStage = "준비 중" | "분석" | "검수" | "확인 필요" | "승인 대기" | "실행" | "검증" | "완료";
+export type UserStage = "준비 중" | "분석" | "검수" | "확인 필요" | "승인 대기" | "실행" | "검증" | "취소 중" | "완료";
 
 export const STAGE_ORDER: UserStage[] = ["준비 중", "분석", "검수", "승인 대기", "실행", "검증", "완료"];
 
@@ -53,6 +57,10 @@ export function phaseToStage(phase: TaskPhase): UserStage {
     case "VERIFYING":
     case "FIX_LOOP":
       return "검증";
+    // 취소는 즉시 끝나지 않는다 — 자식 프로세스 종료를 기다리는 구간이 실제로 존재한다.
+    // "완료"로 접어버리면 아직 프로세스가 살아 있는 동안 끝난 것처럼 보인다.
+    case "CANCELLING":
+      return "취소 중";
     default:
       return "완료";
   }
@@ -105,6 +113,33 @@ export interface VerificationReport {
   newlyFailing?: string[];
   preexistingFailures?: string[];
   overall: "pass" | "fail" | "not_verified";
+}
+
+/** `list_tasks` / `get_task`가 돌려주는 저장된 작업 한 줄. Rust `TaskRow`의 미러. */
+export interface TaskRow {
+  taskId: string;
+  sessionId: string;
+  workspaceId: string;
+  workspacePath: string | null;
+  mode: string | null;
+  userMessage: string;
+  currentPhase: TaskPhase;
+  terminalStatus: string | null;
+  errorSummary: string | null;
+  cancellationRequestedAt: string | null;
+  mutationCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 저장된 이벤트 — 실시간 `TaskEvent`와 달리 `taskId`가 없다(이미 아는 작업의 것이므로). */
+export interface StoredEvent {
+  eventId: number;
+  seq: number;
+  type: string;
+  phase: string | null;
+  payload: Record<string, unknown>;
+  createdAt: string;
 }
 
 export interface FinalResult {

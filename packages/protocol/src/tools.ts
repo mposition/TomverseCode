@@ -42,7 +42,12 @@ export interface ExecutionPlan {
 
 export interface ToolResult {
   requestId: string;
-  status: "ok" | "error" | "denied" | "timeout";
+  /**
+   * `cancelled`는 M0.1에서 추가됐다. `timeout`/`denied`와 **반드시 구별해야 한다** —
+   * 타임아웃은 재시도 대상이고, denied는 정책 판단이며, cancelled는 사용자의 의사다.
+   * 셋을 뭉치면 재시도 정책이 사용자가 멈춘 작업을 다시 실행한다.
+   */
+  status: "ok" | "error" | "denied" | "timeout" | "cancelled";
   output?: unknown;
   error?: string;
   durationMs: number;

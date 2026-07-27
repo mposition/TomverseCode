@@ -11,7 +11,7 @@
  * 의존성을 늘리는 대신 명시적인 작은 함수로 둔다.
  */
 
-import type { Verdict } from "./common.js";
+import type { ReviewMode, Verdict } from "./common.js";
 import type { DraftProposal, PlanStep, ReviewDecision, SingleModelFixResult } from "./proposal.js";
 import type { RunCommandArgs } from "./tools.js";
 
@@ -134,15 +134,23 @@ export function validateDraftProposal(
   };
 }
 
+/**
+ * `reviewMode`는 **호출자가 준다 — 모델이 주지 않는다.**
+ *
+ * "어떤 정보를 보고 판정했는가"는 우리가 프롬프트를 어떻게 구성했는지에 대한 사실이다.
+ * 모델의 응답에서 읽으면 모델이 "blind로 봤다"고 주장할 수 있게 되고, 그러면 blind/informed
+ * 불일치율 지표(product-strategy.md 14절)가 근거를 잃는다. 그래서 ctx의 필수 필드다.
+ */
 export function validateReviewDecision(
   raw: unknown,
-  ctx: { taskId: string; proposalId: string; model: string; createdAt: string }
+  ctx: { taskId: string; proposalId: string; model: string; createdAt: string; reviewMode: ReviewMode }
 ): ReviewDecision {
   const o = requireObject(raw, "reviewDecision");
   const verdict = requireEnum(o.verdict, VERDICTS, "reviewDecision.verdict");
   const decision: ReviewDecision = {
     taskId: ctx.taskId,
     proposalId: ctx.proposalId,
+    reviewMode: ctx.reviewMode,
     verdict,
     rationale: requireNonEmptyString(o.rationale, "reviewDecision.rationale"),
     revisedPlan: o.revisedPlan === undefined || o.revisedPlan === null

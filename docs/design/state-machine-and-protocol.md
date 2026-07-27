@@ -51,19 +51,27 @@ stateDiagram-v2
     FIX_LOOP --> PLANNING: fixLoopRounds <= max
     FIX_LOOP --> FAILED: fixLoopRounds > max
 
-    CREATED --> CANCELLED
-    TRIAGE --> CANCELLED
-    DRAFTING --> CANCELLED
-    SINGLE_MODEL_FIX --> CANCELLED
-    REVIEWING --> CANCELLED
-    PLANNING --> CANCELLED
-    EXECUTING --> CANCELLED
+    CREATED --> CANCELLING
+    TRIAGE --> CANCELLING
+    DRAFTING --> CANCELLING
+    SINGLE_MODEL_FIX --> CANCELLING
+    REVIEWING --> CANCELLING
+    PLANNING --> CANCELLING
+    EXECUTING --> CANCELLING
+    VERIFYING --> CANCELLING
+
+    CANCELLING --> CANCELLED
+    CANCELLING --> FAILED
 
     COMPLETED --> [*]
     FAILED --> [*]
     CANCELLED --> [*]
     REJECTED --> [*]
+    INTERRUPTED --> [*]
 ```
+
+`CANCELLING`(비터미널)과 `INTERRUPTED`(터미널)는 M0.1에서 추가됐다 — 16절 참조. 취소는 순간이 아니라
+자식 프로세스가 죽기를 기다리는 **구간**이고, 앱이 비정상 종료된 작업은 완료도 실패도 취소도 아니다.
 
 `TRIAGE`/`SINGLE_MODEL_FIX`는 13절(Phase 0 스파이크 결과 반영)에서 추가된 상태다 — 원래 설계에는 없었고, 스파이크가 "쉬운 태스크에서는 교차검증이 정확도 이득 없이 비용/지연만 늘린다"는 걸 실측으로 보여준 뒤 반영되었다. `SINGLE_MODEL_FIX`의 verdict 처리(REJECT/NEED_USER_INPUT 분기, tier 승격 규칙)는 14.1절에서 마무리했다.
 
@@ -83,7 +91,9 @@ stateDiagram-v2
 | `EXECUTING` | Tool Runtime | 승인 완료 | 각 ToolRequest 순차 실행, 전부 완료 시 VERIFYING |
 | `VERIFYING` | Verify 서브시스템 | ExecutionPlan 적용 완료 | build/test/lint/diff 결과 종합 |
 | `FIX_LOOP` | Claude Provider | VerificationReport.overall = fail | VerificationReport를 Claude에 다시 전달, 수정된 결과 요청 (원래 tier와 무관하게 항상 Claude 단독 호출이므로 tier 재분류 불필요) |
+| `CANCELLING` | Orchestrator + Rust | 취소 요청 접수 | 자식 프로세스 트리 종료·남은 단계 건너뛰기 완료 → CANCELLED (정리 중 오류면 FAILED) |
 | `COMPLETED` / `FAILED` / `CANCELLED` / `REJECTED` | - | 터미널 상태 | FinalResult 생성, UI에 전달 |
+| `INTERRUPTED` | Rust (앱 시작 시) | 앱 재시작 시 `final_status IS NULL`로 발견됨 | 터미널. 자동 재개하지 않고 사용자에게 되돌리기/다시 실행 선택을 준다 (16.1절) |
 
 ### 2.2 루프 상한 (기본값, 설정 가능해야 함)
 
@@ -616,8 +626,9 @@ interface FileMutationRecord {
 - ~~`SINGLE_MODEL_FIX`가 모호성을 감지했을 때 어떻게 할지~~ → 14.1절에서 `SingleModelFixResult` verdict로 해결
 - ~~UI 와이어프레임 (단계 표시, diff 미리보기, 승인 모달)~~ → [ui-wireframes.md](./ui-wireframes.md), M0에서 구현됨
 - 13.2절 TRIAGE 규칙의 실제 임계값(파일 개수, 키워드 목록) — 스파이크의 5개 초소형 태스크만으로는 튜닝 근거가 부족함. "어려운" 태스크 세트로 스파이크를 재실행해 규칙을 검증/조정 필요. **M0 구현에서 이 항목이 더 시급해졌다 — 15.3절 참조.**
-- 앱 재시작 후 진행 중이던 태스크의 복구 UX — 7절 절차와 `unfinished_tasks()` 조회는 구현됐지만, 사용자에게 "중단된 작업이 있고 되돌릴 수 있다"를 보여주는 화면이 없다
-- **프로세스 샌드박싱** (5.3절) — `run_command`가 실행한 프로세스의 파일·네트워크 접근 제한. Windows job object / 컨테이너 중 무엇을 쓸지, 그리고 그게 개발 도구(테스트 러너가 캐시 디렉터리를 쓰는 등)와 어디서 충돌하는지 조사 필요. 이게 없는 동안은 5.3절의 한계를 UI에도 정직하게 표시해야 한다
+- ~~앱 재시작 후 진행 중이던 태스크의 복구 UX~~ → M0.1에서 `INTERRUPTED` 터미널 + 최근 작업 목록 + 되돌리기/다시 실행 버튼으로 해결(16.1, 16.6절)
+- **프로세스 샌드박싱** (5.3절) — `run_command`가 실행한 프로세스의 파일·네트워크 접근 제한. Windows job object / 컨테이너 중 무엇을 쓸지, 그리고 그게 개발 도구(테스트 러너가 캐시 디렉터리를 쓰는 등)와 어디서 충돌하는지 조사 필요. 이게 없는 동안은 5.3절의 한계를 UI에도 정직하게 표시해야 한다. **M0.1에서 Windows Job Object가 이 항목과 합류했다 — 16.3절의 `taskkill /T` 한계도 같은 해법으로 닫힌다.**
+- 취소 중 UI가 "정리 중"에서 얼마나 기다려야 하는지에 대한 상한 — 현재는 자식이 SIGKILL에 반응할 때까지 기다린다. 응답 없는 프로세스에 대한 사용자 탈출구(강제 포기)가 없다
 - Git commit 자동 생성의 오케스트레이터 통합 — Policy Gate(항상 승인)와 도구는 있으나 `ExecutionPlan`에 commit 단계를 넣는 로직이 없다
 
 ## 15. M0 구현에서 드러난 설계 보완
@@ -662,6 +673,111 @@ patch 파싱 실패는 모델 의견이 아니라 결정론적 사실이다. 3�
 `NODE_V8_COVERAGE`)를 제거한다. 공급자 API 키를 제거하는 것과 같은 자리에서 같은 이유로 처리한다 —
 **결정론적 검증은 실행 환경을 통제해야 성립한다.** 다른 생태계(pytest의 `PYTEST_CURRENT_TEST`,
 .NET의 `DOTNET_*`)에도 유사한 변수가 있으므로 언어 지원을 넓힐 때 함께 확인해야 한다.
+
+## 16. M0.1 — 작업 영속화와 실제 취소
+
+M0의 취소는 "요청을 받아 두었다가 다음 단계에서 확인"하는 협조적 취소였고, 실행 중인 `npm test`는
+끝까지 돌았다. 저장도 이벤트 로그만 있고 작업 목록·복구 경로가 없었다. M0.1은 이 둘을 채운다.
+
+### 16.1 `CANCELLING`과 `INTERRUPTED` — 터미널을 늘린 이유
+
+취소는 순간이 아니라 **구간**이다. 사용자가 버튼을 누른 시각과 자식 프로세스가 실제로 죽는 시각
+사이에 실행 중인 명령이 있다. 그 구간을 `CANCELLED`로 표시하면 아직 프로세스가 살아 있는 동안
+"취소됨"이라고 말하게 되고, 이전 phase로 표시하면 취소 요청이 접수됐다는 사실이 보이지 않는다.
+그래서 비터미널 phase `CANCELLING`을 두고, 취소 가능한 모든 phase에서 여기로 들어온다.
+
+`INTERRUPTED`는 **앱이 비정상 종료된 작업**의 터미널이다. 완료도 실패도 취소도 아니다 —
+사용자가 *되돌릴지 다시 실행할지 결정해야 하는* 상태이며, 다른 터미널로 뭉뚱그리면 그 구별이 사라진다.
+Node는 이 상태로 전이하지 않는다(`INTERRUPTED: []`). 앱 시작 시 Rust가 DB를 보고 확정하는 상태이기 때문이다.
+
+```mermaid
+stateDiagram-v2
+    CANCELLING --> CANCELLED: 정리 완료
+    CANCELLING --> FAILED: 정리 중 오류
+    [*] --> INTERRUPTED: 앱 재시작 시 final_status IS NULL인 작업
+    INTERRUPTED --> [*]: 사용자가 되돌리기 / 다시 실행 선택
+```
+
+**자동 재개하지 않는다.** 부분 실행된 `ToolRequest`의 재개는 멱등성 보장이 없으면 위험하다
+(patch가 반쯤 적용된 파일에 같은 patch를 다시 적용하면 실패하거나, 더 나쁘게는 이중 적용된다).
+"다시 실행"은 **새 `task_id`로 같은 요청 문구를 처음부터** 돌리는 것이지 중단 지점 이어가기가 아니다.
+
+### 16.2 취소가 전파되는 경로
+
+취소는 **양쪽 모두** 필요하다. 한쪽만 하면 절반만 취소된다.
+
+| 방향 | 담당 | 끊는 것 | 안 하면 |
+|---|---|---|---|
+| Rust | `CancellationRegistry` → `CancellationToken` | 실행 중인 자식 **프로세스 트리**, 이후 도구 실행, 이후 검증 시작 | 이미 시작된 `npm test`가 끝까지 돈다 |
+| Node | `AbortController` → `AbortSignal` | 진행 중인 공급자 HTTP 호출 | 모델 호출이 계속 돌아 비용이 발생한다 |
+
+순서는 **Rust 먼저**다. 토큰이 켜져야 진행 중인 프로세스가 죽고 새 도구가 시작되지 않는다.
+
+`CancellationToken::cancel()`은 `compare_exchange`로 **정확히 한 호출자에게만** `true`를 준다.
+취소 버튼 연타나 Rust/Node 양쪽 도착이 `CANCELLATION_REQUESTED` 이벤트를 두 번 남기지 않게 하는 장치다.
+터미널 여부는 메모리 토큰이 아니라 **DB에서 읽는다** — SQLite가 진실의 원천이므로,
+둘이 어긋나면 DB를 믿는다.
+
+**취소는 Policy Gate를 우회하는 통로가 아니다.** 취소된 태스크의 도구 요청은 `cancelled` 상태로
+거부되고 `TOOL_SKIPPED_CANCELLED` 이벤트가 남는다(`denied`와 구별해야 오케스트레이터가 정책 거부와
+헷갈리지 않는다). 롤백만은 예외적으로 **새 토큰**으로 실행한다 — 취소·중단된 작업이야말로 되돌리기가
+가장 필요한 순간이기 때문이다. 다만 롤백도 Policy Gate는 그대로 지나므로 workspace 경계 보장은 유지된다.
+
+### 16.3 프로세스 트리 종료와 그 한계
+
+직접 자식만 죽이는 것으로는 부족하다. `npm test`는 `node`를 자식으로 띄우므로 npm만 죽으면
+실제 테스트 프로세스가 고아로 살아남는다. 따라서:
+
+- **Unix**: `process_group(0)`으로 자식을 프로세스 그룹 리더로 만들고 `killpg(SIGTERM)` → 300ms 유예 → `killpg(SIGKILL)`
+- **Windows**: `CREATE_NEW_PROCESS_GROUP` + `taskkill /T /F`
+
+**정직하게 남겨두는 한계** (5.3절 "이 allowlist가 보장하지 않는 것"의 연장):
+
+- Windows의 `taskkill /T`는 **스냅샷 기반**이다. 이미 고아가 된 손자나 종료 직전에 새로 spawn된
+  프로세스는 놓칠 수 있다. Job Object가 정답이지만 `windows`/`winapi` 크레이트와 unsafe 핸들 관리가
+  필요해 M0.1에서는 미뤘다.
+- **spawn된 프로세스는 스스로 추가 프로세스를 만들거나 파일을 바꿀 수 있다.** 취소는 프로세스를
+  죽일 뿐 그때까지의 파일 변경을 되돌리지 않는다. 되돌리기는 별도의 명시적 동작이다.
+- 취소 시점에 이미 디스크에 쓰인 변경은 남는다. UI는 이걸 숨기지 않고 "이미 변경된 파일은 자동으로
+  되돌아가지 않습니다"라고 표시한다.
+
+### 16.4 스키마 v2 — 추가만 하는 마이그레이션
+
+`SCHEMA_VERSION = 2`. v2 DDL은 **전부 추가 연산**이다(`ALTER TABLE ADD COLUMN` / `CREATE TABLE` /
+`CREATE VIEW`). 기존 v1 이벤트 로그를 재작성하지 않는다 — `task_events`가 append-only 진실의 원천이라는
+원칙(CLAUDE.md 7)은 스키마 업그레이드에서도 깨지면 안 된다.
+
+| 대상 | 추가 | 이유 |
+|---|---|---|
+| `tasks` | `workspace_path`, `mode`, `error_summary`, `cancellation_requested_at` | 워크스페이스별 목록 필터와 "왜 실패했나"를 이벤트 파싱 없이 |
+| `task_events` | `phase` | 로그만으로 흐름을 재구성하려면 각 이벤트가 어느 단계 것인지 필요 |
+| `tool_requests` | `approval_status`, `execution_status`, `started_at` | 승인/실행 상태 추적 |
+| (뷰) `tool_executions` | `tool_requests` ⋈ `tool_results` | **테이블이 아니라 뷰다.** 별도 테이블이면 같은 사실이 두 곳에 저장되어 어긋날 수 있다. 뷰는 정의상 어긋나지 않는다 |
+| `file_mutations` | `mutation_id`, `rollback_status`, `rolled_back_at` | 무엇이 아직 남아 있고 무엇이 되돌려졌는지 |
+| (신규) `verification_checks` | 체크별 행 | "test가 몇 번 실패했나"를 JSON 파싱 없이 질의 |
+
+### 16.5 트랜잭션 규칙
+
+**레코드와 그 이벤트는 같은 트랜잭션에 쓴다.** 이벤트 없이 상태가 바뀌거나, 상태 없이 이벤트만
+남는 중간 상태를 만들지 않기 위해서다. `record_tool_result_with_event` / `record_file_mutation_with_event` /
+`record_verification_with_event` / `finish_task`가 그 형태다.
+
+터미널 상태는 `UPDATE tasks SET final_status = ? WHERE task_id = ? AND final_status IS NULL`로 확정한다.
+영향받은 행이 0이면 경쟁에서 진 것이고, **아무것도 바꾸지 않는다.** 완료와 취소가 동시에 도착해도
+터미널 이벤트는 정확히 하나만 남는다.
+
+한 가지 함정을 기록해 둔다: 이 `record_*_with_event` 계열은 한 트랜잭션에 쓰기 위해 `append_event`를
+거치지 않는다. 그러면 **UI 릴레이(sink)가 빠져서 DB에는 남는데 화면에는 안 보이는** 누락이 생긴다.
+커밋 후 명시적으로 릴레이해야 하며, `combined_writes_are_relayed_to_the_ui_not_only_to_the_database`
+테스트가 이걸 못박는다.
+
+### 16.6 복구 절차
+
+앱 시작 시 `mark_unfinished_as_interrupted()`가 `final_status IS NULL`인 작업을 전부 `INTERRUPTED`로
+확정한다. 멱등이다 — 두 번 돌려도 두 번째는 아무것도 바꾸지 않는다.
+
+이 시점을 지나야 "실행 중"으로 보이는 유령 작업이 사라진다. 실패해도 앱을 죽이지 않는다:
+이력을 못 봐도 새 작업은 할 수 있어야 하므로, UI에 사유를 표시하고 계속 진행한다.
 
 ## 13. Phase 0 스파이크 결과 반영
 

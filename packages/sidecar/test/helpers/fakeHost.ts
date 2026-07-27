@@ -22,7 +22,11 @@ export interface FakeHostOptions {
   /** verify.run 응답을 순서대로 소비한다. 첫 호출은 baseline이다. */
   verifyResults?: VerifyStub[];
   /** tool.execute 응답 override (requestId 순서대로) */
-  toolResults?: { status: "ok" | "error" | "denied" | "timeout"; error?: string; policyDecision?: string }[];
+  toolResults?: {
+    status: "ok" | "error" | "denied" | "timeout" | "cancelled";
+    error?: string;
+    policyDecision?: string;
+  }[];
 }
 
 export interface VerifyStub {

@@ -89,11 +89,31 @@ export const ESCAPE_PATCH = [
   "",
 ].join("\n");
 
-export function createFixtureRepo(options: { withPassingTest?: boolean } = {}): FixtureRepo {
+/**
+ * 오래 도는 테스트 스크립트 — 취소 시나리오(A)용.
+ *
+ * **자기 PID를 파일에 쓴다.** 이게 핵심이다: `npm test`는 `node`를 자식으로 띄우므로
+ * 직접 자식만 죽이면 이 프로세스가 살아남는다. 취소 후 이 PID가 실제로 죽었는지 확인해야
+ * "프로세스 트리를 죽였다"는 주장이 검증된다 (proctree.rs).
+ */
+const SLOW_TEST_SOURCE = `const fs = require("node:fs");
+const path = require("node:path");
+
+fs.writeFileSync(path.join(__dirname, "slow-test.pid"), String(process.pid));
+// 취소가 없으면 테스트 타임아웃까지 버틴다 — 취소가 실제로 끊었는지 시간으로도 드러난다.
+setTimeout(() => {
+  console.log("slow test finished without being cancelled");
+}, 60_000);
+`;
+
+export function createFixtureRepo(
+  options: { withPassingTest?: boolean; slowTest?: boolean } = {}
+): FixtureRepo {
   const root = mkdtempSync(path.join(tmpdir(), "tomverse-fixture-"));
 
   writeFileSync(path.join(root, "paginate.js"), options.withPassingTest ? FIXED_SOURCE : BUGGY_SOURCE);
   writeFileSync(path.join(root, "paginate.test.js"), TEST_SOURCE);
+  if (options.slowTest) writeFileSync(path.join(root, "slow-test.js"), SLOW_TEST_SOURCE);
   writeFileSync(
     path.join(root, "package.json"),
     JSON.stringify(
@@ -101,7 +121,7 @@ export function createFixtureRepo(options: { withPassingTest?: boolean } = {}): 
         name: "fixture-app",
         version: "1.0.0",
         private: true,
-        scripts: { test: "node --test paginate.test.js" },
+        scripts: { test: options.slowTest ? "node slow-test.js" : "node --test paginate.test.js" },
       },
       null,
       2
