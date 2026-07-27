@@ -9,8 +9,10 @@ import {
   type FinalResult,
   type ProviderStatus,
   type RoutingInfo,
+  type StoredEvent,
   type TaskEvent,
   type TaskPhase,
+  type TaskRow,
   type UsageTotals,
   type UserStage,
   type VerificationReport,
@@ -20,6 +22,7 @@ import { ApprovalModal } from "./components/ApprovalModal";
 import { DiffPanel } from "./components/DiffPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
+import { TaskHistory } from "./components/TaskHistory";
 import { VerificationPanel } from "./components/VerificationPanel";
 
 /**
@@ -54,13 +57,58 @@ export default function App() {
   const [devMode, setDevMode] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
+  // 취소는 즉시 끝나지 않는다. 버튼을 누른 순간부터 terminal 이벤트가 올 때까지가 "취소 중"이고,
+  // 그 사이에 버튼을 다시 누를 수 있으면 안 된다(요청 자체는 멱등이지만 사용자에게 혼란스럽다).
+  const [cancelling, setCancelling] = useState(false);
+  const [tasks, setTasks] = useState<TaskRow[]>([]);
+  const [historyBusy, setHistoryBusy] = useState(false);
+  const [selectedTask, setSelectedTask] = useState<{ task: TaskRow; events: StoredEvent[] } | null>(null);
+  const [storeError, setStoreError] = useState<string | null>(null);
+
   const startedAt = useRef<number | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
+
+  const refreshTasks = useCallback(async () => {
+    try {
+      const result = await invoke<{ tasks: TaskRow[] }>("list_tasks", { limit: 50 });
+      setTasks(result.tasks);
+      setStoreError(null);
+    } catch (error) {
+      // 저장 계층이 아직 안 열렸거나 열지 못한 상태. 새 작업 실행은 가능해야 하므로
+      // 화면을 막지 않고 사유만 보여준다.
+      setStoreError(String(error));
+    }
+  }, []);
 
   useEffect(() => {
     void invoke<ProviderStatus>("provider_status").then(setProviderStatus).catch(() => undefined);
     void invoke<WorkspaceInfo | null>("current_workspace").then((info) => info && setWorkspace(info));
-  }, []);
+    void refreshTasks();
+  }, [refreshTasks]);
+
+  // 앱 시작 시 저장 계층이 열리고 **중단된 작업이 INTERRUPTED로 확정되는** 시점.
+  // 그 직후에 목록을 다시 읽어야 중단된 작업이 "진행 중"으로 남아 보이지 않는다.
+  useEffect(() => {
+    const unlisten = listen<{ ok: boolean; error?: string; recovery?: { interruptedTasks?: string[] } }>(
+      "store-ready",
+      (event) => {
+        if (!event.payload.ok) {
+          setStoreError(event.payload.error ?? "저장 계층을 열 수 없습니다");
+          return;
+        }
+        const interrupted = event.payload.recovery?.interruptedTasks ?? [];
+        if (interrupted.length > 0) {
+          setNotice(
+            `이전 실행에서 완료되지 않은 작업 ${interrupted.length}건을 '중단됨'으로 표시했습니다. 자동으로 다시 실행하지 않습니다.`
+          );
+        }
+        void refreshTasks();
+      }
+    );
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [refreshTasks]);
 
   // 경과 시간 표시 (ui-wireframes.md 3.5절)
   useEffect(() => {
@@ -86,6 +134,11 @@ export default function App() {
         if (q && q.length > 0) setQuestions(q);
       }
       if (payload.type === "USER_MESSAGE_RECEIVED") setQuestions(null);
+      // terminal 이벤트가 오면 "취소 중"을 푼다. 타이머로 추측하지 않는다 —
+      // 프로세스가 실제로 죽었다는 사실은 호스트만 알고, 그 사실이 이벤트로 온다.
+      if (payload.type.startsWith("TASK_") && payload.type !== "TASK_CREATED") setCancelling(false);
+      // 확인 카드가 떠 있는 채로 취소되면 답변 입력창이 남는다.
+      if (payload.type === "CANCELLATION_REQUESTED") setQuestions(null);
     });
     const unlistenApproval = listen<ApprovalRequest>("approval-required", (event) => {
       setApproval(event.payload);
@@ -112,10 +165,12 @@ export default function App() {
   const runTask = useCallback(async () => {
     if (!workspace || message.trim().length === 0) return;
     setRunning(true);
+    setCancelling(false);
     setEvents([]);
     setFinalResult(null);
     setQuestions(null);
     setNotice(null);
+    setSelectedTask(null);
     setPhase("CREATED");
     startedAt.current = Date.now();
     setElapsedMs(0);
@@ -127,8 +182,10 @@ export default function App() {
       setFinalResult({ taskId: taskId ?? "(unknown)", status: "failed", summary: String(error) });
     } finally {
       setRunning(false);
+      setCancelling(false);
+      void refreshTasks();
     }
-  }, [workspace, message, mode, taskId]);
+  }, [workspace, message, mode, taskId, refreshTasks]);
 
   const respondApproval = useCallback(
     async (granted: boolean) => {
@@ -151,9 +208,27 @@ export default function App() {
   const cancel = useCallback(async () => {
     const id = currentTaskId(events, taskId);
     if (!id) return;
+    setCancelling(true);
     try {
-      await invoke("cancel_task", { taskId: id });
+      const result = await invoke<{ accepted: boolean; outcome?: string }>("cancel_task", { taskId: id });
+      switch (result.outcome) {
+        // 이미 끝난 작업을 취소한 것은 오류가 아니다 — 사용자가 결과를 아직 못 본 것뿐이다.
+        case "already_terminal":
+          setNotice("이미 종료된 작업입니다.");
+          setCancelling(false);
+          break;
+        case "already_requested":
+          setNotice("이미 취소를 요청했습니다 — 실행 중인 명령을 정리하는 중입니다.");
+          break;
+        case "unknown_task":
+          setNotice("취소할 작업을 찾을 수 없습니다.");
+          setCancelling(false);
+          break;
+        default:
+          setNotice("취소를 요청했습니다. 실행 중인 명령을 종료하는 중입니다.");
+      }
     } catch (error) {
+      setCancelling(false);
       setNotice(`취소 실패: ${String(error)}`);
     }
   }, [events, taskId]);
@@ -184,6 +259,70 @@ export default function App() {
       setNotice(`되돌리기 실패: ${String(error)}`);
     }
   }, [finalResult, taskId]);
+
+  /** 저장된 작업 선택 — 그 작업의 이벤트 타임라인을 DB에서 읽어온다. */
+  const selectTask = useCallback(async (id: string) => {
+    setHistoryBusy(true);
+    try {
+      const [detail, storedEvents] = await Promise.all([
+        invoke<{ task: TaskRow | null }>("get_task", { taskId: id }),
+        invoke<StoredEvent[]>("task_events", { taskId: id }),
+      ]);
+      if (detail.task) setSelectedTask({ task: detail.task, events: storedEvents });
+    } catch (error) {
+      setNotice(`작업을 읽을 수 없습니다: ${String(error)}`);
+    } finally {
+      setHistoryBusy(false);
+    }
+  }, []);
+
+  /** 히스토리에서 되돌리기 — 진행 중 작업의 되돌리기와 같은 경로(Policy Gate 통과)를 쓴다. */
+  const rollbackTask = useCallback(
+    async (id: string) => {
+      setHistoryBusy(true);
+      try {
+        const result = await invoke<{ restored: unknown[]; failed: unknown[] }>("rollback_task", { taskId: id });
+        setNotice(
+          result.failed.length === 0
+            ? `${result.restored.length}개 파일을 되돌렸습니다.`
+            : `${result.restored.length}개 되돌림, ${result.failed.length}개 실패: ${JSON.stringify(result.failed)}`
+        );
+        await refreshTasks();
+      } catch (error) {
+        setNotice(`되돌리기 실패: ${String(error)}`);
+      } finally {
+        setHistoryBusy(false);
+      }
+    },
+    [refreshTasks]
+  );
+
+  const restartTask = useCallback(
+    async (id: string) => {
+      if (running) return;
+      setRunning(true);
+      setCancelling(false);
+      setEvents([]);
+      setFinalResult(null);
+      setSelectedTask(null);
+      setNotice(null);
+      setPhase("CREATED");
+      startedAt.current = Date.now();
+      setElapsedMs(0);
+      try {
+        const result = await invoke<FinalResult>("restart_task", { taskId: id });
+        setFinalResult(result);
+        setTaskId(result.taskId);
+      } catch (error) {
+        setNotice(`다시 실행 실패: ${String(error)}`);
+      } finally {
+        setRunning(false);
+        setCancelling(false);
+        void refreshTasks();
+      }
+    },
+    [running, refreshTasks]
+  );
 
   const routing = useMemo(() => findRouting(events), [events]);
   const usage = useMemo(() => sumUsage(events), [events]);
@@ -291,14 +430,20 @@ export default function App() {
                 {running ? "실행 중..." : "실행"}
               </button>
               {running && (
-                <button className="secondary" onClick={cancel}>
-                  취소
+                <button className="secondary" onClick={cancel} disabled={cancelling}>
+                  {cancelling ? "취소 중..." : "취소"}
                 </button>
               )}
             </div>
             <p className="muted small">
               어느 정책을 골라도 빌드·테스트 검증은 생략되지 않습니다. Fast는 LLM 두 개의 상호 검토만 건너뜁니다.
             </p>
+            {cancelling && (
+              <p className="warn small">
+                취소를 요청했습니다 — 실행 중인 명령을 종료하고 남은 단계를 건너뛰는 중입니다. 이미 변경된 파일은
+                자동으로 되돌아가지 않습니다. 아래 결과에서 되돌리기를 선택할 수 있습니다.
+              </p>
+            )}
           </section>
 
           <StageBar current={stage} stages={STAGE_ORDER} phase={phase} devMode={devMode} />
@@ -409,6 +554,36 @@ export default function App() {
 
           <EventLog events={events} devMode={devMode} />
         </>
+      )}
+
+      {/* 히스토리는 워크스페이스 선택 여부와 무관하게 보인다 — 앱을 켜자마자
+          중단된 작업이 있는지 알아야 하기 때문이다. */}
+      {storeError && <p className="error">작업 기록을 읽을 수 없습니다: {storeError}</p>}
+      <TaskHistory
+        tasks={tasks}
+        selectedId={selectedTask?.task.taskId ?? null}
+        busy={historyBusy || running}
+        onSelect={(id) => void selectTask(id)}
+        onRollback={(id) => void rollbackTask(id)}
+        onRestart={(id) => void restartTask(id)}
+        onRefresh={() => void refreshTasks()}
+      />
+
+      {selectedTask && (
+        <section className="panel">
+          <h2>
+            저장된 작업 기록{" "}
+            <span className="muted small">
+              {selectedTask.task.taskId} · {selectedTask.task.terminalStatus ?? selectedTask.task.currentPhase}
+            </span>
+            <button className="secondary tiny" onClick={() => setSelectedTask(null)}>
+              닫기
+            </button>
+          </h2>
+          <p className="muted small">{selectedTask.task.userMessage}</p>
+          {/* 실시간 로그와 다른 패널에 그린다 — 같은 목록에 섞으면 이벤트가 두 번 보인다. */}
+          <EventLog events={selectedTask.events} devMode={devMode} />
+        </section>
       )}
 
       {approval && <ApprovalModal request={approval} onRespond={respondApproval} />}

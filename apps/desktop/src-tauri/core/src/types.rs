@@ -89,6 +89,21 @@ pub enum ToolStatus {
     Error,
     Denied,
     Timeout,
+    /// 사용자 취소로 중단됨. `Timeout`과 **구별해야 한다** — 타임아웃은 도구/프로젝트의 문제라
+    /// 재시도 대상이지만, 취소는 사용자의 의사이므로 재시도하면 안 된다.
+    Cancelled,
+}
+
+impl ToolStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ToolStatus::Ok => "ok",
+            ToolStatus::Error => "error",
+            ToolStatus::Denied => "denied",
+            ToolStatus::Timeout => "timeout",
+            ToolStatus::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

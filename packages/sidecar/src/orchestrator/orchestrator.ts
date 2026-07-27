@@ -90,6 +90,13 @@ export class Orchestrator {
   private answers: { question: string; answer: string }[] = [];
   private pendingQuestion: PendingQuestion | null = null;
   private eventIds: string[] = [];
+  /**
+   * 터미널에 도달했는지. **완료와 취소가 경쟁할 때 먼저 확정된 쪽만 남긴다**는 규칙의 Node 쪽 절반이다.
+   * (다른 절반은 Rust의 `finish_task`가 `WHERE final_status IS NULL`로 원자적으로 처리한다.)
+   */
+  private terminalReached = false;
+  /** 취소가 요청됐는지. abort signal만 보면 타임아웃 abort와 구별되지 않는다. */
+  private cancelRequested = false;
 
   constructor(private readonly input: RunInput, deps: OrchestratorDeps) {
     this.deps = deps;
@@ -123,13 +130,35 @@ export class Orchestrator {
     return this.state.counters;
   }
 
-  /** 사용자 취소. 진행 중인 공급자 호출을 중단하고 다음 체크포인트에서 CANCELLED로 간다. */
-  cancel(): void {
+  /**
+   * 사용자 취소. **실제로 진행 중인 작업을 끊는다** — 플래그만 세우지 않는다.
+   *
+   * 세 가지를 동시에 해야 한다:
+   *  1. AbortController.abort() — 진행 중인 공급자 HTTP 호출을 끊는다
+   *  2. 어댑터의 cancel() — SDK 내부에 남은 요청 정리
+   *  3. pendingQuestion 해제 — AWAITING_USER_INPUT에서 영원히 멈춰 있지 않게
+   *
+   * 이미 터미널이면 아무것도 하지 않는다(idempotent, 상태 불변).
+   */
+  cancel(): boolean {
+    if (this.terminalReached) return false;
+    if (this.cancelRequested) return true; // idempotent — 재요청도 성공이다
+    this.cancelRequested = true;
+
     this.abort.abort(new Error("사용자가 태스크를 취소했습니다"));
     this.adapters?.executor.cancel();
     this.adapters?.reviewer?.cancel();
-    // AWAITING_USER_INPUT에서 멈춰 있으면 그 대기도 풀어야 한다.
     this.pendingQuestion?.resolve("");
+    return true;
+  }
+
+  get cancellationRequested(): boolean {
+    return this.cancelRequested;
+  }
+
+  /** 진행 중인 공급자 호출에 전달되는 신호. 테스트가 "실제로 전달됐는가"를 확인한다. */
+  get signal(): AbortSignal {
+    return this.abort.signal;
   }
 
   /** AWAITING_USER_INPUT에 대한 사용자 답변 전달. */
@@ -148,7 +177,9 @@ export class Orchestrator {
       return await this.drive();
     } catch (error) {
       // 여기까지 올라온 예외는 처리하지 못한 것이다. 조용히 삼키지 않고 실패로 확정한다.
-      if (this.abort.signal.aborted) {
+      // **AbortError는 일반 ERROR가 아니라 CANCELLED로 분류한다** — 사용자가 멈춘 것을
+      // 실패로 보고하면 "되돌리기 권장" 같은 잘못된 안내가 따라온다.
+      if (this.cancelRequested || this.abort.signal.aborted || isAbortError(error)) {
         return await this.finish("cancelled", "사용자가 취소함");
       }
       const reason: FailureReason =
@@ -551,6 +582,14 @@ export class Orchestrator {
           break;
         }
 
+        // Rust가 취소로 보고한 경우 — 재시도하지 않고 태스크를 취소로 끝낸다.
+        if (result.status === "cancelled") {
+          return {
+            kind: "final",
+            result: await this.finish("cancelled", `도구 실행이 취소되었습니다 (${request.tool})`),
+          };
+        }
+
         if (result.status === "denied") {
           // Policy Gate 거부 또는 사용자 승인 거부. 재시도하지 않는다 —
           // 같은 요청을 다시 보내는 것은 승인 피로도를 유발하는 것 말고는 하는 일이 없다.
@@ -798,6 +837,13 @@ export class Orchestrator {
 
   /** 결정론적 검증은 Rust에 요청한다 — Node가 "검증했다"고 만들어낼 수 없어야 한다. */
   private async runVerification(phase: "baseline" | "post", attemptNumber: number): Promise<VerificationReport> {
+    // 취소된 태스크에서는 Rust가 검증을 거부한다(host.rs). 그 거부를 일반 오류로 흘리면
+    // "검증 실패"로 오인되므로 여기서 취소로 변환한다.
+    if (await this.cancelledHere()) {
+      const error = new Error("태스크가 취소되어 검증을 실행하지 않았습니다");
+      error.name = "AbortError";
+      throw error;
+    }
     const response = await this.deps.transport.request<{ report: VerificationReport }>("verify.run", {
       taskId: this.taskId,
       phase,
@@ -870,7 +916,7 @@ export class Orchestrator {
   }
 
   private async cancelledHere(): Promise<boolean> {
-    return this.abort.signal.aborted;
+    return this.cancelRequested || this.abort.signal.aborted;
   }
 
   private async finish(
@@ -878,6 +924,26 @@ export class Orchestrator {
     summary: string,
     failureReason?: FailureReason
   ): Promise<FinalResult> {
+    // 터미널 이벤트는 **정확히 한 번만** 기록된다. 경쟁하는 두 경로(정상 완료 / 취소)가
+    // 모두 여기 도달할 수 있으므로, 먼저 온 쪽이 확정하고 나중 것은 그 결과를 반환한다.
+    if (this.terminalReached) {
+      return {
+        taskId: this.taskId,
+        status: this.state.phase === "COMPLETED" ? "completed" : status,
+        summary: `(이미 ${this.state.phase}로 종료된 태스크) ${summary}`,
+        auditTrailEventIds: this.eventIds,
+        completedAt: new Date().toISOString(),
+      };
+    }
+
+    // 취소로 끝나는 경우 CANCELLING을 거친다 — UI가 "취소 중"을 보여줄 수 있어야 하고,
+    // 이벤트 로그에도 요청 시점과 완료 시점이 남아야 한다.
+    if (status === "cancelled" && this.state.phase !== "CANCELLING" && isValidTransition(this.state.phase, "CANCELLING")) {
+      await this.transition("CANCELLING");
+    }
+
+    this.terminalReached = true;
+
     const targetPhase: TaskPhase =
       status === "completed" ? "COMPLETED" : status === "failed" ? "FAILED" : status === "cancelled" ? "CANCELLED" : "REJECTED";
 
@@ -1005,6 +1071,20 @@ function providerFailureMessage(normalized: { kind: string; message: string }): 
     default:
       return `공급자 호출에 실패했습니다: ${normalized.message}`;
   }
+}
+
+/**
+ * AbortError 판정. SDK와 fetch가 취소를 이 형태로 던진다.
+ * 취소를 일반 오류로 분류하면 재시도 정책이 사용자 의사를 무시하고 다시 호출한다.
+ */
+function isAbortError(error: unknown): boolean {
+  if (error instanceof Error) {
+    if (error.name === "AbortError") return true;
+    if (error.name === "ProviderCallFailed" && error instanceof ProviderCallFailed) {
+      return error.normalized.kind === "cancelled";
+    }
+  }
+  return false;
 }
 
 function errorMessage(error: unknown): string {

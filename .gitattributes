@@ -1,0 +1,7 @@
+# .bat은 반드시 CRLF여야 한다. LF로 체크아웃되면 cmd.exe가 `goto :label`을 잘못 읽어
+# 스크립트가 조용히 엉뚱하게 동작한다 — 빌드 래퍼에서 가장 찾기 어려운 종류의 고장이다.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 나머지는 저장소에 LF로 두고 체크아웃 시 플랫폼에 맡긴다.
+* text=auto

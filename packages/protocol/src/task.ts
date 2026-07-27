@@ -78,12 +78,32 @@ export type TaskPhase =
   | "EXECUTING"
   | "VERIFYING"
   | "FIX_LOOP"
+  /**
+   * 취소 요청을 받고 정리 중. M0.1에서 추가됐다.
+   *
+   * 왜 별도 phase가 필요한가: 취소는 즉시 일어나지 않는다 — 실행 중인 자식 프로세스를 죽이고
+   * 진행 중인 모델 호출을 끊는 데 시간이 걸린다. 그 사이 UI가 "실행 중"으로 보이면 사용자는
+   * 취소 버튼이 동작하지 않았다고 생각하고 다시 누른다.
+   */
+  | "CANCELLING"
   | "COMPLETED"
   | "FAILED"
   | "CANCELLED"
-  | "REJECTED";
+  | "REJECTED"
+  /**
+   * 앱이 비정상 종료되어 중단됨. **Node 상태 머신은 이 상태로 전이하지 않는다** —
+   * 호스트(Rust)가 앱 시작 시 터미널이 아닌 태스크를 발견해 확정한다.
+   * 완료도 실패도 취소도 아니고, 사용자가 되돌릴지 재실행할지 결정해야 하는 상태다.
+   */
+  | "INTERRUPTED";
 
-export const TERMINAL_PHASES: readonly TaskPhase[] = ["COMPLETED", "FAILED", "CANCELLED", "REJECTED"];
+export const TERMINAL_PHASES: readonly TaskPhase[] = [
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+  "REJECTED",
+  "INTERRUPTED",
+];
 
 export function isTerminalPhase(phase: TaskPhase): boolean {
   return TERMINAL_PHASES.includes(phase);

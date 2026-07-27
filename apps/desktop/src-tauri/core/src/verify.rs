@@ -272,6 +272,9 @@ impl<'a> VerificationRunner<'a> {
 
         let status = match result.status {
             ToolStatus::Timeout => VerificationStatus::TimedOut,
+            // 취소된 검증은 실패가 아니다 — 사용자가 멈춘 것이므로 "고쳐야 할 실패"로 다루면
+            // FIX_LOOP가 존재하지 않는 문제를 고치려 든다.
+            ToolStatus::Cancelled => VerificationStatus::SkippedWithReason,
             // Policy Gate가 검증 명령을 거부한 경우. 이건 통과도 실패도 아니며,
             // 사유를 명시한 스킵으로 기록한다 — 조용히 pass로 넘기면 안 된다.
             ToolStatus::Denied => VerificationStatus::SkippedWithReason,

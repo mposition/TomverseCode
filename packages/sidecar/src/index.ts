@@ -35,7 +35,16 @@ export function createSidecar(
   options: SidecarOptions = {}
 ): NdjsonTransport {
   const transport = new NdjsonTransport(input as never, output as never);
+
+  /**
+   * 진행 중인 태스크의 registry.
+   *
+   * `pendingCancels`가 별도로 필요한 이유: **취소 요청이 task.start보다 먼저 도착할 수 있다.**
+   * (Rust가 task.start를 보낸 직후 사용자가 취소를 누르면, IPC 왕복 순서에 따라 cancel이
+   * 먼저 처리될 수 있다.) 그때 orchestrator가 아직 없다고 취소를 버리면 태스크가 그대로 실행된다.
+   */
   const running = new Map<string, Orchestrator>();
+  const pendingCancels = new Set<string>();
 
   const fake = options.fake ?? fakeOptionsFromEnv();
 
@@ -60,12 +69,20 @@ export function createSidecar(
       deps
     );
     running.set(taskRequest.taskId, orchestrator);
+    // 시작 전에 도착한 취소를 소비한다.
+    if (pendingCancels.delete(taskRequest.taskId)) {
+      orchestrator.cancel();
+    }
 
     try {
       const result: FinalResult = await orchestrator.run();
       return result;
     } finally {
+      // registry cleanup — 터미널에 도달했으므로 반드시 제거한다.
+      // 남겨두면 장시간 실행에서 orchestrator가 무한히 쌓이고, 같은 taskId 재사용 시
+      // 죽은 orchestrator에 취소가 전달된다.
       running.delete(taskRequest.taskId);
+      pendingCancels.delete(taskRequest.taskId);
     }
   });
 
@@ -73,10 +90,19 @@ export function createSidecar(
     const { taskId } = params as { taskId: string };
     const orchestrator = running.get(taskId);
     if (!orchestrator) {
-      return { taskId, cancelled: false, reason: "진행 중인 태스크가 아닙니다" };
+      // 아직 시작하지 않았을 수 있다 — 기록해 두었다가 시작 시 즉시 취소한다.
+      // "진행 중이 아니므로 실패"로 응답하면 그 태스크가 그대로 실행되어 버린다.
+      pendingCancels.add(taskId);
+      return { taskId, cancelled: true, deferred: true, reason: "아직 시작되지 않은 태스크 — 시작 시 즉시 취소됩니다" };
     }
-    orchestrator.cancel();
-    return { taskId, cancelled: true };
+    const accepted = orchestrator.cancel();
+    return {
+      taskId,
+      cancelled: accepted,
+      phase: orchestrator.phase,
+      // 이미 터미널이면 accepted=false다. 오류가 아니라 "바꿀 것이 없었다"는 뜻이다.
+      reason: accepted ? undefined : "이미 종료된 태스크입니다",
+    };
   });
 
   transport.onRequest("task.userInput", async (params) => {
@@ -92,8 +118,14 @@ export function createSidecar(
   transport.onRequest("shutdown", async () => {
     // 진행 중인 in-flight 공급자 호출을 취소하고 응답한다 (process-architecture.md 5절).
     for (const orchestrator of running.values()) orchestrator.cancel();
-    return { ok: true };
+    return { ok: true, cancelled: running.size };
   });
+
+  /** 테스트/진단용 — registry가 실제로 정리되는지 확인한다. */
+  transport.onRequest("debug.activeTasks", async () => ({
+    active: [...running.keys()],
+    pendingCancels: [...pendingCancels],
+  }));
 
   transport.emitEvent("", { type: "ready", protocolVersion: PROTOCOL_VERSION, startedAt: new Date().toISOString() });
 

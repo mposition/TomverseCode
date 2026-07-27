@@ -9,10 +9,11 @@
 //! (process-architecture.md 4절 — 승인은 정책 판단의 연장이므로 Rust 책임 소관).
 
 use crate::artifacts::ArtifactStore;
+use crate::cancel::{CancelOutcome, CancellationRegistry, CancellationToken};
 use crate::paths::WorkspaceRoot;
 use crate::policy::{parse_run_command, PolicyGate};
 use crate::sidecar::SidecarHandler;
-use crate::store::Store;
+use crate::store::{AppendedEvent, Store, StoreError, TerminalOutcome};
 use crate::time::now_iso;
 use crate::tools::{ToolRuntime, MAX_INLINE_OUTPUT_BYTES};
 use crate::types::{
@@ -21,7 +22,6 @@ use crate::types::{
 };
 use crate::verify::{CommandExecutor, VerificationRunner};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -73,13 +73,15 @@ pub struct TaskHost {
     policy: TaskPolicy,
     gate: PolicyGate,
     runtime: ToolRuntime,
-    store: Mutex<Store>,
+    /// 저장 계층은 **공유**한다. Tauri가 활성 워크스페이스 없이도 작업 목록을 조회해야 하고
+    /// (앱 재시작 직후), 여러 컴포넌트가 각자 Store를 열면 SQLite 단일 writer 원칙이 깨진다.
+    store: Arc<Mutex<Store>>,
     artifacts: ArtifactStore,
     approvals: Arc<dyn ApprovalGateway>,
     sink: Arc<dyn EventSink>,
-    /// 태스크별이 아니라 호스트별 취소 플래그. M0는 동시에 한 태스크만 다룬다
-    /// (product-strategy.md 8.2절 "다중 태스크 동시 실행"은 이후 깊이 확장 항목).
-    cancelled: AtomicBool,
+    /// task_id별 취소 신호. M0에서는 호스트당 플래그 하나였으나, 작업 목록/재실행이 생기면서
+    /// "어느 태스크를 취소하는가"를 구별해야 한다.
+    cancels: Arc<CancellationRegistry>,
     /// baseline 검증 리포트 — post 리포트가 "새로 깨진 것"을 계산할 때 쓴다.
     baseline: Mutex<Option<VerificationReport>>,
     /// 이번 태스크에서 마지막으로 만들어진 diff 모음 (UI 표시용)
@@ -91,10 +93,11 @@ impl TaskHost {
     pub fn new(
         root: WorkspaceRoot,
         policy: TaskPolicy,
-        store: Store,
+        store: Arc<Mutex<Store>>,
         artifacts: ArtifactStore,
         approvals: Arc<dyn ApprovalGateway>,
         sink: Arc<dyn EventSink>,
+        cancels: Arc<CancellationRegistry>,
     ) -> Self {
         let gate = PolicyGate::new(&policy);
         let runtime = ToolRuntime::new(
@@ -107,11 +110,11 @@ impl TaskHost {
             policy,
             gate,
             runtime,
-            store: Mutex::new(store),
+            store,
             artifacts,
             approvals,
             sink,
-            cancelled: AtomicBool::new(false),
+            cancels,
             baseline: Mutex::new(None),
             diffs: Mutex::new(Vec::new()),
         }
@@ -125,12 +128,66 @@ impl TaskHost {
         &self.policy
     }
 
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+    /// 태스크 취소 요청. **idempotent**하며, 터미널 상태를 바꾸지 않는다.
+    ///
+    /// 순서가 중요하다: 먼저 DB에서 터미널 여부를 읽고, 터미널이 아닐 때만 토큰을 켠다.
+    /// 반대로 하면 완료된 태스크의 취소 플래그가 켜져 이후 롤백 같은 정당한 도구 실행이 막힌다.
+    pub fn cancel_task(&self, task_id: &str) -> Result<Value, String> {
+        let terminal = self
+            .with_store(|s| s.get_task(task_id))
+            .map_err(|e| format!("태스크를 조회할 수 없습니다: {e}"))?
+            .and_then(|t| t.terminal_status);
+
+        let outcome = self.cancels.request(task_id, terminal.clone());
+
+        // 취소가 새로 확정된 경우에만 이벤트를 남긴다 (연타가 로그를 채우지 않게).
+        if let CancelOutcome::Requested { .. } = &outcome {
+            match self.with_store(|s| s.record_cancellation_request(task_id, "사용자 요청")) {
+                Ok(_) => {}
+                // DB가 터미널이라고 하면 그쪽이 진실이다 — 메모리 토큰보다 DB를 믿는다.
+                Err(StoreError::TerminalAlreadySet { status }) => {
+                    return Ok(json!({ "accepted": true, "outcome": "already_terminal", "status": status }));
+                }
+                Err(e) => return Err(format!("취소 요청을 기록할 수 없습니다: {e}")),
+            }
+        }
+
+        Ok(match outcome {
+            CancelOutcome::Requested { requested_at } => {
+                json!({ "accepted": true, "outcome": "requested", "requestedAt": requested_at })
+            }
+            CancelOutcome::AlreadyRequested { requested_at } => {
+                json!({ "accepted": true, "outcome": "already_requested", "requestedAt": requested_at })
+            }
+            CancelOutcome::AlreadyTerminal { status } => {
+                json!({ "accepted": true, "outcome": "already_terminal", "status": status })
+            }
+            CancelOutcome::UnknownTask => json!({ "accepted": false, "outcome": "unknown_task" }),
+        })
     }
 
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+    pub fn cancellation_token(&self, task_id: &str) -> CancellationToken {
+        self.cancels.token(task_id)
+    }
+
+    pub fn is_cancelled(&self, task_id: &str) -> bool {
+        self.cancels
+            .existing(task_id)
+            .map(|t| t.is_cancelled())
+            .unwrap_or(false)
+    }
+
+    /// 태스크가 터미널에 도달했을 때 토큰을 정리한다.
+    pub fn release_task(&self, task_id: &str) {
+        self.cancels.remove(task_id);
+    }
+
+    pub fn cancels(&self) -> Arc<CancellationRegistry> {
+        self.cancels.clone()
+    }
+
+    pub fn store_handle(&self) -> Arc<Mutex<Store>> {
+        self.store.clone()
     }
 
     pub fn collected_diffs(&self) -> Vec<(String, String)> {
@@ -140,6 +197,49 @@ impl TaskHost {
     pub fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> T) -> T {
         let mut guard = self.store.lock().unwrap();
         f(&mut guard)
+    }
+
+    /// 터미널 상태 확정 + 이벤트를 한 트랜잭션에. 경쟁에서 진 쪽은 아무것도 바꾸지 않는다.
+    pub fn finish_task(
+        &self,
+        task_id: &str,
+        terminal_status: &str,
+        event_type: &str,
+        error_summary: Option<&str>,
+        payload: Value,
+    ) -> Result<TerminalOutcome, String> {
+        let outcome = self
+            .with_store(|s| s.finish_task(task_id, terminal_status, event_type, error_summary, &payload))
+            .map_err(|e| format!("터미널 상태 기록 실패: {e}"))?;
+        if let TerminalOutcome::Recorded { .. } = &outcome {
+            self.sink.emit(
+                "task-event",
+                &json!({ "taskId": task_id, "type": event_type, "payload": payload, "createdAt": now_iso() }),
+            );
+            // 터미널에 도달했으므로 취소 토큰을 정리한다.
+            self.release_task(task_id);
+        }
+        Ok(outcome)
+    }
+
+    /// **이미 DB에 커밋된** 이벤트를 UI로 릴레이한다.
+    ///
+    /// `record_*_with_event` 계열은 레코드와 이벤트를 한 트랜잭션에 쓰기 위해 `append_event`를
+    /// 거치지 않는다. 그러면 sink 릴레이가 빠지므로 UI에서 `FILE_MUTATED` 같은 이벤트가
+    /// 사라진다 — DB에는 남는데 화면에는 안 보이는, 발견하기 어려운 종류의 누락이다.
+    /// 커밋이 끝난 뒤 이 함수로 명시적으로 릴레이한다(커밋 실패 시에는 호출되지 않는다).
+    fn relay(&self, task_id: &str, event_type: &str, payload: &Value, appended: &AppendedEvent) {
+        self.sink.emit(
+            "task-event",
+            &json!({
+                "taskId": task_id,
+                "eventId": appended.event_id,
+                "seq": appended.seq,
+                "type": event_type,
+                "payload": payload,
+                "createdAt": now_iso(),
+            }),
+        );
     }
 
     /// 이벤트 로그 기록 + UI 릴레이. 이벤트 없이 상태가 바뀌지 않도록 모든 상태 변화가 이걸 지난다.
@@ -163,16 +263,25 @@ impl TaskHost {
 
     /// ToolRequest 하나를 끝까지 처리한다. 이 함수가 신뢰 경계의 핵심 경로다.
     pub fn execute_tool(&self, request: &ToolRequest) -> Result<Value, String> {
-        // 0) 취소 확인. 취소된 태스크의 도구는 실행하지 않는다.
-        if self.is_cancelled() {
+        let cancel = self.cancels.token(&request.task_id);
+
+        // 0) 취소 확인. 취소된 태스크의 도구는 **시작하지 않는다.**
+        //    `denied`가 아니라 `cancelled`로 보고해야 오케스트레이터가 정책 거부와 구별한다.
+        if cancel.is_cancelled() {
             let result = ToolResult {
                 request_id: request.request_id.clone(),
-                status: ToolStatus::Denied,
+                status: ToolStatus::Cancelled,
                 output: None,
-                error: Some("태스크가 취소됨".to_string()),
+                error: Some("태스크가 취소되어 도구를 실행하지 않음".to_string()),
                 duration_ms: 0,
                 completed_at: now_iso(),
             };
+            // 취소 후 거부도 감사 로그에 남는다 — "취소했는데 뭐가 더 실행됐나"를 확인할 수 있어야 한다.
+            let _ = self.append_event(
+                &request.task_id,
+                "TOOL_SKIPPED_CANCELLED",
+                json!({ "requestId": request.request_id, "tool": request.tool.as_str() }),
+            );
             return Ok(json!({
                 "result": result,
                 "policy": {
@@ -247,25 +356,20 @@ impl TaskHost {
 
         // 3) 실행. 승인되지 않았으면 Tool Runtime이 스스로 Denied를 반환한다 —
         //    호출자가 승인 확인을 잊는 경로를 없애기 위해 판단을 런타임에도 넘긴다.
-        let outcome = self.runtime.execute(request, &decision, approved);
+        let outcome = self.runtime.execute(request, &decision, approved, &cancel);
 
-        // 4) 결과 기록. 파일 변경이면 mutation과 diff도.
-        self.with_store(|s| s.record_tool_result(&outcome.result, outcome.output_ref.as_deref()))
-            .map_err(|e| format!("tool_result 기록 실패: {e}"))?;
-
+        // 4) 결과 기록. **레코드와 이벤트를 같은 트랜잭션에** 쓴다 (M0.1 트랜잭션 규칙).
         if let Some(mutation) = &outcome.mutation {
-            self.with_store(|s| s.record_file_mutation(mutation))
+            let payload = json!({
+                "requestId": mutation.request_id,
+                "path": mutation.path,
+                "preExisted": mutation.pre_image.existed,
+                "postExists": mutation.post_image.existed,
+            });
+            let appended = self
+                .with_store(|s| s.record_file_mutation_with_event(mutation, &payload))
                 .map_err(|e| format!("file_mutation 기록 실패: {e}"))?;
-            let _ = self.append_event(
-                &request.task_id,
-                "FILE_MUTATED",
-                json!({
-                    "requestId": mutation.request_id,
-                    "path": mutation.path,
-                    "preExisted": mutation.pre_image.existed,
-                    "postExists": mutation.post_image.existed,
-                }),
-            );
+            self.relay(&request.task_id, "FILE_MUTATED", &payload, &appended);
         }
         if let Some(diff) = &outcome.diff {
             let path = outcome
@@ -276,19 +380,26 @@ impl TaskHost {
             self.diffs.lock().unwrap().push((path, diff.clone()));
         }
 
-        let _ = self.append_event(
-            &request.task_id,
-            "TOOL_COMPLETED",
-            json!({
-                "requestId": outcome.result.request_id,
-                "status": outcome.result.status,
-                "error": outcome.result.error,
-                "durationMs": outcome.result.duration_ms,
-                "outputRef": outcome.output_ref,
-                // 큰 출력은 이미 artifact에 있으므로 이벤트에는 요약만 남긴다.
-                "output": summarize_output(outcome.result.output.as_ref()),
-            }),
-        );
+        let completed_payload = json!({
+            "requestId": outcome.result.request_id,
+            "status": outcome.result.status,
+            "error": outcome.result.error,
+            "durationMs": outcome.result.duration_ms,
+            "outputRef": outcome.output_ref,
+            // 큰 출력은 이미 artifact에 있으므로 이벤트에는 요약만 남긴다.
+            "output": summarize_output(outcome.result.output.as_ref()),
+        });
+        let appended = self
+            .with_store(|s| {
+                s.record_tool_result_with_event(
+                    &outcome.result,
+                    outcome.output_ref.as_deref(),
+                    &request.task_id,
+                    &completed_payload,
+                )
+            })
+            .map_err(|e| format!("tool_result 기록 실패: {e}"))?;
+        self.relay(&request.task_id, "TOOL_COMPLETED", &completed_payload, &appended);
 
         Ok(json!({
             "result": outcome.result,
@@ -342,19 +453,26 @@ impl TaskHost {
         phase: VerificationPhase,
         attempt_number: u32,
     ) -> Result<Value, String> {
+        // 취소 이후에는 검증을 새로 시작하지 않는다. 시작해 버리면 "취소했는데 npm test가 돈다"가 된다.
+        if self.is_cancelled(task_id) {
+            let _ = self.append_event(
+                task_id,
+                "VERIFICATION_SKIPPED_CANCELLED",
+                json!({ "phase": format!("{phase:?}"), "attemptNumber": attempt_number }),
+            );
+            return Err("태스크가 취소되어 검증을 실행하지 않았습니다".to_string());
+        }
         let runner = VerificationRunner::new(&self.root, &self.artifacts);
         let baseline = self.baseline.lock().unwrap().clone();
         let mut executor = HostExecutor { host: self };
 
         let report = runner.run(task_id, phase, attempt_number, &mut executor, baseline.as_ref());
 
-        self.with_store(|s| s.record_verification_report(&report))
+        let payload = serde_json::to_value(&report).unwrap_or(Value::Null);
+        let appended = self
+            .with_store(|s| s.record_verification_with_event(&report, &payload))
             .map_err(|e| format!("verification_report 기록 실패: {e}"))?;
-        let _ = self.append_event(
-            task_id,
-            "VERIFICATION_COMPLETED",
-            serde_json::to_value(&report).unwrap_or(Value::Null),
-        );
+        self.relay(task_id, "VERIFICATION_COMPLETED", &payload, &appended);
 
         if phase == VerificationPhase::Baseline {
             *self.baseline.lock().unwrap() = Some(report.clone());
@@ -386,12 +504,30 @@ impl TaskHost {
                 failed.push(json!({ "path": request.args.get("path"), "reason": decision.reason }));
                 continue;
             }
-            let outcome = self.runtime.execute(&request, &decision, true);
+            // 롤백은 **취소된/중단된 태스크에서도 반드시 동작해야 한다** — 오히려 그때가
+            // 가장 필요한 순간이다. 그래서 태스크 취소 토큰이 아니라 새 토큰을 쓴다.
+            // Policy Gate는 그대로 거치므로 workspace 경계 보장은 유지된다.
+            let rollback_token = CancellationToken::new();
+            let outcome = self.runtime.execute(&request, &decision, true, &rollback_token);
             self.with_store(|s| s.record_tool_request(&request, "rollback", &decision))
                 .ok();
-            self.with_store(|s| s.record_tool_result(&outcome.result, None)).ok();
+            let payload = json!({
+                "requestId": outcome.result.request_id,
+                "status": outcome.result.status,
+                "rollback": true,
+            });
+            if let Ok(appended) =
+                self.with_store(|s| s.record_tool_result_with_event(&outcome.result, None, task_id, &payload))
+            {
+                self.relay(task_id, "TOOL_COMPLETED", &payload, &appended);
+            }
             match outcome.result.status {
-                ToolStatus::Ok => restored.push(request.args.get("path").cloned().unwrap_or(Value::Null)),
+                ToolStatus::Ok => {
+                    if let Some(path) = request.args.get("path").and_then(Value::as_str) {
+                        self.with_store(|s| s.mark_mutation_rolled_back(task_id, path)).ok();
+                    }
+                    restored.push(request.args.get("path").cloned().unwrap_or(Value::Null));
+                }
                 _ => failed.push(json!({ "path": request.args.get("path"), "reason": outcome.result.error })),
             }
         }
@@ -584,10 +720,110 @@ mod tests {
             .upsert_workspace("ws-1", &ws.path().to_string_lossy(), "ws")
             .unwrap();
         store.upsert_session("sess-1", "ws-1", None).unwrap();
-        store.create_task("task-1", "sess-1", "ws-1", "fix").unwrap();
+        store
+            .create_task(
+                "task-1",
+                "sess-1",
+                "ws-1",
+                &ws.path().to_string_lossy(),
+                "verified",
+                "fix",
+            )
+            .unwrap();
         let root = WorkspaceRoot::new(ws.path()).unwrap();
-        let host = TaskHost::new(root, policy, store, artifacts, approvals, Arc::new(NullSink));
+        let host = TaskHost::new(
+            root,
+            policy,
+            Arc::new(Mutex::new(store)),
+            artifacts,
+            approvals,
+            Arc::new(NullSink),
+            Arc::new(CancellationRegistry::new()),
+        );
         (ws, art, host)
+    }
+
+    /// sink로 나간 이벤트를 기록한다 — "DB에는 남았는데 UI로는 안 갔다"를 잡기 위한 것.
+    #[derive(Default)]
+    struct RecordingSink {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, _channel: &str, payload: &Value) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(payload.get("type").and_then(Value::as_str).unwrap_or("").to_string());
+        }
+    }
+
+    fn host_with_sink(sink: Arc<RecordingSink>) -> (tempfile::TempDir, tempfile::TempDir, TaskHost) {
+        let ws = tempfile::tempdir().unwrap();
+        fs::create_dir_all(ws.path().join("src")).unwrap();
+        fs::write(ws.path().join("src/app.ts"), "a\nb\nc\n").unwrap();
+        let art = tempfile::tempdir().unwrap();
+        let artifacts = ArtifactStore::new(art.path()).unwrap();
+        let mut store = Store::open_in_memory(artifacts.clone()).unwrap();
+        store
+            .upsert_workspace("ws-1", &ws.path().to_string_lossy(), "ws")
+            .unwrap();
+        store.upsert_session("sess-1", "ws-1", None).unwrap();
+        store
+            .create_task(
+                "task-1",
+                "sess-1",
+                "ws-1",
+                &ws.path().to_string_lossy(),
+                "verified",
+                "fix",
+            )
+            .unwrap();
+        let root = WorkspaceRoot::new(ws.path()).unwrap();
+        let host = TaskHost::new(
+            root,
+            TaskPolicy::default(),
+            Arc::new(Mutex::new(store)),
+            artifacts,
+            Arc::new(AutoApprove),
+            sink,
+            Arc::new(CancellationRegistry::new()),
+        );
+        (ws, art, host)
+    }
+
+    /// M0.1 회귀 방지: 레코드와 이벤트를 한 트랜잭션에 쓰는 `record_*_with_event` 경로는
+    /// `append_event`를 거치지 않는다. 커밋 후 sink로 릴레이하지 않으면 DB에는 남는데
+    /// **UI에서는 파일 변경이 보이지 않는다.** 조용히 사라지는 종류의 버그라 테스트로 못박는다.
+    #[test]
+    fn combined_writes_are_relayed_to_the_ui_not_only_to_the_database() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _a, host) = host_with_sink(sink.clone());
+        host.execute_tool(&req(
+            ToolName::ApplyPatch,
+            json!({ "path": "src/app.ts", "patch": "@@ -1,1 +1,1 @@\n-a\n+A\n" }),
+        ))
+        .unwrap();
+
+        let emitted = sink.seen.lock().unwrap().clone();
+        assert!(
+            emitted.contains(&"FILE_MUTATED".to_string()),
+            "sink로 나간 이벤트: {emitted:?}"
+        );
+        assert!(
+            emitted.contains(&"TOOL_COMPLETED".to_string()),
+            "sink로 나간 이벤트: {emitted:?}"
+        );
+
+        // DB와 sink가 같은 이벤트를 봐야 한다 — 한쪽에만 있으면 감사 추적이 갈라진다.
+        let stored = host.with_store(|s| s.event_types("task-1")).unwrap();
+        for event_type in ["FILE_MUTATED", "TOOL_COMPLETED", "POLICY_DECIDED"] {
+            assert!(stored.contains(&event_type.to_string()), "DB에 {event_type}이 없습니다");
+            assert!(
+                emitted.contains(&event_type.to_string()),
+                "sink에 {event_type}이 없습니다"
+            );
+        }
     }
 
     fn req(tool: ToolName, args: Value) -> ToolRequest {
@@ -642,14 +878,126 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_host_refuses_tool_execution() {
+    fn cancelled_task_refuses_tool_execution() {
         let (ws, _a, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
-        host.cancel();
+        host.cancel_task("task-1").unwrap();
         let out = host
             .execute_tool(&req(ToolName::CreateFile, json!({ "path": "new.ts", "content": "x" })))
             .unwrap();
-        assert_eq!(out["result"]["status"].as_str().unwrap(), "denied");
+        // "denied"(정책이 막음)가 아니라 "cancelled"(사용자가 멈춤)여야 한다 —
+        // 오케스트레이터의 재시도/실패 분류가 이 구분에 의존한다.
+        assert_eq!(out["result"]["status"].as_str().unwrap(), "cancelled");
         assert!(!ws.path().join("new.ts").exists());
+        // 취소 이후 실행 시도도 감사 로그에 남는다.
+        let types = host.with_store(|s| s.event_types("task-1")).unwrap();
+        assert!(types.contains(&"TOOL_SKIPPED_CANCELLED".to_string()));
+        assert!(!types.contains(&"FILE_MUTATED".to_string()));
+    }
+
+    #[test]
+    fn cancel_is_idempotent_and_records_one_event() {
+        let (_ws, _a, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
+        let first = host.cancel_task("task-1").unwrap();
+        let second = host.cancel_task("task-1").unwrap();
+        assert_eq!(first["outcome"].as_str().unwrap(), "requested");
+        assert_eq!(second["outcome"].as_str().unwrap(), "already_requested");
+        assert!(first["accepted"].as_bool().unwrap() && second["accepted"].as_bool().unwrap());
+
+        let requests = host
+            .with_store(|s| s.event_types("task-1"))
+            .unwrap()
+            .into_iter()
+            .filter(|t| t == "CANCELLATION_REQUESTED")
+            .count();
+        assert_eq!(requests, 1, "연타해도 이벤트는 한 번만 남아야 합니다");
+    }
+
+    #[test]
+    fn cancelling_a_completed_task_does_not_change_state() {
+        let (_ws, _a, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
+        host.finish_task(
+            "task-1",
+            "COMPLETED",
+            "TASK_COMPLETED",
+            None,
+            json!({ "summary": "done" }),
+        )
+        .unwrap();
+
+        let outcome = host.cancel_task("task-1").unwrap();
+        assert_eq!(outcome["outcome"].as_str().unwrap(), "already_terminal");
+        assert_eq!(outcome["status"].as_str().unwrap(), "COMPLETED");
+
+        let task = host.with_store(|s| s.get_task("task-1")).unwrap().unwrap();
+        assert_eq!(task.terminal_status.as_deref(), Some("COMPLETED"));
+        assert!(
+            task.cancellation_requested_at.is_none(),
+            "터미널 태스크에 취소 시각이 기록되면 안 됩니다"
+        );
+        // 취소 플래그도 켜지지 않아야 한다 — 켜지면 이후 롤백이 막힌다.
+        assert!(!host.is_cancelled("task-1"));
+    }
+
+    #[test]
+    fn rollback_works_after_cancellation() {
+        // 취소된 태스크야말로 되돌리기가 가장 필요한 순간이다.
+        let (ws, _a, host) = host(
+            TaskPolicy {
+                auto_approve_workspace_writes: true,
+                ..TaskPolicy::default()
+            },
+            Arc::new(AutoApprove),
+        );
+        let original = fs::read_to_string(ws.path().join("src/app.ts")).unwrap();
+        host.execute_tool(&req(
+            ToolName::ApplyPatch,
+            json!({ "path": "src/app.ts", "patch": "@@ -1,1 +1,1 @@\n-a\n+CHANGED\n" }),
+        ))
+        .unwrap();
+        host.cancel_task("task-1").unwrap();
+
+        let result = host.rollback("task-1").unwrap();
+        assert_eq!(result["failed"].as_array().unwrap().len(), 0, "{result}");
+        assert_eq!(fs::read_to_string(ws.path().join("src/app.ts")).unwrap(), original);
+    }
+
+    #[test]
+    fn verification_does_not_start_after_cancellation() {
+        let (_ws, _a, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
+        host.cancel_task("task-1").unwrap();
+        let err = host.run_verification("task-1", VerificationPhase::Post, 0).unwrap_err();
+        assert!(err.contains("취소"), "{err}");
+        let types = host.with_store(|s| s.event_types("task-1")).unwrap();
+        assert!(types.contains(&"VERIFICATION_SKIPPED_CANCELLED".to_string()));
+        assert_eq!(host.with_store(|s| s.verification_report_count("task-1")).unwrap(), 0);
+    }
+
+    #[test]
+    fn competing_terminal_states_keep_the_first_one() {
+        let (_ws, _a, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
+        let first = host
+            .finish_task("task-1", "COMPLETED", "TASK_COMPLETED", None, json!({}))
+            .unwrap();
+        assert!(matches!(first, TerminalOutcome::Recorded { .. }));
+
+        let second = host
+            .finish_task("task-1", "CANCELLED", "TASK_CANCELLED", None, json!({}))
+            .unwrap();
+        assert_eq!(
+            second,
+            TerminalOutcome::AlreadyTerminal {
+                status: "COMPLETED".to_string()
+            }
+        );
+
+        // terminal 이벤트는 정확히 하나만 남아야 한다.
+        let terminal_events = host
+            .with_store(|s| s.event_types("task-1"))
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.starts_with("TASK_") && t != "TASK_CREATED")
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_events, vec!["TASK_COMPLETED"]);
     }
 
     #[test]

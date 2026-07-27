@@ -69,7 +69,7 @@ npm run typecheck      # 전 워크스페이스
 npm run build          # protocol → sidecar → desktop 프런트엔드
 npm test               # sidecar 단위 테스트 (상태 머신, 컨텍스트, 공급자, 라우터)
 
-npm run verify         # M0 전체: 위 + Rust 단위 테스트 + 실제 구성요소 e2e
+npm run verify         # 전체: 위 + Rust 단위 테스트 + 실제 구성요소 e2e
 ```
 
 **end-to-end 테스트는 Rust 호스트 바이너리를 요구한다** — `npm run core:build`를 먼저 실행해야
@@ -86,15 +86,18 @@ npm run verify         # M0 전체: 위 + Rust 단위 테스트 + 실제 구성�
 
 **작동하는 패턴**: `.bat` 래퍼를 만들고 PowerShell 도구로 실행한다(Bash→cmd.exe 경유는 `vcvarsall.bat` 경로 인용이 깨진다).
 
-```bat
-@echo off
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64 >nul 2>nul
-set PATH=%PATH%;%USERPROFILE%\.cargo\bin
-cd /d "C:\Users\Vyper\Documents\Tomverse Code\apps\desktop\src-tauri"
-cargo build
-```
+이 패턴은 이제 `scripts/`에 들어 있다 — **매번 재발견하지 말고 이걸 쓸 것.**
 
-이 패턴을 매번 재발견하지 말 것. `cargo check`/`cargo build`/`npm run tauri dev` 모두 동일하게 감싸면 된다.
+| 스크립트 | 하는 일 |
+|---|---|
+| `scripts\_env.bat` | MSVC 툴체인 + cargo PATH 준비. 나머지가 전부 이걸 call한다 |
+| `scripts\core-test.bat` | 신뢰 경계 크레이트 테스트 (가장 자주 도는 검증) |
+| `scripts\core-build.bat` | `tomverse-host` 빌드 — e2e가 이 산출물을 요구한다 |
+| `scripts\desktop-check.bat` | Tauri 껍데기 크레이트 `cargo check` |
+| `scripts\verify.bat` | 전체 검증 (Node 타입/빌드/테스트 + Rust + e2e). 하나라도 실패하면 즉시 멈춘다 |
+
+`.bat`는 반드시 CRLF여야 한다 — LF면 cmd.exe가 `goto :label`을 잘못 읽어 조용히 엉뚱하게 동작한다.
+`.gitattributes`가 이걸 강제한다.
 
 **단, 신뢰 경계 크레이트(`core/`)는 이 래퍼가 필요 없는 경우가 많다** — tauri에 의존하지 않으므로
 GUI 시스템 라이브러리를 요구하지 않는다. `rusqlite`의 bundled SQLite를 컴파일하려면 C 컴파일러는 필요하다.
@@ -117,7 +120,9 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 - **`gpt-5`/`gpt-5.5`는 OpenAI Organization Verification이 필요하다.** 미인증 계정에서 `model_not_found`로 실패한다 — 모델 가용성이 전역 사실이 아니라 **자격증명별 사실**이라는 뜻이고, 이게 Model Registry에 `requiresOrgVerification` 축이 있는 이유다.
 - **Git for Windows의 GNU `link.exe`가 MSVC `link.exe`를 PATH에서 가린다.** Rust 링크 실패 시 `link: extra operand ... Try 'link --help'`가 나오면 이건 MSVC가 아니라 **coreutils의 하드링크 유틸리티**가 호출된 것이다. rustc가 붙이는 "Visual Studio에서 C++ 빌드 도구를 선택하라"는 힌트는 이 경우 오도할 수 있다. `vcvarsall.bat`를 거치면 MSVC 경로가 앞에 오므로 해결된다.
 - **Bash를 먼저 잡는 습관을 경계할 것.** 이 저장소에서 Windows 네이티브 툴체인(MSVC/MSBuild/VS)을 다룰 때는 PowerShell + `.bat` 래퍼가 기본이다. Bash(MinGW)를 쓰면 위 `link.exe` 같은 Unix 도구 충돌에 걸린다 — 이 편향은 product-strategy.md 12.3절이 우리 제품에서 구조적으로 교정하려는 대상이기도 하다.
-- **파일이 LF로 저장되면 git이 CRLF 경고를 낸다** — 정상이며 무시해도 된다.
+- **파일이 LF로 저장되면 git이 CRLF 경고를 낸다** — 정상이며 무시해도 된다. 단 `.bat`만은 예외로 CRLF를 강제한다(`.gitattributes`).
+- **`record_*_with_event` 계열은 `append_event`를 거치지 않는다.** 레코드와 이벤트를 한 트랜잭션에 쓰기 위한 설계인데, 그 대가로 **sink(UI) 릴레이가 빠진다.** DB에는 남는데 화면에는 안 보이는, 찾기 어려운 종류의 누락이다. 새로 이런 메서드를 만들면 커밋 후 `TaskHost::relay`를 반드시 부를 것.
+- **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트
 

@@ -8,20 +8,27 @@ import { isTerminalPhase } from "@tomverse/protocol";
  * 검증할 수 없고, 잘못된 전이가 조용히 일어난다. 표로 두면 (a) 문서와 1:1 대조가 가능하고
  * (b) 전이마다 유효성을 확인할 수 있고 (c) 잘못된 전이를 실패로 드러낼 수 있다.
  */
+/**
+ * M0.1: 취소는 `CANCELLING`을 거쳐 `CANCELLED`에 도달한다.
+ *
+ * 왜 직행하지 않는가: 취소 요청 시점과 실제 중단 완료 시점 사이에 (a) 실행 중인 자식 프로세스
+ * 종료 (b) 진행 중인 모델 호출 abort가 일어난다. 그 구간을 상태로 표현하지 않으면 UI가
+ * "취소 중"을 보여줄 수 없고, 이벤트 로그에도 "언제 요청했고 언제 끝났는지"가 남지 않는다.
+ */
 export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
-  CREATED: ["SNAPSHOTTING", "CANCELLED", "FAILED"],
-  SNAPSHOTTING: ["TRIAGE", "CANCELLED", "FAILED"],
+  CREATED: ["SNAPSHOTTING", "CANCELLING", "CANCELLED", "FAILED"],
+  SNAPSHOTTING: ["TRIAGE", "CANCELLING", "CANCELLED", "FAILED"],
   // TRIAGE는 complexityTier에 따라 갈린다.
-  TRIAGE: ["DRAFTING", "SINGLE_MODEL_FIX", "CANCELLED", "FAILED"],
-  DRAFTING: ["REVIEWING", "CANCELLED", "FAILED"],
+  TRIAGE: ["DRAFTING", "SINGLE_MODEL_FIX", "CANCELLING", "CANCELLED", "FAILED"],
+  DRAFTING: ["REVIEWING", "CANCELLING", "CANCELLED", "FAILED"],
   // SINGLE_MODEL_FIX의 verdict: ACCEPT → PLANNING, NEED_USER_INPUT → AWAITING_USER_INPUT,
   // REJECT → REJECTED (문서 14.1절)
-  SINGLE_MODEL_FIX: ["PLANNING", "AWAITING_USER_INPUT", "REJECTED", "CANCELLED", "FAILED"],
+  SINGLE_MODEL_FIX: ["PLANNING", "AWAITING_USER_INPUT", "REJECTED", "CANCELLING", "CANCELLED", "FAILED"],
   // REVIEWING의 4갈래: ACCEPT/REVISE → PLANNING, REJECT → REJECTED, NEED_USER_INPUT → AWAITING_USER_INPUT
-  REVIEWING: ["PLANNING", "REJECTED", "AWAITING_USER_INPUT", "CANCELLED", "FAILED"],
+  REVIEWING: ["PLANNING", "REJECTED", "AWAITING_USER_INPUT", "CANCELLING", "CANCELLED", "FAILED"],
   // 14.1절 tier 승격 규칙: 사용자 응답 후에는 **항상** DRAFTING(standard 경로)으로 간다.
   // TRIAGE로 되돌아가는 전이가 없는 것이 그 규칙의 구조적 강제다.
-  AWAITING_USER_INPUT: ["DRAFTING", "CANCELLED", "FAILED"],
+  AWAITING_USER_INPUT: ["DRAFTING", "CANCELLING", "CANCELLED", "FAILED"],
   // PLANNING → FIX_LOOP는 설계 문서 2절 다이어그램에 **없던** 전이다.
   //
   // 필요해진 이유: 문서는 "patch가 적용 계획으로 변환되지 않는 경우"를 다루지 않는다. 그런데
@@ -32,18 +39,23 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
   // 요청한다"이고, patch 파싱 실패는 모델 의견이 아니라 결정론적 사실이다. 프로토콜의
   // `VerificationKind`에 이미 `diff_review`가 있어 이 실패를 리포트로 표현할 수 있다.
   // 상한도 `fixLoopRounds`를 그대로 공유하므로 새 무한 루프가 생기지 않는다.
-  PLANNING: ["AWAITING_APPROVAL", "EXECUTING", "FIX_LOOP", "CANCELLED", "FAILED"],
-  AWAITING_APPROVAL: ["EXECUTING", "CANCELLED", "FAILED"],
+  PLANNING: ["AWAITING_APPROVAL", "EXECUTING", "FIX_LOOP", "CANCELLING", "CANCELLED", "FAILED"],
+  AWAITING_APPROVAL: ["EXECUTING", "CANCELLING", "CANCELLED", "FAILED"],
   // EXECUTING → EXECUTING은 "다음 ToolRequest"를 뜻한다.
-  EXECUTING: ["EXECUTING", "VERIFYING", "CANCELLED", "FAILED"],
+  EXECUTING: ["EXECUTING", "VERIFYING", "CANCELLING", "CANCELLED", "FAILED"],
   // VERIFYING → COMPLETED(pass) 또는 FIX_LOOP(fail). CLAUDE.md 원칙 1에 따라
   // VERIFYING을 건너뛰고 COMPLETED로 가는 전이는 어디에도 없다.
-  VERIFYING: ["COMPLETED", "FIX_LOOP", "CANCELLED", "FAILED"],
-  FIX_LOOP: ["PLANNING", "FAILED", "CANCELLED", "REJECTED"],
+  VERIFYING: ["COMPLETED", "FIX_LOOP", "CANCELLING", "CANCELLED", "FAILED"],
+  FIX_LOOP: ["PLANNING", "FAILED", "CANCELLING", "CANCELLED", "REJECTED"],
+  // 정리만 하고 CANCELLED로 간다. 여기서 COMPLETED로 갈 수 없다 —
+  // 취소를 요청한 뒤 성공으로 끝나면 사용자는 취소가 무시됐다고 느낀다.
+  CANCELLING: ["CANCELLED", "FAILED"],
   COMPLETED: [],
   FAILED: [],
   CANCELLED: [],
   REJECTED: [],
+  // Node는 이 상태로 전이하지 않는다 — 호스트가 앱 시작 시 확정한다(store.rs).
+  INTERRUPTED: [],
 };
 
 export function isValidTransition(from: TaskPhase, to: TaskPhase): boolean {

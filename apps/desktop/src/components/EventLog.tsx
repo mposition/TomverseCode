@@ -30,13 +30,25 @@ const IMPORTANT: string[] = [
   "ROLLBACK_STARTED",
   "ROLLBACK_COMPLETED",
   "ERROR",
+  // 취소는 요청 시점과 실제 종료 시점이 다르다 — 그 사이에 무엇이 건너뛰어졌는지가
+  // "취소가 정말 됐나"를 판단하는 근거이므로 기본 모드에서도 보여준다.
+  "CANCELLATION_REQUESTED",
+  "TOOL_SKIPPED_CANCELLED",
+  "VERIFICATION_SKIPPED_CANCELLED",
   "TASK_COMPLETED",
   "TASK_FAILED",
   "TASK_CANCELLED",
+  "TASK_INTERRUPTED",
   "TASK_REJECTED",
 ];
 
-export function EventLog({ events, devMode }: { events: TaskEvent[]; devMode: boolean }) {
+/**
+ * 실시간 이벤트(`TaskEvent`)와 DB에서 읽어온 이벤트(`StoredEvent`)를 모두 받는다.
+ * 차이는 `taskId` 유무뿐이다 — 저장된 이벤트는 이미 어느 작업의 것인지 알고 조회한 것이라 없다.
+ */
+type DisplayEvent = Omit<TaskEvent, "taskId"> & { taskId?: string };
+
+export function EventLog({ events, devMode }: { events: DisplayEvent[]; devMode: boolean }) {
   const endRef = useRef<HTMLDivElement>(null);
   const visible = devMode ? events : events.filter((e) => IMPORTANT.includes(e.type));
 
@@ -54,7 +66,7 @@ export function EventLog({ events, devMode }: { events: TaskEvent[]; devMode: bo
       ) : (
         <ol>
           {visible.map((event) => (
-            <li key={`${event.taskId}-${event.seq}`} className={eventClass(event.type)}>
+            <li key={`${event.taskId ?? "stored"}-${event.eventId}`} className={eventClass(event.type)}>
               <span className="event-seq">#{event.seq}</span>
               <span className="event-type">{event.type}</span>
               <span className="event-summary">{summarize(event)}</span>
@@ -71,12 +83,15 @@ export function EventLog({ events, devMode }: { events: TaskEvent[]; devMode: bo
 function eventClass(type: string): string {
   if (type.startsWith("TASK_FAILED") || type === "ERROR" || type === "APPROVAL_DENIED") return "event event-error";
   if (type === "TASK_COMPLETED") return "event event-ok";
+  if (type === "CANCELLATION_REQUESTED" || type.endsWith("_SKIPPED_CANCELLED") || type === "TASK_CANCELLED")
+    return "event event-cancel";
+  if (type === "TASK_INTERRUPTED") return "event event-cancel";
   if (type.startsWith("APPROVAL") || type === "POLICY_DECIDED") return "event event-policy";
   return "event";
 }
 
 /** 이벤트별 한 줄 요약. 원본을 보고 싶으면 개발자 모드를 켠다. */
-function summarize(event: TaskEvent): string {
+function summarize(event: DisplayEvent): string {
   const p = event.payload as Record<string, unknown>;
   switch (event.type) {
     case "SNAPSHOT_CREATED": {
@@ -112,6 +127,14 @@ function summarize(event: TaskEvent): string {
       return `${String(p.verdict)} — ${truncate(String(p.rationale ?? ""), 120)}`;
     case "DRAFT_RECEIVED":
       return truncate(String(p.interpretation ?? p.rationale ?? ""), 120);
+    case "CANCELLATION_REQUESTED":
+      return `취소 요청됨 — ${String(p.reason ?? "")}`;
+    case "TOOL_SKIPPED_CANCELLED":
+      return `취소로 건너뜀: ${String(p.tool ?? "")}`;
+    case "VERIFICATION_SKIPPED_CANCELLED":
+      return `취소로 검증을 시작하지 않았습니다 (${String(p.phase ?? "")})`;
+    case "TASK_INTERRUPTED":
+      return `${String(p.interruptedAtPhase ?? "")} 단계에서 중단 — ${String(p.reason ?? "")}`;
     case "TASK_COMPLETED":
     case "TASK_FAILED":
     case "TASK_CANCELLED":
