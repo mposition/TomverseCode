@@ -159,9 +159,33 @@ CREATE TABLE workspace_index (
 
 `WorkspaceIndex`는 태스크 단위가 아니라 워크스페이스 단위이므로 state-machine-and-protocol.md 11절의 artifact GC(터미널 태스크 기준 정리) 대상이 아니다 — 워크스페이스 자체가 삭제될 때만 함께 정리한다. 이 구분을 명확히 하기 위해 11절에 각주를 추가한다(아래 커밋에 포함).
 
-## 11. 다음으로 구체화할 것
+## 11. M0 구현 상태와 보완
+
+M0에서 구현된 것: 2계층 구조(세션 `WorkspaceIndex` + 태스크 `WorkspaceSnapshot`), 7절 하드 필터 전체,
+4절의 `mentioned`/`project-meta` 선정, 8절 예산 패키징(문자 수 근사).
+
+**구현되지 않은 것과 그 결과:** 5절 Tree-sitter 심볼/의존성 인덱스가 없으므로 `symbols`와 `dependencyEdges`가
+비어 있고, 따라서 **`symbol-match`와 `dependency` 선정이 동작하지 않는다.** 빈 결과를 만들어 "구현했다"고
+보이게 하지 않기 위해 그 `reason` 값을 아예 생성하지 않으며, 대신 파일명 키워드 매칭으로 후보를 고르고
+그 사실을 `reasonDetail`에 적어 사용자가 선정 근거의 강도를 판단할 수 있게 한다.
+
+6절 증분 갱신도 M0에서는 채택하지 않았다 — git 상태 지문이 바뀌면 전체 재구축한다. 증분 갱신은 심볼
+인덱스가 있을 때 이득이 커지고, 그때까지는 전체 재구축이 더 단순하며 스테일 컨텍스트 위험도 없다.
+
+### 11.1 TRIAGE와의 상호작용 (구현에서 발견)
+
+Context Engine이 `project-meta`(README/package.json/CLAUDE.md)를 **항상** 포함하고, 파일명 키워드 매칭이
+소스 파일과 그 테스트 파일을 함께 고르기 때문에, `relevantFiles.length`를 그대로 TRIAGE의 복잡도 신호로 쓰면
+**모든 태스크가 `standard`로 분류되어 TRIAGE가 죽는다**(state-machine-and-protocol.md 13.2절의 임계값은 1이다).
+
+그래서 TRIAGE는 작업 파일 개수를 셀 때 `project-meta`와 테스트 파일로 보이는 경로를 제외한다. 테스트 파일은
+작업 범위가 아니라 그 작업을 판정할 근거이므로 복잡도가 아니다. 이 규칙은 임계값을 임의로 올리는 것보다
+설명 가능하지만, 여전히 실측 근거가 없는 휴리스틱이다 — 12절 미해결 항목에 남는다.
+
+## 12. 다음으로 구체화할 것
 
 - 정확한 토큰 카운팅(현재는 문자 수 근사) — provider별 tokenizer 라이브러리 도입 여부
 - 심볼 인덱스 갱신과 `apply_patch` 적용 사이의 원자성 — 파싱 실패 시(문법 오류가 있는 중간 상태) 인덱스를 어떻게 다루는지
 - 멀티 워크스페이스(여러 프로젝트를 동시에 열어둔 경우) `WorkspaceIndex` 동시 보관/전환 전략
+- 11.1절의 "테스트 파일은 복잡도 신호가 아니다" 규칙의 실측 검증 — 테스트 파일 자체를 고치는 태스크가 `simple`로 오분류될 수 있다(대가는 FIX_LOOP 1회로 국한되지만 빈도를 측정해야 한다)
 - ~~Rust core와 Node sidecar 중 어디가 `WorkspaceIndex` 구축을 실제로 수행할지~~ → [process-architecture.md](./process-architecture.md) 6절에서 Node로 결정 (Tree-sitter npm 생태계 성숙도, 권한 불필요 작업은 Node에 두는 일관성, 대용량 데이터 프로세스 간 전송 회피가 근거)

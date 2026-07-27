@@ -120,9 +120,49 @@ interface IpcEvent {
 | Policy Gate 최종 판단 | ✗ | ✗ (1차 분류만) | ✓ |
 | SQLite 쓰기 | ✗ | ✗ (Rust에 `db.appendEvent` 요청) | ✓ |
 
-## 8. 다음으로 구체화할 것
+## 8. M0 구현에서 확정된 것
+
+### 8.1 크레이트 분리: `tomverse-core`와 Tauri 껍데기
+
+2절은 "Rust core"를 하나의 덩어리로 그렸지만, 구현에서 **두 크레이트로 나눴다.**
+
+- `apps/desktop/src-tauri/core/` (`tomverse-core`) — Policy Gate, Tool Runtime, SQLite, Verification Runner,
+  sidecar IPC. **`tauri`에 의존하지 않는다.**
+- `apps/desktop/src-tauri/` (`desktop`) — Tauri command/event 배관과 승인 왕복의 UI 쪽 절반만.
+
+근거:
+
+1. `tauri`는 webkit2gtk/GTK(Linux) 또는 WebView2(Windows) 시스템 라이브러리를 요구한다. 신뢰 경계 코드가
+   거기에 묶이면 **GUI 의존성이 없는 환경에서 `cargo test`가 아예 돌지 않는다** — 보안 로직의 테스트 가능성이
+   GUI 툴킷 설치 여부에 인질로 잡히는 것은 받아들일 수 없다.
+2. CLAUDE.md "보안 로직과 UI 로직을 섞지 않는다"를 구조로 강제한다. `tomverse-core`는 tauri에 의존하지
+   않으므로 UI 관심사가 물리적으로 들어올 수 없다.
+3. 같은 코어를 GUI 없이 구동하는 `tomverse-host` 바이너리가 가능해진다 — end-to-end 테스트가 실제
+   Policy Gate·Tool Runtime·SQLite를 태우면서 GUI를 요구하지 않는다.
+
+이 때문에 `tokio` 의존이 사라졌다. sidecar IPC를 std 스레드 + mpsc로 구현해 Tauri(비동기)와 헤드리스
+호스트(동기)가 같은 코드를 공유한다.
+
+### 8.2 `credential.get`을 IPC에서 제거
+
+3절은 Node → Rust 요청에 `credential.get`을 두었고, 8절 미해결 항목은 그 남용을 막는 rate limit을 과제로 적었다.
+**구현에서는 그 메서드를 아예 없앴다.** 자격증명은 sidecar spawn 시 환경변수로 1회 주입되고, Node가 런타임에
+키를 다시 요청할 경로가 존재하지 않는다. Rust는 `credential.get` 요청을 명시적 오류로 거부한다.
+
+근거: "재요청 빈도로 이상을 탐지한다"는 것보다 **경로 자체를 없애는 것이 단순하고 강하다.** rate limit은
+정상 요청과 남용을 구별하는 임계값을 정해야 하는데, M0에서 그 임계값의 근거가 없다.
+
+### 8.3 Rust → Node 요청에 추가된 것
+
+- `verify.run` — **결정론적 검증은 Rust가 실행한다.** Node는 "언제" 돌릴지만 요청하고, 어떤 명령이 실제로
+  돌았는지와 그 결과는 Rust가 만들어 `verification_reports`에 직접 기록한다. Node가 장악당해도
+  "검증했고 통과했다"고 주장할 수 없어야 하기 때문이다(CLAUDE.md 원칙 1 + 2가 함께 요구하는 것).
+- `usage.record` — 공급자 토큰/비용/지연시간 기록. SQLite writer는 Rust 하나뿐이라는 원칙을 유지한다.
+
+## 9. 다음으로 구체화할 것
 
 - NDJSON 메시지 크기 상한 — `WorkspaceSnapshot`처럼 큰 페이로드가 매 메시지 파싱을 느리게 만들 가능성, 필요시 파일 내용은 별도 임시 파일 경로로 참조하고 IPC 메시지엔 경로만 담는 방식 검토
-- Node sidecar의 정확한 spawn 커맨드/패키징 방식(pkg로 단일 바이너리화 vs 시스템 Node.js 요구 vs Node 런타임 임베딩) — 배포 크기와 "Node 20+ 필요" 요구사항 노출 여부에 영향
-- `credential.get` 요청을 Node가 남용(과도한 재요청)하지 못하도록 하는 rate limit — 신뢰 경계 원칙상 Node가 이상 동작해도 자격증명 재주입 빈도로 이상 탐지가 가능해야 함
-- 멀티 워크스페이스 지원 시 Node sidecar를 워크스페이스당 1개씩 둘지 공유할지 (context-engine.md의 멀티 워크스페이스 미해결 항목과 연결)
+- Node sidecar의 정확한 spawn 커맨드/패키징 방식(pkg로 단일 바이너리화 vs 시스템 Node.js 요구 vs Node 런타임 임베딩) — 배포 크기와 "Node 20+ 필요" 요구사항 노출 여부에 영향. **M0는 `node <경로>`로 실행하며 `TOMVERSE_SIDECAR_ENTRY`로 override 가능하다 — 배포판에서는 반드시 해결해야 한다.**
+- ~~`credential.get` 요청을 Node가 남용하지 못하도록 하는 rate limit~~ → 8.2절에서 메서드 자체를 제거해 해소
+- sidecar 크래시 시 자동 재spawn (5절 표의 "최대 2회") — M0는 재spawn하지 않고 태스크를 실패로 확정한다
+- 멀티 워크스페이스 지원 시 Node sidecar를 워크스페이스당 1개씩 둘지 공유할지 (context-engine.md의 멀티 워크스페이스 미해결 항목과 연결). M0는 워크스페이스 전환 시 기존 sidecar를 종료하고 새로 spawn한다

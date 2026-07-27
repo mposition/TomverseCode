@@ -366,7 +366,15 @@ interface CommandPolicy {
 
 `npm run *`처럼 스크립트명이 와일드카드인 규칙은 Context Engine이 `package.json`의 `scripts` 키를 미리 인덱싱해서, 실제 정의된 스크립트명과 일치할 때만 `conditional`로 허용하고 그 외엔 `user_approval`로 떨어뜨린다 (임의 스크립트 주입 방지).
 
-경로 인자(파일/디렉터리로 보이는 인자)는 별도로 workspace root 기준 canonicalize 후, root 바깥으로 벗어나면 규칙 매치 여부와 무관하게 `blocked` — 이건 Policy Gate가 `CommandRule` 매칭과 별개로 항상 적용하는 하드 체크다.
+경로 인자(파일/디렉터리로 보이는 인자)는 별도로 workspace root 기준 canonicalize 후, root 바깥으로 벗어나면 규칙 매치 여부와 무관하게 `blocked` — 이건 Policy Gate가 `CommandRule` 매칭과 별개로 항상 적용하는 하드 체크다. **`--out=../../etc/passwd`처럼 플래그 값에 숨은 경로도 검사한다** — `-`로 시작하는 인자를 통째로 건너뛰면 그 경로로 탈출할 수 있다(M0 구현에서 발견해 보완).
+
+### 5.3 이 allowlist가 보장하지 않는 것
+
+정직하게 적어둔다. 파일 도구(`read_file`/`apply_patch`/`create_file`/`delete_file`)의 workspace 경계는 강한 보장이다 — 경로를 canonicalize해 루트 밖이면 실행 자체를 하지 않는다.
+
+**그러나 `run_command`로 실행된 프로세스가 그 안에서 무엇을 하는지는 통제할 수 없다.** `npm test`가 workspace 밖 파일을 쓰거나 네트워크를 타는 것을 Policy Gate는 막지 못한다 — 그건 프로세스 샌드박싱(Windows job object, seccomp, 컨테이너)의 문제이고 M0 범위 밖이다.
+
+따라서 **"Policy Gate가 있으니 임의 코드 실행이 안전하다"는 주장은 하지 않는다.** 참인 주장은 세 가지다: (a) 실행될 명령이 사용자에게 정확히 보이고(argv 계약), (b) allowlist 밖 명령은 기본 거부되며, (c) 무엇이 실행됐는지 이벤트 로그로 감사 가능하다. 프로세스 샌드박싱은 별도 항목으로 12절에 남긴다.
 
 ## 6. FIX_LOOP 재전달 페이로드
 
@@ -606,8 +614,54 @@ interface FileMutationRecord {
 - ~~OpenAI Responses API / Anthropic Messages API 필드를 `DraftProposal`/`ReviewDecision`으로 매핑하는 실제 어댑터 계약~~ → 13.3절에서 Phase 0 스파이크 코드로 검증 완료
 - ~~`file_mutations` 테이블 DDL과 7절 스키마 통합~~ → 7절에 DDL 추가 완료(14.2절)
 - ~~`SINGLE_MODEL_FIX`가 모호성을 감지했을 때 어떻게 할지~~ → 14.1절에서 `SingleModelFixResult` verdict로 해결
-- UI 와이어프레임 (단계 표시, diff 미리보기, 승인 모달)
-- 13.2절 TRIAGE 규칙의 실제 임계값(파일 개수, 키워드 목록) — 스파이크의 5개 초소형 태스크만으로는 튜닝 근거가 부족함. "어려운" 태스크 세트로 스파이크를 재실행해 규칙을 검증/조정 필요
+- ~~UI 와이어프레임 (단계 표시, diff 미리보기, 승인 모달)~~ → [ui-wireframes.md](./ui-wireframes.md), M0에서 구현됨
+- 13.2절 TRIAGE 규칙의 실제 임계값(파일 개수, 키워드 목록) — 스파이크의 5개 초소형 태스크만으로는 튜닝 근거가 부족함. "어려운" 태스크 세트로 스파이크를 재실행해 규칙을 검증/조정 필요. **M0 구현에서 이 항목이 더 시급해졌다 — 15.3절 참조.**
+- 앱 재시작 후 진행 중이던 태스크의 복구 UX — 7절 절차와 `unfinished_tasks()` 조회는 구현됐지만, 사용자에게 "중단된 작업이 있고 되돌릴 수 있다"를 보여주는 화면이 없다
+- **프로세스 샌드박싱** (5.3절) — `run_command`가 실행한 프로세스의 파일·네트워크 접근 제한. Windows job object / 컨테이너 중 무엇을 쓸지, 그리고 그게 개발 도구(테스트 러너가 캐시 디렉터리를 쓰는 등)와 어디서 충돌하는지 조사 필요. 이게 없는 동안은 5.3절의 한계를 UI에도 정직하게 표시해야 한다
+- Git commit 자동 생성의 오케스트레이터 통합 — Policy Gate(항상 승인)와 도구는 있으나 `ExecutionPlan`에 commit 단계를 넣는 로직이 없다
+
+## 15. M0 구현에서 드러난 설계 보완
+
+구현이 문서의 빈틈을 세 군데 드러냈다. 셋 다 "결정론적 검증이 최종 판정자"라는 원칙에 직결되므로 기록해 둔다.
+
+### 15.1 `PLANNING → FIX_LOOP` 전이 추가
+
+2절 다이어그램은 **"patch가 적용 계획으로 변환되지 않는 경우"를 다루지 않았다.** 파일 헤더 없는 diff는
+LLM의 흔한 실패 모드인데, 이걸 즉시 `FAILED`로 만들면 한 번의 재요청으로 회복 가능한 오류에 태스크 전체를 버린다.
+
+`FIX_LOOP`를 재사용하는 것이 타당하다: FIX_LOOP의 전제는 "결정론적 증거를 근거로 다시 요청한다"이고
+patch 파싱 실패는 모델 의견이 아니라 결정론적 사실이다. 3절 `VerificationKind`에 이미 `diff_review`가 있어
+이 실패를 리포트로 표현할 수 있고, 상한도 `fixLoopRounds`를 공유하므로 새 무한 루프가 생기지 않는다.
+
+### 15.2 `VerificationCheck.status`를 3값에서 5값으로
+
+원래 `pass | fail | skipped`였다. `skipped` 하나에 "프로젝트에 명령이 없음", "정책상 건너뜀", "타임아웃"이
+뭉쳐 있으면 리포트가 통과로 위장할 여지가 생긴다. 지금은
+`PASSED | FAILED | NOT_CONFIGURED | SKIPPED_WITH_REASON | TIMED_OUT`이고,
+`VerificationReport.overall`에도 `not_verified`가 추가됐다 — 실행된 검증이 하나도 없는 것은 통과가 아니다.
+
+### 15.3 baseline 대비 판정 규칙: "여전히 실패 중이면 실패"
+
+처음에는 "baseline에도 있던 실패는 이번 변경의 책임이 아니므로 pass"로 구현했다. e2e 테스트가 그 규칙의
+치명적 결과를 드러냈다: **"실패하는 테스트를 고쳐줘"라는 태스크에서 모델이 아무것도 고치지 못했는데
+`COMPLETED`가 나온다.** 그 테스트는 당연히 baseline에서도 실패했으므로 "새로 깨진 것 없음 → pass"가 되기 때문이다.
+
+지금 규칙: **현재 실패 중인 체크가 하나라도 있으면 `fail`.** baseline 비교 결과는 판정을 바꾸지 않고
+`newlyFailing`/`preexistingFailures`로 따로 보고한다. 대가는 오래전부터 lint가 깨져 있던 저장소에서
+무관한 수정도 실패로 나오는 것인데, "거짓 성공"과 "설명이 붙은 실패" 중에서는 후자가 제품 명제에 맞다.
+
+**이 규칙이 12절의 TRIAGE 튜닝 항목을 더 시급하게 만든다** — 실패한 태스크는 FIX_LOOP를 태우므로,
+분류 정확도가 비용에 직접 반영된다.
+
+### 15.4 검증 명령의 실행 환경 통제
+
+실측으로 확인한 문제: `NODE_TEST_CONTEXT`가 설정된 셸에서 앱을 실행하면 `node --test`가 자신을 테스트 러너의
+자식으로 취급해 **실패해도 exit code 0을 반환한다.** 그러면 검증 러너가 실패한 테스트를 통과로 보고한다.
+
+따라서 Tool Runtime이 명령을 실행할 때 테스트 러너 제어 변수(`NODE_TEST_CONTEXT`, `NODE_OPTIONS`,
+`NODE_V8_COVERAGE`)를 제거한다. 공급자 API 키를 제거하는 것과 같은 자리에서 같은 이유로 처리한다 —
+**결정론적 검증은 실행 환경을 통제해야 성립한다.** 다른 생태계(pytest의 `PYTEST_CURRENT_TEST`,
+.NET의 `DOTNET_*`)에도 유사한 변수가 있으므로 언어 지원을 넓힐 때 함께 확인해야 한다.
 
 ## 13. Phase 0 스파이크 결과 반영
 
