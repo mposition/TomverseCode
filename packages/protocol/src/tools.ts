@@ -1,21 +1,34 @@
-import type { ISODateTime, RiskTier } from "./common.js";
+import type { EngineRole, ISODateTime, ModelId, RiskTier } from "./common.js";
+
+export type ToolName =
+  | "list_files"
+  | "search_text"
+  | "read_file"
+  | "apply_patch"
+  | "create_file"
+  | "delete_file"
+  | "run_command"
+  | "git_status"
+  | "git_diff"
+  | "run_tests";
+
+/**
+ * docs/design/multi-engine-routing.md 7절 — 공급자가 아니라 역할로 기록한다.
+ * 감사 로그에서 "어떤 역할이 요청했는가"가 "어느 공급자였는가"보다 안정적인 정보다.
+ */
+export type ToolRequester = { role: EngineRole; modelId: ModelId } | { role: "orchestrator" };
 
 export interface ToolRequest {
   requestId: string;
   taskId: string;
-  tool:
-    | "list_files"
-    | "search_text"
-    | "read_file"
-    | "apply_patch"
-    | "create_file"
-    | "delete_file"
-    | "run_command"
-    | "git_status"
-    | "git_diff"
-    | "run_tests";
+  tool: ToolName;
   args: Record<string, unknown>;
-  requestedBy: "openai" | "claude" | "orchestrator";
+  requestedBy: ToolRequester;
+  /**
+   * Node가 계산한 1차 분류. Rust Policy Gate는 이 값을 신뢰하지 않고 독립적으로 재평가한다
+   * (process-architecture.md 2절: 실행 여부의 최종 게이트는 항상 Rust).
+   * 여기 담긴 값은 감사 로그에서 "Node의 판단과 Rust의 판단이 달랐는가"를 보기 위한 기록이다.
+   */
   riskTier: RiskTier;
   createdAt: ISODateTime;
 }
@@ -36,26 +49,100 @@ export interface ToolResult {
   completedAt: ISODateTime;
 }
 
+export type PolicyRiskLevel = "none" | "low" | "medium" | "high" | "prohibited";
+
 export interface PolicyDecision {
   requestId: string;
   decision: "auto_approve" | "require_user_approval" | "deny";
+  /** 사람이 읽을 수 있는 위험도 — UI 승인 모달의 강조 수준을 정한다. */
+  riskLevel: PolicyRiskLevel;
   matchedRule: string;
   reason: string;
+  /** decision === "require_user_approval"과 동치. UI가 파생 계산하지 않도록 명시한다. */
+  requiresUserApproval: boolean;
+  /**
+   * 정규화된 대상: 파일 도구면 canonicalize된 workspace 상대경로, run_command면
+   * "program arg arg (cwd)". Rust가 실제로 무엇에 대해 판단했는지를 드러낸다 —
+   * 승인 모달에 표시되는 값과 실행되는 값이 같다는 보장의 근거.
+   */
+  normalizedTarget: string;
+  decidedAt: ISODateTime;
 }
 
-// docs/design/state-machine-and-protocol.md 5절 — run_command는 셸 문자열이 아니라
-// argv 배열만 받는다 (셸 메타문자 인젝션을 인터페이스 수준에서 차단).
+/**
+ * docs/design/state-machine-and-protocol.md 5절 — run_command는 셸 문자열이 아니라
+ * argv 배열만 받는다 (셸 메타문자 인젝션을 인터페이스 수준에서 차단).
+ *
+ * `program`은 문서 5절의 `executable`과 같은 뜻이다. 작업 지침 3.2절이 program/args/cwd를,
+ * 설계 문서가 executable을 쓰므로 경계에서 두 이름 모두 수용하되(validate.ts의
+ * normalizeRunCommandArgs) 정규화된 형태는 `program`이다.
+ */
 export interface RunCommandArgs {
-  executable: string;
+  program: string;
   args: string[];
+  /** workspace root 기준 상대경로. ".." 세그먼트 금지, 절대경로는 workspace 내부만 허용. */
   cwd: string;
+  /**
+   * shell 실행은 지원하지 않는다. 이 필드가 존재하고 false가 아니면 Policy Gate가 거부한다 —
+   * 타입으로만 막는 것으로는 부족하다(LLM 출력은 타입을 존중하지 않는다).
+   */
   shell?: false;
+  timeoutMs?: number;
+}
+
+export interface CommandRule {
+  /** 문서 5.1절의 executable. basename 비교. */
+  program: string;
+  /** 위치 기반 glob. "*" = 인자 1개, "**" = 나머지 전부 (마지막 세그먼트에만 허용) */
+  argPattern?: string[];
+  cwdMustBeWorkspaceRoot?: boolean;
+  effect: "auto" | "conditional";
+}
+
+export interface CommandPolicy {
+  /** allow보다 항상 우선 평가. 매치 시 riskTier = "blocked" (override 불가) */
+  deny: Omit<CommandRule, "effect">[];
+  allow: CommandRule[];
+}
+
+/**
+ * docs/design/ui-wireframes.md 3.3절 — 승인 모달이 렌더링하는 것.
+ * Rust가 만들고 UI로 직접 전달한다(Node를 거치지 않는다 — process-architecture.md 4절).
+ */
+export interface ApprovalRequestItem {
+  requestId: string;
+  tool: ToolName;
+  riskLevel: PolicyRiskLevel;
+  reason: string;
+  /** run_command일 때만 채워지며, 실제 실행되는 argv와 정확히 같다. */
+  command?: { program: string; args: string[]; cwd: string };
+  /** 파일 도구일 때 대상 경로(workspace 상대) */
+  path?: string;
+  /** apply_patch/create_file의 변경 미리보기 (크면 잘림) */
+  preview?: string;
+}
+
+export interface ApprovalRequest {
+  approvalId: string;
+  taskId: string;
+  items: ApprovalRequestItem[];
+  createdAt: ISODateTime;
+}
+
+export interface ApprovalResponse {
+  approvalId: string;
+  granted: boolean;
+  /** 거부 사유(선택) — 이벤트 로그에 남는다. */
+  note?: string;
+  respondedAt: ISODateTime;
 }
 
 // docs/design/state-machine-and-protocol.md 10절 — 롤백 UX가 사용하는 파일 변경 기록
 export interface FileMutationRecord {
   requestId: string;
+  taskId: string;
+  /** workspace 상대경로 */
   path: string;
-  preImage: { existed: boolean; contentRef?: string };
-  postImage: { existed: boolean; contentRef?: string };
+  preImage: { existed: boolean; contentRef?: string; sha256?: string };
+  postImage: { existed: boolean; contentRef?: string; sha256?: string };
 }
