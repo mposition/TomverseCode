@@ -44,22 +44,39 @@ Phase 0 스파이크 실측: 쉬운 버그 5건에서 **교차검증은 정확�
 
 ```
 packages/protocol/   @tomverse/protocol — 공유 타입의 단일 소스 (설계 문서의 코드 블록이 여기 실체가 됨)
-packages/sidecar/    Node sidecar — Orchestrator, Provider Adapters, Context Engine
+packages/sidecar/    Node sidecar — Orchestrator(상태 머신), Provider Adapters, Context Engine, Router
 apps/desktop/        Tauri 2 + React
-  src-tauri/         Rust core — Policy Gate, Tool Runtime, SQLite, 자격증명, sidecar spawn
+  src/               최소 UI — 단계 표시, 이벤트 로그, 승인 모달, diff, 검증 결과
+  src-tauri/         Tauri 껍데기 — command/event 배관과 승인 왕복의 UI 쪽 절반. 보안 로직 없음
+    core/            tomverse-core — Rust 신뢰 경계 전체. tauri에 의존하지 않는 별도 크레이트
+      src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용)
 spike/               Phase 0 가설 검증 하네스 (프로덕션 코드 아님, 실험 기록)
 docs/design/         설계 문서
 ```
+
+**`core/`를 별도 크레이트로 둔 이유**(process-architecture.md 8.1절): `tauri`는 GUI 시스템 라이브러리를
+요구하므로, 신뢰 경계 코드가 거기에 묶이면 GUI 없는 환경에서 `cargo test`가 돌지 않는다. 보안 로직의
+테스트 가능성을 GUI 툴킷 설치 여부에 인질로 잡히지 않기 위한 분리이며, "보안 로직과 UI 로직을 섞지 않는다"를
+구조로 강제하는 장치이기도 하다. `core/`는 자체 워크스페이스 루트다(`[workspace]` 빈 테이블).
 
 ## 빌드 및 실행
 
 ### Node 쪽 (protocol, sidecar)
 
 ```bash
-npm install                                  # 루트에서 (npm workspaces)
-npm run build --workspace=@tomverse/protocol
-cd packages/sidecar && npm test              # 실제 자식 프로세스를 띄우는 스모크 테스트
+npm install            # 루트에서 (npm workspaces)
+npm run typecheck      # 전 워크스페이스
+npm run build          # protocol → sidecar → desktop 프런트엔드
+npm test               # sidecar 단위 테스트 (상태 머신, 컨텍스트, 공급자, 라우터)
+
+npm run verify         # M0 전체: 위 + Rust 단위 테스트 + 실제 구성요소 e2e
 ```
+
+**end-to-end 테스트는 Rust 호스트 바이너리를 요구한다** — `npm run core:build`를 먼저 실행해야
+`npm run test:e2e`가 돈다. 산출물이 없으면 조용히 건너뛰지 않고 실패하며, 무엇을 빌드해야 하는지 알려준다.
+
+`node --test <디렉터리>`가 이 Node 버전에서 동작하지 않으므로(아래 함정 기록) 테스트 파일 경로를
+`packages/sidecar/package.json`에 직접 나열한다. 새 테스트 파일을 추가하면 그 목록도 갱신할 것.
 
 ### Rust 쪽 — **반드시 이 패턴을 쓸 것**
 
@@ -78,6 +95,17 @@ cargo build
 ```
 
 이 패턴을 매번 재발견하지 말 것. `cargo check`/`cargo build`/`npm run tauri dev` 모두 동일하게 감싸면 된다.
+
+**단, 신뢰 경계 크레이트(`core/`)는 이 래퍼가 필요 없는 경우가 많다** — tauri에 의존하지 않으므로
+GUI 시스템 라이브러리를 요구하지 않는다. `rusqlite`의 bundled SQLite를 컴파일하려면 C 컴파일러는 필요하다.
+
+```bash
+cargo test  --manifest-path apps/desktop/src-tauri/core/Cargo.toml
+cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
+```
+
+`rusqlite`는 0.37로 고정되어 있다 — 0.38 이상은 build script가 unstable `cfg_select`를 써서
+현재 툴체인에서 컴파일되지 않는다. 올리기 전에 툴체인을 먼저 확인할 것.
 
 ## 이 환경에서 이미 밟은 함정
 

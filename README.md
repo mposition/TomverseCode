@@ -43,12 +43,43 @@ Tauri 2 + React (데스크톱 UI) · Rust (정책·실행·저장 신뢰 경계)
 
 ## 현재 상태
 
-**개발 초기 단계.** 설계 문서가 먼저 작성되었고, 모노레포 스캐폴딩과 프로세스 간 통신 배관이 동작하는 단계다.
+**M0(코어 루프) 동작.** 자연어 요청 한 건이 스냅샷 → 분류 → 모델 수정안 → 정책 판단 → 사용자 승인 →
+파일 변경 → 결정론적 검증 → 최종 판정까지 완주하며, 모든 단계가 append-only 이벤트로 남는다.
 
-- 동작함: 공유 프로토콜 타입 패키지, Node sidecar(stdio+NDJSON IPC, 위험도 분류), Tauri 앱이 sidecar를 spawn하고 통신
-- 미구현: Tool Runtime, Policy Gate 실행부, Context Engine, 모델 어댑터 연결, 검증 루프
+동작함:
 
+- **Rust 신뢰 경계** (`apps/desktop/src-tauri/core`) — Policy Gate, Tool Runtime(9개 도구), SQLite 이벤트 로그,
+  Verification Runner, 롤백. Tauri에 의존하지 않는 별도 크레이트라 GUI 없이 테스트된다.
+- **Node sidecar** — 상태 머신(전이 표 + 검증), Context Engine, Model Registry/Router, OpenAI·Anthropic 어댑터,
+  결정론적 fake 공급자.
+- **최소 UI** — 워크스페이스 선택, Fast/Verified 정책, 단계 표시, 실시간 이벤트 로그, 승인 모달(실행될 argv 그대로 표시),
+  diff, 검증 결과, 되돌리기.
+- **헤드리스 호스트** (`tomverse-host`) — GUI 없이 같은 코어 루프를 돌린다. end-to-end 테스트가 이걸 쓴다.
+
+M0 완료 기준(버그 수정 1건 완주)은 `packages/sidecar/test/e2e.test.ts`가 **실제 Rust Policy Gate + Tool Runtime +
+SQLite + 실제로 실패하는 테스트가 있는 픽스처 저장소**로 검증한다. 가짜인 것은 LLM 응답 하나뿐이다.
+
+아직 없는 것:
+
+- Tree-sitter 심볼/의존성 그래프 (`WorkspaceIndex.symbols`가 비어 있음 — 관련 파일 선정이 파일명·경로 매칭에 의존한다)
+- Windows Credential Manager 연동 (지금은 환경변수 — UI가 "개발용 임시 방식"으로 표시한다)
+- Git commit 자동 생성 (도구·정책은 있으나 오케스트레이터가 계획에 넣지 않는다), PR 연동, MCP, Hooks
+- 앱 재시작 후 진행 중이던 태스크 복구 (스키마와 조회는 있고 UI 흐름이 없음)
+- 멀티턴 세션, 다중 태스크 동시 실행
+
+전체 검증: `npm run verify` (Node 타입체크·빌드·단위 테스트 + Rust 단위 테스트 + 실제 구성요소 e2e).
 로드맵(M0~M6)과 각 단계의 완료 기준은 [docs/design/product-strategy.md](./docs/design/product-strategy.md) 13절.
+
+### M0에서 실제로 배운 것
+
+구현하면서 설계 문서가 다루지 않았던 두 가지를 고쳤고, 둘 다 "통과로 위장하지 않는다"는 원칙에 직결된다.
+
+1. **`NODE_TEST_CONTEXT`가 설정된 환경에서는 `node --test`가 실패해도 exit 0을 반환한다.** 검증 러너가
+   테스트 실패를 통과로 보고하게 되는 문제라, Tool Runtime이 검증 명령의 환경에서 테스트 러너 제어 변수를
+   제거한다. 결정론적 검증은 실행 환경을 통제해야 성립한다.
+2. **"변경 전에도 실패했으니 이번 변경 책임이 아니다 → 통과"는 위험한 규칙이었다.** 그러면 "실패하는 테스트를
+   고쳐줘"라는 태스크가 아무것도 고치지 않고 성공한다. 지금은 현재 실패 중인 체크가 있으면 실패로 판정하고,
+   "당신 변경 때문이 아니다"는 별도로 보고한다.
 
 ### 검증되지 않은 가설을 공개해 둡니다
 
