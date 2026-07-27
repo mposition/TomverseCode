@@ -22,6 +22,12 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["process", "io-util", "sync", "rt-multi-thread", "macros"] }
 uuid = { version = "1", features = ["v4"] }
+# 신뢰 경계 전체(Policy Gate, Tool Runtime, 저장, 검증, sidecar IPC).
+# 이 크레이트는 자체 워크스페이스이며 tauri에 의존하지 않는다 — 그래서 GUI 시스템
+# 라이브러리 없이 `cargo test`가 돌고, 보안 로직이 UI 관심사와 섞이지 않는다.
+tomverse-core = { path = "core" }
+
+# tokio는 더 이상 직접 쓰지 않는다 — sidecar IPC가 tomverse-core의 std 스레드 구현으로
+# 옮겨갔기 때문이다(Tauri와 헤드리스 호스트가 같은 코드를 공유해야 해서).
 
