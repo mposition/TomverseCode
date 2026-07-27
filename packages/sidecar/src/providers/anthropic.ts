@@ -1,0 +1,227 @@
+import Anthropic from "@anthropic-ai/sdk";
+import type {
+  DraftProposal,
+  ModelEntry,
+  NormalizedProviderError,
+  ProviderCapabilitiesView,
+  ReviewDecision,
+  SingleModelFixResult,
+  TokenUsage,
+} from "@tomverse/protocol";
+import { validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
+import { normalizeProviderError } from "./errors.js";
+import {
+  buildDraftPrompt,
+  buildFixPrompt,
+  buildReviewPrompt,
+  buildSingleModelFixPrompt,
+  DRAFT_SCHEMA,
+  REVIEW_SCHEMA,
+  SINGLE_FIX_SCHEMA,
+} from "./prompts.js";
+import type {
+  AdapterDeps,
+  DraftInput,
+  FixInput,
+  ProviderAdapter,
+  ProviderCallContext,
+  ProviderResponse,
+  ReviewInput,
+} from "./types.js";
+
+/**
+ * Anthropic 어댑터.
+ *
+ * 구조화 출력: Messages API + `tool_choice: { type: "tool", name }`로 특정 도구 호출을 강제한다.
+ * Phase 0 스파이크(`spike/src/providers/anthropic.ts`)에서 검증된 패턴이다
+ * (state-machine-and-protocol.md 13.3절).
+ *
+ * OpenAI와 다른 메커니즘(강제 도구 호출 vs strict json_schema)을 쓰지만 **같은 스키마 객체**를
+ * 공유한다 — 두 모델에게 다른 것을 요구하면 모델 간 판정 차이를 비교할 수 없게 된다.
+ */
+export class AnthropicAdapter implements ProviderAdapter {
+  readonly providerId: string;
+  readonly modelId: string;
+  private readonly entry: ModelEntry;
+  private readonly client: Anthropic;
+  private readonly controllers = new Set<AbortController>();
+
+  constructor(deps: AdapterDeps) {
+    this.entry = deps.entry;
+    this.providerId = deps.entry.providerId;
+    this.modelId = deps.entry.modelId;
+    this.client = new Anthropic({
+      apiKey: deps.apiKey,
+      baseURL: deps.entry.apiBaseUrl,
+      // 재시도는 우리 정책이 관리한다 (openai.ts와 같은 이유).
+      maxRetries: 0,
+    });
+  }
+
+  capabilities(): ProviderCapabilitiesView {
+    return {
+      providerId: this.providerId,
+      modelId: this.modelId,
+      supportsStructuredOutput: this.entry.capabilities.structuredOutput !== "none",
+      supportsToolCalling: this.entry.capabilities.toolCalling !== "none",
+      maxContextTokens: this.entry.capabilities.maxContextTokens,
+      maxOutputTokens: this.entry.capabilities.maxOutputTokens,
+    };
+  }
+
+  cancel(): void {
+    for (const controller of this.controllers) controller.abort();
+    this.controllers.clear();
+  }
+
+  normalizeUsage(raw: unknown): TokenUsage {
+    const usage = (raw ?? {}) as { input_tokens?: number; output_tokens?: number };
+    return {
+      inputTokens: usage.input_tokens ?? 0,
+      outputTokens: usage.output_tokens ?? 0,
+    };
+  }
+
+  normalizeError(raw: unknown): NormalizedProviderError {
+    return normalizeProviderError(raw);
+  }
+
+  async generateDraft(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<DraftProposal>> {
+    const { parsed, usage, latencyMs } = await this.forcedToolCall(
+      buildDraftPrompt(input),
+      { name: "submit_draft", description: "Submit your draft fix.", schema: DRAFT_SCHEMA },
+      ctx
+    );
+    return {
+      value: validateDraftProposal(parsed, {
+        taskId: ctx.taskId,
+        proposalId: `${ctx.taskId}-${ctx.callId}`,
+        model: this.modelId,
+        createdAt: new Date().toISOString(),
+      }),
+      usage,
+      latencyMs,
+    };
+  }
+
+  async reviewProposal(input: ReviewInput, ctx: ProviderCallContext): Promise<ProviderResponse<ReviewDecision>> {
+    const { parsed, usage, latencyMs } = await this.forcedToolCall(
+      buildReviewPrompt(input),
+      {
+        name: "submit_review",
+        description:
+          "Submit your independent review verdict. Judge the patch against the task and the files — do not assume the draft is correct.",
+        schema: REVIEW_SCHEMA,
+      },
+      ctx
+    );
+    return {
+      value: validateReviewDecision(parsed, {
+        taskId: ctx.taskId,
+        proposalId: input.draft.proposalId,
+        model: this.modelId,
+        createdAt: new Date().toISOString(),
+      }),
+      usage,
+      latencyMs,
+    };
+  }
+
+  async singleModelFix(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<SingleModelFixResult>> {
+    const { parsed, usage, latencyMs } = await this.forcedToolCall(
+      buildSingleModelFixPrompt(input),
+      { name: "submit_fix", description: "Submit your fix, a question, or a rejection.", schema: SINGLE_FIX_SCHEMA },
+      ctx
+    );
+    return {
+      value: validateSingleModelFixResult(parsed, {
+        taskId: ctx.taskId,
+        model: this.modelId,
+        createdAt: new Date().toISOString(),
+      }),
+      usage,
+      latencyMs,
+    };
+  }
+
+  async continueWithToolResult(
+    input: FixInput,
+    ctx: ProviderCallContext
+  ): Promise<ProviderResponse<SingleModelFixResult>> {
+    const { parsed, usage, latencyMs } = await this.forcedToolCall(
+      buildFixPrompt(input),
+      {
+        name: "submit_fix",
+        description: "Submit a corrected patch based on the verification output.",
+        schema: SINGLE_FIX_SCHEMA,
+      },
+      ctx
+    );
+    return {
+      value: validateSingleModelFixResult(parsed, {
+        taskId: ctx.taskId,
+        model: this.modelId,
+        createdAt: new Date().toISOString(),
+      }),
+      usage,
+      latencyMs,
+    };
+  }
+
+  private async forcedToolCall(
+    prompt: string,
+    tool: { name: string; description: string; schema: unknown },
+    ctx: ProviderCallContext
+  ): Promise<{ parsed: unknown; usage: TokenUsage; latencyMs: number }> {
+    const controller = new AbortController();
+    this.controllers.add(controller);
+    const onAbort = () => controller.abort(ctx.signal.reason);
+    ctx.signal.addEventListener("abort", onAbort, { once: true });
+
+    const start = Date.now();
+    try {
+      const message = await this.client.messages.create(
+        {
+          model: this.modelId,
+          max_tokens: this.entry.capabilities.maxOutputTokens,
+          tools: [
+            {
+              name: tool.name,
+              description: tool.description,
+              input_schema: tool.schema as Anthropic.Tool.InputSchema,
+            },
+          ],
+          // 구조화 출력 강제: 이 도구를 반드시 호출하게 한다.
+          tool_choice: { type: "tool", name: tool.name },
+          messages: [{ role: "user", content: prompt }],
+        },
+        { signal: controller.signal }
+      );
+
+      const latencyMs = Date.now() - start;
+      const block = message.content.find(
+        (b): b is Anthropic.ToolUseBlock => b.type === "tool_use" && b.name === tool.name
+      );
+      if (!block) {
+        // tool_choice로 강제했는데도 도구 호출이 없으면 스키마 계약 위반이다.
+        const error = new Error(`Anthropic 응답에 ${tool.name} tool_use 블록이 없음`) as Error & { status?: number };
+        error.status = 400;
+        throw error;
+      }
+      return { parsed: block.input, usage: this.normalizeUsage(message.usage), latencyMs };
+    } finally {
+      ctx.signal.removeEventListener("abort", onAbort);
+      this.controllers.delete(controller);
+    }
+  }
+}
+
+/** 레지스트리 엔트리에 맞는 어댑터를 만든다. 모델 ID를 코드에 고정하지 않기 위한 팩토리. */
+export function createNativeAdapter(entry: ModelEntry, apiKey: string): ProviderAdapter {
+  switch (entry.providerId) {
+    case "anthropic":
+      return new AnthropicAdapter({ entry, apiKey });
+    default:
+      throw new Error(`createNativeAdapter는 ${entry.providerId}를 다루지 않습니다`);
+  }
+}

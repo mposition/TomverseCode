@@ -1,0 +1,393 @@
+import type {
+  DetectedCommand,
+  ModelId,
+  ProjectMeta,
+  RelevanceReason,
+  RelevantFile,
+  WorkspaceIndex,
+  WorkspaceIndexFileEntry,
+  WorkspaceSnapshot,
+} from "@tomverse/protocol";
+import type { ToolBridge } from "../tools/bridge.js";
+import { classifyFile, languageOf } from "./exclude.js";
+import { packageFiles, type TokenBudget } from "./budget.js";
+
+/**
+ * Context Engine — docs/design/context-engine.md.
+ *
+ * 2계층 구조를 지킨다:
+ *  - `WorkspaceIndex`: **세션 스코프**. 파일 트리 + 프로젝트 메타. 비싼 작업을 여기서 1회.
+ *  - `WorkspaceSnapshot`: **태스크 스코프**. 인덱스에서 관련 파일을 고르고 예산에 맞춰 패키징.
+ *
+ * M0에서 하지 않는 것: Tree-sitter 심볼 그래프(9절). 그래서 `symbols`/`dependencyEdges`는
+ * 비어 있고 `symbol-match`/`dependency` 선정은 동작하지 않는다. 두 타입을 분리해 둔 덕분에
+ * 나중에 심볼 인덱스를 채워도 스냅샷 생성 쪽 계약은 바뀌지 않는다.
+ *
+ * **모든 파일 접근이 `ToolBridge`(= Rust Tool Runtime)를 지난다.** 이 모듈에 `node:fs`
+ * import가 없는 것은 실수가 아니라 신뢰 경계 원칙이다.
+ */
+
+/** 프로젝트 규칙 파일 — 우선순위 순서대로 찾아 항상 스냅샷에 포함한다 (4절). */
+const PROJECT_RULE_FILES = ["CLAUDE.md", "AGENTS.md", ".cursorrules", "CONTRIBUTING.md", "README.md"];
+
+const MANIFEST_FILES = ["package.json", "Cargo.toml", "pyproject.toml", "go.mod", "pom.xml", "build.gradle"];
+
+export interface ContextEngineOptions {
+  /** 인덱싱할 최대 파일 수. 아주 큰 저장소에서 첫 태스크가 무한정 느려지지 않게 한다. */
+  maxIndexedFiles?: number;
+  /** 관련 파일 후보 최대 개수 */
+  maxRelevantFiles?: number;
+}
+
+export class ContextEngine {
+  private index: WorkspaceIndex | null = null;
+  private readonly maxIndexedFiles: number;
+  private readonly maxRelevantFiles: number;
+
+  constructor(options: ContextEngineOptions = {}) {
+    this.maxIndexedFiles = options.maxIndexedFiles ?? 20_000;
+    this.maxRelevantFiles = options.maxRelevantFiles ?? 12;
+  }
+
+  /**
+   * 세션 스코프 인덱스 구축/재사용.
+   *
+   * 3절 전략 C: 첫 태스크만 느리고, 이후에는 git HEAD가 같으면 그대로 재사용한다.
+   * HEAD가 바뀌면 전체 재구축한다 — 증분 갱신(6절)은 심볼 인덱스가 있을 때 의미가 커지므로
+   * M0에서는 전체 재구축이 더 단순하고 스테일 컨텍스트 위험도 없다.
+   */
+  async ensureIndex(bridge: ToolBridge, workspaceId: string): Promise<WorkspaceIndex> {
+    const gitHead = await this.readGitHead(bridge);
+    if (this.index && this.index.workspaceId === workspaceId && this.index.gitHeadAtIndex === gitHead) {
+      return this.index;
+    }
+
+    const entries = await bridge.listFiles(".");
+    const fileTree: WorkspaceIndexFileEntry[] = [];
+    const excluded: { path: string; reason: string }[] = [];
+
+    for (const entry of entries) {
+      if (entry.isDir) continue;
+      if (fileTree.length >= this.maxIndexedFiles) {
+        excluded.push({ path: entry.path, reason: `인덱싱 상한(${this.maxIndexedFiles}개) 초과` });
+        continue;
+      }
+      const verdict = classifyFile(entry.path, entry.sizeBytes);
+      if (verdict.excluded) {
+        excluded.push({ path: entry.path, reason: verdict.reason ?? "제외됨" });
+        continue;
+      }
+      fileTree.push({
+        path: entry.path,
+        language: languageOf(entry.path),
+        sizeBytes: entry.sizeBytes,
+        // sha256은 Rust가 파일을 쓸 때만 계산한다. 인덱싱 단계에서 전 파일 해시를 구하려면
+        // 전부 읽어야 하고 그건 3절이 피하려는 비용이다. 빈 문자열이 아니라 명시적으로 비워둔다.
+        sha256: "",
+      });
+    }
+
+    const projectMeta = await this.detectProjectMeta(bridge, fileTree);
+
+    const now = new Date().toISOString();
+    this.index = {
+      workspaceId,
+      gitHeadAtIndex: gitHead,
+      fileTree,
+      symbols: [], // M0 범위 밖 (context-engine.md 9절)
+      dependencyEdges: [],
+      projectMeta,
+      excluded,
+      builtAt: now,
+      lastIncrementalUpdateAt: now,
+    };
+    return this.index;
+  }
+
+  /**
+   * 태스크 스코프 스냅샷. 인덱스에서 고르고 읽어 패키징만 한다 (2절 — 태스크당 비용이 낮은 이유).
+   */
+  async createSnapshot(
+    bridge: ToolBridge,
+    input: {
+      workspaceId: string;
+      userMessage: string;
+      tokenBudgets: TokenBudget[];
+    }
+  ): Promise<WorkspaceSnapshot> {
+    const index = await this.ensureIndex(bridge, input.workspaceId);
+    const gitStatus = await bridge.gitStatus().catch(() => ({ stdout: "", exitCode: null }));
+    const diffSummary = await bridge.gitDiff({ statOnly: true }).catch(() => "");
+
+    const candidates = this.selectRelevantFiles(index, input.userMessage);
+
+    // 명시 지목됐지만 제외 규칙에 걸린 파일은 사용자에게 알린다 (7절 마지막 문단).
+    const excludedNotes = this.notesForMentionedButExcluded(index, input.userMessage);
+
+    const primaryBudget = input.tokenBudgets[0]?.maxTokens ?? 60_000;
+    const relevantFiles: RelevantFile[] = [];
+
+    for (const candidate of candidates) {
+      const file = await bridge.readFile(candidate.path).catch(() => null);
+      if (!file || file.binary || file.content === null) {
+        excludedNotes.push({ path: candidate.path, reason: "읽을 수 없거나 바이너리로 판정됨" });
+        continue;
+      }
+      relevantFiles.push({
+        path: candidate.path,
+        reason: candidate.reason,
+        reasonDetail: candidate.reasonDetail,
+        content: file.content,
+        truncated: file.truncated,
+        sizeBytes: file.sizeBytes,
+        includedBytes: file.content.length,
+      });
+    }
+
+    // 예산에 맞춰 뒤쪽 우선순위부터 잘라낸다 (8절).
+    const packaged = packageFiles(relevantFiles, primaryBudget);
+    for (const dropped of packaged.dropped) {
+      excludedNotes.push({ path: dropped.path, reason: dropped.reason });
+    }
+
+    return {
+      snapshotId: `snap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      workspaceId: input.workspaceId,
+      gitHead: index.gitHeadAtIndex,
+      gitBranch: parseBranch(gitStatus.stdout),
+      gitDirty: hasUncommittedChanges(gitStatus.stdout),
+      gitDiffSummary: diffSummary.trim() === "" ? undefined : diffSummary.trim(),
+      relevantFiles: packaged.files,
+      projectMeta: index.projectMeta,
+      tokenBudget: input.tokenBudgets.map((b) => ({ modelId: b.modelId as ModelId, maxTokens: b.maxTokens })),
+      excludedNotes: excludedNotes.length > 0 ? excludedNotes : undefined,
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * 관련 파일 선정 — 4절 표의 우선순위 순서(mentioned > recently-changed > dependency).
+   * `symbol-match`는 심볼 인덱스가 없어 M0에서 동작하지 않으므로 아예 생성하지 않는다
+   * (빈 결과를 만들어 "구현했다"고 보이게 하지 않는다).
+   */
+  private selectRelevantFiles(
+    index: WorkspaceIndex,
+    userMessage: string
+  ): { path: string; reason: RelevanceReason; reasonDetail: string }[] {
+    const selected = new Map<string, { path: string; reason: RelevanceReason; reasonDetail: string }>();
+
+    const add = (path: string, reason: RelevanceReason, reasonDetail: string) => {
+      if (!selected.has(path) && selected.size < this.maxRelevantFiles) {
+        selected.set(path, { path, reason, reasonDetail });
+      }
+    };
+
+    // 1) 프로젝트 규칙/매니페스트는 우선순위와 별개로 항상 포함한다 (4절 마지막 문단).
+    for (const path of [...PROJECT_RULE_FILES, ...MANIFEST_FILES]) {
+      const entry = index.fileTree.find((f) => f.path === path);
+      if (entry) add(path, "project-meta", `프로젝트 규칙/매니페스트 — 항상 포함 (${path})`);
+    }
+
+    // 2) mentioned: 메시지에서 경로나 파일명을 직접 지목한 경우
+    const mentions = extractMentions(userMessage);
+    for (const entry of index.fileTree) {
+      const base = entry.path.split("/").pop() ?? entry.path;
+      const hit = mentions.find((m) => entry.path === m || entry.path.endsWith(`/${m}`) || base === m);
+      if (hit) add(entry.path, "mentioned", `요청 메시지가 ${JSON.stringify(hit)}를 직접 지목함`);
+    }
+
+    // 3) 키워드 기반: 메시지의 식별자 후보가 파일명에 들어있는 경우.
+    //    심볼 테이블이 없으므로 파일명 매칭이 우리가 할 수 있는 최선이며, 그 사실을 reasonDetail에
+    //    적어 사용자가 선정 근거의 강도를 판단할 수 있게 한다.
+    const keywords = extractKeywords(userMessage);
+    for (const keyword of keywords) {
+      for (const entry of index.fileTree) {
+        const base = (entry.path.split("/").pop() ?? "").toLowerCase();
+        if (base.includes(keyword.toLowerCase())) {
+          add(entry.path, "mentioned", `파일명이 요청의 키워드 ${JSON.stringify(keyword)}를 포함함`);
+        }
+      }
+    }
+
+    // 4) 소스로 보이는 파일이 하나도 안 잡혔으면, 최소한 진입점 후보를 넣는다.
+    //    빈 컨텍스트로 모델을 부르면 확실히 실패하므로, 못 골랐다는 사실보다 후보를 주는 편이 낫다.
+    if ([...selected.values()].every((f) => f.reason === "project-meta")) {
+      const sourceFiles = index.fileTree
+        .filter((f) => f.language !== null && f.language !== "markdown" && f.language !== "json")
+        .slice(0, 5);
+      for (const entry of sourceFiles) {
+        add(entry.path, "dependency", "요청에서 대상 파일을 특정하지 못해 선택된 소스 후보");
+      }
+    }
+
+    // 우선순위 정렬 — 예산 부족 시 뒤쪽부터 잘리므로 순서가 곧 정책이다.
+    const rank: Record<RelevanceReason, number> = {
+      "project-meta": 0,
+      mentioned: 1,
+      "symbol-match": 2,
+      "recently-changed": 3,
+      dependency: 4,
+    };
+    return [...selected.values()].sort((a, b) => rank[a.reason] - rank[b.reason]);
+  }
+
+  private notesForMentionedButExcluded(index: WorkspaceIndex, userMessage: string): { path: string; reason: string }[] {
+    const mentions = extractMentions(userMessage);
+    const notes: { path: string; reason: string }[] = [];
+    for (const mention of mentions) {
+      const hit = index.excluded.find((e) => e.path === mention || e.path.endsWith(`/${mention}`));
+      if (hit) notes.push({ path: hit.path, reason: hit.reason });
+    }
+    return notes;
+  }
+
+  private async readGitHead(bridge: ToolBridge): Promise<string> {
+    const status = await bridge.gitStatus().catch(() => ({ stdout: "", exitCode: null }));
+    // porcelain=v1 --branch의 첫 줄: "## branch...upstream [ahead 1]"
+    // HEAD SHA는 여기 없으므로 git status 결과 전체를 지문으로 쓴다 — 인덱스 무효화 판정에는
+    // "무언가 바뀌었는가"만 필요하고, SHA를 얻으려 명령을 하나 더 실행할 이유가 없다.
+    const branch = parseBranch(status.stdout);
+    return branch === "(unknown)" ? "(no-git)" : `${branch}@${hashString(status.stdout)}`;
+  }
+
+  /**
+   * 프로젝트 유형과 검증 명령 감지.
+   *
+   * 여기서 감지한 명령은 **UI 표시와 모델 컨텍스트용**이다. 실제 검증에 쓰이는 명령은
+   * Rust의 `verify.rs`가 독립적으로 감지한다 — Node가 넘긴 명령을 그대로 실행하면
+   * "검증 명령을 바꿔치기해 통과시키는" 경로가 열리기 때문이다. 두 곳에 감지 로직이
+   * 있는 것은 중복이 아니라 의도된 이중화다.
+   */
+  private async detectProjectMeta(bridge: ToolBridge, fileTree: WorkspaceIndexFileEntry[]): Promise<ProjectMeta> {
+    const paths = new Set(fileTree.map((f) => f.path));
+    const languages = [...new Set(fileTree.map((f) => f.language).filter((l): l is string => l !== null))];
+
+    const meta: ProjectMeta = {
+      languages,
+      agentsMdPresent: false,
+    };
+
+    // 프로젝트 규칙 파일 — 존재하면 내용을 항상 컨텍스트에 넣는다.
+    const ruleSources: string[] = [];
+    const ruleTexts: string[] = [];
+    for (const candidate of PROJECT_RULE_FILES) {
+      if (!paths.has(candidate)) continue;
+      const content = await bridge.tryReadFile(candidate);
+      if (content !== null && content.trim().length > 0) {
+        ruleSources.push(candidate);
+        ruleTexts.push(`# ${candidate}\n\n${content}`);
+        // CLAUDE.md/AGENTS.md만으로 충분하면 README까지 다 넣지 않는다 (예산 절약).
+        if (candidate === "CLAUDE.md" || candidate === "AGENTS.md") break;
+      }
+    }
+    if (ruleTexts.length > 0) {
+      meta.agentsMdPresent = true;
+      meta.agentsMdContent = ruleTexts.join("\n\n---\n\n");
+      meta.agentsMdSources = ruleSources;
+    }
+
+    if (paths.has("package.json")) {
+      const raw = await bridge.tryReadFile("package.json");
+      const scripts = parseNpmScripts(raw);
+      const npm = (script: string, source: string): DetectedCommand =>
+        script === "test"
+          ? { program: "npm", args: ["test"], cwd: ".", source }
+          : { program: "npm", args: ["run", script], cwd: ".", source };
+      if (scripts.has("test")) meta.testCommand = npm("test", "package.json scripts.test");
+      if (scripts.has("build")) meta.buildCommand = npm("build", "package.json scripts.build");
+      if (scripts.has("lint")) meta.lintCommand = npm("lint", "package.json scripts.lint");
+      if (scripts.has("typecheck")) meta.typecheckCommand = npm("typecheck", "package.json scripts.typecheck");
+    }
+
+    if (paths.has("Cargo.toml")) {
+      meta.testCommand ??= { program: "cargo", args: ["test", "--quiet"], cwd: ".", source: "Cargo.toml" };
+      meta.buildCommand ??= { program: "cargo", args: ["build", "--quiet"], cwd: ".", source: "Cargo.toml" };
+    }
+
+    const dotnetProject = [...paths].find((p) => /\.(sln|csproj|fsproj)$/i.test(p) && !p.includes("/"));
+    if (dotnetProject) {
+      meta.testCommand ??= { program: "dotnet", args: ["test"], cwd: ".", source: dotnetProject };
+      meta.buildCommand ??= { program: "dotnet", args: ["build"], cwd: ".", source: dotnetProject };
+    }
+
+    return meta;
+  }
+}
+
+// ---- 순수 함수 (단위 테스트 대상) ----
+
+/** 메시지에서 파일 경로처럼 보이는 토큰을 뽑는다. */
+export function extractMentions(message: string): string[] {
+  const found = new Set<string>();
+  const patterns = [
+    // 경로 구분자를 포함하거나 확장자로 끝나는 토큰: src/app.ts, app.tsx
+    /[\w./\\-]*[\w-]+\.[a-zA-Z0-9]{1,6}\b/g,
+    /[\w-]+\/[\w./-]+/g,
+    // dotfile: `.env`, `.env.local`, `.gitignore`. 위 패턴은 점 앞에 단어 문자를 요구하므로
+    // 이걸 따로 두지 않으면 `.env` 언급을 놓치고, 그러면 "secret을 제외했다"는 안내도 못 한다.
+    /(?:^|[\s"'(])(\.[\w-]+(?:\.[\w-]+)*)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of message.matchAll(pattern)) {
+      const raw = match[1] ?? match[0];
+      const token = raw.replace(/\\/g, "/").replace(/^\.\//, "");
+      // 문장 끝의 마침표를 경로 일부로 오인하지 않는다.
+      const cleaned = token.replace(/\.$/, "");
+      if (cleaned.length > 1) found.add(cleaned);
+    }
+  }
+  return [...found];
+}
+
+/** 식별자 후보(camelCase, snake_case, 3자 이상 영문 단어)를 뽑는다. */
+export function extractKeywords(message: string): string[] {
+  const stop = new Set([
+    "the", "and", "for", "with", "that", "this", "from", "into", "when", "then", "fix", "bug", "please",
+    "should", "would", "could", "make", "made", "does", "not", "but", "you", "are", "was", "were", "have",
+    "add", "use", "using", "code", "file", "files", "test", "tests", "function", "error", "issue",
+  ]);
+  const found = new Set<string>();
+  for (const match of message.matchAll(/\b[A-Za-z_][A-Za-z0-9_]{2,}\b/g)) {
+    const token = match[0];
+    if (stop.has(token.toLowerCase())) continue;
+    // camelCase나 snake_case, 혹은 흔치 않은 단어만 남긴다.
+    const looksLikeIdentifier = /[A-Z]/.test(token.slice(1)) || token.includes("_") || token.length >= 5;
+    if (looksLikeIdentifier) found.add(token);
+  }
+  return [...found].slice(0, 12);
+}
+
+export function parseBranch(porcelain: string): string {
+  const first = porcelain.split("\n").find((line) => line.startsWith("## "));
+  if (!first) return "(unknown)";
+  const rest = first.slice(3);
+  // "branch...origin/branch [ahead 1]" 또는 "HEAD (no branch)"
+  return rest.split(/\.{3}| \[/)[0]?.trim() || "(unknown)";
+}
+
+export function hasUncommittedChanges(porcelain: string): boolean {
+  return porcelain
+    .split("\n")
+    .some((line) => line.trim().length > 0 && !line.startsWith("## "));
+}
+
+export function parseNpmScripts(raw: string | null): Set<string> {
+  if (!raw) return new Set();
+  try {
+    const parsed = JSON.parse(raw) as { scripts?: Record<string, unknown> };
+    return new Set(Object.keys(parsed.scripts ?? {}));
+  } catch {
+    // 매니페스트가 깨져 있으면 스크립트가 없는 것으로 본다 — 추측해서 명령을 만들지 않는다.
+    return new Set();
+  }
+}
+
+/** 인덱스 무효화 판정용 짧은 지문. 암호학적 용도가 아니다. */
+function hashString(input: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}

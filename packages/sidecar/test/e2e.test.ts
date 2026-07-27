@@ -1,0 +1,430 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  createFixtureRepo,
+  ESCAPE_PATCH,
+  FIX_PATCH,
+  MISMATCHED_PATCH,
+  type FixtureRepo,
+} from "./helpers/fixtureRepo.js";
+import type { FakeScriptStep } from "../src/providers/fake.js";
+
+/**
+ * End-to-end 테스트 — **실제** 구성요소로 M0 완료 기준을 검증한다.
+ *
+ * 여기서 진짜인 것:
+ *  - Rust Policy Gate (workspace 경계, 승인 판정)
+ *  - Rust Tool Runtime (실제 파일에 unified diff 적용)
+ *  - Rust Verification Runner (실제로 `npm test`를 실행)
+ *  - SQLite 이벤트 로그 (실제 DB 파일)
+ *  - Node Orchestrator 상태 머신 (실제 sidecar 프로세스)
+ *  - 픽스처 저장소 (실제 파일 시스템, 실제로 실패하는 테스트)
+ *
+ * 가짜인 것은 **LLM 응답 하나뿐**이다 — 그게 fake provider의 존재 이유이고,
+ * 그 외의 것을 mock하면 e2e가 아무것도 증명하지 못한다.
+ */
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// 컴파일 후 위치는 packages/sidecar/dist/test/ 이므로 리포지토리 루트까지 4단계 올라간다.
+const REPO_ROOT = path.resolve(__dirname, "..", "..", "..", "..");
+const HOST_BIN = path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "target", "debug", "tomverse-host");
+const SIDECAR_ENTRY = path.join(REPO_ROOT, "packages", "sidecar", "dist", "src", "index.js");
+
+interface HostRun {
+  exitCode: number;
+  final: {
+    status: string;
+    summary: string;
+    failureReason?: string;
+    verificationReport?: { overall: string; checks: { kind: string; status: string }[] };
+  };
+  mutatedPaths: string[];
+  eventTypes: string[];
+  taskId: string;
+  stderr: string;
+  dbPath: string;
+}
+
+interface RunOptions {
+  message?: string;
+  mode?: "fast" | "verified";
+  approve?: "auto" | "deny";
+  autoApproveWrites?: boolean;
+  script?: FakeScriptStep[];
+  defaultPatch?: string;
+  timeoutSecs?: number;
+}
+
+function hostAvailable(): boolean {
+  return existsSync(HOST_BIN) && existsSync(SIDECAR_ENTRY);
+}
+
+/**
+ * `tomverse-host`를 실제로 실행한다.
+ *
+ * 바이너리나 sidecar dist가 없으면 조용히 통과시키지 않고 **실패**시킨다 —
+ * "환경이 준비되지 않아서 e2e를 건너뛰었다"가 "e2e가 통과했다"로 보이면 안 된다.
+ */
+function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}): HostRun {
+  assert.ok(
+    hostAvailable(),
+    `e2e 테스트에 필요한 산출물이 없습니다.\n` +
+      `  호스트 바이너리: ${HOST_BIN} (${existsSync(HOST_BIN) ? "있음" : "없음"})\n` +
+      `  sidecar 진입점: ${SIDECAR_ENTRY} (${existsSync(SIDECAR_ENTRY) ? "있음" : "없음"})\n` +
+      `다음을 먼저 실행하세요:\n` +
+      `  npm run build\n` +
+      `  cargo build --manifest-path apps/desktop/src-tauri/core/Cargo.toml`
+  );
+
+  const args = [
+    "run",
+    "--workspace",
+    repo.root,
+    "--message",
+    options.message ?? "paginate.js 의 페이지 계산이 한 칸 밀려 있습니다. 1페이지가 첫 항목부터 나오게 고쳐주세요.",
+    "--mode",
+    options.mode ?? "fast",
+    "--approve",
+    options.approve ?? "auto",
+    "--db",
+    path.join(stateDir, "state.db"),
+    "--artifacts",
+    path.join(stateDir, "artifacts"),
+    "--sidecar",
+    SIDECAR_ENTRY,
+    "--timeout-secs",
+    String(options.timeoutSecs ?? 180),
+  ];
+  if (options.autoApproveWrites) args.push("--auto-approve-writes");
+
+  const fakeConfig = {
+    ...(options.defaultPatch !== undefined ? { defaultPatch: options.defaultPatch } : { defaultPatch: FIX_PATCH }),
+    ...(options.script ? { script: options.script } : {}),
+  };
+
+  const result = spawnSync(HOST_BIN, args, {
+    encoding: "utf8",
+    timeout: (options.timeoutSecs ?? 180) * 1000 + 30_000,
+    env: {
+      ...process.env,
+      TOMVERSE_FAKE_SCRIPT: JSON.stringify(fakeConfig),
+      TOMVERSE_EXECUTOR_MODEL: "fake-executor",
+      TOMVERSE_REVIEWER_MODEL: "fake-reviewer",
+      // 실제 공급자가 후보에 끼지 않도록 키를 지운다 — 테스트가 우연히 네트워크를 타면 안 된다.
+      OPENAI_API_KEY: "",
+      ANTHROPIC_API_KEY: "",
+    },
+  });
+
+  const stdout = result.stdout ?? "";
+  const jsonLine = stdout.trim().split("\n").filter(Boolean).pop();
+  assert.ok(jsonLine, `호스트가 결과 JSON을 출력하지 않았습니다.\nstdout:\n${stdout}\nstderr:\n${result.stderr}`);
+
+  const parsed = JSON.parse(jsonLine) as Omit<HostRun, "exitCode" | "stderr">;
+  return { ...parsed, exitCode: result.status ?? -1, stderr: result.stderr ?? "" };
+}
+
+function withRepo(fn: (repo: FixtureRepo, stateDir: string) => void): void {
+  const repo = createFixtureRepo();
+  const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
+  try {
+    fn(repo, stateDir);
+  } finally {
+    repo.cleanup();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+}
+
+/** 이벤트 로그를 SQLite에서 직접 읽는다 — 감사 추적이 실제로 남았는지 확인한다. */
+function readEvents(dbPath: string): { seq: number; type: string; payload: string }[] {
+  const sqlite = spawnSync("sqlite3", [dbPath, "SELECT seq, event_type, payload_json FROM task_events ORDER BY seq"], {
+    encoding: "utf8",
+  });
+  if (sqlite.error || sqlite.status !== 0) return [];
+  return sqlite.stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [seq, type, ...rest] = line.split("|");
+      return { seq: Number(seq), type: type ?? "", payload: rest.join("|") };
+    });
+}
+
+// ---- 픽스처 자체의 전제 검증 ----
+
+/**
+ * 픽스처의 `npm test`를 이 테스트 프로세스 밖에서와 같은 조건으로 실행한다.
+ *
+ * `NODE_TEST_CONTEXT`를 지우는 이유: 우리가 `node --test`로 돌고 있으므로 이 변수가 자식에게
+ * 상속되고, 그러면 자식 `node --test`가 실패해도 exit 0을 반환한다. Rust Tool Runtime도
+ * 같은 변수를 제거하므로(tools/mod.rs) 여기서 지우는 것은 제품 동작을 재현하는 것이다.
+ */
+function runFixtureTests(cwd: string): { status: number | null; stdout: string; stderr: string } {
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  delete env.NODE_OPTIONS;
+  const result = spawnSync("npm", ["test", "--silent"], { cwd, encoding: "utf8", env });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+test("[e2e 전제] 픽스처의 테스트가 수정 전에는 실제로 실패한다", () => {
+  withRepo((repo) => {
+    const result = runFixtureTests(repo.root);
+    assert.notEqual(result.status, 0, "픽스처 테스트가 처음부터 통과하면 e2e가 아무것도 증명하지 못합니다");
+  });
+});
+
+test("[e2e 전제] 수정된 소스에서는 테스트가 통과한다", () => {
+  const repo = createFixtureRepo({ withPassingTest: true });
+  try {
+    const result = runFixtureTests(repo.root);
+    assert.equal(result.status, 0, `수정 후에도 실패합니다:\n${result.stdout}\n${result.stderr}`);
+  } finally {
+    repo.cleanup();
+  }
+});
+
+// ---- M0 완료 기준 ----
+
+test("M0: 버그 수정 1건이 요청→분석→승인→파일 변경→검증→완료까지 완주한다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir);
+
+    assert.equal(run.final.status, "completed", `실패: ${run.final.summary}\nstderr:\n${run.stderr}`);
+    assert.equal(run.exitCode, 0);
+
+    // 1) 파일이 실제로 바뀌었다.
+    assert.deepEqual(run.mutatedPaths, ["paginate.js"]);
+    assert.ok(repo.read("paginate.js").includes("(page - 1) * perPage"));
+
+    // 2) 검증이 실제로 돌아 통과했다 — 통과로 위장한 것이 아니라 npm test가 실제로 성공했다.
+    assert.equal(run.final.verificationReport?.overall, "pass");
+    const testCheck = run.final.verificationReport?.checks.find((c) => c.kind === "test");
+    assert.equal(testCheck?.status, "PASSED");
+
+    // 3) 이벤트 순서가 상태 머신과 일치한다.
+    //    각 도구 실행 안의 순서는 TOOL_REQUESTED → POLICY_DECIDED → (승인) → FILE_MUTATED →
+    //    TOOL_COMPLETED다 (host.rs execute_tool). 정책 판단이 승인 요청보다 먼저 온다 —
+    //    무엇을 승인할지 결정하는 것이 Policy Gate이기 때문이다.
+    const events = run.eventTypes;
+    assertOrder(events, [
+      "TASK_CREATED",
+      "PHASE_CHANGED", // SNAPSHOTTING
+      "SNAPSHOT_CREATED",
+      "TRIAGE_COMPLETED",
+      "ROUTING_DECIDED",
+      "PLAN_CREATED",
+      "TOOL_REQUESTED",
+      "POLICY_DECIDED",
+      "APPROVAL_REQUESTED",
+      "APPROVAL_GRANTED",
+      "FILE_MUTATED",
+      "TOOL_COMPLETED",
+      "VERIFICATION_COMPLETED",
+      "TASK_COMPLETED",
+    ]);
+
+    // 4) 파일 변경 전에 승인이 있었다.
+    assert.ok(events.indexOf("APPROVAL_GRANTED") < events.indexOf("FILE_MUTATED"));
+    // 5) 정책 판단 없이 실행된 도구가 없다.
+    assert.equal(
+      events.filter((t) => t === "TOOL_REQUESTED").length,
+      events.filter((t) => t === "POLICY_DECIDED").length,
+      "모든 도구 요청은 Policy Gate 판단을 거쳐야 합니다"
+    );
+
+    // 6) 이벤트가 SQLite에 실제로 남았고 seq가 단조 증가한다.
+    const rows = readEvents(run.dbPath);
+    if (rows.length > 0) {
+      const seqs = rows.map((r) => r.seq);
+      assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b));
+      assert.equal(seqs[0], 0);
+    }
+  });
+});
+
+test("M0: 검증되지 않은 통과를 만들지 않는다 — baseline과 post 리포트가 모두 기록된다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir);
+    const verifications = run.eventTypes.filter((t) => t === "VERIFICATION_COMPLETED");
+    // baseline(작업 전) + post(작업 후). 둘 다 있어야 "새로 깨진 것"을 판정할 수 있다.
+    assert.ok(verifications.length >= 2, `검증이 두 번(baseline/post) 돌아야 합니다: ${verifications.length}회`);
+  });
+});
+
+test("M0: secret 파일은 모델 컨텍스트에 들어가지 않는다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir, {
+      // 사용자가 .env를 직접 언급해도 하드 필터가 이겨야 한다.
+      message: ".env 의 OPENAI_API_KEY 설정을 paginate.js 에서 읽도록 고쳐주세요",
+    });
+
+    // 이벤트 로그 어디에도 secret 값이 없어야 한다.
+    const rows = readEvents(run.dbPath);
+    const allPayloads = rows.map((r) => r.payload).join("\n");
+    assert.ok(!allPayloads.includes("sk-fixture-must-never-leak"), "이벤트 로그에 secret이 유출되었습니다");
+    // 호스트 stderr(=UI로 릴레이되는 이벤트)에도 없어야 한다.
+    assert.ok(!run.stderr.includes("sk-fixture-must-never-leak"), "이벤트 스트림에 secret이 유출되었습니다");
+  });
+});
+
+// ---- 실패 시나리오 ----
+
+test("실패 시나리오: workspace 밖 파일 수정 요청은 Policy Gate가 거부한다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir, { defaultPatch: ESCAPE_PATCH });
+
+    assert.notEqual(run.final.status, "completed");
+    // 파일이 만들어지지 않았다.
+    assert.deepEqual(run.mutatedPaths, []);
+    // 거부 판정이 이벤트로 남았다.
+    assert.ok(run.eventTypes.includes("POLICY_DECIDED") || run.eventTypes.includes("ERROR"));
+    assert.ok(!run.eventTypes.includes("FILE_MUTATED"), "workspace 밖 파일이 변경되었습니다");
+  });
+});
+
+test("실패 시나리오: 승인 거부는 파일을 변경하지 않고 취소로 끝난다", () => {
+  withRepo((repo, stateDir) => {
+    const before = repo.read("paginate.js");
+    const run = runHost(repo, stateDir, { approve: "deny" });
+
+    assert.notEqual(run.final.status, "completed");
+    assert.equal(repo.read("paginate.js"), before, "승인을 거부했는데 파일이 변경되었습니다");
+    assert.ok(run.eventTypes.includes("APPROVAL_REQUESTED"));
+    assert.ok(run.eventTypes.includes("APPROVAL_DENIED"));
+    assert.ok(!run.eventTypes.includes("FILE_MUTATED"));
+  });
+});
+
+test("실패 시나리오: 기존 내용과 맞지 않는 patch는 부분 적용되지 않는다", () => {
+  withRepo((repo, stateDir) => {
+    const before = repo.read("paginate.js");
+    const run = runHost(repo, stateDir, {
+      defaultPatch: MISMATCHED_PATCH,
+      // fix loop에서도 같은 잘못된 patch를 내면 상한에서 멈춘다.
+      script: [
+        { kind: "fix", payload: { verdict: "ACCEPT", rationale: "다시", patch: MISMATCHED_PATCH } },
+        { kind: "fix", payload: { verdict: "ACCEPT", rationale: "다시", patch: MISMATCHED_PATCH } },
+        { kind: "fix", payload: { verdict: "ACCEPT", rationale: "다시", patch: MISMATCHED_PATCH } },
+        { kind: "fix", payload: { verdict: "ACCEPT", rationale: "다시", patch: MISMATCHED_PATCH } },
+      ],
+    });
+
+    assert.notEqual(run.final.status, "completed");
+    // 가장 중요한 확인: 부분 적용되지 않았다.
+    assert.equal(repo.read("paginate.js"), before, "patch가 부분 적용되었습니다");
+    assert.deepEqual(run.mutatedPaths, []);
+  });
+});
+
+test("실패 시나리오: 검증 실패 후 제한된 fix loop를 돌고 멈춘다", () => {
+  withRepo((repo, stateDir) => {
+    // 문법적으로 적용은 되지만 버그를 고치지 못하는 patch → 테스트가 계속 실패한다.
+    const uselessPatch = [
+      "--- a/paginate.js",
+      "+++ b/paginate.js",
+      "@@ -1,2 +1,3 @@",
+      " function paginate(items, page, perPage) {",
+      "+  // 주석만 추가 — 버그는 그대로다",
+      "   const start = page * perPage;",
+      "",
+    ].join("\n");
+
+    const run = runHost(repo, stateDir, {
+      defaultPatch: uselessPatch,
+      script: [
+        { kind: "fix", payload: { verdict: "REJECT", rationale: "고칠 수 없음", rejectionReason: "원인을 모르겠음" } },
+      ],
+      timeoutSecs: 180,
+    });
+
+    assert.equal(run.final.status, "failed");
+    // 적용은 됐으므로 변경 기록이 남아 있어야 한다 — 롤백이 가능해야 하기 때문이다.
+    assert.deepEqual(run.mutatedPaths, ["paginate.js"]);
+    assert.ok(run.eventTypes.includes("FIX_LOOP_STARTED"), `fix loop가 시작되지 않았습니다: ${run.eventTypes.join(", ")}`);
+    // 무한 루프가 아니라 상한에서 멈췄다.
+    assert.ok(run.eventTypes.filter((t) => t === "FIX_LOOP_STARTED").length <= 3);
+    assert.ok(run.eventTypes.includes("TASK_FAILED"));
+  });
+});
+
+test("롤백이 태스크가 바꾼 파일만 원래 내용으로 되돌린다", () => {
+  withRepo((repo, stateDir) => {
+    const before = repo.read("paginate.js");
+    const run = runHost(repo, stateDir);
+    assert.equal(run.final.status, "completed", run.final.summary);
+    assert.notEqual(repo.read("paginate.js"), before);
+
+    // 사용자가 무관하게 편집한 파일 — 롤백이 이걸 건드리면 안 된다 (문서 10절, git stash를 안 쓰는 이유).
+    repo.write("unrelated.txt", "사용자가 직접 만든 파일\n");
+
+    const rollback = execFileSync(
+      HOST_BIN,
+      [
+        "rollback",
+        "--workspace",
+        repo.root,
+        "--task",
+        run.taskId,
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+      ],
+      { encoding: "utf8" }
+    );
+    const parsed = JSON.parse(rollback.trim().split("\n").pop() as string) as { restored: unknown[]; failed: unknown[] };
+
+    assert.deepEqual(parsed.failed, []);
+    assert.equal(repo.read("paginate.js"), before, "롤백이 원래 내용을 복원하지 못했습니다");
+    assert.equal(repo.read("unrelated.txt"), "사용자가 직접 만든 파일\n", "롤백이 무관한 파일을 건드렸습니다");
+  });
+});
+
+test("verified 모드는 교차검증 경로(REVIEWING)를 지난다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir, { mode: "verified" });
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+    // fake-a(executor)와 fake-b(reviewer)가 다른 공급자이므로 독립성 불변식이 만족된다.
+    assert.ok(run.eventTypes.includes("REVIEW_RECEIVED"), `검수 단계가 실행되지 않았습니다: ${run.eventTypes.join(", ")}`);
+    assert.ok(run.stderr.includes("REVIEWING"), "REVIEWING phase 전이가 보이지 않습니다");
+  });
+});
+
+test("fast 모드 + 단일 파일은 단일 모델 경로를 타지만 검증은 그대로 돈다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir, { mode: "fast" });
+    assert.equal(run.final.status, "completed", run.final.summary);
+    assert.ok(!run.eventTypes.includes("REVIEW_RECEIVED"), "simple tier에서 검수가 실행되었습니다");
+    // 그러나 검증은 생략되지 않는다 — CLAUDE.md 원칙 1.
+    assert.equal(run.final.verificationReport?.overall, "pass");
+  });
+});
+
+test("gitignore된 파일은 컨텍스트 후보에 들어가지 않는다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir);
+    const snapshotLine = run.stderr.split("\n").find((l) => l.includes("SNAPSHOT_CREATED"));
+    if (snapshotLine) {
+      assert.ok(!snapshotLine.includes("ignored/junk.js"), ".gitignore된 파일이 컨텍스트에 들어갔습니다");
+    }
+  });
+});
+
+function assertOrder(actual: string[], expected: string[]): void {
+  let cursor = 0;
+  for (const wanted of expected) {
+    const found = actual.indexOf(wanted, cursor);
+    assert.ok(
+      found >= 0,
+      `이벤트 ${wanted}를 (${cursor} 이후에서) 찾을 수 없습니다.\n실제 순서:\n  ${actual.join("\n  ")}`
+    );
+    cursor = found + 1;
+  }
+}

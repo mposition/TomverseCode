@@ -9,7 +9,14 @@
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspace=@tomverse/sidecar",
+    "//test:e2e": "실제 Rust 호스트 바이너리를 요구한다 — 아래 core:build를 먼저 실행할 것.",
+    "test:e2e": "npm run test:e2e --workspace=@tomverse/sidecar",
+    "core:build": "cargo build --manifest-path apps/desktop/src-tauri/core/Cargo.toml",
+    "core:test": "cargo test --manifest-path apps/desktop/src-tauri/core/Cargo.toml",
+    "//verify": "M0 전체 검증 — Node 타입/빌드/테스트 + Rust 테스트 + 실제 구성요소 e2e.",
+    "verify": "npm run typecheck && npm run build && npm run test && npm run core:test && npm run core:build && npm run test:e2e"
   },
   "engines": {
     "node": ">=20"

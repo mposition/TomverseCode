@@ -4,3 +4,9 @@ node_modules/
 dist/
 *.log
 spike/results/
+
+# Rust 빌드 산출물. Cargo.lock은 바이너리를 만드는 크레이트이므로 커밋한다.
+target/
+
+# 로컬 상태(SQLite, artifact)는 %APPDATA%에 있지만, 개발 중 리포 안으로 떨어질 수 있다.
+.tomverse/

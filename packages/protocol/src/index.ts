@@ -4,4 +4,8 @@ export * from "./snapshot.js";
 export * from "./proposal.js";
 export * from "./tools.js";
 export * from "./verification.js";
+export * from "./registry.js";
+export * from "./provider.js";
+export * from "./events.js";
 export * from "./ipc.js";
+export * from "./validate.js";

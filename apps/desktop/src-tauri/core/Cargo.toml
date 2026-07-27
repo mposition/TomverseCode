@@ -1,0 +1,45 @@
+# tomverse-core는 자체 워크스페이스 루트다 (아래 빈 [workspace] 테이블).
+#
+# 왜 Tauri 크레이트와 분리했는가:
+#  1. 보안 로직(Policy Gate, Tool Runtime, 저장 계층)이 GUI 툴킷 의존성 없이 컴파일·테스트되어야
+#     한다. `tauri`는 webkit2gtk/GTK(Linux) 또는 WebView2(Windows) 시스템 라이브러리를 요구하므로,
+#     신뢰 경계 코드가 거기에 묶이면 GUI 의존성이 없는 환경에서 `cargo test`가 아예 돌지 않는다.
+#  2. CLAUDE.md "보안 로직과 UI 로직을 섞지 않는다" 원칙의 구조적 강제 — 이 크레이트는 tauri에
+#     의존하지 않으므로 UI 관심사가 물리적으로 들어올 수 없다.
+#  3. src-tauri는 이 크레이트를 path 의존성으로 쓰는 얇은 어댑터가 된다.
+[workspace]
+
+[package]
+name = "tomverse-core"
+version = "0.1.0"
+edition = "2021"
+description = "Tomverse Code trust boundary: Policy Gate, Tool Runtime, event store, verification runner"
+publish = false
+
+[lib]
+name = "tomverse_core"
+path = "src/lib.rs"
+
+[[bin]]
+# GUI 없이 코어 루프 전체(Rust 신뢰 경계 + Node sidecar)를 돌리는 헤드리스 호스트.
+# end-to-end 테스트와 개발용 진단에 쓰이며, Tauri 앱은 같은 라이브러리를 다른 프런트엔드로 감싼다.
+name = "tomverse-host"
+path = "src/bin/host.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 0.38 이상은 build.rs가 unstable cfg_select를 써서 현재 툴체인에서 컴파일되지 않는다.
+# bundled를 쓰는 이유: 시스템 SQLite 버전에 의존하지 않아야 배포본 동작이 결정론적이다.
+rusqlite = { version = "0.37", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+# .gitignore 준수 파일 트리 워크. ripgrep 생태계 크레이트로, context-engine.md 5절이
+# 이미 ripgrep을 검색 보완재로 지목하고 있어 도구 선택이 일관된다.
+ignore = "0.4"
+regex = "1"
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
