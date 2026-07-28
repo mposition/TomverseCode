@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkArtifacts, hostBinaryPath, sidecarEntryPath } from "@tomverse/toolchain";
 import type { ArmSpec } from "./types.js";
 
 /**
@@ -23,28 +24,13 @@ import type { ArmSpec } from "./types.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** 컴파일 후 위치는 evals/hypothesis-gate/dist/src/ 이므로 리포지토리 루트까지 4단계. */
 export const REPO_ROOT = path.resolve(__dirname, "..", "..", "..", "..");
-export const HOST_BIN = path.join(
-  REPO_ROOT,
-  "apps",
-  "desktop",
-  "src-tauri",
-  "core",
-  "target",
-  "debug",
-  process.platform === "win32" ? "tomverse-host.exe" : "tomverse-host"
-);
-export const SIDECAR_ENTRY = path.join(REPO_ROOT, "packages", "sidecar", "dist", "src", "index.js");
+// 경로 결정은 `@tomverse/toolchain` 한 곳에만 있다 — sidecar e2e와 같은 함수를 쓴다.
+export const HOST_BIN = hostBinaryPath(REPO_ROOT, process.platform);
+export const SIDECAR_ENTRY = sidecarEntryPath(REPO_ROOT);
 
 export function artifactsPresent(): { ok: boolean; detail: string } {
-  const host = existsSync(HOST_BIN);
-  const sidecar = existsSync(SIDECAR_ENTRY);
-  return {
-    ok: host && sidecar,
-    detail:
-      `  호스트 바이너리: ${HOST_BIN} (${host ? "있음" : "없음"})\n` +
-      `  sidecar 진입점: ${SIDECAR_ENTRY} (${sidecar ? "있음" : "없음"})\n` +
-      `먼저 실행하세요: npm run build && npm run core:build`,
-  };
+  const status = checkArtifacts(REPO_ROOT, process.platform);
+  return { ok: status.ok, detail: status.detail };
 }
 
 export interface HostRunOptions {

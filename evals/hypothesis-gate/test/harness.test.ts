@@ -5,16 +5,17 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { armExecutionOrder, ARMS, armSpec } from "../src/arms.js";
-import { artifactsPresent } from "../src/host.js";
+import { artifactsPresent, HOST_BIN, REPO_ROOT } from "../src/host.js";
 import { loadAllFixtures, loadFixture, listFixtureIds } from "../src/manifest.js";
 import { openRecordStore } from "../src/records.js";
 import { budgetStop, fillReviewerContributions, runExperiment } from "../src/runner.js";
 import { evaluateGate } from "../src/stats.js";
 import { renderMarkdown, writeReports } from "../src/report.js";
 import { preflight } from "../src/preflight.js";
-import { runVerification } from "../src/oracle.js";
+import { classifyOracleFailure, runVerification } from "../src/oracle.js";
 import { applyReferencePatch, changedFilesSince, injectOracle, materialize } from "../src/workspace.js";
-import type { GateRunRecord } from "../src/types.js";
+import { isInfrastructureFailure, type GateRunRecord } from "../src/types.js";
+import { hostBinaryPath, withMsvcEnv } from "@tomverse/toolchain";
 
 /**
  * 하네스 자체를 **실제 구성요소로** 검증한다 (§16).
@@ -381,4 +382,118 @@ test("모든 arm 정의가 리포트에 문서화된다", () => {
 
 test("fixture 목록이 비어 있지 않다", () => {
   assert.ok(listFixtureIds(FIXTURES).length >= 24);
+});
+
+// ---- Windows 툴체인 안정화 회귀 (Gate 쪽) ----
+
+test("툴체인 준비 실패는 모델 실패와 다른 분류가 된다", () => {
+  // 이 둘을 뭉개면 "Rust fixture에서 모델이 약하다"는 잘못된 결론이 나온다.
+  const toolchain = classifyOracleFailure({
+    passed: false,
+    commands: [],
+    toolchainError: "MSVC 빌드 도구를 준비하지 못했습니다 (종료 코드 1).",
+  });
+  assert.equal(toolchain, "toolchain_unavailable");
+  assert.equal(isInfrastructureFailure(toolchain), true, "툴체인 실패가 모델 실패로 집계됩니다");
+
+  const modelFailure = classifyOracleFailure({
+    passed: false,
+    commands: [
+      {
+        command: "node --test oracle.test.js",
+        exitCode: 1,
+        passed: false,
+        timedOut: false,
+        output: "AssertionError: expected 1 to equal 2",
+        durationMs: 10,
+      },
+    ],
+  });
+  assert.equal(modelFailure, "requirement_unmet");
+  assert.equal(isInfrastructureFailure(modelFailure), false, "모델 실패가 인프라 실패로 빠졌습니다");
+});
+
+test("툴체인 실패는 성공률 분모에서 빠진다", () => {
+  const make = (failureClass: string | undefined): GateRunRecord =>
+    ({
+      schemaVersion: 1, runId: "r", fixtureId: "f", fixtureHash: "h", category: "multi_file_contract",
+      repetition: 1, arm: "A", seed: 1, taskId: "t", providerId: "p", requestedModelId: "m",
+      publicVerificationPassed: false, oracleVerificationPassed: false,
+      inputTokens: 0, outputTokens: 0, providerCallCount: 0, retryCount: 0, latencyMs: 1,
+      changedFiles: [], policyDenials: [], promptVersionHash: "p",
+      startedAt: "2026-01-01T00:00:00.000Z", completedAt: "2026-01-01T00:00:00.000Z",
+      providerKind: "real", criteriaHash: "h",
+      ...(failureClass ? { failureClass } : {}),
+    }) as GateRunRecord;
+
+  const evaluation = evaluateGate([make("toolchain_unavailable"), make(undefined)], { seed: 1 });
+  const armA = evaluation.arms.find((a) => a.arm === "A")!;
+  assert.equal(armA.runs, 2);
+  assert.equal(armA.evaluableRuns, 1, "툴체인 실패가 유효 실행으로 세어졌습니다");
+  assert.equal(armA.infraFailures, 1);
+});
+
+test("preflight가 Rust fixture와 MSVC 미준비를 함께 보고한다", () => {
+  const report = preflight({
+    fixtureCount: 24,
+    nativeFixtureCount: 6,
+    arms: ["A", "B", "C", "D"],
+    repetitions: 3,
+    usingFakeProvider: false,
+    msvc: { kind: "unavailable", exitCode: 1, message: "MSVC 빌드 도구를 찾지 못했습니다." },
+  });
+  assert.equal(report.canRunRealExperiment, false);
+  assert.ok(report.blockers.some((b) => b.includes("MSVC")), report.blockers.join(" / "));
+  assert.ok(report.lines.some((l) => l.includes("네이티브(Rust) fixture: 6개")));
+});
+
+test("Rust fixture가 없으면 MSVC 미준비가 차단 요인이 아니다", () => {
+  const report = preflight({
+    fixtureCount: 18,
+    nativeFixtureCount: 0,
+    arms: ["A"],
+    repetitions: 1,
+    usingFakeProvider: false,
+    msvc: { kind: "unavailable", exitCode: 1, message: "없음" },
+  });
+  assert.equal(report.blockers.some((b) => b.includes("MSVC")), false);
+});
+
+test("preflight 출력에 자격증명 값이 나타나지 않는다", () => {
+  const saved = { openai: process.env.OPENAI_API_KEY, anthropic: process.env.ANTHROPIC_API_KEY };
+  try {
+    process.env.OPENAI_API_KEY = "sk-preflight-must-not-appear-0123456789";
+    process.env.ANTHROPIC_API_KEY = "sk-ant-preflight-must-not-appear";
+    const report = preflight({
+      fixtureCount: 24,
+      nativeFixtureCount: 6,
+      arms: ["A", "B", "C", "D"],
+      repetitions: 3,
+      usingFakeProvider: false,
+      msvc: { kind: "ready", env: { INCLUDE: "C:\\i", LIB: "C:\\l" } },
+    });
+    const all = [...report.lines, ...report.blockers].join("\n");
+    assert.ok(!all.includes("sk-"), `preflight 출력에 자격증명이 있습니다:\n${all}`);
+    // 존재 여부는 알려줘야 한다 — 값만 숨기는 것이지 사실을 숨기는 것이 아니다.
+    assert.ok(all.includes("OpenAI 자격증명: 있음"));
+  } finally {
+    if (saved.openai === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = saved.openai;
+    if (saved.anthropic === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = saved.anthropic;
+  }
+});
+
+test("MSVC 준비 결과가 자격증명을 담지 않는다", () => {
+  // 준비된 환경을 그대로 자식에게 넘기므로, 여기에 키가 섞이면 oracle 출력으로 샐 수 있다.
+  const merged = withMsvcEnv({ SAFE: "1" }, { kind: "ready", env: { INCLUDE: "C:\\i", LIB: "C:\\l" } });
+  assert.ok(!JSON.stringify(merged).includes("sk-"));
+  assert.equal(merged.SAFE, "1");
+});
+
+test("호스트 경로가 공용 helper와 일치한다", () => {
+  // gate와 sidecar e2e가 서로 다른 경로를 보면 한쪽만 Windows에서 깨진다.
+  assert.equal(HOST_BIN, hostBinaryPath(REPO_ROOT, process.platform));
+  if (process.platform === "win32") assert.ok(HOST_BIN.endsWith(".exe"));
+  else assert.ok(!HOST_BIN.endsWith(".exe"));
 });

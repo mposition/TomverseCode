@@ -1,0 +1,22 @@
+{
+  "name": "@tomverse/toolchain",
+  "version": "0.1.0",
+  "private": true,
+  "description": "빌드 산출물 위치와 네이티브 툴체인 준비 — sidecar e2e와 가설 게이트가 공유한다. 런타임 의존성 없음.",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": "./dist/src/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "//test": "이 Node 버전은 `node --test <디렉터리>`가 동작하지 않는다 — 파일을 직접 나열한다(CLAUDE.md 함정 기록).",
+    "test": "npm run build && node --test dist/test/hostBinary.test.js dist/test/msvc.test.js dist/test/verifyOrder.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.0",
+    "typescript": "^5.9.3"
+  }
+}

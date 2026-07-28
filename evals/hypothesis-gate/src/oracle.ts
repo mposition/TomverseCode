@@ -1,5 +1,12 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import {
+  needsNativeToolchain,
+  prepareMsvcEnv,
+  withMsvcEnv,
+  type MsvcResult,
+} from "@tomverse/toolchain";
+import { REPO_ROOT } from "./host.js";
 import type { CommandArgv } from "./types.js";
 
 /**
@@ -22,6 +29,14 @@ import type { CommandArgv } from "./types.js";
  *
  * 모델의 verdict("이 patch는 옳다")는 성공 판정에 쓰지 않는다. 그건 측정 대상이 스스로
  * 점수를 매기는 것이다. oracle 명령의 종료 코드만 본다.
+ *
+ * # Windows 네이티브 툴체인
+ *
+ * Rust fixture는 `cargo test`로 검증한다. 일반 PowerShell에는 `INCLUDE`/`LIB`가 없어
+ * 컴파일은 되고 **링크에서** `LNK1104: cannot open file 'msvcrt.lib'`로 실패한다.
+ * 그래서 cargo를 부르기 직전에 MSVC 환경을 준비해 자식에게만 병합한다
+ * (`@tomverse/toolchain`). TypeScript fixture(`node`)는 이 준비가 필요 없고, 준비가
+ * 실패해도 그쪽 20개는 그대로 검증된다 — 전부 막으면 툴체인이 없는 사람은 아무것도 못 본다.
  */
 
 /** 결과 파일에 남길 출력의 상한. 무제한 stdout을 저장하지 않는다(§3). */
@@ -57,6 +72,13 @@ export interface CommandOutcome {
   /** 상한까지 자른 출력. 실패 원인 분류에만 쓴다. */
   output: string;
   durationMs: number;
+  /**
+   * 네이티브 툴체인 준비 실패로 **실행 자체를 하지 않은** 경우.
+   *
+   * 모델/API 실패와 구별해야 한다: 전자는 개발 환경 문제라 사용자가 고칠 수 있고,
+   * 후자는 실험 결과다. 뭉개면 "Rust fixture에서 모델이 약하다"는 잘못된 결론이 나온다.
+   */
+  toolchainError?: string;
 }
 
 export interface VerificationOutcome {
@@ -64,6 +86,8 @@ export interface VerificationOutcome {
   commands: CommandOutcome[];
   /** 하네스 자체가 실패한 경우 (명령을 실행조차 못 함) — 모델 실패로 세면 안 된다. */
   harnessError?: string;
+  /** 네이티브 툴체인 준비 실패 — 이것도 모델 실패가 아니다. */
+  toolchainError?: string;
 }
 
 function childEnv(): NodeJS.ProcessEnv {
@@ -78,11 +102,31 @@ function childEnv(): NodeJS.ProcessEnv {
 export function runCommand(command: CommandArgv, workspaceRoot: string, timeoutMs: number): CommandOutcome {
   const cwd = command.cwd ? path.join(workspaceRoot, command.cwd) : workspaceRoot;
   const started = Date.now();
+
+  // cargo를 부를 때만 MSVC 환경을 준비한다. 준비에 실패하면 **링크 오류까지 가지 않고**
+  // 여기서 멈춘다 — LNK1104는 원인에서 너무 먼 증상이라 사용자가 도달하기 어렵다.
+  let env = childEnv();
+  if (needsNativeToolchain(command.program)) {
+    const msvc = prepareMsvcEnv(REPO_ROOT, process.platform);
+    if (msvc.kind === "unavailable") {
+      return {
+        command: `${command.program} ${command.args.join(" ")}`.trim(),
+        exitCode: null,
+        passed: false,
+        timedOut: false,
+        output: msvc.message,
+        durationMs: Date.now() - started,
+        toolchainError: msvc.message,
+      };
+    }
+    env = withMsvcEnv(env, msvc);
+  }
+
   const result = spawnSync(command.program, command.args, {
     cwd,
     encoding: "utf8",
     timeout: timeoutMs,
-    env: childEnv(),
+    env,
     // 명시적으로 끈다: 셸을 거치면 argv 계약이 깨지고, 인자가 셸에 해석될 수 있다.
     shell: false,
     maxBuffer: 8 * 1024 * 1024,
@@ -120,9 +164,16 @@ export function runVerification(
   for (const command of commands) {
     const outcome = runCommand(command, workspaceRoot, timeoutMs);
     outcomes.push(outcome);
-    if (outcome.timedOut) break;
+    // 툴체인이 없으면 다음 명령도 같은 이유로 실패한다. 반복해서 같은 오류를 쌓지 않는다.
+    if (outcome.timedOut || outcome.toolchainError !== undefined) break;
   }
-  return { passed: outcomes.length === commands.length && outcomes.every((o) => o.passed), commands: outcomes };
+  const toolchainError = outcomes.find((o) => o.toolchainError !== undefined)?.toolchainError;
+  const result: VerificationOutcome = {
+    passed: outcomes.length === commands.length && outcomes.every((o) => o.passed),
+    commands: outcomes,
+  };
+  if (toolchainError !== undefined) result.toolchainError = toolchainError;
+  return result;
 }
 
 /**
@@ -133,6 +184,8 @@ export function runVerification(
  */
 export function classifyOracleFailure(outcome: VerificationOutcome): string | undefined {
   if (outcome.passed) return undefined;
+  // **툴체인 실패를 모델 실패로 세지 않는다.** 이건 개발 환경 문제이고 실험 결과가 아니다.
+  if (outcome.toolchainError !== undefined) return "toolchain_unavailable";
   if (outcome.harnessError) return "oracle_harness_failure";
   const failed = outcome.commands.find((c) => !c.passed);
   if (!failed) return "oracle_harness_failure";

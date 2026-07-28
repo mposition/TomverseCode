@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFixtureRepo, FIX_PATCH, type FixtureRepo } from "./helpers/fixtureRepo.js";
+import { checkArtifacts, hostBinaryPath, sidecarEntryPath } from "@tomverse/toolchain";
 
 /**
  * M0.1 end-to-end 시나리오 — **영속화와 실제 취소**를 실제 구성요소로 검증한다.
@@ -21,17 +22,14 @@ import { createFixtureRepo, FIX_PATCH, type FixtureRepo } from "./helpers/fixtur
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..", "..");
-const HOST_BIN = path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "target", "debug", "tomverse-host");
-const SIDECAR_ENTRY = path.join(REPO_ROOT, "packages", "sidecar", "dist", "src", "index.js");
+// Windows에서는 `tomverse-host.exe`다. 경로 결정은 공용 helper 한 곳에만 있다.
+const HOST_BIN = hostBinaryPath(REPO_ROOT, process.platform);
+const SIDECAR_ENTRY = sidecarEntryPath(REPO_ROOT);
 
 /** 산출물이 없으면 조용히 통과시키지 않는다 — "건너뜀"이 "통과"로 보이면 안 된다. */
 function requireArtifacts(): void {
-  assert.ok(
-    existsSync(HOST_BIN) && existsSync(SIDECAR_ENTRY),
-    `e2e 산출물이 없습니다.\n  ${HOST_BIN} (${existsSync(HOST_BIN) ? "있음" : "없음"})\n` +
-      `  ${SIDECAR_ENTRY} (${existsSync(SIDECAR_ENTRY) ? "있음" : "없음"})\n` +
-      `먼저 실행하세요: npm run build && npm run core:build`
-  );
+  const artifacts = checkArtifacts(REPO_ROOT, process.platform);
+  assert.ok(artifacts.ok, artifacts.detail);
 }
 
 function hostEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {

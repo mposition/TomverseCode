@@ -43,7 +43,7 @@ Arm B가 필요한 이유: 교차검증의 이득이 파이프라인 효과인�
 
 ## Fixture
 
-24개, 8개 카테고리 × 3개, TypeScript와 Rust 두 스택.
+24개, 8개 카테고리 × 3개. **TypeScript 20개 + Rust 4개.**
 
 ```
 fixtures/<id>/
@@ -52,6 +52,12 @@ fixtures/<id>/
   oracle/            숨겨진 판정 테스트 — 실행이 끝난 뒤에만 주입된다
   reference.patch    이 fixture가 풀 수 있음을 증명하는 참조 수정
 ```
+
+Rust fixture(`cargo test`)는 Windows에서 MSVC 툴체인을 요구한다. 일반 PowerShell에는
+`INCLUDE`/`LIB`가 없어 컴파일은 되고 **링크에서** `LNK1104: cannot open file 'msvcrt.lib'`로
+실패하므로, `gate:g:validate`가 cargo를 부르기 전에 `scripts/msvc-env.bat`으로 환경을 준비한다.
+준비에 실패하면 링크 오류까지 가지 않고 **무엇을 설치해야 하는지 먼저 알려주고 종료 코드 4**로 끝난다.
+TypeScript fixture 20개는 MSVC 없이도 그대로 검증된다.
 
 `npm run gate:g:validate`가 모델 호출 없이 다음을 확인한다:
 
@@ -79,7 +85,7 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 `--max-cost-usd N` `--max-concurrency N` `--resume` `--output <dir>`
 `--executor-model <id>` `--reviewer-model <id>`
 
-종료 코드: `0`=PASS, `1`=FAIL, `2`=INCONCLUSIVE, `3`=하네스 오류.
+종료 코드: `0`=PASS, `1`=FAIL, `2`=INCONCLUSIVE, `3`=하네스 오류, `4`=툴체인 미준비.
 
 ## 사전 등록된 판정 기준
 

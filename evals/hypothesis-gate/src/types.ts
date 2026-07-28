@@ -95,6 +95,12 @@ export const INFRA_FAILURE_CLASSES = [
   "fixture_setup_failure",
   "oracle_harness_failure",
   "budget_exhausted",
+  /**
+   * 네이티브 툴체인(Windows MSVC)이 준비되지 않아 Rust fixture를 빌드할 수 없었다.
+   * **개발 환경 문제이지 모델 실패가 아니다** — 모델 실패로 세면 "Rust에서 모델이 약하다"는
+   * 잘못된 결론이 나온다.
+   */
+  "toolchain_unavailable",
 ] as const;
 
 export type ModelFailureClass = (typeof MODEL_FAILURE_CLASSES)[number];

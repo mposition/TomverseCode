@@ -12,7 +12,8 @@
     "gate": "node dist/src/cli.js"
   },
   "dependencies": {
-    "@tomverse/protocol": "*"
+    "@tomverse/protocol": "*",
+    "@tomverse/toolchain": "*"
   },
   "devDependencies": {
     "@types/node": "^24.9.0",

@@ -1,4 +1,5 @@
-import { artifactsPresent } from "./host.js";
+import { prepareMsvcEnv, type MsvcResult } from "@tomverse/toolchain";
+import { artifactsPresent, REPO_ROOT } from "./host.js";
 import { CRITERIA, criteriaHash, describeCriteria } from "./criteria.js";
 import type { ArmId } from "./types.js";
 
@@ -24,6 +25,10 @@ export interface PreflightInput {
   executorModel?: string;
   reviewerModel?: string;
   usingFakeProvider: boolean;
+  /** Rust fixture 개수 — 0이면 MSVC가 없어도 무방하다. */
+  nativeFixtureCount?: number;
+  /** 툴체인 상태 주입 (테스트용). 없으면 실제로 확인한다. */
+  msvc?: MsvcResult;
 }
 
 export interface PreflightReport {
@@ -61,6 +66,18 @@ export function preflight(input: PreflightInput): PreflightReport {
   const artifacts = artifactsPresent();
   if (!artifacts.ok) blockers.push(`실행에 필요한 산출물이 없습니다:\n${artifacts.detail}`);
 
+  // 네이티브 툴체인. **링크 오류까지 가기 전에** 여기서 알린다 —
+  // `LNK1104: cannot open file 'msvcrt.lib'`는 원인에서 너무 먼 증상이다.
+  const nativeFixtures = input.nativeFixtureCount ?? 0;
+  const msvc = input.msvc ?? prepareMsvcEnv(REPO_ROOT, process.platform);
+  lines.push(`네이티브(Rust) fixture: ${nativeFixtures}개`);
+  lines.push(`MSVC 툴체인: ${describeMsvc(msvc)}`);
+  if (nativeFixtures > 0 && msvc.kind === "unavailable") {
+    blockers.push(
+      `Rust fixture ${nativeFixtures}개를 빌드할 수 없습니다 (MSVC 미준비).\n${indent(msvc.message)}`
+    );
+  }
+
   const openai = credentialPresent("openai");
   const anthropic = credentialPresent("anthropic");
 
@@ -95,11 +112,34 @@ export function preflight(input: PreflightInput): PreflightReport {
   lines.push("사전 등록된 판정 기준:");
   for (const line of describeCriteria()) lines.push(`  - ${line}`);
 
-  const canRunRealExperiment = artifacts.ok && openai && anthropic && !input.usingFakeProvider;
+  const canRunRealExperiment =
+    artifacts.ok &&
+    openai &&
+    anthropic &&
+    !input.usingFakeProvider &&
+    !(nativeFixtures > 0 && msvc.kind === "unavailable");
   if (!input.usingFakeProvider) {
     if (!openai) blockers.push("OPENAI_API_KEY가 없습니다 — Arm A/C/D를 실행할 수 없습니다");
     if (!anthropic) blockers.push("ANTHROPIC_API_KEY가 없습니다 — Arm B/C/D를 실행할 수 없습니다");
   }
 
   return { ok: blockers.length === 0, canRunRealExperiment, lines, blockers };
+}
+
+function describeMsvc(result: MsvcResult): string {
+  switch (result.kind) {
+    case "not_needed":
+      return "해당 없음 (Windows가 아님)";
+    case "ready":
+      return "준비됨";
+    case "unavailable":
+      return `준비 실패 (종료 코드 ${result.exitCode})`;
+  }
+}
+
+function indent(text: string): string {
+  return text
+    .split("\n")
+    .map((l) => `  ${l}`)
+    .join("\n");
 }

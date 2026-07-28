@@ -44,6 +44,9 @@ Phase 0 스파이크 실측: 쉬운 버그 5건에서 **교차검증은 정확�
 
 ```
 packages/protocol/   @tomverse/protocol — 공유 타입의 단일 소스 (설계 문서의 코드 블록이 여기 실체가 됨)
+packages/toolchain/  @tomverse/toolchain — 빌드 산출물 위치(Windows는 tomverse-host.exe)와
+                     MSVC 환경 준비. sidecar e2e와 가설 게이트가 **같은 함수**를 쓴다 —
+                     이 지식을 복사해 두었다가 두 곳만 틀려 Windows e2e가 깨진 적이 있다
 packages/sidecar/    Node sidecar — Orchestrator(상태 머신), Provider Adapters, Context Engine, Router
 apps/desktop/        Tauri 2 + React
   src/               최소 UI — 단계 표시, 이벤트 로그, 승인 모달, diff, 검증 결과
@@ -75,13 +78,19 @@ npm test               # sidecar 단위 테스트 (상태 머신, 컨텍스트, 
 npm run verify         # 전체: 위 + Rust 단위 테스트 + 실제 구성요소 e2e
 ```
 
-**검증 순서는 고정이다. `build` → `typecheck` → `test` → `core:test` → `core:build` → `test:e2e`.**
+**검증 순서는 고정이다. `build` → `typecheck` → `core:build` → `test` → `core:test` → `test:e2e`.**
 
 - **build가 typecheck보다 먼저인 이유**: sidecar는 protocol의 **빌드 산출물**(`dist`)에 대해 타입
   검사한다. clean clone이나 fetch 직후처럼 `dist`가 없거나 낡은 상태에서 typecheck를 먼저 돌리면
   **잘못된 protocol 타입을 읽는다** — 통과해도 통과가 아니고, 실패해도 실패가 아니다.
-- **core:build가 test:e2e 바로 앞인 이유**: e2e가 `tomverse-host` 바이너리를 요구한다. 산출물이
-  없으면 조용히 건너뛰지 않고 실패하며, 무엇을 빌드해야 하는지 알려준다.
+- **core:build가 `test`보다 먼저인 이유**: `npm test`에 포함된 가설 게이트 통합 테스트가
+  **실제 `tomverse-host` 바이너리를 요구한다.** 로컬에 남은 예전 바이너리 덕분에 통과하는 상태를
+  허용하지 않는다 — clean clone에서 반드시 실패하기 때문이다.
+- e2e도 같은 바이너리를 요구한다. 산출물이 없으면 조용히 건너뛰지 않고 실패하며,
+  **검사한 전체 경로**를 알려준다(Windows는 `.exe`가 붙는다).
+
+이 선후 관계는 `packages/toolchain/test/verifyOrder.test.ts`가 루트 `verify`와
+`scripts\verify.bat` 양쪽에서 지킨다. 한쪽만 고치면 테스트가 실패한다.
 
 `scripts\verify.bat`과 루트 `package.json`의 `verify`는 **의미상 동일해야 한다.** 한쪽만 고치지 말 것.
 
@@ -122,6 +131,7 @@ npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가
 | `scripts\cargo-test-core.bat` | 신뢰 경계 크레이트 테스트 (가장 자주 도는 검증) |
 | `scripts\cargo-build-core.bat` | `tomverse-host` 빌드 — e2e가 이 산출물을 요구한다 |
 | `scripts\cargo-check-desktop.bat` | Tauri 껍데기 크레이트 `cargo check` |
+| `scripts\msvc-env.bat` | `_env.bat`을 call한 뒤 **필요한 변수만** 출력. 가설 게이트가 cargo 자식 프로세스에 병합한다 |
 | `scripts\tauri-build.bat` | Windows 배포 번들(.msi/.exe). 프런트엔드 빌드를 먼저 돌린다 |
 | `scripts\verify.bat` | 전체 검증 (Node 빌드/타입/테스트 + Rust + e2e). 하나라도 실패하면 즉시 멈춘다 |
 
