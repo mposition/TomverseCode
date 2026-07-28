@@ -11,7 +11,7 @@
 use crate::artifacts::ArtifactStore;
 use crate::cancel::{CancelOutcome, CancellationRegistry, CancellationToken};
 use crate::paths::WorkspaceRoot;
-use crate::policy::{parse_run_command, PolicyGate};
+use crate::policy::{parse_run_command, secrets, PolicyGate};
 use crate::sidecar::SidecarHandler;
 use crate::store::{AppendedEvent, Store, StoreError, TerminalOutcome};
 use crate::time::now_iso;
@@ -329,10 +329,14 @@ impl TaskHost {
                 items: vec![self.describe_for_approval(request, &decision)],
                 created_at: now_iso(),
             };
+            // 승인 모달에는 preview(patch/content 본문)를 그대로 보여준다 — 무엇을 승인하는지
+            // 모르면 승인이 의미가 없다. 그러나 **이벤트에는 남기지 않는다**: 비밀값 파일에
+            // 새로 쓰려는 값이 감사 로그에 영구 보관되면, 승인 화면에서 한 번 보여주는 것과
+            // 전혀 다른 노출이 된다.
             let _ = self.append_event(
                 &request.task_id,
                 "APPROVAL_REQUESTED",
-                serde_json::to_value(&approval).unwrap_or(Value::Null),
+                redact_approval_for_event(&approval),
             );
 
             match self.approvals.request_approval(&approval) {
@@ -380,6 +384,12 @@ impl TaskHost {
             self.diffs.lock().unwrap().push((path, diff.clone()));
         }
 
+        // 비밀값 경로의 **출력은 이벤트에 남기지 않는다.**
+        //
+        // 사용자가 `.env` 읽기를 승인했다는 것은 "이번 판단을 위해 모델이 보는 것"에 동의한
+        // 것이고, "그 값이 감사 로그에 영구히 남는 것"에 동의한 것이 아니다. 이벤트 로그는
+        // UI에 그대로 표시되고 오래 보관되므로, 승인 여부와 무관하게 여기서는 덜어낸다.
+        let secret_target = secrets::is_secret_path(&decision.normalized_target);
         let completed_payload = json!({
             "requestId": outcome.result.request_id,
             "status": outcome.result.status,
@@ -387,7 +397,11 @@ impl TaskHost {
             "durationMs": outcome.result.duration_ms,
             "outputRef": outcome.output_ref,
             // 큰 출력은 이미 artifact에 있으므로 이벤트에는 요약만 남긴다.
-            "output": summarize_output(outcome.result.output.as_ref()),
+            "output": if secret_target {
+                json!({ "redacted": true, "reason": "비밀값을 담을 수 있는 경로이므로 이벤트에 내용을 남기지 않습니다" })
+            } else {
+                summarize_output(outcome.result.output.as_ref())
+            },
         });
         let appended = self
             .with_store(|s| {
@@ -661,15 +675,30 @@ impl SidecarHandler for TaskHost {
 }
 
 /// 이벤트 로그에 들어가는 args에서 큰 본문을 덜어낸다.
-/// secret은 애초에 컨텍스트에 들어가지 않지만(context-engine.md 7절), 파일 본문 전체를
-/// 이벤트에 인라인하면 로그가 비대해진다.
+///
+/// 두 가지 이유가 겹친다:
+///  - **크기**: 파일 본문 전체를 이벤트에 인라인하면 로그가 비대해진다.
+///  - **비밀값**: 대상 경로가 secret으로 분류되면 미리보기조차 남기지 않는다. `.env`에 쓰려는
+///    값의 앞 512바이트는 대개 키 전체를 포함한다 — 자르는 것으로는 보호가 되지 않는다.
 fn redact_args(args: &Value) -> Value {
     let Some(obj) = args.as_object() else {
         return args.clone();
     };
+    let secret_target = obj
+        .get("path")
+        .and_then(Value::as_str)
+        .map(secrets::is_secret_path)
+        .unwrap_or(false);
+
     let mut out = serde_json::Map::new();
     for (k, v) in obj {
         match (k.as_str(), v) {
+            ("content" | "patch", Value::String(s)) if secret_target => {
+                out.insert(
+                    k.clone(),
+                    json!({ "bytes": s.len(), "redacted": true, "reason": "비밀값 경로" }),
+                );
+            }
             ("content" | "patch", Value::String(s)) => {
                 out.insert(k.clone(), json!({ "bytes": s.len(), "preview": truncate(s, 512) }));
             }
@@ -679,6 +708,39 @@ fn redact_args(args: &Value) -> Value {
         }
     }
     Value::Object(out)
+}
+
+/// `APPROVAL_REQUESTED` 이벤트용 축약. 승인 모달로 가는 원본은 건드리지 않는다.
+///
+/// `preview`만 제거하는 이유: 나머지 필드(tool, riskLevel, reason, command argv, path)는
+/// "무엇을 승인했는가"의 감사 기록으로 반드시 남아야 한다. 본문만 없으면 된다.
+fn redact_approval_for_event(approval: &ApprovalRequest) -> Value {
+    let mut value = serde_json::to_value(approval).unwrap_or(Value::Null);
+    if let Some(items) = value.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            let secret_target = item
+                .get("path")
+                .and_then(Value::as_str)
+                .map(secrets::is_secret_path)
+                .unwrap_or(false);
+            let Some(obj) = item.as_object_mut() else { continue };
+            match obj.get("preview") {
+                Some(Value::String(preview)) => {
+                    let bytes = preview.len();
+                    obj.insert(
+                        "preview".to_string(),
+                        if secret_target {
+                            json!({ "bytes": bytes, "redacted": true, "reason": "비밀값 경로" })
+                        } else {
+                            json!({ "bytes": bytes, "preview": truncate(preview, 512) })
+                        },
+                    );
+                }
+                _ => continue,
+            }
+        }
+    }
+    value
 }
 
 fn summarize_output(output: Option<&Value>) -> Value {
@@ -747,6 +809,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         seen: Mutex<Vec<String>>,
+        /// 원본 payload — "DB는 막았는데 화면으로 흘렸다"를 잡기 위해 필요하다.
+        payloads: Mutex<Vec<String>>,
     }
 
     impl EventSink for RecordingSink {
@@ -755,6 +819,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(payload.get("type").and_then(Value::as_str).unwrap_or("").to_string());
+            self.payloads.lock().unwrap().push(payload.to_string());
         }
     }
 
@@ -790,6 +855,100 @@ mod tests {
             Arc::new(CancellationRegistry::new()),
         );
         (ws, art, host)
+    }
+
+    /// 명세 §5 "DB 이벤트에 API 키와 비밀 값 저장 금지"의 실체.
+    ///
+    /// **Node를 신뢰하지 않는 경로를 검증한다.** Node의 Context Engine이 secret 파일을 걸러도,
+    /// 장악당한 Node는 필터를 우회해 `read_file(".env")`를 그냥 요청할 수 있다. 그때
+    /// (a) Policy Gate가 자동 허용하지 않고 (b) 사용자가 승인해도 값이 이벤트에 남지 않아야 한다.
+    #[test]
+    fn secret_file_contents_never_reach_the_event_log() {
+        const SECRET: &str = "sk-must-never-appear-in-the-event-log";
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _a, host) = host_with_sink(sink.clone());
+        fs::write(ws.path().join(".env"), format!("OPENAI_API_KEY={SECRET}\n")).unwrap();
+
+        // 1) 자동 허용이 아니라 승인 필요로 분류된다.
+        let read = req(ToolName::ReadFile, json!({ "path": ".env" }));
+        let decision = host.gate.evaluate(&read, host.root(), host.policy());
+        assert!(
+            decision.requires_user_approval,
+            "비밀값 파일 읽기가 자동 허용되었습니다: {decision:?}"
+        );
+
+        // 2) 사용자가 승인해도(AutoApprove 게이트웨이) 값이 이벤트에 남지 않는다.
+        //    승인은 "모델이 이번 판단에 쓰는 것"에 대한 동의이고, "감사 로그 영구 보관"이 아니다.
+        let result = host.execute_tool(&read).unwrap();
+        let output = result.pointer("/result/output").and_then(|v| v.get("content"));
+        assert!(
+            output
+                .map(|c| c.as_str() == Some(&format!("OPENAI_API_KEY={SECRET}\n")))
+                .unwrap_or(false),
+            "승인된 읽기는 호출자에게 실제 내용을 돌려줘야 합니다 (이벤트에만 남지 않는 것이다)"
+        );
+
+        // 3) DB의 어떤 이벤트에도 비밀값이 없다.
+        let events = host.with_store(|s| s.events("task-1")).unwrap();
+        let all = events
+            .iter()
+            .map(|e| e.payload.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains(SECRET), "이벤트 로그에 비밀값이 저장되었습니다:\n{all}");
+
+        // 4) UI로 릴레이된 스트림에도 없다 — DB만 막고 화면으로 흘리면 의미가 없다.
+        let relayed = sink.payloads.lock().unwrap().join("\n");
+        assert!(
+            !relayed.contains(SECRET),
+            "이벤트 스트림에 비밀값이 유출되었습니다:\n{relayed}"
+        );
+    }
+
+    /// 비밀값 파일에 **쓰는** 경로. 자동 승인 정책이 켜져 있어도 승인을 요구해야 하고,
+    /// 쓰려는 값이 이벤트에 남지 않아야 한다.
+    #[test]
+    fn writing_a_secret_file_requires_approval_even_when_auto_approve_is_on() {
+        const NEW_SECRET: &str = "sk-newly-written-value-must-not-leak";
+        let policy = TaskPolicy {
+            auto_approve_workspace_writes: true,
+            ..TaskPolicy::default()
+        };
+        let (_ws, _a, host) = host(policy, Arc::new(AutoApprove));
+
+        let write = req(
+            ToolName::CreateFile,
+            json!({ "path": ".env.local", "content": format!("KEY={NEW_SECRET}\n") }),
+        );
+        let decision = host.gate.evaluate(&write, host.root(), host.policy());
+        assert!(
+            decision.requires_user_approval,
+            "auto_approve_workspace_writes가 비밀값 파일 쓰기까지 자동 승인했습니다: {decision:?}"
+        );
+
+        host.execute_tool(&write).unwrap();
+        let events = host.with_store(|s| s.events("task-1")).unwrap();
+        let all = events
+            .iter()
+            .map(|e| e.payload.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !all.contains(NEW_SECRET),
+            "쓰려던 비밀값이 이벤트에 저장되었습니다:\n{all}"
+        );
+        // 그러나 "무엇을 했는가"는 남아야 한다 — 값만 빠지고 감사 추적은 유지된다.
+        assert!(all.contains(".env.local"), "감사에 필요한 경로 정보까지 사라졌습니다");
+    }
+
+    /// 일반 소스 파일은 이 규칙에 걸리지 않아야 한다.
+    /// 오탐이 많으면 정상 작업이 매번 승인 모달을 띄우게 되어 승인이 무의미해진다.
+    #[test]
+    fn ordinary_files_are_still_auto_approved_for_reading() {
+        let (_ws, _a, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
+        let read = req(ToolName::ReadFile, json!({ "path": "src/app.ts" }));
+        let decision = host.gate.evaluate(&read, host.root(), host.policy());
+        assert!(!decision.requires_user_approval, "일반 파일 읽기에 승인을 요구했습니다");
     }
 
     /// M0.1 회귀 방지: 레코드와 이벤트를 한 트랜잭션에 쓰는 `record_*_with_event` 경로는

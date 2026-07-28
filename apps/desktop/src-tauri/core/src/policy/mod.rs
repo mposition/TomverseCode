@@ -24,6 +24,7 @@
 //! 무엇이 실행됐는지 감사 가능하다"다.
 
 pub mod command;
+pub mod secrets;
 
 use crate::paths::{PathViolation, WorkspaceRoot};
 use crate::time::now_iso;
@@ -85,6 +86,23 @@ impl PolicyGate {
 
             ToolName::ReadFile => match required_path_arg(request) {
                 Ok(candidate) => match root.resolve_existing(&candidate) {
+                    // 읽기는 보통 자동 허용이지만 **비밀값을 담을 수 있는 경로는 예외**다.
+                    //
+                    // Node의 Context Engine이 이미 secret 파일을 모델 컨텍스트에서 제외하지만,
+                    // 그건 Node가 스스로 지키는 규칙이다. Node가 장악당하면 필터를 우회해
+                    // `read_file(".env")`를 그냥 요청할 수 있고, 그때 막는 것은 여기뿐이다
+                    // (process-architecture.md 2절 신뢰 모델).
+                    //
+                    // 거부가 아니라 승인 필요로 두는 이유: 사용자가 정말로 `.env`를 고쳐달라고
+                    // 요청하는 경우가 있다. 그걸 원천 차단하면 도구가 쓸모없어지므로,
+                    // "무엇을 읽으려 하는지 사용자에게 보이고 사용자가 결정한다"로 처리한다.
+                    Ok(safe) if secrets::is_secret_path(safe.relative()) => Outcome {
+                        decision: Decision::RequireUserApproval,
+                        risk_level: RiskLevel::High,
+                        matched_rule: "secret_path_read_requires_approval".to_string(),
+                        reason: "비밀값을 담을 수 있는 파일을 읽으려 함 — 사용자 승인 필요".to_string(),
+                        normalized_target: safe.relative().to_string(),
+                    },
                     Ok(safe) => Outcome::auto(
                         "read_only_within_workspace",
                         "파일 읽기, workspace 내부 경로",
@@ -103,7 +121,19 @@ impl PolicyGate {
                     match root.resolve_for_create(&candidate) {
                         Ok(safe) => {
                             let target = safe.relative().to_string();
-                            if task_policy.auto_approve_workspace_writes {
+                            // 비밀값 파일 쓰기는 **자동 승인 정책보다 우선**한다. `.env`를 조용히
+                            // 덮어쓰면 사용자가 잃는 것(되돌릴 수 없는 자격증명)이 일반 소스 파일과
+                            // 비교할 수 없이 크다. 정책으로도 이 승인을 끌 수 없게 둔다.
+                            if secrets::is_secret_path(&target) {
+                                Outcome {
+                                    decision: Decision::RequireUserApproval,
+                                    risk_level: RiskLevel::High,
+                                    matched_rule: "secret_path_write_requires_approval".to_string(),
+                                    reason: "비밀값을 담을 수 있는 파일을 변경함 — 자동 승인 정책과 무관하게 승인 필요"
+                                        .to_string(),
+                                    normalized_target: target,
+                                }
+                            } else if task_policy.auto_approve_workspace_writes {
                                 Outcome {
                                     decision: Decision::AutoApprove,
                                     risk_level: RiskLevel::Low,

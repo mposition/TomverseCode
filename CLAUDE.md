@@ -91,10 +91,14 @@ npm run verify         # 전체: 위 + Rust 단위 테스트 + 실제 구성요�
 | 스크립트 | 하는 일 |
 |---|---|
 | `scripts\_env.bat` | MSVC 툴체인 + cargo PATH 준비. 나머지가 전부 이걸 call한다 |
-| `scripts\core-test.bat` | 신뢰 경계 크레이트 테스트 (가장 자주 도는 검증) |
-| `scripts\core-build.bat` | `tomverse-host` 빌드 — e2e가 이 산출물을 요구한다 |
-| `scripts\desktop-check.bat` | Tauri 껍데기 크레이트 `cargo check` |
-| `scripts\verify.bat` | 전체 검증 (Node 타입/빌드/테스트 + Rust + e2e). 하나라도 실패하면 즉시 멈춘다 |
+| `scripts\cargo-test-core.bat` | 신뢰 경계 크레이트 테스트 (가장 자주 도는 검증) |
+| `scripts\cargo-build-core.bat` | `tomverse-host` 빌드 — e2e가 이 산출물을 요구한다 |
+| `scripts\cargo-check-desktop.bat` | Tauri 껍데기 크레이트 `cargo check` |
+| `scripts\tauri-build.bat` | Windows 배포 번들(.msi/.exe). 프런트엔드 빌드를 먼저 돌린다 |
+| `scripts\verify.bat` | 전체 검증 (Node 빌드/타입/테스트 + Rust + e2e). 하나라도 실패하면 즉시 멈춘다 |
+
+`tauri-build.bat`을 `verify.bat`에 넣지 않은 이유: 번들 빌드는 훨씬 오래 걸려서 매번 도는
+검증에 섞으면 개발 루프가 느려진다. 릴리스 전에 따로 돌린다.
 
 `.bat`는 반드시 CRLF여야 한다 — LF면 cmd.exe가 `goto :label`을 잘못 읽어 조용히 엉뚱하게 동작한다.
 `.gitattributes`가 이걸 강제한다.

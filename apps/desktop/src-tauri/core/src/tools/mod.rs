@@ -241,8 +241,12 @@ impl ToolRuntime {
 
         let mut matches: Vec<serde_json::Value> = Vec::new();
         let mut truncated = false;
+        // 건너뛴 비밀값 파일 수 — 조용히 빼면 "검색했는데 없다"와 구별되지 않는다.
+        let mut skipped_secret_files = 0usize;
 
         let mut builder = ignore::WalkBuilder::new(base.absolute());
+        // `.env`처럼 점으로 시작하는 파일도 검색 대상이어야 하므로 hidden 필터를 끈다.
+        // 그 대가로 **비밀값 파일이 그물에 걸리므로** 아래에서 명시적으로 제외해야 한다.
         builder.hidden(false);
         builder.filter_entry(|entry| entry.file_name() != ".git");
 
@@ -252,14 +256,25 @@ impl ToolRuntime {
                 continue;
             }
             let path = entry.path();
+            let Ok(rel_early) = path.strip_prefix(self.root.path()) else {
+                continue;
+            };
+            // 비밀값 파일은 **읽기 전에** 건너뛴다.
+            //
+            // 왜 여기서 막아야 하는가: `search_text`는 자동 승인 도구다. 매칭된 줄 본문을
+            // 그대로 돌려주므로, 제외하지 않으면 `pattern: "sk-"` 한 번으로 승인 절차 없이
+            // API 키를 그대로 얻을 수 있다. 경로 기반 이벤트 redaction으로는 막을 수 없다 —
+            // 검색 대상은 디렉터리이고 유출되는 것은 다른 파일의 내용이기 때문이다.
+            if crate::policy::secrets::is_secret_path(&to_forward_slashes(rel_early)) {
+                skipped_secret_files += 1;
+                continue;
+            }
             let Ok(bytes) = std::fs::read(path) else { continue };
             if is_binary(&bytes) {
                 continue;
             }
             let Ok(text) = String::from_utf8(bytes) else { continue };
-            let Ok(rel) = path.strip_prefix(self.root.path()) else {
-                continue;
-            };
+            let rel = rel_early;
             for (idx, line) in text.lines().enumerate() {
                 if regex.is_match(line) {
                     if matches.len() >= MAX_SEARCH_MATCHES {
@@ -275,7 +290,17 @@ impl ToolRuntime {
             }
         }
 
-        self.ok_json(request, start, json!({ "matches": matches, "truncated": truncated }))
+        self.ok_json(
+            request,
+            start,
+            json!({
+                "matches": matches,
+                "truncated": truncated,
+                // 무엇이 빠졌는지 알려준다. 오케스트레이터가 "여기 없으니 없다"고 결론 내리는 것을
+                // 막고, 사용자에게도 "비밀값 파일은 검색하지 않았다"를 표시할 수 있게 한다.
+                "skippedSecretFiles": skipped_secret_files,
+            }),
+        )
     }
 
     fn read_file(&self, request: &ToolRequest, start: Instant) -> Result<ToolOutcome, String> {
@@ -1306,6 +1331,39 @@ mod tests {
             !paths.iter().any(|p| p.starts_with("ignored")),
             ".gitignore should exclude it, got {paths:?}"
         );
+    }
+
+    /// `search_text`는 자동 승인 도구이므로, 비밀값 파일을 훑으면 승인 절차 없이 키가 유출된다.
+    /// 경로 기반 이벤트 redaction으로는 막을 수 없는 경로다 — 여기서 막아야 한다.
+    #[test]
+    fn search_text_skips_secret_files_so_keys_cannot_be_harvested() {
+        const SECRET: &str = "sk-harvested-through-search";
+        let h = harness();
+        std::fs::write(h.root_path.join(".env"), format!("OPENAI_API_KEY={SECRET}\n")).unwrap();
+        // 일반 파일에도 같은 접두사를 둬서 "패턴이 안 맞아서 못 찾은 것"이 아님을 분명히 한다.
+        std::fs::write(h.root_path.join("src/note.ts"), "// sk-this-one-is-fine\n").unwrap();
+
+        let out = h.run(&req(ToolName::SearchText, json!({ "pattern": "sk-" })));
+        let output = out.result.output.unwrap();
+        let serialized = output.to_string();
+
+        assert!(
+            !serialized.contains(SECRET),
+            "검색 결과로 비밀값이 유출되었습니다: {serialized}"
+        );
+        assert_eq!(
+            output["skippedSecretFiles"].as_u64().unwrap(),
+            1,
+            "건너뛴 사실이 보고되지 않았습니다"
+        );
+        // 일반 파일은 그대로 찾아야 한다 — 과하게 막아 검색이 무용해지면 안 된다.
+        let paths: Vec<&str> = output["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["src/note.ts"]);
     }
 
     #[test]
