@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "daily.js",
+      "content": "// \ud0c0\uc784\uc2a4\ud0ec\ud504\ub97c \uc77c\ubcc4\ub85c \ubb36\ub294\ub2e4.\n//\n// **\uc624\ud504\uc14b\uc744 \ub354\ud55c \ub4a4\uc5d0 \ub0a0\uc9dc\ub97c \uacc4\uc0b0\ud55c\ub2e4.** UTC \uae30\uc900\uc73c\ub85c \ub098\ub204\uba74 UTC+9\uc5d0\uc11c 22\uc2dc\uc5d0 \uc77c\uc5b4\ub09c \uc77c\uc774\n// \uc804\ub0a0\ub85c \uc9d1\uacc4\ub418\uc5b4 \ub9ac\ud3ec\ud2b8\uac00 \ud558\ub8e8\uc529 \ubc00\ub9b0\ub2e4.\n// \ubc84\ud0b7 \ud0a4\ub97c YYYY-MM-DD\ub85c \ub450\ub294 \uc774\uc720: \uc22b\uc790 \uc778\ub371\uc2a4\ub294 \uc0ac\ub78c\uc774 \uc77d\uc744 \uc218 \uc5c6\uc5b4 \ubc00\ub9b0 \uac83\uc744 \ub208\uce58\ucc44\uae30 \uc5b4\ub835\ub2e4.\nconst DAY_MS = 86400000;\n\nfunction groupByDay(timestamps, tzOffsetMinutes) {\n  const buckets = new Map();\n  const offsetMs = tzOffsetMinutes * 60000;\n  for (const ts of timestamps) {\n    const local = ts + offsetMs;\n    const dayStart = Math.floor(local / DAY_MS) * DAY_MS;\n    const key = new Date(dayStart).toISOString().slice(0, 10);\n    buckets.set(key, (buckets.get(key) ?? 0) + 1);\n  }\n  return buckets;\n}\nmodule.exports = { groupByDay };\n"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 import type {
   ComplexityTier,
   DraftProposal,
+  ExperimentControls,
   ExecutionPlan,
   FailureReason,
   FinalResult,
@@ -65,6 +66,11 @@ export interface RunInput {
   taskRequest: TaskRequest;
   policy: TaskPolicy;
   availableProviders: string[];
+  /**
+   * 실험 하네스(evals/hypothesis-gate) 전용 제어. **production 경로에서는 항상 undefined다.**
+   * Rust가 `task.start` params로 채우며, Node는 이 값을 만들어내지 않는다.
+   */
+  experiment?: ExperimentControls;
 }
 
 interface PendingQuestion {
@@ -308,19 +314,28 @@ export class Orchestrator {
     }
 
     await this.transition("DRAFTING");
-    const draftCall = `draft:${this.state.counters.clarificationRounds + 1}`;
-    const draft = await this.callProvider(adapters.executor, "executor", draftCall, (ctx) =>
-      adapters.executor.generateDraft(
-        {
-          snapshot: this.requireSnapshot(),
-          userMessage: this.input.taskRequest.userMessage,
-          userAnswers: this.answers.length > 0 ? this.answers : undefined,
-        },
-        ctx
-      )
-    );
-    if (draft.kind === "final") return draft;
-    const proposal: DraftProposal = draft.value;
+
+    // 실험 하네스가 초안을 주입한 경우(Arm C/D가 Arm A의 초안을 공유). production에서는 항상 undefined다.
+    // 재질문 왕복이 있었다면 주입된 초안은 그 답변을 반영하지 못하므로 쓰지 않는다.
+    const replayed = this.answers.length === 0 ? this.input.experiment?.replayDraft : undefined;
+    let proposal: DraftProposal;
+    if (replayed) {
+      proposal = replayed;
+    } else {
+      const draftCall = `draft:${this.state.counters.clarificationRounds + 1}`;
+      const draft = await this.callProvider(adapters.executor, "executor", draftCall, (ctx) =>
+        adapters.executor.generateDraft(
+          {
+            snapshot: this.requireSnapshot(),
+            userMessage: this.input.taskRequest.userMessage,
+            userAnswers: this.answers.length > 0 ? this.answers : undefined,
+          },
+          ctx
+        )
+      );
+      if (draft.kind === "final") return draft;
+      proposal = draft.value;
+    }
     await this.emit("DRAFT_RECEIVED", {
       proposalId: proposal.proposalId,
       model: proposal.model,
@@ -328,18 +343,28 @@ export class Orchestrator {
       risks: proposal.risks,
       uncertainties: proposal.uncertainties,
       hasPatch: Boolean(proposal.patch && proposal.patch.trim().length > 0),
+      // **초안 본문을 이벤트에 남긴다.** 이전에는 `hasPatch`만 남겨서, 검수자가 REJECT하면
+      // "무엇을 제안했는지"가 어디에도 기록되지 않았다 — Agent Trace 투명성의 실제 구멍이었다.
+      // 8KB를 넘으면 Rust가 artifact로 밀어내고 참조만 남긴다(store.rs INLINE_PAYLOAD_LIMIT_BYTES).
+      patch: proposal.patch ?? null,
+      plan: proposal.plan,
+      // 주입된 초안인지 — 이 값이 "replayed"인 실행은 실험 하네스가 만든 것이다.
+      draftSource: replayed ? "replayed" : "generated",
     });
 
     // ---- REVIEWING ----
     for (;;) {
       await this.transition("REVIEWING");
       const reviewCall = `review:${this.state.counters.reviseRounds + 1}`;
+      // Blind Review는 M1 항목이라 production 기본은 informed다. 실험 하네스만 이 축을 고정한다.
+      const blind = this.input.experiment?.reviewMode === "blind";
       const review = await this.callProvider(reviewer, "reviewer", reviewCall, (ctx) =>
         reviewer.reviewProposal(
           {
             snapshot: this.requireSnapshot(),
             userMessage: this.input.taskRequest.userMessage,
             draft: proposal,
+            blind,
           },
           ctx
         )
@@ -352,6 +377,9 @@ export class Orchestrator {
         rationale: decision.rationale,
         // 검수자가 실행자와 다른 공급자였는지 — 차별화 주장의 근거 데이터.
         reviewerIndependent: this.routing?.reviewerIndependent ?? false,
+        // 어떤 정보를 보고 판정했는지. blind/informed 불일치율 지표의 근거다
+        // (product-strategy.md 14절) — 모델이 주장하는 값이 아니라 우리가 구성한 사실이다.
+        reviewMode: decision.reviewMode,
       });
 
       switch (decision.verdict) {

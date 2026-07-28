@@ -1,0 +1,8 @@
+{
+  "name": "asy-02-event-ordering",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test public.test.js"
+  }
+}

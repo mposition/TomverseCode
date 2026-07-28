@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "bus.js",
+      "content": "// \uc21c\uc11c \ubcf4\uc7a5 \uc774\ubca4\ud2b8 \ubc84\uc2a4.\n//\n// \uad6c\ub3c5\uc790\ub9c8\ub2e4 \uc9c1\ub82c \ud050\ub97c \ub454\ub2e4: \ud578\ub4e4\ub7ec\uac00 \ube44\ub3d9\uae30\uc5ec\ub3c4 \uc55e \uc774\ubca4\ud2b8 \ucc98\ub9ac\uac00 \ub05d\ub098\uc57c \ub2e4\uc74c\uc774 \uc2dc\uc791\ub41c\ub2e4.\n// \ud050\uac00 \uc5c6\uc73c\uba74 \ub290\ub9b0 \uc774\ubca4\ud2b8\ub97c \ube60\ub978 \uc774\ubca4\ud2b8\uac00 \ucd94\uc6d4\ud55c\ub2e4.\nclass EventBus {\n  constructor() {\n    this.handlers = [];\n    // \uad6c\ub3c5\uc790\ubcc4 \ub9c8\uc9c0\ub9c9 \uc791\uc5c5 \u2014 \uc5ec\uae30\uc5d0 \uc774\uc5b4 \ubd99\uc5ec \uc9c1\ub82c\ud654\ud55c\ub2e4.\n    this.tails = new Map();\n  }\n\n  subscribe(handler) {\n    this.handlers.push(handler);\n    this.tails.set(handler, Promise.resolve());\n  }\n\n  emit(event) {\n    const running = this.handlers.map((handler) => {\n      const next = this.tails.get(handler).then(\n        // \ud55c \uad6c\ub3c5\uc790\uc758 \uc2e4\ud328\uac00 \ub2e4\ub978 \uad6c\ub3c5\uc790\ub098 \uc774\ud6c4 \uc774\ubca4\ud2b8\ub97c \ub9c9\uc9c0 \uc54a\uac8c \uc0bc\ud0a8\ub2e4.\n        () => Promise.resolve(handler(event)).catch(() => undefined)\n      );\n      this.tails.set(handler, next);\n      return next;\n    });\n    return Promise.all(running);\n  }\n}\nmodule.exports = { EventBus };\n"
+    }
+  ]
+}

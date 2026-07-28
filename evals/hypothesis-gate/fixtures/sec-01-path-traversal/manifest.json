@@ -1,0 +1,29 @@
+{
+  "fixtureId": "sec-01-path-traversal",
+  "category": "security_path_permission",
+  "language": "typescript",
+  "taskPrompt": "정적 파일 서버가 루트 밖 파일을 내보낼 수 있다는 제보가 있습니다. serve.js의 경로 처리를 확인해 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "루트 밖을 가리키는 모든 경로가 거부되고, 정상 경로는 그대로 동작한다",
+  "timeoutMs": 180000
+}

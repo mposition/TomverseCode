@@ -1,0 +1,33 @@
+{
+  "fixtureId": "asy-03-retry-backoff",
+  "category": "async_ordering",
+  "language": "rust",
+  "taskPrompt": "재시도 로직이 지수 백오프를 제대로 하지 않고, 재시도 가능한 오류와 아닌 오류를 구분하지 않습니다. retry.rs를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "cargo",
+      "args": [
+        "test",
+        "--offline",
+        "--test",
+        "public"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "cargo",
+      "args": [
+        "test",
+        "--offline",
+        "--test",
+        "oracle"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "tests/public.rs"
+  ],
+  "expectedInvariant": "지수 백오프가 시도마다 2배로 늘고 상한에서 멈추며, 재시도 불가 오류는 즉시 반환한다",
+  "timeoutMs": 300000
+}

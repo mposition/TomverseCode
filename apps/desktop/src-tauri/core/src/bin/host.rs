@@ -87,6 +87,23 @@ struct Args {
     /// 테스트 편의 기능이지만, **실행되는 취소 경로는 실제 경로와 동일하다** —
     /// 같은 registry, 같은 토큰, 같은 프로세스 트리 종료 코드를 탄다. 별도 mock이 아니다.
     cancel_after_ms: Option<u64>,
+
+    // ---- 가설 게이트(evals/hypothesis-gate) 전용 ----
+    //
+    // 이 세 옵션은 **arm 구성만 바꾸고 실행 경로는 그대로 둔다.** 하네스가 별도 파이프라인을
+    // 만들면 "production이 이렇게 동작한다"를 측정하지 못하므로, 같은 Policy Gate·Tool
+    // Runtime·Verification Runner를 태우면서 무엇을 비교할지만 지정할 수 있게 한다.
+    /// 후보 공급자를 이 목록으로 제한한다.
+    ///
+    /// arm A/B("단독")를 만드는 **정당한** 방법이다: 공급자가 하나면 라우터의 검수자 독립성
+    /// 불변식이 reviewer를 스스로 드롭하고 그 사유를 `appliedPolicies`에 남긴다.
+    /// reviewer를 억지로 끄는 별도 분기를 만들지 않아도 된다.
+    providers: Option<Vec<String>>,
+    /// `blind` | `informed` — 검수자가 초안 작성자의 자기설명을 보는지.
+    review_mode: Option<String>,
+    /// 초안을 새로 생성하지 않고 이 파일의 `DraftProposal`을 쓴다.
+    /// **파일을 읽는 것은 Rust다** — sidecar는 경로를 받지도 않는다.
+    replay_draft: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -108,6 +125,9 @@ fn parse_args() -> Result<Args, String> {
         timeout_secs: 600,
         verbose: false,
         cancel_after_ms: None,
+        providers: None,
+        review_mode: None,
+        replay_draft: None,
     };
 
     while let Some(flag) = raw.next() {
@@ -141,6 +161,23 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|_| "--cancel-after-ms는 정수여야 합니다".to_string())?,
                 )
             }
+            "--providers" => {
+                args.providers = Some(
+                    value()?
+                        .split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect(),
+                )
+            }
+            "--review-mode" => {
+                let mode = value()?;
+                if mode != "blind" && mode != "informed" {
+                    return Err(format!("알 수 없는 --review-mode: {mode} (blind|informed)"));
+                }
+                args.review_mode = Some(mode);
+            }
+            "--replay-draft" => args.replay_draft = Some(PathBuf::from(value()?)),
             "--verbose" => args.verbose = true,
             other => return Err(format!("알 수 없는 인자: {other}\n\n{}", usage())),
         }
@@ -152,6 +189,8 @@ fn usage() -> String {
     "usage: tomverse-host <run|rollback|recover|tasks|show> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>] [--verbose]\n\
+     \n\
+     가설 게이트 전용: [--providers <csv>] [--review-mode blind|informed] [--replay-draft <file>]\n\
      \n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
      tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
@@ -414,6 +453,49 @@ fn run_task(
         providers
     };
 
+    // `--providers`는 **좁히기만 한다.** 자격증명이 없는 공급자를 후보에 넣을 수는 없다 —
+    // 그러면 "키가 없는데 있는 척"이 되고, 실험이 실제로 어느 모델을 불렀는지 알 수 없어진다.
+    let providers = match &args.providers {
+        Some(requested) => {
+            let narrowed: Vec<String> = providers.iter().filter(|p| requested.contains(p)).cloned().collect();
+            if narrowed.is_empty() {
+                return Err(format!(
+                    "--providers {:?} 중 자격증명이 있는 공급자가 없습니다 (사용 가능: {:?}). \
+                     실험을 실제로 돌리려면 해당 공급자의 API 키가 필요합니다.",
+                    requested, providers
+                ));
+            }
+            narrowed
+        }
+        None => providers,
+    };
+
+    // 초안 재생 파일은 **Rust가 읽는다.** sidecar에는 경로가 아니라 내용만 넘어간다.
+    let replay_draft: Option<Value> = match &args.replay_draft {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("--replay-draft 파일을 읽을 수 없습니다 {path:?}: {e}"))?;
+            let parsed: Value = serde_json::from_str(&text)
+                .map_err(|e| format!("--replay-draft 파일이 유효한 JSON이 아닙니다 {path:?}: {e}"))?;
+            // 최소 형태 확인 — 잘못된 파일이 조용히 "초안 없음"으로 흘러가면 arm이 뒤바뀐다.
+            if parsed.get("patch").is_none() && parsed.get("plan").is_none() {
+                return Err(format!(
+                    "--replay-draft 파일에 patch도 plan도 없습니다 {path:?} — 재생할 초안이 아닙니다"
+                ));
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
+
+    let mut experiment = serde_json::Map::new();
+    if let Some(mode) = &args.review_mode {
+        experiment.insert("reviewMode".to_string(), json!(mode));
+    }
+    if let Some(draft) = replay_draft {
+        experiment.insert("replayDraft".to_string(), draft);
+    }
+
     let params = json!({
         "taskRequest": {
             "taskId": task_id,
@@ -429,6 +511,8 @@ fn run_task(
         },
         "workspaceName": workspace_name(host.root()),
         "availableProviders": providers,
+        // 비어 있으면 아예 넣지 않는다 — production 실행과 바이트 단위로 같은 params가 되도록.
+        "experiment": if experiment.is_empty() { Value::Null } else { Value::Object(experiment) },
     });
 
     // 시나리오 A: 실행 중 취소를 스스로 트리거한다. **취소 경로는 UI의 것과 동일하다** —

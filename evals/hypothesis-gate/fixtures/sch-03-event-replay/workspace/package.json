@@ -1,0 +1,8 @@
+{
+  "name": "sch-03-event-replay",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test public.test.js"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "fixtureId": "mfc-01-pagination-contract",
+  "category": "multi_file_contract",
+  "language": "typescript",
+  "taskPrompt": "목록 API에서 마지막 페이지 다음 페이지를 요청하면 빈 배열이 아니라 첫 페이지 내용이 돌아옵니다. paginate.js와 그것을 쓰는 listUsers.js를 확인해 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "paginate와 호출자가 같은 1-based 페이지 규약을 쓰고, 범위를 벗어난 페이지는 빈 배열을 반환한다",
+  "timeoutMs": 180000
+}

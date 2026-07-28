@@ -1,0 +1,33 @@
+{
+  "fixtureId": "mfc-03-range-endpoints",
+  "category": "multi_file_contract",
+  "language": "rust",
+  "taskPrompt": "바이트 범위 요청 처리에서 마지막 1바이트가 빠집니다. HTTP Range 헤더는 끝 위치를 포함(inclusive)합니다. range.rs와 slice.rs의 계약을 맞춰 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "cargo",
+      "args": [
+        "test",
+        "--offline",
+        "--test",
+        "public"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "cargo",
+      "args": [
+        "test",
+        "--offline",
+        "--test",
+        "oracle"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "tests/public.rs"
+  ],
+  "expectedInvariant": "parse_range는 inclusive 끝을 그대로 보존하고 slice_range가 그 계약대로 자른다",
+  "timeoutMs": 300000
+}

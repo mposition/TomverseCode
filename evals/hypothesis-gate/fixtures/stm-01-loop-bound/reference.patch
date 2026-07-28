@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "loop.js",
+      "content": "// \uc791\uc5c5\uc774 \uc131\uacf5\ud560 \ub54c\uae4c\uc9c0 \uc7ac\uc2dc\ub3c4\ud55c\ub2e4. **\uc0c1\ud55c\uc744 \ub118\uae30\uc9c0 \uc54a\ub294\ub2e4.**\n//\n// \uc774\uc804 \uad6c\ud604\uc740 (a) \uc0c1\ud55c \uac80\uc0ac\uac00 \uc99d\uac00\ubcf4\ub2e4 \uba3c\uc800\ub77c \ud55c \ubc88 \ub354 \ub3cc\uc558\uace0\n// (b) `attempts > maxAttempts`\ub97c \uc4f0\ub294 \ubc14\ub78c\uc5d0 \uacbd\uacc4\uc5d0\uc11c \ud55c \ubc88 \ub354 \ub3cc\uc558\ub2e4.\nfunction runWithRetries(step, maxAttempts) {\n  let attempts = 0;\n  let lastError = null;\n  for (;;) {\n    try {\n      return { status: \"ok\", value: step(attempts), attempts };\n    } catch (error) {\n      lastError = error;\n      if (attempts >= maxAttempts) {\n        return { status: \"failed\", reason: String(lastError), attempts };\n      }\n      attempts += 1;\n    }\n  }\n}\nmodule.exports = { runWithRetries };\n"
+    }
+  ]
+}

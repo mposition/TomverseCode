@@ -3,6 +3,7 @@
 
 import type { ISODateTime } from "./common.js";
 import type { TaskEventType } from "./events.js";
+import type { DraftProposal } from "./proposal.js";
 import type { TaskPolicy, TaskRequest } from "./task.js";
 import type { ToolRequest, ToolResult } from "./tools.js";
 import type { VerificationPhase, VerificationReport } from "./verification.js";
@@ -57,6 +58,38 @@ export interface TaskStartParams {
   workspaceName: string;
   /** 사용 가능한 공급자 (자격증명이 실제로 있는 것만 Rust가 알려준다) */
   availableProviders: string[];
+  /**
+   * 실험 제어 — **평가 하네스 전용**이며 UI 경로에서는 항상 비어 있다.
+   *
+   * 왜 프로토콜에 두는가: 가설 게이트(evals/hypothesis-gate)는 production 실행 경로를 그대로
+   * 태워야 의미가 있다. 하네스가 별도 파이프라인을 만들면 "production이 이렇게 동작한다"를
+   * 측정하지 못한다. 그래서 arm 구성만 주입하고 나머지는 전부 같은 코드가 처리한다.
+   *
+   * **Rust가 채운다.** 값이 파일에서 오는 경우(replayDraft)도 파일을 읽는 것은 Rust다 —
+   * sidecar가 파일에 직접 접근하지 않는다는 원칙(process-architecture.md 2절)은 여기서도 유지된다.
+   */
+  experiment?: ExperimentControls;
+}
+
+/** 가설 게이트의 arm을 결정하는 값들. production 기본값은 "전부 미지정"이다. */
+export interface ExperimentControls {
+  /**
+   * Blind Review 여부를 명시적으로 고정한다.
+   *
+   * production에서는 아직 informed가 기본이고 이 축은 M1 항목이다. 하네스는 같은 초안에 대해
+   * 두 모드를 비교해야 하므로(anchoring 효과 측정) 여기서 강제할 수 있어야 한다.
+   */
+  reviewMode?: "blind" | "informed";
+  /**
+   * 초안을 새로 생성하지 않고 **주어진 것을 그대로 쓴다.**
+   *
+   * Arm C(informed)와 Arm D(blind)가 각각 초안을 새로 생성하면 두 arm의 차이가 review mode인지
+   * 초안 품질의 분산인지 구별할 수 없다. 같은 초안을 공유해야 paired 비교가 성립한다.
+   *
+   * 이건 fake provider가 **아니다**: 실제 OpenAI가 실제로 만든 초안이며, 이후 검수·계획·정책
+   * 판단·도구 실행·검증은 전부 실제 경로를 탄다. 기록에 `draftSource: "replayed"`로 남는다.
+   */
+  replayDraft?: DraftProposal;
 }
 
 export interface TaskUserInputParams {

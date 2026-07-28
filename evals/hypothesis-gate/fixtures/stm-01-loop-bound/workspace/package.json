@@ -1,0 +1,8 @@
+{
+  "name": "stm-01-loop-bound",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test public.test.js"
+  }
+}

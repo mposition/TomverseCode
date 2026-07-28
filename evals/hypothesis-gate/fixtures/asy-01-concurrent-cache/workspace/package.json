@@ -1,0 +1,8 @@
+{
+  "name": "asy-01-concurrent-cache",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test public.test.js"
+  }
+}

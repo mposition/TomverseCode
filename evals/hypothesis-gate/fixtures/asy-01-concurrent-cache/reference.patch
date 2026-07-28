@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "cache.js",
+      "content": "// \ube44\ub3d9\uae30 \uacb0\uacfc\ub97c \uce90\uc2dc\ud55c\ub2e4. **in-flight promise\ub97c \uce90\uc2dc\ud574\uc57c** \ub3d9\uc2dc \uc694\uccad\uc774 \ud569\uccd0\uc9c4\ub2e4.\nclass AsyncCache {\n  constructor(fetcher) {\n    this.fetcher = fetcher;\n    this.values = new Map();\n    this.inflight = new Map();\n  }\n\n  async get(key) {\n    if (this.values.has(key)) return this.values.get(key);\n    const existing = this.inflight.get(key);\n    if (existing) return existing;\n\n    const promise = (async () => {\n      const value = await this.fetcher(key);\n      this.values.set(key, value);\n      return value;\n    })();\n    this.inflight.set(key, promise);\n    try {\n      return await promise;\n    } finally {\n      // \uc131\uacf5\uc774\ub4e0 \uc2e4\ud328\ub4e0 in-flight\uc5d0\uc11c \uc81c\uac70\ud55c\ub2e4. \uc2e4\ud328\ub294 values\uc5d0 \ub4e4\uc5b4\uac00\uc9c0 \uc54a\uc73c\ubbc0\ub85c\n      // \ub2e4\uc74c \ud638\ucd9c\uc774 \ub2e4\uc2dc \uc2dc\ub3c4\ud55c\ub2e4.\n      this.inflight.delete(key);\n    }\n  }\n}\nmodule.exports = { AsyncCache };\n"
+    }
+  ]
+}

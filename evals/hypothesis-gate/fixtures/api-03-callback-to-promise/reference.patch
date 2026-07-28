@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "fetchAll.js",
+      "content": "// \uc5ec\ub7ec \ud0a4\ub97c \uc77d\ub294\ub2e4.\n//\n// **\uc774\uc911 \uc778\ud130\ud398\uc774\uc2a4**: \ucf5c\ubc31\uc744 \uc8fc\uba74 \ucf5c\ubc31\uc73c\ub85c, \uc0dd\ub7b5\ud558\uba74 Promise\ub85c \ub3d9\uc791\ud55c\ub2e4.\n// \ucf5c\ubc31 \uacbd\ub85c\uc5d0\uc11c Promise\ub97c \ud568\uaed8 \ubc18\ud658\ud558\uba74 \uc544\ubb34\ub3c4 \uc7a1\uc9c0 \uc54a\ub294 rejection\uc774 \uc0dd\uae30\ubbc0\ub85c \ubc18\ud658\ud558\uc9c0 \uc54a\ub294\ub2e4.\nfunction fetchAllCore(store, keys) {\n  const out = [];\n  for (const key of keys) {\n    if (!store.has(key)) throw new Error(`\uc5c6\ub294 \ud0a4: ${key}`);\n    out.push(store.get(key));\n  }\n  return out;\n}\n\nfunction fetchAll(store, keys, callback) {\n  if (typeof callback === \"function\") {\n    try {\n      const values = fetchAllCore(store, keys);\n      callback(null, values);\n    } catch (error) {\n      callback(error);\n    }\n    return undefined;\n  }\n  return new Promise((resolve, reject) => {\n    try {\n      resolve(fetchAllCore(store, keys));\n    } catch (error) {\n      reject(error);\n    }\n  });\n}\nmodule.exports = { fetchAll };\n"
+    }
+  ]
+}

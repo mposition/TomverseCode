@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "username.js",
+      "content": "const MIN = 3;\nconst MAX = 20;\n\n// \uc0ac\uc6a9\uc790 \uc774\ub984\uc744 \uac80\uc99d\ud558\uace0 \uc815\uaddc\ud654\ud55c\ub2e4.\n//\n// **\uba3c\uc800 \ub2e4\ub4ec\uace0 \ub098\uc11c \uac80\uc99d\ud55c\ub2e4.** \uc21c\uc11c\ub97c \ubc18\ub300\ub85c \ud558\uba74 (a) \uacf5\ubc31\uc744 \ucc44\uc6cc \ucd5c\uc18c \uae38\uc774\ub97c \uc6b0\ud68c\ud560 \uc218 \uc788\uace0\n// (b) \uacf5\ubc31\uc774 \ud3ec\ud568\ub41c \uac12\uc774 \uc800\uc7a5\ub418\uc5b4 \ub098\uc911\uc5d0 \uc870\ud68c\uac00 \uc548 \ub9de\ub294\ub2e4.\n// \ub0b4\ubd80 \uacf5\ubc31\uc740 \uadf8\ub300\ub85c \ub454\ub2e4 \u2014 \"ada lovelace\"\uc5d0\uc11c \uacf5\ubc31\uc744 \uc9c0\uc6b0\uba74 \ub2e4\ub978 \uc774\ub984\uc774\ub2e4.\nfunction normalizeUsername(raw) {\n  if (typeof raw !== \"string\") return { ok: false, error: \"\ubb38\uc790\uc5f4\uc774 \uc544\ub2d9\ub2c8\ub2e4\" };\n  const value = raw.trim();\n  if (value.length < MIN) return { ok: false, error: `${MIN}\uc790 \uc774\uc0c1\uc774\uc5b4\uc57c \ud569\ub2c8\ub2e4` };\n  if (value.length > MAX) return { ok: false, error: `${MAX}\uc790 \uc774\ud558\uc5ec\uc57c \ud569\ub2c8\ub2e4` };\n  return { ok: true, value };\n}\nmodule.exports = { normalizeUsername, MIN, MAX };\n"
+    }
+  ]
+}

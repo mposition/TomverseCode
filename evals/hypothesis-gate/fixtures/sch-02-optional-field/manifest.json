@@ -1,0 +1,29 @@
+{
+  "fixtureId": "sch-02-optional-field",
+  "category": "schema_compatibility",
+  "language": "typescript",
+  "taskPrompt": "예전 클라이언트가 보낸 요청이 400으로 거부됩니다. 새로 추가한 필드 때문인 것 같습니다. validate.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "새 필드가 없는 예전 요청도 받아들이고, 있으면 형식을 검사한다",
+  "timeoutMs": 180000
+}

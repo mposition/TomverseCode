@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "serve.js",
+      "content": "const path = require(\"node:path\");\n\n/**\n * \uc694\uccad \uacbd\ub85c\ub97c \ub8e8\ud2b8 \uc548\uc758 \uc2e4\uc81c \uacbd\ub85c\ub85c \ubc14\uafbc\ub2e4.\n *\n * \ubb38\uc790\uc5f4\uc5d0\uc11c \"..\"\ub97c \uc9c0\uc6b0\ub294 \ubc29\uc2dd\uc740 \uc548\uc804\ud558\uc9c0 \uc54a\ub2e4 \u2014 `....//`\ucc98\ub7fc \ud544\ud130\ub97c \uac70\uce58\uba74 \"..\"\uac00 \ub418\ub294\n * \ud615\ud0dc\ub97c \uc7a1\uc9c0 \ubabb\ud558\uace0, URL \uc778\ucf54\ub529(`%2e%2e`)\ub3c4 \ud1b5\uacfc\ud55c\ub2e4. **\uc815\uaddc\ud654\ud55c \ub4a4 \ub8e8\ud2b8 \uc548\uc778\uc9c0 \ud655\uc778**\ud558\ub294\n * \uac83\uc774 \uc720\uc77c\ud558\uac8c \uc633\uc740 \ubc29\ubc95\uc774\ub2e4.\n */\nfunction resolveRequestPath(root, requestPath) {\n  const rootResolved = path.resolve(root);\n\n  let decoded;\n  try {\n    decoded = decodeURIComponent(requestPath);\n  } catch {\n    return { ok: false, reason: \"\uc798\ubabb\ub41c URL \uc778\ucf54\ub529\" };\n  }\n  // \uc5ed\uc2ac\ub798\uc2dc\ub3c4 \uad6c\ubd84\uc790\ub85c \ucde8\uae09\ud55c\ub2e4 (Windows).\n  decoded = decoded.replace(/\\\\/g, \"/\");\n\n  const cleaned = decoded.replace(/^\\/+/, \"\");\n  const full = path.resolve(rootResolved, cleaned);\n\n  if (full !== rootResolved && !full.startsWith(rootResolved + path.sep)) {\n    return { ok: false, reason: \"\ub8e8\ud2b8 \ubc16\uc744 \uac00\ub9ac\ud0b5\ub2c8\ub2e4\" };\n  }\n  return { ok: true, path: full };\n}\nmodule.exports = { resolveRequestPath };\n"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "src/retry.rs",
+      "content": "#[derive(Debug, Clone, PartialEq, Eq)]\npub enum CallError {\n    /// \ub2e4\uc2dc \uc2dc\ub3c4\ud558\uba74 \uc131\uacf5\ud560 \uc218 \uc788\ub2e4\n    Transient,\n    /// \ub2e4\uc2dc \uc2dc\ub3c4\ud574\ub3c4 \uac19\ub2e4 \u2014 \uc989\uc2dc \ud3ec\uae30\ud574\uc57c \ud55c\ub2e4\n    Permanent,\n}\n\npub struct Attempt {\n    pub number: u32,\n    pub delay_ms: u64,\n}\n\n/// \uc7ac\uc2dc\ub3c4 \uacc4\ud68d\uc744 \ub9cc\ub4e0\ub2e4. `max_attempts`\ub294 \ucd5c\ucd08 \uc2dc\ub3c4\ub97c \ud3ec\ud568\ud55c\ub2e4.\n///\n/// \ucd5c\ucd08 \uc2dc\ub3c4\ub294 \uae30\ub2e4\ub9ac\uc9c0 \uc54a\uace0, \uc774\ud6c4 \uc2dc\ub3c4\ub9c8\ub2e4 \uc9c0\uc5f0\uc774 2\ubc30\uac00 \ub418\uba70 `max_delay_ms`\uc5d0\uc11c \uba48\ucd98\ub2e4.\npub fn plan(max_attempts: u32, base_delay_ms: u64, max_delay_ms: u64) -> Vec<Attempt> {\n    let mut out = Vec::new();\n    for number in 1..=max_attempts {\n        let delay_ms = if number == 1 {\n            0\n        } else {\n            let exponent = number - 2;\n            base_delay_ms\n                .saturating_mul(1u64 << exponent.min(63))\n                .min(max_delay_ms)\n        };\n        out.push(Attempt { number, delay_ms });\n    }\n    out\n}\n\n/// \uc624\ub958\ub97c \ubcf4\uace0 \uc7ac\uc2dc\ub3c4\ud560\uc9c0 \uacb0\uc815\ud55c\ub2e4. \uc601\uad6c \uc624\ub958\ub294 \uc7ac\uc2dc\ub3c4\ud558\uc9c0 \uc54a\ub294\ub2e4.\npub fn should_retry(error: &CallError) -> bool {\n    matches!(error, CallError::Transient)\n}\n"
+    }
+  ]
+}

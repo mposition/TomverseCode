@@ -1,0 +1,33 @@
+{
+  "fixtureId": "err-03-transaction-rollback",
+  "category": "error_recovery_rollback",
+  "language": "rust",
+  "taskPrompt": "계좌 이체가 중간에 실패하면 출금만 되고 입금이 안 되는 경우가 있습니다. ledger.rs를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "cargo",
+      "args": [
+        "test",
+        "--offline",
+        "--test",
+        "public"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "cargo",
+      "args": [
+        "test",
+        "--offline",
+        "--test",
+        "oracle"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "tests/public.rs"
+  ],
+  "expectedInvariant": "이체는 전부 적용되거나 전부 취소되며, 잔액 합계는 어떤 경우에도 보존된다",
+  "timeoutMs": 300000
+}

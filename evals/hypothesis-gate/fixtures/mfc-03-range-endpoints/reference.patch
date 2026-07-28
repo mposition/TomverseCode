@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "src/slice.rs",
+      "content": "use crate::range::ByteRange;\n\n/// \ubc94\uc704\ub9cc\ud07c \uc798\ub77c\ub0b8\ub2e4. `range.end`\ub294 **inclusive**\uc774\ubbc0\ub85c +1 \ud574\uc11c exclusive\ub85c \ubc14\uafbc\ub2e4.\npub fn slice_range(data: &[u8], range: ByteRange) -> &[u8] {\n    if range.start >= data.len() {\n        return &[];\n    }\n    let end_exclusive = range.end.saturating_add(1).min(data.len());\n    if range.start >= end_exclusive {\n        return &[];\n    }\n    &data[range.start..end_exclusive]\n}\n"
+    }
+  ]
+}

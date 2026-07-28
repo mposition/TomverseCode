@@ -1,0 +1,29 @@
+{
+  "fixtureId": "amb-02-timezone-boundary",
+  "category": "ambiguous_requirement",
+  "language": "typescript",
+  "taskPrompt": "일별 집계 리포트의 숫자가 하루씩 밀리는 것 같다는 제보를 받았습니다. 재현 조건은 확실하지 않습니다. daily.js를 확인해주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "집계는 지정된 타임존의 하루 경계로 묶이고, 경계 시각이 정확히 한 버킷에만 들어간다",
+  "timeoutMs": 180000
+}

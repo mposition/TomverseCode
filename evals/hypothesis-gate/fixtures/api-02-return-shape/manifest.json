@@ -1,0 +1,29 @@
+{
+  "fixtureId": "api-02-return-shape",
+  "category": "public_api_change",
+  "language": "typescript",
+  "taskPrompt": "search()가 결과가 없을 때 null을 반환해 호출자가 자꾸 터집니다. 반환 형태를 정리하되 기존 호출자를 고려해주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "결과 없음이 예외 없이 다룰 수 있는 형태로 반환되고, 오류와 빈 결과가 구별된다",
+  "timeoutMs": 180000
+}
