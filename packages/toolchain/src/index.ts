@@ -28,7 +28,19 @@ export {
   needsNativeToolchain,
   parseMsvcEnv,
   prepareMsvcEnv,
+  READY_MARKER,
   withMsvcEnv,
   type MsvcResult,
   type ScriptRunner,
 } from "./msvc.js";
+
+export {
+  DEFAULT_PATHEXT,
+  findExecutable,
+  programStem,
+  resolveNodeCli,
+  type NodeCliResolution,
+  type ResolveEnv,
+} from "./nodeCli.js";
+
+export { buildOrder, dependencyGraph, type WorkspaceManifest } from "./buildOrder.js";

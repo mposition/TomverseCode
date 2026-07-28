@@ -13,9 +13,14 @@ rem
 rem 이 순서는 루트 package.json의 `verify`와 **의미상 동일해야 한다.** 한쪽만 고치지 말 것 —
 rem packages/toolchain/test/verifyOrder.test.ts가 두 진입점의 순서를 비교해 지킨다.
 rem
+rem **여기서 _env.bat을 call하지 않는다.** 예전에는 call했고, 그래서 이 스크립트는 통과하는데
+rem 루트 `npm run verify`는 일반 PowerShell에서 core:build 단계에 INCLUDE/LIB 없이 들어가
+rem 죽었다 — 단계 순서는 같은데 **환경 준비 의미가 달랐다.** 이제 MSVC 준비는 cargo 런처
+rem (scripts/cargo.mjs)가 하며, 두 진입점이 같은 경로를 지난다. 여기서 미리 준비해 버리면
+rem 그 차이가 다시 감춰진다.
+rem
 rem `npm install` / `npm ci`는 사용자가 사전에 수행한다 — 이 스크립트는 의존성을 건드리지 않는다.
 setlocal
-call "%~dp0_env.bat" || exit /b 1
 pushd "%~dp0.."
 
 call npm run build      || goto :fail

@@ -32,6 +32,10 @@ Windows 데스크톱 AI 코딩 어시스턴트.
 4. **검수자는 실행자와 다른 공급자여야 한다.** 만족시킬 수 없으면 같은 공급자로 "검증한 척"하지 말고, 검수 역할을 드롭한 뒤 그 사실을 사용자에게 표시한다.
 5. **모든 루프에는 상한이 있다.** `clarificationRounds` ≤2, `reviseRounds` ≤2, `fixLoopRounds` ≤3, `toolRetries` ≤2, `providerRetries` ≤3. 상한 없는 루프를 새로 만들지 말 것.
 6. **`run_command`는 셸 문자열이 아니라 argv 배열만 받는다.** 이 덕분에 승인 모달에 표시되는 명령이 실제 실행되는 것과 100% 일치한다는 보장이 성립한다. 이걸 깨면 보안 모델과 UI 약속이 동시에 무너진다.
+   Windows에서 `npm`이 `npm.cmd`(배치 shim)라는 문제는 **`cmd.exe /c`로 감싸서 풀지 않는다** —
+   감싸는 순간 인자의 `&`/`|`/`%`가 셸에 재해석되어 이 보장이 사라진다. 대신
+   `tools/program.rs`가 shim이 하는 일을 구조적으로 재현한다(`node.exe npm-cli.js <원래 argv>`).
+   구조를 확인할 수 없으면 추측해서 실행하지 않고 실패한다.
 7. **`task_events`는 append-only 진실의 원천이다.** `tasks.phase`는 파생 캐시다. 이벤트를 남기지 않고 상태를 바꾸지 말 것.
 
 ## 미검증 가설 — 큰 투자 전에 확인할 것
@@ -44,9 +48,15 @@ Phase 0 스파이크 실측: 쉬운 버그 5건에서 **교차검증은 정확�
 
 ```
 packages/protocol/   @tomverse/protocol — 공유 타입의 단일 소스 (설계 문서의 코드 블록이 여기 실체가 됨)
-packages/toolchain/  @tomverse/toolchain — 빌드 산출물 위치(Windows는 tomverse-host.exe)와
-                     MSVC 환경 준비. sidecar e2e와 가설 게이트가 **같은 함수**를 쓴다 —
-                     이 지식을 복사해 두었다가 두 곳만 틀려 Windows e2e가 깨진 적이 있다
+packages/toolchain/  @tomverse/toolchain — 빌드 산출물 위치(Windows는 tomverse-host.exe),
+                     MSVC 환경 준비, 워크스페이스 빌드 순서. sidecar e2e·가설 게이트·cargo
+                     런처가 **같은 함수**를 쓴다 — 이 지식을 복사해 두었다가 두 곳만 틀려
+                     Windows e2e가 깨진 적이 있다
+  js/exec.mjs        **일반 JavaScript다. 빌드하지 않는다.** MSVC 환경 준비와 실행 파일 해석의
+                     실제 구현이 여기 있고, src/msvc.ts와 src/nodeCli.ts는 타입만 붙여 재수출한다.
+                     TypeScript에 두면 "Rust를 빌드하려면 TypeScript를 먼저 빌드해야 한다"는
+                     순환이 생기고 clean clone에서 막다른 길이 된다. package exports의
+                     `./exec` 서브패스가 dist를 거치지 않고 이걸 직접 가리킨다
 packages/sidecar/    Node sidecar — Orchestrator(상태 머신), Provider Adapters, Context Engine, Router
 apps/desktop/        Tauri 2 + React
   src/               최소 UI — 단계 표시, 이벤트 로그, 승인 모달, diff, 검증 결과
@@ -77,6 +87,16 @@ npm test               # sidecar 단위 테스트 (상태 머신, 컨텍스트, 
 
 npm run verify         # 전체: 위 + Rust 단위 테스트 + 실제 구성요소 e2e
 ```
+
+**`build`와 `typecheck`는 워크스페이스를 명시적 순서로 돈다** — `--workspaces`는 글롭 확장
+순서(`protocol → sidecar → toolchain → …`)로 돌며 의존성을 모른다. sidecar와 가설 게이트는
+`@tomverse/toolchain`의 **빌드 산출물**을 import하므로 그 순서는 clean clone에서 실패한다.
+순서가 뒤집히면 `packages/toolchain/test/buildOrder.test.ts`가 실패한다 — 판정 기준은 사람이
+적은 또 다른 목록이 아니라 **각 워크스페이스 package.json에서 유도한 의존성 그래프**다.
+새 워크스페이스를 루트 `build`에 빠뜨려도 같은 테스트가 잡는다.
+
+**`core:build`/`core:test`는 cargo를 직접 부르지 않고 `scripts/cargo.mjs`를 지난다** —
+아래 "Rust 쪽" 절 참조.
 
 **검증 순서는 고정이다. `build` → `typecheck` → `core:build` → `test` → `core:test` → `test:e2e`.**
 
@@ -121,19 +141,24 @@ npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가
 1. `cargo`/`rustc`가 새 셸의 PATH에 없다(winget 설치 후 PATH가 기존 세션에 반영되지 않음)
 2. MSVC 링커 환경변수(INCLUDE/LIB)가 없으면 컴파일은 되지만 **링크 단계에서 실패**한다
 
-**작동하는 패턴**: `.bat` 래퍼를 만들고 PowerShell 도구로 실행한다(Bash→cmd.exe 경유는 `vcvarsall.bat` 경로 인용이 깨진다).
+**모든 cargo 호출은 `scripts/cargo.mjs` 런처를 지난다.** 루트 `npm run core:build`도,
+`.bat` 래퍼도 마찬가지다 — 한때 `.bat`만 `_env.bat`을 call해서 **단계 순서는 같은데 환경 준비
+의미가 다른** 상태였고, 그래서 `scripts\verify.bat`은 통과하는데 일반 PowerShell의
+`npm run verify`는 `stdarg.h: No such file or directory`로 죽었다. 진입점이 둘이면 반드시 갈라진다.
 
-이 패턴은 이제 `scripts/`에 들어 있다 — **매번 재발견하지 말고 이걸 쓸 것.**
+런처는 컴파일이 필요 없는 일반 JavaScript다(`packages/toolchain/js/exec.mjs`를 import한다).
+TypeScript로 두면 "Rust를 빌드하려면 TypeScript를 먼저 빌드해야 한다"는 순환이 생긴다.
 
 | 스크립트 | 하는 일 |
 |---|---|
-| `scripts\_env.bat` | MSVC 툴체인 + cargo PATH 준비. 나머지가 전부 이걸 call한다 |
+| `scripts\_env.bat` | MSVC 툴체인 + cargo PATH 준비. **Visual Studio 탐지는 여기에만 있다** |
+| `scripts\cargo.mjs` | cargo 실행 런처 — MSVC 환경 준비 + cargo 실행 파일 탐색 + 종료 코드 보존. 나머지 cargo 진입점이 전부 이걸 지난다 |
 | `scripts\cargo-test-core.bat` | 신뢰 경계 크레이트 테스트 (가장 자주 도는 검증) |
 | `scripts\cargo-build-core.bat` | `tomverse-host` 빌드 — e2e가 이 산출물을 요구한다 |
 | `scripts\cargo-check-desktop.bat` | Tauri 껍데기 크레이트 `cargo check` |
-| `scripts\msvc-env.bat` | `_env.bat`을 call한 뒤 **필요한 변수만** 출력. 가설 게이트가 cargo 자식 프로세스에 병합한다 |
+| `scripts\msvc-env.bat` | `_env.bat`을 call한 뒤 **필요한 변수만** 출력. `set`으로 전체를 덤프하면 API 키가 버퍼에 들어간다 |
 | `scripts\tauri-build.bat` | Windows 배포 번들(.msi/.exe). 프런트엔드 빌드를 먼저 돌린다 |
-| `scripts\verify.bat` | 전체 검증 (Node 빌드/타입/테스트 + Rust + e2e). 하나라도 실패하면 즉시 멈춘다 |
+| `scripts\verify.bat` | 전체 검증 (Node 빌드/타입/테스트 + Rust + e2e). 하나라도 실패하면 즉시 멈춘다. **`_env.bat`을 call하지 않는다** — 미리 준비해 버리면 루트 `verify`와의 차이가 다시 감춰진다 |
 
 `tauri-build.bat`을 `verify.bat`에 넣지 않은 이유: 번들 빌드는 훨씬 오래 걸려서 매번 도는
 검증에 섞으면 개발 루프가 느려진다. 릴리스 전에 따로 돌린다.
@@ -164,6 +189,16 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 - **Bash를 먼저 잡는 습관을 경계할 것.** 이 저장소에서 Windows 네이티브 툴체인(MSVC/MSBuild/VS)을 다룰 때는 PowerShell + `.bat` 래퍼가 기본이다. Bash(MinGW)를 쓰면 위 `link.exe` 같은 Unix 도구 충돌에 걸린다 — 이 편향은 product-strategy.md 12.3절이 우리 제품에서 구조적으로 교정하려는 대상이기도 하다.
 - **파일이 LF로 저장되면 git이 CRLF 경고를 낸다** — 정상이며 무시해도 된다. 단 `.bat`만은 예외로 CRLF를 강제한다(`.gitattributes`).
 - **`record_*_with_event` 계열은 `append_event`를 거치지 않는다.** 레코드와 이벤트를 한 트랜잭션에 쓰기 위한 설계인데, 그 대가로 **sink(UI) 릴레이가 빠진다.** DB에는 남는데 화면에는 안 보이는, 찾기 어려운 종류의 누락이다. 새로 이런 메서드를 만들면 커밋 후 `TaskHost::relay`를 반드시 부를 것.
+- **Windows의 `npm`은 `npm.exe`가 아니라 `npm.cmd`다.** `Command::new("npm")`/`spawnSync("npm")`은
+  `program not found`로 실패한다. 증상이 고약한 이유는 그 다음이다 — Verification Runner가
+  테스트를 못 돌려 `SKIPPED_WITH_REASON` → `not_verified`가 되고, **정상 수정 작업이 검증 없이
+  완료로 보고**된다. `tools/program.rs`(제품)와 `@tomverse/toolchain`의 `resolveNodeCli`(테스트
+  하네스)가 각각 이걸 처리한다. 둘을 섞지 말 것 — e2e 본체는 반드시 논리 명령 `npm test`를
+  Rust에 요청해야 해석 계층이 실제로 검증된다.
+- **`std::path`와 Node의 `path`는 실행 중인 OS의 구분자만 안다.** Linux에서
+  `Path::new(r"C:\a\b").parent()`는 `""`를, `path.join("C:\\a", "b")`는 `C:\a/b`를 준다.
+  Windows 분기를 Linux에서 검증하려면 경로 조작을 **대상 플랫폼 기준으로** 해야 한다
+  (`path.win32` / 문자열 직접 처리). 이걸 안 해서 `.exe` 결함이 살아남았다.
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트

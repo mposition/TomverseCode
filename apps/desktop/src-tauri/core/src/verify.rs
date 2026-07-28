@@ -354,6 +354,16 @@ impl<'a> VerificationRunner<'a> {
 /// "거짓 성공"과 "설명이 붙은 실패" 중에서는 후자가 이 제품의 명제에 맞다.
 ///
 /// 실행된 검증이 하나도 없으면 pass가 아니라 `not_verified`다.
+///
+/// **돌려고 했는데 돌지 못한 체크가 하나라도 있으면 `pass`를 낼 수 없다.**
+/// `SkippedWithReason`은 정책 거부·취소·실행 오류를 담는데, 그중 실행 오류에는
+/// "Windows에서 `npm`을 찾지 못했다" 같은 환경 결함이 포함된다. 예전 규칙(`Passed`가 하나라도
+/// 있고 `Failed`가 없으면 pass)이면 **build만 통과하고 test는 실행조차 못한 상태가 `pass`가
+/// 된다.** 그게 정확히 이번 Windows 결함이 만든 상황이며 — 검증되지 않은 것을 검증됐다고
+/// 보고하는 것은 이 제품이 존재하는 이유를 부정한다.
+///
+/// `NotConfigured`는 여기 해당하지 않는다. 그건 "돌릴 것이 없었다"이지 "돌리지 못했다"가
+/// 아니고, lint 스크립트가 없는 프로젝트를 영원히 pass 불가로 만들면 규칙이 쓸모없어진다.
 fn compute_overall(checks: &[VerificationCheck], _newly_failing: Option<&[VerificationKind]>) -> Overall {
     let executed = checks
         .iter()
@@ -372,10 +382,17 @@ fn compute_overall(checks: &[VerificationCheck], _newly_failing: Option<&[Verifi
         .iter()
         .any(|c| matches!(c.status, VerificationStatus::Failed | VerificationStatus::TimedOut));
     if any_failure {
-        Overall::Fail
-    } else {
-        Overall::Pass
+        return Overall::Fail;
     }
+
+    let any_unrunnable = checks
+        .iter()
+        .any(|c| matches!(c.status, VerificationStatus::SkippedWithReason));
+    if any_unrunnable {
+        return Overall::NotVerified;
+    }
+
+    Overall::Pass
 }
 
 fn first_meaningful_line(text: &str) -> String {
@@ -643,6 +660,78 @@ mod tests {
         assert!(test_check.summary.contains("policy denied"));
         // 실행된 검증이 없으므로 pass가 아니다.
         assert_eq!(report.overall, Overall::NotVerified);
+    }
+
+    /// Windows 결함이 만든 상황 그대로: build는 돌아서 통과했는데 test는 프로그램 해석 실패로
+    /// 실행조차 못했다. 예전 규칙이면 `pass`가 나오고, 작업이 검증 없이 완료로 보고된다.
+    #[test]
+    fn a_check_that_could_not_run_blocks_pass_even_if_another_check_passed() {
+        struct PartialExecutor;
+        impl CommandExecutor for PartialExecutor {
+            fn execute(&mut self, request: &ToolRequest) -> ToolResult {
+                let args: Vec<String> = request.args["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect();
+                // `npm run build`는 성공, `npm test`는 실행 자체가 실패.
+                if args.first().map(|a| a.as_str()) == Some("run") {
+                    return ToolResult {
+                        request_id: request.request_id.clone(),
+                        status: ToolStatus::Ok,
+                        output: Some(json!({ "exitCode": 0, "stdout": "built", "stderr": "" })),
+                        error: None,
+                        duration_ms: 5,
+                        completed_at: now_iso(),
+                    };
+                }
+                ToolResult {
+                    request_id: request.request_id.clone(),
+                    status: ToolStatus::Error,
+                    output: None,
+                    error: Some("npm를 실행할 수 없음: program not found".into()),
+                    duration_ms: 1,
+                    completed_at: now_iso(),
+                }
+            }
+        }
+
+        let (_d, _a, root, artifacts) = setup(&[("package.json", r#"{ "scripts": { "test": "x", "build": "y" } }"#)]);
+        let runner = VerificationRunner::new(&root, &artifacts);
+        let report = runner.run("task-1", VerificationPhase::Post, 0, &mut PartialExecutor, None);
+
+        let build = report
+            .checks
+            .iter()
+            .find(|c| c.kind == VerificationKind::Build)
+            .unwrap();
+        let test = report.checks.iter().find(|c| c.kind == VerificationKind::Test).unwrap();
+        assert_eq!(build.status, VerificationStatus::Passed);
+        assert_eq!(test.status, VerificationStatus::SkippedWithReason);
+        assert_eq!(
+            report.overall,
+            Overall::NotVerified,
+            "돌지 못한 검증이 있는데 통과로 보고했습니다"
+        );
+    }
+
+    #[test]
+    fn not_configured_checks_do_not_block_pass() {
+        // "돌릴 것이 없었다"와 "돌리지 못했다"는 다르다. lint 스크립트가 없다고 해서
+        // 영원히 pass가 불가능해지면 규칙이 쓸모없어진다.
+        let (_d, _a, root, artifacts) = setup(&[("package.json", r#"{ "scripts": { "test": "x" } }"#)]);
+        let runner = VerificationRunner::new(&root, &artifacts);
+        let mut exec = FakeExecutor {
+            responses: vec![("npm test".into(), 0, "ok".into())],
+            calls: vec![],
+        };
+        let report = runner.run("task-1", VerificationPhase::Post, 0, &mut exec, None);
+        assert!(report
+            .checks
+            .iter()
+            .any(|c| c.status == VerificationStatus::NotConfigured));
+        assert_eq!(report.overall, Overall::Pass);
     }
 
     #[test]

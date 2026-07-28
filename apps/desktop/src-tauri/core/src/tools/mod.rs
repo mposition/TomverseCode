@@ -6,6 +6,7 @@
 //! 판단이 `Deny`면 실행하지 않는다.
 
 pub mod patch;
+pub mod program;
 
 use crate::artifacts::ArtifactStore;
 use crate::cancel::CancellationToken;
@@ -692,7 +693,16 @@ impl ToolRuntime {
         };
 
         let output = json!({
+            // 요청된 명령 — 승인 화면에 표시됐고 Policy Gate가 판정한 바로 그것이다.
             "command": { "program": cmd.program, "args": cmd.args, "cwd": cmd.cwd },
+            // 실제로 spawn한 것. Windows에서 `npm test`는 `node.exe npm-cli.js test`가 된다.
+            // 둘을 나란히 남기지 않으면 "승인한 것과 실행된 것"의 대응을 사후에 확인할 수 없다.
+            "resolvedCommand": {
+                "executable": execution.resolved.executable.to_string_lossy(),
+                "args": execution.resolved.effective_args,
+                "kind": execution.resolved.kind.as_str(),
+                "shimPath": execution.resolved.shim_path.as_ref().map(|p| p.to_string_lossy()),
+            },
             "exitCode": execution.exit_code,
             "stdout": stdout_preview,
             "stderr": stderr_preview,
@@ -820,12 +830,37 @@ struct Execution {
     stderr: String,
     termination: Termination,
     duration_ms: u64,
+    /// 요청 argv가 실제로 무엇으로 실행됐는가. 결과 JSON에 그대로 실린다 —
+    /// Windows에서 `npm`이 `node.exe npm-cli.js`가 되므로, 둘을 구별해 남기지 않으면
+    /// "승인한 것과 실행된 것"의 대응을 사후에 확인할 수 없다.
+    resolved: program::ResolvedProgram,
+}
+
+/// 실제 환경으로 프로그램을 해석한다.
+///
+/// 해석 계층이 필요한 이유는 `program.rs` 모듈 문서에 있다. 요약하면 Windows의 `npm`은
+/// `npm.cmd`(배치 shim)이라 `Command::new("npm")`으로는 실행되지 않고, 그 결과 검증이
+/// 돌지 않은 채 작업이 완료로 보고됐다.
+///
+/// **셸을 만들지 않는다.** 해석 결과도 program + argv이며, 인자는 가공 없이 그대로 넘어간다.
+fn resolve_for_execution(cmd: &RunCommandArgs) -> Result<program::ResolvedProgram, String> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    let is_file = |p: &Path| p.is_file();
+    let env = program::ResolveEnv {
+        platform: program::Platform::current(),
+        path: &path,
+        pathext: &pathext,
+        is_file: &is_file,
+    };
+    program::resolve_program(&cmd.program, &cmd.args, &env).map_err(|e| e.message)
 }
 
 /// 프로세스 실행 + 타임아웃.
 ///
-/// `Command`에 program/args를 그대로 넘긴다 — 셸을 경유하지 않으므로 인자 안의 공백이나
-/// 메타문자가 재해석되지 않는다. 이게 승인 모달의 표시가 실제 실행과 일치한다는 보장의 실체다.
+/// `Command`에 해석된 program/args를 그대로 넘긴다 — 셸을 경유하지 않으므로 인자 안의
+/// 공백이나 메타문자가 재해석되지 않는다. 이게 승인 모달의 표시가 실제 실행과 일치한다는
+/// 보장의 실체다.
 fn run_process(
     cmd: &RunCommandArgs,
     cwd: &Path,
@@ -833,6 +868,10 @@ fn run_process(
     cancel: &CancellationToken,
 ) -> Result<Execution, String> {
     let start = Instant::now();
+
+    // 해석은 취소 검사보다 먼저 한다 — 해석 실패는 "실행하지 못했다"이지 "취소됐다"가 아니고,
+    // 두 가지를 섞으면 취소 경로가 환경 결함을 감춘다.
+    let resolved = resolve_for_execution(cmd)?;
 
     // 실행 직전 취소 검사 — spawn과 검사 사이의 창을 최소화한다.
     if cancel.is_cancelled() {
@@ -845,12 +884,13 @@ fn run_process(
                 method: "not-started",
             },
             duration_ms: 0,
+            resolved,
         });
     }
 
-    let mut command = Command::new(&cmd.program);
+    let mut command = Command::new(&resolved.executable);
     command
-        .args(&cmd.args)
+        .args(&resolved.effective_args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -873,9 +913,15 @@ fn run_process(
         .env_remove("NODE_V8_COVERAGE");
     // 취소 시 손자 프로세스까지 죽이려면 spawn 전에 그룹을 설정해야 한다 (proctree.rs).
     proctree::configure_group(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("{}를 실행할 수 없음: {e}", cmd.program))?;
+    let mut child = command.spawn().map_err(|e| {
+        // 요청된 이름과 **실제로 실행하려 한 것**을 모두 보여준다. Windows에서 이 둘이
+        // 다를 수 있고, 다를 때 요청 이름만 보면 원인에 도달할 수 없다.
+        format!(
+            "{}를 실행할 수 없음: {e} (실행 대상: {})",
+            cmd.program,
+            resolved.executable.display()
+        )
+    })?;
 
     // stdout/stderr를 별도 스레드로 읽는다. 파이프 버퍼가 차면 자식이 블록되므로
     // wait()만 하고 나중에 읽는 방식은 큰 출력에서 데드락이 된다.
@@ -953,6 +999,7 @@ fn run_process(
         stderr: String::from_utf8_lossy(&stderr).to_string(),
         termination,
         duration_ms: elapsed_ms(start),
+        resolved,
     })
 }
 
@@ -1546,6 +1593,157 @@ mod tests {
         std::env::remove_var("OPENAI_API_KEY");
         let stdout = out.result.output.unwrap()["stdout"].as_str().unwrap().to_string();
         assert_eq!(stdout.trim(), "undefined", "API key leaked into child process env");
+    }
+
+    // ---- 프로그램 해석 계층 (program.rs)의 런타임 쪽 확인 ----
+
+    /// 회귀 10 — 요청 argv와 실제 실행 argv를 결과에서 구별할 수 있어야 한다.
+    ///
+    /// Windows에서 `npm test`는 `node.exe npm-cli.js test`로 실행된다. 둘을 나란히 남기지
+    /// 않으면 "승인 화면에서 본 것과 실제로 돈 것"의 대응을 사후에 확인할 방법이 없다.
+    #[test]
+    fn result_distinguishes_the_requested_command_from_what_was_actually_executed() {
+        let h = harness();
+        let out = h.run(&req(
+            ToolName::RunCommand,
+            json!({ "program": "node", "args": ["-e", "process.stdout.write('ok')"], "cwd": "." }),
+        ));
+        let output = out.result.output.unwrap();
+
+        // 요청은 그대로 보존된다 — Policy Gate가 판정한 바로 그 값이다.
+        assert_eq!(output["command"]["program"].as_str().unwrap(), "node");
+        assert_eq!(
+            output["command"]["args"].as_array().unwrap(),
+            &vec![json!("-e"), json!("process.stdout.write('ok')")]
+        );
+
+        // 실행된 것이 별도 필드로 남는다.
+        let resolved = &output["resolvedCommand"];
+        assert!(!resolved.is_null(), "해석 결과가 기록되지 않았습니다");
+        let executable = resolved["executable"].as_str().unwrap();
+        assert_eq!(crate::policy::command::program_basename(executable), "node");
+        let kind = resolved["kind"].as_str().unwrap();
+        assert!(
+            ["passthrough", "direct", "node-cli-shim"].contains(&kind),
+            "알 수 없는 해석 종류: {kind}"
+        );
+        // 요청 인자는 해석 후에도 끝에 그대로 남아야 한다 (앞에 CLI 스크립트가 붙을 수는 있다).
+        let effective: Vec<String> = resolved["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            effective.ends_with(&["-e".to_string(), "process.stdout.write('ok')".to_string()]),
+            "요청 인자가 변형되었습니다: {effective:?}"
+        );
+    }
+
+    /// 회귀 11 — 자격증명·테스트 러너 제어 변수 제거가 **실제로 spawn되는 프로세스**에 적용된다.
+    ///
+    /// `NODE_TEST_CONTEXT`가 남으면 `node --test`가 실패해도 exit 0을 반환한다. 해석 계층이
+    /// 프로그램을 바꿔도 이 제거가 함께 따라가야 한다 — 안 그러면 검증 러너가 실패를 통과로
+    /// 보고하고, 그건 이 제품의 존재 이유가 무너지는 종류의 버그다.
+    #[test]
+    fn credential_and_test_runner_variables_are_removed_from_the_process_that_actually_runs() {
+        let h = harness();
+        std::env::set_var("OPENAI_API_KEY", "sk-should-not-leak-to-resolved-process");
+        std::env::set_var("NODE_TEST_CONTEXT", "child");
+        let out = h.run(&req(
+            ToolName::RunCommand,
+            json!({
+                "program": "node",
+                // `join`은 undefined를 빈 문자열로 만든다 — String()으로 감싸야 "없음"이 드러난다.
+                "args": ["-e", "process.stdout.write([process.env.OPENAI_API_KEY, process.env.ANTHROPIC_API_KEY, process.env.NODE_TEST_CONTEXT, process.env.NODE_OPTIONS].map(String).join('|'))"],
+                "cwd": "."
+            }),
+        ));
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("NODE_TEST_CONTEXT");
+
+        let output = out.result.output.unwrap();
+        let stdout = output["stdout"].as_str().unwrap().to_string();
+        assert_eq!(
+            stdout.trim(),
+            "undefined|undefined|undefined|undefined",
+            "해석된 프로세스에 제거 대상 변수가 남았습니다: {stdout}"
+        );
+        // 그 프로세스가 정말 해석을 거친 것이었음을 함께 확인한다.
+        assert!(!output["resolvedCommand"].is_null());
+    }
+
+    /// 회귀 12 — 취소와 타임아웃이 **해석된** 프로세스에도 그대로 작동하고,
+    /// 해석 정보가 종료 경로와 무관하게 결과에 남는다.
+    #[test]
+    fn cancellation_and_timeout_apply_to_the_resolved_process() {
+        let h = harness();
+
+        // 타임아웃
+        let timed_out = h.run(&req(
+            ToolName::RunCommand,
+            json!({
+                "program": "node",
+                "args": ["-e", "setTimeout(() => {}, 60000)"],
+                "cwd": ".",
+                "timeoutMs": 300
+            }),
+        ));
+        assert_eq!(timed_out.result.status, ToolStatus::Timeout);
+        assert!(
+            !timed_out.result.output.unwrap()["resolvedCommand"].is_null(),
+            "타임아웃 결과에 해석 정보가 없습니다"
+        );
+
+        // 실행 중 취소
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            token.cancel();
+        });
+        let started = Instant::now();
+        let cancelled = h.run_with_cancel(
+            &req(
+                ToolName::RunCommand,
+                json!({ "program": "node", "args": ["-e", "setTimeout(() => {}, 60000)"], "cwd": "." }),
+            ),
+            &cancel,
+        );
+        assert_eq!(cancelled.result.status, ToolStatus::Cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "해석된 프로세스에서 취소가 동작하지 않았습니다 ({:?})",
+            started.elapsed()
+        );
+        let output = cancelled.result.output.unwrap();
+        assert!(!output["resolvedCommand"].is_null(), "취소 결과에 해석 정보가 없습니다");
+        assert_eq!(output["cancelled"].as_bool().unwrap(), true);
+    }
+
+    /// 해석 실패는 "통과"도 "설정 없음"도 아니다 — 오류로 드러나야 한다.
+    #[test]
+    fn a_program_that_cannot_be_resolved_fails_loudly() {
+        let h = harness();
+        // 정책은 통과하지만(basename이 node라 harness의 allow 규칙에 맞는다) 그 위치에는
+        // 실행 파일이 없다. Linux에서는 spawn이, Windows에서는 해석이 먼저 실패한다.
+        let missing = if cfg!(windows) {
+            r"C:\tomverse-nonexistent\node.exe"
+        } else {
+            "/tomverse-nonexistent/node"
+        };
+        let out = h.run(&req(
+            ToolName::RunCommand,
+            json!({ "program": missing, "args": ["-e", "0"], "cwd": "." }),
+        ));
+        assert_eq!(
+            out.result.status,
+            ToolStatus::Error,
+            "실행하지 못한 명령이 오류로 드러나지 않았습니다: {:?}",
+            out.result.output
+        );
+        let error = out.result.error.unwrap();
+        assert!(error.contains("실행할 수 없"), "무엇이 실패했는지 없습니다: {error}");
     }
 
     #[test]
