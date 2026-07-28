@@ -13,6 +13,7 @@ import {
   type FixtureRepo,
 } from "./helpers/fixtureRepo.js";
 import type { FakeScriptStep } from "../src/providers/fake.js";
+import { checkArtifacts, hostBinaryPath, sidecarEntryPath } from "@tomverse/toolchain";
 
 /**
  * End-to-end 테스트 — **실제** 구성요소로 M0 완료 기준을 검증한다.
@@ -32,8 +33,10 @@ import type { FakeScriptStep } from "../src/providers/fake.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 컴파일 후 위치는 packages/sidecar/dist/test/ 이므로 리포지토리 루트까지 4단계 올라간다.
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..", "..");
-const HOST_BIN = path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "target", "debug", "tomverse-host");
-const SIDECAR_ENTRY = path.join(REPO_ROOT, "packages", "sidecar", "dist", "src", "index.js");
+// 경로 조립을 여기서 하지 않는다. **Windows에서는 `tomverse-host.exe`**이고, 그 사실을
+// 세 파일에 복사해 두었다가 두 곳만 틀렸던 것이 `@tomverse/toolchain`이 생긴 이유다.
+const HOST_BIN = hostBinaryPath(REPO_ROOT, process.platform);
+const SIDECAR_ENTRY = sidecarEntryPath(REPO_ROOT);
 
 interface HostRun {
   exitCode: number;
@@ -61,7 +64,7 @@ interface RunOptions {
 }
 
 function hostAvailable(): boolean {
-  return existsSync(HOST_BIN) && existsSync(SIDECAR_ENTRY);
+  return checkArtifacts(REPO_ROOT, process.platform).ok;
 }
 
 /**
@@ -71,15 +74,10 @@ function hostAvailable(): boolean {
  * "환경이 준비되지 않아서 e2e를 건너뛰었다"가 "e2e가 통과했다"로 보이면 안 된다.
  */
 function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}): HostRun {
-  assert.ok(
-    hostAvailable(),
-    `e2e 테스트에 필요한 산출물이 없습니다.\n` +
-      `  호스트 바이너리: ${HOST_BIN} (${existsSync(HOST_BIN) ? "있음" : "없음"})\n` +
-      `  sidecar 진입점: ${SIDECAR_ENTRY} (${existsSync(SIDECAR_ENTRY) ? "있음" : "없음"})\n` +
-      `다음을 먼저 실행하세요:\n` +
-      `  npm run build\n` +
-      `  cargo build --manifest-path apps/desktop/src-tauri/core/Cargo.toml`
-  );
+  // 실패 메시지에 **검사한 전체 경로**가 들어간다 — Windows에서 `.exe` 유무가 원인일 때
+  // 경로가 없으면 사용자가 원인에 도달할 방법이 없다.
+  const artifacts = checkArtifacts(REPO_ROOT, process.platform);
+  assert.ok(artifacts.ok, artifacts.detail);
 
   const args = [
     "run",

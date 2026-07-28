@@ -21,6 +21,7 @@
     "openai": "^6.9.0"
   },
   "devDependencies": {
+    "@tomverse/toolchain": "*",
     "@types/node": "^24.9.0",
     "typescript": "^5.9.3"
   }

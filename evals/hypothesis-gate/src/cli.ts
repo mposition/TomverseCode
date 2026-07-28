@@ -3,6 +3,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ARMS } from "./arms.js";
 import { criteriaHash, describeCriteria } from "./criteria.js";
+import { prepareMsvcEnv } from "@tomverse/toolchain";
+import { REPO_ROOT } from "./host.js";
 import { loadAllFixtures, listFixtureIds } from "./manifest.js";
 import { preflight } from "./preflight.js";
 import { openRecordStore } from "./records.js";
@@ -126,6 +128,8 @@ async function main(): Promise<number> {
     log("      --max-cost-usd N --max-concurrency N --resume --output <dir>");
     log("      --executor-model <id> --reviewer-model <id>");
     log("");
+    log("종료 코드: 0=PASS  1=FAIL  2=INCONCLUSIVE  3=하네스 오류  4=툴체인 미준비");
+    log("");
     log("사전 등록된 판정 기준:");
     for (const line of describeCriteria()) log(`  - ${line}`);
     return 0;
@@ -140,7 +144,31 @@ async function main(): Promise<number> {
 
   // ---- validate ----
   if (options.command === "validate") {
-    log(`fixture ${fixtures.length}개 검증 중 (모델 호출 없음)...\n`);
+    // Rust fixture가 있으면 **먼저** 툴체인을 확인한다. 없으면 24개를 전부 돌린 뒤
+    // LNK1104 네 번을 보는 대신, 무엇을 설치해야 하는지 한 번 알려준다.
+    const nativeFixtures = fixtures.filter((f) => f.manifest.language === "rust");
+    const msvc = prepareMsvcEnv(REPO_ROOT, process.platform);
+    if (nativeFixtures.length > 0 && msvc.kind === "unavailable") {
+      log("네이티브 툴체인이 준비되지 않았습니다.");
+      log("");
+      log(msvc.message);
+      log("");
+      log(`Rust fixture ${nativeFixtures.length}개를 검증할 수 없습니다:`);
+      for (const fixture of nativeFixtures) log(`  - ${fixture.manifest.fixtureId}`);
+      log("");
+      log("TypeScript fixture만 검증하려면:");
+      log(`  npm run gate:g:validate -- --fixtures ${fixtures
+        .filter((f) => f.manifest.language !== "rust")
+        .map((f) => f.manifest.fixtureId)
+        .slice(0, 3)
+        .join(",")},...`);
+      // 툴체인 문제와 fixture 결함을 다른 종료 코드로 구별한다.
+      return 4;
+    }
+
+    log(`fixture ${fixtures.length}개 검증 중 (모델 호출 없음)...`);
+    if (msvc.kind === "ready") log("MSVC 툴체인: 준비됨");
+    log("");
     const results = validateAll(fixtures);
     let failed = 0;
     for (const result of results) {
@@ -161,6 +189,7 @@ async function main(): Promise<number> {
   const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.GATE_FAKE === "1";
   const pre = preflight({
     fixtureCount: fixtures.length,
+    nativeFixtureCount: fixtures.filter((f) => f.manifest.language === "rust").length,
     arms: options.arms,
     repetitions: options.command === "pilot" ? 1 : options.repetitions,
     ...(options.maxCostUsd !== undefined ? { maxCostUsd: options.maxCostUsd } : {}),

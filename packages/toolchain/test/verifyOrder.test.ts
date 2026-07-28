@@ -1,0 +1,171 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+/**
+ * 회귀 테스트 3 — 검증 실행 순서 불변식.
+ *
+ * # 왜 필요한가
+ *
+ * `npm test`에는 가설 게이트 통합 테스트가 들어 있고, 그건 **실제 `tomverse-host` 바이너리를
+ * 요구한다.** 따라서 `core:build`가 `test`보다 뒤에 있으면 clean clone에서 반드시 실패한다.
+ * 로컬에 예전 바이너리가 남아 있으면 이 실수가 몇 주 동안 드러나지 않는다.
+ *
+ * # 어떻게 테스트하는가
+ *
+ * 소스 문자열을 통째로 비교하지 않는다(주석 한 줄만 바꿔도 깨지는 테스트는 유지되지 않는다).
+ * 대신 **스크립트에서 단계 이름의 등장 순서만 뽑아** 필수 선후 관계를 확인한다.
+ * 순서가 뒤집히면 실패하고, 설명이나 주석을 바꾸는 것으로는 실패하지 않는다.
+ */
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(__dirname, "..", "..", "..", "..");
+
+/** verify가 반드시 지켜야 하는 선후 관계. */
+const REQUIRED_ORDER: { before: string; after: string; why: string }[] = [
+  {
+    before: "build",
+    after: "typecheck",
+    why: "sidecar는 protocol의 빌드 산출물(dist)에 대해 타입 검사한다 — 먼저 빌드하지 않으면 낡은 타입을 읽는다",
+  },
+  {
+    before: "core:build",
+    after: "test",
+    why: "npm test에 포함된 가설 게이트 통합 테스트가 실제 tomverse-host 바이너리를 요구한다",
+  },
+  {
+    before: "core:build",
+    after: "test:e2e",
+    why: "e2e가 tomverse-host 바이너리를 요구한다",
+  },
+];
+
+/**
+ * 주석을 걷어낸다.
+ *
+ * `.bat`의 `rem` 줄에는 "왜 이 순서인가"를 설명하느라 단계 이름이 그대로 등장한다.
+ * 그걸 실행 단계로 세면 순서 비교가 엉뚱해진다 — 실제로 이 테스트를 처음 돌렸을 때
+ * 주석의 `npm test` 언급 때문에 첫 단계가 `test`로 잡혔다.
+ */
+function stripComments(script: string): string {
+  return script
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*(rem\b|::)/i.test(line))
+    .join("\n");
+}
+
+/** 스크립트 문자열에서 우리가 아는 단계 이름의 등장 순서를 뽑는다. */
+export function extractStepOrder(rawScript: string): string[] {
+  const script = stripComments(rawScript);
+  const steps: { index: number; name: string }[] = [];
+  // 긴 이름을 먼저 찾아 `core:build`가 `build`로 잘못 잡히지 않게 한다.
+  const names = ["core:build", "core:test", "test:e2e", "typecheck", "build", "test"];
+  const claimed: { start: number; end: number }[] = [];
+
+  for (const name of names) {
+    const pattern = new RegExp(`npm (?:run )?${name.replace(":", ":")}(?![\\w:-])`, "g");
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(script)) !== null) {
+      const start = match.index;
+      const end = start + match[0].length;
+      // 이미 더 긴 이름이 차지한 구간이면 건너뛴다.
+      if (claimed.some((c) => start >= c.start && start < c.end)) continue;
+      claimed.push({ start, end });
+      steps.push({ index: start, name });
+    }
+  }
+  return steps.sort((a, b) => a.index - b.index).map((s) => s.name);
+}
+
+function firstIndexOf(steps: readonly string[], name: string): number {
+  return steps.indexOf(name);
+}
+
+test("추출기가 단계 이름을 순서대로 뽑는다", () => {
+  // 추출기 자체가 틀리면 아래 불변식 검사가 무의미해진다.
+  const order = extractStepOrder(
+    "npm run build && npm run typecheck && npm run core:build && npm test && npm run core:test && npm run test:e2e"
+  );
+  assert.deepEqual(order, ["build", "typecheck", "core:build", "test", "core:test", "test:e2e"]);
+});
+
+test("추출기가 core:build를 build로 잘못 잡지 않는다", () => {
+  assert.deepEqual(extractStepOrder("npm run core:build"), ["core:build"]);
+  assert.deepEqual(extractStepOrder("npm run core:test"), ["core:test"]);
+  assert.deepEqual(extractStepOrder("npm run test:e2e"), ["test:e2e"]);
+});
+
+test("루트 package.json의 verify가 필수 선후 관계를 지킨다", () => {
+  const pkg = JSON.parse(readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
+    scripts: Record<string, string>;
+  };
+  const verify = pkg.scripts.verify;
+  assert.ok(typeof verify === "string" && verify.length > 0, "루트에 verify 스크립트가 없습니다");
+
+  const steps = extractStepOrder(verify);
+  for (const { before, after, why } of REQUIRED_ORDER) {
+    const beforeIndex = firstIndexOf(steps, before);
+    const afterIndex = firstIndexOf(steps, after);
+    assert.ok(beforeIndex >= 0, `verify에 ${before} 단계가 없습니다: ${steps.join(" → ")}`);
+    assert.ok(afterIndex >= 0, `verify에 ${after} 단계가 없습니다: ${steps.join(" → ")}`);
+    assert.ok(
+      beforeIndex < afterIndex,
+      `verify 순서 위반: ${before}가 ${after}보다 뒤에 있습니다.\n이유: ${why}\n현재 순서: ${steps.join(" → ")}`
+    );
+  }
+});
+
+test("scripts/verify.bat이 루트 verify와 같은 순서다", () => {
+  // 두 진입점이 갈라지면 "Windows에서만 깨지는" 상태가 만들어진다.
+  const bat = readFileSync(path.join(REPO_ROOT, "scripts", "verify.bat"), "utf8");
+  const pkg = JSON.parse(readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
+    scripts: Record<string, string>;
+  };
+
+  const batSteps = extractStepOrder(bat);
+  const pkgSteps = extractStepOrder(pkg.scripts.verify!);
+  assert.deepEqual(
+    batSteps,
+    pkgSteps,
+    `scripts\\verify.bat과 루트 verify의 순서가 다릅니다.\n  bat: ${batSteps.join(" → ")}\n  pkg: ${pkgSteps.join(" → ")}`
+  );
+});
+
+test("scripts/verify.bat이 CRLF를 유지한다", () => {
+  // LF면 cmd.exe가 `goto :label`을 잘못 읽어 조용히 엉뚱하게 동작한다(CLAUDE.md 함정 기록).
+  const raw = readFileSync(path.join(REPO_ROOT, "scripts", "verify.bat"));
+  const text = raw.toString("utf8");
+  const lfOnly = (text.match(/(?<!\r)\n/g) ?? []).length;
+  assert.equal(lfOnly, 0, `verify.bat에 CRLF가 아닌 줄바꿈이 ${lfOnly}개 있습니다`);
+});
+
+test("MSVC 환경 스크립트도 CRLF다", () => {
+  const raw = readFileSync(path.join(REPO_ROOT, "scripts", "msvc-env.bat"), "utf8");
+  const lfOnly = (raw.match(/(?<!\r)\n/g) ?? []).length;
+  assert.equal(lfOnly, 0, `msvc-env.bat에 CRLF가 아닌 줄바꿈이 ${lfOnly}개 있습니다`);
+});
+
+test("msvc-env.bat이 전체 환경을 덤프하지 않는다", () => {
+  // `set` 한 줄이면 OPENAI_API_KEY까지 전부 stdout으로 나온다.
+  const script = readFileSync(path.join(REPO_ROOT, "scripts", "msvc-env.bat"), "utf8");
+  const dumpsEverything = /^\s*set\s*$/m.test(script);
+  assert.equal(dumpsEverything, false, "msvc-env.bat이 전체 환경을 출력합니다 — 자격증명이 새어나갑니다");
+  // MSVC 탐지는 _env.bat에만 있어야 한다. 여기에 Visual Studio 경로가 있으면 중복이다.
+  assert.ok(
+    !/Program Files/i.test(script),
+    "msvc-env.bat에 Visual Studio 경로가 하드코딩되어 있습니다 — 탐지는 _env.bat 한 곳에만 있어야 합니다"
+  );
+  assert.ok(script.includes("_env.bat"), "msvc-env.bat이 _env.bat을 호출하지 않습니다");
+});
+
+test("_env.bat이 절대 경로를 하드코딩하되 사용자별 경로는 쓰지 않는다", () => {
+  const script = readFileSync(path.join(REPO_ROOT, "scripts", "_env.bat"), "utf8");
+  // 표준 설치 위치를 후보로 두는 것은 정상이다. 특정 사용자 홈은 아니다.
+  assert.ok(
+    !/C:\\Users\\[A-Za-z0-9_.-]+\\/i.test(script),
+    "_env.bat에 특정 사용자 머신의 절대 경로가 있습니다"
+  );
+  assert.ok(script.includes("%USERPROFILE%"), "cargo 경로는 %USERPROFILE%로 풀어야 합니다");
+});
