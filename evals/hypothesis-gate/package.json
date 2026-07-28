@@ -1,0 +1,21 @@
+{
+  "name": "@tomverse/hypothesis-gate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "가설 게이트 G — 어려운 태스크에서 교차검증이 실제로 이득인지 측정한다. 제품 코드가 아니라 측정 도구다.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "//test": "이 Node 버전은 `node --test <디렉터리>`가 동작하지 않는다 — 파일을 직접 나열한다(CLAUDE.md 함정 기록).",
+    "test": "npm run build && node --test dist/test/criteria.test.js dist/test/manifest.test.js dist/test/stats.test.js dist/test/records.test.js dist/test/harness.test.js",
+    "gate": "node dist/src/cli.js"
+  },
+  "dependencies": {
+    "@tomverse/protocol": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.0",
+    "typescript": "^5.9.3"
+  }
+}

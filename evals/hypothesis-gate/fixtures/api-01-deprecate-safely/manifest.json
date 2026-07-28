@@ -1,0 +1,29 @@
+{
+  "fixtureId": "api-01-deprecate-safely",
+  "category": "public_api_change",
+  "language": "typescript",
+  "taskPrompt": "정렬 옵션을 문자열에서 객체로 바꾸고 싶습니다. 기존 호출자를 깨지 않으면서 새 형태를 지원하도록 query.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "예전 문자열 형태와 새 객체 형태를 모두 받아들이고, 예전 형태 사용 시 경고를 남긴다",
+  "timeoutMs": 180000
+}

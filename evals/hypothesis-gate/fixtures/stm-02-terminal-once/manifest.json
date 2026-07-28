@@ -1,0 +1,29 @@
+{
+  "fixtureId": "stm-02-terminal-once",
+  "category": "state_machine_bounds",
+  "language": "typescript",
+  "taskPrompt": "작업이 완료된 뒤에도 취소가 들어오면 상태가 바뀌어 버립니다. 종료 상태는 한 번만 확정되어야 합니다. machine.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "종료 상태는 정확히 한 번만 확정되고, 이후 어떤 전이도 상태를 바꾸지 않으며, 허용되지 않은 전이는 거부된다",
+  "timeoutMs": 180000
+}

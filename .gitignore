@@ -10,3 +10,7 @@ target/
 
 # 로컬 상태(SQLite, artifact)는 %APPDATA%에 있지만, 개발 중 리포 안으로 떨어질 수 있다.
 .tomverse/
+
+# 가설 게이트 실행 산출물 — 모델 응답과 명령 출력이 들어 있어 저장소에 남길 이유가 없다.
+# 저장소에는 fixture·하네스·사전 등록 기준·비밀값 없는 집계 리포트만 커밋한다.
+evals/hypothesis-gate/reports/

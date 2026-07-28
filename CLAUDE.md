@@ -50,7 +50,10 @@ apps/desktop/        Tauri 2 + React
   src-tauri/         Tauri 껍데기 — command/event 배관과 승인 왕복의 UI 쪽 절반. 보안 로직 없음
     core/            tomverse-core — Rust 신뢰 경계 전체. tauri에 의존하지 않는 별도 크레이트
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용)
-spike/               Phase 0 가설 검증 하네스 (프로덕션 코드 아님, 실험 기록)
+spike/               Phase 0 가설 검증 하네스 (프로덕션 코드 아님, 실험 기록 — 보존하되 수정하지 않는다)
+evals/hypothesis-gate/  가설 게이트 G — 어려운 태스크에서 교차검증이 실제 이득인지 측정한다.
+                     제품 코드가 아니라 **측정 도구**이며, production 실행 경로(tomverse-host)를
+                     그대로 태운다. 사전 등록된 판정 기준이 src/criteria.ts에 해시로 봉인되어 있다.
 docs/design/         설계 문서
 ```
 
@@ -64,19 +67,44 @@ docs/design/         설계 문서
 ### Node 쪽 (protocol, sidecar)
 
 ```bash
-npm install            # 루트에서 (npm workspaces)
-npm run typecheck      # 전 워크스페이스
+npm install            # 루트에서 (npm workspaces). verify는 의존성을 건드리지 않으므로 이건 먼저 해둘 것
 npm run build          # protocol → sidecar → desktop 프런트엔드
+npm run typecheck      # 전 워크스페이스 (build 다음이다 — 아래 순서 이유 참조)
 npm test               # sidecar 단위 테스트 (상태 머신, 컨텍스트, 공급자, 라우터)
 
 npm run verify         # 전체: 위 + Rust 단위 테스트 + 실제 구성요소 e2e
 ```
 
-**end-to-end 테스트는 Rust 호스트 바이너리를 요구한다** — `npm run core:build`를 먼저 실행해야
-`npm run test:e2e`가 돈다. 산출물이 없으면 조용히 건너뛰지 않고 실패하며, 무엇을 빌드해야 하는지 알려준다.
+**검증 순서는 고정이다. `build` → `typecheck` → `test` → `core:test` → `core:build` → `test:e2e`.**
+
+- **build가 typecheck보다 먼저인 이유**: sidecar는 protocol의 **빌드 산출물**(`dist`)에 대해 타입
+  검사한다. clean clone이나 fetch 직후처럼 `dist`가 없거나 낡은 상태에서 typecheck를 먼저 돌리면
+  **잘못된 protocol 타입을 읽는다** — 통과해도 통과가 아니고, 실패해도 실패가 아니다.
+- **core:build가 test:e2e 바로 앞인 이유**: e2e가 `tomverse-host` 바이너리를 요구한다. 산출물이
+  없으면 조용히 건너뛰지 않고 실패하며, 무엇을 빌드해야 하는지 알려준다.
+
+`scripts\verify.bat`과 루트 `package.json`의 `verify`는 **의미상 동일해야 한다.** 한쪽만 고치지 말 것.
+
+**루트의 `build`/`typecheck`에는 `--if-present`를 쓰지 않는다.** 워크스페이스가 스크립트를 잃으면
+조용히 통과하는 대신 실패해야 하기 때문이다. `test`는 테스트가 있는 워크스페이스를 명시한다 —
+새 워크스페이스에 테스트를 추가하면 루트 `test`에도 넣을 것.
 
 `node --test <디렉터리>`가 이 Node 버전에서 동작하지 않으므로(아래 함정 기록) 테스트 파일 경로를
 `packages/sidecar/package.json`에 직접 나열한다. 새 테스트 파일을 추가하면 그 목록도 갱신할 것.
+(`evals/hypothesis-gate/package.json`도 같은 방식이다.)
+
+### 가설 게이트 G
+
+```bash
+npm run gate:g:validate   # fixture 24개 품질 검증 (모델 호출 없음)
+npm run gate:g:dry-run    # preflight + 실행 계획 (API 호출 없음)
+npm run gate:g:pilot      # 반복 1회 — 하네스/비용/실패 분류 확인용. PASS를 내지 않는다
+npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가 필요하다
+```
+
+**fake provider 결과로 가설을 판정하지 않는다** — 모든 기록에 `providerKind`가 남고, 집계가
+`fake` 기록만 있으면 무조건 `INCONCLUSIVE`를 낸다. 자세한 것은
+[evals/hypothesis-gate/README.md](./evals/hypothesis-gate/README.md).
 
 ### Rust 쪽 — **반드시 이 패턴을 쓸 것**
 

@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "writer.js",
+      "content": "// \uc5ec\ub7ec \ud56d\ubaa9\uc744 \uc800\uc7a5\uc18c\uc5d0 \ud568\uaed8 \uc4f4\ub2e4.\n//\n// \ubd80\ubd84 \uc801\uc6a9\uc744 \ub0a8\uae30\uc9c0 \uc54a\ub294\ub2e4: \uc4f0\uae30 \uc804\uc5d0 **pre-image\ub97c \uae30\ub85d**\ud558\uace0, \uc2e4\ud328\ud558\uba74 \uc5ed\uc21c\uc73c\ub85c \ub418\ub3cc\ub9b0\ub2e4.\n// \"\uc2e4\ud328\ud588\uc9c0\ub9cc \uc808\ubc18\uc740 \uc801\uc6a9\ub428\"\uc740 \uc0ac\uc6a9\uc790\uac00 \uc190\uc73c\ub85c \uc815\ub9ac\ud574\uc57c \ud558\ub294 \ucd5c\uc545\uc758 \uc0c1\ud0dc\ub2e4.\nclass BatchWriter {\n  constructor(store) {\n    this.store = store;\n  }\n\n  writeAll(entries) {\n    const undo = [];\n    try {\n      for (const [key, value] of entries) {\n        undo.push(this.store.has(key) ? { key, existed: true, previous: this.store.get(key) } : { key, existed: false });\n        this.store.set(key, value);\n      }\n      return { ok: true, written: entries.map(([key]) => key) };\n    } catch (error) {\n      // \uc5ed\uc21c\uc73c\ub85c \ub418\ub3cc\ub9b0\ub2e4 \u2014 \uac19\uc740 \ud0a4\ub97c \ub450 \ubc88 \uc37c\ub2e4\uba74 \uac00\uc7a5 \uc624\ub798\ub41c pre-image\uac00 \ucd5c\uc885\uc801\uc73c\ub85c \ub0a8\uc544\uc57c \ud55c\ub2e4.\n      for (let i = undo.length - 1; i >= 0; i -= 1) {\n        const entry = undo[i];\n        if (entry.existed) this.store.set(entry.key, entry.previous);\n        else this.store.delete(entry.key);\n      }\n      return { ok: false, written: [], reason: String(error) };\n    }\n  }\n}\nmodule.exports = { BatchWriter };\n"
+    }
+  ]
+}

@@ -328,19 +328,145 @@ mod tests {
         );
     }
 
+    /// workspace 밖에 **실제로 존재하는** 파일을 만들고 그 절대경로를 넘긴다.
+    ///
+    /// OS별 하드코딩 경로(`/etc/passwd`)를 쓰지 않는 이유: Windows에서 `/etc/passwd`는
+    /// `Path::is_absolute()`가 **false**다(드라이브 접두사가 없어 "루트 상대" 경로로 해석된다).
+    /// 그래서 절대경로 분기에 들어가지 않고 workspace에 이어 붙여져 `NotFound`가 되며,
+    /// 테스트가 의도한 `AbsoluteOutsideWorkspace` 경로를 **전혀 검증하지 못했다.**
+    /// 실제 임시 디렉터리에서 절대경로를 만들면 두 OS에서 같은 의미가 된다.
     #[test]
     fn rejects_absolute_path_outside_workspace() {
         let (_dir, root) = workspace();
-        let err = root.resolve_existing("/etc/passwd").unwrap_err();
-        assert_eq!(err, PathViolation::AbsoluteOutsideWorkspace);
+
+        // workspace와 완전히 별개인 임시 디렉터리 — 형제 관계이므로 절대 중첩되지 않는다.
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("stolen.txt");
+        fs::write(&outside_file, "workspace 밖의 내용\n").unwrap();
+
+        // 전제 확인: 이 경로가 두 OS 모두에서 실제로 절대경로여야 테스트가 의미를 가진다.
+        assert!(
+            outside_file.is_absolute(),
+            "테스트 전제 실패 — 절대경로가 아니면 검증하려는 분기에 들어가지 않습니다: {outside_file:?}"
+        );
+        assert!(outside_file.exists(), "테스트 전제 실패 — 파일이 실제로 있어야 합니다");
+
+        assert_eq!(
+            root.resolve_existing(&outside_file.to_string_lossy()).unwrap_err(),
+            PathViolation::AbsoluteOutsideWorkspace
+        );
+
+        // 쓰기 경로도 같은 판정이어야 한다 — 읽기만 막고 쓰기가 열려 있으면 의미가 없다.
+        assert_eq!(
+            root.resolve_for_create(&outside_file.to_string_lossy()).unwrap_err(),
+            PathViolation::AbsoluteOutsideWorkspace
+        );
+    }
+
+    /// 함정 기록: Windows에서 `/etc/passwd`류는 절대경로가 **아니다.**
+    ///
+    /// `Path::is_absolute()`는 Windows에서 접두사(`C:`)와 루트를 모두 요구하므로 `/etc/passwd`는
+    /// false다. 따라서 workspace에 이어 붙여져 `NotFound`가 된다 — 탈출이 허용되는 것은 아니지만
+    /// **`AbsoluteOutsideWorkspace` 분기를 검증하지 못한다.** 이 사실을 테스트로 못박아두면
+    /// 다음 사람이 문자열 특수 처리로 "고치려는" 시도를 막을 수 있다.
+    #[cfg(windows)]
+    #[test]
+    fn posix_root_relative_paths_are_not_absolute_on_windows() {
+        let (_dir, root) = workspace();
+        assert!(!Path::new("/etc/passwd").is_absolute());
+        // workspace 상대로 해석되어 존재하지 않으므로 NotFound. 탈출은 여전히 일어나지 않는다.
+        assert_eq!(
+            root.resolve_existing("/etc/passwd").unwrap_err(),
+            PathViolation::NotFound
+        );
+    }
+
+    /// 같은 경로가 Unix에서는 진짜 절대경로다 — 같은 입력이 OS에 따라 다른 판정을 받는다는
+    /// 사실 자체를 남겨둔다. 그래서 위 `rejects_absolute_path_outside_workspace`가
+    /// 하드코딩 문자열이 아니라 실제 임시 디렉터리를 써야 한다.
+    #[cfg(unix)]
+    #[test]
+    fn posix_root_relative_paths_are_absolute_on_unix() {
+        let (_dir, root) = workspace();
+        assert!(Path::new("/etc").is_absolute());
+        assert_eq!(
+            root.resolve_existing("/etc").unwrap_err(),
+            PathViolation::AbsoluteOutsideWorkspace
+        );
+    }
+
+    /// 아직 없는 workspace 밖 절대경로도 거부해야 한다.
+    /// 존재 여부로 갈리면 "없는 파일을 만들어 탈출"이 열린다.
+    #[test]
+    fn rejects_absolute_path_outside_workspace_even_when_missing() {
+        let (_dir, root) = workspace();
+        let outside = tempfile::tempdir().unwrap();
+        let missing = outside.path().join("not-created-yet.txt");
+        assert!(missing.is_absolute());
+        assert!(!missing.exists());
+
+        assert_eq!(
+            root.resolve_for_create(&missing.to_string_lossy()).unwrap_err(),
+            PathViolation::AbsoluteOutsideWorkspace
+        );
     }
 
     #[test]
     fn accepts_absolute_path_inside_workspace() {
         let (_dir, root) = workspace();
         let abs = root.path().join("src/app.ts");
+        assert!(abs.is_absolute());
         let safe = root.resolve_existing(&abs.to_string_lossy()).unwrap();
         assert_eq!(safe.relative(), "src/app.ts");
+
+        // 아직 없는 workspace 내부 절대경로는 **생성 대상으로는** 허용된다.
+        let new_abs = root.path().join("src/new.ts");
+        let safe = root.resolve_for_create(&new_abs.to_string_lossy()).unwrap();
+        assert_eq!(safe.relative(), "src/new.ts");
+    }
+
+    /// §2.1이 요구하는 네 판정이 **한 곳에서** 서로 구별되는지 본다.
+    /// 개별 테스트로 흩어 두면 "셋 다 통과하지만 서로 뭉개진 경우"를 놓친다.
+    #[test]
+    fn path_violations_are_distinguishable_on_every_os() {
+        let (_dir, root) = workspace();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("stolen.txt");
+        fs::write(&outside_file, "x").unwrap();
+
+        let cases: Vec<(&str, String, PathViolation)> = vec![
+            (
+                "workspace 밖 절대경로",
+                outside_file.to_string_lossy().to_string(),
+                PathViolation::AbsoluteOutsideWorkspace,
+            ),
+            (
+                "없는 workspace 내부 상대경로",
+                "src/missing.ts".to_string(),
+                PathViolation::NotFound,
+            ),
+            (
+                "상위 탐색",
+                "../outside.txt".to_string(),
+                PathViolation::ParentTraversal,
+            ),
+            (
+                "workspace 안으로 되돌아오는 상위 탐색",
+                "src/../src/app.ts".to_string(),
+                PathViolation::ParentTraversal,
+            ),
+        ];
+
+        for (label, candidate, expected) in cases {
+            assert_eq!(
+                root.resolve_existing(&candidate).unwrap_err(),
+                expected,
+                "{label}: 기대한 위반과 다릅니다"
+            );
+        }
+
+        // 그리고 정상 경로는 통과해야 한다 — 전부 거부하는 것으로는 위 단정이 무의미하다.
+        assert_eq!(root.resolve_existing("src/app.ts").unwrap().relative(), "src/app.ts");
     }
 
     #[cfg(unix)]

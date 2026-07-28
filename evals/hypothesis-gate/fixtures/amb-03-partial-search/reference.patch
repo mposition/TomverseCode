@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "find.js",
+      "content": "// \ubb38\uc11c\uc5d0\uc11c \uac80\uc0c9\uc5b4\ub97c \ucc3e\ub294\ub2e4.\n//\n// \uc0ac\uc6a9\uc790\uac00 \uc785\ub825\ud55c \ubb38\uc790\uc5f4\uc744 \uc815\uaddc\uc2dd\uc73c\ub85c \ucef4\ud30c\uc77c\ud558\uba74 \uc548 \ub41c\ub2e4: `$9.99`\uc758 `$`\ub294 \uc575\ucee4\ub85c,\n// `config[dev]`\uc758 `[]`\ub294 \ubb38\uc790 \ud074\ub798\uc2a4\ub85c \ud574\uc11d\ub418\uc5b4 \"\uac00\ub054 \uacb0\uacfc\ub97c \ubabb \ucc3e\ub294\" \uc99d\uc0c1\uc774 \ub41c\ub2e4.\n// `(` \uac19\uc740 \uc785\ub825\uc740 \uc544\uc608 \uc608\uc678\ub97c \ub358\uc9c4\ub2e4. \ubb38\uc790 \uadf8\ub300\ub85c \ube44\uad50\ud558\ub294 \uac83\uc774 \uc633\ub2e4.\nfunction findMatches(documents, term) {\n  const needle = String(term ?? \"\").trim().toLowerCase();\n  if (needle.length === 0) return [];\n  return documents.filter((doc) => String(doc).toLowerCase().includes(needle));\n}\nmodule.exports = { findMatches };\n"
+    }
+  ]
+}

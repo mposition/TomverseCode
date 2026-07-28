@@ -1,0 +1,8 @@
+{
+  "name": "stm-03-rate-limiter",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test public.test.js"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "err-01-partial-write",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test public.test.js"
+  }
+}

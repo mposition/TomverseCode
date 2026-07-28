@@ -1,0 +1,29 @@
+{
+  "fixtureId": "sch-01-migration-additive",
+  "category": "schema_compatibility",
+  "language": "typescript",
+  "taskPrompt": "새 버전으로 올린 뒤 예전에 저장된 설정을 못 읽는다는 보고가 있습니다. migrate.js를 확인해 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "v1 설정이 손실 없이 v2로 올라가고, 이미 v2인 설정은 두 번 마이그레이션되지 않는다",
+  "timeoutMs": 180000
+}

@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "listUsers.js",
+      "content": "const { paginate } = require(\"./paginate.js\");\n\n// README\uc758 \uacc4\uc57d\ub300\ub85c page\ub294 1-based\ub2e4. \uc5ec\uae30\uc11c \ubcf4\uc815\ud558\uc9c0 \uc54a\ub294\ub2e4.\nfunction listUsers(all, page, perPage) {\n  return paginate(all, page, perPage);\n}\nmodule.exports = { listUsers };\n"
+    }
+  ]
+}

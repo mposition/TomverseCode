@@ -1,0 +1,29 @@
+{
+  "fixtureId": "asy-02-event-ordering",
+  "category": "async_ordering",
+  "language": "typescript",
+  "taskPrompt": "이벤트 구독자가 가끔 이벤트를 순서와 다르게 받습니다. 비동기 핸들러가 섞이는 것 같습니다. bus.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "한 구독자에 대해 이벤트가 발행 순서대로, 겹치지 않고 전달된다",
+  "timeoutMs": 180000
+}

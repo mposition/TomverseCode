@@ -1,0 +1,29 @@
+{
+  "fixtureId": "api-03-callback-to-promise",
+  "category": "public_api_change",
+  "language": "typescript",
+  "taskPrompt": "콜백 기반 API를 Promise로 옮기려 합니다. 기존 콜백 호출자를 깨지 않으면서 await도 되게 fetchAll.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "콜백을 주면 콜백으로, 안 주면 Promise로 동작하며 오류 전달 방식이 각각 올바르다",
+  "timeoutMs": 180000
+}

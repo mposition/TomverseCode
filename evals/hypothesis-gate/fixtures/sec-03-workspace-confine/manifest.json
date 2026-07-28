@@ -1,0 +1,33 @@
+{
+  "fixtureId": "sec-03-workspace-confine",
+  "category": "security_path_permission",
+  "language": "rust",
+  "taskPrompt": "워크스페이스 경계 검사가 일부 입력을 통과시킵니다. confine.rs를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "cargo",
+      "args": [
+        "test",
+        "--offline",
+        "--test",
+        "public"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "cargo",
+      "args": [
+        "test",
+        "--offline",
+        "--test",
+        "oracle"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "tests/public.rs"
+  ],
+  "expectedInvariant": "정규화 후 루트 밖을 가리키는 모든 경로가 거부되고, 루트 안 경로는 상대 경로로 반환된다",
+  "timeoutMs": 300000
+}

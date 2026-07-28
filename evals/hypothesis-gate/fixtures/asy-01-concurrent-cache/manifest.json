@@ -1,0 +1,29 @@
+{
+  "fixtureId": "asy-01-concurrent-cache",
+  "category": "async_ordering",
+  "language": "typescript",
+  "taskPrompt": "같은 키를 동시에 여러 번 요청하면 fetch가 여러 번 호출됩니다. 캐시가 in-flight 요청을 합쳐주지 않는 것 같습니다. cache.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "같은 키에 대한 동시 요청은 fetch를 한 번만 부르고, 실패 시 실패한 요청이 캐시에 남지 않는다",
+  "timeoutMs": 180000
+}

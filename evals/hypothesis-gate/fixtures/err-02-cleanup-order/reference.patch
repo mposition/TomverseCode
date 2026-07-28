@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "cleanup.js",
+      "content": "// \ud68d\ub4dd\ud55c \ub9ac\uc18c\uc2a4\ub97c \uc815\ub9ac\ud55c\ub2e4.\n//\n// \ub450 \uac00\uc9c0\uac00 \uc911\uc694\ud558\ub2e4:\n//  1. **\uc5ed\uc21c** \u2014 \ub098\uc911\uc5d0 \uc5bb\uc740 \uac83\uc774 \uba3c\uc800 \uc5bb\uc740 \uac83\uc5d0 \uc758\uc874\ud560 \uc218 \uc788\ub2e4.\n//  2. **\ud558\ub098\uac00 \uc2e4\ud328\ud574\ub3c4 \uacc4\uc18d** \u2014 \uccab \uc2e4\ud328\uc5d0\uc11c \uba48\ucd94\uba74 \ub098\uba38\uc9c0\uac00 \uc804\ubd80 \uc0cc\ub2e4. \uc624\ub958\ub294 \ubaa8\uc544\uc11c \ubcf4\uace0\ud55c\ub2e4.\nclass ResourceScope {\n  constructor() {\n    this.disposers = [];\n  }\n\n  register(name, dispose) {\n    this.disposers.push({ name, dispose });\n  }\n\n  disposeAll() {\n    const errors = [];\n    // \ubaa9\ub85d\uc744 \uba3c\uc800 \ube44\uc6b4\ub2e4 \u2014 \ub450 \ubc88 \ud638\ucd9c\ud574\ub3c4 \uc911\ubcf5 \uc815\ub9ac\ud558\uc9c0 \uc54a\uac8c.\n    const pending = this.disposers.slice().reverse();\n    this.disposers = [];\n    for (const { name, dispose } of pending) {\n      try {\n        dispose();\n      } catch (error) {\n        errors.push({ name, error: String(error) });\n      }\n    }\n    return { ok: errors.length === 0, errors };\n  }\n}\nmodule.exports = { ResourceScope };\n"
+    }
+  ]
+}

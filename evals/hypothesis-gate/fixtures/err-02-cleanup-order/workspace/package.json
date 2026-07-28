@@ -1,0 +1,8 @@
+{
+  "name": "err-02-cleanup-order",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test public.test.js"
+  }
+}

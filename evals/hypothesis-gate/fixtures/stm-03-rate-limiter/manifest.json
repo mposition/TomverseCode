@@ -1,0 +1,29 @@
+{
+  "fixtureId": "stm-03-rate-limiter",
+  "category": "state_machine_bounds",
+  "language": "typescript",
+  "taskPrompt": "요청 제한이 창 경계에서 실제 허용치의 두 배를 통과시킵니다. limiter.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "임의의 windowMs 구간에서 허용 횟수를 절대 넘지 않는다",
+  "timeoutMs": 180000
+}

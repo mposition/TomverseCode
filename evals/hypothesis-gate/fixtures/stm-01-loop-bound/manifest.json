@@ -1,0 +1,29 @@
+{
+  "fixtureId": "stm-01-loop-bound",
+  "category": "state_machine_bounds",
+  "language": "typescript",
+  "taskPrompt": "작업 재시도가 가끔 멈추지 않고 계속 돕니다. 상한이 있어야 하는데 동작하지 않는 것 같습니다. loop.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "재시도 횟수가 maxAttempts를 넘지 않고, 상한 도달 시 마지막 실패 사유를 담아 종료한다",
+  "timeoutMs": 180000
+}

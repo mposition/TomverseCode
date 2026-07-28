@@ -1,0 +1,29 @@
+{
+  "fixtureId": "sch-03-event-replay",
+  "category": "schema_compatibility",
+  "language": "typescript",
+  "taskPrompt": "이벤트 로그를 재생하면 예전에 기록된 이벤트에서 예외가 납니다. replay.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "알 수 없는 이벤트 타입과 예전 payload 형태를 만나도 재생이 멈추지 않고 상태가 일관되게 남는다",
+  "timeoutMs": 180000
+}

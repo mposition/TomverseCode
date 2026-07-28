@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "limiter.js",
+      "content": "// \uc2ac\ub77c\uc774\ub529 \ucc3d \ubc29\uc2dd \uc694\uccad \uc81c\ud55c\uae30.\n//\n// \uace0\uc815 \ucc3d\uc740 \uacbd\uacc4\uc5d0\uc11c \uc0c1\ud55c\uc758 2\ubc30\ub97c \ud1b5\uacfc\uc2dc\ud0a8\ub2e4: \ucc3d \ub05d\uc5d0 N\uac1c, \ucc3d\uc774 \ub9ac\uc14b\ub41c \uc9c1\ud6c4 N\uac1c\uac00\n// \uc544\uc8fc \uc9e7\uc740 \uc2e4\uc81c \uc2dc\uac04 \uc548\uc5d0 \uc9c0\ub098\uac04\ub2e4. \ud5c8\uc6a9 \uc2dc\uac01\uc744 \uae30\uc5b5\ud558\uace0 windowMs \uc548\uc758 \uac83\ub9cc \uc138\uba74\n// \uc5b4\ub5a4 \uad6c\uac04\uc5d0\uc11c\ub3c4 \uc0c1\ud55c\uc774 \uc9c0\ucf1c\uc9c4\ub2e4.\nclass RateLimiter {\n  constructor(limit, windowMs) {\n    this.limit = limit;\n    this.windowMs = windowMs;\n    this.accepted = [];\n  }\n\n  allow(now) {\n    const cutoff = now - this.windowMs;\n    // \ucc3d \ubc16\uc73c\ub85c \ub098\uac04 \uae30\ub85d\uc740 \ubc84\ub9b0\ub2e4 \u2014 \ubb34\ud55c\ud788 \uc313\uc774\uc9c0 \uc54a\uac8c.\n    while (this.accepted.length > 0 && this.accepted[0] <= cutoff) {\n      this.accepted.shift();\n    }\n    if (this.accepted.length < this.limit) {\n      this.accepted.push(now);\n      return true;\n    }\n    return false;\n  }\n}\nmodule.exports = { RateLimiter };\n"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "validate.js",
+      "content": "// \uc8fc\ubb38 \uc694\uccad \uac80\uc99d.\n//\n// v2\uc5d0\uc11c \ucd94\uac00\ub41c `deliveryWindow`/`couponCode`\ub294 **\uc120\ud0dd \ud544\ub4dc**\ub2e4. \ud544\uc218\ub85c \ub9cc\ub4e4\uba74 \uc608\uc804 \ud074\ub77c\uc774\uc5b8\ud2b8\uac00\n// \uc804\ubd80 400\uc744 \ubc1b\ub294\ub2e4 \u2014 \uc2a4\ud0a4\ub9c8\ub97c \ub113\ud788\ub294 \ubcc0\uacbd\uc740 \ud558\uc704 \ud638\ud658\uc774\uc5b4\uc57c \ud55c\ub2e4.\n// \ub2e4\ub9cc \uac12\uc774 **\uc788\uc73c\uba74** \ud615\uc2dd\uc740 \uac80\uc0ac\ud55c\ub2e4: \uc5c6\ub294 \uac83\uacfc \uc798\ubabb\ub41c \uac83\uc740 \ub2e4\ub974\ub2e4.\nfunction validateOrder(body) {\n  const errors = [];\n  if (typeof body.itemId !== \"string\" || body.itemId.length === 0) errors.push(\"itemId\uac00 \ud544\uc694\ud569\ub2c8\ub2e4\");\n  if (typeof body.quantity !== \"number\" || body.quantity < 1) errors.push(\"quantity\uac00 1 \uc774\uc0c1\uc774\uc5b4\uc57c \ud569\ub2c8\ub2e4\");\n\n  if (body.deliveryWindow !== undefined && body.deliveryWindow !== null) {\n    if (typeof body.deliveryWindow !== \"string\") errors.push(\"deliveryWindow\ub294 \ubb38\uc790\uc5f4\uc774\uc5b4\uc57c \ud569\ub2c8\ub2e4\");\n  }\n  if (body.couponCode !== undefined && body.couponCode !== null) {\n    if (typeof body.couponCode !== \"string\") errors.push(\"couponCode\ub294 \ubb38\uc790\uc5f4\uc774\uc5b4\uc57c \ud569\ub2c8\ub2e4\");\n  }\n  return { ok: errors.length === 0, errors };\n}\nmodule.exports = { validateOrder };\n"
+    }
+  ]
+}

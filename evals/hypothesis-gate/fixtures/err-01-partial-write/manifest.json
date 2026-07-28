@@ -1,0 +1,29 @@
+{
+  "fixtureId": "err-01-partial-write",
+  "category": "error_recovery_rollback",
+  "language": "typescript",
+  "taskPrompt": "여러 파일을 함께 저장하다 중간에 실패하면 일부만 바뀐 상태로 남습니다. writer.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "일괄 저장이 실패하면 어떤 파일도 바뀌지 않은 상태로 되돌아간다",
+  "timeoutMs": 180000
+}

@@ -1,0 +1,29 @@
+{
+  "fixtureId": "amb-03-partial-search",
+  "category": "ambiguous_requirement",
+  "language": "typescript",
+  "taskPrompt": "검색이 '가끔 결과를 못 찾는다'는 제보가 있습니다. 어떤 검색어인지는 알려주지 않았습니다. find.js를 확인해주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "검색은 대소문자와 앞뒤 공백에 영향받지 않고, 정규식 메타문자가 든 검색어도 문자 그대로 찾는다",
+  "timeoutMs": 180000
+}

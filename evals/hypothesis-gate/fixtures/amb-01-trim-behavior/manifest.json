@@ -1,0 +1,29 @@
+{
+  "fixtureId": "amb-01-trim-behavior",
+  "category": "ambiguous_requirement",
+  "language": "typescript",
+  "taskPrompt": "사용자 이름 검증이 이상하게 동작한다는 제보가 있습니다. 공백이 들어간 이름이 문제인 것 같은데 정확한 증상은 모르겠습니다. username.js를 확인해주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "이름은 앞뒤 공백을 제거한 뒤 검증·저장되고, 내부 공백은 보존되며, 공백만 있는 이름은 거부된다",
+  "timeoutMs": 180000
+}

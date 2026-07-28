@@ -1,0 +1,8 @@
+{
+  "name": "mfc-02-currency-units",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test public.test.js"
+  }
+}

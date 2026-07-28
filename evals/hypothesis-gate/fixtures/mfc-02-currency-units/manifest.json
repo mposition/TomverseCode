@@ -1,0 +1,29 @@
+{
+  "fixtureId": "mfc-02-currency-units",
+  "category": "multi_file_contract",
+  "language": "typescript",
+  "taskPrompt": "장바구니 합계가 가끔 100배로 표시됩니다. cart.js, pricing.js, format.js를 보고 원인을 찾아 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "금액은 내부적으로 항상 최소 단위(센트) 정수로 다루고, 표시 시점에만 한 번 나눈다",
+  "timeoutMs": 180000
+}

@@ -1,0 +1,29 @@
+{
+  "fixtureId": "err-02-cleanup-order",
+  "category": "error_recovery_rollback",
+  "language": "typescript",
+  "taskPrompt": "리소스를 정리할 때 하나가 실패하면 나머지가 정리되지 않고 남습니다. cleanup.js를 고쳐주세요.",
+  "publicVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "public.test.js"
+      ]
+    }
+  ],
+  "oracleVerificationCommands": [
+    {
+      "program": "node",
+      "args": [
+        "--test",
+        "oracle.test.js"
+      ]
+    }
+  ],
+  "forbiddenPaths": [
+    "public.test.js"
+  ],
+  "expectedInvariant": "정리는 역순으로 전부 시도되고, 실패한 것이 있어도 나머지가 정리되며 모든 오류가 보고된다",
+  "timeoutMs": 180000
+}
