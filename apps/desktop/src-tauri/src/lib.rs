@@ -131,7 +131,7 @@ async fn rollback_task(app: tauri::AppHandle, task_id: String) -> Result<Value, 
 /// (아직 워크스페이스를 고르기 전에도) 봐야 하는 정보이기 때문이다.
 /// `after_event_id`를 주면 그 이후만 돌려준다 — UI가 이미 받은 이벤트를 다시 그리지 않도록.
 #[tauri::command]
-fn task_events(
+fn get_task_events(
     state: tauri::State<'_, SessionState>,
     task_id: String,
     after_event_id: Option<i64>,
@@ -210,7 +210,7 @@ pub fn run() {
             cancel_task,
             provide_user_input,
             rollback_task,
-            task_events,
+            get_task_events,
             list_tasks,
             get_task,
             restart_task,

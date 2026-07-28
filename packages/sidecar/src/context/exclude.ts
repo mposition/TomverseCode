@@ -6,6 +6,11 @@
  *
  * `.gitignore` 준수는 Rust의 `list_files`가 처리한다(ignore 크레이트). 여기서는 그것만으로
  * 부족한 것 — git이 추적하고 있는 secret 파일, 바이너리, 대용량 — 을 막는다.
+ *
+ * **Rust에 같은 성질의 목록이 따로 있다**(`apps/desktop/src-tauri/core/src/policy/secrets.rs`).
+ * 중복이 아니라 독립 검증이다: 여기 있는 필터는 Node가 스스로 지키는 규칙이고, Node가 장악당하면
+ * 우회할 수 있다. 그래서 Rust가 도구 요청 시점에 한 번 더 판정한다
+ * (state-machine-and-protocol.md 16.7절). **한쪽을 고칠 때 다른 쪽도 함께 볼 것.**
  */
 
 /** 기본 500KB 초과 파일은 인덱싱하지 않는다 (7절). */

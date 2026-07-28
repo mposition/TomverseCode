@@ -266,7 +266,7 @@ export default function App() {
     try {
       const [detail, storedEvents] = await Promise.all([
         invoke<{ task: TaskRow | null }>("get_task", { taskId: id }),
-        invoke<StoredEvent[]>("task_events", { taskId: id }),
+        invoke<StoredEvent[]>("get_task_events", { taskId: id }),
       ]);
       if (detail.task) setSelectedTask({ task: detail.task, events: storedEvents });
     } catch (error) {
