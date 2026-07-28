@@ -169,3 +169,44 @@ test("_env.bat이 절대 경로를 하드코딩하되 사용자별 경로는 쓰
   );
   assert.ok(script.includes("%USERPROFILE%"), "cargo 경로는 %USERPROFILE%로 풀어야 합니다");
 });
+
+test("_env.bat이 Visual Studio를 vswhere로 찾는다", () => {
+  // 실측 사례: 사용자의 VS는 D:\Program Files\Microsoft Visual Studio\18\Enterprise 였다.
+  // 후보 경로를 하드코딩하면 드라이브·버전·에디션 중 하나만 달라도 빗나가고, 목록을 늘리는
+  // 방식으로는 영원히 못 쫓아간다. vswhere.exe는 Installer가 고정 위치에 두는 조회 도구다.
+  const script = readFileSync(path.join(REPO_ROOT, "scripts", "_env.bat"), "utf8");
+  assert.ok(script.includes("vswhere.exe"), "_env.bat이 vswhere를 쓰지 않습니다");
+  assert.ok(
+    /-property\s+installationPath/.test(script),
+    "_env.bat이 vswhere에 설치 경로를 묻지 않습니다"
+  );
+  // 안전망 후보가 vswhere보다 먼저 오면 vswhere가 사실상 죽는다.
+  assert.ok(
+    script.indexOf("vswhere.exe") < script.indexOf("Microsoft Visual Studio\\2022"),
+    "하드코딩 후보가 vswhere보다 먼저 시도됩니다"
+  );
+});
+
+test("_env.bat이 드라이브 문자를 하드코딩하지 않는다", () => {
+  // VS가 D: 드라이브에 설치된 실제 사례가 있었다. Program Files 위치는 환경변수로 푼다.
+  const script = readFileSync(path.join(REPO_ROOT, "scripts", "_env.bat"), "utf8");
+  const hardcoded = script
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*rem\b/i.test(line))
+    .filter((line) => /[A-Za-z]:\\/.test(line));
+  assert.deepEqual(
+    hardcoded,
+    [],
+    `_env.bat의 실행 줄에 드라이브 문자가 하드코딩되어 있습니다:\n${hardcoded.join("\n")}`
+  );
+});
+
+test("_env.bat이 vcvarsall 성공을 INCLUDE로 확인한다", () => {
+  // vcvarsall이 0으로 끝나도 변수가 안 잡히는 경우가 있다. 여기서 안 걸르면
+  // stdarg.h 없음 / LNK1104라는 훨씬 먼 증상으로만 드러난다.
+  const script = readFileSync(path.join(REPO_ROOT, "scripts", "_env.bat"), "utf8");
+  assert.ok(
+    /if not defined INCLUDE/i.test(script),
+    "_env.bat이 vcvarsall 실행 후 INCLUDE를 확인하지 않습니다"
+  );
+});
