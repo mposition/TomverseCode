@@ -13,7 +13,7 @@ import {
   type FixtureRepo,
 } from "./helpers/fixtureRepo.js";
 import type { FakeScriptStep } from "../src/providers/fake.js";
-import { checkArtifacts, hostBinaryPath, sidecarEntryPath } from "@tomverse/toolchain";
+import { checkArtifacts, hostBinaryPath, resolveNodeCli, sidecarEntryPath } from "@tomverse/toolchain";
 
 /**
  * End-to-end 테스트 — **실제** 구성요소로 M0 완료 기준을 검증한다.
@@ -159,6 +159,17 @@ function readEvents(dbPath: string): { seq: number; type: string; payload: strin
 /**
  * 픽스처의 `npm test`를 이 테스트 프로세스 밖에서와 같은 조건으로 실행한다.
  *
+ * # 이건 제품 경로가 아니다
+ *
+ * **아래 e2e 본체는 계속 논리 명령 `npm test`를 Rust Tool Runtime에 요청한다.** 그래야 새
+ * Windows 프로그램 해석 계층(`tools/program.rs`)이 실제로 검증된다. 여기 있는 것은 그 전에
+ * "픽스처가 정말 실패하는가"를 확인하는 **전제 검사**일 뿐이고, Node 쪽에서 npm을 직접
+ * 띄워야 하므로 별도 helper가 필요하다.
+ *
+ * Windows에서 `spawnSync("npm", ...)`는 `npm.exe`가 없어 실패한다(`npm.cmd`가 설치된다).
+ * 셸로 감싸지 않고 `@tomverse/toolchain`의 해석 helper로 Node + `npm-cli.js`를 조립한다 —
+ * 제품 쪽과 같은 방식이되, 구현은 서로 독립이다.
+ *
  * `NODE_TEST_CONTEXT`를 지우는 이유: 우리가 `node --test`로 돌고 있으므로 이 변수가 자식에게
  * 상속되고, 그러면 자식 `node --test`가 실패해도 exit 0을 반환한다. Rust Tool Runtime도
  * 같은 변수를 제거하므로(tools/mod.rs) 여기서 지우는 것은 제품 동작을 재현하는 것이다.
@@ -167,7 +178,21 @@ function runFixtureTests(cwd: string): { status: number | null; stdout: string; 
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
   delete env.NODE_OPTIONS;
-  const result = spawnSync("npm", ["test", "--silent"], { cwd, encoding: "utf8", env });
+
+  const resolved = resolveNodeCli("npm", ["test", "--silent"], {
+    platform: process.platform,
+    pathValue: env.PATH ?? env.Path ?? "",
+    pathext: env.PATHEXT,
+  });
+  // 해석하지 못하면 조용히 건너뛰지 않는다 — 전제 검사가 사라지면 e2e 전체의 의미가 약해진다.
+  if (!resolved.ok) assert.fail(`픽스처 테스트를 실행할 수 없습니다:\n${resolved.message}`);
+
+  const result = spawnSync(resolved.executable, resolved.args, {
+    cwd,
+    encoding: "utf8",
+    env,
+    shell: false,
+  });
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
