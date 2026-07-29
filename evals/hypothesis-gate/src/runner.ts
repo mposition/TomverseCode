@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { BudgetLedger } from "@tomverse/sidecar/budget";
 import { armExecutionOrder, armSpec, ARMS } from "./arms.js";
 import { criteriaHash } from "./criteria.js";
 import { allPayloads, lastPayload, readEvents, runHost, type HostRunResult } from "./host.js";
@@ -41,6 +42,15 @@ export interface RunnerOptions {
   store: RecordStore;
   runId: string;
   maxCostUsd?: number;
+  /**
+   * 예산 ledger — 있으면 **호출 전에 예약**하고, 예약할 수 없으면 그 기록을 실행하지 않는다.
+   * 없으면(fake/dry-run) 예산 강제가 없다.
+   */
+  ledger?: BudgetLedger;
+  /** 한 기록의 보수적 최대 비용. ledger가 있으면 필수다 — 없으면 예약할 금액을 모른다. */
+  estimateRecordCostUsd?: (arm: ArmId) => { maxUsd: number; basis: string } | undefined;
+  /** 실제 공급자 실행인가. true면 비용을 잴 수 없는 기록에서 남은 유료 호출을 중단한다. */
+  realProvider?: boolean;
   /** fake provider 스크립트 — 하네스 자동 테스트 전용. 있으면 기록이 `providerKind: "fake"`가 된다. */
   fakeScript?: unknown;
   executorModel?: string;
@@ -55,6 +65,10 @@ export interface RunnerResult {
   skippedResume: number;
   budgetExhausted: boolean;
   spentUsd: number;
+  /** 비용을 잴 수 없어 중단했는가 — 이건 경고가 아니라 실행 차단 사유다. */
+  unmeasurableCostAbort: boolean;
+  /** 중단 사유(있으면). 리포트와 종료 메시지에 그대로 나간다. */
+  abortReason?: string;
   dryRunPlan?: { fixtureId: string; arm: ArmId; repetition: number }[];
 }
 
@@ -96,6 +110,7 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
       skippedResume: 0,
       budgetExhausted: false,
       spentUsd: 0,
+      unmeasurableCostAbort: false,
       dryRunPlan: plan.map((p) => ({ fixtureId: p.fixture.manifest.fixtureId, arm: p.arm, repetition: p.repetition })),
     };
   }
@@ -104,9 +119,10 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
   const drafts = new Map<string, unknown>();
   let spentUsd = 0;
   let executed = 0;
-  let unmeasurableCostWarned = false;
   let skippedResume = 0;
   let budgetExhausted = false;
+  let unmeasurableCostAbort = false;
+  let abortReason: string | undefined;
 
   for (const item of plan) {
     const { fixture, arm, repetition } = item;
@@ -147,22 +163,62 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
       }
     }
 
+    // **유료 호출 전에 예약한다.** 사후 검사만으로는 마지막 한 건의 비용만큼 상한을 넘길 수 있다.
+    let reservation: ReturnType<BudgetLedger["reserve"]> | undefined;
+    if (options.ledger) {
+      const estimate = options.estimateRecordCostUsd?.(arm);
+      if (estimate === undefined) {
+        abortReason =
+          `${fixtureId} rep${repetition} Arm ${arm}: 예상 비용을 계산할 수 없어 유료 호출을 시작하지 않습니다`;
+        unmeasurableCostAbort = true;
+        log(abortReason);
+        break;
+      }
+      reservation = options.ledger.reserve(estimate, `${fixtureId}/${arm}/rep${repetition}`);
+      if (!reservation.ok) {
+        budgetExhausted = true;
+        abortReason = reservation.reason;
+        log(`예약 실패 — 남은 ${plan.length - executed - skippedResume}건을 실행하지 않습니다`);
+        log(`  ${reservation.reason}`);
+        break;
+      }
+    }
+
     log(`${fixtureId} rep${repetition} Arm ${arm} 실행 중...`);
-    const record = executeOne({ ...options, fixture, arm, repetition, replayDraft, criteriaHashValue: hash });
+    let record: RecordWithDraft;
+    try {
+      record = executeOne({ ...options, fixture, arm, repetition, replayDraft, criteriaHashValue: hash });
+    } catch (error) {
+      // 예외로 빠져나가도 ledger가 예약을 물고 있으면 남은 예산이 영영 줄어든 채로 남는다.
+      if (reservation?.ok) reservation.reservation.release();
+      throw error;
+    }
+
+    // **실제 공급자인데 비용을 잴 수 없으면 남은 유료 호출을 중단한다.**
+    // 예전에는 경고만 하고 계속 돌았는데, 그러면 예산 상한이 아무것도 막지 못하는 상태로
+    // 몇 시간 동안 돈을 쓰게 된다. 0으로 대체하지도 않는다 — 0은 fake에만 참이다.
+    const costUnmeasurable = options.realProvider === true && record.costUsd === undefined;
+    if (costUnmeasurable) {
+      record.failureClass = "cost_unmeasurable";
+    }
+
     appendChecked(options.store, record);
     executed += 1;
     spentUsd += record.costUsd ?? 0;
+    if (reservation?.ok) {
+      // 실제 사용량으로 정산한다. 비용을 모르면 예약을 해제하되(과금 여부를 모르므로 확정하지 않는다)
+      // 바로 다음에서 중단하므로 더 이상 유료 호출은 없다.
+      if (record.costUsd === undefined) reservation.reservation.release();
+      else reservation.reservation.settle(record.costUsd);
+    }
 
-    // **비용을 잴 수 없으면 예산 상한은 아무것도 막지 못한다.** 실제 API로 몇 시간을 도는
-    // 실험에서 이건 조용히 돈을 쓰게 두는 것과 같으므로, 한 번은 크게 알린다.
-    // (fake provider는 단가가 0이라 정상적으로 undefined가 아닌 0을 보고한다.)
-    if (options.maxCostUsd !== undefined && record.costUsd === undefined && !unmeasurableCostWarned) {
-      unmeasurableCostWarned = true;
-      log(
-        `[경고] 실행 비용을 확인할 수 없습니다 (모델 단가 정보 없음). ` +
-          `--max-cost-usd ${options.maxCostUsd}가 실질적으로 강제되지 않습니다 — ` +
-          `Model Registry의 단가와 반환된 모델 ID를 확인하세요.`
-      );
+    if (costUnmeasurable) {
+      unmeasurableCostAbort = true;
+      abortReason =
+        `${fixtureId} rep${repetition} Arm ${arm}: 실제 응답에 usage가 없거나 비용을 계산할 수 없습니다. ` +
+        `예산 상한을 강제할 수 없으므로 남은 유료 호출을 중단합니다 (기록은 보존되며 --resume으로 이어받을 수 있습니다).`;
+      log(abortReason);
+      break;
     }
 
     if (spec.draftSource === "generate" && record.draftProposal !== undefined) {
@@ -170,7 +226,15 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     }
   }
 
-  return { planned: plan.length, executed, skippedResume, budgetExhausted, spentUsd };
+  return {
+    planned: plan.length,
+    executed,
+    skippedResume,
+    budgetExhausted,
+    spentUsd,
+    unmeasurableCostAbort,
+    ...(abortReason !== undefined ? { abortReason } : {}),
+  };
 }
 
 /** 저장된 Arm A 기록에서 초안을 복구한다 — resume 후에도 C/D가 같은 초안을 쓸 수 있어야 한다. */
