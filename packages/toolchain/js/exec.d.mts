@@ -34,6 +34,7 @@ export declare const defaultRunner: ScriptRunner;
 
 export declare function isWindows(platform: string): boolean;
 export declare function msvcEnvScriptPath(repoRoot: string): string;
+export declare function shellExecutablePath(env?: Record<string, string | undefined>): string;
 export declare function parseMsvcEnv(stdout: string): { ready: boolean; env: Record<string, string> };
 export declare function interpretMsvcOutcome(
   outcome: { status: number | null; stdout: string; stderr: string },

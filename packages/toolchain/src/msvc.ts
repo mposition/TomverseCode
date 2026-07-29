@@ -33,6 +33,7 @@ export {
   parseMsvcEnv,
   prepareMsvcEnv,
   READY_MARKER,
+  shellExecutablePath,
   withMsvcEnv,
 } from "@tomverse/toolchain/exec";
 

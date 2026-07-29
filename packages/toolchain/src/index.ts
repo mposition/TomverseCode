@@ -29,6 +29,7 @@ export {
   parseMsvcEnv,
   prepareMsvcEnv,
   READY_MARKER,
+  shellExecutablePath,
   withMsvcEnv,
   type MsvcResult,
   type ScriptRunner,
