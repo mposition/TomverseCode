@@ -256,13 +256,15 @@ test("예산 소진 판정이 경계에서 정확하다", () => {
   assert.equal(budgetStop(1.5, 1), true);
 });
 
-test("비용을 잴 수 없는데 예산 상한이 걸려 있으면 경고한다", async () => {
+test("fake 실행은 비용을 잴 수 없어도 중단하지 않는다", async () => {
+  // 예전에는 여기서 "경고만 하고 계속" 도는 것을 확인했다. 지금은 **실제 공급자**일 때만
+  // 중단하고(safety.test.ts 5번), fake는 단가 0이 정상이므로 끝까지 돈다.
+  // 두 경로를 구별하지 못하면 fake 하네스 테스트가 매번 중단되거나, 유료 실행이 계속 돌게 된다.
   assert.ok(artifactsPresent().ok);
   await withDirAsync(async (dir) => {
     const fixtures = [loadFixture(FIXTURES, "stm-01-loop-bound")];
     const store = openRecordStore(path.join(dir, "records.jsonl"));
-    const messages: string[] = [];
-    await runExperiment({
+    const result = await runExperiment({
       fixtures,
       arms: ["A"],
       repetitions: 1,
@@ -271,16 +273,13 @@ test("비용을 잴 수 없는데 예산 상한이 걸려 있으면 경고한다
       runId: "budget-warn",
       maxCostUsd: 10,
       fakeScript: { defaultPatch: FIXED_PATCH },
-      onProgress: (m) => messages.push(m),
+      // realProvider를 켜지 않는다 — fake 실행이다.
     });
+    assert.equal(result.unmeasurableCostAbort, false, "fake 실행인데 비용 미측정으로 중단했습니다");
+    assert.equal(result.executed, 1);
     const record = store.all()[0]!;
-    if (record.costUsd === undefined) {
-      // 비용을 모르는 채로 조용히 계속 도는 것이 가장 위험하다.
-      assert.ok(
-        messages.some((m) => m.includes("비용을 확인할 수 없습니다")),
-        `경고가 없습니다: ${messages.join(" / ")}`
-      );
-    } else {
+    assert.notEqual(record.failureClass, "cost_unmeasurable");
+    if (record.costUsd !== undefined) {
       assert.equal(record.costUsd, 0, "fake 모델의 단가는 0이어야 합니다");
     }
   });

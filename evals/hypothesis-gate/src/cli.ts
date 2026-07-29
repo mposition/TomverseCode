@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ARMS } from "./arms.js";
-import { criteriaHash, describeCriteria } from "./criteria.js";
+import { createBudgetLedger } from "@tomverse/sidecar/budget";
+import { criteriaHash, CRITERIA, describeCriteria } from "./criteria.js";
 import { prepareMsvcEnv } from "@tomverse/toolchain";
 import { REPO_ROOT } from "./host.js";
 import { loadAllFixtures, listFixtureIds } from "./manifest.js";
 import { preflight } from "./preflight.js";
+import { estimateRecordCost, lookupModel, maxCallsPerRecord, planModels, isModelPlan } from "./models.js";
+import { OptionError, parseArgs, requireCostLimitForPaidRun, type CliOptions } from "./options.js";
 import { openRecordStore } from "./records.js";
+import { buildRunCard, renderRunCard, selectSmokeFixtures } from "./runCard.js";
+import { checkCompatibility, META_VERSION, readMeta, runDirPaths, withApproval, writeMeta } from "./runDir.js";
+import { ARMS } from "./arms.js";
 import { writeReports } from "./report.js";
 import { fillReviewerContributions, runExperiment } from "./runner.js";
 import { evaluateGate } from "./stats.js";
@@ -30,103 +35,26 @@ const PACKAGE_ROOT = path.resolve(__dirname, "..", "..");
 const FIXTURES_ROOT = path.join(PACKAGE_ROOT, "fixtures");
 const REPORTS_ROOT = path.join(PACKAGE_ROOT, "reports");
 
-interface CliOptions {
-  command: string;
-  fixtures: string[];
-  arms: ArmId[];
-  repetitions: number;
-  seed: number;
-  maxCostUsd?: number;
-  maxConcurrency: number;
-  resume: boolean;
-  output: string;
-  executorModel?: string;
-  reviewerModel?: string;
-}
-
-function parseArgs(argv: string[]): CliOptions {
-  const options: CliOptions = {
-    command: argv[0] ?? "help",
-    fixtures: [],
-    arms: ARMS.map((a) => a.arm),
-    repetitions: 3,
-    seed: 1,
-    // 동시 실행은 기본 1이다. 여러 fixture를 동시에 돌리면 rate limit과 머신 부하가
-    // 지연 측정을 오염시킨다 — p95 지연이 판정 기준에 있으므로 기본은 순차다.
-    maxConcurrency: 1,
-    resume: false,
-    output: REPORTS_ROOT,
-  };
-
-  for (let i = 1; i < argv.length; i += 1) {
-    const flag = argv[i];
-    const next = (): string => {
-      const value = argv[i + 1];
-      if (value === undefined) throw new Error(`${flag}에 값이 필요합니다`);
-      i += 1;
-      return value;
-    };
-    switch (flag) {
-      case "--fixtures":
-        options.fixtures = next().split(",").map((f) => f.trim()).filter(Boolean);
-        break;
-      case "--arms":
-        options.arms = next().split(",").map((a) => a.trim().toUpperCase() as ArmId).filter(Boolean);
-        break;
-      case "--repetitions":
-        options.repetitions = Number.parseInt(next(), 10);
-        break;
-      case "--seed":
-        options.seed = Number.parseInt(next(), 10);
-        break;
-      case "--max-cost-usd":
-        options.maxCostUsd = Number.parseFloat(next());
-        break;
-      case "--max-concurrency":
-        options.maxConcurrency = Number.parseInt(next(), 10);
-        break;
-      case "--resume":
-        options.resume = true;
-        break;
-      case "--output":
-        options.output = path.resolve(next());
-        break;
-      case "--executor-model":
-        options.executorModel = next();
-        break;
-      case "--reviewer-model":
-        options.reviewerModel = next();
-        break;
-      default:
-        throw new Error(`알 수 없는 옵션: ${flag}`);
-    }
-  }
-  if (!Number.isFinite(options.repetitions) || options.repetitions < 1) {
-    throw new Error("--repetitions는 1 이상의 정수여야 합니다");
-  }
-  if (options.maxConcurrency > 1) {
-    // 명시적으로 거부하지 않고 경고만 한다 — 사용자가 지연 측정을 포기하고 속도를 택할 수 있다.
-    process.stderr.write(
-      `[경고] --max-concurrency ${options.maxConcurrency}: 동시 실행은 지연 측정을 오염시킵니다. ` +
-        `p95 지연이 판정 기준에 있으므로 confirmatory 실행에서는 1을 권장합니다.\n`
-    );
-  }
-  return options;
-}
-
 function log(message: string): void {
   process.stdout.write(`${message}\n`);
 }
 
 async function main(): Promise<number> {
-  const options = parseArgs(process.argv.slice(2));
+  const options = parseArgs(process.argv.slice(2), REPORTS_ROOT);
+  const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.GATE_FAKE === "1";
+  // **API를 부르기 전에** 유료 실행의 전제를 확인한다.
+  requireCostLimitForPaidRun(options, usingFake);
 
   if (options.command === "help") {
-    log("usage: gate <validate|dry-run|pilot|run|report> [옵션]");
+    log("usage: gate <validate|dry-run|plan-pilot|pilot|run|report> [옵션]");
     log("");
     log("옵션: --fixtures a,b --arms A,B,C,D --repetitions N --seed N");
-    log("      --max-cost-usd N --max-concurrency N --resume --output <dir>");
+    log("      --max-cost-usd N --max-concurrency 1 --resume --output <run-dir>");
     log("      --executor-model <id> --reviewer-model <id>");
+    log("");
+    log("--max-cost-usd는 실제 공급자를 쓰는 pilot/run에 **필수**입니다 (우회 옵션 없음).");
+    log("--max-concurrency는 1만 허용합니다 — protocol v1은 순차 실행만 지원합니다.");
+    log("--output은 하나의 실행 디렉터리이며 최초 실행과 재개가 같은 records.jsonl을 씁니다.");
     log("");
     log("종료 코드: 0=PASS  1=FAIL  2=INCONCLUSIVE  3=하네스 오류  4=툴체인 미준비");
     log("");
@@ -186,7 +114,46 @@ async function main(): Promise<number> {
     return failed === 0 ? 0 : 1;
   }
 
-  const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.GATE_FAKE === "1";
+  // ---- plan-pilot ----
+  // **실제 API를 부르지 않는다.** 사용자가 승인할 수 있는 실행 계획서를 만든다.
+  if (options.command === "plan-pilot") {
+    const models = planModels({
+      ...(options.executorModel ? { executorModel: options.executorModel } : {}),
+      ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
+      allowZeroPricing: usingFake,
+    });
+    const extra: string[] = [];
+    if (usingFake) {
+      extra.push("fake provider 모드입니다 — 이 카드로 유료 실행을 승인할 수 없습니다");
+    }
+    const card = buildRunCard({
+      fixtures,
+      arms: options.arms,
+      seed: options.seed,
+      maxConcurrency: options.maxConcurrency,
+      outputDir: options.output,
+      ...(options.maxCostUsd !== undefined ? { approvedLimitUsd: options.maxCostUsd } : {}),
+      models,
+      extraBlockers: extra,
+      generatedAt: new Date().toISOString(),
+    });
+    for (const line of renderRunCard(card)) log(line);
+    log("");
+    log("P0 smoke 실행 명령:");
+    log(
+      `  npm run gate:g:pilot -- --fixtures ${selectSmokeFixtures(fixtures)
+        .map((f) => f.manifest.fixtureId)
+        .join(",")} --repetitions 1 --max-concurrency 1 --seed ${options.seed} \\`
+    );
+    log(`      --output ${path.join(options.output, "p0-smoke")} --max-cost-usd <P0 승인 금액>`);
+    log("");
+    log("P1 전체 pilot 실행 명령 (P0가 완전히 정상일 때만):");
+    log(`  npm run gate:g:pilot -- --repetitions 1 --max-concurrency 1 --seed ${options.seed} \\`);
+    log(`      --output ${path.join(options.output, "p1-pilot")} --max-cost-usd <P1 승인 금액>`);
+    // 승인 대상이므로 blocker가 있어도 카드는 출력한다. 종료 코드로 상태를 구별한다.
+    return card.status === "READY_FOR_APPROVAL" ? 0 : 2;
+  }
+
   const pre = preflight({
     fixtureCount: fixtures.length,
     nativeFixtureCount: fixtures.filter((f) => f.manifest.language === "rust").length,
@@ -248,8 +215,102 @@ async function main(): Promise<number> {
 
   const isPilot = options.command === "pilot";
   const runId = `${isPilot ? "pilot" : "run"}-${randomUUID()}`;
-  const recordsPath = path.join(options.output, options.resume ? "records.jsonl" : `${runId}.jsonl`);
-  const store = openRecordStore(options.resume ? path.join(options.output, "records.jsonl") : recordsPath);
+
+  // ---- 실행 디렉터리 계약 (§5) ----
+  // 최초 실행과 재개가 **같은 파일**을 쓴다. 예전에는 최초가 <uuid>.jsonl, 재개가
+  // records.jsonl이어서 `--resume`만 붙이면 처음부터 다시 돌았다.
+  const { records: recordsPath } = runDirPaths(options.output);
+  const store = openRecordStore(recordsPath);
+  const spentSoFar = store.all().reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
+
+  const models = planModels({
+    ...(options.executorModel ? { executorModel: options.executorModel } : {}),
+    ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
+    allowZeroPricing: usingFake,
+  });
+  if (!usingFake && !isModelPlan(models)) {
+    log("모델 계획을 확정할 수 없습니다:");
+    for (const blocker of models.blockers) log(`  - ${blocker}`);
+    return 2;
+  }
+
+  const incomingMeta = {
+    stage: isPilot ? "pilot" : "confirmatory",
+    protocolVersion: CRITERIA.protocolVersion,
+    criteriaHash: criteriaHash(),
+    fixtureHashes: Object.fromEntries(fixtures.map((f) => [f.manifest.fixtureId, f.fixtureHash])),
+    arms: options.arms.map(String),
+    repetitions: isPilot ? 1 : options.repetitions,
+    seed: options.seed,
+    executorModelId: isModelPlan(models) ? models.executor.modelId : (options.executorModel ?? "(fake)"),
+    reviewerModelId: isModelPlan(models) ? models.reviewer.modelId : (options.reviewerModel ?? "(fake)"),
+  };
+
+  const existingMeta = readMeta(options.output);
+  const now = new Date().toISOString();
+  if (existingMeta) {
+    const compat = checkCompatibility(existingMeta, incomingMeta, {
+      approvedLimitUsd: options.maxCostUsd ?? Number.POSITIVE_INFINITY,
+      alreadySpentUsd: spentSoFar,
+    });
+    if (compat.conflicts.length > 0) {
+      log(`기존 실행 디렉터리와 조건이 다릅니다: ${options.output}`);
+      for (const conflict of compat.conflicts) log(`  - ${conflict}`);
+      log("");
+      log("다른 실험의 결과를 같은 디렉터리에 섞지 않습니다. --output에 새 디렉터리를 지정하세요.");
+      return 3;
+    }
+    if (compat.budgetBelowSpent) {
+      log(
+        `승인 상한 $${options.maxCostUsd}가 이미 쓴 금액 $${spentSoFar.toFixed(4)} 이하입니다 — ` +
+          `새 호출을 할 수 없으므로 여기서 멈춥니다.`
+      );
+      return 2;
+    }
+    if (compat.budgetRaised && options.maxCostUsd !== undefined) {
+      log(`예산 상한을 올렸습니다 — 새 사용자 승인으로 기록합니다: $${options.maxCostUsd}`);
+      writeMeta(options.output, withApproval(existingMeta, options.maxCostUsd, now, "상한 상향"));
+    }
+    log(`기존 기록 ${store.count()}건을 이어받습니다 (${recordsPath})`);
+  } else {
+    writeMeta(options.output, {
+      metaVersion: META_VERSION,
+      ...incomingMeta,
+      approvals:
+        options.maxCostUsd !== undefined
+          ? [{ approvedLimitUsd: options.maxCostUsd, at: now, note: "최초 승인" }]
+          : [],
+      createdAt: now,
+    });
+  }
+
+  // ---- 예산 ledger ----
+  // 유료 실행에서만 만든다. fake는 단가 0이므로 예약이 의미가 없다.
+  const ledger = !usingFake && options.maxCostUsd !== undefined ? createBudgetLedger(options.maxCostUsd) : undefined;
+  const estimateRecordCostUsd = ((): ((arm: ArmId) => { maxUsd: number; basis: string } | undefined) | undefined => {
+    if (!ledger || !isModelPlan(models)) return undefined;
+    const executorEntry = lookupModel(models.executor.modelId);
+    const reviewerEntry = lookupModel(models.reviewer.modelId);
+    return (arm: ArmId) => {
+      const spec = ARMS.find((a) => a.arm === arm);
+      if (!spec || !executorEntry) return undefined;
+      // Arm B는 anthropic이 executor 자리다.
+      const actingExecutor = spec.providers[0] === "anthropic" ? reviewerEntry : executorEntry;
+      if (!actingExecutor) return undefined;
+      const estimate = estimateRecordCost(
+        actingExecutor,
+        reviewerEntry,
+        maxCallsPerRecord(arm, spec.providers.length)
+      );
+      return estimate === undefined ? undefined : { maxUsd: estimate.maxUsd, basis: estimate.basis };
+    };
+  })();
+
+  if (ledger) {
+    log(`예산 ledger: 승인 상한 $${ledger.approvedLimitUsd} / 이미 쓴 금액 $${spentSoFar.toFixed(4)}`);
+    log("각 기록의 최대 비용을 **호출 전에 예약**합니다. 예약할 수 없으면 호출하지 않습니다.");
+    log("");
+  }
 
   if (isPilot) {
     log("**Pilot 실행** — 하네스·fixture·비용·실패 분류를 확인합니다.");
@@ -265,6 +326,9 @@ async function main(): Promise<number> {
     store,
     runId,
     ...(options.maxCostUsd !== undefined ? { maxCostUsd: options.maxCostUsd } : {}),
+    ...(ledger ? { ledger } : {}),
+    ...(estimateRecordCostUsd ? { estimateRecordCostUsd } : {}),
+    realProvider: !usingFake,
     ...(options.executorModel ? { executorModel: options.executorModel } : {}),
     ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
     onProgress: log,
@@ -273,15 +337,27 @@ async function main(): Promise<number> {
   log("");
   log(`실행 ${result.executed}건 / 재개로 건너뜀 ${result.skippedResume}건 / 계획 ${result.planned}건`);
   log(`누적 비용: $${result.spentUsd.toFixed(4)}`);
+  if (ledger) {
+    const snapshot = ledger.snapshot();
+    log(
+      `ledger: 확정 $${snapshot.committedUsd.toFixed(4)} / 예약 $${snapshot.reservedUsd.toFixed(4)} / ` +
+        `남음 $${snapshot.availableUsd.toFixed(4)} (예약 ${snapshot.reservationsOpened}건, ` +
+        `정산 ${snapshot.reservationsSettled}건, 해제 ${snapshot.reservationsReleased}건)`
+    );
+  }
   if (result.budgetExhausted) {
     log("**예산 상한에 도달해 중단했습니다.** 지금까지의 결과는 저장되었고 판정은 INCONCLUSIVE입니다.");
   }
+  if (result.unmeasurableCostAbort) {
+    log("**비용을 확인할 수 없어 중단했습니다.** 예산 상한을 강제할 수 없는 상태로는 유료 호출을 계속하지 않습니다.");
+  }
+  if (result.abortReason) log(`중단 사유: ${result.abortReason}`);
 
   return finalizeAndReport(store.all(), options, runId, true);
 }
 
 async function reportOnly(options: CliOptions): Promise<number> {
-  const store = openRecordStore(path.join(options.output, "records.jsonl"));
+  const store = openRecordStore(runDirPaths(options.output).records);
   if (store.count() === 0) {
     log("기록이 없습니다. 먼저 pilot 또는 run을 실행하세요.");
     return 1;

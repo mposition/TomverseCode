@@ -26,6 +26,8 @@
     "gate:g:test": "npm run test --workspace=@tomverse/hypothesis-gate",
     "gate:g:validate": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js validate",
     "gate:g:dry-run": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js dry-run",
+    "//gate:g:plan-pilot": "유료 실행 전 승인 카드. **실제 API를 부르지 않는다.**",
+    "gate:g:plan-pilot": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js plan-pilot",
     "gate:g:pilot": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js pilot",
     "gate:g:run": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js run",
     "gate:g:report": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js report"

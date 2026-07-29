@@ -101,6 +101,12 @@ export const INFRA_FAILURE_CLASSES = [
    * 잘못된 결론이 나온다.
    */
   "toolchain_unavailable",
+  /**
+   * 실제 응답에 usage가 없거나 모델 단가를 몰라 비용을 계산할 수 없었다.
+   * **모델 실패가 아니다** — 예산 상한을 강제할 수 없다는 하네스/설정 문제이며,
+   * 이 값이 나오면 남은 유료 호출을 중단한다.
+   */
+  "cost_unmeasurable",
 ] as const;
 
 export type ModelFailureClass = (typeof MODEL_FAILURE_CLASSES)[number];

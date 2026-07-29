@@ -24,5 +24,18 @@
     "@tomverse/toolchain": "*",
     "@types/node": "^24.9.0",
     "typescript": "^5.9.3"
+  },
+  "types": "./dist/src/index.d.ts",
+  "//exports": "예산 ledger는 제품 코드다. 가설 게이트가 이걸 가져다 쓴다 — 측정 도구에만 두면 제품의 유료 호출 경로에는 같은 보호가 없게 된다.",
+  "exports": {
+    ".": "./dist/src/index.js",
+    "./budget": {
+      "types": "./dist/src/budget/ledger.d.ts",
+      "default": "./dist/src/budget/ledger.js"
+    },
+    "./registry": {
+      "types": "./dist/src/routing/registry.d.ts",
+      "default": "./dist/src/routing/registry.js"
+    }
   }
 }

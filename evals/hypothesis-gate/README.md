@@ -76,16 +76,60 @@ TypeScript fixture 20개는 MSVC 없이도 그대로 검증된다.
 npm run gate:g:test       # 하네스 자동 테스트 (실제 API 없음, npm test에도 포함된다)
 npm run gate:g:validate   # fixture 품질 검증 (모델 호출 없음)
 npm run gate:g:dry-run    # preflight + 실행 계획만
+npm run gate:g:plan-pilot # **유료 실행 승인 카드** (실제 API 호출 0건)
 npm run gate:g:pilot      # 반복 1회. 하네스·비용·실패 분류 확인용. PASS를 내지 않는다
 npm run gate:g:run        # confirmatory (기본 반복 3회)
 npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 ```
 
 옵션: `--fixtures a,b` `--arms A,B,C,D` `--repetitions N` `--seed N`
-`--max-cost-usd N` `--max-concurrency N` `--resume` `--output <dir>`
+`--max-cost-usd N` `--max-concurrency 1` `--resume` `--output <run-dir>`
 `--executor-model <id>` `--reviewer-model <id>`
 
 종료 코드: `0`=PASS, `1`=FAIL, `2`=INCONCLUSIVE, `3`=하네스 오류, `4`=툴체인 미준비.
+
+## 유료 실행 안전장치
+
+실제 공급자를 쓰는 실험은 시작하면 되돌릴 수 없다. 그래서 돈이 나가기 전에 막는다.
+
+**`--max-cost-usd`는 유료 `pilot`/`run`에 필수다.** 우회 옵션은 없다. fake provider와
+`dry-run`은 면제된다(단가 0이거나 아예 호출하지 않으므로). `0`·음수·`NaN`·`Infinity`·
+`5달러` 같은 값은 **파싱 단계에서** 거부된다 — API를 부른 뒤에 알면 늦다.
+
+**비용은 호출 전에 예약한다.** 예전에는 기록이 끝난 뒤 누적 비용을 검사했는데, 그러면
+마지막 한 건의 비용만큼 상한을 넘길 수 있었다. 이제 각 기록의 보수적 최대 비용을 먼저
+예약하고, 예약할 수 없으면 **호출하지 않는다.** 완료 후 실제 usage로 정산하고, 오류·취소·
+타임아웃이면 예약을 해제한다. ledger 구현은 제품 코드(`@tomverse/sidecar/budget`)에 있다 —
+측정 도구에만 두면 제품의 유료 호출 경로에는 같은 보호가 없게 되기 때문이다.
+
+**비용을 잴 수 없으면 경고가 아니라 중단이다.** 실제 응답에 usage가 없거나 모델 단가를
+모르면 그 기록을 `cost_unmeasurable` 인프라 실패로 남기고 **남은 유료 호출을 멈춘다.**
+비용을 0으로 대체하지 않는다 — 0은 fake에만 참이고, 모르는 것을 0으로 적으면 예산 상한이
+아무것도 막지 못한다.
+
+**`--max-concurrency`는 1만 받는다.** 판정 기준의 p95 지연 비교가 순차 실행을 전제하기
+때문이다. 예전에는 1보다 큰 값을 받아 경고만 하고 실제로는 무시했는데, 그건 CLI가 거짓
+계약을 내건 것이다. 병렬 실행은 별도 protocol 버전에서 다룬다.
+
+## 실행 디렉터리와 재개
+
+`--output <dir>`는 **하나의 실험 실행 디렉터리**다.
+
+```
+<run-dir>/
+  run.json        메타데이터 — 무엇을 어떤 조건으로 돌렸는가
+  records.jsonl   실행 기록 (최초 실행과 재개가 같은 파일을 쓴다)
+  report.md, summary.json, ...
+```
+
+예전에는 최초 실행이 `<uuid>.jsonl`에, 재개가 `records.jsonl`에 붙어서 **중단 후
+`--resume`만 추가하면 처음부터 다시 돌았다.** 몇 시간과 실제 돈이 든 기록을 못 찾는 것이므로
+편의 문제가 아니라 사고였다.
+
+재개할 때 stage·protocol version·criteria hash·fixture hash·arm·seed·모델 ID 중 하나라도
+다르면 **거부한다.** 다른 조건의 기록을 한 파일에 섞으면 집계가 조용히 틀린다.
+예산은 낮춰서 재개할 수 있지만 이미 쓴 금액보다 낮으면 즉시 중단하고, 올리면 새 사용자
+승인으로 `run.json`에 기록된다. P0와 P1은 **다른 디렉터리**를 쓴다.
 
 ## 사전 등록된 판정 기준
 
@@ -142,5 +186,12 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 **하네스: 완료.** fixture 24개가 검증을 통과하고, 실제 `tomverse-host`로 도는 자동 테스트가
 전부 통과한다.
 
+**유료 실행 안전장치: 완료.** 비용 상한 강제, 호출 전 예약, 측정 불가 시 중단, 순차 실행
+계약, 실행 디렉터리 기반 재개, 모델 가용성·가격 검증, 승인 카드가 모두 들어갔다.
+
 **실제 가설 판정: INCONCLUSIVE — API 실험 미실행.** 이 저장소에는 OpenAI/Anthropic 자격증명이
 없으므로 pilot도 confirmatory도 돌리지 않았다. 성공률과 비용을 지어내지 않는다.
+
+다음 단계는 `npm run gate:g:plan-pilot -- --max-cost-usd <금액> --output <dir>`로 승인 카드를
+만들어 사용자가 승인하는 것이다. 카드에는 계획 기록 수, 최대 호출 수, 보수적 최대 비용,
+중단 조건이 들어가고 **실제 API 호출은 0건**이다.
