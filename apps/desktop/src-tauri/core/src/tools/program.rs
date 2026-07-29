@@ -300,17 +300,32 @@ pub fn find_executable(program: &str, env: &ResolveEnv<'_>) -> Option<PathBuf> {
     None
 }
 
-/// 한 후보 경로에 대해 그대로 / PATHEXT를 붙여 존재를 확인한다.
+/// 한 후보 경로에 대해 실행 가능한 파일을 찾는다.
+///
+/// # Windows에서 확장자 없는 파일을 집으면 안 된다
+///
+/// Node의 Windows 설치 디렉터리에는 `npm.cmd` **옆에 확장자 없는 `npm`**이 함께 있다
+/// (Git Bash/MSYS용 셸 스크립트다). 확장자 없는 후보를 먼저 확인하면 그걸 집게 되고,
+/// 실측으로 이렇게 실패했다:
+///
+/// ```text
+/// npm는 셸 없이 실행할 수 없는 형식입니다 (.): D:\Program Files\nodejs\npm
+/// ```
+///
+/// Windows에서 실행 파일 판정은 **PATHEXT가 한다.** 확장자 없는 파일은 어떤 PATHEXT 항목과도
+/// 맞지 않으므로 실행 파일이 아니다 — `cmd`도 CreateProcess도 그렇게 해석한다. 그러니 이름에
+/// 확장자가 없으면 PATHEXT를 붙인 것만 후보로 본다.
 fn probe(candidate: &str, requested: &str, env: &ResolveEnv<'_>) -> Option<PathBuf> {
-    if (env.is_file)(Path::new(candidate)) {
-        return Some(PathBuf::from(candidate));
-    }
+    let exists = |path: &str| (env.is_file)(Path::new(path));
+
     if env.platform != Platform::Windows {
-        return None;
+        // POSIX에는 PATHEXT가 없다. 파일이 곧 실행 대상이다.
+        return exists(candidate).then(|| PathBuf::from(candidate));
     }
-    // 이미 확장자를 갖고 있으면 덧붙이지 않는다 — `npm.cmd.exe`를 찾으려 들면 안 된다.
+
+    // 이미 확장자를 갖고 있으면 그대로만 본다 — `npm.cmd.exe`를 찾으려 들면 안 된다.
     if !extension_of(requested).is_empty() {
-        return None;
+        return exists(candidate).then(|| PathBuf::from(candidate));
     }
 
     let raw = if env.pathext.trim().is_empty() {
@@ -337,7 +352,7 @@ fn probe(candidate: &str, requested: &str, env: &ResolveEnv<'_>) -> Option<PathB
                 continue;
             }
             let with_ext = format!("{candidate}{cased}");
-            if (env.is_file)(Path::new(&with_ext)) {
+            if exists(&with_ext) {
                 return Some(PathBuf::from(with_ext));
             }
         }
@@ -384,8 +399,10 @@ mod tests {
 
     impl Fs {
         fn new(files: &[&str]) -> Self {
+            // 양쪽 구분자를 같은 형태로 맞춘다. 이 하네스는 Windows 경로와 POSIX 경로를
+            // 모두 담으므로, 조회할 때만 정규화하면 POSIX 항목이 영영 매치되지 않는다.
             Self {
-                files: files.iter().map(|f| f.to_string()).collect(),
+                files: files.iter().map(|f| f.replace('/', "\\")).collect(),
             }
         }
         fn probe(&self) -> impl Fn(&Path) -> bool + '_ {
@@ -394,10 +411,16 @@ mod tests {
     }
 
     /// 전형적인 Windows Node 설치.
+    ///
+    /// **확장자 없는 `npm`/`npx`가 `.cmd` 옆에 실제로 존재한다.** Node 인스톨러가 Git Bash/MSYS용
+    /// 셸 스크립트를 함께 깔기 때문이다. 실측에서 해석기가 이걸 집어 실패했으므로, fixture가
+    /// 실제 설치를 그대로 흉내내지 않으면 그 결함을 다시 놓친다.
     fn node_install() -> Fs {
         Fs::new(&[
             r"C:\Program Files\nodejs\node.exe",
+            r"C:\Program Files\nodejs\npm",
             r"C:\Program Files\nodejs\npm.cmd",
+            r"C:\Program Files\nodejs\npx",
             r"C:\Program Files\nodejs\npx.cmd",
             r"C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js",
             r"C:\Program Files\nodejs\node_modules\npm\bin\npx-cli.js",
@@ -508,6 +531,59 @@ mod tests {
         // 논리적 요청은 보존된다.
         assert_eq!(resolved.requested_program, "npm");
         assert_eq!(resolved.requested_args, args(&["test", "--silent"]));
+    }
+
+    /// 실측 결함: Node 인스톨러가 `npm.cmd` 옆에 확장자 없는 `npm`(Git Bash용 셸 스크립트)을
+    /// 함께 깐다. 확장자 없는 후보를 먼저 확인하면 그걸 집고, Windows에서는 실행할 수 없다.
+    #[test]
+    fn windows_ignores_the_extensionless_unix_shim_next_to_npm_cmd() {
+        let fs = node_install();
+        let env = win_env(&fs, "");
+        let resolved = resolve_program("npm", &args(&["test"]), &env).unwrap();
+
+        assert_eq!(
+            resolved.shim_path,
+            Some(PathBuf::from(r"C:\Program Files\nodejs\npm.cmd")),
+            "확장자 없는 Unix 셸 스크립트를 집었습니다"
+        );
+        assert_eq!(resolved.kind, ResolutionKind::NodeCliShim);
+    }
+
+    #[test]
+    fn windows_never_resolves_to_an_extensionless_file() {
+        // PATHEXT에 맞지 않는 파일은 Windows에서 실행 파일이 아니다. 어떤 이름으로도
+        // 확장자 없는 결과가 나오면 안 된다 — 나오면 spawn 단계에서 정체불명으로 실패한다.
+        let fs = Fs::new(&[r"C:\tools\thing", r"C:\tools\other"]);
+        let env = ResolveEnv {
+            platform: Platform::Windows,
+            path: r"C:\tools",
+            pathext: "",
+            is_file: Box::leak(Box::new(fs.probe())),
+        };
+        for program in ["thing", "other"] {
+            let error =
+                resolve_program(program, &args(&[]), &env).expect_err("확장자 없는 파일이 실행 대상이 되었습니다");
+            assert!(error.message.contains("PATH에서 찾지 못했습니다"), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn non_windows_still_accepts_extensionless_executables() {
+        // POSIX에는 PATHEXT가 없다. 위 규칙을 그쪽까지 적용하면 모든 명령이 깨진다.
+        let fs = Fs::new(&["/usr/bin/npm"]);
+        let probe = fs.probe();
+        let env = ResolveEnv {
+            platform: Platform::Unix,
+            path: "/usr/bin",
+            pathext: "",
+            is_file: &probe,
+        };
+        // Unix 분기는 PATH를 뒤지지 않고 요청을 그대로 통과시킨다.
+        let resolved = resolve_program("npm", &args(&["test"]), &env).unwrap();
+        assert_eq!(resolved.kind, ResolutionKind::Passthrough);
+        assert_eq!(resolved.executable, PathBuf::from("npm"));
+        // find_executable 자체도 확장자 없는 파일을 찾아야 한다.
+        assert_eq!(find_executable("npm", &env), Some(PathBuf::from("/usr/bin/npm")));
     }
 
     // ---- 4. npm.cmd와 절대 경로 npm.cmd ----
