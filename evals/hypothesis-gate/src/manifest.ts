@@ -214,8 +214,19 @@ function relativeFiles(dir: string, prefix = ""): string[] {
   return out;
 }
 
+/**
+ * fixture 목록.
+ *
+ * **디렉터리가 없으면 빈 배열이 아니라 예외다.** 예전에는 `[]`를 돌려줬는데, 그러면 경로가
+ * 잘못됐을 때 "fixture 0개"로 조용히 진행하고 그 위의 검사들이 빈 집합에 대해 통과해 버린다.
+ * 실측으로 이렇게 걸렸다 — Windows에서 `new URL(import.meta.url).pathname`이
+ * `/C:/...`를 주는 바람에 fixture 경로가 깨졌고, 테스트 5개가 서로 무관해 보이는 실패로
+ * 나타났다. 존재하지 않는 경로와 비어 있는 디렉터리는 다른 사실이므로 다르게 보고한다.
+ */
 export function listFixtureIds(fixturesRoot: string): string[] {
-  if (!existsSync(fixturesRoot)) return [];
+  if (!existsSync(fixturesRoot)) {
+    throw new Error(`fixture 디렉터리가 없습니다: ${fixturesRoot}`);
+  }
   return readdirSync(fixturesRoot, { withFileTypes: true })
     .filter((e) => e.isDirectory() && !e.name.startsWith("."))
     .map((e) => e.name)
