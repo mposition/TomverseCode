@@ -78,9 +78,16 @@ function fsOf(files: readonly string[]): (p: string) => boolean {
   return (p) => set.has(p.replace(/\//g, "\\"));
 }
 
+/**
+ * 실제 Windows Node 설치 — **확장자 없는 `npm`/`npx`가 `.cmd` 옆에 함께 있다.**
+ * Node 인스톨러가 Git Bash/MSYS용 셸 스크립트를 같이 깔기 때문이고, 실측에서 해석기가
+ * 이걸 집어 실패했다. fixture가 실제 설치를 그대로 흉내내지 않으면 그 결함을 다시 놓친다.
+ */
 const NODE_INSTALL = [
   "C:\\Program Files\\nodejs\\node.exe",
+  "C:\\Program Files\\nodejs\\npm",
   "C:\\Program Files\\nodejs\\npm.cmd",
+  "C:\\Program Files\\nodejs\\npx",
   "C:\\Program Files\\nodejs\\npx.cmd",
   "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js",
   "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js",
@@ -141,6 +148,43 @@ test("알려지지 않은 배치 shim은 실행 대상이 되지 않는다", () 
   assert.equal(resolved.ok, false);
   if (resolved.ok) return;
   assert.ok(resolved.message.includes("알려지지 않은"), resolved.message);
+});
+
+test("Windows에서 .cmd 옆의 확장자 없는 Unix shim을 집지 않는다", () => {
+  // Windows의 실행 파일 판정은 PATHEXT가 한다. 확장자 없는 파일은 실행 파일이 아니다.
+  const found = findExecutable("npm", {
+    platform: "win32",
+    pathValue: WIN_PATH,
+    isFile: fsOf(NODE_INSTALL),
+  });
+  assert.equal(found, "C:\\Program Files\\nodejs\\npm.cmd", `확장자 없는 파일을 집었습니다: ${found}`);
+
+  const resolved = resolveNodeCli("npm", ["test"], {
+    platform: "win32",
+    pathValue: WIN_PATH,
+    isFile: fsOf(NODE_INSTALL),
+  });
+  assert.equal(resolved.ok, true);
+  if (resolved.ok) assert.equal(resolved.kind, "node-cli");
+});
+
+test("Windows에서 확장자 없는 파일은 아예 후보가 되지 않는다", () => {
+  const found = findExecutable("thing", {
+    platform: "win32",
+    pathValue: "C:\\tools",
+    isFile: fsOf(["C:\\tools\\thing"]),
+  });
+  assert.equal(found, undefined, `확장자 없는 파일을 실행 대상으로 골랐습니다: ${found}`);
+});
+
+test("비 Windows에서는 확장자 없는 실행 파일이 정상이다", () => {
+  // POSIX에는 PATHEXT가 없다. 위 규칙을 그쪽까지 적용하면 모든 명령이 깨진다.
+  const found = findExecutable("npm", {
+    platform: "linux",
+    pathValue: "/usr/bin",
+    isFile: (p) => p === "/usr/bin/npm",
+  });
+  assert.equal(found, "/usr/bin/npm");
 });
 
 test("PATHEXT를 지정하지 않으면 기본 목록을 쓴다", () => {

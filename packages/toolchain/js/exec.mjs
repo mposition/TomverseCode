@@ -367,12 +367,22 @@ export function findExecutable(program, env) {
         .map((e) => (e.startsWith(".") ? e : `.${e}`))
     : [];
 
-  /** @param {string} candidate */
+  /**
+   * # Windows에서 확장자 없는 파일을 집으면 안 된다
+   *
+   * Node의 Windows 설치 디렉터리에는 `npm.cmd` **옆에 확장자 없는 `npm`**이 함께 있다
+   * (Git Bash/MSYS용 셸 스크립트다). 확장자 없는 후보를 먼저 확인하면 그걸 집게 되고,
+   * Windows에서는 실행할 수 없어 spawn이 그대로 실패한다 — 실측으로 확인했다.
+   *
+   * Windows의 실행 파일 판정은 **PATHEXT가 한다.** 확장자 없는 파일은 어떤 항목과도 맞지
+   * 않으므로 실행 파일이 아니다. POSIX에는 PATHEXT가 없으므로 그쪽은 파일이 곧 실행 대상이다.
+   *
+   * @param {string} candidate
+   */
   const probe = (candidate) => {
-    if (isFile(candidate)) return candidate;
-    if (!windows) return undefined;
-    // 확장자를 이미 갖고 있으면 덧붙이지 않는다 — `npm.cmd.exe`를 찾으려 들면 안 된다.
-    if (programExtension(program).length > 0) return undefined;
+    if (!windows) return isFile(candidate) ? candidate : undefined;
+    // 확장자를 이미 갖고 있으면 그대로만 본다 — `npm.cmd.exe`를 찾으려 들면 안 된다.
+    if (programExtension(program).length > 0) return isFile(candidate) ? candidate : undefined;
     for (const ext of extensions) {
       // PATHEXT는 대문자로 오는 것이 보통이지만 파일은 소문자다. 둘 다 시도한다 —
       // 대소문자 비구분 파일 시스템에서는 첫 시도가 맞고, 아니면 두 번째가 맞는다.

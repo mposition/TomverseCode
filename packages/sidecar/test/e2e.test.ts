@@ -193,6 +193,20 @@ function runFixtureTests(cwd: string): { status: number | null; stdout: string; 
     env,
     shell: false,
   });
+  // **spawn 실패를 "테스트 실패"로 넘기지 않는다.**
+  // `status`는 프로세스가 뜨지 못하면 null이다. 그런데 "픽스처가 실패한다"는 전제 검사는
+  // `status !== 0`을 보므로, npm을 아예 실행하지 못해도 통과해 버린다 — 실측으로 그렇게
+  // 거짓 통과했다. 실행 자체가 안 된 것은 전제 검사 결과가 아니라 환경 결함이다.
+  if (result.error !== undefined || result.status === null) {
+    assert.fail(
+      [
+        `픽스처 테스트를 실행하지 못했습니다 (전제 검사가 성립하지 않습니다).`,
+        `  실행 대상: ${resolved.executable}`,
+        `  인자: ${JSON.stringify(resolved.args)}`,
+        `  오류: ${result.error?.message ?? "종료 코드 없음"}`,
+      ].join("\n")
+    );
+  }
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
