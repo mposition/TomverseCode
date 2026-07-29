@@ -66,6 +66,28 @@ export function msvcEnvScriptPath(repoRoot) {
 }
 
 /**
+ * 배치를 돌릴 셸의 **절대 경로**.
+ *
+ * `"cmd.exe"`라는 이름으로 spawn하면 PATH에 System32가 있어야 한다. 보통은 있지만 PATH를
+ * 좁혀 놓은 환경에서는 `spawnSync cmd.exe ENOENT`가 나고, 그 증상은 "MSVC 준비 실패"로
+ * 보고되어 **원인에서 멀다.** cmd.exe 위치는 Windows가 `%ComSpec%`로 알려주는 값이므로
+ * 굳이 PATH에 의존할 이유가 없다.
+ *
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {string}
+ */
+export function shellExecutablePath(env = process.env) {
+  const comspec = env.ComSpec ?? env.COMSPEC ?? env.comspec;
+  if (comspec !== undefined && comspec.trim().length > 0) return comspec;
+  const systemRoot = env.SystemRoot ?? env.SYSTEMROOT ?? env.systemroot;
+  if (systemRoot !== undefined && systemRoot.trim().length > 0) {
+    return `${systemRoot.replace(/[\\/]+$/, "")}\\System32\\cmd.exe`;
+  }
+  // 둘 다 없으면 이름으로 시도한다 — 여기까지 오면 환경이 이미 비정상이다.
+  return "cmd.exe";
+}
+
+/**
  * 실제 실행기. 테스트는 자체 runner를 주입한다 — Linux에서도 Windows 분기를 검증할 수 있어야 한다.
  * @type {(program: string, args: readonly string[]) => { status: number | null, stdout: string, stderr: string }}
  */
@@ -208,9 +230,10 @@ export function prepareMsvcEnv(repoRoot, platform, runner = defaultRunner, optio
   if (useCache && cached?.key === key) return cached.result;
 
   const script = msvcEnvScriptPath(repoRoot);
-  // `cmd.exe /d /c <script>` — /d는 AutoRun 레지스트리 스크립트를 건너뛴다(재현성).
+  // `<cmd.exe> /d /c <script>` — /d는 AutoRun 레지스트리 스크립트를 건너뛴다(재현성).
   // 프로그램·플래그·스크립트 경로 셋 다 우리가 만든 값이며 사용자 입력이 섞이지 않는다.
-  const outcome = runner("cmd.exe", ["/d", "/c", script]);
+  // 셸 경로는 PATH가 아니라 %ComSpec%에서 얻는다 — 이유는 shellExecutablePath 참조.
+  const outcome = runner(shellExecutablePath(), ["/d", "/c", script]);
   const result = interpretMsvcOutcome(outcome, script);
 
   if (useCache) cached = { key, result };
@@ -227,13 +250,30 @@ export function clearMsvcCache() {
  *
  * 준비되지 않았거나 불필요하면 **원본을 그대로 돌려준다** — 조용히 절반만 적용하지 않는다.
  *
+ * # 왜 단순 스프레드가 아닌가
+ *
+ * Windows 환경변수는 **대소문자를 구별하지 않는다.** `process.env`를 평범한 객체로 펼치면
+ * 키가 Windows가 준 철자 그대로(보통 `Path`) 들어오는데, 여기에 `PATH`를 대입하면
+ * **두 키가 모두** 자식에게 전달된다. 어느 쪽이 이길지는 정해져 있지 않고, 지면 방금 준비한
+ * MSVC 경로가 통째로 무시되어 다시 링크 단계에서 실패한다.
+ *
+ * 그래서 대소문자만 다른 기존 키를 지우고 대입한다. Linux에서는 이 루프가 아무것도 하지 않는다
+ * (거기서는 정말로 서로 다른 변수이므로 지우면 안 되고, 실제로 겹칠 일도 없다).
+ *
  * @param {Record<string, string | undefined>} base
  * @param {import("./exec.d.mts").MsvcResult} result
  * @returns {Record<string, string | undefined>}
  */
 export function withMsvcEnv(base, result) {
   if (result.kind !== "ready") return base;
-  return { ...base, ...result.env };
+  const merged = { ...base };
+  for (const [key, value] of Object.entries(result.env)) {
+    for (const existing of Object.keys(merged)) {
+      if (existing !== key && existing.toLowerCase() === key.toLowerCase()) delete merged[existing];
+    }
+    merged[key] = value;
+  }
+  return merged;
 }
 
 /**

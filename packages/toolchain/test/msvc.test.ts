@@ -9,6 +9,7 @@ import {
   needsNativeToolchain,
   parseMsvcEnv,
   prepareMsvcEnv,
+  shellExecutablePath,
   withMsvcEnv,
   type ScriptRunner,
 } from "../src/msvc.js";
@@ -71,12 +72,28 @@ test("고정된 프로그램과 argv로만 실행한다 (셸 문자열 조합 �
   };
   prepareMsvcEnv(REPO, "win32", runner, { useCache: false });
 
-  assert.equal(seen?.program, "cmd.exe");
+  // 프로그램은 cmd.exe이되 경로는 %ComSpec%에서 온다 — PATH에 System32가 없는 환경에서
+  // `spawnSync cmd.exe ENOENT`가 나고, 그 증상이 "MSVC 준비 실패"로 보고되면 원인에서 멀다.
+  assert.ok(seen !== undefined);
+  assert.equal(seen!.program.split(/[\\/]/).pop()!.toLowerCase(), "cmd.exe");
   assert.deepEqual(seen?.args, ["/d", "/c", SCRIPT]);
   // 인자에 셸 메타문자가 없어야 한다 — 있으면 셸 조합을 하고 있다는 뜻이다.
   for (const arg of seen!.args) {
     assert.ok(!/[&|;><]/.test(arg), `argv에 셸 메타문자가 있습니다: ${arg}`);
   }
+});
+
+test("셸 경로는 PATH가 아니라 %ComSpec%에서 얻는다", () => {
+  assert.equal(shellExecutablePath({ ComSpec: "C:\\Windows\\System32\\cmd.exe" }), "C:\\Windows\\System32\\cmd.exe");
+  // 대소문자 변형도 받는다 — Windows가 어느 철자로 줄지 보장되지 않는다.
+  assert.equal(shellExecutablePath({ COMSPEC: "D:\\alt\\cmd.exe" }), "D:\\alt\\cmd.exe");
+  // ComSpec이 없으면 SystemRoot로 조립한다.
+  assert.equal(shellExecutablePath({ SystemRoot: "C:\\Windows" }), "C:\\Windows\\System32\\cmd.exe");
+  assert.equal(shellExecutablePath({ SystemRoot: "C:\\Windows\\" }), "C:\\Windows\\System32\\cmd.exe");
+  // 둘 다 없으면 이름으로 시도한다 — 여기까지 오면 환경이 이미 비정상이다.
+  assert.equal(shellExecutablePath({}), "cmd.exe");
+  // 빈 값은 설정되지 않은 것으로 본다.
+  assert.equal(shellExecutablePath({ ComSpec: "   ", SystemRoot: "C:\\Windows" }), "C:\\Windows\\System32\\cmd.exe");
 });
 
 // ---- 회귀 4: _env.bat 실패 코드 보존 ----
@@ -221,6 +238,20 @@ test("환경 병합은 준비된 경우에만 일어난다", () => {
   assert.equal(merged.EXISTING, "1", "기존 변수를 잃었습니다");
   assert.equal(merged.PATH, "C:\\vs");
   assert.equal(merged.LIB, "C:\\lib");
+});
+
+test("대소문자만 다른 기존 키를 남기지 않는다", () => {
+  // Windows의 process.env는 `Path`로 온다. 여기에 `PATH`를 그냥 더하면 **두 키가 모두**
+  // 자식에게 전달되고, 어느 쪽이 이길지 정해져 있지 않다. 지면 방금 준비한 MSVC 경로가
+  // 통째로 무시되어 다시 링크에서 실패한다 — 실측으로 자식이 System32를 잃는 것을 확인했다.
+  const base = { Path: "C:\\old", ComSpec: "C:\\Windows\\System32\\cmd.exe" };
+  const merged = withMsvcEnv(base, { kind: "ready", env: { PATH: "C:\\vs", INCLUDE: "C:\\i" } });
+
+  const pathKeys = Object.keys(merged).filter((k) => k.toLowerCase() === "path");
+  assert.deepEqual(pathKeys, ["PATH"], `PATH 계열 키가 여럿입니다: ${pathKeys.join(", ")}`);
+  assert.equal(merged.PATH, "C:\\vs");
+  // 무관한 변수는 그대로 남는다.
+  assert.equal(merged.ComSpec, "C:\\Windows\\System32\\cmd.exe");
 });
 
 // ---- 회귀 6: 툴체인 실패와 모델/API 실패의 구별 ----

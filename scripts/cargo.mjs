@@ -52,6 +52,8 @@ if (msvc.kind === "unavailable") {
   process.exit(msvc.exitCode === 0 ? 1 : Math.abs(msvc.exitCode) || 1);
 }
 
+// withMsvcEnv가 대소문자만 다른 중복 키(`Path`와 `PATH`)를 남기지 않는다 — Windows에서
+// 둘 다 넘기면 어느 쪽이 이길지 정해져 있지 않고, 지면 방금 준비한 MSVC 경로가 무시된다.
 const env = withMsvcEnv({ ...process.env }, msvc);
 
 // cargo를 **절대 경로로** 찾아 spawn한다.
@@ -59,10 +61,12 @@ const env = withMsvcEnv({ ...process.env }, msvc);
 // 왜 `spawnSync("cargo", ...)`로 충분하지 않은가: POSIX에서 Node의 spawn은 자식에게 넘긴
 // env가 아니라 **부모 프로세스의** PATH로 실행 파일을 찾는다. 방금 병합한 PATH에만 cargo가
 // 있는 상황(예: `_env.bat`이 `%USERPROFILE%\.cargo\bin`을 붙인 경우)에서 조용히 못 찾는다.
+// Windows는 `Path`, POSIX는 `PATH`로 오므로 둘 다 본다.
+const pathValue = env.PATH ?? env.Path ?? "";
 const executable = findExecutable("cargo", {
   platform: process.platform,
-  pathValue: env.PATH ?? env.Path ?? "",
-  pathext: env.PATHEXT,
+  pathValue,
+  pathext: env.PATHEXT ?? env.Pathext,
 });
 
 if (executable === undefined) {
