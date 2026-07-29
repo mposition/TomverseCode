@@ -206,6 +206,12 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
   `Path::new(r"C:\a\b").parent()`는 `""`를, `path.join("C:\\a", "b")`는 `C:\a/b`를 준다.
   Windows 분기를 Linux에서 검증하려면 경로 조작을 **대상 플랫폼 기준으로** 해야 한다
   (`path.win32` / 문자열 직접 처리). 이걸 안 해서 `.exe` 결함이 살아남았다.
+- **`new URL(import.meta.url).pathname`은 Windows에서 깨진다.** 드라이브 문자 앞에 슬래시가
+  붙어 `/C:/Users/...`가 되고, `path.resolve`가 그걸 이어붙이면 존재하지 않는 경로가 된다.
+  **`fileURLToPath`만 쓸 것** — 플랫폼별 규칙을 아는 유일한 변환이다. 증상이 고약한 이유는
+  경로가 깨지면 fixture/파일 목록이 **조용히 0개**가 되어 그 위의 검사들이 빈 집합에 대해
+  통과하거나 원인과 먼 실패를 내기 때문이다. 그래서 `listFixtureIds`는 디렉터리가 없으면
+  빈 배열이 아니라 예외를 던진다 — "없는 경로"와 "빈 디렉터리"는 다른 사실이다.
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트

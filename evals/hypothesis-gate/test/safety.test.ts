@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createBudgetLedger, maxCallCostUsd, pricingIsUsable, validateApprovedLimit } from "@tomverse/sidecar/budget";
 import type { ModelEntry } from "@tomverse/protocol";
 import { criteriaHash, CRITERIA } from "../src/criteria.js";
@@ -24,7 +25,25 @@ import type { GateRunRecord } from "../src/types.js";
  * 만들면 `npm test`가 돈을 쓰게 되고, 그건 이 파일이 막으려는 것과 같은 종류의 사고다.
  */
 
-const FIXTURES_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..", "fixtures");
+/**
+ * **`new URL(import.meta.url).pathname`을 쓰지 않는다.** Windows에서는 드라이브 문자 앞에
+ * 슬래시가 붙어(`/C:/Users/...`) 경로가 깨진다. 그러면 fixture가 0개가 되고, 이 파일의
+ * 검사들이 빈 집합에 대해 통과하거나 서로 무관해 보이는 실패로 나타난다 — 실측으로 그랬다.
+ * `fileURLToPath`가 플랫폼별 규칙을 아는 유일한 변환이다.
+ */
+const FIXTURES_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "fixtures");
+
+/**
+ * fixture가 실제로 로드되는지 **맨 먼저** 확인한다.
+ *
+ * 경로가 깨지면 아래 검사들이 빈 집합에 대해 돌면서 원인과 먼 실패를 낸다. 여기서 한 번
+ * 크게 실패하는 편이 다섯 곳에서 조금씩 틀리는 것보다 낫다.
+ */
+test("0. fixture 24개가 실제로 로드된다 (경로가 깨지면 여기서 먼저 실패한다)", () => {
+  const ids = listFixtureIds(FIXTURES_ROOT);
+  assert.equal(ids.length, 24, `fixture 경로가 잘못되었습니다: ${FIXTURES_ROOT}`);
+  assert.equal(loadAllFixtures(FIXTURES_ROOT, ids).length, 24);
+});
 
 function withDir(fn: (dir: string) => void): void {
   const dir = mkdtempSync(path.join(tmpdir(), "gate-safety-"));
