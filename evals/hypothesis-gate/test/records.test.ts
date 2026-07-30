@@ -134,3 +134,42 @@ test("정상 기록은 통과시킨다", () => {
   assert.equal(findSecretLike("skip-this-test"), undefined);
   assert.doesNotThrow(() => assertNoSecrets(record("a", "A", 1)));
 });
+
+// ---- 오탐 (실측 결함) ----
+
+test("task-<uuid>를 자격증명으로 오탐하지 않는다", () => {
+  // `"taskId":"task-367002d2-..."` 안에는 `ta`sk-`367002d2-...`가 들어 있다. 호스트는
+  // taskId를 받지 못하면 `task-{uuid}`를 스스로 만들고(bin/host.rs), 그러면 정상 기록이
+  // 저장되지 못한 채 실행이 멈춘다 — 유료 실행이라면 돈은 썼는데 결과가 사라진다.
+  for (const taskId of [
+    "task-367002d2-2c0d-4f1a-9b3e-8a7c6d5e4f30",
+    "task-feebd484-1111-2222-3333-444455556666",
+    "gate-367002d2-2c0d-4f1a-9b3e-8a7c6d5e4f30",
+    "skipped-367002d2-2c0d-4f1a-9b3e-8a7c6d5e4f30",
+  ]) {
+    assert.equal(findSecretLike({ taskId }), undefined, `오탐: ${taskId}`);
+  }
+  // 기록 전체로도 확인한다 — JSON 직렬화 과정에서 인접 필드와 붙어 생기는 오탐이 없어야 한다.
+  assert.doesNotThrow(() =>
+    assertNoSecrets(record("a", "A", 1, { taskId: "task-367002d2-2c0d-4f1a-9b3e-8a7c6d5e4f30" }))
+  );
+});
+
+test("경계를 좁혀도 진짜 키는 여전히 잡는다", () => {
+  // 정밀도를 올린 것이 탐지를 약화시킨 것이 아님을 확인한다. 실제 키는 항상 토큰의 시작이다.
+  const key = "sk-abcdefghijklmnopqrstuvwxyz012345";
+  for (const context of [
+    key,
+    `OPENAI_API_KEY=${key}`,
+    `OPENAI_API_KEY: ${key}`,
+    `"${key}"`,
+    `사용 키는 ${key} 입니다`,
+    `--api-key ${key}`,
+    `\n${key}`,
+  ]) {
+    assert.ok(findSecretLike({ note: context }) !== undefined, `놓쳤습니다: ${context}`);
+  }
+  assert.ok(findSecretLike({ note: "sk-ant-api03-abcdefghijklmnopqrstuvwxyz" }) !== undefined);
+  assert.ok(findSecretLike({ note: "ghp_abcdefghijklmnopqrstuvwxyz0123" }) !== undefined);
+  assert.ok(findSecretLike({ note: "-----BEGIN RSA PRIVATE KEY-----" }) !== undefined);
+});
