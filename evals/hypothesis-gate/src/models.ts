@@ -1,5 +1,10 @@
 import { BUILTIN_MODELS } from "@tomverse/sidecar/registry";
-import { maxCallCostUsd, pricingIsUsable, DEFAULT_CONTEXT_TOKEN_BUDGET } from "@tomverse/sidecar/budget";
+import {
+  maxCallCostUsd,
+  pricingIsUsable,
+  effectiveMaxOutputTokens,
+  DEFAULT_CONTEXT_TOKEN_BUDGET,
+} from "@tomverse/sidecar/budget";
 import type { ModelEntry } from "@tomverse/protocol";
 import type { ArmId } from "./types.js";
 
@@ -32,8 +37,10 @@ export interface ModelFacts {
   outputPerMTok: number;
   pricingAsOf: string;
   maxContextTokens: number;
-  /** provider에 실제로 전달되는 최대 출력 토큰 (어댑터가 이 값을 그대로 넘긴다). */
-  maxOutputTokens: number;
+  /** 모델이 허용하는 최대 출력 토큰. */
+  modelMaxOutputTokens: number;
+  /** **어댑터가 실제로 요청하는** 출력 토큰. 비용을 지배하는 값이다. */
+  requestedMaxOutputTokens: number;
   structuredOutput: string;
   toolCalling: string;
   requiresOrgVerification: boolean;
@@ -95,7 +102,8 @@ export function factsOf(entry: ModelEntry): ModelFacts {
     outputPerMTok: entry.economics.outputPerMTok,
     pricingAsOf: entry.economics.pricingAsOf,
     maxContextTokens: entry.capabilities.maxContextTokens,
-    maxOutputTokens: entry.capabilities.maxOutputTokens,
+    modelMaxOutputTokens: entry.capabilities.maxOutputTokens,
+    requestedMaxOutputTokens: effectiveMaxOutputTokens(entry),
     structuredOutput: entry.capabilities.structuredOutput,
     toolCalling: entry.capabilities.toolCalling,
     requiresOrgVerification: entry.availability.requiresOrgVerification,
@@ -185,9 +193,11 @@ export function estimateRecordCost(
   calls: { executor: number; reviewer: number },
   contextTokenBudget = DEFAULT_CONTEXT_TOKEN_BUDGET
 ): RecordCostEstimate | undefined {
+  // **어댑터가 실제로 요청하는 값**을 쓴다. 모델 최대치를 쓰면 예약이 실제 청구보다 크게
+  // 부풀고, 그러면 승인 상한이 감당 못 하는 것처럼 보여 실행을 막는다.
   const perExecutor = maxCallCostUsd(executor, {
     maxInputTokens: contextTokenBudget,
-    maxOutputTokens: executor.capabilities.maxOutputTokens,
+    maxOutputTokens: effectiveMaxOutputTokens(executor),
   });
   if (perExecutor === undefined) return undefined;
 
@@ -197,7 +207,7 @@ export function estimateRecordCost(
     if (!reviewer) return undefined;
     const perReviewer = maxCallCostUsd(reviewer, {
       maxInputTokens: contextTokenBudget,
-      maxOutputTokens: reviewer.capabilities.maxOutputTokens,
+      maxOutputTokens: effectiveMaxOutputTokens(reviewer),
     });
     if (perReviewer === undefined) return undefined;
     total += perReviewer * calls.reviewer;
@@ -209,8 +219,9 @@ export function estimateRecordCost(
     executorCalls: calls.executor,
     reviewerCalls: calls.reviewer,
     basis:
-      `입력 ${contextTokenBudget.toLocaleString()}토큰 상한 + 출력은 어댑터가 실제 전달하는 ` +
-      `maxOutputTokens 기준: ${executor.modelId} ${calls.executor}회×$${perExecutor.toFixed(4)}${reviewerPart}`,
+      `입력 ${contextTokenBudget.toLocaleString()}토큰 상한 + 출력 ` +
+      `${effectiveMaxOutputTokens(executor).toLocaleString()}토큰(어댑터가 실제 요청하는 값): ` +
+      `${executor.modelId} ${calls.executor}회×$${perExecutor.toFixed(4)}${reviewerPart}`,
   };
 }
 

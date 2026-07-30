@@ -8,6 +8,7 @@ import type {
   SingleModelFixResult,
   TokenUsage,
 } from "@tomverse/protocol";
+import { effectiveMaxOutputTokens } from "../budget/ledger.js";
 import { validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
 import { normalizeProviderError } from "./errors.js";
 import {
@@ -70,7 +71,8 @@ export class OpenAIAdapter implements ProviderAdapter {
       supportsStructuredOutput: this.entry.capabilities.structuredOutput !== "none",
       supportsToolCalling: this.entry.capabilities.toolCalling !== "none",
       maxContextTokens: this.entry.capabilities.maxContextTokens,
-      maxOutputTokens: this.entry.capabilities.maxOutputTokens,
+      // 보고값과 실제 요청값을 일치시킨다 — 다르면 감사 기록이 실제를 설명하지 못한다.
+      maxOutputTokens: effectiveMaxOutputTokens(this.entry),
     };
   }
 
@@ -187,7 +189,7 @@ export class OpenAIAdapter implements ProviderAdapter {
         {
           model: this.modelId,
           input: [{ role: "user", content: prompt }],
-          max_output_tokens: this.entry.capabilities.maxOutputTokens,
+          max_output_tokens: effectiveMaxOutputTokens(this.entry),
           text: {
             format: {
               type: "json_schema",
