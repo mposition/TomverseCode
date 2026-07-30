@@ -181,6 +181,7 @@ TypeScript로 두면 "Rust를 빌드하려면 TypeScript를 먼저 빌드해야 
 | 스크립트 | 하는 일 |
 |---|---|
 | `scripts\_env.bat` | MSVC 툴체인 + cargo PATH 준비. **Visual Studio 탐지는 여기에만 있다** |
+| `scripts\msvc-doctor.bat` | MSVC 탐지 진단 — 무엇을 어디까지 확인했는지 읽기 전용으로 출력. `npm run msvc:doctor` |
 | `scripts\assertDepsFresh.mjs` | 의존 워크스페이스의 `dist`가 소스보다 낡았는지 확인. 낡은 `.d.ts`로 컴파일해 원인과 먼 오류가 쏟아지는 것을 막는다 |
 | `scripts\cargo.mjs` | cargo 실행 런처 — MSVC 환경 준비 + cargo 실행 파일 탐색 + 종료 코드 보존. 나머지 cargo 진입점이 전부 이걸 지난다 |
 | `scripts\cargo-test-core.bat` | 신뢰 경계 크레이트 테스트 (가장 자주 도는 검증) |
@@ -222,6 +223,15 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
   묻는다(Installer가 `%ProgramFiles(x86)%\Microsoft Visual Studio\Installer`에 항상 둔다).
   참고로 `cc-rs`는 자체 vswhere 탐지로 `cl.exe`를 **찾아낸다** — 그래서 증상이
   "컴파일러 없음"이 아니라 `stdarg.h: No such file or directory`(=INCLUDE 미설정)로 나온다.
+- **vswhere도 만능이 아니다.** Visual Studio가 설치된 머신에서 `vswhere.exe가 없습니다`가 나온
+  실측 사례가 있다(Installer 디렉터리를 두 고정 위치에서 못 찾음). 그래서 탐지를 네 겹으로 둔다:
+  `TOMVERSE_VCVARSALL` override → vswhere(고정 2곳 + PATH) → `VSINSTALLDIR` →
+  `Microsoft Visual Studio` 서브트리 **검색**(목록이 아니다). 그리고 전부 실패하면 **확인한 것을
+  전부 출력한다** — "설치되어 있지 않은 것으로 보입니다"만 말하면 설치되어 있는 사용자가 할 수
+  있는 일이 없다. 상태를 보려면 `npm run msvc:doctor`.
+- **괄호가 든 변수 이름을 괄호 블록 안에서 쓰면 cmd 파서가 블록을 일찍 닫는다.**
+  `%ProgramFiles(x86)%`가 그렇다. `if ... (` 안에서 쓰기 전에 평범한 이름으로 옮길 것.
+  `echo` 텍스트의 괄호도 `^(`/`^)`로 escape한다.
 - **Git for Windows의 GNU `link.exe`가 MSVC `link.exe`를 PATH에서 가린다.** Rust 링크 실패 시 `link: extra operand ... Try 'link --help'`가 나오면 이건 MSVC가 아니라 **coreutils의 하드링크 유틸리티**가 호출된 것이다. rustc가 붙이는 "Visual Studio에서 C++ 빌드 도구를 선택하라"는 힌트는 이 경우 오도할 수 있다. `vcvarsall.bat`를 거치면 MSVC 경로가 앞에 오므로 해결된다.
 - **Bash를 먼저 잡는 습관을 경계할 것.** 이 저장소에서 Windows 네이티브 툴체인(MSVC/MSBuild/VS)을 다룰 때는 PowerShell + `.bat` 래퍼가 기본이다. Bash(MinGW)를 쓰면 위 `link.exe` 같은 Unix 도구 충돌에 걸린다 — 이 편향은 product-strategy.md 12.3절이 우리 제품에서 구조적으로 교정하려는 대상이기도 하다.
 - **파일이 LF로 저장되면 git이 CRLF 경고를 낸다** — 정상이며 무시해도 된다. 단 `.bat`만은 예외로 CRLF를 강제한다(`.gitattributes`).

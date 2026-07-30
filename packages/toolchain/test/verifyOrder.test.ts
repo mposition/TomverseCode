@@ -180,11 +180,50 @@ test("_env.bat이 Visual Studio를 vswhere로 찾는다", () => {
     /-property\s+installationPath/.test(script),
     "_env.bat이 vswhere에 설치 경로를 묻지 않습니다"
   );
-  // 안전망 후보가 vswhere보다 먼저 오면 vswhere가 사실상 죽는다.
+  // 안전망(서브트리 검색)이 vswhere보다 먼저 오면 vswhere가 사실상 죽는다.
   assert.ok(
-    script.indexOf("vswhere.exe") < script.indexOf("Microsoft Visual Studio\\2022"),
-    "하드코딩 후보가 vswhere보다 먼저 시도됩니다"
+    script.indexOf("vswhere.exe") < script.indexOf(":find_vcvars"),
+    "안전망 검색이 vswhere보다 먼저 시도됩니다"
   );
+
+  // 버전·에디션을 목록으로 적는 방식으로 돌아가지 않는다. "2022"나 특정 에디션 이름이
+  // 후보로 등장하면 그 목록은 새 버전이 나오는 순간 틀린다(실측: VS 18 Enterprise).
+  assert.ok(
+    !/Microsoft Visual Studio\\20\d\d\\/.test(script),
+    "_env.bat에 연도 기반 설치 경로 후보가 다시 들어왔습니다 — 목록이 아니라 검색을 쓸 것"
+  );
+
+  // 탐지가 전부 실패했을 때 **사용자가 직접 지정할 수 있는 탈출구**가 있어야 한다.
+  // "설치되지 않은 것으로 보입니다"만 말하면 설치되어 있는 사용자가 할 수 있는 일이 없다.
+  assert.ok(
+    script.includes("TOMVERSE_VCVARSALL"),
+    "탐지 실패 시 사용자가 vcvarsall.bat 위치를 지정할 방법이 없습니다"
+  );
+  // PATH에 단독 설치된 vswhere도 정당한 조회 도구다.
+  assert.ok(/where\s+vswhere\.exe/.test(script), "_env.bat이 PATH의 vswhere를 보지 않습니다");
+});
+
+test("탐지 실패 메시지가 확인한 것을 전부 알려준다", () => {
+  // 실측: Visual Studio가 설치된 머신에서 "설치되어 있지 않은 것으로 보입니다"가 나왔다.
+  // 그 메시지로는 사용자도 우리도 다음에 무엇을 볼지 알 수 없다 — 무엇을 어디까지 확인했는지가
+  // 함께 나와야 추측 없이 원인을 좁힐 수 있다.
+  const script = readFileSync(path.join(REPO_ROOT, "scripts", "_env.bat"), "utf8");
+  for (const fact of ["ProgramFiles", "VSINSTALLDIR", "TOMVERSE_VCVARSALL", "msvc:doctor"]) {
+    assert.ok(script.includes(fact), `탐지 실패 안내에 ${fact}가 없습니다`);
+  }
+
+  // 진단 명령은 읽기 전용이며, 전체 환경을 덤프하지 않는다(키가 버퍼에 들어간다).
+  const doctor = readFileSync(path.join(REPO_ROOT, "scripts", "msvc-doctor.bat"), "utf8");
+  assert.ok(doctor.includes("_env.bat"), "진단이 실제 탐지 경로를 실행하지 않습니다");
+  assert.ok(
+    !/^\s*set\s*$/m.test(doctor),
+    "진단이 전체 환경을 덤프합니다 — API 키가 출력에 들어갑니다"
+  );
+
+  const root = JSON.parse(readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
+    scripts: Record<string, string>;
+  };
+  assert.ok(root.scripts["msvc:doctor"]?.includes("msvc-doctor.bat"), "msvc:doctor 스크립트가 없습니다");
 });
 
 test("_env.bat이 드라이브 문자를 하드코딩하지 않는다", () => {
