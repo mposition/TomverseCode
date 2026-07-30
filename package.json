@@ -28,6 +28,8 @@
     "gate:g:dry-run": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js dry-run",
     "//gate:g:plan-pilot": "유료 실행 전 승인 카드. **실제 API를 부르지 않는다.**",
     "gate:g:plan-pilot": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js plan-pilot",
+    "//gate:g:probe-models": "역할당 최소 요청 1회로 모델을 실제 확인한다. **실제 API를 부르므로 --max-cost-usd가 필수다.** 카드가 READY_FOR_MODEL_PROBE일 때 다음으로 도는 명령.",
+    "gate:g:probe-models": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js probe-models",
     "gate:g:pilot": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js pilot",
     "gate:g:run": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js run",
     "gate:g:report": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js report"

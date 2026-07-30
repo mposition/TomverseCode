@@ -127,9 +127,21 @@ npm run verify         # 전체: 위 + Rust 단위 테스트 + 실제 구성요�
 ```bash
 npm run gate:g:validate   # fixture 24개 품질 검증 (모델 호출 없음)
 npm run gate:g:dry-run    # preflight + 실행 계획 (API 호출 없음)
+npm run gate:g:plan-pilot # 단계별(P0/P1) 승인 카드 (API 호출 없음)
+npm run gate:g:probe-models  # 역할당 최소 요청 1회로 모델 실제 확인. --max-cost-usd 필수
 npm run gate:g:pilot      # 반복 1회 — 하네스/비용/실패 분류 확인용. PASS를 내지 않는다
 npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가 필요하다
 ```
+
+**"레지스트리에 있으므로 사용 가능"은 승인 근거가 아니다.** 모델 가용성은 전역 사실이 아니라
+자격증명별 사실이므로(gpt-5 사례), 준비성을 축별로 나눠 적고 오프라인 검사는
+`credentialPresent`·`liveProbeVerified`·`exactModelIdVerified`를 **true로 만들 수 없다.**
+그래서 카드 상태에 `READY_FOR_MODEL_PROBE`가 있고, 유료 pilot 승인은 `probe-models`가
+실제 호출로 확인한 뒤에만 가능하다.
+
+**재개가 승인 한도를 늘리지 않는다.** `records.jsonl`에서 확정 비용을 복원해 원장에 넣고,
+복원값을 신뢰할 수 없으면(비용 없는 유료 기록, NaN, 중복 기록, 이벤트와 불일치) **재개하지
+않는다.** 0으로 보고 계속하는 것이 가장 위험하다 — 그 순간 한도가 사라진다.
 
 **fake provider 결과로 가설을 판정하지 않는다** — 모든 기록에 `providerKind`가 남고, 집계가
 `fake` 기록만 있으면 무조건 `INCONCLUSIVE`를 낸다. 자세한 것은
@@ -212,6 +224,16 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
   경로가 깨지면 fixture/파일 목록이 **조용히 0개**가 되어 그 위의 검사들이 빈 집합에 대해
   통과하거나 원인과 먼 실패를 내기 때문이다. 그래서 `listFixtureIds`는 디렉터리가 없으면
   빈 배열이 아니라 예외를 던진다 — "없는 경로"와 "빈 디렉터리"는 다른 사실이다.
+- **`exports` 맵 안에 `"//"` 주석 키를 두면 서브패스 import가 전부 깨진다.** `package.json`의
+  `exports`는 키가 모두 `.`로 시작해야 하고, 하나라도 아니면 **맵 전체가 무효**가 된다.
+  증상이 고약한 이유는 오류가 그 파일을 가리키지 않는다는 점이다 — `@tomverse/sidecar/budget`을
+  import하는 **모든 파일**에서 `TS2307 Cannot find module`이 나므로, 방금 고친 코드나
+  빌드 순서를 의심하게 된다. 주석은 `exports` **밖에** 둘 것(루트의 `"//exports"`).
+- **`createBudgetLedger(limit)`를 재개 때 새로 만들면 승인 한도가 재시작마다 초기화된다.**
+  `committed`가 0에서 시작하므로 $25 한도에서 $20을 쓴 뒤 재개하면 $25를 더 쓸 수 있었다.
+  이미 쓴 금액을 복원해 `initialCommittedUsd`로 넘겨야 하고, 상한과 비교하는 값은 이번 프로세스의
+  지출이 아니라 **누적**이다. 지출을 `spentUsd` 하나로 부르면 로그에서 그 숫자가 session인지
+  전체인지 구별되지 않으므로 이름을 셋으로 나눈다(historical/session/cumulative).
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트

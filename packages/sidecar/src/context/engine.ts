@@ -8,6 +8,7 @@ import type {
   WorkspaceIndexFileEntry,
   WorkspaceSnapshot,
 } from "@tomverse/protocol";
+import { DEFAULT_CONTEXT_TOKEN_BUDGET } from "../budget/ledger.js";
 import type { ToolBridge } from "../tools/bridge.js";
 import { classifyFile, languageOf } from "./exclude.js";
 import { packageFiles, type TokenBudget } from "./budget.js";
@@ -124,7 +125,9 @@ export class ContextEngine {
     // 명시 지목됐지만 제외 규칙에 걸린 파일은 사용자에게 알린다 (7절 마지막 문단).
     const excludedNotes = this.notesForMentionedButExcluded(index, input.userMessage);
 
-    const primaryBudget = input.tokenBudgets[0]?.maxTokens ?? 60_000;
+    // 기본값은 **비용 추정과 같은 상수**를 읽는다. 여기에 숫자를 직접 적으면 예산 원장의
+    // 보수적 추정이 실제 요청과 조용히 어긋난다 — 예약이 실제 청구를 감당하지 못하는 상태다.
+    const primaryBudget = input.tokenBudgets[0]?.maxTokens ?? DEFAULT_CONTEXT_TOKEN_BUDGET;
     const relevantFiles: RelevantFile[] = [];
 
     for (const candidate of candidates) {

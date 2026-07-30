@@ -26,7 +26,11 @@
     "typescript": "^5.9.3"
   },
   "types": "./dist/src/index.d.ts",
-  "//exports": "예산 ledger는 제품 코드다. 가설 게이트가 이걸 가져다 쓴다 — 측정 도구에만 두면 제품의 유료 호출 경로에는 같은 보호가 없게 된다.",
+  "//exports": [
+    "예산 ledger는 제품 코드다. 가설 게이트가 이걸 가져다 쓴다 — 측정 도구에만 두면 제품의 유료 호출 경로에는 같은 보호가 없게 된다.",
+    "./providers를 노출하는 이유: 가설 게이트의 probe-models가 production 어댑터를 그대로 태운다. probe용 HTTP 호출을 따로 만들면 'probe는 통과했는데 실제 실행은 실패'가 가능해진다.",
+    "exports 맵 안에는 '//' 주석 키를 두지 않는다 — '.'로 시작하지 않는 키가 하나라도 있으면 맵 전체가 무효가 되어 서브패스 import가 조용히 깨진다(실측)."
+  ],
   "exports": {
     ".": "./dist/src/index.js",
     "./budget": {
@@ -36,6 +40,10 @@
     "./registry": {
       "types": "./dist/src/routing/registry.d.ts",
       "default": "./dist/src/routing/registry.js"
+    },
+    "./providers": {
+      "types": "./dist/src/providers/factory.d.ts",
+      "default": "./dist/src/providers/factory.js"
     }
   }
 }

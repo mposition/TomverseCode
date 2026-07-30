@@ -12,12 +12,18 @@ import type { ModelEntry } from "@tomverse/protocol";
  * 그래서 순서를 뒤집는다: **호출을 시작하기 전에 그 호출이 낼 수 있는 최대 비용을 예약하고,**
  * 예약할 수 없으면 호출하지 않는다. 완료 후 실제 사용량으로 정산한다.
  *
- * # 왜 sidecar(제품)에 있는가
+ * # 왜 sidecar(제품)에 있는가 — 그리고 **지금 제품은 이걸 쓰지 않는다**
  *
  * 측정 도구에만 두면 제품의 유료 호출 경로에는 같은 보호가 없게 된다. 사용자 돈을 쓰는 것은
  * 제품도 마찬가지이므로, 계약은 제품 쪽에 두고 가설 게이트가 그걸 **가져다 쓴다.**
  * 게이트는 (fixture, arm, 반복) 단위로, 제품은 provider 호출 단위로 예약한다 —
  * 같은 인터페이스로 둘 다 표현된다.
+ *
+ * **다만 `Orchestrator`의 provider 호출 경로에는 아직 예약이 없다.** 이 파일이 제품 패키지에
+ * 있다는 것만으로 "제품이 보호된다"고 읽으면 안 된다. 지금 예약을 강제하는 것은 가설 게이트뿐이고,
+ * 제품에 적용하기 위한 선행 조건 세 가지(승인 상한을 받는 UI, 예약 거부 시의 태스크 종료 사유,
+ * SQLite `budget_events` 영속)는 `docs/design/multi-engine-routing.md` 10.6절에 적혀 있다.
+ * 그것들이 정해지기 전에 끼워 넣으면 "상한 초과로 거부됐는데 태스크가 조용히 실패"가 먼저 생긴다.
  *
  * # 병렬 실행
  *
@@ -25,6 +31,62 @@ import type { ModelEntry } from "@tomverse/protocol";
  * 나중에 동시 실행을 붙여도 double-spend가 생기지 않는다. 두 호출이 동시에 예약을 요청하면
  * 남은 예산이 부족한 쪽이 거부된다.
  */
+
+/**
+ * 예산 원장 이벤트 — **append-only 감사 추적.**
+ *
+ * 예산과 승인 상태가 프로세스 메모리에만 있으면 재시작 후 아무것도 설명할 수 없다.
+ * 원장은 이벤트를 만들기만 하고, 어디에 쓸지는 sink가 정한다(가설 게이트는 JSONL에 쓴다).
+ *
+ * **자격증명·API 키·authorization 헤더는 담지 않는다.** 이 이벤트는 저장되고 사람이 읽는다.
+ */
+export type BudgetEventType =
+  | "approval_created"
+  | "approval_raised"
+  | "reservation_opened"
+  | "reservation_released"
+  | "reservation_settled"
+  | "provider_usage_recorded"
+  | "budget_estimate_breached"
+  | "run_blocked";
+
+export interface BudgetEvent {
+  type: BudgetEventType;
+  at: string;
+  /** 어느 실행인가. 재시작 후 같은 원장을 이어받는 근거다. */
+  runId: string;
+  stage: string;
+  /** 예약/호출 상관관계 ID — 어느 호출의 이야기인지 잇는다. */
+  correlationId?: string;
+  provider?: string;
+  model?: string;
+  approvedLimitUsd: number;
+  reservedUsd?: number;
+  actualUsd?: number;
+  cumulativeUsd: number;
+  reason?: string;
+}
+
+export interface LedgerContext {
+  runId: string;
+  stage: string;
+  onEvent?: (event: BudgetEvent) => void;
+  /** 시각 주입 — 테스트가 결정론적으로 검증할 수 있어야 한다. */
+  now?: () => string;
+}
+
+export interface LedgerOptions extends Partial<LedgerContext> {
+  /**
+   * 이전 실행에서 **이미 확정된** 비용.
+   *
+   * # 이것이 없으면 승인 한도가 무의미해진다
+   *
+   * 예전에는 재개할 때 원장을 `createBudgetLedger(limit)`로 새로 만들었다. 그러면
+   * `committed`가 0에서 시작하므로 **$25 한도에서 $20을 쓴 뒤 재개하면 추가로 $25를 더 쓸 수
+   * 있었다.** 재시작 횟수만큼 한도가 늘어나는 것이므로 "승인 한도"라는 말이 성립하지 않는다.
+   */
+  initialCommittedUsd?: number;
+}
 
 /** 이 호출/작업이 낼 수 있는 **최대** 비용과 그 근거. */
 export interface CostEstimate {
@@ -57,23 +119,40 @@ export type ReserveOutcome =
 export interface BudgetLedger {
   /** 사용자가 승인한 상한. 이 값을 코드가 스스로 올리지 않는다. */
   readonly approvedLimitUsd: number;
-  /** 정산이 끝난 실제 비용의 합. */
-  committedUsd(): number;
+  /** 이전 실행들에서 이미 확정된 비용 (재개 시 복원한 값). */
+  historicalCommittedUsd(): number;
+  /** 이번 프로세스에서 확정된 비용. */
+  sessionCommittedUsd(): number;
+  /** 전체 확정 비용 = historical + session. **승인 한도와 비교되는 값이다.** */
+  cumulativeCommittedUsd(): number;
   /** 진행 중인 호출을 위해 잡아둔 금액. */
   reservedUsd(): number;
-  /** 지금 새 호출에 쓸 수 있는 금액 = 상한 − 확정 − 예약. */
+  /** 지금 새 호출에 쓸 수 있는 금액 = 상한 − historical − session − 예약. */
   availableUsd(): number;
+  /**
+   * 추정이 실제를 감당하지 못한 사실이 확인됐는가.
+   * 한 번 true가 되면 이후 예약은 전부 거부된다 — 추정을 신뢰할 수 없는 상태에서
+   * 유료 호출을 계속하는 것은 예산 상한이 없는 것과 같다.
+   */
+  estimateBreached(): boolean;
   /** 예약을 시도한다. 남은 금액이 부족하면 **호출하지 않는다**는 뜻의 실패를 돌려준다. */
   reserve(estimate: CostEstimate, label: string): ReserveOutcome;
+  /** 상한을 올린 사실을 기록한다. 코드가 스스로 부르지 않고 사용자 승인이 있을 때만 부른다. */
+  recordApprovalRaised(newLimitUsd: number, reason: string): void;
+  /** 실행이 차단된 사실을 감사 추적에 남긴다. */
+  recordBlocked(reason: string): void;
   /** 지금까지의 지출 요약 — 리포트/Run Card용. */
   snapshot(): BudgetSnapshot;
 }
 
 export interface BudgetSnapshot {
   approvedLimitUsd: number;
-  committedUsd: number;
+  historicalCommittedUsd: number;
+  sessionCommittedUsd: number;
+  cumulativeCommittedUsd: number;
   reservedUsd: number;
   availableUsd: number;
+  estimateBreached: boolean;
   reservationsOpened: number;
   reservationsSettled: number;
   reservationsReleased: number;
@@ -95,80 +174,158 @@ export function validateApprovedLimit(value: number): { ok: true } | { ok: false
   return { ok: true };
 }
 
-export function createBudgetLedger(approvedLimitUsd: number): BudgetLedger {
+/**
+ * 이전 실행에서 복원한 확정 비용 검증.
+ *
+ * 여기서 fail closed하는 것이 요점이다 — 복원값이 수상하면 "0으로 보고 계속"이 아니라 멈춘다.
+ */
+export function validateInitialCommitted(value: number): { ok: true } | { ok: false; reason: string } {
+  if (!Number.isFinite(value)) {
+    return { ok: false, reason: `복원한 누적 비용이 유한한 수가 아닙니다 (${value})` };
+  }
+  if (value < 0) {
+    return { ok: false, reason: `복원한 누적 비용이 음수입니다 (${value})` };
+  }
+  return { ok: true };
+}
+
+export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOptions = {}): BudgetLedger {
   const check = validateApprovedLimit(approvedLimitUsd);
   if (!check.ok) throw new Error(check.reason);
 
-  let committed = 0;
+  const historical = options.initialCommittedUsd ?? 0;
+  const historicalCheck = validateInitialCommitted(historical);
+  if (!historicalCheck.ok) throw new Error(historicalCheck.reason);
+
+  const runId = options.runId ?? "(unknown-run)";
+  const stage = options.stage ?? "(unknown-stage)";
+  const now = options.now ?? ((): string => new Date().toISOString());
+  const emit = (event: Omit<BudgetEvent, "at" | "runId" | "stage" | "approvedLimitUsd" | "cumulativeUsd">): void => {
+    options.onEvent?.({
+      ...event,
+      at: now(),
+      runId,
+      stage,
+      approvedLimitUsd,
+      cumulativeUsd: historical + session,
+    });
+  };
+
+  let session = 0;
   let reserved = 0;
   let opened = 0;
   let settledCount = 0;
   let releasedCount = 0;
+  let breached = false;
 
-  const available = (): number => approvedLimitUsd - committed - reserved;
+  const available = (): number => approvedLimitUsd - historical - session - reserved;
+
+  emit({ type: "approval_created", reason: `초기 승인 상한 $${approvedLimitUsd}, 복원된 누적 $${historical}` });
 
   return {
     approvedLimitUsd,
-    committedUsd: () => committed,
+    historicalCommittedUsd: () => historical,
+    sessionCommittedUsd: () => session,
+    cumulativeCommittedUsd: () => historical + session,
     reservedUsd: () => reserved,
     availableUsd: available,
+    estimateBreached: () => breached,
 
     reserve(estimate, label) {
+      // **추정이 한 번 틀린 것이 확인되면 더 이상 유료 호출을 시작하지 않는다.**
+      if (breached) {
+        const reason =
+          `${label}: 이전 호출의 실제 비용이 예약액을 초과했습니다 (BUDGET_ESTIMATE_BREACH). ` +
+          `추정을 신뢰할 수 없는 상태로는 유료 호출을 계속하지 않습니다.`;
+        emit({ type: "run_blocked", correlationId: label, reason });
+        return { ok: false, reason, requestedUsd: estimate.maxUsd, availableUsd: available() };
+      }
       if (!Number.isFinite(estimate.maxUsd) || estimate.maxUsd < 0) {
         // 비용을 계산할 수 없으면 **추측해서 진행하지 않는다.** 예산 상한이 아무것도 막지
         // 못하는 상태로 유료 호출을 시작하는 것이 이 ledger가 존재하는 이유와 정면으로 어긋난다.
-        return {
-          ok: false,
-          reason: `${label}: 예상 비용을 계산할 수 없습니다 (${estimate.maxUsd}). ${estimate.basis}`,
-          requestedUsd: Number.NaN,
-          availableUsd: available(),
-        };
+        const reason = `${label}: 예상 비용을 계산할 수 없습니다 (${estimate.maxUsd}). ${estimate.basis}`;
+        emit({ type: "run_blocked", correlationId: label, reason });
+        return { ok: false, reason, requestedUsd: Number.NaN, availableUsd: available() };
       }
       if (estimate.maxUsd > available()) {
-        return {
-          ok: false,
-          reason:
-            `${label}: 예상 최대 비용 $${estimate.maxUsd.toFixed(4)}가 남은 예산 ` +
-            `$${available().toFixed(4)}를 초과합니다 (승인 상한 $${approvedLimitUsd}). ${estimate.basis}`,
-          requestedUsd: estimate.maxUsd,
-          availableUsd: available(),
-        };
+        const reason =
+          `${label}: 예상 최대 비용 $${estimate.maxUsd.toFixed(4)}가 남은 예산 ` +
+          `$${available().toFixed(4)}를 초과합니다 (승인 상한 $${approvedLimitUsd}, ` +
+          `이미 확정 $${(historical + session).toFixed(4)} = 이전 $${historical.toFixed(4)} + ` +
+          `이번 $${session.toFixed(4)}). ${estimate.basis}`;
+        emit({ type: "run_blocked", correlationId: label, reason });
+        return { ok: false, reason, requestedUsd: estimate.maxUsd, availableUsd: available() };
       }
 
       reserved += estimate.maxUsd;
       opened += 1;
       const amount = estimate.maxUsd;
+      const id = `${label}#${opened}`;
+      emit({ type: "reservation_opened", correlationId: id, reservedUsd: amount, reason: estimate.basis });
+
       let done = false;
       const reservation: Reservation = {
-        id: `${label}#${opened}`,
+        id,
         reservedUsd: amount,
         get settled() {
           return done;
         },
         settle(actualUsd: number) {
-          if (done) throw new Error(`예약 ${this.id}이(가) 이미 정산되었습니다`);
+          if (done) throw new Error(`예약 ${id}이(가) 이미 정산되었습니다`);
           done = true;
           settledCount += 1;
           reserved -= amount;
           // 실제 비용이 예약보다 클 수 있다(추정이 틀린 경우). 그때도 **실제 값을 기록한다** —
           // 예약액으로 깎아 기록하면 장부가 실제 청구액과 어긋난다.
-          committed += Number.isFinite(actualUsd) && actualUsd > 0 ? actualUsd : 0;
+          const actual = Number.isFinite(actualUsd) && actualUsd > 0 ? actualUsd : 0;
+          session += actual;
+          emit({ type: "reservation_settled", correlationId: id, reservedUsd: amount, actualUsd: actual });
+          emit({ type: "provider_usage_recorded", correlationId: id, actualUsd: actual });
+
+          // **예약보다 실제가 크면 추정이 틀렸다는 뜻이다.** 조용히 넘기면 available이 음수인
+          // 상태로 계속 돌 수 있고, 그건 승인 한도가 없는 것과 같다.
+          if (actual > amount) {
+            breached = true;
+            emit({
+              type: "budget_estimate_breached",
+              correlationId: id,
+              reservedUsd: amount,
+              actualUsd: actual,
+              reason:
+                `실제 비용 $${actual.toFixed(4)}이 예약액 $${amount.toFixed(4)}을 초과했습니다. ` +
+                `이후 유료 호출을 차단합니다.`,
+            });
+          }
         },
         release() {
-          if (done) throw new Error(`예약 ${this.id}이(가) 이미 정산되었습니다`);
+          if (done) throw new Error(`예약 ${id}이(가) 이미 정산되었습니다`);
           done = true;
           releasedCount += 1;
           reserved -= amount;
+          emit({ type: "reservation_released", correlationId: id, reservedUsd: amount });
         },
       };
       return { ok: true, reservation };
     },
 
+    recordApprovalRaised(newLimitUsd, reason) {
+      // 상한 자체는 바꾸지 않는다 — 새 상한으로는 **새 원장**을 만들어야 한다.
+      // 여기서는 "사용자가 올렸다"는 사실만 감사 추적에 남긴다.
+      emit({ type: "approval_raised", reason: `${reason} (새 상한 $${newLimitUsd})` });
+    },
+
+    recordBlocked(reason) {
+      emit({ type: "run_blocked", reason });
+    },
+
     snapshot: () => ({
       approvedLimitUsd,
-      committedUsd: committed,
+      historicalCommittedUsd: historical,
+      sessionCommittedUsd: session,
+      cumulativeCommittedUsd: historical + session,
       reservedUsd: reserved,
       availableUsd: available(),
+      estimateBreached: breached,
       reservationsOpened: opened,
       reservationsSettled: settledCount,
       reservationsReleased: releasedCount,

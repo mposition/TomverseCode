@@ -43,6 +43,14 @@ export interface RunnerOptions {
   runId: string;
   maxCostUsd?: number;
   /**
+   * **이전 실행들에서 이미 확정된 비용.** 재개할 때 복원해서 넘긴다.
+   *
+   * 이 값이 없으면 `budgetStop`이 이번 프로세스의 지출만 보므로, 재개할 때마다 승인 상한이
+   * 처음부터 다시 주어진다 — $25 한도에서 $20을 쓰고 재개하면 $25를 더 쓸 수 있었다.
+   * 상한과 비교해야 하는 값은 session이 아니라 **cumulative**다.
+   */
+  historicalSpentUsd?: number;
+  /**
    * 예산 ledger — 있으면 **호출 전에 예약**하고, 예약할 수 없으면 그 기록을 실행하지 않는다.
    * 없으면(fake/dry-run) 예산 강제가 없다.
    */
@@ -64,7 +72,18 @@ export interface RunnerResult {
   executed: number;
   skippedResume: number;
   budgetExhausted: boolean;
-  spentUsd: number;
+  /**
+   * 지출 세 가지를 **이름으로 구별한다.**
+   *
+   * 예전에는 `spentUsd` 하나였고 그것이 "이번 프로세스의 지출"이었는데 로그에는
+   * "누적 비용"으로 찍혔다. 재개한 실행에서 그 숫자를 보고 "$3밖에 안 썼네"라고 읽으면
+   * 실제로는 $23을 쓴 상태일 수 있다. 승인 상한과 비교되는 값은 cumulative뿐이다.
+   */
+  historicalSpentUsd: number;
+  sessionSpentUsd: number;
+  cumulativeSpentUsd: number;
+  /** 승인 상한이 있을 때 남은 금액. 상한이 없으면 `undefined`(0으로 적지 않는다). */
+  availableUsd?: number;
   /** 비용을 잴 수 없어 중단했는가 — 이건 경고가 아니라 실행 차단 사유다. */
   unmeasurableCostAbort: boolean;
   /** 중단 사유(있으면). 리포트와 종료 메시지에 그대로 나간다. */
@@ -75,10 +94,13 @@ export interface RunnerResult {
 /**
  * 예산 소진 판정. 순수 함수로 떼어둔 이유: 이 결정이 틀리면 실제 돈이 새므로
  * fake provider(단가 0) 없이도 경계값을 직접 검증할 수 있어야 한다.
+ *
+ * 인자 이름이 `cumulativeSpentUsd`인 것이 중요하다 — **이전 실행분을 포함한 값**이어야 한다.
+ * session 지출을 넘기면 재개 횟수만큼 상한이 늘어난다.
  */
-export function budgetStop(spentUsd: number, maxCostUsd: number | undefined): boolean {
+export function budgetStop(cumulativeSpentUsd: number, maxCostUsd: number | undefined): boolean {
   if (maxCostUsd === undefined) return false;
-  return spentUsd >= maxCostUsd;
+  return cumulativeSpentUsd >= maxCostUsd;
 }
 
 /** 초안 캐시 키 — 같은 fixture/반복이면 같은 초안을 공유한다. */
@@ -103,13 +125,21 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     }
   }
 
+  // 재개로 복원한 이전 지출. ledger가 있으면 그 값이 정본이다 — 두 곳에서 따로 세면 갈라진다.
+  const historicalSpentUsd = options.ledger?.historicalCommittedUsd() ?? options.historicalSpentUsd ?? 0;
+  const remaining = (cumulative: number): number | undefined =>
+    options.maxCostUsd === undefined ? undefined : options.maxCostUsd - cumulative;
+
   if (options.dryRun) {
     return {
       planned: plan.length,
       executed: 0,
       skippedResume: 0,
       budgetExhausted: false,
-      spentUsd: 0,
+      historicalSpentUsd,
+      sessionSpentUsd: 0,
+      cumulativeSpentUsd: historicalSpentUsd,
+      ...(remaining(historicalSpentUsd) !== undefined ? { availableUsd: remaining(historicalSpentUsd)! } : {}),
       unmeasurableCostAbort: false,
       dryRunPlan: plan.map((p) => ({ fixtureId: p.fixture.manifest.fixtureId, arm: p.arm, repetition: p.repetition })),
     };
@@ -117,7 +147,7 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
 
   /** Arm A가 만든 초안을 Arm C/D가 재생하기 위한 캐시. */
   const drafts = new Map<string, unknown>();
-  let spentUsd = 0;
+  let sessionSpentUsd = 0;
   let executed = 0;
   let skippedResume = 0;
   let budgetExhausted = false;
@@ -138,10 +168,15 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
       continue;
     }
 
-    if (budgetStop(spentUsd, options.maxCostUsd)) {
+    // **cumulative로 비교한다.** session만 보면 재개 횟수만큼 상한이 늘어난다.
+    if (budgetStop(historicalSpentUsd + sessionSpentUsd, options.maxCostUsd)) {
       // **새 API 호출을 시작하지 않는다.** 예산을 넘겨 쓰지 않는 것이 이 분기의 요점이다.
       budgetExhausted = true;
-      log(`예산 상한 $${options.maxCostUsd} 소진 — 남은 ${plan.length - executed - skippedResume}건을 실행하지 않습니다`);
+      log(
+        `예산 상한 $${options.maxCostUsd} 소진 (누적 $${(historicalSpentUsd + sessionSpentUsd).toFixed(4)} = ` +
+          `이전 $${historicalSpentUsd.toFixed(4)} + 이번 $${sessionSpentUsd.toFixed(4)}) — ` +
+          `남은 ${plan.length - executed - skippedResume}건을 실행하지 않습니다`
+      );
       break;
     }
 
@@ -204,7 +239,7 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
 
     appendChecked(options.store, record);
     executed += 1;
-    spentUsd += record.costUsd ?? 0;
+    sessionSpentUsd += record.costUsd ?? 0;
     if (reservation?.ok) {
       // 실제 사용량으로 정산한다. 비용을 모르면 예약을 해제하되(과금 여부를 모르므로 확정하지 않는다)
       // 바로 다음에서 중단하므로 더 이상 유료 호출은 없다.
@@ -226,12 +261,17 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     }
   }
 
+  const cumulativeSpentUsd = historicalSpentUsd + sessionSpentUsd;
+  const availableUsd = options.ledger ? options.ledger.availableUsd() : remaining(cumulativeSpentUsd);
   return {
     planned: plan.length,
     executed,
     skippedResume,
     budgetExhausted,
-    spentUsd,
+    historicalSpentUsd,
+    sessionSpentUsd,
+    cumulativeSpentUsd,
+    ...(availableUsd !== undefined ? { availableUsd } : {}),
     unmeasurableCostAbort,
     ...(abortReason !== undefined ? { abortReason } : {}),
   };

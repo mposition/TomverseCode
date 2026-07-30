@@ -76,7 +76,8 @@ TypeScript fixture 20개는 MSVC 없이도 그대로 검증된다.
 npm run gate:g:test       # 하네스 자동 테스트 (실제 API 없음, npm test에도 포함된다)
 npm run gate:g:validate   # fixture 품질 검증 (모델 호출 없음)
 npm run gate:g:dry-run    # preflight + 실행 계획만
-npm run gate:g:plan-pilot # **유료 실행 승인 카드** (실제 API 호출 0건)
+npm run gate:g:plan-pilot # **단계별(P0/P1) 유료 실행 승인 카드** (실제 API 호출 0건)
+npm run gate:g:probe-models  # 역할당 **최소 요청 1회**로 모델을 실제 확인 (--max-cost-usd 필수)
 npm run gate:g:pilot      # 반복 1회. 하네스·비용·실패 분류 확인용. PASS를 내지 않는다
 npm run gate:g:run        # confirmatory (기본 반복 3회)
 npm run gate:g:report     # 기존 기록으로 리포트만 재생성
@@ -84,7 +85,11 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 
 옵션: `--fixtures a,b` `--arms A,B,C,D` `--repetitions N` `--seed N`
 `--max-cost-usd N` `--max-concurrency 1` `--resume` `--output <run-dir>`
-`--executor-model <id>` `--reviewer-model <id>`
+`--stage smoke|pilot|confirmatory` `--executor-model <id>` `--reviewer-model <id>`
+`plan-pilot` 전용: `--p0-max-cost-usd N` `--p1-max-cost-usd N`
+
+**진행 순서**: `plan-pilot` → (카드가 `READY_FOR_MODEL_PROBE`면) `probe-models` →
+`plan-pilot` 재생성 → P0 카드 승인 → P0 `pilot` 실행 → P0가 완전히 정상 → P1 카드 승인 → P1 실행.
 
 종료 코드: `0`=PASS, `1`=FAIL, `2`=INCONCLUSIVE, `3`=하네스 오류, `4`=툴체인 미준비.
 
@@ -102,6 +107,19 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 타임아웃이면 예약을 해제한다. ledger 구현은 제품 코드(`@tomverse/sidecar/budget`)에 있다 —
 측정 도구에만 두면 제품의 유료 호출 경로에는 같은 보호가 없게 되기 때문이다.
 
+**재시작이 승인 상한을 늘리지 않는다.** 예전에는 재개할 때 원장을 `createBudgetLedger(limit)`로
+새로 만들어 `committed`가 0에서 시작했다. **$25 한도에서 $20을 쓴 뒤 재개하면 $25를 더 쓸 수
+있었다** — 재시작 횟수만큼 한도가 늘어나는 것이므로 "승인 한도"라는 말이 성립하지 않는다.
+이제 `records.jsonl`에서 확정 비용을 복원해 `initialCommittedUsd`로 넘기고, 승인 상한과 비교되는
+값은 **누적**(이전 + 이번)이다. 로그도 `이전 실행 확정` / `이번 실행 확정` / `전체 누적`을
+따로 적는다 — "누적 비용" 한 줄로 뭉치면 그 숫자가 session인지 전체인지 알 수 없다.
+
+**복원값이 수상하면 재개하지 않는다(fail closed).** 유료 호출을 했는데 비용이 없는 기록,
+`NaN`/`Infinity`/음수, `cost_unmeasurable` 기록, 같은 (fixture, arm, 반복)이 두 번 있는 파일 —
+어느 경우든 합계를 신뢰할 수 없으므로 멈춘다. "0으로 보고 계속"이 가장 위험하다: 그 순간
+한도가 사라진다. `budget-events.jsonl`(append-only)과 기록 파일의 합계가 다르면 **한쪽을 골라
+계속하지 않는다** — 어느 쪽이 맞는지 코드가 알 수 없다.
+
 **비용을 잴 수 없으면 경고가 아니라 중단이다.** 실제 응답에 usage가 없거나 모델 단가를
 모르면 그 기록을 `cost_unmeasurable` 인프라 실패로 남기고 **남은 유료 호출을 멈춘다.**
 비용을 0으로 대체하지 않는다 — 0은 fake에만 참이고, 모르는 것을 0으로 적으면 예산 상한이
@@ -117,8 +135,10 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 
 ```
 <run-dir>/
-  run.json        메타데이터 — 무엇을 어떤 조건으로 돌렸는가
-  records.jsonl   실행 기록 (최초 실행과 재개가 같은 파일을 쓴다)
+  run.json              메타데이터 — 무엇을 어떤 조건으로 돌렸는가 (stage 포함)
+  records.jsonl         실행 기록 (최초 실행과 재개가 같은 파일을 쓴다)
+  budget-events.jsonl   예산 원장 감사 추적 (append-only, 8가지 이벤트)
+  model-probe/          probe 결과 — **게이트 기록과 분리된다** (probe는 실험 표본이 아니다)
   report.md, summary.json, ...
 ```
 
@@ -130,6 +150,39 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 다르면 **거부한다.** 다른 조건의 기록을 한 파일에 섞으면 집계가 조용히 틀린다.
 예산은 낮춰서 재개할 수 있지만 이미 쓴 금액보다 낮으면 즉시 중단하고, 올리면 새 사용자
 승인으로 `run.json`에 기록된다. P0와 P1은 **다른 디렉터리**를 쓴다.
+
+## 모델 준비성 — "레지스트리에 있으므로 사용 가능"은 사실이 아니다
+
+`gpt-5`는 Model Registry에 있는데 미인증 계정에서 `model_not_found`로 실패한다. 모델 가용성은
+전역 사실이 아니라 **자격증명별 사실**이고, 그것을 확인하는 방법은 실제로 부르는 것뿐이다.
+그래서 하나의 `available` 필드 대신 **출처가 다른 사실들을 축별로** 적는다.
+
+| 축 | 누가 아는가 |
+|---|---|
+| `catalogKnown` | Model Registry |
+| `pricingKnown` | Model Registry (기준일 있는 단가) |
+| `structuredOutputDeclared` | Model Registry — **선언**이며 동작 확인이 아니다 |
+| `credentialPresent` | 환경 (값은 읽지 않고 존재만 본다) |
+| `liveProbeVerified` | **실제 요청만** |
+| `exactModelIdVerified` | **실제 요청만** (조용한 대체 탐지) |
+
+**오프라인 검사는 뒤 세 축을 true로 만들 수 없다.** `registryReadiness`가 항상 false로 두고,
+올리는 경로는 `withCredentialPresence`와 `withLiveProbe` 둘뿐이다.
+
+카드 상태도 그에 맞춰 셋이다:
+
+- `BLOCKED` — 고쳐야 할 것이 있다. probe를 돌려도 해결되지 않는다.
+- `READY_FOR_MODEL_PROBE` — 오프라인으로 확인할 수 있는 것은 전부 확인됐다. 다음은
+  `gate:g:probe-models`이며 **아직 유료 pilot을 승인할 수 없다.**
+- `READY_FOR_PAID_RUN` — 실제 호출로 모델·모델 ID·구조화 출력까지 확인됐다.
+
+### `gate:g:probe-models`
+
+역할당 **정확히 한 번** 최소 요청을 보낸다. 재시도도 fallback도 없다 — "다른 모델로 바꿔서라도
+성공"은 이 명령이 대답하려는 질문("이 모델이 되는가")을 지운다. production 어댑터를 그대로
+태우므로(`@tomverse/sidecar/providers`) 확인되는 것은 "공급자가 살아있다"가 아니라 **우리 코드
+경로가 이 모델과 구조화 출력까지 동작하는가**다. 요청 **전에** 예약하고, 비용을 잴 수 없으면
+중단하며, 결과는 `records.jsonl`이 아닌 `model-probe/`에 쓴다.
 
 ## 사전 등록된 판정 기준
 
@@ -187,11 +240,21 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 전부 통과한다.
 
 **유료 실행 안전장치: 완료.** 비용 상한 강제, 호출 전 예약, 측정 불가 시 중단, 순차 실행
-계약, 실행 디렉터리 기반 재개, 모델 가용성·가격 검증, 승인 카드가 모두 들어갔다.
+계약, 실행 디렉터리 기반 재개, **재개 시 예산 복구(재시작이 한도를 늘리지 않는다)**,
+append-only 예산 감사 추적, 모델 준비성 축 분리, 단계별(P0/P1) 승인 카드가 모두 들어갔다.
+
+**모델 실제 확인: 미실행.** `probe-models`는 구현되어 있고 mock transport로 검증되지만
+**실제로 돌리지 않았다** — 이 저장소에는 자격증명이 없고, 유료 호출은 사용자 승인 사항이다.
 
 **실제 가설 판정: INCONCLUSIVE — API 실험 미실행.** 이 저장소에는 OpenAI/Anthropic 자격증명이
 없으므로 pilot도 confirmatory도 돌리지 않았다. 성공률과 비용을 지어내지 않는다.
 
-다음 단계는 `npm run gate:g:plan-pilot -- --max-cost-usd <금액> --output <dir>`로 승인 카드를
-만들어 사용자가 승인하는 것이다. 카드에는 계획 기록 수, 최대 호출 수, 보수적 최대 비용,
-중단 조건이 들어가고 **실제 API 호출은 0건**이다.
+다음 단계:
+
+```bash
+npm run gate:g:plan-pilot -- --p0-max-cost-usd <P0 금액> --p1-max-cost-usd <P1 금액> --output <dir>
+npm run gate:g:probe-models -- --max-cost-usd <probe 금액> --output <dir>
+```
+
+카드에는 계획 기록 수, **총 provider 호출 상한(executor/reviewer 내역 포함)**, 보수적 최대 비용,
+중단 조건, 실행 명령이 들어가고 **실제 API 호출은 0건**이다.

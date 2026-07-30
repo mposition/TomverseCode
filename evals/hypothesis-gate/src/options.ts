@@ -1,5 +1,6 @@
 import path from "node:path";
 import { ARMS } from "./arms.js";
+import type { Stage } from "./runCard.js";
 import type { ArmId } from "./types.js";
 
 /**
@@ -28,6 +29,27 @@ export interface CliOptions {
   output: string;
   executorModel?: string;
   reviewerModel?: string;
+  /**
+   * 이 실행이 어느 단계인가. 기록 디렉터리의 `run.json`에 남아 **단계가 섞이는 것을 막는다** —
+   * P0 smoke를 돌린 디렉터리에 P1 pilot을 이어붙이면 두 계획의 기록이 한 파일에 섞인다.
+   * 지정하지 않으면 명령에서 유도한다(pilot → pilot, run → confirmatory).
+   */
+  stage?: Stage;
+  /** plan-pilot 전용 — P0 단계에 승인할 금액. */
+  p0MaxCostUsd?: number;
+  /** plan-pilot 전용 — P1 단계에 승인할 금액. P0와 규모가 크게 다르므로 따로 받는다. */
+  p1MaxCostUsd?: number;
+}
+
+const STAGES: readonly Stage[] = Object.freeze(["smoke", "pilot", "confirmatory"]);
+
+export function parseStage(raw: string): Stage {
+  const text = raw.trim();
+  const found = STAGES.find((s) => s === text);
+  if (!found) {
+    throw new OptionError(`--stage: 알 수 없는 단계 ${JSON.stringify(raw)} (가능한 값: ${STAGES.join(", ")})`);
+  }
+  return found;
 }
 
 export class OptionError extends Error {}
@@ -91,10 +113,15 @@ function concurrencyUsage(problem: string): string {
   ].join("\n");
 }
 
-/** 실제 공급자를 쓰는 유료 명령인가. fake와 dry-run은 여기 해당하지 않는다. */
+/**
+ * 실제 공급자를 쓰는 유료 명령인가. fake와 dry-run은 여기 해당하지 않는다.
+ *
+ * `probe-models`도 여기 들어간다 — 요청이 두 번뿐이라도 실제 돈이 나가므로, 상한 없이
+ * 시작할 수 있게 두면 "작으니까 괜찮다"가 예외의 시작점이 된다.
+ */
 export function isPaidCommand(command: string, usingFakeProvider: boolean): boolean {
   if (usingFakeProvider) return false;
-  return command === "pilot" || command === "run";
+  return command === "pilot" || command === "run" || command === "probe-models";
 }
 
 export function parseArgs(argv: string[], defaultOutput: string): CliOptions {
@@ -133,6 +160,15 @@ export function parseArgs(argv: string[], defaultOutput: string): CliOptions {
       case "--max-cost-usd":
         options.maxCostUsd = parseCostLimit(next());
         break;
+      case "--p0-max-cost-usd":
+        options.p0MaxCostUsd = parseCostLimit(next());
+        break;
+      case "--p1-max-cost-usd":
+        options.p1MaxCostUsd = parseCostLimit(next());
+        break;
+      case "--stage":
+        options.stage = parseStage(next());
+        break;
       case "--max-concurrency":
         options.maxConcurrency = parseConcurrency(next());
         break;
@@ -155,7 +191,29 @@ export function parseArgs(argv: string[], defaultOutput: string): CliOptions {
   if (!Number.isFinite(options.repetitions) || options.repetitions < 1) {
     throw new OptionError("--repetitions는 1 이상의 정수여야 합니다");
   }
+  assertStageMatchesCommand(options);
   return options;
+}
+
+/**
+ * 단계와 명령이 맞는가.
+ *
+ * `gate:g:run`(confirmatory)에 `--stage smoke`를 붙이면 24 fixture × 3회를 smoke 디렉터리에
+ * 쓰게 된다. 그런 조합을 실행하면 승인 절차가 뜻을 잃으므로 파싱 단계에서 막는다.
+ */
+export function assertStageMatchesCommand(options: CliOptions): void {
+  if (options.stage === undefined) return;
+  const allowed: Record<string, Stage[]> = {
+    pilot: ["smoke", "pilot"],
+    run: ["confirmatory"],
+  };
+  const permitted = allowed[options.command];
+  if (permitted === undefined) return;
+  if (!permitted.includes(options.stage)) {
+    throw new OptionError(
+      `${options.command} 명령에는 --stage ${permitted.join(" 또는 ")}만 쓸 수 있습니다 (받은 값: ${options.stage})`
+    );
+  }
 }
 
 /**
@@ -173,8 +231,8 @@ export function requireCostLimitForPaidRun(options: CliOptions, usingFakeProvide
       "올바른 사용 예:",
       `  npm run gate:g:${options.command} -- --max-cost-usd 25 --output <run-dir>`,
       "",
-      "먼저 계획을 확인하세요:",
-      "  npm run gate:g:plan-pilot -- --max-cost-usd 25 --output <run-dir>",
+      "먼저 계획을 확인하세요 (단계별 승인 금액을 따로 받습니다):",
+      "  npm run gate:g:plan-pilot -- --p0-max-cost-usd 15 --p1-max-cost-usd 160 --output <run-dir>",
       "",
       "예산 상한 없이 유료 실행하는 방법은 제공하지 않습니다.",
     ].join("\n")
