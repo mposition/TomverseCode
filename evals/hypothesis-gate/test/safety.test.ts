@@ -43,7 +43,7 @@ import {
 import { createAdapterProbeTransport } from "../src/probeTransport.js";
 import { preflight } from "../src/preflight.js";
 import { quotePowerShellArg } from "../src/shellQuote.js";
-import { loadAllFixtures, listFixtureIds } from "../src/manifest.js";
+import { loadAllFixtures, listFixtureIds, type LoadedFixture } from "../src/manifest.js";
 import {
   estimateRecordCost,
   maxCallsPerRecord,
@@ -2486,9 +2486,48 @@ function runCli(args: string[], env: NodeJS.ProcessEnv = {}): CliResult {
  */
 const CLI_FAKE_KEYS = { OPENAI_API_KEY: "test-openai-key-value", ANTHROPIC_API_KEY: "test-anthropic-key-value" };
 
+/**
+ * CLI 테스트가 쓰는 **TypeScript 전용** fixture.
+ *
+ * # 왜 Rust fixture를 쓰지 않는가
+ *
+ * preflight는 Rust fixture가 하나라도 있으면 MSVC 툴체인을 요구하고, 없으면 blocker로 막는다.
+ * 그건 정당한 차단이지만 **run-card 게이트보다 먼저** 일어난다. Visual Studio가 없는 Windows에서
+ * 이 테스트들이 "카드가 없어서 거부"가 아니라 "MSVC가 없어서 거부"로 실패했다 — 실측으로 그랬다.
+ * Linux에서는 `prepareMsvcEnv`가 `not_needed`를 주므로 드러나지 않는 종류의 차이다.
+ *
+ * 확인하려는 것은 승인 게이트이고 네이티브 툴체인과 무관하므로, fixture를 TypeScript로 좁혀
+ * 그 축을 아예 제거한다. 아래 `assertReachedGate`가 "네이티브 fixture 0개"를 확인하므로,
+ * 나중에 누가 Rust fixture를 다시 넣으면 **Linux에서도** 실패한다.
+ */
+function typescriptFixtures(): LoadedFixture[] {
+  const all = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+  const ts = all.filter((f) => f.manifest.language === "typescript");
+  assert.ok(ts.length > 0, "TypeScript fixture가 없습니다");
+  // `selectSmokeFixtures`와 같은 결정론(id 순 첫 항목)을 쓴다.
+  return [...ts].sort((a, b) => a.manifest.fixtureId.localeCompare(b.manifest.fixtureId)).slice(0, 1);
+}
+
+/**
+ * preflight를 지나 **승인 게이트까지 도달했는지** 확인한다.
+ *
+ * 이 확인이 없으면 "다른 이유로 거부됐는데 테스트는 통과"가 가능하다 — 그게 이번 Windows
+ * 실패에서 드러난 문제의 반대편이다.
+ */
+function assertReachedGate(result: CliResult): void {
+  assert.ok(
+    result.stdout.includes("네이티브(Rust) fixture: 0개"),
+    `Rust fixture가 섞였습니다 — MSVC 유무에 따라 결과가 달라집니다:\n${result.stdout.slice(0, 400)}`
+  );
+  assert.ok(
+    !result.stdout.includes("MSVC 미준비"),
+    `preflight의 MSVC blocker에 걸렸습니다 — 승인 게이트에 도달하지 못했습니다:\n${result.stdout.slice(0, 400)}`
+  );
+}
+
 test("54. --run-card 없는 유료 pilot은 기록을 하나도 만들지 않고 거부된다", () => {
   withDir((dir) => {
-    const smoke = selectSmokeFixtures(loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT)));
+    const smoke = typescriptFixtures();
     const result = runCli(
       [
         "pilot",
@@ -2504,6 +2543,7 @@ test("54. --run-card 없는 유료 pilot은 기록을 하나도 만들지 않고
       CLI_FAKE_KEYS
     );
     assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+    assertReachedGate(result);
     assert.ok(result.stdout.includes("--run-card가 필수입니다"), result.stdout);
     assert.ok(result.stdout.includes("실제 API 호출: 0건"), result.stdout);
     // **기록이 없다** = host를 띄우지 않았다 = provider를 부르지 않았다.
@@ -2517,7 +2557,8 @@ test("54b. 유효한 카드가 있어도 열린 예약이 있으면 provider를 
   withDir((base) => {
     const runDir = path.join(base, "p0-smoke");
     const probeDir = path.join(base, "model-probe");
-    const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+    // **TypeScript 전용 fixture.** Rust가 섞이면 MSVC 유무가 결과를 바꾼다(위 주석).
+    const fixtures = typescriptFixtures();
     const smoke = selectSmokeFixtures(fixtures);
     const now = new Date().toISOString();
 
@@ -2590,6 +2631,7 @@ test("54b. 유효한 카드가 있어도 열린 예약이 있으면 provider를 
       CLI_FAKE_KEYS
     );
     assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+    assertReachedGate(result);
     // 카드는 통과했다는 것을 확인한다 — 그래야 다음 게이트가 실제로 막았음을 알 수 있다.
     assert.ok(result.stdout.includes("Run Card 승인 확인"), result.stdout);
     assert.ok(result.stdout.includes("BLOCKED_UNRESOLVED_RESERVATION"), result.stdout);
@@ -2607,7 +2649,7 @@ test("54c. evidence의 자격증명이 다르면 유효한 카드로도 실행�
   withDir((base) => {
     const runDir = path.join(base, "p0-smoke");
     const probeDir = path.join(base, "model-probe");
-    const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+    const fixtures = typescriptFixtures();
     const smoke = selectSmokeFixtures(fixtures);
     const now = new Date().toISOString();
     const models = planModels({ credentialPresence: () => true });
@@ -2675,6 +2717,7 @@ test("54c. evidence의 자격증명이 다르면 유효한 카드로도 실행�
       CLI_FAKE_KEYS
     );
     assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+    assertReachedGate(result);
     assert.ok(result.stdout.includes("BLOCKED_INVALID_PROBE_EVIDENCE"), result.stdout);
     assert.ok(result.stdout.includes("probe 당시와 다릅니다"), result.stdout);
     assert.equal(existsSync(path.join(runDir, RECORDS_FILE)), false, "기록 파일이 생겼습니다");

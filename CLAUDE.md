@@ -255,6 +255,12 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 - **`String.raw` 템플릿은 trailing backslash로 끝낼 수 없다.** 백틱을 escape해 버려서
   `String.raw`C:\temp\`` 는 문자열이 닫히지 않는다. 그리고 trailing backslash는 Windows 경로
   인용 테스트가 **반드시 확인해야 하는 경우**다 — 백슬래시를 이중화한 일반 문자열을 쓸 것.
+- **CLI를 하위 프로세스로 돌리는 테스트에 Rust fixture를 쓰지 말 것.** preflight는 Rust
+  fixture가 하나라도 있으면 MSVC를 요구하고 없으면 blocker로 막는데, 그 차단이 **검증하려는
+  게이트보다 먼저** 일어난다. Visual Studio가 없는 Windows에서 "카드가 없어서 거부"를 기대한
+  테스트가 "MSVC가 없어서 거부"로 실패했다 — Linux는 `not_needed`를 주므로 드러나지 않는다.
+  fixture를 TypeScript로 좁히고, **"네이티브 fixture 0개"를 테스트가 확인**해서 나중에 Rust가
+  다시 섞이면 Linux에서도 실패하게 할 것.
 - **소스를 검사하는 테스트는 자기 자신을 센다.** 검사 대상 토큰을 assertion 안에 그대로 적으면
   개수 비교가 언제나 어긋난다. needle을 런타임에 조립하거나(`"foo" + "("`) 괄호 깊이로 호출
   범위를 잘라낼 것.
