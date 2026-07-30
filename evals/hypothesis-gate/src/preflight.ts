@@ -1,4 +1,5 @@
 import { prepareMsvcEnv, type MsvcResult } from "@tomverse/toolchain";
+import { computeCallBudget, describeCallBudget } from "./callBudget.js";
 import { artifactsPresent, REPO_ROOT } from "./host.js";
 import { CRITERIA, criteriaHash, describeCriteria } from "./criteria.js";
 import type { ArmId } from "./types.js";
@@ -95,11 +96,17 @@ export function preflight(input: PreflightInput): PreflightReport {
     `공급자 독립성(검수자 ≠ 실행자): ${independence ? "성립" : "불성립 — 교차검증 arm을 돌릴 수 없습니다"}`
   );
 
-  // 최대 API 호출 수. Arm A는 draft 1회, C/D는 review 1회(초안 재생), B는 draft 1회.
-  // fix loop가 최대 3회 더 부를 수 있으므로 상한은 그 배수다.
-  const perRunMaxCalls = 1 + 3;
-  const maxCalls = input.fixtureCount * input.arms.length * input.repetitions * perRunMaxCalls;
-  lines.push(`최대 API 호출 수(상한, fix loop 포함): ${maxCalls}`);
+  // **호출 수는 공용 계산기에서 온다** (§9).
+  //
+  // 예전에는 여기서 `fixture × arm × 반복 × 4`로 executor 호출만 세고 그 값을
+  // "최대 API 호출 수"로 표시했다. confirmatory에서 화면에는 1,152가 찍혔고 실제 상한은
+  // 1,584였다(executor 1,152 + reviewer 432). 같은 수를 두 곳에서 세면 반드시 갈라진다.
+  const callBudget = computeCallBudget({
+    fixtureCount: input.fixtureCount,
+    arms: input.arms,
+    repetitions: input.repetitions,
+  });
+  for (const line of describeCallBudget(callBudget)) lines.push(line);
   lines.push(`예산 상한: ${input.maxCostUsd === undefined ? "(미지정 — 상한 없이 진행)" : `$${input.maxCostUsd}`}`);
 
   if (input.usingFakeProvider) {

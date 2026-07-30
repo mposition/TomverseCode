@@ -189,10 +189,25 @@ export function withCredentialPresence(readiness: ModelReadiness, present: boole
  */
 export function withLiveProbe(
   readiness: ModelReadiness,
-  probe: { outcome: LiveProbeOutcome; returnedModelId?: string; checkedAt: string; note?: string }
+  probe: {
+    outcome: LiveProbeOutcome;
+    returnedModelId?: string;
+    /**
+     * Model Registry가 이 응답 ID를 인정했는가(`providerModelIdAccepted`).
+     *
+     * 이 판정을 여기서 다시 하지 않는 이유: 허용 목록(`acceptedProviderModelIds`)은 레지스트리
+     * 계약이고, 같은 규칙을 두 곳에 적으면 한쪽만 고쳐질 수 있다. 주어지지 않으면 **정확히
+     * 일치만** 인정한다 — 기본값이 느슨한 쪽이면 이 축이 있으나 마나다.
+     */
+    acceptedByRegistry?: boolean;
+    checkedAt: string;
+    note?: string;
+  }
 ): ModelReadiness {
-  const exact =
-    probe.outcome === "verified" && probe.returnedModelId !== undefined && probe.returnedModelId === readiness.modelId;
+  const idMatches =
+    probe.acceptedByRegistry ??
+    (probe.returnedModelId !== undefined && probe.returnedModelId === readiness.modelId);
+  const exact = probe.outcome === "verified" && idMatches;
   const notes = [...readiness.notes];
   if (probe.note) notes.push(probe.note);
   if (probe.outcome === "verified" && !exact) {

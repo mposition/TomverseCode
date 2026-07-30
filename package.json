@@ -30,6 +30,10 @@
     "gate:g:plan-pilot": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js plan-pilot",
     "//gate:g:probe-models": "역할당 최소 요청 1회로 모델을 실제 확인한다. **실제 API를 부르므로 --max-cost-usd가 필수다.** 카드가 READY_FOR_MODEL_PROBE일 때 다음으로 도는 명령.",
     "gate:g:probe-models": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js probe-models",
+    "//gate:g:budget-status": "실행 디렉터리의 예산 상태를 **읽기만** 한다. 열린 예약을 자동으로 정리하는 위험한 명령은 만들지 않는다 — 과금 여부는 공급자 청구 내역으로만 확인된다.",
+    "gate:g:budget-status": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js budget-status",
+    "//gate:g:attest-p0": "P0 결과를 검사해 attestation을 만든다. P1은 이 attestation 없이 실행되지 않는다. API 호출 없음.",
+    "gate:g:attest-p0": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js attest-p0",
     "gate:g:pilot": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js pilot",
     "gate:g:run": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js run",
     "gate:g:report": "npm run build --workspace=@tomverse/hypothesis-gate && node evals/hypothesis-gate/dist/src/cli.js report"

@@ -39,6 +39,19 @@ import type { ModelEntry } from "@tomverse/protocol";
  * 원장은 이벤트를 만들기만 하고, 어디에 쓸지는 sink가 정한다(가설 게이트는 JSONL에 쓴다).
  *
  * **자격증명·API 키·authorization 헤더는 담지 않는다.** 이 이벤트는 저장되고 사람이 읽는다.
+ *
+ * # 왜 정산이 이벤트 하나인가
+ *
+ * 예전에는 정산이 `reservation_settled` + `provider_usage_recorded` 두 이벤트였다. 그 사이에
+ * 프로세스가 죽으면 "정산은 됐는데 usage는 모르는" 상태가 남고, 그건 어느 쪽을 믿어야 하는지
+ * 알 수 없는 상태다. 이제 **비용·usage·응답 모델 ID를 `reservation_settled` 하나에 담는다** —
+ * crash window를 이벤트 사이에서 없애는 것이 목적이다. `provider_usage_recorded`는 호환을 위해
+ * 남아 있지만 비용의 정본이 아니다(아래 참조).
+ *
+ * # 비용의 정본은 `reservation_settled`다
+ *
+ * 한 예약의 확정 비용은 그 예약의 **terminal 이벤트**가 말한다. `records.jsonl`은 실험 기록이고
+ * 파생물이다. 둘이 다르면 어느 쪽도 믿지 않고 멈춘다(`reconcileEvents`).
  */
 export type BudgetEventType =
   | "approval_created"
@@ -48,9 +61,34 @@ export type BudgetEventType =
   | "reservation_settled"
   | "provider_usage_recorded"
   | "budget_estimate_breached"
-  | "run_blocked";
+  | "run_blocked"
+  /** 과금 여부를 확정할 수 없는 채로 끝난 예약. **terminal이 아니다** — 사람이 확인해야 한다. */
+  | "reservation_unresolved"
+  /** 정산 값이 수치 검증을 통과하지 못했다. 이후 유료 호출을 차단한다. */
+  | "budget_ledger_invalid";
+
+/**
+ * 이벤트 스키마 버전.
+ *
+ * 읽는 쪽이 **모르는 버전을 만나면 해석하지 않고 멈춘다.** 새 필드를 무시하고 계속하면
+ * "그 필드에 담긴 비용을 못 본 채로 재개"가 가능해지고, 그건 이 원장이 막으려는 것과 같은 사고다.
+ */
+export const BUDGET_EVENT_VERSION = 2;
+
+/** provider 요청이 실제로 나갔는가 — 과금 가능성을 판정하는 축 (§6). */
+export type DispatchState =
+  /** 요청을 보내지 않았다. 과금 없음이 확실하다. */
+  | "not_dispatched"
+  /** 보냈지만 응답을 받지 못했다. **과금 여부 불확실.** */
+  | "dispatched_no_response"
+  /** 응답을 받았고 usage가 있다. 실제 비용으로 정산할 수 있다. */
+  | "response_received_with_usage"
+  /** 응답을 받았지만 usage가 없다. **과금됐을 수 있으나 금액을 모른다.** */
+  | "response_received_without_usage";
 
 export interface BudgetEvent {
+  /** 스키마 버전. 모르는 버전은 해석하지 않는다. */
+  eventVersion: number;
   type: BudgetEventType;
   at: string;
   /** 어느 실행인가. 재시작 후 같은 원장을 이어받는 근거다. */
@@ -65,6 +103,15 @@ export interface BudgetEvent {
   actualUsd?: number;
   cumulativeUsd: number;
   reason?: string;
+  /** 정산 이벤트에 함께 담는 사용량. 이벤트 사이 crash window를 없애기 위한 것이다. */
+  usage?: { inputTokens: number; outputTokens: number };
+  /** 우리가 요청한 모델 ID. */
+  requestedModelId?: string;
+  /** **공급자 응답 envelope이 실어 온** 모델 ID. 조용한 대체를 사후에 감사할 근거다. */
+  providerReportedModelId?: string;
+  /** 공급자 요청 ID(제공되는 경우). 공급자 지원 문의에 쓸 수 있다. */
+  providerRequestId?: string;
+  dispatchState?: DispatchState;
 }
 
 export interface LedgerContext {
@@ -86,6 +133,15 @@ export interface LedgerOptions extends Partial<LedgerContext> {
    * 있었다.** 재시작 횟수만큼 한도가 늘어나는 것이므로 "승인 한도"라는 말이 성립하지 않는다.
    */
   initialCommittedUsd?: number;
+  /**
+   * 이전 실행에서 **미해결로 남은 예약액**.
+   *
+   * 열린 예약은 "쓰지 않은 돈"이 아니다 — 공급자가 요청을 처리하고 과금했을 수 있다.
+   * 그래서 사용 가능한 예산으로 되돌리지 않고 상한에서 계속 빼둔다. 다만 이 원장은
+   * 애초에 그 상태로 만들어지지 않는다(재개가 차단되므로) — 상태 조회 명령이 남은 예산을
+   * 사람에게 보여줄 때 쓰는 경로다.
+   */
+  initialUnresolvedUsd?: number;
 }
 
 /** 이 호출/작업이 낼 수 있는 **최대** 비용과 그 근거. */
@@ -95,13 +151,82 @@ export interface CostEstimate {
   basis: string;
 }
 
+/**
+ * 측정된 값과 **측정하지 못한 값을 타입으로 구별한다** (§7).
+ *
+ * 예전에는 `settle(actualUsd: number)`였고, NaN·Infinity·음수를 0으로 바꿨다. 0은 "공짜"라는
+ * 뜻이고 그건 fake에만 참이므로, 모르는 것을 0으로 적으면 예산 상한이 아무것도 막지 못한다.
+ * 숫자 하나로는 "0달러였다"와 "모른다"를 구별할 수 없으니 타입을 나눈다.
+ */
+export type CostMeasurement =
+  | { measured: true; usd: number }
+  | { measured: false; reason: string };
+
+export type UsageMeasurement =
+  | { measured: true; inputTokens: number; outputTokens: number }
+  | { measured: false; reason: string };
+
+/** 정산에 필요한 사실 전부. 하나의 terminal 이벤트에 함께 들어간다. */
+export interface Settlement {
+  cost: CostMeasurement;
+  usage: UsageMeasurement;
+  /**
+   * 실제 공급자였는가. `real`이면 입력·출력 토큰이 **둘 다 0인 것은 측정 실패로 본다** —
+   * 실제 호출이 0 토큰을 쓰는 일은 없다. fake는 0이 정상이다.
+   */
+  providerKind: "real" | "fake";
+  requestedModelId?: string;
+  providerReportedModelId?: string;
+  providerRequestId?: string;
+  dispatchState?: DispatchState;
+}
+
+/** 원장이 더 이상 유료 호출을 허용하지 않는 상태들. */
+export type LedgerState =
+  | "OK"
+  /** 실제 비용이 예약액을 초과했다 — 추정을 신뢰할 수 없다. */
+  | "BUDGET_ESTIMATE_BREACH"
+  /** 비용을 측정할 수 없었다. */
+  | "COST_UNMEASURABLE"
+  /** 정산 값이 수치 검증을 통과하지 못했다(NaN/Infinity/음수 등). */
+  | "BUDGET_LEDGER_INVALID"
+  /** 과금 여부가 불확실한 예약이 남았다. */
+  | "UNRESOLVED_RESERVATION";
+
+export type SettleOutcome =
+  | { ok: true; committedUsd: number }
+  | {
+      ok: false;
+      /** 이 실패로 원장이 들어간 상태. 이후 예약은 전부 거부된다. */
+      state: LedgerState;
+      reason: string;
+    };
+
 export interface Reservation {
   readonly id: string;
   readonly reservedUsd: number;
-  /** 실제 사용량이 확정됐을 때. 예약을 풀고 확정 비용을 누적한다. */
-  settle(actualUsd: number): void;
-  /** 호출이 취소·타임아웃·오류로 끝나 비용이 발생하지 않았을 때. */
-  release(): void;
+  /**
+   * 실제 사용량이 확정됐을 때. 예약을 풀고 확정 비용을 누적한다.
+   *
+   * **수치 검증을 통과하지 못하면 예약을 풀지 않는다.** 조용히 0으로 정산하면 그 순간
+   * 상한이 사라지므로, 예약을 열린 채로 남기고 원장을 차단 상태로 만든다 —
+   * 그러면 재개도 막히고 사람이 확인하게 된다.
+   */
+  settle(settlement: Settlement): SettleOutcome;
+  /**
+   * 요청이 **나가지 않았을 때만** 예약을 해제한다.
+   *
+   * 인자로 `dispatchState: "not_dispatched"`를 요구하는 것이 요점이다 — 타입이 "보냈는데
+   * 해제"를 막는다. 보낸 뒤의 실패는 과금 여부를 모르므로 `markUnresolved`다.
+   */
+  release(grounds: { dispatchState: "not_dispatched"; reason: string }): void;
+  /**
+   * 과금 여부를 확정할 수 없는 채로 끝났다. **예약을 풀지 않는다.**
+   *
+   * 공급자가 응답을 만들고 과금한 뒤 파싱이나 스키마 검증에서 실패했을 수 있다.
+   * 그 경우 "해제"는 쓴 돈을 안 쓴 것으로 만드는 것이므로, 미해결로 남기고 멈춘다.
+   */
+  markUnresolved(grounds: { dispatchState: DispatchState; reason: string }): void;
   /** 이미 정산/해제됐는가 — 이중 정산을 막는다. */
   readonly settled: boolean;
 }
@@ -114,6 +239,8 @@ export type ReserveOutcome =
       reason: string;
       requestedUsd: number;
       availableUsd: number;
+      /** 원장이 차단 상태여서 거부된 경우 그 상태. */
+      state?: LedgerState;
     };
 
 export interface BudgetLedger {
@@ -127,8 +254,12 @@ export interface BudgetLedger {
   cumulativeCommittedUsd(): number;
   /** 진행 중인 호출을 위해 잡아둔 금액. */
   reservedUsd(): number;
-  /** 지금 새 호출에 쓸 수 있는 금액 = 상한 − historical − session − 예약. */
+  /** 과금 여부가 불확실해 미해결로 남은 금액. 사용 가능한 예산으로 돌아오지 않는다. */
+  unresolvedUsd(): number;
+  /** 지금 새 호출에 쓸 수 있는 금액 = 상한 − historical − session − 예약 − 미해결. */
   availableUsd(): number;
+  /** 원장 상태. `OK`가 아니면 새 예약을 받지 않는다. */
+  state(): LedgerState;
   /**
    * 추정이 실제를 감당하지 못한 사실이 확인됐는가.
    * 한 번 true가 되면 이후 예약은 전부 거부된다 — 추정을 신뢰할 수 없는 상태에서
@@ -151,11 +282,14 @@ export interface BudgetSnapshot {
   sessionCommittedUsd: number;
   cumulativeCommittedUsd: number;
   reservedUsd: number;
+  unresolvedUsd: number;
   availableUsd: number;
+  state: LedgerState;
   estimateBreached: boolean;
   reservationsOpened: number;
   reservationsSettled: number;
   reservationsReleased: number;
+  reservationsUnresolved: number;
 }
 
 /**
@@ -189,6 +323,54 @@ export function validateInitialCommitted(value: number): { ok: true } | { ok: fa
   return { ok: true };
 }
 
+/**
+ * 정산 값의 수치 검증 (§7).
+ *
+ * 순수 함수로 떼어둔 이유: 이 판정이 틀리면 실제 돈이 새고, 그때 원장 인스턴스를 만들지 않고도
+ * 경계값을 직접 확인할 수 있어야 한다.
+ */
+export function validateSettlement(
+  settlement: Settlement
+): { ok: true; usd: number; inputTokens: number; outputTokens: number } | { ok: false; reason: string } {
+  if (!settlement.cost.measured) {
+    return { ok: false, reason: `비용을 측정하지 못했습니다: ${settlement.cost.reason}` };
+  }
+  const usd = settlement.cost.usd;
+  if (!Number.isFinite(usd)) {
+    return { ok: false, reason: `실제 비용이 유한한 수가 아닙니다 (${usd})` };
+  }
+  if (usd < 0) {
+    return { ok: false, reason: `실제 비용이 음수입니다 (${usd})` };
+  }
+  if (!settlement.usage.measured) {
+    return { ok: false, reason: `사용량을 측정하지 못했습니다: ${settlement.usage.reason}` };
+  }
+  for (const [name, value] of [
+    ["inputTokens", settlement.usage.inputTokens],
+    ["outputTokens", settlement.usage.outputTokens],
+  ] as const) {
+    if (!Number.isFinite(value)) return { ok: false, reason: `${name}이 유한한 수가 아닙니다 (${value})` };
+    if (value < 0) return { ok: false, reason: `${name}이 음수입니다 (${value})` };
+  }
+  if (
+    settlement.providerKind === "real" &&
+    settlement.usage.inputTokens === 0 &&
+    settlement.usage.outputTokens === 0
+  ) {
+    // 실제 호출이 0 토큰을 쓰는 일은 없다. 이건 "공짜였다"가 아니라 "usage를 못 읽었다"다.
+    return {
+      ok: false,
+      reason: "실제 공급자 응답인데 입력·출력 토큰이 모두 0입니다 — usage를 읽지 못한 것으로 봅니다",
+    };
+  }
+  return {
+    ok: true,
+    usd,
+    inputTokens: settlement.usage.inputTokens,
+    outputTokens: settlement.usage.outputTokens,
+  };
+}
+
 export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOptions = {}): BudgetLedger {
   const check = validateApprovedLimit(approvedLimitUsd);
   if (!check.ok) throw new Error(check.reason);
@@ -197,12 +379,19 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
   const historicalCheck = validateInitialCommitted(historical);
   if (!historicalCheck.ok) throw new Error(historicalCheck.reason);
 
+  const initialUnresolved = options.initialUnresolvedUsd ?? 0;
+  const unresolvedCheck = validateInitialCommitted(initialUnresolved);
+  if (!unresolvedCheck.ok) throw new Error(unresolvedCheck.reason);
+
   const runId = options.runId ?? "(unknown-run)";
   const stage = options.stage ?? "(unknown-stage)";
   const now = options.now ?? ((): string => new Date().toISOString());
-  const emit = (event: Omit<BudgetEvent, "at" | "runId" | "stage" | "approvedLimitUsd" | "cumulativeUsd">): void => {
+  const emit = (
+    event: Omit<BudgetEvent, "eventVersion" | "at" | "runId" | "stage" | "approvedLimitUsd" | "cumulativeUsd">
+  ): void => {
     options.onEvent?.({
       ...event,
+      eventVersion: BUDGET_EVENT_VERSION,
       at: now(),
       runId,
       stage,
@@ -213,14 +402,29 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
 
   let session = 0;
   let reserved = 0;
+  let unresolved = initialUnresolved;
   let opened = 0;
   let settledCount = 0;
   let releasedCount = 0;
-  let breached = false;
+  let unresolvedCount = 0;
+  let ledgerState: LedgerState = initialUnresolved > 0 ? "UNRESOLVED_RESERVATION" : "OK";
 
-  const available = (): number => approvedLimitUsd - historical - session - reserved;
+  const available = (): number => approvedLimitUsd - historical - session - reserved - unresolved;
 
-  emit({ type: "approval_created", reason: `초기 승인 상한 $${approvedLimitUsd}, 복원된 누적 $${historical}` });
+  emit({
+    type: "approval_created",
+    reason: `초기 승인 상한 $${approvedLimitUsd}, 복원된 누적 $${historical}, 미해결 $${initialUnresolved}`,
+  });
+
+  /** 원장을 차단 상태로 만들고 감사 이벤트를 남긴다. 되돌리지 않는다. */
+  const block = (state: LedgerState, correlationId: string | undefined, reason: string): void => {
+    ledgerState = state;
+    emit({
+      type: state === "BUDGET_LEDGER_INVALID" ? "budget_ledger_invalid" : "run_blocked",
+      ...(correlationId !== undefined ? { correlationId } : {}),
+      reason: `[${state}] ${reason}`,
+    });
+  };
 
   return {
     approvedLimitUsd,
@@ -228,17 +432,19 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
     sessionCommittedUsd: () => session,
     cumulativeCommittedUsd: () => historical + session,
     reservedUsd: () => reserved,
+    unresolvedUsd: () => unresolved,
     availableUsd: available,
-    estimateBreached: () => breached,
+    state: () => ledgerState,
+    estimateBreached: () => ledgerState === "BUDGET_ESTIMATE_BREACH",
 
     reserve(estimate, label) {
-      // **추정이 한 번 틀린 것이 확인되면 더 이상 유료 호출을 시작하지 않는다.**
-      if (breached) {
+      // **원장이 한 번 차단되면 더 이상 유료 호출을 시작하지 않는다.**
+      if (ledgerState !== "OK") {
         const reason =
-          `${label}: 이전 호출의 실제 비용이 예약액을 초과했습니다 (BUDGET_ESTIMATE_BREACH). ` +
-          `추정을 신뢰할 수 없는 상태로는 유료 호출을 계속하지 않습니다.`;
+          `${label}: 원장이 ${ledgerState} 상태입니다 — ` +
+          `이 상태에서 유료 호출을 계속하는 것은 예산 상한이 없는 것과 같습니다.`;
         emit({ type: "run_blocked", correlationId: label, reason });
-        return { ok: false, reason, requestedUsd: estimate.maxUsd, availableUsd: available() };
+        return { ok: false, reason, requestedUsd: estimate.maxUsd, availableUsd: available(), state: ledgerState };
       }
       if (!Number.isFinite(estimate.maxUsd) || estimate.maxUsd < 0) {
         // 비용을 계산할 수 없으면 **추측해서 진행하지 않는다.** 예산 상한이 아무것도 막지
@@ -252,7 +458,7 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
           `${label}: 예상 최대 비용 $${estimate.maxUsd.toFixed(4)}가 남은 예산 ` +
           `$${available().toFixed(4)}를 초과합니다 (승인 상한 $${approvedLimitUsd}, ` +
           `이미 확정 $${(historical + session).toFixed(4)} = 이전 $${historical.toFixed(4)} + ` +
-          `이번 $${session.toFixed(4)}). ${estimate.basis}`;
+          `이번 $${session.toFixed(4)}, 미해결 $${unresolved.toFixed(4)}). ${estimate.basis}`;
         emit({ type: "run_blocked", correlationId: label, reason });
         return { ok: false, reason, requestedUsd: estimate.maxUsd, availableUsd: available() };
       }
@@ -270,22 +476,58 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
         get settled() {
           return done;
         },
-        settle(actualUsd: number) {
+        settle(settlement: Settlement): SettleOutcome {
           if (done) throw new Error(`예약 ${id}이(가) 이미 정산되었습니다`);
+
+          const validated = validateSettlement(settlement);
+          if (!validated.ok) {
+            // **예약을 풀지 않는다.** 0으로 정산하면 그 금액만큼 상한이 되살아나고,
+            // 그건 실제로 과금됐을 수 있는 돈을 안 쓴 것으로 만드는 것이다.
+            const state: LedgerState = settlement.cost.measured ? "BUDGET_LEDGER_INVALID" : "COST_UNMEASURABLE";
+            emit({
+              type: "reservation_unresolved",
+              correlationId: id,
+              reservedUsd: amount,
+              reason: validated.reason,
+              ...(settlement.dispatchState ? { dispatchState: settlement.dispatchState } : {}),
+              ...(settlement.requestedModelId ? { requestedModelId: settlement.requestedModelId } : {}),
+              ...(settlement.providerReportedModelId
+                ? { providerReportedModelId: settlement.providerReportedModelId }
+                : {}),
+            });
+            unresolved += amount;
+            reserved -= amount;
+            unresolvedCount += 1;
+            done = true;
+            block(state, id, validated.reason);
+            return { ok: false, state, reason: validated.reason };
+          }
+
           done = true;
           settledCount += 1;
           reserved -= amount;
-          // 실제 비용이 예약보다 클 수 있다(추정이 틀린 경우). 그때도 **실제 값을 기록한다** —
-          // 예약액으로 깎아 기록하면 장부가 실제 청구액과 어긋난다.
-          const actual = Number.isFinite(actualUsd) && actualUsd > 0 ? actualUsd : 0;
+          const actual = validated.usd;
           session += actual;
-          emit({ type: "reservation_settled", correlationId: id, reservedUsd: amount, actualUsd: actual });
-          emit({ type: "provider_usage_recorded", correlationId: id, actualUsd: actual });
+          // **비용·usage·응답 모델 ID가 한 이벤트에 함께 들어간다.** 두 이벤트로 나누면
+          // 그 사이에 죽었을 때 어느 쪽을 믿어야 하는지 알 수 없다.
+          emit({
+            type: "reservation_settled",
+            correlationId: id,
+            reservedUsd: amount,
+            actualUsd: actual,
+            usage: { inputTokens: validated.inputTokens, outputTokens: validated.outputTokens },
+            ...(settlement.requestedModelId ? { requestedModelId: settlement.requestedModelId } : {}),
+            ...(settlement.providerReportedModelId
+              ? { providerReportedModelId: settlement.providerReportedModelId }
+              : {}),
+            ...(settlement.providerRequestId ? { providerRequestId: settlement.providerRequestId } : {}),
+            ...(settlement.dispatchState ? { dispatchState: settlement.dispatchState } : {}),
+          });
 
           // **예약보다 실제가 크면 추정이 틀렸다는 뜻이다.** 조용히 넘기면 available이 음수인
           // 상태로 계속 돌 수 있고, 그건 승인 한도가 없는 것과 같다.
           if (actual > amount) {
-            breached = true;
+            ledgerState = "BUDGET_ESTIMATE_BREACH";
             emit({
               type: "budget_estimate_breached",
               correlationId: id,
@@ -296,13 +538,35 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
                 `이후 유료 호출을 차단합니다.`,
             });
           }
+          return { ok: true, committedUsd: historical + session };
         },
-        release() {
+        release(grounds) {
           if (done) throw new Error(`예약 ${id}이(가) 이미 정산되었습니다`);
           done = true;
           releasedCount += 1;
           reserved -= amount;
-          emit({ type: "reservation_released", correlationId: id, reservedUsd: amount });
+          emit({
+            type: "reservation_released",
+            correlationId: id,
+            reservedUsd: amount,
+            reason: grounds.reason,
+            dispatchState: grounds.dispatchState,
+          });
+        },
+        markUnresolved(grounds) {
+          if (done) throw new Error(`예약 ${id}이(가) 이미 정산되었습니다`);
+          done = true;
+          unresolvedCount += 1;
+          reserved -= amount;
+          unresolved += amount;
+          emit({
+            type: "reservation_unresolved",
+            correlationId: id,
+            reservedUsd: amount,
+            reason: grounds.reason,
+            dispatchState: grounds.dispatchState,
+          });
+          block("UNRESOLVED_RESERVATION", id, grounds.reason);
         },
       };
       return { ok: true, reservation };
@@ -324,11 +588,14 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
       sessionCommittedUsd: session,
       cumulativeCommittedUsd: historical + session,
       reservedUsd: reserved,
+      unresolvedUsd: unresolved,
       availableUsd: available(),
-      estimateBreached: breached,
+      state: ledgerState,
+      estimateBreached: ledgerState === "BUDGET_ESTIMATE_BREACH",
       reservationsOpened: opened,
       reservationsSettled: settledCount,
       reservationsReleased: releasedCount,
+      reservationsUnresolved: unresolvedCount,
     }),
   };
 }

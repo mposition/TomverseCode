@@ -276,6 +276,64 @@ P0에서 실제 usage를 얻은 뒤에 다루는 것이 옳은 순서다.
 이 세 가지가 정해지기 전에 제품 경로에 예약을 끼워 넣으면, "상한을 넘어 거부됐는데 태스크가
 조용히 실패로 끝나는" 동작을 먼저 만들게 된다. 그건 지금 없는 보호보다 나쁘다.
 
+## 10.7 비용의 정본은 예약의 terminal 이벤트다 (crash-safe 재개)
+
+실행 순서는 (1) `reservation_opened` → (2) provider 호출 → (3) `records.jsonl` 기록 →
+(4) `reservation_settled`다. **(1) 이후 어디서든 프로세스가 죽을 수 있다.**
+
+예전 대조 검사는 `reservation_settled`의 합계와 기록 파일의 비용 합계만 비교했다. 그러면
+개시만 있고 종결이 없는 예약은 **어떤 합계에도 나타나지 않는다.** 두 합계가 모두 0이면
+"아무것도 안 썼다"로 읽히고 재개가 허용되는데, 그 요청은 공급자가 처리하고 과금했을 수 있다.
+즉 프로세스를 죽였다 되살리는 것만으로 같은 예산을 다시 쓸 수 있었다.
+
+**결정: 한 예약의 확정 비용은 그 예약의 terminal 이벤트가 말한다.** `records.jsonl`은 실험
+기록이며 파생물이다. 정본을 이벤트 쪽에 두는 이유는 셋이다.
+
+1. 기록은 **실험 단위**(fixture × arm × 반복)이고 예약도 같은 단위지만, 예약은 기록이 만들어지기
+   **전에** 열린다. 기록만 보면 "열렸지만 기록되지 않은" 상태를 표현할 수 없다.
+2. 이벤트는 append-only이고 correlationId로 이어지므로, 상태 머신으로 검증할 수 있다.
+   허용되는 흐름은 `opened → settled`와 `opened → released` 둘뿐이며 나머지는 전부 fail closed다.
+3. 기록 파일은 리포트 생성이 다시 쓰기도 하는 파생 산출물이다. 돈의 정본을 파생물에 두면
+   파이프라인 어딘가의 재생성이 장부를 바꾼다.
+
+두 값이 다르면 **어느 쪽도 믿지 않고 멈춘다.** 어느 쪽이 맞는지 코드가 알 수 없고, 틀린 쪽을
+믿으면 한도를 넘겨 쓰거나 남은 예산을 잃는다.
+
+**정산은 이벤트 하나다.** 예전에는 `reservation_settled` + `provider_usage_recorded` 두 개였고
+그 사이가 crash window였다("정산은 됐는데 usage는 모르는" 상태). 이제 비용·usage·응답 모델 ID를
+`reservation_settled` 하나에 담는다. `provider_usage_recorded`는 읽기 호환을 위해 남아 있고,
+있으면 정산 비용과 일치하는지 검사하지만 **비용의 정본은 아니다.**
+
+**열린 예약을 자동으로 정리하지 않는다.** 그 요청이 실제로 과금됐는지는 공급자 콘솔의 청구
+내역으로만 확인되고, 코드가 대신 판단하면 사용자 돈이 새거나 남은 예산을 잃는다. 그래서
+자동 복구 명령을 만들지 않고 읽기 전용 조회(`gate:g:budget-status`)만 둔다. 열린 예약액은
+사용 가능한 예산으로 되돌리지 않고 상한에서 계속 빼둔다 — 재시작 횟수만큼 그 금액을 다시 쓸 수
+있게 되는 것이 이번에 고친 결함이기 때문이다.
+
+**과금 여부가 불확실한 실패는 해제하지 않는다.** provider 호출 실패를 네 상태로 나눈다:
+`not_dispatched`(해제 가능), `response_received_with_usage`(실제 비용으로 정산),
+`dispatched_no_response`·`response_received_without_usage`(미해결로 남기고 중단). 공급자가 응답을
+생성하고 과금한 뒤 우리 쪽 파싱이나 스키마 검증에서 실패하는 경우가 있으므로, "예외가 났으니
+해제"는 쓴 돈을 안 쓴 것으로 만드는 것이다. 네트워크 타임아웃도 여기 속한다 — 응답이 생성됐지만
+받지 못한 것일 수 있고 그건 청구된다. 반대로 인증 실패·모델 미지원·rate limit·5xx는 공급자가
+요청을 거절한 것이므로 청구되지 않는다. 이 선을 더 보수적으로 그으면(모든 실패를 불확실로)
+일시적 5xx 하나가 실행 디렉터리를 영구히 막고, 그건 보호가 아니라 사용 불가다.
+
+## 10.8 exact-model 검증은 응답 envelope만 본다
+
+`DraftProposal.model`과 `ReviewDecision.model`은 어댑터가 `this.modelId`를 **우리가 넣는** 값이다.
+그건 요청한 모델 ID이므로, 그 값으로 "요청한 모델이 그대로 왔다"를 판정하면 **항상 통과한다** —
+즉 조용한 대체를 절대 잡지 못하는 검증이었다.
+
+이제 `ProviderResponse.meta`가 응답 envelope의 `model` 필드(`providerReportedModelId`)와
+요청 ID, 공급자 요청 ID, dispatch 상태를 실어 나른다. envelope에 모델이 없으면 `undefined`이며
+**요청 ID로 채우지 않는다.** 모르는 것을 아는 것처럼 적으면 검증이 무의미해진다.
+
+alias 문제는 정규화가 아니라 **명시적 허용 목록**으로 푼다(`ModelEntry.acceptedProviderModelIds`).
+prefix 비교를 쓰면 `claude-sonnet-5`가 `claude-sonnet-5.5`의 prefix이므로 **다른 모델을
+통과시킨다.** 목록이 비어 있으면 정확히 일치만 허용한다 — 기본값이 느슨한 쪽이면 이 축이 있으나
+마나다. 실험에서는 alias보다 pinned(dated) 모델 ID를 우선한다.
+
 ## 11. Tomverse Insight의 기존 자산 재사용
 
 **3절의 Model Registry를 백지에서 만들 필요가 없다.** Tomverse Insight(`H:\Project\ai-chat-hub`, 리포지토리 `mposition/Tomverse`)에 이미 동등한 구조가 프로덕션에서 돌고 있다.

@@ -39,6 +39,16 @@ export interface CliOptions {
   p0MaxCostUsd?: number;
   /** plan-pilot 전용 — P1 단계에 승인할 금액. P0와 규모가 크게 다르므로 따로 받는다. */
   p1MaxCostUsd?: number;
+  /**
+   * 유료 실행이 근거로 삼는 Run Card 파일. **pilot/run에 필수다**(fake 실행은 면제).
+   *
+   * 예전에는 카드가 화면에만 출력됐고 실행은 그것을 요구하지 않았다. 즉 승인 절차가 있는
+   * 것처럼 보이지만 강제되지 않았다. 우회 플래그는 만들지 않는다 — "이번만 카드 없이"를
+   * 허용하는 순간 그게 기본 사용법이 된다.
+   */
+  runCard?: string;
+  /** probe evidence 파일 경로. 지정하지 않으면 실행 디렉터리 규약 위치를 본다. */
+  probeEvidence?: string;
 }
 
 const STAGES: readonly Stage[] = Object.freeze(["smoke", "pilot", "confirmatory"]);
@@ -168,6 +178,12 @@ export function parseArgs(argv: string[], defaultOutput: string): CliOptions {
         break;
       case "--stage":
         options.stage = parseStage(next());
+        break;
+      case "--run-card":
+        options.runCard = path.resolve(next());
+        break;
+      case "--probe-evidence":
+        options.probeEvidence = path.resolve(next());
         break;
       case "--max-concurrency":
         options.maxConcurrency = parseConcurrency(next());

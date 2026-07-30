@@ -20,12 +20,14 @@ import {
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
 } from "./prompts.js";
+import { ProviderCallFailure } from "./types.js";
 import type {
   AdapterDeps,
   DraftInput,
   FixInput,
   ProviderAdapter,
   ProviderCallContext,
+  ProviderCallMetadata,
   ProviderResponse,
   ReviewInput,
 } from "./types.js";
@@ -89,7 +91,7 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   async generateDraft(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<DraftProposal>> {
-    const { parsed, usage, latencyMs } = await this.forcedToolCall(
+    const { parsed, usage, latencyMs, meta } = await this.forcedToolCall(
       buildDraftPrompt(input),
       { name: "submit_draft", description: "Submit your draft fix.", schema: DRAFT_SCHEMA },
       ctx
@@ -103,11 +105,12 @@ export class AnthropicAdapter implements ProviderAdapter {
       }),
       usage,
       latencyMs,
+      meta,
     };
   }
 
   async reviewProposal(input: ReviewInput, ctx: ProviderCallContext): Promise<ProviderResponse<ReviewDecision>> {
-    const { parsed, usage, latencyMs } = await this.forcedToolCall(
+    const { parsed, usage, latencyMs, meta } = await this.forcedToolCall(
       buildReviewPrompt(input),
       {
         name: "submit_review",
@@ -128,11 +131,12 @@ export class AnthropicAdapter implements ProviderAdapter {
       }),
       usage,
       latencyMs,
+      meta,
     };
   }
 
   async singleModelFix(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<SingleModelFixResult>> {
-    const { parsed, usage, latencyMs } = await this.forcedToolCall(
+    const { parsed, usage, latencyMs, meta } = await this.forcedToolCall(
       buildSingleModelFixPrompt(input),
       { name: "submit_fix", description: "Submit your fix, a question, or a rejection.", schema: SINGLE_FIX_SCHEMA },
       ctx
@@ -145,6 +149,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       }),
       usage,
       latencyMs,
+      meta,
     };
   }
 
@@ -152,7 +157,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     input: FixInput,
     ctx: ProviderCallContext
   ): Promise<ProviderResponse<SingleModelFixResult>> {
-    const { parsed, usage, latencyMs } = await this.forcedToolCall(
+    const { parsed, usage, latencyMs, meta } = await this.forcedToolCall(
       buildFixPrompt(input),
       {
         name: "submit_fix",
@@ -169,6 +174,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       }),
       usage,
       latencyMs,
+      meta,
     };
   }
 
@@ -176,7 +182,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     prompt: string,
     tool: { name: string; description: string; schema: unknown },
     ctx: ProviderCallContext
-  ): Promise<{ parsed: unknown; usage: TokenUsage; latencyMs: number }> {
+  ): Promise<{ parsed: unknown; usage: TokenUsage; latencyMs: number; meta: ProviderCallMetadata }> {
     const controller = new AbortController();
     this.controllers.add(controller);
     const onAbort = () => controller.abort(ctx.signal.reason);
@@ -203,21 +209,56 @@ export class AnthropicAdapter implements ProviderAdapter {
       );
 
       const latencyMs = Date.now() - start;
+      const usage = this.normalizeUsage(message.usage);
+      // **Messages API 응답 envelope의 model을 읽는다.** ReviewDecision.model은 우리가 넣은
+      // 요청 ID이므로 exact-model 검증에 쓸 수 없다.
+      const meta: ProviderCallMetadata = {
+        requestedModelId: this.modelId,
+        ...envelopeIdentity(message),
+        dispatchState: "response_received_with_usage",
+      };
       const block = message.content.find(
         (b): b is Anthropic.ToolUseBlock => b.type === "tool_use" && b.name === tool.name
       );
       if (!block) {
         // tool_choice로 강제했는데도 도구 호출이 없으면 스키마 계약 위반이다.
-        const error = new Error(`Anthropic 응답에 ${tool.name} tool_use 블록이 없음`) as Error & { status?: number };
-        error.status = 400;
-        throw error;
+        // **응답은 이미 받았고 과금됐다** — 아는 사실을 오류에 실어 보낸다.
+        throw new ProviderCallFailure({
+          message: `Anthropic 응답에 ${tool.name} tool_use 블록이 없음`,
+          dispatchState: meta.dispatchState,
+          classification: {
+            kind: "schema_violation",
+            message: `${tool.name} tool_use 블록 없음`,
+            status: 400,
+            retryable: false,
+          },
+          usage,
+          ...(meta.providerReportedModelId ? { providerReportedModelId: meta.providerReportedModelId } : {}),
+          ...(meta.providerRequestId ? { providerRequestId: meta.providerRequestId } : {}),
+          latencyMs,
+          status: 400,
+        });
       }
-      return { parsed: block.input, usage: this.normalizeUsage(message.usage), latencyMs };
+      return { parsed: block.input, usage, latencyMs, meta };
     } finally {
       ctx.signal.removeEventListener("abort", onAbort);
       this.controllers.delete(controller);
     }
   }
+}
+
+/**
+ * 응답 envelope에서 모델 ID와 요청 ID를 뽑는다. **없으면 채우지 않는다** —
+ * `this.modelId`로 폴백하면 exact-model 검증이 항상 통과해 무의미해진다.
+ */
+function envelopeIdentity(message: unknown): { providerReportedModelId?: string; providerRequestId?: string } {
+  const candidate = message as { model?: unknown; id?: unknown };
+  const out: { providerReportedModelId?: string; providerRequestId?: string } = {};
+  if (typeof candidate.model === "string" && candidate.model.length > 0) {
+    out.providerReportedModelId = candidate.model;
+  }
+  if (typeof candidate.id === "string" && candidate.id.length > 0) out.providerRequestId = candidate.id;
+  return out;
 }
 
 /** 레지스트리 엔트리에 맞는 어댑터를 만든다. 모델 ID를 코드에 고정하지 않기 위한 팩토리. */

@@ -53,6 +53,26 @@ export interface ModelEntry {
   capabilities: ModelCapabilities;
   economics: ModelEconomics;
   availability: ModelAvailability;
+  /**
+   * 이 엔트리로 요청했을 때 **응답 envelope이 실어 올 수 있는 모델 ID의 명시적 목록.**
+   *
+   * # 왜 필요한가
+   *
+   * 공급자는 alias(`claude-sonnet-5`)로 요청해도 dated ID(`claude-sonnet-5-20250929`)로
+   * 응답할 수 있다. 그때 `providerReportedModelId === requestedModelId`는 거짓이 되고,
+   * 실험은 정당한 응답을 조용한 대체로 오판한다.
+   *
+   * 그렇다고 prefix 비교나 정규화로 풀지 않는다 — `claude-sonnet-5`가 `claude-sonnet-5.5`의
+   * prefix이기도 하므로, prefix 규칙은 **다른 모델을 통과시킨다.** 정규화 규칙은 공급자의
+   * 명명 관례가 바뀌면 조용히 틀리기도 한다.
+   *
+   * 그래서 허용 목록을 사람이 명시한다. 비어 있거나 없으면 **정확히 일치만** 허용한다 —
+   * 기본값이 느슨한 쪽이면 이 축이 있으나 마나다.
+   *
+   * 실험에서는 alias보다 **pinned(dated) 모델 ID를 우선**한다. 그러면 이 목록이 필요 없고,
+   * "무엇을 측정했는가"가 시간이 지나도 그대로 남는다.
+   */
+  acceptedProviderModelIds?: ModelId[];
   // 8절 부트스트랩 — 초기엔 비어있고 실제 실행 데이터가 쌓이면 채워진다.
   evaluation?: ModelEvaluation;
 }

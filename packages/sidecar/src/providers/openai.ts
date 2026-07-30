@@ -20,12 +20,14 @@ import {
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
 } from "./prompts.js";
+import { ProviderCallFailure } from "./types.js";
 import type {
   AdapterDeps,
   DraftInput,
   FixInput,
   ProviderAdapter,
   ProviderCallContext,
+  ProviderCallMetadata,
   ProviderResponse,
   ReviewInput,
 } from "./types.js";
@@ -99,7 +101,7 @@ export class OpenAIAdapter implements ProviderAdapter {
   }
 
   async generateDraft(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<DraftProposal>> {
-    const { parsed, usage, latencyMs } = await this.structuredCall(
+    const { parsed, usage, latencyMs, meta } = await this.structuredCall(
       buildDraftPrompt(input),
       { name: "draft_proposal", schema: DRAFT_SCHEMA, strict: true },
       ctx
@@ -113,11 +115,12 @@ export class OpenAIAdapter implements ProviderAdapter {
       }),
       usage,
       latencyMs,
+      meta,
     };
   }
 
   async reviewProposal(input: ReviewInput, ctx: ProviderCallContext): Promise<ProviderResponse<ReviewDecision>> {
-    const { parsed, usage, latencyMs } = await this.structuredCall(
+    const { parsed, usage, latencyMs, meta } = await this.structuredCall(
       buildReviewPrompt(input),
       { name: "review_decision", schema: REVIEW_SCHEMA, strict: false },
       ctx
@@ -133,11 +136,12 @@ export class OpenAIAdapter implements ProviderAdapter {
       }),
       usage,
       latencyMs,
+      meta,
     };
   }
 
   async singleModelFix(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<SingleModelFixResult>> {
-    const { parsed, usage, latencyMs } = await this.structuredCall(
+    const { parsed, usage, latencyMs, meta } = await this.structuredCall(
       buildSingleModelFixPrompt(input),
       { name: "single_model_fix", schema: SINGLE_FIX_SCHEMA, strict: false },
       ctx
@@ -150,6 +154,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       }),
       usage,
       latencyMs,
+      meta,
     };
   }
 
@@ -157,7 +162,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     input: FixInput,
     ctx: ProviderCallContext
   ): Promise<ProviderResponse<SingleModelFixResult>> {
-    const { parsed, usage, latencyMs } = await this.structuredCall(
+    const { parsed, usage, latencyMs, meta } = await this.structuredCall(
       buildFixPrompt(input),
       { name: "single_model_fix", schema: SINGLE_FIX_SCHEMA, strict: false },
       ctx
@@ -170,6 +175,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       }),
       usage,
       latencyMs,
+      meta,
     };
   }
 
@@ -177,7 +183,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     prompt: string,
     format: { name: string; schema: unknown; strict: boolean },
     ctx: ProviderCallContext
-  ): Promise<{ parsed: unknown; usage: TokenUsage; latencyMs: number }> {
+  ): Promise<{ parsed: unknown; usage: TokenUsage; latencyMs: number; meta: ProviderCallMetadata }> {
     const controller = new AbortController();
     this.controllers.add(controller);
     const onAbort = () => controller.abort(ctx.signal.reason);
@@ -203,6 +209,14 @@ export class OpenAIAdapter implements ProviderAdapter {
       );
 
       const latencyMs = Date.now() - start;
+      const usage = this.normalizeUsage(response.usage);
+      // **응답 envelope의 model을 읽는다.** 우리가 요청한 값이 아니라 공급자가 말한 값이며,
+      // 조용한 대체를 잡을 수 있는 유일한 근거다. 없으면 undefined로 남긴다.
+      const meta: ProviderCallMetadata = {
+        requestedModelId: this.modelId,
+        ...envelopeIdentity(response),
+        dispatchState: "response_received_with_usage",
+      };
       const text = extractOutputText(response);
       let parsed: unknown;
       try {
@@ -210,13 +224,21 @@ export class OpenAIAdapter implements ProviderAdapter {
       } catch (cause) {
         // 구조화 출력을 강제했는데도 JSON이 아니면 schema_violation이다 —
         // 재시도 정책이 이 구분에 의존하므로 일반 오류로 뭉개지 않는다.
-        const error = new Error(
-          `OpenAI 구조화 출력이 JSON이 아님: ${cause instanceof Error ? cause.message : String(cause)}`
-        ) as Error & { status?: number };
-        error.status = 400;
-        throw error;
+        //
+        // **응답은 이미 받았고 과금됐다.** 그래서 평범한 Error가 아니라 아는 사실을 실은
+        // ProviderCallFailure를 던진다 — 호출자가 예약을 해제할지 미해결로 남길지 판단할 수 있어야 한다.
+        throw new ProviderCallFailure({
+          message: `OpenAI 구조화 출력이 JSON이 아님: ${cause instanceof Error ? cause.message : String(cause)}`,
+          dispatchState: meta.dispatchState,
+          classification: { kind: "schema_violation", message: "구조화 출력이 JSON이 아님", status: 400, retryable: false },
+          usage,
+          ...(meta.providerReportedModelId ? { providerReportedModelId: meta.providerReportedModelId } : {}),
+          ...(meta.providerRequestId ? { providerRequestId: meta.providerRequestId } : {}),
+          latencyMs,
+          status: 400,
+        });
       }
-      return { parsed, usage: this.normalizeUsage(response.usage), latencyMs };
+      return { parsed, usage, latencyMs, meta };
     } finally {
       ctx.signal.removeEventListener("abort", onAbort);
       this.controllers.delete(controller);
@@ -228,6 +250,22 @@ export class OpenAIAdapter implements ProviderAdapter {
  * `output_text` 편의 프로퍼티가 없거나 빈 SDK 형태에 대한 폴백.
  * 스파이크에서 이미 필요했던 방어이므로 그대로 유지한다.
  */
+/**
+ * 응답 envelope에서 모델 ID와 요청 ID를 뽑는다.
+ *
+ * **없으면 채우지 않는다.** `this.modelId`로 폴백하면 "요청한 모델이 그대로 왔다"가 항상
+ * 참이 되어 검증이 무의미해진다 — 그 폴백이 정확히 이번에 고친 결함이다.
+ */
+function envelopeIdentity(response: unknown): { providerReportedModelId?: string; providerRequestId?: string } {
+  const candidate = response as { model?: unknown; id?: unknown };
+  const out: { providerReportedModelId?: string; providerRequestId?: string } = {};
+  if (typeof candidate.model === "string" && candidate.model.length > 0) {
+    out.providerReportedModelId = candidate.model;
+  }
+  if (typeof candidate.id === "string" && candidate.id.length > 0) out.providerRequestId = candidate.id;
+  return out;
+}
+
 function extractOutputText(response: unknown): string {
   const candidate = response as {
     output_text?: unknown;

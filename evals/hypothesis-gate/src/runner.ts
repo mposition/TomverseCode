@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { BudgetLedger } from "@tomverse/sidecar/budget";
+import type { BudgetLedger, DispatchState } from "@tomverse/sidecar/budget";
 import { armExecutionOrder, armSpec, ARMS } from "./arms.js";
 import { criteriaHash } from "./criteria.js";
 import { allPayloads, lastPayload, readEvents, runHost, type HostRunResult } from "./host.js";
@@ -101,6 +101,36 @@ export interface RunnerResult {
 export function budgetStop(cumulativeSpentUsd: number, maxCostUsd: number | undefined): boolean {
   if (maxCostUsd === undefined) return false;
   return cumulativeSpentUsd >= maxCostUsd;
+}
+
+/**
+ * 이 기록의 provider 요청이 실제로 나갔는가 (§6).
+ *
+ * # 왜 순수 함수인가
+ *
+ * 이 판정이 "예약을 해제할지 미해결로 남길지"를 결정한다. 틀리면 (a) 과금된 돈을 안 쓴 것으로
+ * 만들거나 (b) 정상 실행을 영구히 막는다. 둘 다 비싸므로 fake provider 없이 경계값을 직접
+ * 검증할 수 있어야 한다.
+ *
+ * # 왜 network_timeout만 불확실인가
+ *
+ * 과금은 공급자가 토큰을 생성했을 때 발생한다. 인증 실패·모델 미지원·rate limit·5xx는 공급자가
+ * 요청을 거절한 것이므로 청구되지 않는다. **네트워크 타임아웃은 다르다** — 응답이 생성됐지만
+ * 우리가 받지 못한 것일 수 있고, 그건 청구된다. 그래서 이것만 미해결로 남긴다.
+ *
+ * 이 선을 더 보수적으로 그으면(모든 실패를 불확실로) 일시적 5xx 하나가 실행 디렉터리를
+ * 영구히 막는다. 그건 보호가 아니라 사용 불가다.
+ */
+export function classifyDispatch(record: {
+  providerCallCount: number;
+  costUsd?: number;
+  failureClass?: string;
+}): DispatchState {
+  if (record.providerCallCount > 0) {
+    return record.costUsd === undefined ? "response_received_without_usage" : "response_received_with_usage";
+  }
+  if (record.failureClass === "network_timeout") return "dispatched_no_response";
+  return "not_dispatched";
 }
 
 /** 초안 캐시 키 — 같은 fixture/반복이면 같은 초안을 공유한다. */
@@ -224,8 +254,14 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     try {
       record = executeOne({ ...options, fixture, arm, repetition, replayDraft, criteriaHashValue: hash });
     } catch (error) {
-      // 예외로 빠져나가도 ledger가 예약을 물고 있으면 남은 예산이 영영 줄어든 채로 남는다.
-      if (reservation?.ok) reservation.reservation.release();
+      // 예외로 빠져나가면 **요청이 나갔는지 알 수 없다.** 해제하면 과금됐을 수 있는 돈을
+      // 안 쓴 것으로 만드는 것이므로, 미해결로 남기고 사람이 확인하게 한다.
+      if (reservation?.ok) {
+        reservation.reservation.markUnresolved({
+          dispatchState: "dispatched_no_response",
+          reason: `하네스 예외로 중단되어 provider 호출 여부를 확인할 수 없습니다: ${String(error).slice(0, 200)}`,
+        });
+      }
       throw error;
     }
 
@@ -241,10 +277,37 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     executed += 1;
     sessionSpentUsd += record.costUsd ?? 0;
     if (reservation?.ok) {
-      // 실제 사용량으로 정산한다. 비용을 모르면 예약을 해제하되(과금 여부를 모르므로 확정하지 않는다)
-      // 바로 다음에서 중단하므로 더 이상 유료 호출은 없다.
-      if (record.costUsd === undefined) reservation.reservation.release();
-      else reservation.reservation.settle(record.costUsd);
+      const dispatch = classifyDispatch(record);
+      if (dispatch === "response_received_with_usage" && record.costUsd !== undefined) {
+        const outcome = reservation.reservation.settle({
+          cost: { measured: true, usd: record.costUsd },
+          usage: { measured: true, inputTokens: record.inputTokens, outputTokens: record.outputTokens },
+          providerKind: record.providerKind,
+          requestedModelId: record.requestedModelId,
+          ...(record.returnedModelId ? { providerReportedModelId: record.returnedModelId } : {}),
+          dispatchState: dispatch,
+        });
+        if (!outcome.ok) {
+          // 수치 검증 실패 — 원장이 차단 상태가 됐다. 남은 유료 호출을 시작하지 않는다.
+          unmeasurableCostAbort = true;
+          abortReason = `${fixtureId} rep${repetition} Arm ${arm}: ${outcome.reason} (원장 상태 ${outcome.state})`;
+          log(abortReason);
+          break;
+        }
+      } else if (dispatch === "not_dispatched") {
+        reservation.reservation.release({
+          dispatchState: "not_dispatched",
+          reason: `provider 호출 없이 끝난 기록입니다 (${record.failureClass ?? "사유 없음"})`,
+        });
+      } else {
+        // **과금 여부를 모른다.** 해제하지 않고 미해결로 남긴다.
+        reservation.reservation.markUnresolved({
+          dispatchState: dispatch,
+          reason:
+            `${dispatch}: 요청이 나갔지만 비용을 확정할 수 없습니다 ` +
+            `(${record.failureClass ?? "사유 없음"}, provider 호출 ${record.providerCallCount}회)`,
+        });
+      }
     }
 
     if (costUnmeasurable) {

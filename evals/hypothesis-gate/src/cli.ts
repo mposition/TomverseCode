@@ -6,11 +6,14 @@ import { BUILTIN_MODELS, ModelRegistry } from "@tomverse/sidecar/registry";
 import {
   approvalCoversHistorical,
   budgetEventsPath,
+  budgetStatus,
   createBudgetEventSink,
   readBudgetEvents,
-  reconcile,
+  reconcileBudget,
   recoverSpendFromRecords,
+  renderBudgetStatus,
 } from "./budgetRecovery.js";
+import { computeCallBudget, describeCallBudget } from "./callBudget.js";
 import { criteriaHash, CRITERIA, describeCriteria } from "./criteria.js";
 import { prepareMsvcEnv } from "@tomverse/toolchain";
 import { REPO_ROOT } from "./host.js";
@@ -18,10 +21,39 @@ import { loadAllFixtures, listFixtureIds } from "./manifest.js";
 import { credentialPresent, preflight } from "./preflight.js";
 import { estimateRecordCost, lookupModel, maxCallsPerRecord, planModels, isModelPlan } from "./models.js";
 import { OptionError, parseArgs, requireCostLimitForPaidRun, type CliOptions } from "./options.js";
-import { PROBE_BUDGET_EVENTS_FILE, probeModels, renderProbeSummary, writeProbeResults } from "./probeModels.js";
-import { createAdapterProbeTransport } from "./probeTransport.js";
+import {
+  attestP0,
+  loadP0Attestation,
+  p0AttestationPath,
+  renderAttestation,
+  validateP0Attestation,
+  writeP0Attestation,
+} from "./p0Attestation.js";
+import {
+  loadProbeEvidence,
+  probeEvidencePath,
+  validateProbeEvidence,
+  writeProbeEvidence,
+  type ProbeEvidence,
+} from "./probeEvidence.js";
+import {
+  bindingForRoles,
+  PROBE_BUDGET_EVENTS_FILE,
+  probeModels,
+  renderProbeSummary,
+  writeProbeResults,
+} from "./probeModels.js";
+import { ADAPTER_CONTRACT_VERSION, createAdapterProbeTransport } from "./probeTransport.js";
 import { openRecordStore } from "./records.js";
-import { buildStagedCards, renderRunCard } from "./runCard.js";
+import {
+  authorizeRunCard,
+  buildStagedCards,
+  cardFileFor,
+  loadRunCard,
+  renderRunCard,
+  writeRunCard,
+  type Stage,
+} from "./runCard.js";
 import { checkCompatibility, META_VERSION, readMeta, runDirPaths, withApproval, writeMeta } from "./runDir.js";
 import { ARMS } from "./arms.js";
 import { writeReports } from "./report.js";
@@ -59,17 +91,20 @@ async function main(): Promise<number> {
   requireCostLimitForPaidRun(options, usingFake);
 
   if (options.command === "help") {
-    log("usage: gate <validate|dry-run|plan-pilot|probe-models|pilot|run|report> [옵션]");
+    log("usage: gate <validate|dry-run|plan-pilot|probe-models|budget-status|attest-p0|pilot|run|report> [옵션]");
     log("");
     log("옵션: --fixtures a,b --arms A,B,C,D --repetitions N --seed N");
     log("      --max-cost-usd N --max-concurrency 1 --resume --output <run-dir>");
     log("      --stage smoke|pilot|confirmatory --executor-model <id> --reviewer-model <id>");
     log("      plan-pilot 전용: --p0-max-cost-usd N --p1-max-cost-usd N");
+    log("      유료 실행 필수: --run-card <path>   (선택: --probe-evidence <path>)");
     log("");
     log("--max-cost-usd는 실제 공급자를 쓰는 pilot/run에 **필수**입니다 (우회 옵션 없음).");
     log("--max-concurrency는 1만 허용합니다 — protocol v1은 순차 실행만 지원합니다.");
     log("--output은 하나의 실행 디렉터리이며 최초 실행과 재개가 같은 records.jsonl을 씁니다.");
     log("재개 시 records.jsonl에서 이미 쓴 금액을 복원하므로 재시작이 승인 상한을 늘리지 않습니다.");
+    log("열린 예약(개시만 있고 종결이 없는 예약)이 있으면 재개하지 않습니다 — 그 요청은 과금됐을 수 있습니다.");
+    log("유료 pilot/run은 --run-card가 필수입니다 (우회 옵션 없음).");
     log("");
     log("종료 코드: 0=PASS  1=FAIL  2=INCONCLUSIVE  3=하네스 오류  4=툴체인 미준비");
     log("");
@@ -142,6 +177,64 @@ async function main(): Promise<number> {
     if (usingFake) {
       extra.push("fake provider 모드입니다 — 이 카드로 유료 실행을 승인할 수 없습니다");
     }
+
+    // ---- probe evidence 읽기 (§3) ----
+    // 예전에는 probe 결과를 아무도 다시 읽지 않았다. 그래서 probe에 성공해도 카드는 계속
+    // READY_FOR_MODEL_PROBE였고, 반대로 pilot은 자격증명 존재만으로 실행 경로에 들어갔다.
+    const evidenceFile = options.probeEvidence ?? probeEvidencePath(path.join(options.output, "model-probe"));
+    const now = new Date().toISOString();
+    const loaded = loadProbeEvidence(evidenceFile);
+    let evidence: ProbeEvidence | undefined;
+    const evidenceProblems: string[] = [];
+    if (!loaded.found) {
+      log(`probe evidence가 없습니다: ${evidenceFile}`);
+    } else if (loaded.raw === undefined) {
+      evidenceProblems.push(`probe evidence를 읽을 수 없습니다: ${loaded.parseError ?? "알 수 없는 오류"}`);
+    } else if (isModelPlan(models)) {
+      const verdict = validateProbeEvidence(loaded.raw, {
+        now,
+        protocolVersion: CRITERIA.protocolVersion,
+        criteriaHash: criteriaHash(),
+        registrySnapshotHash: new ModelRegistry(BUILTIN_MODELS).snapshotHash(),
+        adapterContractVersion: ADAPTER_CONTRACT_VERSION,
+        executorModelId: models.executor.modelId,
+        reviewerModelId: models.reviewer.modelId,
+        env: process.env,
+      });
+      if (verdict.ok) evidence = verdict.evidence;
+      else evidenceProblems.push(...verdict.reasons);
+    }
+
+    // ---- P0 attestation 읽기 (§5) ----
+    const attestationFile = p0AttestationPath(path.join(options.output, "p0-smoke"));
+    const attestationLoad = loadP0Attestation(attestationFile);
+    let p0Attestation: { attestationId: string; attestationHash: string } | undefined;
+    const p0Problems: string[] = [];
+    if (attestationLoad.found && attestationLoad.raw !== undefined && evidence && isModelPlan(models)) {
+      const verdict = validateP0Attestation(attestationLoad.raw, {
+        probeEvidenceId: evidence.evidenceId,
+        probeEvidenceHash: evidence.evidencePayloadHash,
+        criteriaHash: criteriaHash(),
+        protocolVersion: CRITERIA.protocolVersion,
+        executorModelId: models.executor.modelId,
+        reviewerModelId: models.reviewer.modelId,
+      });
+      if (verdict.ok) {
+        p0Attestation = {
+          attestationId: verdict.attestation.attestationId,
+          attestationHash: verdict.attestation.attestationHash,
+        };
+      } else {
+        p0Problems.push(...verdict.reasons);
+      }
+    } else if (attestationLoad.found && attestationLoad.parseError) {
+      p0Problems.push(`P0 attestation을 읽을 수 없습니다: ${attestationLoad.parseError}`);
+    }
+
+    const credentialsPresent = isModelPlan(models)
+      ? [models.executor.providerId, models.reviewer.providerId].every((p) => credentialPresent(p))
+      : false;
+
     // **단계마다 카드 한 장.** 승인 하나가 P0와 P1을 함께 덮으면 "P0가 정상일 때만 P1"이
     // 절차로 성립하지 않는다. 단계별 상한을 따로 받는 것이 그 절차의 다른 절반이다.
     const cards = buildStagedCards({
@@ -154,12 +247,22 @@ async function main(): Promise<number> {
       ...(options.p1MaxCostUsd !== undefined ? { p1ApprovedLimitUsd: options.p1MaxCostUsd } : {}),
       models,
       extraBlockers: extra,
-      generatedAt: new Date().toISOString(),
+      createdAt: now,
+      credentialsPresent,
+      ...(evidence ? { probeEvidence: evidence } : {}),
+      ...(evidenceProblems.length > 0 ? { probeEvidenceProblems: evidenceProblems } : {}),
+      ...(p0Attestation ? { p0Attestation } : {}),
+      ...(p0Problems.length > 0 ? { p0AttestationProblems: p0Problems } : {}),
       joinPath: (a, b) => path.join(a, b),
     });
 
     for (const card of [cards.p0, cards.p1]) {
       for (const line of renderRunCard(card)) log(line);
+      // **카드를 파일로 남긴다.** 실행이 이 파일을 요구하므로, 출력만 하고 끝나면
+      // 승인 절차가 강제되지 않는다.
+      const file = writeRunCard(card);
+      log("");
+      log(`카드 파일: ${file}`);
       log("");
       log("─".repeat(72));
       log("");
@@ -170,10 +273,11 @@ async function main(): Promise<number> {
       log(`      --output ${options.output}`);
       log("");
     }
-    log("진행 순서: P0 카드 승인 → P0 실행 → P0가 완전히 정상 → P1 카드 승인 → P1 실행");
+    log("진행 순서: probe-models → P0 카드 승인 → P0 실행 → P0 attestation → P1 카드 승인 → P1 실행");
+    log("유료 실행에는 --run-card가 필수입니다 (우회 옵션 없음).");
     // 승인 대상이므로 blocker가 있어도 카드는 출력한다. 종료 코드로 상태를 구별한다.
-    // 두 장 중 하나라도 유료 실행 준비가 아니면 0을 내지 않는다.
-    const bothReady = [cards.p0, cards.p1].every((c) => c.status === "READY_FOR_PAID_RUN");
+    const approvable = ["READY_FOR_P0_APPROVAL", "READY_FOR_P1_APPROVAL"];
+    const bothReady = [cards.p0, cards.p1].every((c) => approvable.includes(c.status));
     return bothReady ? 0 : 2;
   }
 
@@ -199,13 +303,22 @@ async function main(): Promise<number> {
       return 3;
     }
 
+    const roles = [
+      { role: "executor" as const, entry: executorEntry, readiness: models.readiness[0]! },
+      { role: "reviewer" as const, entry: reviewerEntry, readiness: models.readiness[1]! },
+    ];
+    // 자격증명 binding은 **키 값을 읽지 않고** 존재와 동일성만 확인할 수 있는 형태로 만든다.
+    const binding = bindingForRoles(roles, process.env);
+    if (!binding) {
+      log("공급자 자격증명이 없어 probe를 보내지 않았습니다.");
+      log("→ 상태: BLOCKED_MISSING_CREDENTIALS / 실제 API 호출: 0건");
+      return 2;
+    }
+
     const registry = new ModelRegistry(BUILTIN_MODELS);
     const probeDir = path.join(options.output, "model-probe");
     const summary = await probeModels({
-      roles: [
-        { role: "executor", entry: executorEntry, readiness: models.readiness[0]! },
-        { role: "reviewer", entry: reviewerEntry, readiness: models.readiness[1]! },
-      ],
+      roles,
       ...(options.maxCostUsd !== undefined ? { maxCostUsd: options.maxCostUsd } : {}),
       maxConcurrency: options.maxConcurrency,
       // production 어댑터를 그대로 태운다 — probe 전용 호출을 만들면 "probe는 통과했는데
@@ -214,6 +327,13 @@ async function main(): Promise<number> {
       costOfUsage: (modelId, usage) => registry.costUsd(modelId, usage),
       onEvent: createBudgetEventSink(probeDir, PROBE_BUDGET_EVENTS_FILE),
       onProgress: log,
+      evidenceBinding: {
+        protocolVersion: CRITERIA.protocolVersion,
+        criteriaHash: criteriaHash(),
+        registrySnapshotHash: registry.snapshotHash(),
+        adapterContractVersion: ADAPTER_CONTRACT_VERSION,
+        credentialBinding: binding,
+      },
     });
 
     for (const line of renderProbeSummary(summary)) log(line);
@@ -224,7 +344,70 @@ async function main(): Promise<number> {
       log(`probe 요약: ${written.summary}`);
       log("이 파일들은 게이트 기록(records.jsonl)과 분리되어 있습니다 — probe는 실험 표본이 아닙니다.");
     }
+    if (summary.evidence) {
+      const file = writeProbeEvidence(probeDir, summary.evidence);
+      log(`probe evidence: ${file}`);
+      log("이제 plan-pilot이 이 evidence를 읽어 P0 승인 카드를 만듭니다.");
+    }
     return summary.status === "READY_FOR_PAID_RUN" ? 0 : 2;
+  }
+
+  // ---- budget-status ----
+  // **읽기 전용.** API를 부르지 않고, 파일을 고치지도 않는다.
+  if (options.command === "budget-status") {
+    const store = openRecordStore(runDirPaths(options.output).records);
+    const report = budgetStatus({
+      runDir: options.output,
+      records: store.all(),
+      eventRead: readBudgetEvents(options.output),
+      ...(options.maxCostUsd !== undefined ? { approvedLimitUsd: options.maxCostUsd } : {}),
+    });
+    for (const line of renderBudgetStatus(report)) log(line);
+    return report.resumable ? 0 : 2;
+  }
+
+  // ---- attest-p0 ----
+  // P0 실행 결과를 검사해 attestation을 만든다. **API를 부르지 않는다.**
+  if (options.command === "attest-p0") {
+    const cardFile = options.runCard ?? path.join(options.output, cardFileFor("smoke"));
+    const loadedCard = loadRunCard(cardFile);
+    if (!loadedCard.ok) {
+      log(`P0 Run Card를 읽을 수 없습니다: ${cardFile}`);
+      for (const reason of loadedCard.reasons) log(`  - ${reason}`);
+      return 2;
+    }
+    const evidenceFile = options.probeEvidence ?? probeEvidencePath(path.join(path.dirname(options.output), "model-probe"));
+    const loadedEvidence = loadProbeEvidence(evidenceFile);
+    if (!loadedEvidence.found || loadedEvidence.raw === undefined) {
+      log(`probe evidence를 읽을 수 없습니다: ${evidenceFile}`);
+      log("→ 상태: BLOCKED_INVALID_PROBE_EVIDENCE");
+      return 2;
+    }
+    const store = openRecordStore(runDirPaths(options.output).records);
+    const events = readBudgetEvents(options.output);
+    if (!events.ok) {
+      log("예산 이벤트를 해석할 수 없어 attestation을 만들지 않았습니다:");
+      for (const reason of events.reasons) log(`  - ${reason}`);
+      return 2;
+    }
+    const outcome = attestP0({
+      card: loadedCard.card,
+      evidence: loadedEvidence.raw as ProbeEvidence,
+      records: store.all(),
+      budgetEvents: events.events,
+      createdAt: new Date().toISOString(),
+    });
+    for (const line of renderAttestation(outcome)) log(line);
+    if (!outcome.ok) {
+      log("");
+      log(`→ 상태: ${outcome.status}`);
+      return 2;
+    }
+    const file = writeP0Attestation(options.output, outcome.attestation);
+    log("");
+    log(`attestation: ${file}`);
+    log("이제 plan-pilot이 이 attestation을 읽어 P1 승인 카드를 만듭니다.");
+    return 0;
   }
 
   const pre = preflight({
@@ -253,6 +436,13 @@ async function main(): Promise<number> {
       dryRun: true,
     });
     log(`실행 계획: ${result.planned}건`);
+    // **공용 계산기를 쓴다.** 예전에는 preflight가 executor 호출만 세고 그것을
+    // "최대 API 호출 수"로 표시했다 — confirmatory에서 1,152 vs 실제 1,584였다.
+    for (const line of describeCallBudget(
+      computeCallBudget({ fixtureCount: fixtures.length, arms: options.arms, repetitions: options.repetitions })
+    )) {
+      log(line);
+    }
     log("");
     log("처음 12건:");
     for (const item of (result.dryRunPlan ?? []).slice(0, 12)) {
@@ -288,6 +478,96 @@ async function main(): Promise<number> {
 
   const isPilot = options.command === "pilot";
   const runId = `${isPilot ? "pilot" : "run"}-${randomUUID()}`;
+  const requestedStage: Stage = options.stage ?? (isPilot ? "pilot" : "confirmatory");
+
+  // ---- Run Card 게이트 (§4) ----
+  // **어댑터를 만들기 전에** 확인한다. fake 실행은 면제한다 — 단가 0이고 승인 대상이 아니다.
+  // 우회 플래그는 없다: 유료 실행은 카드 없이 시작할 수 없다.
+  if (!usingFake) {
+    if (options.runCard === undefined) {
+      log(`${options.command}는 실제 공급자를 호출하므로 --run-card가 필수입니다 (우회 옵션 없음).`);
+      log("");
+      log("먼저 카드를 만드세요:");
+      log("  npm run gate:g:plan-pilot -- --p0-max-cost-usd <금액> --p1-max-cost-usd <금액> --output <dir>");
+      log("");
+      log("→ 상태: BLOCKED_MISSING_RUN_CARD / 실제 API 호출: 0건");
+      return 2;
+    }
+    const loadedCard = loadRunCard(options.runCard);
+    if (!loadedCard.ok) {
+      log(`Run Card를 쓸 수 없습니다: ${options.runCard}`);
+      for (const reason of loadedCard.reasons) log(`  - ${reason}`);
+      log("→ 상태: BLOCKED_INVALID_RUN_CARD / 실제 API 호출: 0건");
+      return 2;
+    }
+    const plannedModels = planModels({
+      ...(options.executorModel ? { executorModel: options.executorModel } : {}),
+      ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
+      credentialPresence: credentialPresent,
+    });
+    if (!isModelPlan(plannedModels)) {
+      log("모델 계획을 확정할 수 없어 카드를 검증할 수 없습니다:");
+      for (const blocker of plannedModels.blockers) log(`  - ${blocker}`);
+      return 2;
+    }
+    const verdict = authorizeRunCard(loadedCard.card, {
+      stage: requestedStage,
+      outputDir: options.output,
+      fixtureIds: fixtures.map((f) => f.manifest.fixtureId),
+      arms: options.arms,
+      repetitions: isPilot ? 1 : options.repetitions,
+      seed: options.seed,
+      ...(options.maxCostUsd !== undefined ? { maxCostUsd: options.maxCostUsd } : {}),
+      executorModelId: plannedModels.executor.modelId,
+      reviewerModelId: plannedModels.reviewer.modelId,
+      now: new Date().toISOString(),
+    });
+    if (!verdict.ok) {
+      log(`Run Card가 이 실행을 승인하지 않습니다: ${options.runCard}`);
+      for (const reason of verdict.reasons) log(`  - ${reason}`);
+      log("");
+      log("카드와 다른 조건으로 실행하지 않습니다. 카드를 다시 만들거나 인수를 카드에 맞추세요.");
+      log(`→ 상태: ${verdict.status} / 실제 API 호출: 0건`);
+      return 2;
+    }
+    // evidence의 자격증명 binding까지 여기서 확인한다 — 카드가 가리키는 evidence가
+    // **지금 쓰는 키**로 얻어진 것이어야 한다.
+    const evidenceFile =
+      options.probeEvidence ?? probeEvidencePath(path.join(path.dirname(options.output), "model-probe"));
+    const loadedEvidence = loadProbeEvidence(evidenceFile);
+    if (!loadedEvidence.found || loadedEvidence.raw === undefined) {
+      log(`카드가 가리키는 probe evidence를 읽을 수 없습니다: ${evidenceFile}`);
+      log("→ 상태: BLOCKED_INVALID_PROBE_EVIDENCE / 실제 API 호출: 0건");
+      return 2;
+    }
+    const evidenceVerdict = validateProbeEvidence(loadedEvidence.raw, {
+      now: new Date().toISOString(),
+      protocolVersion: CRITERIA.protocolVersion,
+      criteriaHash: criteriaHash(),
+      registrySnapshotHash: new ModelRegistry(BUILTIN_MODELS).snapshotHash(),
+      adapterContractVersion: ADAPTER_CONTRACT_VERSION,
+      executorModelId: plannedModels.executor.modelId,
+      reviewerModelId: plannedModels.reviewer.modelId,
+      env: process.env,
+    });
+    if (!evidenceVerdict.ok) {
+      log("probe evidence가 이 실행을 보증하지 않습니다:");
+      for (const reason of evidenceVerdict.reasons) log(`  - ${reason}`);
+      log(`→ 상태: ${evidenceVerdict.status} / 실제 API 호출: 0건`);
+      return 2;
+    }
+    if (
+      loadedCard.card.probeEvidenceId !== evidenceVerdict.evidence.evidenceId ||
+      loadedCard.card.probeEvidenceHash !== evidenceVerdict.evidence.evidencePayloadHash
+    ) {
+      log("Run Card가 가리키는 evidence와 현재 evidence 파일이 다릅니다 — 카드를 다시 만드세요.");
+      log("→ 상태: BLOCKED_INVALID_PROBE_EVIDENCE / 실제 API 호출: 0건");
+      return 2;
+    }
+    log(`Run Card 승인 확인: ${loadedCard.card.cardId} (${loadedCard.card.cardHash})`);
+    log(`probe evidence 확인: ${evidenceVerdict.evidence.evidenceId}`);
+    log("");
+  }
 
   // ---- 실행 디렉터리 계약 (§5) ----
   // 최초 실행과 재개가 **같은 파일**을 쓴다. 예전에는 최초가 <uuid>.jsonl, 재개가
@@ -310,19 +590,42 @@ async function main(): Promise<number> {
   }
   const spentSoFar = recovery.spend.historicalUsd;
 
-  // ---- 이벤트 원장과의 대조 (§7) ----
-  const priorEvents = readBudgetEvents(options.output);
-  const agreement = reconcile(spentSoFar, priorEvents);
+  // ---- 이벤트 원장과의 대조 (§1, §7) ----
+  // **합계만 비교하지 않는다.** 열린 예약(개시만 있고 종결이 없는 예약)은 어떤 합계에도
+  // 나타나지 않지만, 그 요청은 공급자가 처리하고 과금했을 수 있다.
+  const eventRead = readBudgetEvents(options.output);
+  if (!eventRead.ok) {
+    log(`예산 이벤트를 해석할 수 없습니다: ${options.output}`);
+    for (const reason of eventRead.reasons) log(`  - ${reason}`);
+    log(`→ 상태: ${eventRead.status} / 유료 호출: 없음`);
+    return 2;
+  }
+  const agreement = reconcileBudget({
+    recordsUsd: spentSoFar,
+    events: eventRead.events,
+    truncatedLastLine: eventRead.truncatedLastLine,
+  });
   if (!agreement.ok) {
-    log(`예산 원장과 기록 파일이 일치하지 않습니다: ${options.output}`);
-    log(`  - ${agreement.reason}`);
-    log("→ 상태: BLOCKED / 유료 호출: 없음");
+    log(`예산 원장을 신뢰할 수 없어 재개하지 않습니다: ${options.output}`);
+    for (const reason of agreement.reasons) log(`  - ${reason}`);
+    for (const open of agreement.analysis.reservations.filter(
+      (r) => r.outcome === "open" || r.outcome === "unresolved"
+    )) {
+      log("");
+      log(`미해결 예약: ${open.correlationId}`);
+      log(`  예약액 $${open.reservedUsd.toFixed(6)} / 상태 ${open.outcome}`);
+      log(`  실행 ${open.runId} / 단계 ${open.stage} / 개시 ${open.openedAt}`);
+    }
+    log("");
+    log("이 예약액은 사용 가능한 예산으로 되돌리지 않습니다. 기록과 이벤트를 고치지도 않았습니다.");
+    log(`자세한 상태: npm run gate:g:budget-status -- --output ${options.output}`);
+    log(`→ 상태: ${agreement.status} / 유료 호출: 없음`);
     return 2;
   }
   if (store.count() > 0) {
     log(
       `복원한 이전 지출: $${spentSoFar.toFixed(4)} (유료 기록 ${recovery.spend.countedRecords}건, ` +
-        `fake 기록 ${recovery.spend.fakeRecords}건, 예산 이벤트 ${priorEvents.length}건)`
+        `fake 기록 ${recovery.spend.fakeRecords}건, 예산 이벤트 ${eventRead.events.length}건)`
     );
   }
 

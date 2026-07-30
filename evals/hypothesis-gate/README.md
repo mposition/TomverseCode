@@ -78,6 +78,8 @@ npm run gate:g:validate   # fixture 품질 검증 (모델 호출 없음)
 npm run gate:g:dry-run    # preflight + 실행 계획만
 npm run gate:g:plan-pilot # **단계별(P0/P1) 유료 실행 승인 카드** (실제 API 호출 0건)
 npm run gate:g:probe-models  # 역할당 **최소 요청 1회**로 모델을 실제 확인 (--max-cost-usd 필수)
+npm run gate:g:budget-status # 예산 상태 **읽기 전용** 조회 (열린 예약 확인. 고치지 않는다)
+npm run gate:g:attest-p0     # P0 결과를 검사해 attestation 생성 (API 호출 없음)
 npm run gate:g:pilot      # 반복 1회. 하네스·비용·실패 분류 확인용. PASS를 내지 않는다
 npm run gate:g:run        # confirmatory (기본 반복 3회)
 npm run gate:g:report     # 기존 기록으로 리포트만 재생성
@@ -87,9 +89,35 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 `--max-cost-usd N` `--max-concurrency 1` `--resume` `--output <run-dir>`
 `--stage smoke|pilot|confirmatory` `--executor-model <id>` `--reviewer-model <id>`
 `plan-pilot` 전용: `--p0-max-cost-usd N` `--p1-max-cost-usd N`
+유료 실행 필수: `--run-card <path>` (선택: `--probe-evidence <path>`)
 
-**진행 순서**: `plan-pilot` → (카드가 `READY_FOR_MODEL_PROBE`면) `probe-models` →
-`plan-pilot` 재생성 → P0 카드 승인 → P0 `pilot` 실행 → P0가 완전히 정상 → P1 카드 승인 → P1 실행.
+**진행 순서** — 각 단계가 다음 단계의 **입력**이다:
+
+```
+plan-pilot            카드 상태 READY_FOR_MODEL_PROBE (자격증명은 있으나 실제 확인이 없음)
+  ↓
+probe-models          역할당 요청 1회 → model-probe/probe-evidence.json
+  ↓
+plan-pilot            evidence를 읽어 P0 카드 = READY_FOR_P0_APPROVAL, 카드 파일 저장
+  ↓
+pilot --run-card ...  카드 해시·인자·예산·evidence·자격증명 binding 확인 후 P0 실행
+  ↓
+attest-p0             8건 전부 정상인지 검사 → p0-attestation.json
+  ↓
+plan-pilot            attestation을 읽어 P1 카드 = READY_FOR_P1_APPROVAL
+  ↓
+pilot --run-card ...  P1 실행
+```
+
+카드 상태는 곧 다음 행동이다:
+
+| 상태 | 뜻 |
+|---|---|
+| `BLOCKED_MISSING_CREDENTIALS` | 키가 없다. probe도 실행도 불가능하다 |
+| `READY_FOR_MODEL_PROBE` | 오프라인으로 확인할 수 있는 것은 다 됐다. 다음은 probe |
+| `BLOCKED_INVALID_PROBE_EVIDENCE` | evidence가 손상·불일치·만료됐다 |
+| `BLOCKED_PENDING_P0_RESULT` | P1인데 P0 attestation이 없다 |
+| `READY_FOR_P0_APPROVAL` / `READY_FOR_P1_APPROVAL` | 유료 실행을 승인할 수 있다 |
 
 종료 코드: `0`=PASS, `1`=FAIL, `2`=INCONCLUSIVE, `3`=하네스 오류, `4`=툴체인 미준비.
 
@@ -119,6 +147,27 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 어느 경우든 합계를 신뢰할 수 없으므로 멈춘다. "0으로 보고 계속"이 가장 위험하다: 그 순간
 한도가 사라진다. `budget-events.jsonl`(append-only)과 기록 파일의 합계가 다르면 **한쪽을 골라
 계속하지 않는다** — 어느 쪽이 맞는지 코드가 알 수 없다.
+
+**열린 예약을 0원으로 재개하지 않는다.** 실행 순서는 (1) 예약 → (2) provider 호출 → (3) 기록 →
+(4) 정산이고, (1) 이후 어디서든 프로세스가 죽을 수 있다. 예전 대조 검사는 정산 합계와 기록 합계만
+비교했으므로 **개시만 있고 종결이 없는 예약이 어떤 합계에도 나타나지 않았다** — 두 합계가 0이면
+"안 썼다"로 읽히고 재개가 허용됐다. 그 요청은 공급자가 처리하고 과금했을 수 있다. 이제 이벤트를
+correlationId별 상태 머신으로 검증하고(허용 흐름은 `opened → settled`, `opened → released` 둘뿐),
+열린 예약이 있으면 `BLOCKED_UNRESOLVED_RESERVATION`으로 멈춘다. 그 금액은 사용 가능한 예산으로
+되돌리지 않으며, **자동으로 정리하는 명령도 만들지 않는다** — 실제 과금 여부는 공급자 청구 내역으로만
+확인되고 코드가 대신 판단하면 돈이 새거나 예산을 잃는다. 근거는
+[multi-engine-routing.md 10.7절](../../docs/design/multi-engine-routing.md).
+
+**과금 여부가 불확실한 실패는 해제하지 않는다.** provider 실패를 네 상태로 나눈다 —
+`not_dispatched`(해제), `response_received_with_usage`(실제 비용으로 정산),
+`dispatched_no_response`·`response_received_without_usage`(미해결로 남기고 중단). 공급자가 응답을
+만들고 과금한 뒤 파싱에서 실패하는 경우가 있으므로 "예외가 났으니 해제"는 쓴 돈을 안 쓴 것으로
+만드는 것이다. 네트워크 타임아웃도 불확실이다(응답이 생성됐지만 못 받은 것일 수 있다).
+
+**NaN·Infinity·음수·측정 실패는 0으로 정산되지 않는다.** 타입 수준에서 "0달러"와 "모른다"를
+구별한다(`CostMeasurement`/`UsageMeasurement`). 실공급자 응답의 입력·출력 토큰이 **둘 다 0**인 것도
+측정 실패로 본다 — 실제 호출이 0 토큰을 쓰는 일은 없다. 이런 값이 오면 예약을 풀지 않고 원장을
+`BUDGET_LEDGER_INVALID`로 전환해 이후 유료 호출을 차단한다.
 
 **비용을 잴 수 없으면 경고가 아니라 중단이다.** 실제 응답에 usage가 없거나 모델 단가를
 모르면 그 기록을 `cost_unmeasurable` 인프라 실패로 남기고 **남은 유료 호출을 멈춘다.**
@@ -164,10 +213,16 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 | `structuredOutputDeclared` | Model Registry — **선언**이며 동작 확인이 아니다 |
 | `credentialPresent` | 환경 (값은 읽지 않고 존재만 본다) |
 | `liveProbeVerified` | **실제 요청만** |
-| `exactModelIdVerified` | **실제 요청만** (조용한 대체 탐지) |
+| `exactModelIdVerified` | **실제 요청만** — 응답 envelope의 `model` 필드로만 판정 |
 
 **오프라인 검사는 뒤 세 축을 true로 만들 수 없다.** `registryReadiness`가 항상 false로 두고,
 올리는 경로는 `withCredentialPresence`와 `withLiveProbe` 둘뿐이다.
+
+`exactModelIdVerified`는 **응답 envelope의 `model` 필드만** 본다. `DraftProposal.model`과
+`ReviewDecision.model`은 어댑터가 `this.modelId`를 넣은 값이므로 그것으로 비교하면 항상 통과하고,
+즉 조용한 대체를 절대 잡지 못한다. alias는 정규화가 아니라 레지스트리의 명시적 허용 목록
+(`acceptedProviderModelIds`)으로 다룬다 — prefix 비교는 `claude-sonnet-5`가
+`claude-sonnet-5.5`의 prefix이므로 **다른 모델을 통과시킨다.**
 
 카드 상태도 그에 맞춰 셋이다:
 
@@ -175,6 +230,39 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 - `READY_FOR_MODEL_PROBE` — 오프라인으로 확인할 수 있는 것은 전부 확인됐다. 다음은
   `gate:g:probe-models`이며 **아직 유료 pilot을 승인할 수 없다.**
 - `READY_FOR_PAID_RUN` — 실제 호출로 모델·모델 ID·구조화 출력까지 확인됐다.
+
+### Probe Evidence와 Run Card
+
+`probe-models`는 확인 결과를 `model-probe/probe-evidence.json`에 남긴다. 이 파일은 **무엇을
+무엇으로 확인했는가**에 결합된다: protocol/criteria 해시, Model Registry 스냅샷 해시, 어댑터 계약
+버전, 요청·응답 모델 ID, 자격증명 binding, 24시간 유효 기간. 하나라도 다르거나 만료되면 거부한다 —
+다른 모델·다른 키·다른 카탈로그에서 얻은 확인은 이 실행을 보증하지 않는다.
+
+자격증명 binding은 **키 원문·prefix·suffix를 저장하지 않는다.** 목적 문자열과 evidence마다 새로
+만드는 salt로 HMAC-SHA-256 다이제스트만 남기며, "같은 키인가"만 비교할 수 있다.
+
+`pilot`/`run`은 `--run-card`를 **필수로** 받는다(fake 실행은 면제). 예전에는 카드가 화면에만
+출력됐고 실행은 그것을 요구하지 않았으므로, 사용자가 `plan-pilot`을 거치지 않고 곧바로 유료
+실행을 시작할 수 있었다 — 승인 절차가 있는 것처럼 보이지만 강제되지 않는 상태였다. 이제
+**어댑터를 만들기 전에** 카드 해시·단계·출력 경로·fixture/arm/모델/seed·승인 상한·evidence·
+자격증명 binding·만료를 확인하고 하나라도 다르면 거부한다. 우회 플래그는 없다.
+
+카드에는 사람이 복사할 명령과 **argv 배열**이 함께 들어간다. 검증은 문자열을 다시 파싱하지 않고
+argv 구조를 비교한다 — 재파싱은 인용 규칙을 두 번 구현하는 것이고, 그 둘이 갈라지면 "카드와
+실행이 같다"는 검증이 거짓이 된다. 복사용 문자열은 PowerShell 규칙으로 인용하므로
+`C:\Users\...\Tomverse Code\...`처럼 공백·괄호·비ASCII·trailing backslash가 있는 경로도 깨지지 않는다.
+
+### P0 Attestation
+
+P1 카드의 선행 조건은 문장이 아니라 **파일**이다. `attest-p0`가 P0 결과를 검사해
+`p0-attestation.json`을 만들고, P1은 그것 없이 실행되지 않는다. 검사 항목: 카드가 요구한 기록 수와
+정확히 일치, 전부 실제 공급자 기록, 중복 없음, 인프라·인증·모델·스키마·usage 오류 0건, 모든 비용
+측정됨, 열린 예약 0건, 예산 추정 초과 0건, evidence와 같은 모델·자격증명, 응답 envelope 모델 ID
+일치, fixture/criteria/카드 해시 일치, secret 미탐지.
+
+**부분 성공에는 attestation을 만들지 않는다.** P0의 목적은 품질 측정이 아니라 실행 경로 확인이므로,
+8건 중 7건만 돌았다면 확인되지 않은 경로가 남아 있고 그 경로가 P1에서 96건 규모로 실패할 수 있다.
+조건이 어긋나면 `BLOCKED_P0_INCOMPLETE`(기록 부족) 또는 `BLOCKED_P0_FAILED`(기록은 있지만 실패)다.
 
 ### `gate:g:probe-models`
 
@@ -243,6 +331,10 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 계약, 실행 디렉터리 기반 재개, **재개 시 예산 복구(재시작이 한도를 늘리지 않는다)**,
 append-only 예산 감사 추적, 모델 준비성 축 분리, 단계별(P0/P1) 승인 카드가 모두 들어갔다.
 
+**crash-safe 재개 / 증거 체인: 완료.** 열린 예약 상태 머신, 읽기 전용 예산 조회,
+provider envelope 모델 ID 검증, ProbeEvidence, Run Card 강제, P0 attestation, 불확실 과금 처리,
+실제 timeout abort, 공용 호출 수 계산기, PowerShell 경로 인용이 들어갔다.
+
 **모델 실제 확인: 미실행.** `probe-models`는 구현되어 있고 mock transport로 검증되지만
 **실제로 돌리지 않았다** — 이 저장소에는 자격증명이 없고, 유료 호출은 사용자 승인 사항이다.
 
@@ -254,6 +346,8 @@ append-only 예산 감사 추적, 모델 준비성 축 분리, 단계별(P0/P1) 
 ```bash
 npm run gate:g:plan-pilot -- --p0-max-cost-usd <P0 금액> --p1-max-cost-usd <P1 금액> --output <dir>
 npm run gate:g:probe-models -- --max-cost-usd <probe 금액> --output <dir>
+npm run gate:g:plan-pilot -- --p0-max-cost-usd <P0 금액> --p1-max-cost-usd <P1 금액> --output <dir>
+npm run gate:g:pilot -- --stage smoke --run-card <dir>/p0-smoke/p0-run-card.json ...
 ```
 
 카드에는 계획 기록 수, **총 provider 호출 상한(executor/reviewer 내역 포함)**, 보수적 최대 비용,

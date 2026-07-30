@@ -4,6 +4,11 @@ import { FakeProviderAdapter, type FakeProviderOptions } from "./fake.js";
 import { OpenAIAdapter } from "./openai.js";
 import type { ProviderAdapter } from "./types.js";
 
+// 가설 게이트가 이 서브패스만 import하므로, 계약 버전과 오류 타입을 여기서 함께 노출한다.
+export { ADAPTER_CONTRACT_VERSION, ProviderCallFailure } from "./types.js";
+export type { ProviderCallMetadata, ProviderResponse } from "./types.js";
+export { redactSecrets, containsSecretLike } from "./redact.js";
+
 /**
  * 역할 배정 → 어댑터 인스턴스.
  *

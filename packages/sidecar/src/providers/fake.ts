@@ -8,13 +8,16 @@ import type {
   TokenUsage,
 } from "@tomverse/protocol";
 import { validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
+import type { DispatchState } from "../budget/ledger.js";
 import { normalizeProviderError } from "./errors.js";
+import { ProviderCallFailure } from "./types.js";
 import type {
   AdapterDeps,
   DraftInput,
   FixInput,
   ProviderAdapter,
   ProviderCallContext,
+  ProviderCallMetadata,
   ProviderResponse,
   ReviewInput,
 } from "./types.js";
@@ -36,16 +39,40 @@ import type {
 export interface FakeScriptStep {
   /** 어떤 호출에 응답할지 */
   kind: "draft" | "review" | "singleFix" | "fix";
-  /** 이 스텝이 던질 오류 (재시도/타임아웃 경로 테스트용) */
-  throws?: { message: string; status?: number; name?: string };
+  /**
+   * 이 스텝이 던질 오류 (재시도/타임아웃 경로 테스트용).
+   *
+   * `dispatchState`를 주면 실제 어댑터처럼 `ProviderCallFailure`를 던진다 — 응답을 받은 뒤
+   * 파싱/스키마에서 실패한 경우(=과금됐을 수 있는 경우)를 fake로 재현하기 위한 것이다.
+   * 주지 않으면 예전처럼 평범한 `Error`를 던진다(기존 재시도 테스트가 그 경로를 쓴다).
+   */
+  throws?: {
+    message: string;
+    status?: number;
+    name?: string;
+    dispatchState?: DispatchState;
+    usage?: TokenUsage;
+  };
   /** 응답 지연 (타임아웃 테스트용) */
   delayMs?: number;
   /** 구조화 출력으로 반환할 값. 검증을 거치므로 잘못된 형태면 여기서 걸린다. */
   payload?: Record<string, unknown>;
   usage?: TokenUsage;
+  /**
+   * 이 응답의 **envelope 모델 ID**. 지정하지 않으면 요청 모델 ID와 같다.
+   *
+   * 조용한 대체(공급자가 다른 모델로 응답)를 테스트하려면 여기에 다른 값을 넣는다.
+   * `null`은 "envelope에 model이 없음"을 뜻한다 — 그것도 검증이 막아야 하는 상태다.
+   */
+  providerReportedModelId?: string | null;
 }
 
 export interface FakeProviderOptions {
+  /**
+   * 스크립트가 지정하지 않을 때 쓸 envelope 모델 ID. 기본은 요청 모델 ID와 같다.
+   * `null`이면 envelope에 model이 없는 공급자를 흉내낸다.
+   */
+  providerReportedModelId?: string | null;
   /** 순서대로 소비되는 스크립트. 비면 기본 동작(아래 defaults)으로 응답한다. */
   script?: FakeScriptStep[];
   /**
@@ -102,6 +129,23 @@ export class FakeProviderAdapter implements ProviderAdapter {
     return normalizeProviderError(raw);
   }
 
+  /**
+   * 실제 어댑터와 **같은 계약**으로 메타데이터를 만든다.
+   *
+   * fake가 이 필드를 안 채우면 fake로 도는 테스트는 exact-model 검증 경로를 전혀 지나지 않고,
+   * 결함은 실제 공급자에서만 처음 드러난다. 그래서 fake도 envelope을 흉내낸다.
+   */
+  private metaFor(step: FakeScriptStep | undefined): ProviderCallMetadata {
+    const scripted = step?.providerReportedModelId !== undefined ? step.providerReportedModelId : this.options.providerReportedModelId;
+    const reported = scripted === undefined ? this.modelId : scripted;
+    return {
+      requestedModelId: this.modelId,
+      ...(reported === null ? {} : { providerReportedModelId: reported }),
+      providerRequestId: `fake-req-${this.cursor}`,
+      dispatchState: "response_received_with_usage",
+    };
+  }
+
   async generateDraft(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<DraftProposal>> {
     const step = await this.consume("draft", ctx);
     const payload = step?.payload ?? {
@@ -122,6 +166,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
+      meta: this.metaFor(step),
     };
   }
 
@@ -142,6 +187,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
+      meta: this.metaFor(step),
     };
   }
 
@@ -160,6 +206,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
+      meta: this.metaFor(step),
     };
   }
 
@@ -178,6 +225,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
+      meta: this.metaFor(step),
     };
   }
 
@@ -207,6 +255,19 @@ export class FakeProviderAdapter implements ProviderAdapter {
     this.throwIfAborted(ctx);
 
     if (step?.throws) {
+      if (step.throws.dispatchState !== undefined) {
+        const meta = this.metaFor(step);
+        throw new ProviderCallFailure({
+          message: step.throws.message,
+          dispatchState: step.throws.dispatchState,
+          classification: normalizeProviderError(
+            Object.assign(new Error(step.throws.message), { status: step.throws.status })
+          ),
+          ...(step.throws.usage ? { usage: step.throws.usage } : {}),
+          ...(meta.providerReportedModelId ? { providerReportedModelId: meta.providerReportedModelId } : {}),
+          ...(step.throws.status !== undefined ? { status: step.throws.status } : {}),
+        });
+      }
       const error = new Error(step.throws.message) as Error & { status?: number };
       if (step.throws.name) error.name = step.throws.name;
       if (step.throws.status !== undefined) error.status = step.throws.status;

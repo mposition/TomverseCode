@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,16 +14,35 @@ import {
   pricingIsUsable,
   validateApprovedLimit,
   type BudgetEvent,
+  type Settlement,
 } from "@tomverse/sidecar/budget";
+import { containsSecretLike, ProviderCallFailure, redactSecrets } from "@tomverse/sidecar/providers";
 import type { ModelEntry } from "@tomverse/protocol";
 import {
+  analyzeBudgetEvents,
   approvalCoversHistorical,
+  budgetStatus,
   createBudgetEventSink,
   readBudgetEvents,
-  reconcile,
+  reconcileBudget,
   recoverSpendFromRecords,
 } from "../src/budgetRecovery.js";
+import { BUILTIN_MODELS, ModelRegistry } from "@tomverse/sidecar/registry";
+import { computeCallBudget } from "../src/callBudget.js";
 import { criteriaHash, CRITERIA } from "../src/criteria.js";
+import { attestP0, validateP0Attestation } from "../src/p0Attestation.js";
+import {
+  buildProbeEvidence,
+  computeCredentialBinding,
+  validateProbeEvidence,
+  writeProbeEvidence,
+  type CredentialBinding,
+  type ProbeEvidence,
+  type RoleEvidence,
+} from "../src/probeEvidence.js";
+import { createAdapterProbeTransport } from "../src/probeTransport.js";
+import { preflight } from "../src/preflight.js";
+import { quotePowerShellArg } from "../src/shellQuote.js";
 import { loadAllFixtures, listFixtureIds } from "../src/manifest.js";
 import {
   estimateRecordCost,
@@ -38,6 +58,7 @@ import {
 import {
   probeModels,
   PROBE_RECORDS_FILE,
+  renderProbeSummary,
   writeProbeResults,
   type ProbeRole,
   type ProbeTransport,
@@ -46,11 +67,21 @@ import {
 import { ARMS } from "../src/arms.js";
 import { OptionError, parseArgs, parseConcurrency, parseCostLimit, requireCostLimitForPaidRun } from "../src/options.js";
 import { openRecordStore } from "../src/records.js";
-import { buildStagedCards, renderRunCard, selectSmokeFixtures } from "../src/runCard.js";
+import {
+  authorizeRunCard,
+  buildStagedCards,
+  loadRunCard,
+  renderRunCard,
+  runCardPath,
+  selectSmokeFixtures,
+  type CardExecutionRequest,
+  writeRunCard,
+  type RunCard,
+} from "../src/runCard.js";
 import { checkCompatibility, RECORDS_FILE, runDirPaths, type RunMeta } from "../src/runDir.js";
 import { runExperiment } from "../src/runner.js";
 import { evaluateGate } from "../src/stats.js";
-import type { GateRunRecord } from "../src/types.js";
+import type { ArmId, GateRunRecord } from "../src/types.js";
 
 /**
  * Pilot Safety Gate 테스트 (§9).
@@ -79,6 +110,29 @@ test("0. fixture 24개가 실제로 로드된다 (경로가 깨지면 여기서 
   assert.equal(ids.length, 24, `fixture 경로가 잘못되었습니다: ${FIXTURES_ROOT}`);
   assert.equal(loadAllFixtures(FIXTURES_ROOT, ids).length, 24);
 });
+
+/**
+ * 정산 인자를 만드는 테스트 헬퍼.
+ *
+ * `settle(usd)` 하나였던 것을 `Settlement`로 바꾼 이유가 §7이다 — "0달러였다"와 "모른다"를
+ * 숫자 하나로는 구별할 수 없었고, NaN/음수가 0으로 정산됐다.
+ */
+function settlement(usd: number, overrides: Partial<Settlement> = {}): Settlement {
+  return {
+    cost: { measured: true, usd },
+    usage: { measured: true, inputTokens: 100, outputTokens: 50 },
+    providerKind: "real",
+    dispatchState: "response_received_with_usage",
+    ...overrides,
+  };
+}
+
+/** 이벤트 목록만 필요할 때. 읽기가 실패하면 테스트가 그 자리에서 죽어야 한다. */
+function eventsIn(dir: string): BudgetEvent[] {
+  const read = readBudgetEvents(dir);
+  assert.equal(read.ok, true, read.ok ? "" : read.reasons.join(" / "));
+  return read.ok ? read.events : [];
+}
 
 function withDir(fn: (dir: string) => void): void {
   const dir = mkdtempSync(path.join(tmpdir(), "gate-safety-"));
@@ -305,7 +359,7 @@ test("7. 예약 비용과 실제 비용을 정산한다", () => {
   assert.equal(ledger.reservedUsd(), 4);
   assert.equal(ledger.availableUsd(), 6);
 
-  outcome.reservation.settle(0.25);
+  outcome.reservation.settle(settlement(0.25));
   assert.equal(ledger.reservedUsd(), 0);
   assert.equal(ledger.cumulativeCommittedUsd(), 0.25);
   // 예약이 풀렸으므로 남은 예산이 늘어난다 — 과대 추정이 예산을 영구히 잡아먹지 않는다.
@@ -318,7 +372,7 @@ test("7b. 실제 비용이 예약보다 커도 실제 값을 기록한다", () =
   const outcome = ledger.reserve({ maxUsd: 1, basis: "b" }, "one");
   assert.ok(outcome.ok);
   if (!outcome.ok) return;
-  outcome.reservation.settle(3);
+  outcome.reservation.settle(settlement(3));
   assert.equal(ledger.cumulativeCommittedUsd(), 3);
 });
 
@@ -328,14 +382,14 @@ test("8. 오류·취소·타임아웃 시 예약이 해제되고 장부가 일�
   assert.ok(outcome.ok);
   if (!outcome.ok) return;
 
-  outcome.reservation.release();
+  outcome.reservation.release({ dispatchState: "not_dispatched", reason: "테스트" });
   assert.equal(ledger.reservedUsd(), 0);
   assert.equal(ledger.cumulativeCommittedUsd(), 0);
   assert.equal(ledger.availableUsd(), 10, "해제 후 예산이 원래대로 돌아오지 않았습니다");
 
   // 이중 정산은 장부를 망가뜨리므로 막는다.
-  assert.throws(() => outcome.reservation.settle(1));
-  assert.throws(() => outcome.reservation.release());
+  assert.throws(() => outcome.reservation.settle(settlement(1)));
+  assert.throws(() => outcome.reservation.release({ dispatchState: "not_dispatched", reason: "테스트" }));
 
   const snapshot = ledger.snapshot();
   assert.equal(snapshot.reservationsOpened, 1);
@@ -544,7 +598,8 @@ function buildCards(p0?: number, p1?: number) {
     // 자격증명 존재 여부를 주입한다 — 개발자 머신에 키가 있는지에 따라 결과가 달라지면
     // 이 테스트는 아무것도 보장하지 않는다.
     models: planModels({ credentialPresence: () => true }),
-    generatedAt: "2026-07-29T00:00:00Z",
+    credentialsPresent: true,
+    createdAt: "2026-07-29T00:00:00Z",
     joinPath: (a, b) => `${a}/${b}`,
   });
 }
@@ -577,16 +632,16 @@ test("15. P1 카드가 executor-only가 아니라 진짜 총 호출 상한을 �
     },
     { executor: 0, reviewer: 0 }
   );
-  assert.equal(p1.maxExecutorCalls, expected.executor);
-  assert.equal(p1.maxReviewerCalls, expected.reviewer);
+  assert.equal(p1.callBudget.executor, expected.executor);
+  assert.equal(p1.callBudget.reviewer, expected.reviewer);
   // **핵심**: "최대"라고 부르는 값은 executor만 센 값이 아니라 전부 더한 값이다.
-  assert.equal(p1.maxProviderCallsTotal, expected.executor + expected.reviewer);
-  assert.ok(p1.maxProviderCallsTotal > p1.maxExecutorCalls, "총 상한이 executor 내역보다 크지 않습니다");
+  assert.equal(p1.callBudget.total, expected.executor + expected.reviewer);
+  assert.ok(p1.callBudget.total > p1.callBudget.executor, "총 상한이 executor 내역보다 크지 않습니다");
 
   // 렌더링에서도 총 상한이 먼저 나오고, executor 수치가 "최대"로 표시되지 않는다.
   const rendered = renderRunCard(buildCards(30, 300).p1).join("\n");
-  assert.ok(rendered.includes(`최대 provider 호출 수(총 상한): ${p1.maxProviderCallsTotal}회`), rendered);
-  assert.ok(!rendered.includes(`최대 provider 호출 수: ${p1.maxExecutorCalls}회`), "executor 수치를 최대라고 불렀습니다");
+  assert.ok(rendered.includes(`최대 provider 호출 수(총 상한): ${p1.callBudget.total}회`), rendered);
+  assert.ok(!rendered.includes(`최대 provider 호출 수: ${p1.callBudget.executor}회`), "executor 수치를 최대라고 불렀습니다");
 });
 
 test("16. P0 smoke는 8건이고 TypeScript/Rust를 하나씩 쓴다", () => {
@@ -614,10 +669,10 @@ test("16b. P0와 P1은 카드·승인·출력 디렉터리가 분리된다", () 
   assert.equal(cards.p1.approvedLimitUsd, 300);
   assert.notEqual(cards.p0.stage.stage, cards.p1.stage.stage);
   // 실행 명령이 자기 단계와 자기 디렉터리를 가리킨다.
-  assert.ok(cards.p0.runCommand.includes("--stage smoke"), cards.p0.runCommand);
-  assert.ok(cards.p0.runCommand.includes(cards.p0.outputDir), cards.p0.runCommand);
-  assert.ok(cards.p1.runCommand.includes("--stage pilot"), cards.p1.runCommand);
-  assert.ok(cards.p1.runCommand.includes(cards.p1.outputDir), cards.p1.runCommand);
+  assert.ok(cards.p0.runCommandPowerShell.includes("--stage smoke"), cards.p0.runCommandPowerShell);
+  assert.ok(cards.p0.runCommandPowerShell.includes(cards.p0.outputDir), cards.p0.runCommandPowerShell);
+  assert.ok(cards.p1.runCommandPowerShell.includes("--stage pilot"), cards.p1.runCommandPowerShell);
+  assert.ok(cards.p1.runCommandPowerShell.includes(cards.p1.outputDir), cards.p1.runCommandPowerShell);
   // P1에는 선행 조건이 붙는다 — P0 결과를 확인하지 않고 승인하지 않도록.
   assert.ok((cards.p1.prerequisites ?? []).some((p) => p.includes("P0")), JSON.stringify(cards.p1.prerequisites));
   assert.equal(cards.p0.prerequisites, undefined);
@@ -861,7 +916,7 @@ test("22. 정산 후 재시작해도 누적이 상한을 넘지 못한다", () =
   const r1 = first.reserve({ maxUsd: 20, basis: "b" }, "one");
   assert.ok(r1.ok);
   if (!r1.ok) return;
-  r1.reservation.settle(20);
+  r1.reservation.settle(settlement(20));
   assert.equal(first.cumulativeCommittedUsd(), 20);
 
   // 2회차: 같은 승인 상한으로 재개한다. 복원값을 넘기므로 남은 것은 $5다.
@@ -869,7 +924,7 @@ test("22. 정산 후 재시작해도 누적이 상한을 넘지 못한다", () =
   const r2 = resumed.reserve({ maxUsd: 5, basis: "b" }, "two");
   assert.ok(r2.ok);
   if (!r2.ok) return;
-  r2.reservation.settle(5);
+  r2.reservation.settle(settlement(5));
 
   assert.equal(resumed.cumulativeCommittedUsd(), 25);
   assert.equal(resumed.availableUsd(), 0);
@@ -977,7 +1032,7 @@ test("26. 세 번 재개해도 승인 총액을 넘지 않는다", () => {
     for (let i = 0; i < 10; i += 1) {
       const outcome = ledger.reserve({ maxUsd: 3, basis: "회차 추정" }, `r${round}-${i}`);
       if (!outcome.ok) break;
-      outcome.reservation.settle(3);
+      outcome.reservation.settle(settlement(3));
       records.push(paidRecord(`f${round}-${i}`, "A", round, 3));
     }
     assert.ok(
@@ -1006,22 +1061,20 @@ test("27. 승인 상향과 예약 이력이 append-only로 남는다", () => {
     const r = ledger.reserve({ maxUsd: 1, basis: "b" }, "one");
     assert.ok(r.ok);
     if (!r.ok) return;
-    r.reservation.settle(0.5);
+    r.reservation.settle(settlement(0.5));
     ledger.recordApprovalRaised(20, "사용자 승인");
     ledger.recordBlocked("테스트 차단");
 
-    const events = readBudgetEvents(dir);
+    const events = eventsIn(dir);
+    // `provider_usage_recorded`가 없는 것이 의도다: 비용·usage·응답 모델 ID를 정산 이벤트
+    // 하나에 담아 **이벤트 사이 crash window를 없앴다.** 두 이벤트로 나누면 그 사이에 죽었을 때
+    // "정산은 됐는데 usage는 모르는" 상태가 남고, 어느 쪽을 믿어야 하는지 알 수 없다.
     assert.deepEqual(
       events.map((e) => e.type),
-      [
-        "approval_created",
-        "reservation_opened",
-        "reservation_settled",
-        "provider_usage_recorded",
-        "approval_raised",
-        "run_blocked",
-      ]
+      ["approval_created", "reservation_opened", "reservation_settled", "approval_raised", "run_blocked"]
     );
+    const settled = events.find((e) => e.type === "reservation_settled");
+    assert.deepEqual(settled?.usage, { inputTokens: 100, outputTokens: 50 }, "정산 이벤트에 usage가 없습니다");
     // 상향은 사실로만 남고 이 원장의 상한을 바꾸지 않는다 — 새 상한은 새 원장이 받는다.
     assert.equal(ledger.approvedLimitUsd, 10);
     for (const event of events) {
@@ -1037,7 +1090,7 @@ test("27. 승인 상향과 예약 이력이 append-only로 남는다", () => {
     // 두 번째 원장이 같은 디렉터리에 써도 앞의 이벤트를 덮지 않는다.
     const before = events.length;
     createBudgetLedger(10, { initialCommittedUsd: 2.5, runId: "run-2", stage: "pilot", onEvent: createBudgetEventSink(dir) });
-    const after = readBudgetEvents(dir);
+    const after = eventsIn(dir);
     assert.equal(after.length, before + 1);
     assert.equal(after[after.length - 1]!.runId, "run-2");
   });
@@ -1053,19 +1106,19 @@ test("27b. 8가지 예산 이벤트가 모두 필수 필드를 갖고 남는다"
     const released = ledger.reserve({ maxUsd: 1, basis: "b" }, "released");
     assert.ok(released.ok);
     if (!released.ok) return;
-    released.reservation.release();
+    released.reservation.release({ dispatchState: "not_dispatched", reason: "테스트" });
 
     // 실제가 예약을 넘으면 추정이 틀렸다는 사실이 남고, 이후 예약이 차단된다.
     const breached = ledger.reserve({ maxUsd: 1, basis: "b" }, "breached");
     assert.ok(breached.ok);
     if (!breached.ok) return;
-    breached.reservation.settle(3);
+    breached.reservation.settle(settlement(3));
     assert.equal(ledger.estimateBreached(), true);
     assert.equal(ledger.reserve({ maxUsd: 0.01, basis: "b" }, "after").ok, false);
 
     ledger.recordApprovalRaised(20, "사용자 승인");
 
-    const events = readBudgetEvents(dir);
+    const events = eventsIn(dir);
     const types = new Set(events.map((e) => e.type));
     for (const required of [
       "approval_created",
@@ -1073,7 +1126,6 @@ test("27b. 8가지 예산 이벤트가 모두 필수 필드를 갖고 남는다"
       "reservation_opened",
       "reservation_released",
       "reservation_settled",
-      "provider_usage_recorded",
       "budget_estimate_breached",
       "run_blocked",
     ] as const) {
@@ -1115,18 +1167,18 @@ test("29. 예산 이벤트와 기록 합계가 다르면 재개하지 않는다"
     const r = ledger.reserve({ maxUsd: 2, basis: "b" }, "one");
     assert.ok(r.ok);
     if (!r.ok) return;
-    r.reservation.settle(2);
+    r.reservation.settle(settlement(2));
 
-    const events = readBudgetEvents(dir);
+    const events = eventsIn(dir);
     // 기록 파일이 같은 값을 말하면 재개할 수 있다.
-    assert.equal(reconcile(2, events).ok, true);
+    assert.equal(reconcileBudget({ recordsUsd: 2, events }).ok, true);
     // 다르면 어느 쪽이 맞는지 코드가 알 수 없다 — 한쪽을 골라 계속하지 않는다.
-    const mismatch = reconcile(0, events);
+    const mismatch = reconcileBudget({ recordsUsd: 0, events });
     assert.equal(mismatch.ok, false);
-    if (!mismatch.ok) assert.ok(mismatch.reason.includes("다릅니다"), mismatch.reason);
+    if (!mismatch.ok) assert.ok(mismatch.reasons.join(" ").includes("다릅니다"), mismatch.reasons.join(" / "));
 
     // 이벤트 파일이 아예 없는 것은 불일치가 아니다(이 기능 이전에 만든 실행 디렉터리).
-    assert.equal(reconcile(2, []).ok, true);
+    assert.equal(reconcileBudget({ recordsUsd: 2, events: [] }).ok, true);
   });
 });
 
@@ -1167,11 +1219,12 @@ function mockTransport(
 
 function goodOutcome(modelId: string): RoleProbeOutcome {
   return {
-    returnedModelId: modelId,
+    providerReportedModelId: modelId,
     usage: { inputTokens: 500, outputTokens: 120 },
     latencyMs: 900,
     structuredOutputOk: true,
     evidence: "필수 필드가 채워짐",
+    dispatchState: "response_received_with_usage",
   };
 }
 
@@ -1265,16 +1318,19 @@ test("32. 요청 전에 예약하고, 예약할 수 없으면 부르지 않는�
 
 test("33. 응답 모델 ID가 요청과 다르면 BLOCKED다 (조용한 대체 금지)", async () => {
   const log: MockTransportLog = { calls: [] };
-  const substituted: RoleProbeOutcome = { ...goodOutcome("exec-1"), returnedModelId: "some-other-model" };
+  const substituted: RoleProbeOutcome = { ...goodOutcome("exec-1"), providerReportedModelId: "some-other-model" };
   const summary = await probeModels(
     probeInput(mockTransport({ executor: substituted, reviewer: goodOutcome("rev-1") }, log))
   );
   assert.equal(summary.status, "BLOCKED");
-  assert.ok(summary.blockers.some((b) => b.includes("조용한 대체")), summary.blockers.join("\n"));
+  assert.ok(
+    summary.blockers.some((b) => b.includes("정확히 일치만 통과")),
+    summary.blockers.join("\n")
+  );
   // 대체가 확인된 뒤에는 다음 역할을 부르지 않는다 — 그리고 다른 모델로 바꿔 재시도하지 않는다.
   assert.deepEqual(log.calls, [{ role: "executor", modelId: "exec-1" }]);
   assert.equal(summary.records[0]!.exactModelIdVerified, false);
-  assert.equal(summary.records[0]!.returnedModelId, "some-other-model");
+  assert.equal(summary.records[0]!.providerReportedModelId, "some-other-model");
 });
 
 test("33b. 실제 호출이 실패하면 다른 모델로 대체하지 않는다", async () => {
@@ -1282,7 +1338,8 @@ test("33b. 실제 호출이 실패하면 다른 모델로 대체하지 않는다
   const summary = await probeModels(
     probeInput(mockTransport({ executor: new Error("model_not_found"), reviewer: goodOutcome("rev-1") }, log))
   );
-  assert.equal(summary.status, "BLOCKED");
+  // 평범한 Error는 요청이 나갔는지 알려주지 않는다 → 과금 불확실로 본다.
+  assert.equal(summary.status, "BLOCKED_UNRESOLVED_RESERVATION");
   assert.equal(log.calls.length, 1, "실패 후 다른 요청을 보냈습니다");
   assert.equal(summary.records[0]!.liveProbe, "failed");
   assert.ok(summary.records[0]!.failureReason?.includes("model_not_found"));
@@ -1297,7 +1354,8 @@ test("34. usage가 없거나 비용을 잴 수 없으면 중단한다", async ()
   const summary = await probeModels(
     probeInput(mockTransport({ executor: noUsage, reviewer: goodOutcome("rev-1") }, log))
   );
-  assert.equal(summary.status, "BLOCKED");
+  // 응답을 받았으므로 과금됐을 수 있다 — 해제하지 않고 미해결로 남긴다.
+  assert.equal(summary.status, "BLOCKED_UNRESOLVED_RESERVATION");
   // 0으로 대체하지 않는다 — actualUsd가 undefined로 남는다.
   assert.equal(summary.records[0]!.actualUsd, undefined);
   assert.equal(summary.actualUsd, 0, "측정 불가를 비용 0으로 합산했습니다");
@@ -1309,7 +1367,7 @@ test("34. usage가 없거나 비용을 잴 수 없으면 중단한다", async ()
   const unpriced = await probeModels(
     probeInput(mockTransport({ executor: goodOutcome("exec-1") }, log2), { costOfUsage: () => undefined })
   );
-  assert.equal(unpriced.status, "BLOCKED");
+  assert.equal(unpriced.status, "BLOCKED_UNRESOLVED_RESERVATION");
   assert.equal(unpriced.records[0]!.actualUsd, undefined);
 });
 
@@ -1395,4 +1453,1268 @@ test("38. 비용 추정이 입력과 출력 상한을 모두 반영한다", () =
   // 그리고 출력 몫은 공용 상한(모델 최대치가 아니라)으로 계산된다.
   const expected = inputOnly + (effectiveMaxOutputTokens(executor) / 1_000_000) * 20;
   assert.ok(Math.abs(small.maxUsd - expected) < 1e-9, `${small.maxUsd} != ${expected}`);
+});
+
+// ---------------------------------------------------------------------------
+// 39~55. Crash-safe 예산과 증거 체인 (§11)
+//
+// **실제 네트워크를 타지 않는다.** provider 호출은 mock transport 또는 주입된 어댑터로만
+// 일어나고, 아래 테스트들은 "이름이 요구사항을 반복하는" 대신 실제 provider callback 횟수,
+// 이벤트 상태, 파일 내용, CLI 종료 코드를 확인한다.
+// ---------------------------------------------------------------------------
+
+/** 개시만 있고 종결이 없는 예약을 만든다 — crash를 재현하는 가장 정확한 방법이다. */
+function crashAfterOpen(dir: string): void {
+  const sink = createBudgetEventSink(dir);
+  const ledger = createBudgetLedger(10, { runId: "crash", stage: "smoke", onEvent: sink, now: () => "T0" });
+  const outcome = ledger.reserve({ maxUsd: 3, basis: "b" }, "fx/A/rep1");
+  assert.ok(outcome.ok);
+  // 여기서 프로세스가 죽었다고 가정한다: settle도 release도 부르지 않는다.
+}
+
+test("39. 열린 예약을 reconcile이 정상으로 반환하지 않는다", () => {
+  withDir((dir) => {
+    crashAfterOpen(dir);
+    const read = readBudgetEvents(dir);
+    assert.equal(read.ok, true);
+    if (!read.ok) return;
+
+    // 합계만 보면 0 == 0이라 통과했을 상태다. 상태 머신이 열린 예약을 잡아야 한다.
+    const settledSum = read.events
+      .filter((e) => e.type === "reservation_settled")
+      .reduce((sum, e) => sum + (e.actualUsd ?? 0), 0);
+    assert.equal(settledSum, 0, "정산 이벤트가 없어야 하는 상황입니다");
+
+    const outcome = reconcileBudget({ recordsUsd: 0, events: read.events });
+    assert.equal(outcome.ok, false, "열린 예약이 있는데 재개 가능으로 판정했습니다");
+    if (!outcome.ok) {
+      assert.equal(outcome.status, "BLOCKED_UNRESOLVED_RESERVATION");
+      assert.ok(outcome.reasons.join(" ").includes("종결 이벤트가 없습니다"), outcome.reasons.join(" / "));
+    }
+    // 예약액은 사용 가능한 예산으로 되돌아오지 않는다.
+    assert.equal(outcome.analysis.unresolvedUsd, 3);
+    assert.equal(outcome.analysis.settledUsd, 0);
+  });
+});
+
+test("39b. crash 지점별 판정 — opened / 요청 후 / 기록 후 / settle 후", () => {
+  // 1) reservation_opened 직후 종료 → BLOCKED
+  withDir((dir) => {
+    crashAfterOpen(dir);
+    const events = eventsIn(dir);
+    assert.equal(reconcileBudget({ recordsUsd: 0, events }).ok, false);
+  });
+
+  // 2) provider 요청 전송 후 결과 저장 전 종료 → 같은 흔적이 남으므로 BLOCKED
+  //    (요청이 나갔다는 사실은 이벤트 파일에 없다 — 그래서 열린 예약을 과금 가능으로 본다.)
+  withDir((dir) => {
+    crashAfterOpen(dir);
+    const status = budgetStatus({ runDir: dir, records: [], eventRead: readBudgetEvents(dir), approvedLimitUsd: 10 });
+    assert.equal(status.resumable, false);
+    assert.equal(status.blockedStatus, "BLOCKED_UNRESOLVED_RESERVATION");
+    assert.equal(status.openReservations.length, 1);
+    assert.equal(status.openReservations[0]!.reservedUsd, 3);
+    assert.equal(status.openReservations[0]!.stage, "smoke");
+    assert.equal(status.openReservations[0]!.openedAt, "T0");
+  });
+
+  // 3) record 저장 후 settle 전 종료 → 기록에는 비용이 있는데 이벤트에는 정산이 없다.
+  withDir((dir) => {
+    crashAfterOpen(dir);
+    const events = eventsIn(dir);
+    const outcome = reconcileBudget({ recordsUsd: 2.5, events });
+    assert.equal(outcome.ok, false, "기록만 있고 정산 이벤트가 없는데 재개를 허용했습니다");
+  });
+
+  // 4) settle 후 종료 → 정산 이벤트 하나에 비용·usage·모델 ID가 모두 있으므로 안전하게 판정된다.
+  //    (예전에는 정산과 usage가 두 이벤트였고 그 사이가 crash window였다.)
+  withDir((dir) => {
+    const sink = createBudgetEventSink(dir);
+    const ledger = createBudgetLedger(10, { runId: "ok", stage: "smoke", onEvent: sink, now: () => "T1" });
+    const outcome = ledger.reserve({ maxUsd: 3, basis: "b" }, "fx/A/rep1");
+    assert.ok(outcome.ok);
+    if (!outcome.ok) return;
+    outcome.reservation.settle(settlement(1.25, { providerReportedModelId: "m-1", requestedModelId: "m-1" }));
+
+    const events = eventsIn(dir);
+    const settled = events.find((e) => e.type === "reservation_settled");
+    assert.ok(settled?.usage, "정산 이벤트에 usage가 없습니다 — crash window가 남아 있습니다");
+    assert.equal(settled?.providerReportedModelId, "m-1");
+    assert.equal(reconcileBudget({ recordsUsd: 1.25, events }).ok, true);
+  });
+
+  // 5) 정상 release 완료 → 재개 가능
+  withDir((dir) => {
+    const sink = createBudgetEventSink(dir);
+    const ledger = createBudgetLedger(10, { runId: "rel", stage: "smoke", onEvent: sink, now: () => "T2" });
+    const outcome = ledger.reserve({ maxUsd: 3, basis: "b" }, "fx/A/rep1");
+    assert.ok(outcome.ok);
+    if (!outcome.ok) return;
+    outcome.reservation.release({ dispatchState: "not_dispatched", reason: "요청 전 중단" });
+    assert.equal(reconcileBudget({ recordsUsd: 0, events: eventsIn(dir) }).ok, true);
+  });
+});
+
+test("39c. settled/released 중복과 순서 위반을 거부한다", () => {
+  const base = (overrides: Partial<BudgetEvent>): BudgetEvent => ({
+    eventVersion: 2,
+    type: "reservation_opened",
+    at: "T",
+    runId: "r",
+    stage: "smoke",
+    approvedLimitUsd: 10,
+    cumulativeUsd: 0,
+    ...overrides,
+  });
+
+  // settled + released 둘 다
+  const both = analyzeBudgetEvents([
+    base({ type: "reservation_opened", correlationId: "x", reservedUsd: 1 }),
+    base({ type: "reservation_settled", correlationId: "x", reservedUsd: 1, actualUsd: 0.5 }),
+    base({ type: "reservation_released", correlationId: "x", reservedUsd: 1 }),
+  ]);
+  assert.ok(both.problems.some((p) => p.includes("종결 이벤트가 두 번")), both.problems.join(" / "));
+
+  // opened 없이 settled
+  const orphan = analyzeBudgetEvents([base({ type: "reservation_settled", correlationId: "y", actualUsd: 1 })]);
+  assert.ok(orphan.problems.some((p) => p.includes("없이 reservation_settled")), orphan.problems.join(" / "));
+
+  // 예약액 불일치
+  const mismatch = analyzeBudgetEvents([
+    base({ type: "reservation_opened", correlationId: "z", reservedUsd: 1 }),
+    base({ type: "reservation_settled", correlationId: "z", reservedUsd: 5, actualUsd: 1 }),
+  ]);
+  assert.ok(mismatch.problems.some((p) => p.includes("예약액")), mismatch.problems.join(" / "));
+
+  // provider usage 이벤트와 정산 비용 불일치
+  const usageMismatch = analyzeBudgetEvents([
+    base({ type: "reservation_opened", correlationId: "u", reservedUsd: 2 }),
+    base({ type: "reservation_settled", correlationId: "u", reservedUsd: 2, actualUsd: 1 }),
+    base({ type: "provider_usage_recorded", correlationId: "u", actualUsd: 9 }),
+  ]);
+  assert.ok(usageMismatch.problems.some((p) => p.includes("provider usage")), usageMismatch.problems.join(" / "));
+
+  // 모르는 이벤트 버전
+  withDir((dir) => {
+    writeFileSync(path.join(dir, "budget-events.jsonl"), `${JSON.stringify(base({ eventVersion: 99 }))}\n`);
+    const read = readBudgetEvents(dir);
+    assert.equal(read.ok, false);
+    if (!read.ok) assert.ok(read.reasons.join(" ").includes("버전"), read.reasons.join(" / "));
+  });
+
+  // 손상된 **중간** 줄 (마지막 줄이 아니므로 중단 흔적이 아니다)
+  withDir((dir) => {
+    writeFileSync(
+      path.join(dir, "budget-events.jsonl"),
+      `{"broken":\n${JSON.stringify(base({ correlationId: "a", reservedUsd: 1 }))}\n`
+    );
+    const read = readBudgetEvents(dir);
+    assert.equal(read.ok, false);
+  });
+
+  // 잘린 **마지막** 줄은 버리되 사실을 남긴다 → 재개 불가
+  withDir((dir) => {
+    writeFileSync(
+      path.join(dir, "budget-events.jsonl"),
+      `${JSON.stringify(base({ correlationId: "a", reservedUsd: 1 }))}\n{"partial":`
+    );
+    const read = readBudgetEvents(dir);
+    assert.equal(read.ok, true);
+    if (!read.ok) return;
+    assert.equal(read.truncatedLastLine, true);
+    const outcome = reconcileBudget({ recordsUsd: 0, events: read.events, truncatedLastLine: true });
+    assert.equal(outcome.ok, false, "잘린 줄이 있는데 재개를 허용했습니다");
+  });
+});
+
+test("40. 열린 예약이 있으면 재시작해도 그 금액을 재사용할 수 없다", () => {
+  // 상한 $10, 열린 예약 $3. 세 번 재시작해도 남은 예산은 $7을 넘지 않는다.
+  for (let restart = 1; restart <= 3; restart += 1) {
+    const ledger = createBudgetLedger(10, { initialUnresolvedUsd: 3 });
+    assert.equal(ledger.unresolvedUsd(), 3);
+    assert.equal(ledger.availableUsd(), 7, `${restart}회차에서 미해결 금액이 예산으로 돌아왔습니다`);
+    // 그리고 원장이 차단 상태이므로 애초에 예약을 받지 않는다.
+    assert.equal(ledger.state(), "UNRESOLVED_RESERVATION");
+    const outcome = ledger.reserve({ maxUsd: 1, basis: "b" }, "x");
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) assert.equal(outcome.state, "UNRESOLVED_RESERVATION");
+  }
+});
+
+test("41. NaN/Infinity/음수 비용은 fail closed — 0으로 정산되지 않는다", () => {
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+    const events: BudgetEvent[] = [];
+    const ledger = createBudgetLedger(10, { onEvent: (e) => events.push(e) });
+    const outcome = ledger.reserve({ maxUsd: 2, basis: "b" }, "one");
+    assert.ok(outcome.ok);
+    if (!outcome.ok) return;
+    const settled = outcome.reservation.settle(settlement(bad));
+    assert.equal(settled.ok, false, `${bad}가 정산되었습니다`);
+    if (!settled.ok) assert.equal(settled.state, "BUDGET_LEDGER_INVALID");
+
+    // **예약이 해제되지 않는다** — 0으로 정산하면 그 금액만큼 상한이 되살아난다.
+    assert.equal(ledger.sessionCommittedUsd(), 0);
+    assert.equal(ledger.unresolvedUsd(), 2);
+    assert.equal(ledger.availableUsd(), 8);
+    assert.equal(ledger.state(), "BUDGET_LEDGER_INVALID");
+    // 이후 유료 호출이 차단된다.
+    assert.equal(ledger.reserve({ maxUsd: 0.01, basis: "b" }, "two").ok, false);
+    // 감사 이벤트가 남는다.
+    assert.ok(events.some((e) => e.type === "budget_ledger_invalid"), events.map((e) => e.type).join(","));
+  }
+});
+
+test("41b. usage 토큰 이상값과 실공급자 0토큰도 fail closed", () => {
+  const cases: { label: string; settlement: Settlement }[] = [
+    {
+      label: "inputTokens NaN",
+      settlement: settlement(1, { usage: { measured: true, inputTokens: Number.NaN, outputTokens: 1 } }),
+    },
+    {
+      label: "outputTokens 음수",
+      settlement: settlement(1, { usage: { measured: true, inputTokens: 1, outputTokens: -1 } }),
+    },
+    {
+      label: "실공급자 응답의 0/0 토큰",
+      settlement: settlement(1, { usage: { measured: true, inputTokens: 0, outputTokens: 0 }, providerKind: "real" }),
+    },
+    {
+      label: "비용 측정 실패",
+      settlement: settlement(0, { cost: { measured: false, reason: "usage 없음" } }),
+    },
+  ];
+  for (const testCase of cases) {
+    const ledger = createBudgetLedger(10);
+    const outcome = ledger.reserve({ maxUsd: 2, basis: "b" }, "one");
+    assert.ok(outcome.ok);
+    if (!outcome.ok) return;
+    const settled = outcome.reservation.settle(testCase.settlement);
+    assert.equal(settled.ok, false, `${testCase.label}가 정산되었습니다`);
+    assert.equal(ledger.sessionCommittedUsd(), 0, testCase.label);
+    assert.equal(ledger.unresolvedUsd(), 2, testCase.label);
+  }
+
+  // **0은 fake에서 합법이다** — 타입 수준에서 "0달러"와 "모른다"를 구별한 결과다.
+  const fake = createBudgetLedger(10);
+  const outcome = fake.reserve({ maxUsd: 1, basis: "b" }, "fake");
+  assert.ok(outcome.ok);
+  if (!outcome.ok) return;
+  const ok = outcome.reservation.settle({
+    cost: { measured: true, usd: 0 },
+    usage: { measured: true, inputTokens: 0, outputTokens: 0 },
+    providerKind: "fake",
+  });
+  assert.equal(ok.ok, true, "fake의 0토큰/0달러 정산이 막혔습니다");
+  assert.equal(fake.unresolvedUsd(), 0);
+});
+
+test("42. parse/schema 오류 후 예약이 해제되지 않는다", async () => {
+  // 응답을 받고 usage까지 있었지만 스키마에서 실패한 경우 — 과금됐다.
+  const log: MockTransportLog = { calls: [] };
+  const events: BudgetEvent[] = [];
+  const failure = new ProviderCallFailure({
+    message: "구조화 출력이 JSON이 아님",
+    dispatchState: "response_received_with_usage",
+    classification: { kind: "schema_violation", message: "json", status: 400, retryable: false },
+    usage: { inputTokens: 400, outputTokens: 90 },
+    providerReportedModelId: "exec-1",
+  });
+  const summary = await probeModels(
+    probeInput(mockTransport({ executor: failure, reviewer: goodOutcome("rev-1") }, log), {
+      onEvent: (e) => events.push(e),
+    })
+  );
+
+  assert.equal(summary.status, "BLOCKED");
+  // usage가 있으므로 **실제 비용으로 정산**된다 — 해제(=안 쓴 것으로 만들기)가 아니다.
+  assert.ok(summary.actualUsd > 0, `실제 비용이 정산되지 않았습니다: ${summary.actualUsd}`);
+  assert.equal(summary.records[0]!.reservationOutcome, "settled");
+  assert.ok(!events.some((e) => e.type === "reservation_released"), "과금된 호출의 예약이 해제되었습니다");
+  // 다음 역할은 부르지 않는다.
+  assert.equal(log.calls.length, 1);
+
+  // usage를 모르는 경우 → 미해결로 남는다(해제도 정산도 아니다).
+  const log2: MockTransportLog = { calls: [] };
+  const events2: BudgetEvent[] = [];
+  const noUsage = new ProviderCallFailure({
+    message: "응답을 받았으나 usage 없음",
+    dispatchState: "response_received_without_usage",
+    classification: { kind: "schema_violation", message: "no usage", retryable: false },
+  });
+  const summary2 = await probeModels(
+    probeInput(mockTransport({ executor: noUsage, reviewer: goodOutcome("rev-1") }, log2), {
+      onEvent: (e) => events2.push(e),
+    })
+  );
+  assert.equal(summary2.status, "BLOCKED_UNRESOLVED_RESERVATION");
+  assert.equal(summary2.records[0]!.reservationOutcome, "unresolved");
+  assert.ok(summary2.unresolvedUsd > 0);
+  assert.ok(!events2.some((e) => e.type === "reservation_released"));
+  assert.ok(events2.some((e) => e.type === "reservation_unresolved"));
+  assert.equal(log2.calls.length, 1);
+
+  // **요청이 나가지 않은 것이 확실할 때만** 해제된다.
+  const log3: MockTransportLog = { calls: [] };
+  const events3: BudgetEvent[] = [];
+  const notDispatched = new ProviderCallFailure({
+    message: "요청 조립 실패",
+    dispatchState: "not_dispatched",
+    classification: { kind: "auth", message: "no key", retryable: false },
+  });
+  const summary3 = await probeModels(
+    probeInput(mockTransport({ executor: notDispatched }, log3), { onEvent: (e) => events3.push(e) })
+  );
+  assert.equal(summary3.unresolvedUsd, 0);
+  assert.equal(summary3.records[0]!.reservationOutcome, "released");
+  assert.ok(events3.some((e) => e.type === "reservation_released"));
+});
+
+test("43. 오류 메시지에 secret-like 문자열이 있어도 어디에도 남지 않는다", async () => {
+  const secret = "sk-ant-0123456789abcdefghijklmnopqrstuvwxyz";
+  const log: MockTransportLog = { calls: [] };
+  const events: BudgetEvent[] = [];
+  const leaky = new ProviderCallFailure({
+    message: `401 from provider: Authorization: Bearer ${secret}`,
+    dispatchState: "not_dispatched",
+    classification: { kind: "auth", message: "unauthorized", retryable: false },
+  });
+  const summary = await probeModels(
+    probeInput(mockTransport({ executor: leaky }, log), { onEvent: (e) => events.push(e) })
+  );
+
+  // **만드는 지점에서 지운다** — 저장 직전 검사만으로는 stdout에 이미 나간 것을 못 막는다.
+  assert.ok(!leaky.message.includes(secret), "ProviderCallFailure가 원문 키를 그대로 담았습니다");
+  assert.ok(redactSecrets(`Bearer ${secret}`).includes("[REDACTED"), "redaction이 동작하지 않습니다");
+
+  const serialized = JSON.stringify({ summary, events });
+  assert.ok(!serialized.includes(secret), "요약 또는 이벤트에 키가 남았습니다");
+  assert.ok(!containsSecretLike(serialized), serialized.slice(0, 300));
+
+  // 화면 출력에도 남지 않는다.
+  const rendered = renderProbeSummary(summary).join("\n");
+  assert.ok(!rendered.includes(secret));
+  assert.ok(!containsSecretLike(rendered));
+
+  // 파일에도 남지 않는다.
+  withDir((dir) => {
+    writeProbeResults(dir, summary);
+    const text = readFileSync(path.join(dir, "model-probe.json"), "utf8");
+    assert.ok(!text.includes(secret));
+    assert.ok(!containsSecretLike(text));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 44~55. Probe evidence → Run Card → P0 → P1 증거 체인 (§11)
+// ---------------------------------------------------------------------------
+
+const FAKE_KEYS = { OPENAI_API_KEY: "test-openai-key-value", ANTHROPIC_API_KEY: "test-anthropic-key-value" };
+
+function bindingFor(env: NodeJS.ProcessEnv = FAKE_KEYS): CredentialBinding {
+  const binding = computeCredentialBinding(
+    [
+      { providerId: "openai", envName: "OPENAI_API_KEY" },
+      { providerId: "anthropic", envName: "ANTHROPIC_API_KEY" },
+    ],
+    env,
+    "a".repeat(64)
+  );
+  assert.ok(binding, "binding을 만들 수 없습니다");
+  return binding!;
+}
+
+const EVIDENCE_BINDING = {
+  protocolVersion: CRITERIA.protocolVersion,
+  criteriaHash: criteriaHash(),
+  registrySnapshotHash: "reg-hash",
+  adapterContractVersion: "2",
+};
+
+function roleEvidenceFor(modelId: string, providerId: string): RoleEvidence {
+  return {
+    providerId,
+    requestedModelId: modelId,
+    providerReportedModelId: modelId,
+    exactModelIdVerified: true,
+    structuredOutputVerified: true,
+    usage: { inputTokens: 500, outputTokens: 120 },
+    actualUsd: 0.002,
+  };
+}
+
+function validEvidence(overrides: Partial<Parameters<typeof buildProbeEvidence>[0]> = {}): ProbeEvidence {
+  return buildProbeEvidence({
+    createdAt: "2026-07-30T00:00:00.000Z",
+    ...EVIDENCE_BINDING,
+    executor: roleEvidenceFor("gpt-4.1", "openai"),
+    reviewer: roleEvidenceFor("claude-sonnet-5", "anthropic"),
+    approvedProbeLimitUsd: 1,
+    cumulativeProbeCostUsd: 0.004,
+    credentialBinding: bindingFor(),
+    evidenceId: "probe-fixed-id",
+    ...overrides,
+  });
+}
+
+function expectationsAt(now: string): Parameters<typeof validateProbeEvidence>[1] {
+  return {
+    now,
+    ...EVIDENCE_BINDING,
+    executorModelId: "gpt-4.1",
+    reviewerModelId: "claude-sonnet-5",
+    env: FAKE_KEYS,
+  };
+}
+
+test("44. probe evidence는 만료·변조·모델 불일치·다른 키를 거부한다", () => {
+  const evidence = validEvidence();
+  const inWindow = "2026-07-30T01:00:00.000Z";
+  assert.equal(validateProbeEvidence(evidence, expectationsAt(inWindow)).ok, true);
+
+  // 만료
+  const expired = validateProbeEvidence(evidence, expectationsAt("2026-08-01T00:00:00.000Z"));
+  assert.equal(expired.ok, false);
+  if (!expired.ok) assert.ok(expired.reasons.some((r) => r.includes("만료")), expired.reasons.join(" / "));
+
+  // 변조: 비용을 손으로 고치면 해시가 깨진다.
+  const tampered = { ...evidence, cumulativeProbeCostUsd: 0.000001 };
+  const tamperedVerdict = validateProbeEvidence(tampered, expectationsAt(inWindow));
+  assert.equal(tamperedVerdict.ok, false);
+  if (!tamperedVerdict.ok) {
+    assert.equal(tamperedVerdict.status, "BLOCKED_INVALID_PROBE_EVIDENCE");
+    assert.ok(tamperedVerdict.reasons.some((r) => r.includes("해시")), tamperedVerdict.reasons.join(" / "));
+  }
+
+  // 모델 불일치
+  const otherModel = validateProbeEvidence(evidence, { ...expectationsAt(inWindow), executorModelId: "gpt-5.1" });
+  assert.equal(otherModel.ok, false);
+  if (!otherModel.ok) assert.ok(otherModel.reasons.some((r) => r.includes("executor 모델")));
+
+  // 레지스트리 스냅샷 / 어댑터 계약이 바뀌면 거부
+  for (const changed of [{ registrySnapshotHash: "other" }, { adapterContractVersion: "3" }]) {
+    const verdict = validateProbeEvidence(evidence, { ...expectationsAt(inWindow), ...changed });
+    assert.equal(verdict.ok, false, JSON.stringify(changed));
+  }
+
+  // 다른 자격증명
+  const otherKey = validateProbeEvidence(evidence, {
+    ...expectationsAt(inWindow),
+    env: { ...FAKE_KEYS, OPENAI_API_KEY: "different-key" },
+  });
+  assert.equal(otherKey.ok, false);
+  if (!otherKey.ok) assert.ok(otherKey.reasons.some((r) => r.includes("probe 당시와 다릅니다")));
+
+  // 키가 사라진 경우
+  const noKey = validateProbeEvidence(evidence, { ...expectationsAt(inWindow), env: { OPENAI_API_KEY: "test-openai-key-value" } });
+  assert.equal(noKey.ok, false);
+});
+
+test("44b. credentialBinding에 키 원문·prefix·suffix가 없다", () => {
+  const evidence = validEvidence();
+  const text = JSON.stringify(evidence);
+  for (const key of Object.values(FAKE_KEYS)) {
+    assert.ok(!text.includes(key), "evidence에 키 원문이 있습니다");
+    assert.ok(!text.includes(key.slice(0, 8)), "evidence에 키 prefix가 있습니다");
+    assert.ok(!text.includes(key.slice(-8)), "evidence에 키 suffix가 있습니다");
+  }
+  assert.equal(evidence.credentialBinding.algorithm, "HMAC-SHA256");
+  // 환경변수 **이름**은 남는다 — 값이 아니라 어디를 봐야 하는지의 정보다.
+  assert.ok(text.includes("OPENAI_API_KEY"));
+});
+
+test("45. probe 결과가 Run Card readiness에 반영된다", () => {
+  const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+  const models = planModels({ credentialPresence: () => true });
+  const common = {
+    fixtures,
+    arms: ["A", "B", "C", "D"] as ArmId[],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    p1ApprovedLimitUsd: 300,
+    models,
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    joinPath: (a: string, b: string) => `${a}/${b}`,
+  };
+
+  // evidence 없음 → READY_FOR_MODEL_PROBE
+  const before = buildStagedCards(common);
+  assert.equal(before.p0.status, "READY_FOR_MODEL_PROBE");
+  assert.equal(before.p0.probeEvidenceId, undefined);
+
+  // evidence 있음 → P0는 승인 가능, P1은 P0 결과 대기
+  const after = buildStagedCards({ ...common, probeEvidence: validEvidence() });
+  assert.equal(after.p0.status, "READY_FOR_P0_APPROVAL", after.p0.blockers.join(" / "));
+  assert.equal(after.p0.probeEvidenceId, "probe-fixed-id");
+  assert.equal(after.p1.status, "BLOCKED_PENDING_P0_RESULT");
+
+  // P0 attestation까지 있으면 P1도 승인 가능
+  const withP0 = buildStagedCards({
+    ...common,
+    probeEvidence: validEvidence(),
+    p0Attestation: { attestationId: "p0-x", attestationHash: "hash-x" },
+  });
+  assert.equal(withP0.p1.status, "READY_FOR_P1_APPROVAL", withP0.p1.blockers.join(" / "));
+  assert.equal(withP0.p1.p0AttestationId, "p0-x");
+
+  // 자격증명이 없으면 그것이 가장 먼저다.
+  const noCreds = buildStagedCards({ ...common, credentialsPresent: false, probeEvidence: validEvidence() });
+  assert.equal(noCreds.p0.status, "BLOCKED_MISSING_CREDENTIALS");
+
+  // evidence가 깨졌으면 READY_FOR_MODEL_PROBE가 아니라 BLOCKED_INVALID_PROBE_EVIDENCE다.
+  const broken = buildStagedCards({ ...common, probeEvidenceProblems: ["해시가 다릅니다"] });
+  assert.equal(broken.p0.status, "BLOCKED_INVALID_PROBE_EVIDENCE");
+});
+
+test("46. Run Card 없이는 유료 실행 경로에 들어갈 수 없다", () => {
+  // CLI 인수 수준에서 카드 없이 실행하는 우회 플래그가 없다.
+  const options = parseArgs(["pilot", "--max-cost-usd", "10"], "/o");
+  assert.equal(options.runCard, undefined);
+  const flags = ["--force", "--no-run-card", "--skip-run-card", "--unsafe", "--yes"];
+  for (const flag of flags) {
+    assert.throws(() => parseArgs(["pilot", flag], "/o"), OptionError, `${flag}가 받아들여졌습니다`);
+  }
+  // 카드 경로는 받는다.
+  assert.ok(parseArgs(["pilot", "--run-card", "/tmp/p0-run-card.json"], "/o").runCard?.endsWith("p0-run-card.json"));
+});
+
+test("47. 카드 해시·단계·경로·인자·예산이 다르면 승인하지 않는다", () => {
+  const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+  const cards = buildStagedCards({
+    fixtures,
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    p1ApprovedLimitUsd: 300,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: validEvidence(),
+    joinPath: (a, b) => `${a}/${b}`,
+  });
+  const card = cards.p0;
+  const request: CardExecutionRequest = {
+    stage: "smoke",
+    outputDir: card.outputDir,
+    fixtureIds: card.stage.fixtureIds,
+    arms: card.stage.arms,
+    repetitions: 1,
+    seed: 1,
+    maxCostUsd: 30,
+    executorModelId: card.models!.executor.modelId,
+    reviewerModelId: card.models!.reviewer.modelId,
+    now: "2026-07-30T01:00:00.000Z",
+  };
+  assert.equal(authorizeRunCard(card, request).ok, true, JSON.stringify(authorizeRunCard(card, request)));
+
+  const rejections: { label: string; patch: Partial<CardExecutionRequest> }[] = [
+    { label: "단계", patch: { stage: "pilot" } },
+    { label: "출력 경로", patch: { outputDir: "/tmp/other" } },
+    { label: "fixture", patch: { fixtureIds: ["nope"] } },
+    { label: "arm", patch: { arms: ["A"] as ArmId[] } },
+    { label: "반복", patch: { repetitions: 3 } },
+    { label: "seed", patch: { seed: 99 } },
+    { label: "예산", patch: { maxCostUsd: 300 } },
+    { label: "executor 모델", patch: { executorModelId: "gpt-5.1" } },
+    { label: "만료", patch: { now: "2026-08-05T00:00:00.000Z" } },
+  ];
+  for (const rejection of rejections) {
+    const verdict = authorizeRunCard(card, { ...request, ...rejection.patch });
+    assert.equal(verdict.ok, false, `${rejection.label}가 달라도 승인했습니다`);
+    if (!verdict.ok) assert.equal(verdict.status, "BLOCKED_INVALID_RUN_CARD");
+  }
+
+  // 카드 파일을 손으로 고치면 해시 검증에서 막힌다.
+  withDir((dir) => {
+    const stored: RunCard = { ...card, outputDir: dir };
+    writeRunCard(stored);
+    const file = runCardPath(dir, "smoke");
+    const raw = JSON.parse(readFileSync(file, "utf8")) as RunCard;
+    raw.approvedLimitUsd = 9_999;
+    writeFileSync(file, JSON.stringify(raw, null, 2));
+    const loaded = loadRunCard(file);
+    assert.equal(loaded.ok, false, "수정된 카드가 통과했습니다");
+    if (!loaded.ok) assert.ok(loaded.reasons.join(" ").includes("해시"), loaded.reasons.join(" / "));
+  });
+
+  // evidence가 연결되지 않은 카드는 승인 불가다.
+  const noEvidence = buildStagedCards({
+    fixtures,
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    joinPath: (a, b) => `${a}/${b}`,
+  }).p0;
+  const verdict = authorizeRunCard(noEvidence, request);
+  assert.equal(verdict.ok, false);
+  if (!verdict.ok) assert.ok(verdict.reasons.some((r) => r.includes("probe evidence")));
+});
+
+test("48. P0 attestation은 8건 전부 정상일 때만 만들어진다", () => {
+  const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+  const evidence = validEvidence();
+  const card = buildStagedCards({
+    fixtures,
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => `${a}/${b}`,
+  }).p0;
+
+  const goodRecords = p0Records(card, evidence);
+  assert.equal(goodRecords.length, 8);
+  const events = p0Events(goodRecords);
+
+  const ok = attestP0({ card, evidence, records: goodRecords, budgetEvents: events, createdAt: "2026-07-30T02:00:00.000Z" });
+  assert.equal(ok.ok, true, ok.ok ? "" : ok.reasons.join(" / "));
+  if (!ok.ok) return;
+  assert.equal(ok.attestation.actualRecords, 8);
+  assert.equal(ok.attestation.expectedRecords, 8);
+  assert.ok(ok.attestation.checks.every((c) => c.passed));
+
+  // 부분 실행 → BLOCKED_P0_INCOMPLETE
+  const partial = attestP0({
+    card,
+    evidence,
+    records: goodRecords.slice(0, 7),
+    budgetEvents: p0Events(goodRecords.slice(0, 7)),
+    createdAt: "2026-07-30T02:00:00.000Z",
+  });
+  assert.equal(partial.ok, false);
+  if (!partial.ok) assert.equal(partial.status, "BLOCKED_P0_INCOMPLETE");
+
+  // 인프라 실패 1건 → BLOCKED_P0_FAILED
+  const withFailure = goodRecords.map((r, i) => (i === 0 ? { ...r, failureClass: "auth_failure" as const } : r));
+  const failed = attestP0({
+    card,
+    evidence,
+    records: withFailure,
+    budgetEvents: p0Events(withFailure),
+    createdAt: "2026-07-30T02:00:00.000Z",
+  });
+  assert.equal(failed.ok, false);
+  if (!failed.ok) assert.equal(failed.status, "BLOCKED_P0_FAILED");
+
+  // 열린 예약 1건 → attestation 없음
+  const openEvent: BudgetEvent = {
+    eventVersion: 2,
+    type: "reservation_opened",
+    at: "T",
+    runId: "r",
+    stage: "smoke",
+    approvedLimitUsd: 30,
+    cumulativeUsd: 0,
+    correlationId: "leftover",
+    reservedUsd: 1,
+  };
+  const withOpen = attestP0({
+    card,
+    evidence,
+    records: goodRecords,
+    budgetEvents: [...events, openEvent],
+    createdAt: "2026-07-30T02:00:00.000Z",
+  });
+  assert.equal(withOpen.ok, false);
+
+  // 응답 envelope 모델 ID가 evidence와 다르면 attestation 없음 —
+  // **DraftProposal.model이 같아도** 통과하지 않는다.
+  const substituted = goodRecords.map((r) => ({ ...r, returnedModelId: "some-other-model" }));
+  const wrongModel = attestP0({
+    card,
+    evidence,
+    records: substituted,
+    budgetEvents: p0Events(substituted),
+    createdAt: "2026-07-30T02:00:00.000Z",
+  });
+  assert.equal(wrongModel.ok, false);
+  if (!wrongModel.ok) {
+    assert.ok(
+      wrongModel.reasons.some((r) => r.includes("응답 envelope 모델 ID")),
+      wrongModel.reasons.join(" / ")
+    );
+  }
+});
+
+test("49. 실패한·변조된 P0 attestation으로는 P1을 승인하지 않는다", () => {
+  const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+  const evidence = validEvidence();
+  const card = buildStagedCards({
+    fixtures,
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => `${a}/${b}`,
+  }).p0;
+  const records = p0Records(card, evidence);
+  const outcome = attestP0({ card, evidence, records, budgetEvents: p0Events(records), createdAt: "2026-07-30T02:00:00.000Z" });
+  assert.ok(outcome.ok);
+  if (!outcome.ok) return;
+
+  const expect = {
+    probeEvidenceId: evidence.evidenceId,
+    probeEvidenceHash: evidence.evidencePayloadHash,
+    criteriaHash: criteriaHash(),
+    protocolVersion: CRITERIA.protocolVersion,
+    executorModelId: "gpt-4.1",
+    reviewerModelId: "claude-sonnet-5",
+  };
+  assert.equal(validateP0Attestation(outcome.attestation, expect).ok, true);
+
+  // 변조: 검사 결과를 통과로 바꾸면 해시가 깨진다.
+  const tampered = {
+    ...outcome.attestation,
+    checks: outcome.attestation.checks.map((c) => ({ ...c, passed: true })),
+    actualRecords: 1,
+  };
+  const tamperedVerdict = validateP0Attestation(tampered, expect);
+  assert.equal(tamperedVerdict.ok, false);
+  if (!tamperedVerdict.ok) assert.equal(tamperedVerdict.status, "BLOCKED_PENDING_P0_RESULT");
+
+  // 다른 evidence를 근거로 만든 attestation은 이 실행을 보증하지 않는다.
+  const otherEvidence = validateP0Attestation(outcome.attestation, { ...expect, probeEvidenceId: "probe-other" });
+  assert.equal(otherEvidence.ok, false);
+
+  // 다른 모델
+  const otherModel = validateP0Attestation(outcome.attestation, { ...expect, executorModelId: "gpt-5.1" });
+  assert.equal(otherModel.ok, false);
+});
+
+test("50. probe timeout이 실제 abort를 발생시키고 과금 불확실로 처리된다", async () => {
+  // 시간을 주입한다 — 60초를 기다리는 테스트는 만들지 않는다.
+  const fired: (() => void)[] = [];
+  const timers = {
+    setTimeout: (handler: () => void) => {
+      fired.push(handler);
+      return fired.length;
+    },
+    clearTimeout: () => undefined,
+  };
+
+  let sawAbort = false;
+  const transport = createAdapterProbeTransport({
+    timeoutMs: 1,
+    timers,
+    now: () => "2026-07-30T00:00:00.000Z",
+    // **주입된 어댑터** — 이 테스트는 네트워크를 타지 않는다.
+    adapterFactory: () => ({
+      async generateDraft(_input, ctx) {
+        // timeout timer를 발화시킨 뒤 abort 신호를 확인한다.
+        fired.forEach((f) => f());
+        if (ctx.signal.aborted) {
+          sawAbort = true;
+          const error = new Error("aborted") as Error & { name: string };
+          error.name = "AbortError";
+          throw error;
+        }
+        throw new Error("abort가 오지 않았습니다");
+      },
+      async reviewProposal() {
+        throw new Error("reviewer는 호출되지 않아야 합니다");
+      },
+    }),
+  });
+
+  const entry = modelEntry({ modelId: "exec-1", providerId: "openai" });
+  await assert.rejects(
+    () => transport.probe("executor", entry),
+    (error: Error) => {
+      assert.equal(error.name, "ProbeTimeoutError");
+      // **타임아웃은 not_dispatched가 아니다** — 응답이 생성됐지만 못 받은 것일 수 있다.
+      assert.equal((error as ProviderCallFailure).dispatchState, "dispatched_no_response");
+      return true;
+    }
+  );
+  assert.equal(sawAbort, true, "AbortController가 실제로 abort되지 않았습니다");
+
+  // 사용자 취소는 타임아웃과 구별된다.
+  const controller = new AbortController();
+  const cancelTransport = createAdapterProbeTransport({
+    timeoutMs: 10_000,
+    timers: { setTimeout: () => 1, clearTimeout: () => undefined },
+    externalSignal: controller.signal,
+    adapterFactory: () => ({
+      async generateDraft(_input, ctx) {
+        controller.abort();
+        assert.equal(ctx.signal.aborted, true);
+        const error = new Error("cancelled") as Error & { name: string };
+        error.name = "AbortError";
+        throw error;
+      },
+      async reviewProposal() {
+        throw new Error("호출되지 않아야 합니다");
+      },
+    }),
+  });
+  await assert.rejects(
+    () => cancelTransport.probe("executor", entry),
+    (error: Error) => error.name === "ProbeCancelledError"
+  );
+
+  // 타임아웃 후 두 번째 역할을 부르지 않는다 (probeModels의 중단 규칙).
+  const log: MockTransportLog = { calls: [] };
+  const timeoutFailure = new ProviderCallFailure({
+    message: "timeout",
+    dispatchState: "dispatched_no_response",
+    classification: { kind: "timeout", message: "t", retryable: false },
+  });
+  const summary = await probeModels(probeInput(mockTransport({ executor: timeoutFailure }, log)));
+  assert.equal(log.calls.length, 1);
+  assert.equal(summary.status, "BLOCKED_UNRESOLVED_RESERVATION");
+  assert.ok(summary.unresolvedUsd > 0, "타임아웃이 과금 불확실로 처리되지 않았습니다");
+});
+
+test("51. 모든 화면에서 총 호출 상한을 쓴다 (executor-only를 최대라 부르지 않는다)", () => {
+  // confirmatory: 24 fixture × 4 arm × 3회.
+  const confirmatory = computeCallBudget({ fixtureCount: 24, arms: ["A", "B", "C", "D"], repetitions: 3 });
+  assert.equal(confirmatory.executor, 1_152);
+  assert.equal(confirmatory.reviewer, 432);
+  assert.equal(confirmatory.total, 1_584, "총 상한이 executor+reviewer가 아닙니다");
+
+  // P0 44회 / P1 528회가 **같은 함수에서** 나온다.
+  assert.equal(computeCallBudget({ fixtureCount: 2, arms: ["A", "B", "C", "D"], repetitions: 1 }).total, 44);
+  assert.equal(computeCallBudget({ fixtureCount: 24, arms: ["A", "B", "C", "D"], repetitions: 1 }).total, 528);
+
+  // preflight 출력이 총 상한을 쓴다.
+  const pre = preflight({
+    fixtureCount: 24,
+    arms: ["A", "B", "C", "D"],
+    repetitions: 3,
+    usingFakeProvider: true,
+    msvc: { kind: "not_needed" },
+  });
+  const text = pre.lines.join("\n");
+  assert.ok(text.includes("최대 provider 호출 수(총 상한): 1,584회"), text);
+  assert.ok(text.includes("executor(초안 1 + fix loop 3): 1,152회"), text);
+  assert.ok(text.includes("reviewer(검수 1 + revise 2): 432회"), text);
+  // executor 수치가 단독으로 "최대 API 호출 수"라고 불리지 않는다.
+  assert.ok(!/최대 API 호출 수/.test(text), text);
+});
+
+test("52. 공백·괄호·비ASCII·따옴표가 있는 Windows 경로 명령이 재현 가능하다", () => {
+  // 백슬래시는 이중화해 적는다. `String.raw`는 **trailing backslash가 백틱을 escape**해서
+  // 쓸 수 없다 — 그리고 trailing backslash가 정확히 이 테스트가 확인해야 하는 경우다.
+  const paths = [
+    "C:\\Users\\Vyper\\Documents\\Tomverse Code\\run",
+    "C:\\Program Files (x86)\\Tomverse\\run",
+    "C:\\사용자\\톰버스 코드\\실행",
+    "C:\\temp\\trailing\\",
+    "C:\\it's mine\\run",
+  ];
+  for (const target of paths) {
+    const quoted = quotePowerShellArg(target);
+    // 공백이 있으면 반드시 인용된다.
+    if (/\s/.test(target)) assert.ok(quoted.startsWith("'"), `${target} → ${quoted}`);
+    // 작은따옴표는 이중화된다 — PowerShell literal 문자열의 유일한 escape다.
+    if (target.includes("'")) assert.ok(quoted.includes("''"), quoted);
+    // 인용을 풀면 원래 경로가 그대로 나온다 (PowerShell literal 규칙).
+    const unquoted = quoted.startsWith("'") ? quoted.slice(1, -1).replace(/''/g, "'") : quoted;
+    assert.equal(unquoted, target, `${target} → ${quoted}`);
+  }
+
+  // 카드의 argv는 **구조**이므로 인용과 무관하게 원본 경로를 담는다.
+  const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+  const spaced = "C:\\Users\\Vyper\\Documents\\Tomverse Code\\gate";
+  const cards = buildStagedCards({
+    fixtures,
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: spaced,
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: validEvidence(),
+    joinPath: (a, b) => `${a}\\\\${b}`,
+  });
+  const card = cards.p0;
+  const outputIndex = card.runArgv.indexOf("--output");
+  assert.ok(outputIndex >= 0);
+  assert.equal(card.runArgv[outputIndex + 1], `${spaced}\\\\p0-smoke`, "argv에 원본 경로가 담기지 않았습니다");
+  // 사람이 읽는 문자열에서는 인용된다.
+  assert.ok(card.runCommandPowerShell.includes(`'${spaced}\\\\p0-smoke'`), card.runCommandPowerShell);
+  // 문자열을 다시 파싱하지 않고 argv를 비교하는 것이 요점이다.
+  assert.deepEqual(card.resumeArgv, [...card.runArgv, "--resume"]);
+});
+
+test("53. 이 파일의 모든 provider 상호작용이 mock 또는 주입 어댑터다", () => {
+  // `createAdapterProbeTransport`를 adapterFactory 없이 부르면 실제 어댑터가 만들어지고,
+  // 그것만이 네트워크로 나간다. 이 파일에 그런 호출이 하나도 없어야 한다.
+  //
+  // **needle을 런타임에 조립한다.** 소스를 검사하는 테스트가 검사 대상 문자열을 그대로
+  // 담고 있으면 자기 자신을 세게 되고, 그러면 개수 비교가 언제나 어긋난다.
+  const needle = `createAdapterProbe${"Transport("}`;
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const source = readFileSync(path.join(root, "test", "safety.test.ts"), "utf8");
+
+  const calls: string[] = [];
+  let index = source.indexOf(needle);
+  while (index >= 0) {
+    // 호출 하나의 인자 범위를 괄호 깊이로 잘라낸다.
+    let depth = 0;
+    let end = index + needle.length - 1;
+    for (; end < source.length; end += 1) {
+      if (source[end] === "(") depth += 1;
+      else if (source[end] === ")") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    calls.push(source.slice(index, end + 1));
+    index = source.indexOf(needle, end + 1);
+  }
+
+  assert.ok(calls.length >= 2, `transport 테스트가 없습니다 (발견 ${calls.length}건)`);
+  for (const call of calls) {
+    assert.ok(
+      call.includes("adapterFactory"),
+      `주입 없이 실제 transport를 만들었습니다: ${call.slice(0, 120)}`
+    );
+  }
+});
+
+// ---- 공용: P0 mock 기록과 이벤트 ----
+
+/** 카드가 요구하는 8건을 만든다. 실제 P0를 돌리지 않고 attestation 경로를 검증하기 위한 것이다. */
+function p0Records(card: RunCard, evidence: ProbeEvidence): GateRunRecord[] {
+  const out: GateRunRecord[] = [];
+  for (const fixtureId of card.stage.fixtureIds) {
+    for (const arm of card.stage.arms) {
+      const fixture = card.fixtureHashes.find((f) => f.fixtureId === fixtureId)!;
+      out.push({
+        ...sampleRecord(fixtureId, arm as "A" | "B" | "C" | "D", 1),
+        fixtureHash: fixture.hash,
+        category: fixture.category as GateRunRecord["category"],
+        providerCallCount: 1,
+        costUsd: 0.01,
+        inputTokens: 500,
+        outputTokens: 100,
+        // 응답 envelope이 실어 온 모델 ID. arm에 따라 executor/reviewer가 달라진다.
+        returnedModelId:
+          arm === "B"
+            ? evidence.reviewer.providerReportedModelId
+            : evidence.executor.providerReportedModelId,
+        oracleVerificationPassed: true,
+        publicVerificationPassed: true,
+      });
+    }
+  }
+  return out;
+}
+
+/** 각 기록에 대응하는 정상 예약 이벤트(개시 + 정산). */
+function p0Events(records: readonly GateRunRecord[]): BudgetEvent[] {
+  const events: BudgetEvent[] = [];
+  records.forEach((record, i) => {
+    const id = `${record.fixtureId}/${record.arm}/rep${record.repetition}#${i + 1}`;
+    const base = {
+      eventVersion: 2,
+      at: "T",
+      runId: "p0",
+      stage: "smoke",
+      approvedLimitUsd: 30,
+      cumulativeUsd: 0,
+      correlationId: id,
+      reservedUsd: 0.5,
+    } as const;
+    events.push({ ...base, type: "reservation_opened" });
+    events.push({
+      ...base,
+      type: "reservation_settled",
+      actualUsd: record.costUsd ?? 0,
+      usage: { inputTokens: record.inputTokens, outputTokens: record.outputTokens },
+    });
+  });
+  return events;
+}
+
+// ---------------------------------------------------------------------------
+// 54~57. CLI 수준 차단 — 종료 코드와 "기록이 없다"로 확인한다 (§11)
+//
+// **환경에서 실제 키를 지우고 실행한다.** 로직이 깨져도 네트워크로 나갈 수 없는 상태에서
+// 종료 코드를 확인하므로, 이 테스트들이 유료 호출을 유발할 경로가 없다.
+// ---------------------------------------------------------------------------
+
+const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "cli.js");
+
+interface CliResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+function runCli(args: string[], env: NodeJS.ProcessEnv = {}): CliResult {
+  const result = spawnSync(process.execPath, [CLI, ...args], {
+    encoding: "utf8",
+    env: {
+      // 실제 키를 상속하지 않는다. PATH 등 필수만 남긴다.
+      PATH: process.env.PATH ?? "",
+      HOME: process.env.HOME ?? "",
+      ...env,
+    },
+  });
+  return { code: result.status ?? -1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+/**
+ * CLI에 넘길 **가짜** 자격증명.
+ *
+ * 값이 실제 키가 아니므로 이 환경으로는 공급자에 연결할 수 없다. 그런데도 넣는 이유는
+ * preflight의 "자격증명 없음" 차단을 지나 **그 뒤의 게이트**(run-card, 예약 상태)를
+ * 실제로 검증하기 위한 것이다.
+ */
+const CLI_FAKE_KEYS = { OPENAI_API_KEY: "test-openai-key-value", ANTHROPIC_API_KEY: "test-anthropic-key-value" };
+
+test("54. --run-card 없는 유료 pilot은 기록을 하나도 만들지 않고 거부된다", () => {
+  withDir((dir) => {
+    const smoke = selectSmokeFixtures(loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT)));
+    const result = runCli(
+      [
+        "pilot",
+        "--fixtures",
+        smoke.map((f) => f.manifest.fixtureId).join(","),
+        "--stage",
+        "smoke",
+        "--max-cost-usd",
+        "5",
+        "--output",
+        dir,
+      ],
+      CLI_FAKE_KEYS
+    );
+    assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+    assert.ok(result.stdout.includes("--run-card가 필수입니다"), result.stdout);
+    assert.ok(result.stdout.includes("실제 API 호출: 0건"), result.stdout);
+    // **기록이 없다** = host를 띄우지 않았다 = provider를 부르지 않았다.
+    assert.equal(existsSync(path.join(dir, RECORDS_FILE)), false, "기록 파일이 생겼습니다");
+    // run.json도 만들지 않는다 — 승인되지 않은 실행이 디렉터리를 건드려서는 안 된다.
+    assert.equal(existsSync(path.join(dir, "run.json")), false, "승인 전에 메타 파일을 썼습니다");
+  });
+});
+
+test("54b. 유효한 카드가 있어도 열린 예약이 있으면 provider를 부르지 않는다", () => {
+  withDir((base) => {
+    const runDir = path.join(base, "p0-smoke");
+    const probeDir = path.join(base, "model-probe");
+    const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+    const smoke = selectSmokeFixtures(fixtures);
+    const now = new Date().toISOString();
+
+    // 이 환경의 (가짜) 키로 binding을 만든 evidence — CLI에 같은 환경을 넘긴다.
+    const binding = computeCredentialBinding(
+      [
+        { providerId: "openai", envName: "OPENAI_API_KEY" },
+        { providerId: "anthropic", envName: "ANTHROPIC_API_KEY" },
+      ],
+      CLI_FAKE_KEYS
+    );
+    assert.ok(binding);
+    const registry = new ModelRegistry(BUILTIN_MODELS);
+    const models = planModels({ credentialPresence: () => true });
+    assert.ok(isModelPlan(models));
+    if (!isModelPlan(models)) return;
+    const evidence = buildProbeEvidence({
+      createdAt: now,
+      protocolVersion: CRITERIA.protocolVersion,
+      criteriaHash: criteriaHash(),
+      registrySnapshotHash: registry.snapshotHash(),
+      adapterContractVersion: "2",
+      executor: roleEvidenceFor(models.executor.modelId, models.executor.providerId),
+      reviewer: roleEvidenceFor(models.reviewer.modelId, models.reviewer.providerId),
+      approvedProbeLimitUsd: 1,
+      cumulativeProbeCostUsd: 0.004,
+      credentialBinding: binding!,
+    });
+    writeProbeEvidence(probeDir, evidence);
+
+    const cards = buildStagedCards({
+      fixtures,
+      arms: ["A", "B", "C", "D"],
+      seed: 1,
+      maxConcurrency: 1,
+      outputRoot: base,
+      p0ApprovedLimitUsd: 5,
+      models,
+      createdAt: now,
+      credentialsPresent: true,
+      probeEvidence: evidence,
+      joinPath: (a, b) => path.join(a, b),
+    });
+    assert.equal(cards.p0.status, "READY_FOR_P0_APPROVAL", cards.p0.blockers.join(" / "));
+    writeRunCard(cards.p0);
+
+    // 이제 열린 예약을 남긴다 — 카드는 유효하지만 예산 원장을 신뢰할 수 없는 상태다.
+    crashAfterOpen(runDir);
+
+    const result = runCli(
+      [
+        "pilot",
+        "--fixtures",
+        smoke.map((f) => f.manifest.fixtureId).join(","),
+        "--stage",
+        "smoke",
+        "--arms",
+        "A,B,C,D",
+        "--repetitions",
+        "1",
+        "--seed",
+        "1",
+        "--max-cost-usd",
+        "5",
+        "--output",
+        runDir,
+        "--run-card",
+        runCardPath(runDir, "smoke"),
+      ],
+      CLI_FAKE_KEYS
+    );
+    assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+    // 카드는 통과했다는 것을 확인한다 — 그래야 다음 게이트가 실제로 막았음을 알 수 있다.
+    assert.ok(result.stdout.includes("Run Card 승인 확인"), result.stdout);
+    assert.ok(result.stdout.includes("BLOCKED_UNRESOLVED_RESERVATION"), result.stdout);
+    assert.ok(result.stdout.includes("사용 가능한 예산으로 되돌리지 않습니다"), result.stdout);
+    // provider를 부르지 않았다.
+    assert.equal(existsSync(path.join(runDir, RECORDS_FILE)), false, "기록 파일이 생겼습니다");
+    // 이벤트 파일을 고치지도 않았다.
+    const events = eventsIn(runDir);
+    assert.equal(events.filter((e) => e.type === "reservation_opened").length, 1);
+    assert.equal(events.filter((e) => e.type === "reservation_released").length, 0);
+  });
+});
+
+test("54c. evidence의 자격증명이 다르면 유효한 카드로도 실행되지 않는다", () => {
+  withDir((base) => {
+    const runDir = path.join(base, "p0-smoke");
+    const probeDir = path.join(base, "model-probe");
+    const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+    const smoke = selectSmokeFixtures(fixtures);
+    const now = new Date().toISOString();
+    const models = planModels({ credentialPresence: () => true });
+    assert.ok(isModelPlan(models));
+    if (!isModelPlan(models)) return;
+
+    // **다른 키**로 binding을 만든다.
+    const binding = computeCredentialBinding(
+      [
+        { providerId: "openai", envName: "OPENAI_API_KEY" },
+        { providerId: "anthropic", envName: "ANTHROPIC_API_KEY" },
+      ],
+      { OPENAI_API_KEY: "some-other-openai-key", ANTHROPIC_API_KEY: "some-other-anthropic-key" }
+    );
+    assert.ok(binding);
+    const evidence = buildProbeEvidence({
+      createdAt: now,
+      protocolVersion: CRITERIA.protocolVersion,
+      criteriaHash: criteriaHash(),
+      registrySnapshotHash: new ModelRegistry(BUILTIN_MODELS).snapshotHash(),
+      adapterContractVersion: "2",
+      executor: roleEvidenceFor(models.executor.modelId, models.executor.providerId),
+      reviewer: roleEvidenceFor(models.reviewer.modelId, models.reviewer.providerId),
+      approvedProbeLimitUsd: 1,
+      cumulativeProbeCostUsd: 0.004,
+      credentialBinding: binding!,
+    });
+    writeProbeEvidence(probeDir, evidence);
+
+    const cards = buildStagedCards({
+      fixtures,
+      arms: ["A", "B", "C", "D"],
+      seed: 1,
+      maxConcurrency: 1,
+      outputRoot: base,
+      p0ApprovedLimitUsd: 5,
+      models,
+      createdAt: now,
+      credentialsPresent: true,
+      probeEvidence: evidence,
+      joinPath: (a, b) => path.join(a, b),
+    });
+    writeRunCard(cards.p0);
+
+    const result = runCli(
+      [
+        "pilot",
+        "--fixtures",
+        smoke.map((f) => f.manifest.fixtureId).join(","),
+        "--stage",
+        "smoke",
+        "--arms",
+        "A,B,C,D",
+        "--repetitions",
+        "1",
+        "--seed",
+        "1",
+        "--max-cost-usd",
+        "5",
+        "--output",
+        runDir,
+        "--run-card",
+        runCardPath(runDir, "smoke"),
+      ],
+      CLI_FAKE_KEYS
+    );
+    assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
+    assert.ok(result.stdout.includes("BLOCKED_INVALID_PROBE_EVIDENCE"), result.stdout);
+    assert.ok(result.stdout.includes("probe 당시와 다릅니다"), result.stdout);
+    assert.equal(existsSync(path.join(runDir, RECORDS_FILE)), false, "기록 파일이 생겼습니다");
+  });
+});
+
+test("55. 상한 없이 유료 실행/probe를 시작할 수 없다 (종료 코드 3)", () => {
+  withDir((dir) => {
+    for (const command of ["pilot", "run", "probe-models"]) {
+      const result = runCli([command, "--output", dir]);
+      assert.equal(result.code, 3, `${command}: ${result.stdout}${result.stderr}`);
+      assert.ok(result.stderr.includes("--max-cost-usd가 필수입니다"), result.stderr);
+      assert.equal(existsSync(path.join(dir, RECORDS_FILE)), false);
+    }
+  });
+});
+
+test("56. budget-status는 읽기 전용이며 미해결 예약을 그대로 보여준다", () => {
+  withDir((dir) => {
+    crashAfterOpen(dir);
+    const status = runCli(["budget-status", "--output", dir, "--max-cost-usd", "5"]);
+    assert.equal(status.code, 2, status.stdout);
+    assert.ok(status.stdout.includes("BLOCKED_UNRESOLVED_RESERVATION"), status.stdout);
+    assert.ok(status.stdout.includes("미해결 예약: 1건"), status.stdout);
+    assert.ok(status.stdout.includes("자동으로 정리하지 않습니다"), status.stdout);
+    assert.ok(status.stdout.includes("재개 가능: 불가"), status.stdout);
+    // **파일을 고치지 않는다.** 예약이 해제되거나 이벤트가 지워지지 않았다.
+    const events = eventsIn(dir);
+    assert.equal(events.filter((e) => e.type === "reservation_opened").length, 1);
+    assert.equal(events.filter((e) => e.type === "reservation_released").length, 0);
+    assert.equal(existsSync(path.join(dir, RECORDS_FILE)), false);
+  });
+});
+
+test("57. dry-run 출력이 reviewer를 포함한 총 상한을 쓴다", () => {
+  withDir((dir) => {
+    const result = runCli(["dry-run", "--repetitions", "3", "--output", dir]);
+    assert.equal(result.code, 0, `${result.stdout}${result.stderr}`);
+    assert.ok(result.stdout.includes("최대 provider 호출 수(총 상한): 1,584회"), result.stdout);
+    assert.ok(result.stdout.includes("reviewer(검수 1 + revise 2): 432회"), result.stdout);
+    assert.ok(!/최대 API 호출 수/.test(result.stdout), "executor-only 수치를 최대라고 불렀습니다");
+  });
 });

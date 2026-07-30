@@ -1,24 +1,38 @@
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { createBudgetLedger } from "@tomverse/sidecar/budget";
 import { ARMS } from "./arms.js";
+import { computeCallBudget, describeCallBudget, type CallBudget } from "./callBudget.js";
 import { CRITERIA, criteriaHash } from "./criteria.js";
 import {
   estimateRecordCost,
   lookupModel,
   maxCallsPerRecord,
-  MAX_EXECUTOR_CALLS_PER_RECORD,
+  readinessBlockers,
+  readinessProbeGaps,
+  withLiveProbe,
   type ModelPlan,
 } from "./models.js";
+import type { ProbeEvidence } from "./probeEvidence.js";
 import { findSecretLike } from "./records.js";
+import { posixCommand, powerShellCommand } from "./shellQuote.js";
 import type { LoadedFixture } from "./manifest.js";
 import type { ArmId } from "./types.js";
 
 /**
- * Pilot Run Card (§7) — **실제 API를 부르지 않고** 사용자가 승인할 수 있는 실행 계획서.
+ * Run Card (§4) — **유료 실행의 필수 입력.**
  *
- * # 왜 필요한가
+ * # 왜 출력만으로는 부족했나
  *
- * 유료 실험은 시작하면 되돌릴 수 없다. 무엇을 몇 번 부르고 최대 얼마가 들 수 있는지,
- * 무엇이 실험을 중단시키는지를 **돈을 쓰기 전에** 한 장으로 볼 수 있어야 승인이 의미를 갖는다.
+ * 예전 카드는 화면에 출력되고 끝났다. `pilot`은 그 카드를 요구하지 않았으므로, 사용자는
+ * `plan-pilot`을 거치지 않고 곧바로 `pilot --max-cost-usd 200`을 돌릴 수 있었다. 그러면
+ * 카드가 보여준 계획(어떤 fixture, 어떤 모델, 얼마)과 실제 실행이 아무 관계도 없다 —
+ * 승인 절차가 있는 것처럼 보이지만 강제되지 않는 상태다.
+ *
+ * 이제 카드는 **파일로 저장되고 해시로 봉인되며**, `pilot`/`run`이 `--run-card`를 필수로 받는다.
+ * 실행 전에 카드 해시·단계·경로·인자·예산·probe evidence·자격증명 binding을 확인하고,
+ * 하나라도 다르면 **어댑터를 만들기 전에** 거부한다.
  *
  * # 이 카드에 없는 것
  *
@@ -29,6 +43,18 @@ import type { ArmId } from "./types.js";
 /** 실험 단계. P0와 P1의 기록을 같은 디렉터리에 섞지 않기 위해 stage가 메타에 들어간다. */
 export type Stage = "smoke" | "pilot" | "confirmatory";
 
+export const RUN_CARD_SCHEMA_VERSION = 1;
+export const P0_CARD_FILE = "p0-run-card.json";
+export const P1_CARD_FILE = "p1-run-card.json";
+
+/**
+ * 카드 유효 기간.
+ *
+ * probe evidence(24시간)보다 길면 "만료된 확인 위에 유효한 카드"가 생긴다. 같게 두어
+ * 두 문서가 함께 낡게 한다.
+ */
+export const RUN_CARD_TTL_HOURS = 24;
+
 export interface StagePlan {
   stage: Stage;
   label: string;
@@ -38,38 +64,46 @@ export interface StagePlan {
   /** 계획된 기록 수 = fixture × arm × 반복. */
   plannedRecords: number;
   /**
-   * **이 단계가 낼 수 있는 provider 호출 수의 진짜 상한.** executor + reviewer 전부다.
+   * provider 호출 상한 — **executor/reviewer/총합을 함께 담는다.**
    *
-   * 예전에는 `maxProviderCalls`가 executor 파이프라인만 세면서 카드에는 "최대 provider
-   * 호출 수"로 표시됐다. P1에서 그 값은 384였고 실제 상한은 528이었다 — 사용자가 보는
-   * "최대"가 실제 최대보다 27% 작았다는 뜻이고, 승인 판단의 근거로 쓸 수 없는 수치다.
-   * 그래서 `maxProviderCallsTotal`이 정본이고, 내역은 아래 두 필드로 따로 보여준다.
+   * 예전에는 executor만 센 값이 카드에 "최대 provider 호출 수"로 표시됐다. P1에서 그 값은
+   * 384였고 실제 상한은 528이었다. 사용자가 보는 "최대"가 실제보다 작으면 승인 근거로
+   * 쓸 수 없으므로, 이제 `callBudget.total`이 정본이고 내역이 함께 나온다.
    */
-  maxProviderCallsTotal: number;
-  /** 내역 — executor 파이프라인(초안 1 + fix loop 3)이 낼 수 있는 최대. */
-  maxExecutorCalls: number;
-  /** 내역 — 검수자(검수 1 + revise 2)가 낼 수 있는 최대. 단독 arm은 0이다. */
-  maxReviewerCalls: number;
+  callBudget: CallBudget;
   /** 보수적 최대 비용. 계산할 수 없으면 undefined다(0으로 대체하지 않는다). */
   maxCostUsd?: number;
   perArmMaxCostUsd: { arm: ArmId; maxUsd?: number; basis?: string }[];
 }
 
 /**
- * 카드 상태.
+ * 카드 상태 (§3).
  *
- * `READY_FOR_APPROVAL` 하나였을 때의 문제: 오프라인 검사만 통과한 상태와 실제 호출까지
- * 확인한 상태가 같은 단어로 표시됐다. 앞의 것으로 유료 실행을 승인하면 "레지스트리에
- * 있으므로 사용 가능"을 승인 근거로 쓰는 것이다.
- *
- *  - `BLOCKED` — 고쳐야 할 것이 있다. probe를 돌려도 해결되지 않는다.
- *  - `READY_FOR_MODEL_PROBE` — 오프라인으로 확인할 수 있는 것은 전부 확인됐다.
- *    다음 행동은 `gate:g:probe-models`다. **아직 유료 pilot을 승인할 수 없다.**
- *  - `READY_FOR_PAID_RUN` — 실제 호출로 모델·모델 ID·구조화 출력까지 확인됐다.
+ * 상태가 곧 "다음에 무엇을 해야 하는가"다. `READY_FOR_APPROVAL` 하나였을 때는 오프라인 검사만
+ * 통과한 상태와 실제 호출까지 확인한 상태가 같은 단어로 표시됐고, 앞의 것으로 유료 실행을
+ * 승인하면 "레지스트리에 있으므로 사용 가능"을 승인 근거로 쓰는 것이었다.
  */
-export type CardStatus = "READY_FOR_PAID_RUN" | "READY_FOR_MODEL_PROBE" | "BLOCKED";
+export type CardStatus =
+  /** 자격증명이 없다. probe도 실행도 불가능하다. */
+  | "BLOCKED_MISSING_CREDENTIALS"
+  /** 오프라인으로 확인할 수 있는 것은 전부 확인됐다. 다음은 `gate:g:probe-models`다. */
+  | "READY_FOR_MODEL_PROBE"
+  /** evidence가 있지만 손상·불일치·만료됐다. */
+  | "BLOCKED_INVALID_PROBE_EVIDENCE"
+  /** P1인데 P0 attestation이 없다. */
+  | "BLOCKED_PENDING_P0_RESULT"
+  /** 그 밖의 결함(가격 정보 없음, 예산 부족, 독립성 위반 등). */
+  | "BLOCKED"
+  /** P0 유료 실행을 승인할 수 있다. */
+  | "READY_FOR_P0_APPROVAL"
+  /** P1 유료 실행을 승인할 수 있다. */
+  | "READY_FOR_P1_APPROVAL";
 
 export interface RunCard {
+  cardSchemaVersion: number;
+  cardId: string;
+  /** 카드 전체의 해시. 실행 시 재계산해 비교한다 — 손으로 고친 카드를 잡는다. */
+  cardHash: string;
   status: CardStatus;
   /** 사용자가 다음에 할 일 한 줄. 상태만 보고 무엇을 해야 할지 추측하게 하지 않는다. */
   nextAction: string;
@@ -91,18 +125,34 @@ export interface RunCard {
   /** **이 카드 하나가 쓰는 실행 디렉터리.** P0와 P1은 서로 다른 디렉터리를 쓴다. */
   outputDir: string;
   approvedLimitUsd?: number;
+  /** 이 카드가 근거로 삼은 probe evidence. 없으면 유료 승인 상태가 되지 않는다. */
+  probeEvidenceId?: string;
+  probeEvidenceHash?: string;
+  /** P1은 P0 attestation을 요구한다. */
+  requiresP0Attestation: boolean;
+  p0AttestationId?: string;
+  p0AttestationHash?: string;
   /**
    * 이 카드가 승인하는 **한 단계**. P0와 P1을 한 카드에 넣으면 승인 하나가 두 단계를
    * 덮으므로, "P0가 정상일 때만 P1을 승인한다"는 절차가 카드 수준에서 성립하지 않는다.
    */
   stage: StagePlan;
+  createdAt: string;
+  expiresAt: string;
   /** 실제 API 호출 수 — 카드를 만드는 명령은 항상 0이다. */
   realApiCalls: 0;
   abortConditions: string[];
-  runCommand: string;
-  resumeCommand: string;
-  generatedAt: string;
-  /** 이 단계 앞에 사람이 확인해야 하는 것. P1 카드는 "P0가 완전히 정상"을 여기 담는다. */
+  /**
+   * 실행 인자 **구조**. 검증은 이 배열을 비교한다 — 문자열을 다시 파싱하면 인용 규칙을
+   * 두 번 구현하게 되고, 그 둘이 갈라지면 "카드와 실행이 같다"는 검증이 거짓이 된다.
+   */
+  runArgv: string[];
+  /** 사람이 복사할 수 있는 형태. Windows 공백 경로가 깨지지 않게 인용한다. */
+  runCommandPowerShell: string;
+  runCommandPosix: string;
+  resumeArgv: string[];
+  resumeCommandPowerShell: string;
+  /** 이 단계 앞에 사람이 확인해야 하는 것. */
   prerequisites?: string[];
 }
 
@@ -134,17 +184,9 @@ export function planStage(input: {
   const perArm: StagePlan["perArmMaxCostUsd"] = [];
   let total = 0;
   let costKnown = input.models !== undefined;
-  let maxExecutorCalls = 0;
-  let maxReviewerCalls = 0;
 
   for (const spec of armSpecs) {
-    // 호출 수는 **arm 정의와 루프 상한에서 유도한다.** 상수로 적어두면 arm을 추가하거나
-    // 루프 상한을 바꿀 때 카드가 조용히 틀린 수를 말한다.
     const calls = maxCallsPerRecord(spec.arm, spec.providers.length);
-    const records = input.fixtures.length * input.repetitions;
-    maxExecutorCalls += calls.executor * records;
-    maxReviewerCalls += calls.reviewer * records;
-
     if (!input.models) {
       perArm.push({ arm: spec.arm });
       continue;
@@ -167,16 +209,21 @@ export function planStage(input: {
     perArm.push({ arm: spec.arm, maxUsd: armTotal, basis: estimate.basis });
   }
 
+  // **호출 수는 공용 계산기에서 온다** — preflight/dry-run과 같은 함수를 쓴다.
+  const callBudget = computeCallBudget({
+    fixtureCount: input.fixtures.length,
+    arms: armSpecs.map((a) => a.arm),
+    repetitions: input.repetitions,
+  });
+
   return {
     stage: input.stage,
     label: input.label,
     fixtureIds: input.fixtures.map((f) => f.manifest.fixtureId),
     arms: armSpecs.map((a) => a.arm),
     repetitions: input.repetitions,
-    plannedRecords: input.fixtures.length * armSpecs.length * input.repetitions,
-    maxProviderCallsTotal: maxExecutorCalls + maxReviewerCalls,
-    maxExecutorCalls,
-    maxReviewerCalls,
+    plannedRecords: callBudget.records,
+    callBudget,
     ...(costKnown ? { maxCostUsd: total } : {}),
     perArmMaxCostUsd: perArm,
   };
@@ -188,12 +235,13 @@ export const ABORT_CONDITIONS: readonly string[] = Object.freeze([
   "모델 미지원 / 요청한 모델을 쓸 수 없음",
   "구조화 출력 또는 tool-use 실패 (schema_violation)",
   "usage가 없거나 비용을 계산할 수 없음 — 예산 상한이 무의미해지므로 남은 유료 호출을 중단",
+  "과금 여부가 불확실한 실패 — 예약을 해제하지 않고 미해결로 남기고 중단",
   "기록에서 자격증명처럼 보이는 값 탐지",
   "oracle 하네스 실패",
   "네이티브 툴체인 실패 (toolchain_unavailable)",
   "예산 예약 실패 — 승인 상한을 넘길 수 있는 호출은 시작하지 않음",
   "검수자 독립성 위반 (executor와 reviewer가 같은 공급자)",
-  "예상하지 못한 모델 대체 — run metadata에 고정된 모델과 다른 모델이 응답",
+  "응답 envelope의 모델 ID가 요청과 다름 — 조용한 대체를 허용하지 않음",
   "P0 smoke에 한해: 인프라 실패율이 0보다 큼",
 ]);
 
@@ -213,10 +261,21 @@ export interface StageCardInput {
   approvedLimitUsd?: number;
   models: ModelPlan | { blockers: string[]; probeGaps: string[] };
   extraBlockers?: string[];
-  generatedAt: string;
+  createdAt: string;
   contextTokenBudget?: number;
   /** 이 단계를 시작하기 전에 사람이 확인해야 하는 선행 조건(P1은 P0 결과다). */
   prerequisites?: string[];
+  /** 자격증명이 전부 있는가. 없으면 probe도 실행도 불가능하다. */
+  credentialsPresent: boolean;
+  /** 검증을 통과한 probe evidence. 없으면 유료 승인 상태가 되지 않는다. */
+  probeEvidence?: ProbeEvidence;
+  /** evidence가 있었지만 검증에 실패한 경우의 사유. */
+  probeEvidenceProblems?: string[];
+  /** P1이 요구하는 P0 attestation. */
+  p0Attestation?: { attestationId: string; attestationHash: string };
+  p0AttestationProblems?: string[];
+  ttlHours?: number;
+  cardId?: string;
 }
 
 /**
@@ -224,13 +283,18 @@ export interface StageCardInput {
  *
  * 예전에는 카드 하나가 P0와 P1 두 단계를 담고 승인 상한도 하나였다. 그러면 "P0가 완전히
  * 정상일 때만 P1을 승인한다"는 절차가 카드 수준에서 성립하지 않는다 — 승인 하나가 두 단계를
- * 덮고, 출력 디렉터리도 하나이므로 P0의 기록과 P1의 기록이 섞인다. 단계마다 카드·승인·
- * 디렉터리를 분리하는 것이 그 절차를 구조로 만드는 방법이다.
+ * 덮고, 출력 디렉터리도 하나이므로 P0의 기록과 P1의 기록이 섞인다.
  */
 export function buildStageCard(input: StageCardInput): RunCard {
-  const blockers = [...(input.extraBlockers ?? []), ...input.models.blockers];
-  const probeGaps = [...input.models.probeGaps];
-  const models = "executor" in input.models ? input.models : undefined;
+  // **evidence가 있으면 오프라인 준비성 위에 실제 확인 결과를 얹는다.**
+  //
+  // 이걸 하지 않으면 probe에 성공해도 `probeGaps`에 "실제로 호출할 수 있는지 확인되지
+  // 않았습니다"가 남아 카드가 계속 READY_FOR_MODEL_PROBE가 된다 — 즉 probe가 아무것도
+  // 잠그지 못하는 상태가 그대로 유지된다.
+  const plan = isPlan(input.models) ? applyEvidence(input.models, input.probeEvidence) : input.models;
+  const models = isPlan(plan) ? plan : undefined;
+  const blockers = [...(input.extraBlockers ?? []), ...plan.blockers];
+  const probeGaps = [...plan.probeGaps];
 
   const stage = planStage({
     stage: input.stage,
@@ -256,7 +320,6 @@ export function buildStageCard(input: StageCardInput): RunCard {
       blockers.push(`${input.stage} 최대 비용을 계산할 수 없습니다 — 가격 정보가 없는 모델이 포함되어 있습니다`);
     } else {
       const ledger = createBudgetLedger(input.approvedLimitUsd);
-      // 가장 비싼 arm 한 건조차 예약할 수 없으면 아무것도 못 돌린다.
       const worst = Math.max(
         ...stage.perArmMaxCostUsd.map((a) => (a.maxUsd ?? 0) / Math.max(1, stage.fixtureIds.length * input.repetitions))
       );
@@ -267,8 +330,6 @@ export function buildStageCard(input: StageCardInput): RunCard {
             `(가장 비싼 arm 1건 최대 $${worst.toFixed(4)})`
         );
       }
-      // 승인 상한이 단계 전체를 감당하지 못하는 것 자체는 blocker가 아니다 — 예약이
-      // 남은 예산에서 멈추므로 안전하다. 다만 **중간에 멈춘다는 사실**은 미리 알려야 한다.
       if (stage.maxCostUsd > input.approvedLimitUsd) {
         probeGaps.push(
           `승인 상한 $${input.approvedLimitUsd}는 ${input.stage} 전체 보수적 최대 ` +
@@ -278,13 +339,35 @@ export function buildStageCard(input: StageCardInput): RunCard {
     }
   }
 
-  const status: CardStatus =
-    blockers.length > 0 ? "BLOCKED" : probeGaps.length > 0 ? "READY_FOR_MODEL_PROBE" : "READY_FOR_PAID_RUN";
+  const evidenceProblems = [...(input.probeEvidenceProblems ?? [])];
+  const p0Problems = [...(input.p0AttestationProblems ?? [])];
+  const requiresP0Attestation = input.stage !== "smoke";
 
-  const card: RunCard = {
+  // ---- 상태 결정 ----
+  // 순서에 의미가 있다: 앞의 것이 해결되지 않으면 뒤의 것을 확인해도 무의미하다.
+  const status: CardStatus = ((): CardStatus => {
+    if (!input.credentialsPresent) return "BLOCKED_MISSING_CREDENTIALS";
+    if (blockers.length > 0) return "BLOCKED";
+    if (evidenceProblems.length > 0) return "BLOCKED_INVALID_PROBE_EVIDENCE";
+    if (!input.probeEvidence) return "READY_FOR_MODEL_PROBE";
+    if (requiresP0Attestation && !input.p0Attestation) return "BLOCKED_PENDING_P0_RESULT";
+    if (requiresP0Attestation && p0Problems.length > 0) return "BLOCKED_PENDING_P0_RESULT";
+    if (probeGaps.some((g) => g.includes("확인되지 않았습니다"))) return "READY_FOR_MODEL_PROBE";
+    return input.stage === "smoke" ? "READY_FOR_P0_APPROVAL" : "READY_FOR_P1_APPROVAL";
+  })();
+
+  const ttl = input.ttlHours ?? RUN_CARD_TTL_HOURS;
+  const expiresAt = new Date(new Date(input.createdAt).getTime() + ttl * 3_600_000).toISOString();
+  const cardId = input.cardId ?? `card-${input.stage}-${randomUUID()}`;
+  const runArgv = stageArgv(input);
+  const resumeArgv = [...runArgv, "--resume"];
+
+  const withoutHash: Omit<RunCard, "cardHash"> = {
+    cardSchemaVersion: RUN_CARD_SCHEMA_VERSION,
+    cardId,
     status,
     nextAction: describeNextAction(status, input.stage),
-    blockers,
+    blockers: [...blockers, ...evidenceProblems, ...p0Problems],
     probeGaps,
     protocolVersion: CRITERIA.protocolVersion,
     criteriaHash: criteriaHash(),
@@ -315,14 +398,30 @@ export function buildStageCard(input: StageCardInput): RunCard {
     maxConcurrency: input.maxConcurrency,
     outputDir: input.outputDir,
     ...(input.approvedLimitUsd !== undefined ? { approvedLimitUsd: input.approvedLimitUsd } : {}),
+    ...(input.probeEvidence
+      ? {
+          probeEvidenceId: input.probeEvidence.evidenceId,
+          probeEvidenceHash: input.probeEvidence.evidencePayloadHash,
+        }
+      : {}),
+    requiresP0Attestation,
+    ...(input.p0Attestation
+      ? { p0AttestationId: input.p0Attestation.attestationId, p0AttestationHash: input.p0Attestation.attestationHash }
+      : {}),
     stage,
+    createdAt: input.createdAt,
+    expiresAt,
     realApiCalls: 0,
     abortConditions: [...ABORT_CONDITIONS],
-    runCommand: stageCommand(input),
-    resumeCommand: `${stageCommand(input)} --resume`,
-    generatedAt: input.generatedAt,
+    runArgv,
+    runCommandPowerShell: powerShellCommand(runArgv),
+    runCommandPosix: posixCommand(runArgv),
+    resumeArgv,
+    resumeCommandPowerShell: powerShellCommand(resumeArgv),
     ...(input.prerequisites && input.prerequisites.length > 0 ? { prerequisites: [...input.prerequisites] } : {}),
   };
+
+  const card: RunCard = { ...withoutHash, cardHash: runCardHash(withoutHash) };
 
   // 카드에 자격증명이 섞이면 승인 절차 자체가 유출 경로가 된다. 만들자마자 확인한다.
   const leaked = findSecretLike(card);
@@ -332,42 +431,91 @@ export function buildStageCard(input: StageCardInput): RunCard {
   return card;
 }
 
+/** 카드 해시. 해시 자신을 제외한 전체를 안정된 순서로 직렬화한다. */
+export function runCardHash(card: Omit<RunCard, "cardHash">): string {
+  const canonical = JSON.stringify(card, Object.keys(card).sort());
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
+}
+
+function isPlan(value: ModelPlan | { blockers: string[]; probeGaps: string[] }): value is ModelPlan {
+  return "executor" in value;
+}
+
+/**
+ * 검증된 evidence를 준비성에 반영한다.
+ *
+ * evidence는 이미 `validateProbeEvidence`를 통과한 것만 들어온다 — 모델 ID·자격증명·
+ * 레지스트리·계약·만료가 모두 확인된 상태다. 그래서 여기서 다시 판정하지 않고
+ * **그 사실을 준비성 축에 옮기기만** 한다.
+ */
+function applyEvidence(plan: ModelPlan, evidence: ProbeEvidence | undefined): ModelPlan {
+  if (!evidence) return plan;
+  const byModel = new Map([
+    [evidence.executor.requestedModelId, evidence.executor],
+    [evidence.reviewer.requestedModelId, evidence.reviewer],
+  ]);
+  const readiness = plan.readiness.map((r) => {
+    const role = byModel.get(r.modelId);
+    if (!role) return r;
+    return withLiveProbe(r, {
+      outcome: "verified",
+      returnedModelId: role.providerReportedModelId,
+      acceptedByRegistry: role.exactModelIdVerified,
+      checkedAt: evidence.createdAt,
+      note: `probe evidence ${evidence.evidenceId}로 확인됨 (실제 비용 $${role.actualUsd.toFixed(6)})`,
+    });
+  });
+  const probeGaps = readiness.flatMap((r) => readinessProbeGaps(r));
+  const blockers = readiness.flatMap((r) => readinessBlockers(r));
+  return { ...plan, readiness, probeGaps, blockers: [...new Set([...plan.blockers, ...blockers])] };
+}
+
 /** 단계 → 실행 스크립트. `smoke`도 pilot 스크립트를 쓰지만 `--stage`로 구별된다. */
 function scriptFor(stage: Stage): string {
   return stage === "confirmatory" ? "gate:g:run" : "gate:g:pilot";
 }
 
 /**
- * 이 카드를 승인했을 때 실제로 돌릴 명령.
+ * 이 카드를 승인했을 때 실제로 돌릴 인자 **배열**.
  *
- * 카드가 계획을 말하고 사용자가 손으로 다른 명령을 조립하면 둘이 어긋난다. 그래서 카드가
- * **자기 계획을 재현하는 명령**을 그대로 싣는다 — fixture 목록과 seed까지 포함해서다.
+ * 문자열이 아니라 배열이 정본인 이유: 실행 검증이 문자열을 다시 파싱하면 인용 규칙을 두 번
+ * 구현하게 되고, 그 둘이 갈라지면 "카드와 실행이 같다"는 검증이 거짓이 된다.
  */
-function stageCommand(input: StageCardInput): string {
-  const parts = [`npm run ${scriptFor(input.stage)} --`, `--stage ${input.stage}`];
+function stageArgv(input: StageCardInput): string[] {
+  const argv = ["npm", "run", scriptFor(input.stage), "--", "--stage", input.stage];
   // 전체 fixture가 아닌 단계는 목록을 명시해야 같은 계획이 재현된다.
   if (input.stage === "smoke") {
-    parts.push(`--fixtures ${input.fixtures.map((f) => f.manifest.fixtureId).join(",")}`);
+    argv.push("--fixtures", input.fixtures.map((f) => f.manifest.fixtureId).join(","));
   }
-  parts.push(`--arms ${[...input.arms].join(",")}`);
-  parts.push(`--repetitions ${input.repetitions}`);
-  parts.push(`--max-concurrency ${input.maxConcurrency}`);
-  parts.push(`--seed ${input.seed}`);
-  parts.push(`--output ${input.outputDir}`);
-  parts.push(`--max-cost-usd ${input.approvedLimitUsd ?? "<이 단계의 승인 금액>"}`);
-  return parts.join(" ");
+  argv.push("--arms", [...input.arms].join(","));
+  argv.push("--repetitions", String(input.repetitions));
+  argv.push("--max-concurrency", String(input.maxConcurrency));
+  argv.push("--seed", String(input.seed));
+  argv.push("--output", input.outputDir);
+  argv.push("--max-cost-usd", input.approvedLimitUsd === undefined ? "<이 단계의 승인 금액>" : String(input.approvedLimitUsd));
+  argv.push("--run-card", path.join(input.outputDir, cardFileFor(input.stage)));
+  return argv;
+}
+
+export function cardFileFor(stage: Stage): string {
+  return stage === "smoke" ? P0_CARD_FILE : P1_CARD_FILE;
 }
 
 function describeNextAction(status: CardStatus, stage: Stage): string {
   switch (status) {
+    case "BLOCKED_MISSING_CREDENTIALS":
+      return "공급자 자격증명을 환경에 설정하세요. 키가 없으면 probe도 실행도 불가능합니다.";
     case "BLOCKED":
       return "blocker를 해결하세요. 실제 probe를 돌려도 해결되지 않습니다.";
+    case "BLOCKED_INVALID_PROBE_EVIDENCE":
+      return "`npm run gate:g:probe-models`로 evidence를 다시 만드세요. 기존 evidence는 이 실행을 보증하지 않습니다.";
+    case "BLOCKED_PENDING_P0_RESULT":
+      return "P0를 먼저 실행하고 attestation을 만드세요. P0 결과 없이 P1을 승인할 수 없습니다.";
     case "READY_FOR_MODEL_PROBE":
-      return (
-        "`npm run gate:g:probe-models`로 모델을 실제 확인하세요. " +
-        "오프라인 사실만으로는 유료 실행을 승인할 수 없습니다."
-      );
-    case "READY_FOR_PAID_RUN":
+      return "`npm run gate:g:probe-models`로 모델을 실제 확인하세요. 오프라인 사실만으로는 유료 실행을 승인할 수 없습니다.";
+    case "READY_FOR_P0_APPROVAL":
+      return "이 카드의 실행 명령을 승인하면 P0 smoke를 시작할 수 있습니다.";
+    case "READY_FOR_P1_APPROVAL":
       return `이 카드의 실행 명령을 승인하면 ${stage} 단계를 시작할 수 있습니다.`;
   }
 }
@@ -389,10 +537,16 @@ export function buildStagedCards(input: {
   p1ApprovedLimitUsd?: number;
   models: ModelPlan | { blockers: string[]; probeGaps: string[] };
   extraBlockers?: string[];
-  generatedAt: string;
+  createdAt: string;
   contextTokenBudget?: number;
+  credentialsPresent: boolean;
+  probeEvidence?: ProbeEvidence;
+  probeEvidenceProblems?: string[];
+  p0Attestation?: { attestationId: string; attestationHash: string };
+  p0AttestationProblems?: string[];
   /** 경로 결합 — 테스트가 플랫폼과 무관하게 검증할 수 있어야 한다. */
   joinPath?: (a: string, b: string) => string;
+  ttlHours?: number;
 }): { p0: RunCard; p1: RunCard } {
   const join = input.joinPath ?? ((a: string, b: string): string => `${a}/${b}`);
   const common = {
@@ -400,9 +554,13 @@ export function buildStagedCards(input: {
     seed: input.seed,
     maxConcurrency: input.maxConcurrency,
     models: input.models,
-    generatedAt: input.generatedAt,
+    createdAt: input.createdAt,
+    credentialsPresent: input.credentialsPresent,
     ...(input.extraBlockers ? { extraBlockers: input.extraBlockers } : {}),
     ...(input.contextTokenBudget !== undefined ? { contextTokenBudget: input.contextTokenBudget } : {}),
+    ...(input.probeEvidence ? { probeEvidence: input.probeEvidence } : {}),
+    ...(input.probeEvidenceProblems ? { probeEvidenceProblems: input.probeEvidenceProblems } : {}),
+    ...(input.ttlHours !== undefined ? { ttlHours: input.ttlHours } : {}),
   };
   return {
     p0: buildStageCard({
@@ -422,12 +580,154 @@ export function buildStagedCards(input: {
       repetitions: 1,
       outputDir: join(input.outputRoot, "p1-pilot"),
       ...(input.p1ApprovedLimitUsd !== undefined ? { approvedLimitUsd: input.p1ApprovedLimitUsd } : {}),
+      ...(input.p0Attestation ? { p0Attestation: input.p0Attestation } : {}),
+      ...(input.p0AttestationProblems ? { p0AttestationProblems: input.p0AttestationProblems } : {}),
       prerequisites: [
         "P0 smoke가 완전히 정상이어야 합니다 — 인프라 실패 0건, 비용 측정 가능, 구조화 출력 성공",
-        "P0에서 요청한 모델 ID와 응답 모델 ID가 같았음이 기록으로 확인되어야 합니다",
+        "P0에서 요청한 모델 ID와 응답 envelope 모델 ID가 같았음이 attestation으로 확인되어야 합니다",
       ],
     }),
   };
+}
+
+// ---------------------------------------------------------------------------
+// 저장과 검증
+// ---------------------------------------------------------------------------
+
+export function runCardPath(outputDir: string, stage: Stage): string {
+  return path.join(outputDir, cardFileFor(stage));
+}
+
+export function writeRunCard(card: RunCard): string {
+  mkdirSync(card.outputDir, { recursive: true });
+  const file = runCardPath(card.outputDir, card.stage.stage);
+  writeFileSync(file, `${JSON.stringify(card, null, 2)}\n`);
+  return file;
+}
+
+export type CardLoad =
+  | { ok: true; card: RunCard }
+  | { ok: false; reasons: string[] };
+
+export function loadRunCard(file: string): CardLoad {
+  if (!existsSync(file)) return { ok: false, reasons: [`Run Card 파일이 없습니다: ${file}`] };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(file, "utf8"));
+  } catch (error) {
+    return { ok: false, reasons: [`Run Card를 읽을 수 없습니다: ${String(error).slice(0, 200)}`] };
+  }
+  if (typeof raw !== "object" || raw === null) return { ok: false, reasons: ["Run Card가 객체가 아닙니다"] };
+  const card = raw as RunCard;
+  if (card.cardSchemaVersion !== RUN_CARD_SCHEMA_VERSION) {
+    return {
+      ok: false,
+      reasons: [
+        `Run Card 스키마 버전이 ${String(card.cardSchemaVersion)}입니다 (이 코드는 ` +
+          `${RUN_CARD_SCHEMA_VERSION}만 압니다) — 모르는 형식을 해석하지 않습니다`,
+      ],
+    };
+  }
+  const { cardHash, ...rest } = card;
+  const recomputed = runCardHash(rest as Omit<RunCard, "cardHash">);
+  if (cardHash !== recomputed) {
+    return {
+      ok: false,
+      reasons: [`Run Card 해시가 다릅니다 (저장 ${String(cardHash)} / 재계산 ${recomputed}) — 파일이 수정되었습니다`],
+    };
+  }
+  return { ok: true, card };
+}
+
+export interface CardExecutionRequest {
+  stage: Stage;
+  outputDir: string;
+  fixtureIds: string[];
+  arms: ArmId[];
+  repetitions: number;
+  seed: number;
+  maxCostUsd?: number;
+  executorModelId: string;
+  reviewerModelId: string;
+  now: string;
+}
+
+export type CardGateVerdict =
+  | { ok: true; card: RunCard }
+  | { ok: false; status: "BLOCKED_INVALID_RUN_CARD"; reasons: string[] };
+
+/**
+ * 유료 실행 직전 검증 — **어댑터를 만들기 전에** 부른다.
+ *
+ * # 왜 CLI 인수와 카드를 둘 다 보는가
+ *
+ * 카드만 보면 사용자가 카드와 다른 인수를 주고 실행할 수 있고, 인수만 보면 승인이 무의미하다.
+ * 둘이 **같아야** 승인이 실행을 설명한다. 다르면 어느 쪽이 사용자 의도인지 코드가 알 수 없으므로
+ * 거부하고, 사용자가 카드를 다시 만들거나 인수를 맞추게 한다.
+ */
+export function authorizeRunCard(card: RunCard, request: CardExecutionRequest): CardGateVerdict {
+  const reasons: string[] = [];
+  const fail = (): CardGateVerdict => ({ ok: false, status: "BLOCKED_INVALID_RUN_CARD", reasons });
+
+  const approvable: CardStatus[] = ["READY_FOR_P0_APPROVAL", "READY_FOR_P1_APPROVAL"];
+  if (!approvable.includes(card.status)) {
+    reasons.push(`Run Card 상태가 ${card.status}입니다 — 승인 가능한 상태(${approvable.join(", ")})가 아닙니다`);
+  }
+  if (card.expiresAt <= request.now) {
+    reasons.push(`Run Card가 만료되었습니다 (만료 ${card.expiresAt}, 현재 ${request.now}) — 다시 만드세요`);
+  }
+  if (card.stage.stage !== request.stage) {
+    reasons.push(`단계가 다릅니다 (카드 ${card.stage.stage} / 요청 ${request.stage})`);
+  }
+  if (card.outputDir !== request.outputDir) {
+    reasons.push(`출력 디렉터리가 다릅니다 (카드 ${card.outputDir} / 요청 ${request.outputDir})`);
+  }
+  if (card.protocolVersion !== CRITERIA.protocolVersion) {
+    reasons.push(`protocol version이 다릅니다 (카드 ${card.protocolVersion} / 현재 ${CRITERIA.protocolVersion})`);
+  }
+  if (card.criteriaHash !== criteriaHash()) {
+    reasons.push(`판정 기준 해시가 다릅니다 (카드 ${card.criteriaHash} / 현재 ${criteriaHash()})`);
+  }
+
+  const cardFixtures = [...card.stage.fixtureIds].sort();
+  const wanted = [...request.fixtureIds].sort();
+  if (JSON.stringify(cardFixtures) !== JSON.stringify(wanted)) {
+    reasons.push(`fixture 집합이 다릅니다 (카드 ${cardFixtures.length}개 / 요청 ${wanted.length}개)`);
+  }
+  if (JSON.stringify([...card.stage.arms].sort()) !== JSON.stringify([...request.arms].sort())) {
+    reasons.push(`arm 집합이 다릅니다 (카드 ${card.stage.arms.join(",")} / 요청 ${request.arms.join(",")})`);
+  }
+  if (card.stage.repetitions !== request.repetitions) {
+    reasons.push(`반복 횟수가 다릅니다 (카드 ${card.stage.repetitions} / 요청 ${request.repetitions})`);
+  }
+  if (card.seed !== request.seed) {
+    reasons.push(`seed가 다릅니다 (카드 ${card.seed} / 요청 ${request.seed})`);
+  }
+  if (card.approvedLimitUsd !== request.maxCostUsd) {
+    reasons.push(
+      `승인 상한이 다릅니다 (카드 $${String(card.approvedLimitUsd)} / 요청 $${String(request.maxCostUsd)}) — ` +
+        `카드가 승인한 금액과 다른 금액으로 실행하지 않습니다`
+    );
+  }
+  if (card.models) {
+    if (card.models.executor.modelId !== request.executorModelId) {
+      reasons.push(`executor 모델이 다릅니다 (카드 ${card.models.executor.modelId} / 요청 ${request.executorModelId})`);
+    }
+    if (card.models.reviewer.modelId !== request.reviewerModelId) {
+      reasons.push(`reviewer 모델이 다릅니다 (카드 ${card.models.reviewer.modelId} / 요청 ${request.reviewerModelId})`);
+    }
+  } else {
+    reasons.push("Run Card에 모델 계획이 없습니다 — 무엇을 측정하는지 확정되지 않은 카드로 유료 실행하지 않습니다");
+  }
+  if (!card.probeEvidenceId || !card.probeEvidenceHash) {
+    reasons.push("Run Card에 probe evidence가 연결되어 있지 않습니다 — 실제 확인 없이 유료 실행하지 않습니다");
+  }
+  if (card.requiresP0Attestation && (!card.p0AttestationId || !card.p0AttestationHash)) {
+    reasons.push("이 단계는 P0 attestation을 요구하는데 카드에 연결되어 있지 않습니다");
+  }
+
+  if (reasons.length > 0) return fail();
+  return { ok: true, card };
 }
 
 export function renderRunCard(card: RunCard): string[] {
@@ -435,13 +735,22 @@ export function renderRunCard(card: RunCard): string[] {
   const money = (v: number | undefined): string => (v === undefined ? "(계산 불가)" : `$${v.toFixed(2)}`);
 
   lines.push(`=== Run Card — Stage ${card.stage.stage} ===`);
+  lines.push(`카드 ID: ${card.cardId}`);
+  lines.push(`카드 해시: ${card.cardHash}`);
   lines.push(`상태: ${card.status}`);
   lines.push(`다음 행동: ${card.nextAction}`);
-  lines.push(`생성 시각: ${card.generatedAt}`);
+  lines.push(`생성 시각: ${card.createdAt} / 만료: ${card.expiresAt}`);
   lines.push(`실제 API 호출: ${card.realApiCalls}건`);
   lines.push("");
   lines.push(`protocol version: v${card.protocolVersion}`);
   lines.push(`판정 기준 해시: ${card.criteriaHash}`);
+  lines.push(
+    `probe evidence: ${card.probeEvidenceId ?? "(없음 — 아직 실제 확인이 없습니다)"}` +
+      (card.probeEvidenceHash ? ` / hash ${card.probeEvidenceHash}` : "")
+  );
+  lines.push(
+    `P0 attestation: ${card.requiresP0Attestation ? (card.p0AttestationId ?? "(필요하지만 없음)") : "(이 단계는 요구하지 않음)"}`
+  );
   lines.push(`fixture: ${card.fixtureHashes.length}개`);
   const categories = new Map<string, number>();
   for (const f of card.fixtureHashes) categories.set(f.category, (categories.get(f.category) ?? 0) + 1);
@@ -495,10 +804,7 @@ export function renderRunCard(card: RunCard): string[] {
   lines.push(stage.label);
   lines.push(`  fixture ${stage.fixtureIds.length}개 × arm ${stage.arms.length}개 × 반복 ${stage.repetitions}회`);
   lines.push(`  계획 기록 수: ${stage.plannedRecords}건`);
-  // **총 상한이 먼저 나온다.** executor만 센 수치를 "최대"라고 부르면 승인 근거가 틀린다.
-  lines.push(`  최대 provider 호출 수(총 상한): ${stage.maxProviderCallsTotal}회`);
-  lines.push(`      내역 — executor(초안 1 + fix loop 3): ${stage.maxExecutorCalls}회`);
-  lines.push(`      내역 — reviewer(검수 1 + revise 2): ${stage.maxReviewerCalls}회`);
+  for (const line of describeCallBudget(stage.callBudget, "  ")) lines.push(line);
   lines.push(`  보수적 최대 비용: ${money(stage.maxCostUsd)}`);
   for (const arm of stage.perArmMaxCostUsd) {
     lines.push(`      Arm ${arm.arm}: ${money(arm.maxUsd)}`);
@@ -518,8 +824,13 @@ export function renderRunCard(card: RunCard): string[] {
   );
   lines.push("상한 초과 방지: 각 기록의 최대 비용을 **호출 전에 예약**하고, 예약할 수 없으면 호출하지 않는다");
   lines.push("재개 시: 기록에서 이미 쓴 금액을 복원해 원장에 넣으므로 재시작이 상한을 늘리지 않는다");
-  lines.push(`실행 명령: ${card.runCommand}`);
-  lines.push(`재개 명령: ${card.resumeCommand}`);
+  lines.push("");
+  lines.push("실행 명령 (PowerShell — 공백 있는 경로도 그대로 복사 가능):");
+  lines.push(`  ${card.runCommandPowerShell}`);
+  lines.push("실행 명령 (bash/zsh):");
+  lines.push(`  ${card.runCommandPosix}`);
+  lines.push("재개 명령 (PowerShell):");
+  lines.push(`  ${card.resumeCommandPowerShell}`);
   lines.push("");
 
   if (card.prerequisites && card.prerequisites.length > 0) {
@@ -533,7 +844,7 @@ export function renderRunCard(card: RunCard): string[] {
 
   if (card.blockers.length > 0) {
     lines.push("");
-    lines.push("BLOCKED — 다음이 해결되어야 합니다 (probe로는 해결되지 않습니다):");
+    lines.push(`${card.status} — 다음이 해결되어야 합니다:`);
     for (const blocker of card.blockers) lines.push(`  - ${blocker}`);
   }
   if (card.probeGaps.length > 0) {

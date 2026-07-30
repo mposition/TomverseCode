@@ -9,6 +9,8 @@ import type {
   VerificationDigest,
   WorkspaceSnapshot,
 } from "@tomverse/protocol";
+import type { DispatchState } from "../budget/ledger.js";
+import { redactSecrets } from "./redact.js";
 
 /**
  * 공급자 중립 인터페이스 — 작업 지침 4.6절.
@@ -55,12 +57,89 @@ export interface FixInput {
   attemptNumber: number;
 }
 
+/**
+ * 어댑터 계약 버전.
+ *
+ * `ProviderResponse`의 모양이나 exact-model 검증에 쓰이는 필드가 바뀌면 올린다. probe evidence에
+ * 박아 두므로, 계약이 바뀐 뒤 예전 evidence로 유료 실행을 승인하는 것을 막는다 —
+ * "그때 확인한 것"과 "지금 검증하는 것"이 다른 계약이면 그 확인은 이 실행을 보증하지 않는다.
+ *
+ * 2: 응답 envelope의 모델 ID(`providerReportedModelId`)와 dispatch 상태를 실어 나르기 시작.
+ */
+export const ADAPTER_CONTRACT_VERSION = "2";
+
+/**
+ * 공급자 호출 메타데이터 — **응답 envelope이 말한 사실.**
+ *
+ * # 왜 `DraftProposal.model`로는 안 되는가
+ *
+ * `validateDraftProposal`은 `model` 필드에 `this.modelId`를 **우리가 넣는다.** 그건 우리가
+ * 요청한 모델 ID이고, 공급자가 무엇으로 응답했는지와는 무관하다. 그 값으로 "요청한 모델이
+ * 그대로 왔다"를 판정하면 항상 통과한다 — 즉 조용한 대체를 절대 잡지 못한다.
+ *
+ * 그래서 응답 envelope의 `model` 필드를 따로 실어 나른다. 없으면 `undefined`이며,
+ * **요청 ID로 대체하지 않는다** — 모르는 것을 아는 것처럼 적으면 검증이 무의미해진다.
+ */
+export interface ProviderCallMetadata {
+  /** 우리가 요청한 모델 ID. */
+  requestedModelId: string;
+  /** 응답 envelope이 실어 온 모델 ID. 없으면 `undefined`(요청 ID로 채우지 않는다). */
+  providerReportedModelId?: string;
+  /** 공급자 요청 ID(제공되는 경우). 자격증명이 아니며 공급자 지원 문의에 쓸 수 있다. */
+  providerRequestId?: string;
+  /** 요청이 실제로 나갔는가 — 과금 가능성 판정의 근거다. */
+  dispatchState: DispatchState;
+}
+
 export interface ProviderResponse<T> {
   value: T;
   usage: TokenUsage;
   latencyMs: number;
+  /** 응답 envelope이 말한 사실. exact-model 검증은 **이것만** 쓴다. */
+  meta: ProviderCallMetadata;
   /** 응답 원문을 보관하지 않는다 — 작업 지침 4.6절 "provider 응답 원문 전체를 일반 로그에 남기지 않는다" */
   raw?: never;
+}
+
+/**
+ * 호출이 실패했지만 **과금됐을 수 있는** 경우에 던지는 오류 (§6).
+ *
+ * 공급자가 응답을 만들고 과금한 뒤 JSON 파싱이나 스키마 검증에서 실패할 수 있다. 그때 평범한
+ * `Error`를 던지면 호출자는 "요청이 나갔는지"조차 알 수 없고, 그러면 예약을 해제(=쓴 돈을
+ * 안 쓴 것으로 만들기)하는 쪽으로 기울게 된다. 그래서 **아는 사실을 오류에 실어 보낸다.**
+ *
+ * 메시지는 `redactSecrets`를 지난 값만 담는다 — 공급자 오류 본문에 요청 헤더가 되돌아오는
+ * 경우가 있고, 결과 파일 저장 단계의 사후 검사만으로는 stdout에 이미 나간 것을 되돌릴 수 없다.
+ */
+export class ProviderCallFailure extends Error {
+  readonly dispatchState: DispatchState;
+  readonly usage?: TokenUsage;
+  readonly providerReportedModelId?: string;
+  readonly providerRequestId?: string;
+  readonly latencyMs?: number;
+  readonly classification: NormalizedProviderError;
+
+  constructor(input: {
+    message: string;
+    dispatchState: DispatchState;
+    classification: NormalizedProviderError;
+    usage?: TokenUsage;
+    providerReportedModelId?: string;
+    providerRequestId?: string;
+    latencyMs?: number;
+    /** HTTP 상태 — 기존 재시도 분류기가 읽는다. */
+    status?: number;
+  }) {
+    super(redactSecrets(input.message));
+    this.name = "ProviderCallFailure";
+    this.dispatchState = input.dispatchState;
+    this.classification = input.classification;
+    if (input.usage !== undefined) this.usage = input.usage;
+    if (input.providerReportedModelId !== undefined) this.providerReportedModelId = input.providerReportedModelId;
+    if (input.providerRequestId !== undefined) this.providerRequestId = input.providerRequestId;
+    if (input.latencyMs !== undefined) this.latencyMs = input.latencyMs;
+    if (input.status !== undefined) (this as { status?: number }).status = input.status;
+  }
 }
 
 export interface ProviderAdapter {

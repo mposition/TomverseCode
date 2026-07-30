@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ModelEntry, ModelId, ProviderId } from "@tomverse/protocol";
 
 /**
@@ -130,6 +131,61 @@ export const BUILTIN_MODELS: ModelEntry[] = [
   },
 ];
 
+/**
+ * exact-model 검증 (§2).
+ *
+ * 비교는 **정확히 일치** 아니면 `acceptedProviderModelIds`에 명시된 값과의 일치뿐이다.
+ * prefix 비교나 정규화를 하지 않는 이유: `claude-sonnet-5`는 `claude-sonnet-5.5`의 prefix이므로
+ * prefix 규칙은 **다른 모델을 통과시킨다.** 느슨하게 열어 둔 축은 결국 아무것도 막지 않는다.
+ *
+ * `providerReportedModelId`가 없으면 검증 실패다 — 모르는 것을 통과시키지 않는다.
+ */
+export function providerModelIdAccepted(
+  entry: ModelEntry,
+  providerReportedModelId: string | undefined
+): { ok: true; matchedBy: "exact" | "accepted_list" } | { ok: false; reason: string } {
+  if (providerReportedModelId === undefined || providerReportedModelId.length === 0) {
+    return {
+      ok: false,
+      reason: `${entry.modelId}: 응답 envelope에 모델 ID가 없습니다 — 요청 ID로 대체하지 않습니다`,
+    };
+  }
+  if (providerReportedModelId === entry.modelId) return { ok: true, matchedBy: "exact" };
+  const accepted = entry.acceptedProviderModelIds ?? [];
+  if (accepted.includes(providerReportedModelId)) return { ok: true, matchedBy: "accepted_list" };
+  return {
+    ok: false,
+    reason:
+      `${entry.modelId}: 응답 모델 ID가 ${providerReportedModelId}입니다. ` +
+      (accepted.length === 0
+        ? `허용 목록(acceptedProviderModelIds)이 비어 있으므로 정확히 일치만 통과합니다.`
+        : `허용 목록 [${accepted.join(", ")}]에도 없습니다.`),
+  };
+}
+
+/**
+ * 레지스트리 스냅샷 해시 — evidence가 "어떤 카탈로그 기준이었는가"를 남긴다.
+ *
+ * 해시에 넣는 것은 **비용·능력·가용성처럼 판정에 쓰이는 필드**다. `evaluation`처럼 실행이
+ * 쌓으면서 바뀌는 필드는 넣지 않는다 — 그걸 넣으면 실행할수록 evidence가 무효가 된다.
+ */
+export function registrySnapshotHash(entries: readonly ModelEntry[]): string {
+  const canonical = [...entries]
+    .map((e) => ({
+      modelId: e.modelId,
+      providerId: e.providerId,
+      protocol: e.protocol,
+      apiBaseUrl: e.apiBaseUrl,
+      apiKeyEnvName: e.apiKeyEnvName,
+      capabilities: e.capabilities,
+      economics: e.economics,
+      availability: e.availability,
+      acceptedProviderModelIds: e.acceptedProviderModelIds ?? [],
+    }))
+    .sort((a, b) => a.modelId.localeCompare(b.modelId));
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex").slice(0, 16);
+}
+
 export class ModelRegistry {
   private readonly entries: ModelEntry[];
 
@@ -169,6 +225,17 @@ export class ModelRegistry {
 
   providersOf(entries: ModelEntry[]): ProviderId[] {
     return [...new Set(entries.map((e) => e.providerId))];
+  }
+
+  /**
+   * 이 레지스트리 스냅샷의 해시.
+   *
+   * probe evidence에 박아 두면 "그 확인이 어떤 카탈로그 기준이었는가"가 남는다. 단가나 능력
+   * 선언이 바뀐 뒤에도 예전 evidence를 그대로 쓰는 것을 막기 위한 것이다 — 비용 추정이
+   * 달라지면 그 evidence로 승인한 예산의 의미도 달라진다.
+   */
+  snapshotHash(): string {
+    return registrySnapshotHash(this.entries);
   }
 
   /** 레지스트리의 가격 정보로 비용을 계산한다. 가격이 0인 fake는 0을, 없는 모델은 undefined를 준다. */

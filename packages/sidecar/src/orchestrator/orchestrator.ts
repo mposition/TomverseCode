@@ -853,6 +853,11 @@ export class Orchestrator {
       role,
       providerId: adapter.providerId,
       modelId: adapter.modelId,
+      // **요청한 모델과 공급자가 응답한 모델을 둘 다 남긴다.** 하나만 남기면 조용한 대체를
+      // 사후에 감사할 수 없다 — `modelId`는 우리가 요청한 값이므로 항상 우리 기대와 같다.
+      requestedModelId: response.meta.requestedModelId,
+      resolvedModelId: response.meta.providerReportedModelId,
+      ...(response.meta.providerRequestId ? { providerRequestId: response.meta.providerRequestId } : {}),
       usage: response.usage,
       costUsd: this.registry.costUsd(adapter.modelId, response.usage),
       latencyMs: response.latencyMs,

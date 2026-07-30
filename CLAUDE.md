@@ -129,6 +129,8 @@ npm run gate:g:validate   # fixture 24개 품질 검증 (모델 호출 없음)
 npm run gate:g:dry-run    # preflight + 실행 계획 (API 호출 없음)
 npm run gate:g:plan-pilot # 단계별(P0/P1) 승인 카드 (API 호출 없음)
 npm run gate:g:probe-models  # 역할당 최소 요청 1회로 모델 실제 확인. --max-cost-usd 필수
+npm run gate:g:budget-status # 예산 상태 읽기 전용 조회 (열린 예약). 고치지 않는다
+npm run gate:g:attest-p0     # P0 결과 검사 → p0-attestation.json (API 호출 없음)
 npm run gate:g:pilot      # 반복 1회 — 하네스/비용/실패 분류 확인용. PASS를 내지 않는다
 npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가 필요하다
 ```
@@ -142,6 +144,21 @@ npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가
 **재개가 승인 한도를 늘리지 않는다.** `records.jsonl`에서 확정 비용을 복원해 원장에 넣고,
 복원값을 신뢰할 수 없으면(비용 없는 유료 기록, NaN, 중복 기록, 이벤트와 불일치) **재개하지
 않는다.** 0으로 보고 계속하는 것이 가장 위험하다 — 그 순간 한도가 사라진다.
+
+**합계 비교만으로는 부족하다 — 열린 예약이 보이지 않는다.** 예약 개시 후 정산 전에 죽으면
+`reservation_opened`만 남고 어떤 합계에도 나타나지 않는데, 그 요청은 과금됐을 수 있다. 예산
+이벤트를 correlationId별 상태 머신으로 검증하고(허용 흐름 `opened → settled` / `opened → released`),
+열린 예약이 있으면 `BLOCKED_UNRESOLVED_RESERVATION`으로 멈춘다. **자동 정리 명령을 만들지 말 것** —
+실제 과금 여부는 공급자 청구 내역으로만 확인된다. 근거: multi-engine-routing.md 10.7절.
+
+**유료 실행은 Run Card 없이 시작할 수 없다.** `pilot`/`run`은 `--run-card`를 필수로 받고,
+어댑터를 만들기 전에 카드 해시·단계·경로·인자·예산·probe evidence·자격증명 binding·만료를
+확인한다. 우회 플래그를 추가하지 말 것.
+
+**exact-model 검증은 응답 envelope만 본다.** `DraftProposal.model`/`ReviewDecision.model`은
+어댑터가 `this.modelId`를 넣은 값이라 비교하면 항상 통과한다 — 조용한 대체를 잡지 못한다.
+`ProviderResponse.meta.providerReportedModelId`를 쓰고, alias는 prefix 비교가 아니라
+`ModelEntry.acceptedProviderModelIds` 목록으로 다룬다(10.8절).
 
 **fake provider 결과로 가설을 판정하지 않는다** — 모든 기록에 `providerKind`가 남고, 집계가
 `fake` 기록만 있으면 무조건 `INCONCLUSIVE`를 낸다. 자세한 것은
@@ -234,6 +251,12 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
   이미 쓴 금액을 복원해 `initialCommittedUsd`로 넘겨야 하고, 상한과 비교하는 값은 이번 프로세스의
   지출이 아니라 **누적**이다. 지출을 `spentUsd` 하나로 부르면 로그에서 그 숫자가 session인지
   전체인지 구별되지 않으므로 이름을 셋으로 나눈다(historical/session/cumulative).
+- **`String.raw` 템플릿은 trailing backslash로 끝낼 수 없다.** 백틱을 escape해 버려서
+  `String.raw`C:\temp\`` 는 문자열이 닫히지 않는다. 그리고 trailing backslash는 Windows 경로
+  인용 테스트가 **반드시 확인해야 하는 경우**다 — 백슬래시를 이중화한 일반 문자열을 쓸 것.
+- **소스를 검사하는 테스트는 자기 자신을 센다.** 검사 대상 토큰을 assertion 안에 그대로 적으면
+  개수 비교가 언제나 어긋난다. needle을 런타임에 조립하거나(`"foo" + "("`) 괄호 깊이로 호출
+  범위를 잘라낼 것.
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트
