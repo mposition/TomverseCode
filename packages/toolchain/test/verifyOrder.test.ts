@@ -203,6 +203,23 @@ test("_env.bat이 Visual Studio를 vswhere로 찾는다", () => {
   assert.ok(/where\s+vswhere\.exe/.test(script), "_env.bat이 PATH의 vswhere를 보지 않습니다");
 });
 
+test("_env.bat이 vswhere에 -latest가 아니라 -all을 쓴다", () => {
+  // 실측 머신에 설치가 둘 있었다: 최신 VS 18 Enterprise에는 C++ 빌드 도구가 없고, 도구가 있는
+  // 것은 더 오래된 2022 BuildTools였다. `-latest`는 "가장 새 설치 하나"만 주므로 그 하나가
+  // 쓸 수 없으면 나머지를 보지 않고 실패한다. 필요한 것은 "가장 새 것"이 아니라
+  // **vcvarsall.bat이 실제로 있는 것**이다.
+  const script = readFileSync(path.join(REPO_ROOT, "scripts", "_env.bat"), "utf8");
+  const queries = script.split(/\r?\n/).filter((line) => line.includes("-property installationPath"));
+  assert.ok(queries.length >= 2, `vswhere 조회가 예상보다 적습니다: ${queries.length}`);
+  for (const query of queries) {
+    assert.ok(!/\s-latest\b/.test(query), `-latest는 쓸 수 있는 설치를 놓칠 수 있습니다: ${query.trim()}`);
+    assert.ok(/\s-all\b/.test(query), `-all이 없습니다: ${query.trim()}`);
+  }
+  // 그리고 각 후보마다 vcvarsall.bat 존재를 **파일로** 확인해야 한다 — 선언만으로는 부족하다.
+  const checks = script.split(/\r?\n/).filter((line) => /if exist "%%i\\VC\\Auxiliary/.test(line));
+  assert.equal(checks.length, queries.length, "vswhere 조회 수와 vcvarsall.bat 확인 수가 다릅니다");
+});
+
 test("탐지 실패 메시지가 확인한 것을 전부 알려준다", () => {
   // 실측: Visual Studio가 설치된 머신에서 "설치되어 있지 않은 것으로 보입니다"가 나왔다.
   // 그 메시지로는 사용자도 우리도 다음에 무엇을 볼지 알 수 없다 — 무엇을 어디까지 확인했는지가
@@ -224,6 +241,26 @@ test("탐지 실패 메시지가 확인한 것을 전부 알려준다", () => {
     scripts: Record<string, string>;
   };
   assert.ok(root.scripts["msvc:doctor"]?.includes("msvc-doctor.bat"), "msvc:doctor 스크립트가 없습니다");
+});
+
+test("msvc-doctor.bat이 읽을 수 있는 출력을 내고 셸 상태를 되돌린다", () => {
+  // 실측: 진단 출력이 전부 깨져 나왔다. 이 스크립트의 출력은 npm/node의 UTF-8 파이프를 지나지
+  // 않고 콘솔에 직접 가므로, 파일이 UTF-8인데 콘솔 코드 페이지가 cp949/437이면 한글이 깨진다.
+  // 그리고 코드 페이지는 setlocal로 스코프되지 않으므로 **직접 되돌려야** 한다 — 진단 명령이
+  // 사용자의 셸 상태를 바꿔 놓고 끝나면 안 된다.
+  const doctor = readFileSync(path.join(REPO_ROOT, "scripts", "msvc-doctor.bat"), "utf8");
+  assert.ok(/chcp\s+65001/.test(doctor), "진단이 UTF-8 코드 페이지를 설정하지 않습니다 — 한글이 깨집니다");
+  assert.ok(
+    /chcp\s+%OLD_CP%/.test(doctor),
+    "진단이 코드 페이지를 되돌리지 않습니다 — 사용자의 셸이 65001로 남습니다"
+  );
+
+  // 설치 경로만 나열하면 "둘 다 있는데 왜 실패하나"로 읽힌다. 실측 머신은 최신 설치에
+  // C++ 빌드 도구가 없고 더 오래된 설치에만 있었다 — 그 차이가 출력에 보여야 한다.
+  assert.ok(
+    doctor.includes("VC\\Auxiliary\\Build\\vcvarsall.bat"),
+    "진단이 설치별 vcvarsall.bat 존재를 확인하지 않습니다"
+  );
 });
 
 test("_env.bat이 드라이브 문자를 하드코딩하지 않는다", () => {

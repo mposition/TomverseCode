@@ -20,9 +20,14 @@ rem 탐지를 **네 겹**으로 두고, 전부 실패하면 **무엇을 어디�
 rem "설치되지 않은 것으로 보입니다"라고만 말하면 설치되어 있는 사용자가 무엇을 해야 할지 모른다.
 rem
 rem   1) TOMVERSE_VCVARSALL — 사용자가 직접 지정하는 탈출구. 탐지가 실패하는 머신의 최종 답이다.
-rem   2) vswhere.exe — 고정 위치 두 곳 + PATH
+rem   2) vswhere.exe — 고정 위치 두 곳 + PATH. **-latest를 쓰지 않는다**(아래 참조).
 rem   3) VSINSTALLDIR — 이미 VS 셸 안에서 실행된 경우
 rem   4) Program Files 아래 "Microsoft Visual Studio" 서브트리 **검색** (목록이 아니라 검색이다)
+rem
+rem **왜 -latest가 아니라 -all인가.** 실측 머신에 설치가 둘 있었다. 최신은 VS 18 Enterprise인데
+rem C++ 빌드 도구가 없고, 도구가 있는 것은 더 오래된 2022 BuildTools였다. -latest는 "가장 새
+rem 설치 하나"만 주므로 그 하나가 쓸 수 없으면 나머지를 보지 않고 실패한다. 우리가 필요한 것은
+rem "가장 새 것"이 아니라 **vcvarsall.bat이 실제로 있는 것**이므로 전부 받아서 첫 항목을 쓴다.
 rem ---------------------------------------------------------------------------
 
 if defined VSCMD_ARG_TGT_ARCH goto :cargo_path
@@ -53,16 +58,18 @@ if not defined VCVARS (
 )
 
 if not defined VCVARS if defined VSWHERE (
-  rem 2a) C++ 빌드 도구를 갖춘 최신 설치.
-  for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do (
+  rem 2a) C++ 빌드 도구를 갖춘 설치 **전부**를 받아 vcvarsall.bat이 있는 첫 항목을 쓴다.
+  for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -all -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do (
     if not defined VCVARS if exist "%%i\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvarsall.bat"
   )
   rem 2b) 미리보기 채널도 본다 — 새 메이저 버전은 한동안 여기에만 있다.
-  if not defined VCVARS for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do (
+  if not defined VCVARS for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -all -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do (
     if not defined VCVARS if exist "%%i\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvarsall.bat"
   )
-  rem 2c) 워크로드 조건 없이 vcvarsall.bat이 있는 설치라면 받아들인다.
-  if not defined VCVARS for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -prerelease -products * -property installationPath 2^>nul`) do (
+  rem 2c) 워크로드 선언과 무관하게 vcvarsall.bat이 있는 설치라면 받아들인다.
+  rem     선언은 신뢰의 근거지만 **파일 존재가 최종 판정**이다 — VS 18처럼 새 버전이 컴포넌트
+  rem     ID를 바꾸면 -requires가 빗나갈 수 있고, 그때도 실제로 쓸 수 있으면 쓴다.
+  if not defined VCVARS for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -all -prerelease -products * -property installationPath 2^>nul`) do (
     if not defined VCVARS if exist "%%i\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvarsall.bat"
   )
   if defined VCVARS set "MSVC_HOW=vswhere"
