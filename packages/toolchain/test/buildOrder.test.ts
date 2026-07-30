@@ -195,3 +195,71 @@ test("@tomverse/toolchain은 어떤 워크스페이스에도 의존하지 않는
   const graph = dependencyGraph(readWorkspaces());
   assert.deepEqual([...(graph.get("@tomverse/toolchain") ?? [])], []);
 });
+
+/**
+ * **한 워크스페이스만 빌드하는 명령이 낡은 dist를 쓰지 못하게 한다.**
+ *
+ * 실측 사고: `git pull`로 sidecar의 공개 타입이 바뀐 직후 Windows에서 게이트 명령을 돌렸더니
+ * 게이트가 **예전 `.d.ts`** 에 대해 컴파일되어 `TS2305 has no exported member`가 71개 나왔다.
+ * 오류가 원인을 가리키지 않는 종류다 — 방금 받은 코드가 잘못됐다고 읽힌다.
+ *
+ * 막는 방법이 둘이고 둘 다 확인한다:
+ *  1. 사용자가 부르는 `gate:g:*` 스크립트가 의존성 체인을 함께 빌드한다.
+ *  2. dist를 소비하는 워크스페이스의 `build`가 산출물 신선도를 먼저 확인한다.
+ */
+test("dist를 소비하는 워크스페이스만 단독으로 빌드되지 않는다", () => {
+  const root = JSON.parse(readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
+    scripts: Record<string, string>;
+  };
+
+  // (1) 게이트를 실행하는 모든 스크립트가 gate:g:build를 지난다.
+  const gateScripts = Object.entries(root.scripts).filter(
+    ([name]) => name.startsWith("gate:g:") && !name.startsWith("//") && name !== "gate:g:build"
+  );
+  assert.ok(gateScripts.length >= 5, `gate:g:* 스크립트가 예상보다 적습니다: ${gateScripts.length}`);
+  for (const [name, command] of gateScripts) {
+    assert.ok(
+      command.includes("npm run gate:g:build"),
+      `${name}이 의존성 체인을 빌드하지 않습니다 — 낡은 sidecar dist에 대해 컴파일될 수 있습니다: ${command}`
+    );
+    assert.ok(
+      !command.includes("npm run build --workspace=@tomverse/hypothesis-gate"),
+      `${name}이 게이트만 빌드합니다: ${command}`
+    );
+  }
+
+  // gate:g:build 자체는 protocol → toolchain → sidecar → gate 순서여야 한다.
+  const chain = root.scripts["gate:g:build"];
+  assert.ok(chain, "gate:g:build 스크립트가 없습니다");
+  const chainOrder = ["@tomverse/protocol", "@tomverse/toolchain", "@tomverse/sidecar", "@tomverse/hypothesis-gate"];
+  let cursor = -1;
+  for (const workspace of chainOrder) {
+    const at = chain!.indexOf(`--workspace=${workspace}`);
+    assert.ok(at > cursor, `gate:g:build의 순서가 잘못되었습니다 (${workspace}): ${chain}`);
+    cursor = at;
+  }
+
+  // (2) 내부 워크스페이스에 의존하는 워크스페이스의 build가 신선도 검사를 지난다.
+  const guard = "scripts/assertDepsFresh.mjs";
+  assert.ok(
+    existsSync(path.join(REPO_ROOT, guard)),
+    `${guard}가 없습니다 — 낡은 dist를 잡는 장치가 사라졌습니다`
+  );
+  for (const manifest of readWorkspaces()) {
+    const internal = Object.keys({ ...manifest.dependencies, ...manifest.devDependencies }).filter((dep) =>
+      dep.startsWith("@tomverse/")
+    );
+    if (internal.length === 0) continue;
+    const raw = JSON.parse(
+      readFileSync(path.join(REPO_ROOT, manifest.directory, "package.json"), "utf8")
+    ) as RawManifest;
+    const build = raw.scripts?.build;
+    if (build === undefined) continue;
+    // 프런트엔드(vite)는 dist의 .d.ts를 소비하지 않으므로 대상이 아니다.
+    if (!build.includes("tsc")) continue;
+    assert.ok(
+      build.includes("assertDepsFresh.mjs"),
+      `${manifest.name}의 build가 의존성 신선도를 확인하지 않습니다: ${build}`
+    );
+  }
+});

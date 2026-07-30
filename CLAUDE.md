@@ -181,6 +181,7 @@ TypeScript로 두면 "Rust를 빌드하려면 TypeScript를 먼저 빌드해야 
 | 스크립트 | 하는 일 |
 |---|---|
 | `scripts\_env.bat` | MSVC 툴체인 + cargo PATH 준비. **Visual Studio 탐지는 여기에만 있다** |
+| `scripts\assertDepsFresh.mjs` | 의존 워크스페이스의 `dist`가 소스보다 낡았는지 확인. 낡은 `.d.ts`로 컴파일해 원인과 먼 오류가 쏟아지는 것을 막는다 |
 | `scripts\cargo.mjs` | cargo 실행 런처 — MSVC 환경 준비 + cargo 실행 파일 탐색 + 종료 코드 보존. 나머지 cargo 진입점이 전부 이걸 지난다 |
 | `scripts\cargo-test-core.bat` | 신뢰 경계 크레이트 테스트 (가장 자주 도는 검증) |
 | `scripts\cargo-build-core.bat` | `tomverse-host` 빌드 — e2e가 이 산출물을 요구한다 |
@@ -257,6 +258,14 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 - **소스를 검사하는 테스트는 자기 자신을 센다.** 검사 대상 토큰을 assertion 안에 그대로 적으면
   개수 비교가 언제나 어긋난다. needle을 런타임에 조립하거나(`"foo" + "("`) 괄호 깊이로 호출
   범위를 잘라낼 것.
+- **한 워크스페이스만 빌드하면 낡은 `.d.ts`에 대해 컴파일된다.** 워크스페이스들은 서로의
+  **`dist`** 에 대해 타입 검사하므로(위 "검증 순서" 절), `git pull`로 sidecar 공개 타입이 바뀐
+  직후 `npm run gate:g:*`이나 `npm test --workspace=@tomverse/hypothesis-gate`를 돌리면
+  **예전 `.d.ts`** 를 읽는다. 실측으로 `TS2305 has no exported member`가 71개 나왔고, 그 오류는
+  원인을 가리키지 않는다 — 방금 받은 코드가 잘못됐다고 읽힌다. 이제 두 겹으로 막는다:
+  루트 `gate:g:build`가 체인을 함께 빌드하고, dist를 소비하는 워크스페이스의 `build`가
+  `scripts/assertDepsFresh.mjs`로 산출물 신선도를 먼저 확인한다. 두 장치를
+  `packages/toolchain/test/buildOrder.test.ts`가 지킨다.
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트

@@ -6,7 +6,8 @@
   "type": "module",
   "main": "./dist/src/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "//build": "protocol/toolchain의 dist에 대해 타입 검사하므로, 낡았으면 먼저 멈춘다(evals/hypothesis-gate와 같은 이유).",
+    "build": "node ../../scripts/assertDepsFresh.mjs . && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/index.js",
     "//test": "이 Node 버전은 `node --test <디렉터리>`가 동작하지 않는다(CLAUDE.md 함정 기록) — 파일 경로를 직접 나열한다.",
