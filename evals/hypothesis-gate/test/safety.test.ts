@@ -4,7 +4,14 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createBudgetLedger, maxCallCostUsd, pricingIsUsable, validateApprovedLimit } from "@tomverse/sidecar/budget";
+import {
+  createBudgetLedger,
+  effectiveMaxOutputTokens,
+  maxCallCostUsd,
+  MAX_OUTPUT_TOKENS_PER_CALL,
+  pricingIsUsable,
+  validateApprovedLimit,
+} from "@tomverse/sidecar/budget";
 import type { ModelEntry } from "@tomverse/protocol";
 import { criteriaHash, CRITERIA } from "../src/criteria.js";
 import { loadAllFixtures, listFixtureIds } from "../src/manifest.js";
@@ -615,7 +622,7 @@ test("19b. 비용 추정은 순수 함수이므로 네트워크 없이 검증된
   const estimate = estimateRecordCost(executor, reviewer, calls, 1_000_000);
   assert.ok(estimate);
   assert.ok(Math.abs(estimate.maxUsd - (0.12 * 4 + 0.12 * 3)) < 1e-9, String(estimate.maxUsd));
-  assert.ok(estimate.basis.includes("maxOutputTokens"), estimate.basis);
+  assert.ok(estimate.basis.includes("어댑터가 실제 요청하는 값"), estimate.basis);
 
   // 가격을 모르면 undefined — 0으로 대체하지 않는다.
   const broken = modelEntry({
@@ -659,3 +666,63 @@ function sampleRecord(fixtureId: string, arm: "A" | "B" | "C" | "D", repetition:
     criteriaHash: criteriaHash(),
   };
 }
+
+// ---- 출력 토큰 상한: 추정과 실제 요청이 갈라지면 안 된다 ----
+
+test("20. 어댑터가 모델 최대치가 아니라 공용 상한을 요청한다", () => {
+  // 어댑터가 `entry.capabilities.maxOutputTokens`를 그대로 넘기면 비용 상한이 그 값에
+  // 지배된다(P1에서 출력이 약 85%였다). 상한을 한 곳에 두고 어댑터와 추정기가 같은 것을
+  // 읽어야 예약이 실제 청구와 맞는다 — 한쪽만 바꾸면 조용히 어긋난다.
+  // dist/test → dist → hypothesis-gate → evals → 저장소 루트 (네 단계다).
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
+  for (const file of ["openai.ts", "anthropic.ts"]) {
+    const source = readFileSync(path.join(root, "packages", "sidecar", "src", "providers", file), "utf8");
+    assert.ok(
+      /max_(?:output_)?tokens:\s*effectiveMaxOutputTokens\(/.test(source),
+      `${file}이 공용 상한을 쓰지 않습니다 — 추정과 실제 요청이 갈라집니다`
+    );
+    assert.ok(
+      !/max_(?:output_)?tokens:\s*this\.entry\.capabilities\.maxOutputTokens/.test(source),
+      `${file}이 모델 최대치를 그대로 요청합니다`
+    );
+  }
+});
+
+test("20b. 공용 상한이 모델 최대치보다 작을 때만 잘라낸다", () => {
+  const big = modelEntry({ modelId: "big", providerId: "openai" });
+  big.capabilities.maxOutputTokens = 64_000;
+  assert.equal(effectiveMaxOutputTokens(big), MAX_OUTPUT_TOKENS_PER_CALL);
+
+  // 모델이 우리 상한보다 작으면 모델 쪽을 따른다 — 요청할 수 없는 값을 보내면 오류가 난다.
+  const small = modelEntry({ modelId: "small", providerId: "openai" });
+  small.capabilities.maxOutputTokens = 8_192;
+  assert.equal(effectiveMaxOutputTokens(small), 8_192);
+});
+
+test("20c. 비용 추정이 실제 요청값을 쓴다", () => {
+  const executor = modelEntry({ modelId: "e", providerId: "openai" });
+  executor.capabilities.maxOutputTokens = 64_000;
+  const reviewer = modelEntry({ modelId: "r", providerId: "anthropic" });
+  reviewer.capabilities.maxOutputTokens = 64_000;
+
+  const estimate = estimateRecordCost(executor, reviewer, maxCallsPerRecord("C", 2));
+  assert.ok(estimate);
+  // 추정이 모델 최대치(64,000)를 썼다면 이 값보다 훨씬 커진다.
+  const perCallWithCap = maxCallCostUsd(executor, {
+    maxInputTokens: 60_000,
+    maxOutputTokens: MAX_OUTPUT_TOKENS_PER_CALL,
+  });
+  assert.ok(perCallWithCap !== undefined);
+  assert.ok(
+    estimate.maxUsd < perCallWithCap * 8,
+    `추정이 공용 상한을 반영하지 않았습니다: $${estimate.maxUsd}`
+  );
+  assert.ok(estimate.basis.includes("어댑터가 실제 요청하는 값"), estimate.basis);
+});
+
+test("20d. 모든 arm이 같은 출력 상한을 쓴다 (비교를 왜곡하지 않는다)", () => {
+  // arm마다 다른 상한을 주면 A와 C/D의 비교에 교란 변수가 들어간다.
+  const openai = modelEntry({ modelId: "e", providerId: "openai" });
+  const anthropic = modelEntry({ modelId: "r", providerId: "anthropic" });
+  assert.equal(effectiveMaxOutputTokens(openai), effectiveMaxOutputTokens(anthropic));
+});

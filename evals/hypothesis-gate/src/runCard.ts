@@ -310,7 +310,8 @@ export function renderRunCard(card: RunCard): string[] {
           `in $${m.inputPerMTok}/M out $${m.outputPerMTok}/M, 기준일 ${m.pricingAsOf}`
       );
       lines.push(
-        `      context ${m.maxContextTokens.toLocaleString()} / maxOutput ${m.maxOutputTokens.toLocaleString()} ` +
+        `      context ${m.maxContextTokens.toLocaleString()} / ` +
+          `요청 출력 ${m.requestedMaxOutputTokens.toLocaleString()} (모델 최대 ${m.modelMaxOutputTokens.toLocaleString()}) ` +
           `/ ${m.structuredOutput}`
       );
     }

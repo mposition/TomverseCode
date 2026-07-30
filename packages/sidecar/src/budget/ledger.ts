@@ -186,6 +186,44 @@ export function createBudgetLedger(approvedLimitUsd: number): BudgetLedger {
  */
 export const DEFAULT_CONTEXT_TOKEN_BUDGET = 60_000;
 
+/**
+ * 한 번의 provider 호출에 요청하는 **출력 토큰 상한.**
+ *
+ * # 왜 모델 최대치를 쓰지 않는가
+ *
+ * 어댑터는 `max_output_tokens`에 `entry.capabilities.maxOutputTokens`를 그대로 넘겼다.
+ * gpt-4.1은 32,768, claude-sonnet-5는 64,000이다. 그 값이 **비용 상한을 지배한다** —
+ * 가설 게이트 P1의 보수적 최대 비용에서 출력 토큰이 약 85%를 차지했다.
+ *
+ * 우리가 모델에게 요청하는 것은 patch가 담긴 JSON 하나다. 6만 토큰 출력은 필요하지 않고,
+ * 지연에도 불리하다(출력 토큰 수가 곧 생성 시간이다).
+ *
+ * # 왜 더 낮추지 않는가
+ *
+ * 너무 낮으면 출력이 잘려 구조화 출력이 스키마를 만족하지 못하고, 그러면
+ * `schema_violation` → 재시도가 된다. **돈과 정확도를 함께 잃는 실패**이고, 게이트에서는
+ * 모델 실패로 오분류될 수 있다. 그래서 현실적 필요보다 넉넉한 쪽으로 잡는다 —
+ * 16,000 토큰은 수백 줄 규모의 다중 파일 patch를 담고도 여유가 있다.
+ *
+ * # 왜 역할별로 다르게 하지 않는가
+ *
+ * 검수 응답은 초안보다 짧지만, arm마다 다른 상한을 주면 A와 C/D의 비교에 상한이라는
+ * 교란 변수가 들어간다. 실험 공정성을 위해 **모든 역할·모든 arm이 같은 값**을 쓴다.
+ *
+ * 이 값을 바꾸면 비용 추정과 실제 요청이 함께 움직여야 한다. 그래서 상수를 여기 한 곳에 두고
+ * 어댑터와 게이트의 추정기가 **같은 것을 읽는다** — 한쪽만 바꾸면 예약이 실제와 어긋난다.
+ */
+export const MAX_OUTPUT_TOKENS_PER_CALL = 16_000;
+
+/**
+ * 이 모델에 실제로 요청할 출력 토큰 수.
+ *
+ * 모델이 우리 상한보다 작은 최대치를 가질 수 있으므로(예: 8,192) 더 작은 쪽을 쓴다.
+ */
+export function effectiveMaxOutputTokens(entry: ModelEntry): number {
+  return Math.min(entry.capabilities.maxOutputTokens, MAX_OUTPUT_TOKENS_PER_CALL);
+}
+
 export interface CallCostInput {
   /** 이 호출에 넣을 입력 토큰 상한. 모델의 maxContextTokens를 넘지 못한다. */
   maxInputTokens: number;
@@ -205,6 +243,8 @@ export function maxCallCostUsd(entry: ModelEntry, input: CallCostInput): number 
   if (inputPerMTok < 0 || outputPerMTok < 0) return undefined;
 
   const inputTokens = Math.min(input.maxInputTokens, entry.capabilities.maxContextTokens);
+  // 호출자가 넘긴 값과 모델 최대치 중 작은 쪽. 호출자는 `effectiveMaxOutputTokens`를 넘기므로
+  // 추정과 실제 요청이 같은 수를 쓴다 — 어긋나면 예약이 실제 청구와 맞지 않는다.
   const outputTokens = Math.min(input.maxOutputTokens, entry.capabilities.maxOutputTokens);
   return (inputTokens / 1_000_000) * inputPerMTok + (outputTokens / 1_000_000) * outputPerMTok;
 }
