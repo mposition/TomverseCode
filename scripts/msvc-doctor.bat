@@ -27,6 +27,12 @@ chcp 65001 >nul 2>nul
 set "PF_X86=%ProgramFiles(x86)%"
 set "PF_64=%ProgramFiles%"
 
+rem 64비트 프로세스에서는 ProgramW6432가 ProgramFiles와 같은 값이다. 그대로 두면 같은 경로를
+rem 두 번 확인한 것처럼 출력되어, 읽는 사람이 "두 곳을 봤는데 둘 다 없다"로 오해한다.
+rem 진단의 목적은 사실을 정확히 보여주는 것이므로 중복 축을 지운다.
+set "PF_W6432="
+if defined ProgramW6432 if /i not "%ProgramW6432%"=="%PF_64%" set "PF_W6432=%ProgramW6432%"
+
 echo === MSVC 탐지 진단 ===
 echo.
 echo [경로 변수]
@@ -40,7 +46,7 @@ echo.
 echo [vswhere.exe]
 call :probe "%PF_X86%\Microsoft Visual Studio\Installer\vswhere.exe"
 call :probe "%PF_64%\Microsoft Visual Studio\Installer\vswhere.exe"
-if defined ProgramW6432 call :probe "%ProgramW6432%\Microsoft Visual Studio\Installer\vswhere.exe"
+if defined PF_W6432 call :probe "%PF_W6432%\Microsoft Visual Studio\Installer\vswhere.exe"
 for /f "usebackq delims=" %%W in (`where vswhere.exe 2^>nul`) do echo   PATH에서 발견: "%%W"
 echo.
 
@@ -76,7 +82,7 @@ echo.
 echo [Program Files 아래 vcvarsall.bat 검색]
 call :find "%PF_64%"
 call :find "%PF_X86%"
-if defined ProgramW6432 call :find "%ProgramW6432%"
+if defined PF_W6432 call :find "%PF_W6432%"
 echo.
 
 echo [cargo]
