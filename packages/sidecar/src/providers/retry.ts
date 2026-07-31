@@ -1,5 +1,7 @@
-import type { NormalizedProviderError } from "@tomverse/protocol";
+import type { NormalizedProviderError, TokenUsage } from "@tomverse/protocol";
+import type { DispatchState } from "../budget/ledger.js";
 import { isRetryableKind, normalizeProviderError } from "./errors.js";
+import { ProviderCallFailure } from "./types.js";
 
 /**
  * 공급자 호출 인프라 재시도 — docs/design/state-machine-and-protocol.md 9절.
@@ -25,15 +27,57 @@ export const DEFAULT_RETRY_POLICY: RetryPolicy = {
   transientCapMs: 30_000,
 };
 
+/**
+ * 재시도까지 끝난 뒤의 최종 실패.
+ *
+ * # 왜 `facts`가 필요한가 (§2.6)
+ *
+ * 예전에는 이 클래스가 `NormalizedProviderError`만 실었다. 그런데 어댑터가 던지는
+ * `ProviderCallFailure`에는 **과금 판정에 필요한 사실**(요청이 나갔는가, usage를 받았는가,
+ * 응답 envelope의 모델 ID는 무엇인가)이 들어 있고, 그것이 여기서 통째로 사라졌다.
+ * 사실이 사라지면 호출자는 "모른다"를 "안 썼다"로 읽는 쪽으로 기울게 된다.
+ *
+ * 마지막 시도의 사실만이 아니라 **모든 attempt의 사실**을 보존한다 — 첫 시도가 과금되고
+ * 재시도가 거절당한 경우, 마지막만 보면 과금이 보이지 않는다.
+ */
+export interface ProviderAttemptFacts {
+  attempt: number;
+  dispatchState: DispatchState;
+  usage?: TokenUsage;
+  providerReportedModelId?: string;
+  providerRequestId?: string;
+  errorKind: string;
+}
+
 export class ProviderCallFailed extends Error {
   constructor(
     readonly normalized: NormalizedProviderError,
     readonly attempts: number,
-    readonly exhausted: boolean
+    readonly exhausted: boolean,
+    /** 시도별 dispatch 사실. 어댑터가 `ProviderCallFailure`를 던진 시도만 채워진다. */
+    readonly facts: ProviderAttemptFacts[] = []
   ) {
     super(normalized.message);
     this.name = "ProviderCallFailed";
   }
+}
+
+/** 어댑터 오류에서 보존해야 하는 사실을 뽑는다. 평범한 `Error`면 dispatch를 모른다. */
+export function attemptFacts(attempt: number, raw: unknown, kind: string): ProviderAttemptFacts {
+  if (raw instanceof ProviderCallFailure) {
+    return {
+      attempt,
+      dispatchState: raw.dispatchState,
+      ...(raw.usage !== undefined ? { usage: raw.usage } : {}),
+      ...(raw.providerReportedModelId !== undefined
+        ? { providerReportedModelId: raw.providerReportedModelId }
+        : {}),
+      ...(raw.providerRequestId !== undefined ? { providerRequestId: raw.providerRequestId } : {}),
+      errorKind: kind,
+    };
+  }
+  // **모르면 불확실로 본다.** 어댑터 안쪽에서 난 오류는 요청이 나간 뒤일 수 있다.
+  return { attempt, dispatchState: "dispatched_no_response", errorKind: kind };
 }
 
 export interface RetryHooks {
@@ -68,6 +112,9 @@ export async function callWithRetry<T>(
 ): Promise<{ value: T; attempts: number }> {
   const sleep = hooks.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   let attempt = 0;
+  // **모든 attempt의 사실을 모은다.** 첫 시도가 과금되고 재시도가 거절당한 경우,
+  // 마지막 시도만 보면 그 과금이 보이지 않는다(§2.6).
+  const facts: ProviderAttemptFacts[] = [];
 
   for (;;) {
     attempt += 1;
@@ -76,16 +123,17 @@ export async function callWithRetry<T>(
       return { value, attempts: attempt };
     } catch (raw) {
       const normalized = normalizeProviderError(raw);
+      facts.push(attemptFacts(attempt - 1, raw, normalized.kind));
 
       // 취소는 재시도 대상이 아니다 — 사용자가 멈추라고 한 것을 다시 부르면 안 된다.
       if (normalized.kind === "cancelled") {
-        throw new ProviderCallFailed(normalized, attempt, false);
+        throw new ProviderCallFailed(normalized, attempt, false, facts);
       }
       if (!isRetryableKind(normalized.kind) || !normalized.retryable) {
-        throw new ProviderCallFailed(normalized, attempt, false);
+        throw new ProviderCallFailed(normalized, attempt, false, facts);
       }
       if (attempt > policy.maxRetries) {
-        throw new ProviderCallFailed(normalized, attempt, true);
+        throw new ProviderCallFailed(normalized, attempt, true, facts);
       }
 
       const delayMs = backoffDelayMs(normalized, attempt, policy);

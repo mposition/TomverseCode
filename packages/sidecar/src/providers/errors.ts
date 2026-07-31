@@ -1,4 +1,5 @@
 import type { NormalizedProviderError, ProviderErrorKind } from "@tomverse/protocol";
+import { ProviderCallFailure } from "./types.js";
 
 /**
  * 공급자 오류 정규화 — docs/design/state-machine-and-protocol.md 9절.
@@ -14,6 +15,16 @@ export function normalizeProviderError(raw: unknown): NormalizedProviderError {
   // AbortError — 취소는 오류가 아니지만 오류 채널로 도착한다.
   if (isAbort(raw)) {
     return { kind: "cancelled", message: "호출이 취소되었습니다", retryable: false };
+  }
+
+  // **어댑터가 스스로 분류했으면 그것을 쓴다** (§2.6).
+  //
+  // `ProviderCallFailure`는 어댑터가 응답을 실제로 본 뒤 만든 오류다 — 어느 계층에서 무엇이
+  // 실패했는지 여기보다 정확히 안다. 그 분류를 버리고 status만으로 다시 추측하면, 어댑터가
+  // 확보한 사실이 재시도 판정에서 사라진다. 실측으로 `status`가 없는 파싱 실패가 네트워크
+  // 오류로 재분류되어 재시도 여부가 뒤바뀌었다.
+  if (raw instanceof ProviderCallFailure) {
+    return raw.classification;
   }
 
   // 구조화 출력 경계 검증 실패. 재시도 축이 아니라 "모델이 계약을 어겼다"는 사실이므로

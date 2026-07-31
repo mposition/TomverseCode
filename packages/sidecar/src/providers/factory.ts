@@ -1,5 +1,6 @@
 import type { ModelEntry, RoleAssignment } from "@tomverse/protocol";
 import { AnthropicAdapter } from "./anthropic.js";
+import { resolveCredential } from "./credentials.js";
 import { FakeProviderAdapter, type FakeProviderOptions } from "./fake.js";
 import { OpenAIAdapter } from "./openai.js";
 import type { ProviderAdapter } from "./types.js";
@@ -8,6 +9,16 @@ import type { ProviderAdapter } from "./types.js";
 export { ADAPTER_CONTRACT_VERSION, ProviderCallFailure } from "./types.js";
 export type { ProviderCallMetadata, ProviderResponse } from "./types.js";
 export { redactSecrets, containsSecretLike } from "./redact.js";
+export {
+  CREDENTIAL_ENV_ALIAS_PREFIX,
+  credentialEnvCandidates,
+  credentialUsable,
+  resolveCredential,
+} from "./credentials.js";
+export type { CredentialResolution } from "./credentials.js";
+// 재시도 래퍼도 같은 서브패스로 노출한다 — 가설 게이트가 attempt별 dispatch 사실을 검증한다(§2.6).
+export { attemptFacts, callWithRetry, ProviderCallFailed } from "./retry.js";
+export type { ProviderAttemptFacts, RetryPolicy } from "./retry.js";
 
 /**
  * 역할 배정 → 어댑터 인스턴스.
@@ -24,8 +35,14 @@ export interface AdapterFactoryOptions {
 }
 
 export class MissingCredentialError extends Error {
-  constructor(readonly providerId: string, readonly envName: string) {
-    super(`${providerId} 공급자의 자격증명이 없습니다 (${envName} 미설정)`);
+  constructor(
+    readonly providerId: string,
+    readonly envName: string,
+    /** `missing`인지 `ambiguous`인지 — 사용자가 해야 하는 일이 다르다. */
+    readonly kind: "missing" | "ambiguous" = "missing",
+    message?: string
+  ) {
+    super(message ?? `${providerId} 공급자의 자격증명이 없습니다 (${envName} 미설정)`);
     this.name = "MissingCredentialError";
   }
 }
@@ -43,10 +60,13 @@ export function createAdapter(
     return new FakeProviderAdapter({ entry, apiKey: "" }, options.fake);
   }
 
-  const apiKey = env[entry.apiKeyEnvName];
-  if (!apiKey || apiKey.trim().length === 0) {
-    throw new MissingCredentialError(entry.providerId, entry.apiKeyEnvName);
+  // **공용 resolver를 지난다** (§2.10). preflight·준비성·evidence binding·이 factory가 같은
+  // 규칙으로 같은 변수를 고르지 않으면, "확인했다"와 "실행한다"가 다른 키를 가리킬 수 있다.
+  const resolved = resolveCredential(entry.providerId, entry.apiKeyEnvName, env);
+  if (!resolved.ok) {
+    throw new MissingCredentialError(entry.providerId, entry.apiKeyEnvName, resolved.kind, resolved.reason);
   }
+  const apiKey = resolved.value;
 
   switch (entry.providerId) {
     case "openai":

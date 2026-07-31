@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { BudgetLedger, DispatchState } from "@tomverse/sidecar/budget";
 import { armExecutionOrder, armSpec, ARMS } from "./arms.js";
 import { criteriaHash } from "./criteria.js";
@@ -13,6 +14,7 @@ import {
   type ArmId,
   type FailureClass,
   type GateRunRecord,
+  type ProviderCallFact,
 } from "./types.js";
 import {
   changedFilesSince,
@@ -63,6 +65,9 @@ export interface RunnerOptions {
   fakeScript?: unknown;
   executorModel?: string;
   reviewerModel?: string;
+  /** 이 실행을 승인한 receipt. 모든 기록에 그대로 실린다 (§2.3). */
+  receiptId?: string;
+  receiptHash?: string;
   dryRun?: boolean;
   onProgress?: (message: string) => void;
 }
@@ -104,33 +109,116 @@ export function budgetStop(cumulativeSpentUsd: number, maxCostUsd: number | unde
 }
 
 /**
- * 이 기록의 provider 요청이 실제로 나갔는가 (§6).
+ * 이 기록의 provider 요청이 실제로 나갔는가 (§2.6, §2.7).
  *
- * # 왜 순수 함수인가
+ * # 무엇을 고쳤나 — 실측 시나리오
  *
- * 이 판정이 "예약을 해제할지 미해결로 남길지"를 결정한다. 틀리면 (a) 과금된 돈을 안 쓴 것으로
- * 만들거나 (b) 정상 실행을 영구히 막는다. 둘 다 비싸므로 fake provider 없이 경계값을 직접
- * 검증할 수 있어야 한다.
+ * 예전 판정은 이랬다: `providerCallCount === 0`이고 `failureClass !== "network_timeout"`이면
+ * `not_dispatched` → **예약 전액 해제.** 그런데 `providerCallCount`는 `PROVIDER_USAGE` 이벤트를
+ * 센 값이고, 그 이벤트는 host 실패 분류 **이후에** 읽혔다. 그래서 다음이 가능했다:
  *
- * # 왜 network_timeout만 불확실인가
+ * 1. executor 호출 성공, 과금 발생, `PROVIDER_USAGE` 기록됨
+ * 2. reviewer 호출이 5xx로 실패 → host가 실패로 종료
+ * 3. runner가 `classifyInfrastructureFailure`에서 곧바로 반환 → **DB를 읽지 않음**
+ * 4. `providerCallCount = 0`, `costUsd = undefined` → `not_dispatched`
+ * 5. 예약 전액 해제 → **이미 쓴 executor 비용이 승인 예산에서 사라짐**
  *
- * 과금은 공급자가 토큰을 생성했을 때 발생한다. 인증 실패·모델 미지원·rate limit·5xx는 공급자가
- * 요청을 거절한 것이므로 청구되지 않는다. **네트워크 타임아웃은 다르다** — 응답이 생성됐지만
- * 우리가 받지 못한 것일 수 있고, 그건 청구된다. 그래서 이것만 미해결로 남긴다.
+ * # 새 규칙
  *
- * 이 선을 더 보수적으로 그으면(모든 실패를 불확실로) 일시적 5xx 하나가 실행 디렉터리를
- * 영구히 막는다. 그건 보호가 아니라 사용 불가다.
+ * `auth_failure`·`rate_limit`·`provider_5xx`는 **HTTP 분류일 뿐 dispatch 사실이 아니다.**
+ * 429나 5xx를 받았다는 것은 요청이 공급자에게 **도달했다**는 뜻이고, 그 앞 호출이 과금됐을 수
+ * 있다. 그래서 해제의 근거가 되지 못한다.
+ *
+ * 해제(`not_dispatched`)는 **적극적 증거**가 있을 때만이다:
+ * 이벤트를 읽을 수 있었고, `PROVIDER_CALL_STARTED`가 하나도 없으며, 실패가 호출 이전 단계에서
+ * 났을 때. 자격증명 없음, fixture 준비 실패, 툴체인 미준비가 그것이다.
+ *
+ * 이벤트를 읽지 못했으면 `dispatched_no_response`다 — "모른다"를 "안 썼다"로 읽지 않는다.
  */
+
+/** 호출 이전 단계에서만 날 수 있는 실패. 이 목록에 HTTP 분류를 넣지 말 것. */
+const PRE_DISPATCH_FAILURES: ReadonlySet<string> = new Set([
+  "auth_failure",
+  "fixture_setup_failure",
+  "toolchain_unavailable",
+]);
+
 export function classifyDispatch(record: {
-  providerCallCount: number;
+  providerCalls: readonly { dispatchState: DispatchState; costUsd?: number }[];
+  eventsReadable: boolean;
   costUsd?: number;
   failureClass?: string;
 }): DispatchState {
-  if (record.providerCallCount > 0) {
+  // 이벤트를 읽지 못했으면 아무것도 단정할 수 없다. **가장 보수적인 쪽**으로 간다.
+  if (!record.eventsReadable) return "dispatched_no_response";
+
+  if (record.providerCalls.length === 0) {
+    // 호출이 시작된 흔적이 없다. 그래도 해제하려면 실패가 호출 **이전**이어야 한다.
+    if (record.failureClass !== undefined && PRE_DISPATCH_FAILURES.has(record.failureClass)) {
+      return "not_dispatched";
+    }
+    if (record.failureClass === undefined) return "not_dispatched";
+    // rate_limit / provider_5xx / network_timeout / host_crash 등: 요청이 나갔을 수 있다.
+    return "dispatched_no_response";
+  }
+
+  const uncertain = record.providerCalls.filter(
+    (c) => c.dispatchState === "dispatched_no_response" || c.dispatchState === "response_received_without_usage"
+  );
+  const measured = record.providerCalls.filter((c) => c.dispatchState === "response_received_with_usage");
+
+  if (uncertain.length > 0) {
+    // 측정된 비용과 불확실한 attempt가 **동시에** 있을 수 있다. 그 구별은 호출자가
+    // `partialSettlement`으로 처리한다 — 여기서는 "불확실한 것이 있다"만 말한다.
+    return uncertain.some((c) => c.dispatchState === "response_received_without_usage")
+      ? "response_received_without_usage"
+      : "dispatched_no_response";
+  }
+  if (measured.length > 0) {
     return record.costUsd === undefined ? "response_received_without_usage" : "response_received_with_usage";
   }
-  if (record.failureClass === "network_timeout") return "dispatched_no_response";
+  // 전부 not_dispatched로 기록된 호출들.
   return "not_dispatched";
+}
+
+/**
+ * 이 기록에서 **확정된 비용**과 **불확실한 attempt**를 분리한다 (§2.7).
+ *
+ * 한 record에 둘이 함께 있으면 전액 해제도 전액 정산도 옳지 않다. 확정분은 보존하고 나머지는
+ * 미해결로 남긴다 — "전체 reservation을 release해서는 안 된다".
+ */
+export function partitionSettlement(record: {
+  providerCalls: readonly { dispatchState: DispatchState; costUsd?: number }[];
+}): { measuredUsd: number; measuredCalls: number; uncertainCalls: number } {
+  let measuredUsd = 0;
+  let measuredCalls = 0;
+  let uncertainCalls = 0;
+  for (const call of record.providerCalls) {
+    if (call.dispatchState === "response_received_with_usage" && typeof call.costUsd === "number") {
+      measuredUsd += call.costUsd;
+      measuredCalls += 1;
+      continue;
+    }
+    if (call.dispatchState !== "not_dispatched") uncertainCalls += 1;
+  }
+  return { measuredUsd, measuredCalls, uncertainCalls };
+}
+
+/**
+ * 정산 이벤트에 실을 **응답 envelope 모델 ID.**
+ *
+ * `record.returnedModelId`(= `DRAFT_RECEIVED.model`)를 쓰지 않는다 — 그건 어댑터가 자기
+ * 요청 ID를 채운 자기보고 값이므로, 그것으로 "요청한 모델이 왔다"를 감사할 수 없다(§2.8).
+ * 성공한 호출들이 하나의 값에 동의할 때만 적고, 갈리면 적지 않는다.
+ */
+function envelopeModelId(record: { providerCalls: readonly ProviderCallFact[] }): string | undefined {
+  const reported = new Set(
+    record.providerCalls
+      .filter((c) => c.status === "succeeded")
+      .map((c) => c.providerReportedModelId)
+      .filter((m): m is string => typeof m === "string")
+  );
+  return reported.size === 1 ? [...reported][0] : undefined;
 }
 
 /** 초안 캐시 키 — 같은 fixture/반복이면 같은 초안을 공유한다. */
@@ -278,13 +366,15 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     sessionSpentUsd += record.costUsd ?? 0;
     if (reservation?.ok) {
       const dispatch = classifyDispatch(record);
+      const split = partitionSettlement(record);
+
       if (dispatch === "response_received_with_usage" && record.costUsd !== undefined) {
         const outcome = reservation.reservation.settle({
           cost: { measured: true, usd: record.costUsd },
           usage: { measured: true, inputTokens: record.inputTokens, outputTokens: record.outputTokens },
           providerKind: record.providerKind,
           requestedModelId: record.requestedModelId,
-          ...(record.returnedModelId ? { providerReportedModelId: record.returnedModelId } : {}),
+          ...(envelopeModelId(record) ? { providerReportedModelId: envelopeModelId(record)! } : {}),
           dispatchState: dispatch,
         });
         if (!outcome.ok) {
@@ -299,13 +389,43 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
           dispatchState: "not_dispatched",
           reason: `provider 호출 없이 끝난 기록입니다 (${record.failureClass ?? "사유 없음"})`,
         });
+      } else if (split.measuredCalls > 0 && split.measuredUsd > 0) {
+        // **확정된 비용과 불확실한 attempt가 함께 있다** (§2.7).
+        //
+        // 전액 해제하면 executor가 실제로 쓴 돈이 사라지고, 전액 정산하면 불확실한 attempt의
+        // 과금 가능성이 승인 예산에서 사라진다. 확정분은 세고 나머지는 미해결로 남긴다 —
+        // 그러면 이 디렉터리는 재개 불가가 되고 사람이 청구 내역으로 확인하게 된다.
+        const outcome = reservation.reservation.settlePartial({
+          measured: {
+            cost: { measured: true, usd: split.measuredUsd },
+            usage: { measured: true, inputTokens: record.inputTokens, outputTokens: record.outputTokens },
+            providerKind: record.providerKind,
+            requestedModelId: record.requestedModelId,
+            ...(envelopeModelId(record) ? { providerReportedModelId: envelopeModelId(record)! } : {}),
+            dispatchState: "response_received_with_usage",
+          },
+          unresolved: {
+            dispatchState: dispatch,
+            reason:
+              `호출 ${split.measuredCalls}건은 비용이 확정됐고 ${split.uncertainCalls}건은 과금 여부가 ` +
+              `불확실합니다 (${record.failureClass ?? "사유 없음"}). 확정분만 반영하고 나머지는 미해결로 남깁니다.`,
+          },
+        });
+        unmeasurableCostAbort = true;
+        abortReason =
+          `${fixtureId} rep${repetition} Arm ${arm}: 확정 $${split.measuredUsd.toFixed(6)} + ` +
+          `불확실 ${split.uncertainCalls}건 — 남은 유료 호출을 중단합니다` +
+          (outcome.ok ? "" : ` (${outcome.reason})`);
+        log(abortReason);
+        break;
       } else {
         // **과금 여부를 모른다.** 해제하지 않고 미해결로 남긴다.
         reservation.reservation.markUnresolved({
           dispatchState: dispatch,
           reason:
-            `${dispatch}: 요청이 나갔지만 비용을 확정할 수 없습니다 ` +
-            `(${record.failureClass ?? "사유 없음"}, provider 호출 ${record.providerCallCount}회)`,
+            `${dispatch}: 요청이 나갔을 수 있으나 비용을 확정할 수 없습니다 ` +
+            `(${record.failureClass ?? "사유 없음"}, provider 호출 ${record.providerCalls.length}건, ` +
+            `이벤트 읽기 ${record.eventsReadable ? "성공" : "실패"})`,
         });
       }
     }
@@ -363,6 +483,17 @@ interface ExecuteOneOptions extends RunnerOptions {
   criteriaHashValue: string;
 }
 
+const DISPATCH_STATES: ReadonlySet<string> = new Set([
+  "not_dispatched",
+  "dispatched_no_response",
+  "response_received_with_usage",
+  "response_received_without_usage",
+]);
+
+function isDispatchState(value: unknown): value is DispatchState {
+  return typeof value === "string" && DISPATCH_STATES.has(value);
+}
+
 /** 기록에 초안을 함께 실어 나른다(재개 시 복구용). JSONL에는 그대로 저장된다. */
 type RecordWithDraft = GateRunRecord & { draftProposal?: unknown };
 
@@ -400,6 +531,12 @@ function executeOne(options: ExecuteOneOptions): RecordWithDraft {
     completedAt: startedAt,
     providerKind: options.fakeScript !== undefined ? "fake" : "real",
     criteriaHash: options.criteriaHashValue,
+    ...(options.receiptId ? { receiptId: options.receiptId } : {}),
+    ...(options.receiptHash ? { receiptHash: options.receiptHash } : {}),
+    providerCalls: [],
+    // 이벤트를 읽기 전에는 **읽을 수 없었다**가 기본값이다. 낙관적 기본값을 두면 예외 경로에서
+    // "호출 0회"로 읽혀 예약이 해제된다.
+    eventsReadable: false,
   };
   if (spec.reviewMode) base.reviewMode = spec.reviewMode;
 
@@ -419,15 +556,32 @@ function executeOne(options: ExecuteOneOptions): RecordWithDraft {
     base.latencyMs = hostResult.wallClockMs;
     base.taskId = hostResult.taskId;
 
+    // **이벤트를 먼저 읽는다** (§2.7).
+    //
+    // 예전에는 `classifyInfrastructureFailure`가 먼저였고, 실패면 DB를 읽지 않고 반환했다.
+    // 그러면 executor가 성공해 과금된 뒤 reviewer가 5xx로 죽은 실행에서 usage를 통째로
+    // 잃는다 — 그리고 usage가 없으니 `not_dispatched`로 판정돼 예약까지 해제됐다.
+    // host가 실패했든 아니든 DB가 만들어졌으면 남은 사실을 최대한 회수한다.
+    const read = readEventsSafely(hostResult.dbPath, workspace.root, hostResult.taskId);
+    base.eventsReadable = read.ok;
+    if (read.ok) applyEventDerivedFields(base, read.events);
+
     const infraFailure = classifyInfrastructureFailure(hostResult);
     if (infraFailure) {
       base.failureClass = infraFailure;
+      if (!read.ok) {
+        base.policyDenials = [...base.policyDenials, `이벤트를 읽지 못했습니다: ${read.reason}`];
+      }
       base.completedAt = new Date().toISOString();
       return base;
     }
-
-    const events = readEvents(hostResult.dbPath, workspace.root, hostResult.taskId);
-    applyEventDerivedFields(base, events);
+    if (!read.ok) {
+      // 이벤트를 못 읽었다는 것 자체가 **과금 불확실 상태**다. 성공으로 넘기지 않는다.
+      base.failureClass = "oracle_harness_failure";
+      base.policyDenials = [...base.policyDenials, `이벤트를 읽지 못했습니다: ${read.reason}`];
+      base.completedAt = new Date().toISOString();
+      return base;
+    }
 
     // ---- 변경 파일과 금지 경로 ----
     base.changedFiles = changedFilesSince(fixture, workspace.root);
@@ -473,6 +627,28 @@ function executeOne(options: ExecuteOneOptions): RecordWithDraft {
   }
 }
 
+/**
+ * 이벤트를 읽되 **실패를 빈 목록으로 감추지 않는다** (§2.7).
+ *
+ * `readEvents`는 파싱 실패에서 `[]`를 준다. "이벤트가 없다"와 "이벤트를 못 읽었다"는 전혀 다른
+ * 사실인데 같은 값이 되므로, 여기서 갈라 놓는다 — 못 읽은 것은 호출이 나갔는지 모른다는 뜻이고,
+ * 그건 예약을 해제할 수 없는 상태다.
+ */
+function readEventsSafely(
+  dbPath: string,
+  workspaceRoot: string,
+  taskId: string
+): { ok: true; events: ReturnType<typeof readEvents> } | { ok: false; reason: string } {
+  if (!existsSync(dbPath)) {
+    return { ok: false, reason: `상태 DB가 만들어지지 않았습니다: ${dbPath}` };
+  }
+  try {
+    return { ok: true, events: readEvents(dbPath, workspaceRoot, taskId) };
+  } catch (error) {
+    return { ok: false, reason: String(error).slice(0, 200) };
+  }
+}
+
 /** 프로세스를 띄우지 못했거나 공급자 인증/한도 문제인가. */
 function classifyInfrastructureFailure(result: HostRunResult): FailureClass | undefined {
   if (result.spawnError) return "host_crash";
@@ -484,15 +660,109 @@ function classifyInfrastructureFailure(result: HostRunResult): FailureClass | un
   return undefined;
 }
 
-/** DB 이벤트에서 usage/verdict/초안을 뽑아 기록을 채운다. */
+/**
+ * DB 이벤트에서 **호출별 사실**과 usage/verdict/초안을 뽑아 기록을 채운다 (§2.6).
+ *
+ * # 세 이벤트를 어떻게 합치는가
+ *
+ * - `PROVIDER_CALL_STARTED`: adapter 호출 **직전**. 여기까지만 있고 terminal이 없으면
+ *   요청이 나갔는지도 응답이 왔는지도 모른다 → `dispatched_no_response`.
+ * - `PROVIDER_USAGE`: usage를 받은 성공 → `response_received_with_usage`.
+ * - `PROVIDER_CALL_FAILED`: 실패. 어댑터가 아는 dispatch 사실을 그대로 싣는다.
+ *
+ * 키는 `callId + attempt`다. 재시도한 attempt마다 사실이 따로 남아야 "몇 번 나갔고 그중
+ * 무엇이 과금됐는가"를 말할 수 있다.
+ */
 function applyEventDerivedFields(record: RecordWithDraft, events: ReturnType<typeof readEvents>): void {
+  const calls = new Map<string, ProviderCallFact>();
+  const key = (callId: unknown, attempt: unknown): string => `${String(callId)}#${String(attempt ?? 0)}`;
+
+  for (const payload of allPayloads(events, "PROVIDER_CALL_STARTED")) {
+    const p = payload as {
+      callId?: string; role?: string; attempt?: number; providerId?: string;
+      requestedModelId?: string; startedAt?: string;
+    };
+    calls.set(key(p.callId, p.attempt), {
+      callId: p.callId ?? "(unknown)",
+      role: p.role === "executor" || p.role === "reviewer" ? p.role : "unknown",
+      attempt: p.attempt ?? 0,
+      providerId: p.providerId ?? "(unknown)",
+      requestedModelId: p.requestedModelId ?? "(unknown)",
+      // **개시만 있고 종결이 없으면 불확실이다.** 아래 두 루프가 이 값을 덮어쓴다.
+      dispatchState: "dispatched_no_response",
+      status: "unknown",
+      startedAt: p.startedAt ?? record.startedAt,
+    });
+  }
+
   for (const usage of allPayloads(events, "PROVIDER_USAGE")) {
-    const u = usage as { usage?: { inputTokens?: number; outputTokens?: number }; costUsd?: number };
+    const u = usage as {
+      callId?: string; role?: string; attempt?: number; providerId?: string;
+      requestedModelId?: string; resolvedModelId?: string; providerRequestId?: string;
+      usage?: { inputTokens?: number; outputTokens?: number }; costUsd?: number; createdAt?: string;
+    };
     record.inputTokens += u.usage?.inputTokens ?? 0;
     record.outputTokens += u.usage?.outputTokens ?? 0;
     record.costUsd = (record.costUsd ?? 0) + (u.costUsd ?? 0);
     record.providerCallCount += 1;
+
+    const id = key(u.callId, u.attempt);
+    const existing = calls.get(id);
+    const fact: ProviderCallFact = {
+      callId: u.callId ?? existing?.callId ?? "(unknown)",
+      role: u.role === "executor" || u.role === "reviewer" ? u.role : (existing?.role ?? "unknown"),
+      attempt: u.attempt ?? existing?.attempt ?? 0,
+      providerId: u.providerId ?? existing?.providerId ?? "(unknown)",
+      requestedModelId: u.requestedModelId ?? existing?.requestedModelId ?? "(unknown)",
+      // **응답 envelope의 모델 ID다.** 없으면 적지 않는다 — 요청 ID로 채우면 exact-model
+      // 검증이 자기 자신과 비교하게 되어 조용한 대체를 절대 잡지 못한다(§2.8).
+      ...(typeof u.resolvedModelId === "string" ? { providerReportedModelId: u.resolvedModelId } : {}),
+      ...(typeof u.providerRequestId === "string" ? { providerRequestId: u.providerRequestId } : {}),
+      dispatchState: "response_received_with_usage",
+      ...(u.usage?.inputTokens !== undefined ? { inputTokens: u.usage.inputTokens } : {}),
+      ...(u.usage?.outputTokens !== undefined ? { outputTokens: u.usage.outputTokens } : {}),
+      ...(u.costUsd !== undefined ? { costUsd: u.costUsd } : {}),
+      status: "succeeded",
+      startedAt: existing?.startedAt ?? u.createdAt ?? record.startedAt,
+      ...(u.createdAt ? { completedAt: u.createdAt } : {}),
+    };
+    calls.set(id, fact);
   }
+
+  for (const failure of allPayloads(events, "PROVIDER_CALL_FAILED")) {
+    const f = failure as {
+      callId?: string; role?: string; attempt?: number; providerId?: string;
+      requestedModelId?: string; providerReportedModelId?: string; providerRequestId?: string;
+      dispatchState?: string; errorKind?: string;
+      usage?: { inputTokens?: number; outputTokens?: number }; at?: string;
+    };
+    const id = key(f.callId, f.attempt);
+    const existing = calls.get(id);
+    calls.set(id, {
+      callId: f.callId ?? existing?.callId ?? "(unknown)",
+      role: f.role === "executor" || f.role === "reviewer" ? f.role : (existing?.role ?? "unknown"),
+      attempt: f.attempt ?? existing?.attempt ?? 0,
+      providerId: f.providerId ?? existing?.providerId ?? "(unknown)",
+      requestedModelId: f.requestedModelId ?? existing?.requestedModelId ?? "(unknown)",
+      ...(typeof f.providerReportedModelId === "string"
+        ? { providerReportedModelId: f.providerReportedModelId }
+        : {}),
+      ...(typeof f.providerRequestId === "string" ? { providerRequestId: f.providerRequestId } : {}),
+      // 어댑터가 dispatch 사실을 실어 보냈으면 그것을 쓴다. 없으면 **불확실**이 기본이다 —
+      // HTTP 분류만으로 "안 나갔다"를 추론하지 않는다(§2.6).
+      dispatchState: isDispatchState(f.dispatchState) ? f.dispatchState : "dispatched_no_response",
+      ...(f.usage?.inputTokens !== undefined ? { inputTokens: f.usage.inputTokens } : {}),
+      ...(f.usage?.outputTokens !== undefined ? { outputTokens: f.usage.outputTokens } : {}),
+      ...(f.errorKind ? { errorKind: f.errorKind } : {}),
+      status: "failed",
+      startedAt: existing?.startedAt ?? f.at ?? record.startedAt,
+      ...(f.at ? { completedAt: f.at } : {}),
+    });
+  }
+
+  record.providerCalls = [...calls.values()].sort((a, b) =>
+    a.startedAt === b.startedAt ? a.attempt - b.attempt : a.startedAt < b.startedAt ? -1 : 1
+  );
   record.retryCount = allPayloads(events, "PROVIDER_RETRY").length;
 
   const routing = lastPayload(events, "ROUTING_DECIDED") as
@@ -583,6 +853,12 @@ function skippedRecord(
     completedAt: now,
     providerKind: options.fakeScript !== undefined ? "fake" : "real",
     criteriaHash: hash,
+    ...(options.receiptId ? { receiptId: options.receiptId } : {}),
+    ...(options.receiptHash ? { receiptHash: options.receiptHash } : {}),
+    // 이 기록은 host를 띄우지도 않았다. 호출이 없고 이벤트를 읽을 것도 없다는 것이 **사실**이므로
+    // `eventsReadable: true`가 맞다 — 그래야 `not_dispatched`로 판정돼 예약이 정상 해제된다.
+    providerCalls: [],
+    eventsReadable: true,
   };
 }
 

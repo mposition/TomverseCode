@@ -95,3 +95,23 @@ export function armExecutionOrder(selected: readonly ArmId[]): ArmId[] {
   }
   return [...generators, ...replayers];
 }
+
+/**
+ * 이 arm의 역할별 모델 배정 — **배정 규칙의 유일한 구현.**
+ *
+ * Arm B는 공급자가 anthropic 하나뿐이라 라우터가 검수자 독립성 불변식에 따라 reviewer를
+ * 드롭하고, **카드의 reviewer 모델이 executor 자리에 앉는다.** 이 사실을 attestation·비용
+ * 추정·preflight가 각자 다시 적으면 반드시 갈라진다.
+ */
+export function modelForRole(
+  arm: ArmId,
+  role: "executor" | "reviewer",
+  models: { executorModelId: string; reviewerModelId: string }
+): string | undefined {
+  const spec = armSpec(arm);
+  if (role === "executor") {
+    return spec.providers[0] === "anthropic" ? models.reviewerModelId : models.executorModelId;
+  }
+  // 공급자가 하나뿐인 arm에는 reviewer가 없다.
+  return spec.providers.length > 1 ? models.reviewerModelId : undefined;
+}

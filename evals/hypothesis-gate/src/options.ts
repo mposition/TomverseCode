@@ -1,6 +1,6 @@
 import path from "node:path";
 import { ARMS } from "./arms.js";
-import type { Stage } from "./runCard.js";
+import { STAGES, type Stage } from "./stage.js";
 import type { ArmId } from "./types.js";
 
 /**
@@ -47,11 +47,17 @@ export interface CliOptions {
    * 허용하는 순간 그게 기본 사용법이 된다.
    */
   runCard?: string;
-  /** probe evidence 파일 경로. 지정하지 않으면 실행 디렉터리 규약 위치를 본다. */
+  /** probe evidence 파일 경로. 지정하지 않으면 승인 번들의 규약 위치를 본다. */
   probeEvidence?: string;
+  /**
+   * P0 attestation 파일 경로 (§2.5).
+   *
+   * P1 카드가 이 경로를 명령에 실어 주므로, P1 실행은 **실행 직전에** 그 파일을 다시 읽고
+   * 해시·상태·체인을 확인한다. 카드를 만든 뒤 파일이 지워지거나 바뀌었을 수 있고,
+   * 그 사실은 카드 해시로는 드러나지 않는다.
+   */
+  p0Attestation?: string;
 }
-
-const STAGES: readonly Stage[] = Object.freeze(["smoke", "pilot", "confirmatory"]);
 
 export function parseStage(raw: string): Stage {
   const text = raw.trim();
@@ -184,6 +190,9 @@ export function parseArgs(argv: string[], defaultOutput: string): CliOptions {
         break;
       case "--probe-evidence":
         options.probeEvidence = path.resolve(next());
+        break;
+      case "--p0-attestation":
+        options.p0Attestation = path.resolve(next());
         break;
       case "--max-concurrency":
         options.maxConcurrency = parseConcurrency(next());

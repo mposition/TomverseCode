@@ -23,6 +23,13 @@ export type TaskEventType =
   | "VERIFICATION_COMPLETED"
   | "FIX_LOOP_STARTED"
   | "PROVIDER_USAGE"
+  /**
+   * adapter 호출 **직전**. 이것만 있고 terminal(`PROVIDER_USAGE`/`PROVIDER_CALL_FAILED`)이
+   * 없으면 요청이 나갔는지도 과금됐는지도 모른다 — 그 상태의 예약은 해제하지 않는다.
+   */
+  | "PROVIDER_CALL_STARTED"
+  /** 호출 실패. 어댑터가 아는 dispatch 사실(과금 가능성)을 함께 남긴다. */
+  | "PROVIDER_CALL_FAILED"
   | "PROVIDER_RETRY"
   | "TOOL_RETRY"
   | "USER_MESSAGE_RECEIVED"

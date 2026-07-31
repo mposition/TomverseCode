@@ -1,6 +1,13 @@
-import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { artifactHash, verifyArtifactHash } from "./canonical.js";
+import {
+  buildCredentialBinding,
+  credentialBindingMatchesResolved,
+  type ReceiptCredentialBinding,
+  type ResolvedProviderCredential,
+} from "./receipt.js";
 
 /**
  * Probe Evidence (§3) — **"실제로 확인했다"를 다음 단계로 옮기는 증거.**
@@ -24,7 +31,7 @@ import path from "node:path";
  * 끝낼 수 있는" 길이이면서, 카탈로그·계정 상태가 크게 바뀌기 전이라고 볼 수 있는 길이다.
  */
 
-export const PROBE_EVIDENCE_SCHEMA_VERSION = 1;
+export const PROBE_EVIDENCE_SCHEMA_VERSION = 2;
 export const PROBE_EVIDENCE_FILE = "probe-evidence.json";
 
 /** evidence 유효 기간. 짧게 두는 근거는 위 주석 참조. */
@@ -36,7 +43,7 @@ export const PROBE_EVIDENCE_TTL_HOURS = 24;
  * HMAC 입력에 목적을 넣는 이유: 같은 키로 만든 다른 용도의 다이제스트와 이 값이 섞이지 않게 한다.
  * (같은 해시를 다른 문맥에서 재사용하면 한 곳의 유출이 다른 곳의 검증을 통과시킬 수 있다.)
  */
-export const CREDENTIAL_BINDING_PURPOSE = "tomverse/gate-g/probe-credential-binding/v1";
+export const CREDENTIAL_BINDING_PURPOSE = "tomverse/gate-g/probe-credential-binding/v2";
 
 /**
  * 자격증명이 **같은 것인지만** 확인할 수 있는 비가역 binding.
@@ -51,13 +58,7 @@ export const CREDENTIAL_BINDING_PURPOSE = "tomverse/gate-g/probe-credential-bind
  * salt는 비밀이 아니다. 역할은 "같은 키가 다른 evidence에서 같은 다이제스트로 나타나지 않게"
  * 하는 것이다. 다이제스트를 되돌리려면 키를 추측해야 하는데, API 키는 고엔트로피 난수다.
  */
-export interface CredentialBinding {
-  algorithm: "HMAC-SHA256";
-  purpose: string;
-  /** evidence마다 새로 만드는 무작위 salt (hex). 비밀이 아니다. */
-  salt: string;
-  providers: { providerId: string; envName: string; digest: string }[];
-}
+export type CredentialBinding = ReceiptCredentialBinding;
 
 export interface RoleEvidence {
   providerId: string;
@@ -93,94 +94,60 @@ export interface ProbeEvidence {
 // credential binding
 // ---------------------------------------------------------------------------
 
-function digestFor(salt: string, providerId: string, keyValue: string): string {
-  return createHmac("sha256", Buffer.from(salt, "hex"))
-    .update(`${CREDENTIAL_BINDING_PURPOSE}\n${providerId}\n${keyValue}`)
-    .digest("hex");
-}
-
-export interface ProviderCredentialSpec {
-  providerId: string;
-  envName: string;
-}
-
 /**
  * 현재 환경의 자격증명으로 binding을 만든다.
  *
- * 키가 없는 공급자가 있으면 `undefined`를 돌려준다 — binding을 만들 수 없다는 사실을
- * "빈 다이제스트"로 적으면 나중에 "키가 없었는데 통과"가 가능해진다.
+ * **입력이 `env`가 아니라 해석이 끝난 자격증명이다** (§2.10). 예전에는 이 함수가 스스로
+ * `env[envName]`을 읽었고, 그건 어댑터 factory가 읽는 것과 다른 규칙이었다 — 별칭 하나만
+ * 설정한 환경에서 "확인은 통과했는데 실행은 자격증명 없음으로 실패"가 성립했다.
+ * 이제 `resolveCredential`이 고른 이름과 값만 들어온다.
+ *
+ * 자격증명을 하나라도 해석할 수 없으면 호출자가 `undefined`를 넘기고, 그때 binding은
+ * 만들어지지 않는다 — "키가 없다"를 빈 다이제스트로 적으면 나중에 그 상태가 검증을 통과한다.
  */
 export function computeCredentialBinding(
-  specs: readonly ProviderCredentialSpec[],
-  env: NodeJS.ProcessEnv,
+  credentials: readonly ResolvedProviderCredential[] | undefined,
   salt: string = randomBytes(32).toString("hex")
 ): CredentialBinding | undefined {
-  const providers: CredentialBinding["providers"] = [];
-  for (const spec of specs) {
-    const value = (env[spec.envName] ?? "").trim();
-    if (value.length === 0) return undefined;
-    providers.push({ providerId: spec.providerId, envName: spec.envName, digest: digestFor(salt, spec.providerId, value) });
-  }
-  return { algorithm: "HMAC-SHA256", purpose: CREDENTIAL_BINDING_PURPOSE, salt, providers };
+  if (credentials === undefined || credentials.length === 0) return undefined;
+  return buildCredentialBinding(CREDENTIAL_BINDING_PURPOSE, credentials, salt);
 }
 
-/** 지금 환경의 자격증명이 binding을 만들 때와 같은가. */
+/** 지금 손에 있는 자격증명이 binding을 만들 때와 같은가. */
 export function credentialBindingMatches(
   binding: CredentialBinding,
-  env: NodeJS.ProcessEnv
+  credentials: readonly ResolvedProviderCredential[]
 ): { ok: true } | { ok: false; reason: string } {
-  if (binding.algorithm !== "HMAC-SHA256" || binding.purpose !== CREDENTIAL_BINDING_PURPOSE) {
-    return { ok: false, reason: "자격증명 binding의 알고리즘 또는 목적 문자열이 이 코드가 아는 것과 다릅니다" };
+  if (binding.purpose !== CREDENTIAL_BINDING_PURPOSE) {
+    return {
+      ok: false,
+      reason:
+        `자격증명 binding의 목적 문자열이 이 코드가 아는 것과 다릅니다 ` +
+        `(${String(binding.purpose)}) — 다른 용도나 이전 스키마의 binding입니다`,
+    };
   }
-  if (!/^[0-9a-f]{32,}$/.test(binding.salt)) {
-    return { ok: false, reason: "자격증명 binding의 salt 형식이 올바르지 않습니다" };
-  }
-  for (const provider of binding.providers) {
-    const value = (env[provider.envName] ?? "").trim();
-    if (value.length === 0) {
-      return { ok: false, reason: `${provider.providerId} 자격증명(${provider.envName})이 현재 환경에 없습니다` };
-    }
-    const expected = Buffer.from(provider.digest, "hex");
-    const actual = Buffer.from(digestFor(binding.salt, provider.providerId, value), "hex");
-    // 길이가 다르면 timingSafeEqual이 던진다. 형식 오류를 예외로 흘리지 않고 사유로 돌려준다.
-    if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
-      return {
-        ok: false,
-        reason:
-          `${provider.providerId} 자격증명이 probe 당시와 다릅니다 — ` +
-          `그때 확인한 것이 지금 쓰는 키를 보증하지 않으므로 evidence를 쓰지 않습니다`,
-      };
-    }
-  }
-  return { ok: true };
+  const result = credentialBindingMatchesResolved(binding, credentials);
+  if (result.ok) return result;
+  // 문맥을 evidence 쪽 표현으로 바꾼다 — 사용자가 다시 해야 하는 일이 "probe를 다시 돌리기"다.
+  return {
+    ok: false,
+    reason: `${result.reason.replace("승인 당시와", "probe 당시와")} — evidence를 쓰지 않습니다`,
+  };
 }
 
 // ---------------------------------------------------------------------------
 // evidence 생성/검증
 // ---------------------------------------------------------------------------
 
-/** 해시 대상에서 해시 자신을 뺀 나머지. 순서를 고정해 같은 내용이 같은 해시를 낸다. */
-function payloadForHash(evidence: Omit<ProbeEvidence, "evidencePayloadHash">): string {
-  return JSON.stringify({
-    schemaVersion: evidence.schemaVersion,
-    evidenceId: evidence.evidenceId,
-    createdAt: evidence.createdAt,
-    expiresAt: evidence.expiresAt,
-    protocolVersion: evidence.protocolVersion,
-    criteriaHash: evidence.criteriaHash,
-    registrySnapshotHash: evidence.registrySnapshotHash,
-    adapterContractVersion: evidence.adapterContractVersion,
-    executor: evidence.executor,
-    reviewer: evidence.reviewer,
-    approvedProbeLimitUsd: evidence.approvedProbeLimitUsd,
-    cumulativeProbeCostUsd: evidence.cumulativeProbeCostUsd,
-    credentialBinding: evidence.credentialBinding,
-    status: evidence.status,
-  });
-}
-
+/**
+ * evidence 해시 — **해시 필드 자신만 제외한 전체**를 재귀 canonical JSON으로 해시한다.
+ *
+ * 예전에는 필드를 손으로 나열했다. 그 목록에 새 필드를 넣는 것을 잊으면 그 필드가 조용히
+ * 해시 밖으로 빠지고, 그때 검증은 통과하지만 아무것도 보증하지 않는다. 이제 뺄 것이 하나뿐이므로
+ * 잊을 것이 없다.
+ */
 export function evidencePayloadHash(evidence: Omit<ProbeEvidence, "evidencePayloadHash">): string {
-  return createHash("sha256").update(payloadForHash(evidence)).digest("hex").slice(0, 32);
+  return artifactHash(evidence);
 }
 
 export function buildProbeEvidence(input: {
@@ -226,7 +193,11 @@ export interface EvidenceExpectations {
   adapterContractVersion: string;
   executorModelId: string;
   reviewerModelId: string;
-  env: NodeJS.ProcessEnv;
+  /**
+   * 지금 해석된 자격증명. **`env`가 아니다** — 어느 변수를 읽을지 정하는 규칙이 이 파일에
+   * 또 있으면 어댑터 factory와 갈라진다(§2.10).
+   */
+  credentials: readonly ResolvedProviderCredential[];
 }
 
 export type EvidenceVerdict =
@@ -253,21 +224,20 @@ export function validateProbeEvidence(raw: unknown, expect: EvidenceExpectations
   if (evidence.schemaVersion !== PROBE_EVIDENCE_SCHEMA_VERSION) {
     reasons.push(
       `evidence 스키마 버전이 ${String(evidence.schemaVersion)}입니다 (이 코드는 ` +
-        `${PROBE_EVIDENCE_SCHEMA_VERSION}만 압니다) — 모르는 형식을 해석하지 않습니다`
+        `${PROBE_EVIDENCE_SCHEMA_VERSION}만 압니다) — 모르는 형식을 해석하지 않습니다.`
     );
+    // **자동 마이그레이션하지 않는다.** v1 evidence는 중첩 필드가 해시에 들어가지 않던 시절의
+    // 것이라 "해시가 맞다"가 아무것도 보증하지 않는다. 되살리는 대신 다시 확인하게 한다.
+    reasons.push("`npm run gate:g:probe-models`로 evidence를 다시 만드세요 — 이전 형식은 되살리지 않습니다.");
     return fail();
   }
   if (evidence.status !== "VERIFIED") {
     reasons.push(`evidence 상태가 ${String(evidence.status)}입니다 — VERIFIED만 승인 근거가 됩니다`);
   }
 
-  const { evidencePayloadHash: stored, ...rest } = evidence;
-  const recomputed = evidencePayloadHash(rest as Omit<ProbeEvidence, "evidencePayloadHash">);
-  if (stored !== recomputed) {
-    reasons.push(
-      `evidence 해시가 다릅니다 (저장 ${String(stored)} / 재계산 ${recomputed}) — ` +
-        `파일이 수정되었거나 손상되었습니다`
-    );
+  const hashCheck = verifyArtifactHash(evidence, "evidencePayloadHash");
+  if (!hashCheck.ok) {
+    reasons.push(`evidence ${hashCheck.reason}`);
     // 해시가 깨졌으면 아래 필드들을 신뢰할 수 없으므로 여기서 끝낸다.
     return fail();
   }
@@ -320,7 +290,7 @@ export function validateProbeEvidence(raw: unknown, expect: EvidenceExpectations
     reasons.push("evidence에 자격증명 binding이 없습니다");
     return fail();
   }
-  const binding = credentialBindingMatches(evidence.credentialBinding, expect.env);
+  const binding = credentialBindingMatches(evidence.credentialBinding, expect.credentials);
   if (!binding.ok) reasons.push(binding.reason);
 
   if (reasons.length > 0) return fail();

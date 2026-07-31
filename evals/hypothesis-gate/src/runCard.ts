@@ -1,10 +1,27 @@
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { createBudgetLedger } from "@tomverse/sidecar/budget";
 import { ARMS } from "./arms.js";
+import {
+  APPROVALS_DIR,
+  ATTESTATIONS_DIR,
+  CARDS_DIR,
+  EVIDENCE_DIR,
+  artifactPath,
+  loadApprovalArtifactByPath,
+  storeApprovalArtifact,
+  writeApprovalPointer,
+} from "./approvalStore.js";
 import { computeCallBudget, describeCallBudget, type CallBudget } from "./callBudget.js";
+import { artifactHash, verifyArtifactHash } from "./canonical.js";
 import { CRITERIA, criteriaHash } from "./criteria.js";
+import {
+  diffArgv,
+  executionArgv,
+  executionCliArgv,
+  resumeArgv as buildResumeArgv,
+  type ExecutionRequestSpec,
+} from "./executionRequest.js";
 import {
   estimateRecordCost,
   lookupModel,
@@ -17,8 +34,11 @@ import {
 import type { ProbeEvidence } from "./probeEvidence.js";
 import { findSecretLike } from "./records.js";
 import { posixCommand, powerShellCommand } from "./shellQuote.js";
+import { requiresP0Attestation as stageRequiresAttestation, type Stage } from "./stage.js";
 import type { LoadedFixture } from "./manifest.js";
 import type { ArmId } from "./types.js";
+
+export type { Stage } from "./stage.js";
 
 /**
  * Run Card (§4) — **유료 실행의 필수 입력.**
@@ -40,12 +60,17 @@ import type { ArmId } from "./types.js";
  * 결과가 아니므로 성공률을 적을 수 없고, 적으면 지어낸 것이다.
  */
 
-/** 실험 단계. P0와 P1의 기록을 같은 디렉터리에 섞지 않기 위해 stage가 메타에 들어간다. */
-export type Stage = "smoke" | "pilot" | "confirmatory";
-
-export const RUN_CARD_SCHEMA_VERSION = 1;
-export const P0_CARD_FILE = "p0-run-card.json";
-export const P1_CARD_FILE = "p1-run-card.json";
+/**
+ * 카드 스키마 버전.
+ *
+ * 2: 해시가 **재귀 canonical JSON**으로 바뀌었고(§2.1), 카드가 immutable 경로와 근거 아티팩트
+ * 경로를 갖는다(§2.2). v1 카드는 중첩 필드가 해시에 들어가지 않던 시절의 것이므로 되살리지
+ * 않는다 — "해시가 맞다"가 아무것도 보증하지 않는 카드로 유료 실행을 승인할 수는 없다.
+ */
+export const RUN_CARD_SCHEMA_VERSION = 2;
+/** 사람이 최신 카드를 찾을 수 있게 하는 **안내용** 포인터. 승인 근거가 아니다. */
+export const P0_CARD_POINTER_FILE = "p0-run-card.pointer.json";
+export const P1_CARD_POINTER_FILE = "p1-run-card.pointer.json";
 
 /**
  * 카드 유효 기간.
@@ -125,13 +150,26 @@ export interface RunCard {
   /** **이 카드 하나가 쓰는 실행 디렉터리.** P0와 P1은 서로 다른 디렉터리를 쓴다. */
   outputDir: string;
   approvedLimitUsd?: number;
+  /**
+   * 이 카드 자신의 **immutable 경로** (§2.2).
+   *
+   * 카드가 자기 경로를 알아야 하는 이유: `--run-card`로 받은 경로가 이 값과 다르면 거부한다.
+   * 그렇게 하지 않으면 "덮어쓰이는 안내용 사본"을 승인 근거로 쓸 수 있고, 그 사본은 시간에
+   * 따라 내용이 달라진다.
+   */
+  immutableCardPath: string;
+  /** 승인 번들 디렉터리. P0와 P1이 공유한다 — evidence 하나가 두 단계의 근거이기 때문이다. */
+  approvalsDir: string;
   /** 이 카드가 근거로 삼은 probe evidence. 없으면 유료 승인 상태가 되지 않는다. */
   probeEvidenceId?: string;
   probeEvidenceHash?: string;
+  /** 그 evidence의 immutable 경로. 실행 명령이 이 경로를 그대로 쓴다. */
+  probeEvidencePath?: string;
   /** P1은 P0 attestation을 요구한다. */
   requiresP0Attestation: boolean;
   p0AttestationId?: string;
   p0AttestationHash?: string;
+  p0AttestationPath?: string;
   /**
    * 이 카드가 승인하는 **한 단계**. P0와 P1을 한 카드에 넣으면 승인 하나가 두 단계를
    * 덮으므로, "P0가 정상일 때만 P1을 승인한다"는 절차가 카드 수준에서 성립하지 않는다.
@@ -257,6 +295,8 @@ export interface StageCardInput {
   maxConcurrency: number;
   /** **이 단계만의** 실행 디렉터리. P0와 P1이 같은 디렉터리를 쓰면 기록이 섞인다. */
   outputDir: string;
+  /** 승인 번들 디렉터리(`<outputRoot>/approvals`). 카드·evidence·attestation이 여기 산다. */
+  approvalsDir: string;
   /** **이 단계만의** 승인 상한. */
   approvedLimitUsd?: number;
   models: ModelPlan | { blockers: string[]; probeGaps: string[] };
@@ -271,8 +311,8 @@ export interface StageCardInput {
   probeEvidence?: ProbeEvidence;
   /** evidence가 있었지만 검증에 실패한 경우의 사유. */
   probeEvidenceProblems?: string[];
-  /** P1이 요구하는 P0 attestation. */
-  p0Attestation?: { attestationId: string; attestationHash: string };
+  /** P1이 요구하는 P0 attestation. 경로까지 받는다 — 실행 명령이 그것을 그대로 쓴다. */
+  p0Attestation?: { attestationId: string; attestationHash: string; path: string };
   p0AttestationProblems?: string[];
   ttlHours?: number;
   cardId?: string;
@@ -341,7 +381,7 @@ export function buildStageCard(input: StageCardInput): RunCard {
 
   const evidenceProblems = [...(input.probeEvidenceProblems ?? [])];
   const p0Problems = [...(input.p0AttestationProblems ?? [])];
-  const requiresP0Attestation = input.stage !== "smoke";
+  const requiresP0Attestation = stageRequiresAttestation(input.stage);
 
   // ---- 상태 결정 ----
   // 순서에 의미가 있다: 앞의 것이 해결되지 않으면 뒤의 것을 확인해도 무의미하다.
@@ -359,8 +399,33 @@ export function buildStageCard(input: StageCardInput): RunCard {
   const ttl = input.ttlHours ?? RUN_CARD_TTL_HOURS;
   const expiresAt = new Date(new Date(input.createdAt).getTime() + ttl * 3_600_000).toISOString();
   const cardId = input.cardId ?? `card-${input.stage}-${randomUUID()}`;
-  const runArgv = stageArgv(input);
-  const resumeArgv = [...runArgv, "--resume"];
+
+  // **경로가 먼저 정해져야 argv를 만들 수 있다.** 카드가 출력하는 명령은 immutable 경로를
+  // 가리켜야 하고, 그 경로는 cardId에서 나온다.
+  const immutableCardPath = artifactPath(path.join(input.approvalsDir, CARDS_DIR), cardId);
+  const evidencePath = input.probeEvidence
+    ? artifactPath(path.join(input.approvalsDir, EVIDENCE_DIR), input.probeEvidence.evidenceId)
+    : undefined;
+
+  const spec: ExecutionRequestSpec = {
+    stage: input.stage,
+    fixtureIds: input.fixtures.map((f) => f.manifest.fixtureId),
+    arms: [...input.arms],
+    repetitions: input.repetitions,
+    maxConcurrency: input.maxConcurrency,
+    seed: input.seed,
+    outputDir: input.outputDir,
+    ...(input.approvedLimitUsd !== undefined ? { approvedLimitUsd: input.approvedLimitUsd } : {}),
+    // 모델 계획이 없는 카드는 어차피 BLOCKED이지만, argv에는 사실을 적는다 — "(미확정)"이
+    // 들어간 명령은 그대로 실행되지 않으므로 조용히 기본값으로 도는 일이 없다.
+    executorModelId: models?.executor.modelId ?? "(미확정)",
+    reviewerModelId: models?.reviewer.modelId ?? "(미확정)",
+    runCardPath: immutableCardPath,
+    probeEvidencePath: evidencePath ?? "(probe evidence 없음)",
+    ...(input.p0Attestation ? { p0AttestationPath: input.p0Attestation.path } : {}),
+  };
+  const runArgv = executionArgv(spec);
+  const resumeArgvValue = buildResumeArgv(spec);
 
   const withoutHash: Omit<RunCard, "cardHash"> = {
     cardSchemaVersion: RUN_CARD_SCHEMA_VERSION,
@@ -398,15 +463,22 @@ export function buildStageCard(input: StageCardInput): RunCard {
     maxConcurrency: input.maxConcurrency,
     outputDir: input.outputDir,
     ...(input.approvedLimitUsd !== undefined ? { approvedLimitUsd: input.approvedLimitUsd } : {}),
-    ...(input.probeEvidence
+    immutableCardPath,
+    approvalsDir: input.approvalsDir,
+    ...(input.probeEvidence && evidencePath
       ? {
           probeEvidenceId: input.probeEvidence.evidenceId,
           probeEvidenceHash: input.probeEvidence.evidencePayloadHash,
+          probeEvidencePath: evidencePath,
         }
       : {}),
     requiresP0Attestation,
     ...(input.p0Attestation
-      ? { p0AttestationId: input.p0Attestation.attestationId, p0AttestationHash: input.p0Attestation.attestationHash }
+      ? {
+          p0AttestationId: input.p0Attestation.attestationId,
+          p0AttestationHash: input.p0Attestation.attestationHash,
+          p0AttestationPath: input.p0Attestation.path,
+        }
       : {}),
     stage,
     createdAt: input.createdAt,
@@ -416,8 +488,8 @@ export function buildStageCard(input: StageCardInput): RunCard {
     runArgv,
     runCommandPowerShell: powerShellCommand(runArgv),
     runCommandPosix: posixCommand(runArgv),
-    resumeArgv,
-    resumeCommandPowerShell: powerShellCommand(resumeArgv),
+    resumeArgv: resumeArgvValue,
+    resumeCommandPowerShell: powerShellCommand(resumeArgvValue),
     ...(input.prerequisites && input.prerequisites.length > 0 ? { prerequisites: [...input.prerequisites] } : {}),
   };
 
@@ -431,10 +503,17 @@ export function buildStageCard(input: StageCardInput): RunCard {
   return card;
 }
 
-/** 카드 해시. 해시 자신을 제외한 전체를 안정된 순서로 직렬화한다. */
+/**
+ * 카드 해시 — 해시 자신을 제외한 **전체**를 재귀 canonical JSON으로 해시한다 (§2.1).
+ *
+ * 예전 구현은 `JSON.stringify(card, Object.keys(card).sort())`였다. array replacer는
+ * property whitelist이고 그 whitelist가 모든 깊이에 적용되므로, **중첩 객체가 전부 `{}`로
+ * 직렬화됐다.** 즉 `models.executor.modelId`, `stage.fixtureIds`, `stage.callBudget`,
+ * `fixtureHashes[*].hash`, `arms[*].providers`, `readiness` 내부를 아무리 바꿔도 cardHash가
+ * 그대로였다 — 해시가 지키던 것은 최상위 스칼라뿐이었다. 자세한 근거는 `canonical.ts`.
+ */
 export function runCardHash(card: Omit<RunCard, "cardHash">): string {
-  const canonical = JSON.stringify(card, Object.keys(card).sort());
-  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
+  return artifactHash(card);
 }
 
 function isPlan(value: ModelPlan | { blockers: string[]; probeGaps: string[] }): value is ModelPlan {
@@ -470,35 +549,15 @@ function applyEvidence(plan: ModelPlan, evidence: ProbeEvidence | undefined): Mo
   return { ...plan, readiness, probeGaps, blockers: [...new Set([...plan.blockers, ...blockers])] };
 }
 
-/** 단계 → 실행 스크립트. `smoke`도 pilot 스크립트를 쓰지만 `--stage`로 구별된다. */
-function scriptFor(stage: Stage): string {
-  return stage === "confirmatory" ? "gate:g:run" : "gate:g:pilot";
-}
-
 /**
- * 이 카드를 승인했을 때 실제로 돌릴 인자 **배열**.
+ * 안내용 포인터 파일 이름.
  *
- * 문자열이 아니라 배열이 정본인 이유: 실행 검증이 문자열을 다시 파싱하면 인용 규칙을 두 번
- * 구현하게 되고, 그 둘이 갈라지면 "카드와 실행이 같다"는 검증이 거짓이 된다.
+ * **승인 근거가 아니다** — 이 파일은 덮어쓰이므로 시간에 따라 내용이 달라진다. 승인의 대상이
+ * 시간에 따라 달라지면 "이것을 승인했다"는 말이 성립하지 않는다. 그래서 포인터는 Run Card
+ * 형태가 아니고(`kind: "approval-pointer"`), 실수로 `--run-card`에 넘겨도 카드로 해석되지 않는다.
  */
-function stageArgv(input: StageCardInput): string[] {
-  const argv = ["npm", "run", scriptFor(input.stage), "--", "--stage", input.stage];
-  // 전체 fixture가 아닌 단계는 목록을 명시해야 같은 계획이 재현된다.
-  if (input.stage === "smoke") {
-    argv.push("--fixtures", input.fixtures.map((f) => f.manifest.fixtureId).join(","));
-  }
-  argv.push("--arms", [...input.arms].join(","));
-  argv.push("--repetitions", String(input.repetitions));
-  argv.push("--max-concurrency", String(input.maxConcurrency));
-  argv.push("--seed", String(input.seed));
-  argv.push("--output", input.outputDir);
-  argv.push("--max-cost-usd", input.approvedLimitUsd === undefined ? "<이 단계의 승인 금액>" : String(input.approvedLimitUsd));
-  argv.push("--run-card", path.join(input.outputDir, cardFileFor(input.stage)));
-  return argv;
-}
-
-export function cardFileFor(stage: Stage): string {
-  return stage === "smoke" ? P0_CARD_FILE : P1_CARD_FILE;
+export function cardPointerFileFor(stage: Stage): string {
+  return stage === "smoke" ? P0_CARD_POINTER_FILE : P1_CARD_POINTER_FILE;
 }
 
 function describeNextAction(status: CardStatus, stage: Stage): string {
@@ -542,14 +601,18 @@ export function buildStagedCards(input: {
   credentialsPresent: boolean;
   probeEvidence?: ProbeEvidence;
   probeEvidenceProblems?: string[];
-  p0Attestation?: { attestationId: string; attestationHash: string };
+  p0Attestation?: { attestationId: string; attestationHash: string; path: string };
   p0AttestationProblems?: string[];
   /** 경로 결합 — 테스트가 플랫폼과 무관하게 검증할 수 있어야 한다. */
   joinPath?: (a: string, b: string) => string;
   ttlHours?: number;
 }): { p0: RunCard; p1: RunCard } {
   const join = input.joinPath ?? ((a: string, b: string): string => `${a}/${b}`);
+  // **승인 번들은 두 단계가 공유한다** — evidence 하나가 P0와 P1의 근거이고, P1 카드가 P0
+  // attestation을 가리킨다. 단계별 실행 디렉터리는 그 아래가 아니라 형제로 둔다.
+  const approvalsDir = join(input.outputRoot, APPROVALS_DIR);
   const common = {
+    approvalsDir,
     arms: input.arms,
     seed: input.seed,
     maxConcurrency: input.maxConcurrency,
@@ -594,61 +657,110 @@ export function buildStagedCards(input: {
 // 저장과 검증
 // ---------------------------------------------------------------------------
 
-export function runCardPath(outputDir: string, stage: Stage): string {
-  return path.join(outputDir, cardFileFor(stage));
-}
-
-export function writeRunCard(card: RunCard): string {
-  mkdirSync(card.outputDir, { recursive: true });
-  const file = runCardPath(card.outputDir, card.stage.stage);
-  writeFileSync(file, `${JSON.stringify(card, null, 2)}\n`);
-  return file;
+/**
+ * 카드를 **immutable 번들에 저장하고** 안내용 포인터를 갱신한다 (§2.2).
+ *
+ * 같은 cardId에 다른 내용을 쓰려 하면 `ArtifactConflictError`가 올라간다 — 이미 실행이 그
+ * 카드를 근거로 삼았을 수 있으므로 조용히 덮어쓰지 않는다.
+ */
+export function writeRunCard(card: RunCard): { cardFile: string; pointerFile: string; created: boolean } {
+  const stored = storeApprovalArtifact(path.join(card.approvalsDir, CARDS_DIR), card.cardId, card);
+  const pointerFile = writeApprovalPointer(path.join(card.outputDir, cardPointerFileFor(card.stage.stage)), {
+    kind: "approval-pointer",
+    note:
+      "이 파일은 **안내용**입니다. 승인 근거는 immutablePath의 파일이며, --run-card에는 그 경로를 " +
+      "넘기세요. 이 포인터는 plan-pilot을 다시 돌릴 때마다 갱신됩니다.",
+    stage: card.stage.stage,
+    artifactId: card.cardId,
+    artifactHash: card.cardHash,
+    immutablePath: card.immutableCardPath,
+    updatedAt: card.createdAt,
+  });
+  return { cardFile: stored.file, pointerFile, created: stored.created };
 }
 
 export type CardLoad =
   | { ok: true; card: RunCard }
   | { ok: false; reasons: string[] };
 
+/**
+ * 카드를 읽고 **형식·버전·해시·경로**를 확인한다.
+ *
+ * 경로까지 보는 이유(§2.2): 카드는 자기 immutable 경로를 알고 있고, 그와 다른 파일에서 읽힌
+ * 카드는 사본이다. 사본은 덮어쓰일 수 있으므로 승인 근거가 되지 못한다.
+ */
 export function loadRunCard(file: string): CardLoad {
-  if (!existsSync(file)) return { ok: false, reasons: [`Run Card 파일이 없습니다: ${file}`] };
-  let raw: unknown;
-  try {
-    raw = JSON.parse(readFileSync(file, "utf8"));
-  } catch (error) {
-    return { ok: false, reasons: [`Run Card를 읽을 수 없습니다: ${String(error).slice(0, 200)}`] };
-  }
+  const loaded = loadApprovalArtifactByPath(file);
+  if (!loaded.found) return { ok: false, reasons: [loaded.reason] };
+  const raw = loaded.raw;
   if (typeof raw !== "object" || raw === null) return { ok: false, reasons: ["Run Card가 객체가 아닙니다"] };
+
+  if ((raw as { kind?: unknown }).kind === "approval-pointer") {
+    const pointer = raw as { immutablePath?: string };
+    return {
+      ok: false,
+      reasons: [
+        `이 파일은 승인 근거가 아니라 **안내용 포인터**입니다: ${file}`,
+        `승인에 쓰는 immutable 카드 경로: ${pointer.immutablePath ?? "(포인터에 경로가 없습니다)"}`,
+      ],
+    };
+  }
+
   const card = raw as RunCard;
   if (card.cardSchemaVersion !== RUN_CARD_SCHEMA_VERSION) {
     return {
       ok: false,
       reasons: [
         `Run Card 스키마 버전이 ${String(card.cardSchemaVersion)}입니다 (이 코드는 ` +
-          `${RUN_CARD_SCHEMA_VERSION}만 압니다) — 모르는 형식을 해석하지 않습니다`,
+          `${RUN_CARD_SCHEMA_VERSION}만 압니다) — 모르는 형식을 해석하지 않습니다.`,
+        "`npm run gate:g:plan-pilot`으로 카드를 다시 만드세요. 이전 형식은 되살리지 않습니다 — " +
+          "v1 해시는 중첩 필드를 덮지 않았으므로 '해시가 맞다'가 아무것도 보증하지 않습니다.",
       ],
     };
   }
-  const { cardHash, ...rest } = card;
-  const recomputed = runCardHash(rest as Omit<RunCard, "cardHash">);
-  if (cardHash !== recomputed) {
+
+  const hashCheck = verifyArtifactHash(card, "cardHash");
+  if (!hashCheck.ok) return { ok: false, reasons: [`Run Card ${hashCheck.reason}`] };
+
+  if (typeof card.immutableCardPath !== "string" || card.immutableCardPath.length === 0) {
+    return { ok: false, reasons: ["Run Card에 immutable 경로가 없습니다 — 승인 번들 밖에서 만들어진 카드입니다"] };
+  }
+  if (path.resolve(card.immutableCardPath) !== path.resolve(file)) {
     return {
       ok: false,
-      reasons: [`Run Card 해시가 다릅니다 (저장 ${String(cardHash)} / 재계산 ${recomputed}) — 파일이 수정되었습니다`],
+      reasons: [
+        `이 카드는 다른 경로에서 왔습니다 (카드가 기록한 경로 ${card.immutableCardPath} / 읽은 경로 ${file}).`,
+        "사본은 덮어쓰일 수 있으므로 승인 근거가 되지 못합니다 — 카드가 기록한 경로를 그대로 쓰세요.",
+      ],
     };
   }
   return { ok: true, card };
 }
 
+/** 실행 직전에 확인하는 fixture 사실 — id뿐 아니라 **현재 내용 해시**까지 본다. */
+export interface RequestFixture {
+  fixtureId: string;
+  category: string;
+  language: string;
+  hash: string;
+}
+
 export interface CardExecutionRequest {
   stage: Stage;
   outputDir: string;
-  fixtureIds: string[];
+  /** **실행 직전의 현재 fixture 사실.** id만 비교하면 내용이 바뀐 fixture로 실행된다(§2.4). */
+  fixtures: RequestFixture[];
   arms: ArmId[];
   repetitions: number;
+  maxConcurrency: number;
   seed: number;
   maxCostUsd?: number;
   executorModelId: string;
   reviewerModelId: string;
+  /** 이 실행에 넘긴 카드/evidence/attestation 경로. 카드가 기록한 것과 같아야 한다. */
+  runCardPath: string;
+  probeEvidencePath: string;
+  p0AttestationPath?: string;
   now: string;
 }
 
@@ -664,6 +776,13 @@ export type CardGateVerdict =
  * 카드만 보면 사용자가 카드와 다른 인수를 주고 실행할 수 있고, 인수만 보면 승인이 무의미하다.
  * 둘이 **같아야** 승인이 실행을 설명한다. 다르면 어느 쪽이 사용자 의도인지 코드가 알 수 없으므로
  * 거부하고, 사용자가 카드를 다시 만들거나 인수를 맞추게 한다.
+ *
+ * # 왜 argv를 통째로 비교하는가 (§2.9)
+ *
+ * 필드를 하나씩 비교하면 **새 축을 추가할 때 비교를 빠뜨린다.** 실제로 모델 override와
+ * evidence 경로가 그렇게 빠져 있었고, 그래서 카드가 출력한 명령이 그 카드의 검증을 통과하지
+ * 못하는 상태가 됐다. 이제 카드를 만든 것과 같은 생성기로 요청 argv를 만들고 **배열을 비교**한다 —
+ * 새 플래그를 추가하면 자동으로 비교 대상에 들어간다.
  */
 export function authorizeRunCard(card: RunCard, request: CardExecutionRequest): CardGateVerdict {
   const reasons: string[] = [];
@@ -676,12 +795,6 @@ export function authorizeRunCard(card: RunCard, request: CardExecutionRequest): 
   if (card.expiresAt <= request.now) {
     reasons.push(`Run Card가 만료되었습니다 (만료 ${card.expiresAt}, 현재 ${request.now}) — 다시 만드세요`);
   }
-  if (card.stage.stage !== request.stage) {
-    reasons.push(`단계가 다릅니다 (카드 ${card.stage.stage} / 요청 ${request.stage})`);
-  }
-  if (card.outputDir !== request.outputDir) {
-    reasons.push(`출력 디렉터리가 다릅니다 (카드 ${card.outputDir} / 요청 ${request.outputDir})`);
-  }
   if (card.protocolVersion !== CRITERIA.protocolVersion) {
     reasons.push(`protocol version이 다릅니다 (카드 ${card.protocolVersion} / 현재 ${CRITERIA.protocolVersion})`);
   }
@@ -689,40 +802,62 @@ export function authorizeRunCard(card: RunCard, request: CardExecutionRequest): 
     reasons.push(`판정 기준 해시가 다릅니다 (카드 ${card.criteriaHash} / 현재 ${criteriaHash()})`);
   }
 
-  const cardFixtures = [...card.stage.fixtureIds].sort();
-  const wanted = [...request.fixtureIds].sort();
-  if (JSON.stringify(cardFixtures) !== JSON.stringify(wanted)) {
-    reasons.push(`fixture 집합이 다릅니다 (카드 ${cardFixtures.length}개 / 요청 ${wanted.length}개)`);
-  }
-  if (JSON.stringify([...card.stage.arms].sort()) !== JSON.stringify([...request.arms].sort())) {
-    reasons.push(`arm 집합이 다릅니다 (카드 ${card.stage.arms.join(",")} / 요청 ${request.arms.join(",")})`);
-  }
-  if (card.stage.repetitions !== request.repetitions) {
-    reasons.push(`반복 횟수가 다릅니다 (카드 ${card.stage.repetitions} / 요청 ${request.repetitions})`);
-  }
-  if (card.seed !== request.seed) {
-    reasons.push(`seed가 다릅니다 (카드 ${card.seed} / 요청 ${request.seed})`);
-  }
-  if (card.approvedLimitUsd !== request.maxCostUsd) {
-    reasons.push(
-      `승인 상한이 다릅니다 (카드 $${String(card.approvedLimitUsd)} / 요청 $${String(request.maxCostUsd)}) — ` +
-        `카드가 승인한 금액과 다른 금액으로 실행하지 않습니다`
-    );
-  }
-  if (card.models) {
-    if (card.models.executor.modelId !== request.executorModelId) {
-      reasons.push(`executor 모델이 다릅니다 (카드 ${card.models.executor.modelId} / 요청 ${request.executorModelId})`);
+  // ---- 실행 인자 전체 비교 ----
+  const requestSpec: ExecutionRequestSpec = {
+    stage: request.stage,
+    fixtureIds: request.fixtures.map((f) => f.fixtureId),
+    arms: [...request.arms],
+    repetitions: request.repetitions,
+    maxConcurrency: request.maxConcurrency,
+    seed: request.seed,
+    outputDir: request.outputDir,
+    ...(request.maxCostUsd !== undefined ? { approvedLimitUsd: request.maxCostUsd } : {}),
+    executorModelId: request.executorModelId,
+    reviewerModelId: request.reviewerModelId,
+    runCardPath: request.runCardPath,
+    probeEvidencePath: request.probeEvidencePath,
+    ...(request.p0AttestationPath !== undefined ? { p0AttestationPath: request.p0AttestationPath } : {}),
+  };
+  const cardCli = card.runArgv.slice(card.runArgv.indexOf("--") + 1);
+  const differences = diffArgv(cardCli, executionCliArgv(requestSpec));
+  for (const difference of differences) reasons.push(difference);
+
+  // ---- 현재 fixture 내용 (§2.4) ----
+  // id 집합만 비교하면 **같은 id인데 내용이 바뀐 fixture**로 실행된다. 그러면 카드가 승인한
+  // 실험과 실제로 도는 실험이 다르고, attestation은 그 차이를 볼 수 없다.
+  const cardFixtures = new Map(card.fixtureHashes.map((f) => [f.fixtureId, f]));
+  for (const fixture of request.fixtures) {
+    const known = cardFixtures.get(fixture.fixtureId);
+    if (!known) {
+      reasons.push(`fixture ${fixture.fixtureId}는 이 카드에 없습니다`);
+      continue;
     }
-    if (card.models.reviewer.modelId !== request.reviewerModelId) {
-      reasons.push(`reviewer 모델이 다릅니다 (카드 ${card.models.reviewer.modelId} / 요청 ${request.reviewerModelId})`);
+    if (known.hash !== fixture.hash) {
+      reasons.push(
+        `fixture ${fixture.fixtureId}의 **내용이 바뀌었습니다** (카드 ${known.hash} / 현재 ${fixture.hash}) — ` +
+          `카드가 승인한 것과 다른 실험이므로 호출을 시작하지 않습니다`
+      );
     }
-  } else {
+    if (known.category !== fixture.category || known.language !== fixture.language) {
+      reasons.push(
+        `fixture ${fixture.fixtureId}의 층화 사실이 다릅니다 ` +
+          `(카드 ${known.category}/${known.language} / 현재 ${fixture.category}/${fixture.language})`
+      );
+    }
+  }
+  for (const id of cardFixtures.keys()) {
+    if (!request.fixtures.some((f) => f.fixtureId === id)) {
+      reasons.push(`카드의 fixture ${id}가 이번 실행 요청에 없습니다`);
+    }
+  }
+
+  if (!card.models) {
     reasons.push("Run Card에 모델 계획이 없습니다 — 무엇을 측정하는지 확정되지 않은 카드로 유료 실행하지 않습니다");
   }
-  if (!card.probeEvidenceId || !card.probeEvidenceHash) {
+  if (!card.probeEvidenceId || !card.probeEvidenceHash || !card.probeEvidencePath) {
     reasons.push("Run Card에 probe evidence가 연결되어 있지 않습니다 — 실제 확인 없이 유료 실행하지 않습니다");
   }
-  if (card.requiresP0Attestation && (!card.p0AttestationId || !card.p0AttestationHash)) {
+  if (card.requiresP0Attestation && (!card.p0AttestationId || !card.p0AttestationHash || !card.p0AttestationPath)) {
     reasons.push("이 단계는 P0 attestation을 요구하는데 카드에 연결되어 있지 않습니다");
   }
 

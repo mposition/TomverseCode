@@ -9,7 +9,7 @@ import {
   type DispatchState,
 } from "@tomverse/sidecar/budget";
 import { providerModelIdAccepted } from "@tomverse/sidecar/registry";
-import { redactSecrets } from "@tomverse/sidecar/providers";
+import { redactSecrets, resolveCredential } from "@tomverse/sidecar/providers";
 import type { ModelEntry, TokenUsage } from "@tomverse/protocol";
 import { withLiveProbe, type ModelReadiness } from "./models.js";
 import {
@@ -19,6 +19,7 @@ import {
   type ProbeEvidence,
   type RoleEvidence,
 } from "./probeEvidence.js";
+import type { ResolvedProviderCredential } from "./receipt.js";
 import { findSecretLike } from "./records.js";
 
 /**
@@ -648,11 +649,37 @@ export function renderProbeSummary(summary: ProbeSummary): string[] {
   return lines;
 }
 
-/** 자격증명 binding을 만든다. 키가 하나라도 없으면 undefined — 그게 곧 probe 불가다. */
+/**
+ * 이 역할들이 쓰는 공급자 자격증명을 **공용 resolver로** 해석한다 (§2.10).
+ *
+ * 예전에는 `env[entry.apiKeyEnvName]`을 직접 읽었고, 그건 preflight가 인정하던 별칭을 몰랐다.
+ * 별칭 하나만 설정된 환경에서 "preflight는 있다고 하는데 binding은 못 만든다"가 성립했고,
+ * 두 변수에 다른 키가 있으면 어느 것으로 확인했는지 알 수 없었다.
+ */
+export function resolveRoleCredentials(
+  roles: readonly { entry: ModelEntry }[],
+  env: NodeJS.ProcessEnv
+): { ok: true; credentials: ResolvedProviderCredential[] } | { ok: false; reasons: string[] } {
+  const byProvider = new Map(roles.map((r) => [r.entry.providerId, r.entry.apiKeyEnvName]));
+  const credentials: ResolvedProviderCredential[] = [];
+  const reasons: string[] = [];
+  for (const [providerId, envName] of byProvider) {
+    const resolved = resolveCredential(providerId, envName, env);
+    if (!resolved.ok) {
+      reasons.push(resolved.reason);
+      continue;
+    }
+    credentials.push({ providerId, envName: resolved.envName, value: resolved.value });
+  }
+  if (reasons.length > 0) return { ok: false, reasons };
+  return { ok: true, credentials };
+}
+
+/** 자격증명 binding을 만든다. 해석할 수 없는 공급자가 있으면 undefined — 그게 곧 probe 불가다. */
 export function bindingForRoles(
   roles: readonly { entry: ModelEntry }[],
   env: NodeJS.ProcessEnv
 ): CredentialBinding | undefined {
-  const specs = [...new Map(roles.map((r) => [r.entry.providerId, { providerId: r.entry.providerId, envName: r.entry.apiKeyEnvName }])).values()];
-  return computeCredentialBinding(specs, env);
+  const resolved = resolveRoleCredentials(roles, env);
+  return resolved.ok ? computeCredentialBinding(resolved.credentials) : undefined;
 }

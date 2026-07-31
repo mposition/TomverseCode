@@ -1,4 +1,5 @@
 import { prepareMsvcEnv, type MsvcResult } from "@tomverse/toolchain";
+import { credentialUsable, resolveCredential } from "@tomverse/sidecar/providers";
 import { computeCallBudget, describeCallBudget } from "./callBudget.js";
 import { artifactsPresent, REPO_ROOT } from "./host.js";
 import { CRITERIA, criteriaHash, describeCriteria } from "./criteria.js";
@@ -40,15 +41,41 @@ export interface PreflightReport {
   blockers: string[];
 }
 
-const PROVIDER_ENV: { providerId: string; envNames: string[] }[] = [
-  { providerId: "openai", envNames: ["OPENAI_API_KEY", "TOMVERSE_OPENAI_API_KEY"] },
-  { providerId: "anthropic", envNames: ["ANTHROPIC_API_KEY", "TOMVERSE_ANTHROPIC_API_KEY"] },
-];
+/**
+ * 공급자별 정본 환경변수 이름 — Model Registry의 `apiKeyEnvName`과 같아야 한다.
+ *
+ * 별칭(`TOMVERSE_` 접두)은 여기서 나열하지 않는다. 그 규칙은 `resolveCredential` 하나에만 있다.
+ */
+const PROVIDER_PRIMARY_ENV: Record<string, string> = {
+  openai: "OPENAI_API_KEY",
+  anthropic: "ANTHROPIC_API_KEY",
+};
 
-export function credentialPresent(providerId: string): boolean {
-  const entry = PROVIDER_ENV.find((p) => p.providerId === providerId);
-  if (!entry) return false;
-  return entry.envNames.some((name) => (process.env[name] ?? "").trim().length > 0);
+/**
+ * 자격증명을 **쓸 수 있는 상태인가** — 값은 읽지 않는다.
+ *
+ * # 무엇을 고쳤나 (§2.10)
+ *
+ * 예전에는 이 함수가 자체 별칭 목록을 갖고 `some(name => env[name])`으로 판정했다. 어댑터
+ * factory는 레지스트리 이름 하나만 읽었으므로, 별칭만 설정한 환경에서 **"자격증명 있음"으로
+ * 승인 카드가 나오는데 실행은 `MissingCredentialError`로 죽었다.** 그리고 두 변수에 다른 키가
+ * 있으면 어느 것으로 확인했는지 알 수 없었다.
+ *
+ * 이제 factory와 **같은 resolver**를 쓴다. 별칭 충돌은 `false`다 — "있지만 쓸 수 없다"를
+ * "있다"로 보고하면 실행되지 않을 계획을 승인 가능으로 표시하게 된다.
+ */
+export function credentialPresent(providerId: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const primary = PROVIDER_PRIMARY_ENV[providerId];
+  if (primary === undefined) return false;
+  return credentialUsable(providerId, primary, env);
+}
+
+/** 왜 쓸 수 없는지 — 없음과 충돌은 사용자가 해야 하는 일이 다르다. */
+export function credentialProblem(providerId: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const primary = PROVIDER_PRIMARY_ENV[providerId];
+  if (primary === undefined) return `${providerId}: 이 하네스가 아는 공급자가 아닙니다`;
+  const resolved = resolveCredential(providerId, primary, env);
+  return resolved.ok ? undefined : resolved.reason;
 }
 
 /**
@@ -126,8 +153,11 @@ export function preflight(input: PreflightInput): PreflightReport {
     !input.usingFakeProvider &&
     !(nativeFixtures > 0 && msvc.kind === "unavailable");
   if (!input.usingFakeProvider) {
-    if (!openai) blockers.push("OPENAI_API_KEY가 없습니다 — Arm A/C/D를 실행할 수 없습니다");
-    if (!anthropic) blockers.push("ANTHROPIC_API_KEY가 없습니다 — Arm B/C/D를 실행할 수 없습니다");
+    // 이유를 그대로 옮긴다 — "없음"과 "별칭 충돌"은 사용자가 해야 하는 일이 다르다(§2.10).
+    if (!openai) blockers.push(`${credentialProblem("openai") ?? "openai 자격증명 문제"} — Arm A/C/D를 실행할 수 없습니다`);
+    if (!anthropic) {
+      blockers.push(`${credentialProblem("anthropic") ?? "anthropic 자격증명 문제"} — Arm B/C/D를 실행할 수 없습니다`);
+    }
   }
 
   return { ok: blockers.length === 0, canRunRealExperiment, lines, blockers };

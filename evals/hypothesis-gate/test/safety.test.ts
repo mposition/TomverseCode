@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,9 +14,20 @@ import {
   pricingIsUsable,
   validateApprovedLimit,
   type BudgetEvent,
+  type DispatchState,
   type Settlement,
 } from "@tomverse/sidecar/budget";
-import { containsSecretLike, ProviderCallFailure, redactSecrets } from "@tomverse/sidecar/providers";
+import {
+  attemptFacts,
+  callWithRetry,
+  containsSecretLike,
+  createAdapter,
+  MissingCredentialError,
+  ProviderCallFailed,
+  ProviderCallFailure,
+  redactSecrets,
+  resolveCredential,
+} from "@tomverse/sidecar/providers";
 import type { ModelEntry } from "@tomverse/protocol";
 import {
   analyzeBudgetEvents,
@@ -26,11 +37,12 @@ import {
   readBudgetEvents,
   reconcileBudget,
   recoverSpendFromRecords,
+  renderBudgetStatus,
 } from "../src/budgetRecovery.js";
-import { BUILTIN_MODELS, ModelRegistry } from "@tomverse/sidecar/registry";
+import { BUILTIN_MODELS, ModelRegistry, providerModelIdAccepted } from "@tomverse/sidecar/registry";
 import { computeCallBudget } from "../src/callBudget.js";
 import { criteriaHash, CRITERIA } from "../src/criteria.js";
-import { attestP0, validateP0Attestation } from "../src/p0Attestation.js";
+import { attestP0, validateP0Attestation, type AttestationInput } from "../src/p0Attestation.js";
 import {
   buildProbeEvidence,
   computeCredentialBinding,
@@ -40,8 +52,29 @@ import {
   type ProbeEvidence,
   type RoleEvidence,
 } from "../src/probeEvidence.js";
+import {
+  buildCredentialBinding,
+  buildExecutionReceipt,
+  credentialBindingMatchesResolved,
+  credentialDigest,
+  factsOf,
+  readExecutionReceipts,
+  RECEIPT_CREDENTIAL_PURPOSE,
+  reuseOrConflict,
+  type ExecutionAuthorizationReceipt,
+  type ReceiptFacts,
+  type ResolvedProviderCredential,
+} from "../src/receipt.js";
+import {
+  ArtifactConflictError,
+  approvalPaths,
+  loadApprovalArtifactByPath,
+  storeApprovalArtifact,
+} from "../src/approvalStore.js";
+import { artifactHash, canonicalJson, CanonicalJsonError, verifyArtifactHash } from "../src/canonical.js";
+import { diffArgv, executionArgv, executionCliArgv } from "../src/executionRequest.js";
 import { createAdapterProbeTransport } from "../src/probeTransport.js";
-import { preflight } from "../src/preflight.js";
+import { credentialPresent, credentialProblem, preflight } from "../src/preflight.js";
 import { quotePowerShellArg } from "../src/shellQuote.js";
 import { loadAllFixtures, listFixtureIds, type LoadedFixture } from "../src/manifest.js";
 import {
@@ -54,6 +87,7 @@ import {
   registryReadiness,
   withCredentialPresence,
   type ModelReadiness,
+  lookupModel,
 } from "../src/models.js";
 import {
   probeModels,
@@ -64,7 +98,7 @@ import {
   type ProbeTransport,
   type RoleProbeOutcome,
 } from "../src/probeModels.js";
-import { ARMS } from "../src/arms.js";
+import { ARMS, modelForRole } from "../src/arms.js";
 import { OptionError, parseArgs, parseConcurrency, parseCostLimit, requireCostLimitForPaidRun } from "../src/options.js";
 import { openRecordStore } from "../src/records.js";
 import {
@@ -72,16 +106,17 @@ import {
   buildStagedCards,
   loadRunCard,
   renderRunCard,
-  runCardPath,
+  cardPointerFileFor,
   selectSmokeFixtures,
   type CardExecutionRequest,
   writeRunCard,
   type RunCard,
+  runCardHash,
 } from "../src/runCard.js";
 import { checkCompatibility, RECORDS_FILE, runDirPaths, type RunMeta } from "../src/runDir.js";
-import { runExperiment } from "../src/runner.js";
+import { classifyDispatch, partitionSettlement, runExperiment } from "../src/runner.js";
 import { evaluateGate } from "../src/stats.js";
-import type { ArmId, GateRunRecord } from "../src/types.js";
+import type { ArmId, GateRunRecord, ProviderCallFact } from "../src/types.js";
 
 /**
  * Pilot Safety Gate 테스트 (§9).
@@ -793,6 +828,8 @@ function sampleRecord(fixtureId: string, arm: "A" | "B" | "C" | "D", repetition:
     taskId: `t-${fixtureId}-${arm}`,
     providerId: "openai",
     requestedModelId: "gpt-4.1",
+    providerCalls: [],
+    eventsReadable: true,
     publicVerificationPassed: false,
     oracleVerificationPassed: false,
     inputTokens: 0,
@@ -1810,15 +1847,22 @@ test("43. 오류 메시지에 secret-like 문자열이 있어도 어디에도 �
 
 const FAKE_KEYS = { OPENAI_API_KEY: "test-openai-key-value", ANTHROPIC_API_KEY: "test-anthropic-key-value" };
 
+/** 환경변수 맵을 **해석된 자격증명**으로 바꾼다 — resolver가 하는 일을 테스트에서도 그대로 쓴다. */
+function credentialsFrom(env: NodeJS.ProcessEnv = FAKE_KEYS): ResolvedProviderCredential[] {
+  const out: ResolvedProviderCredential[] = [];
+  for (const [providerId, envName] of [
+    ["openai", "OPENAI_API_KEY"],
+    ["anthropic", "ANTHROPIC_API_KEY"],
+  ] as const) {
+    const resolved = resolveCredential(providerId, envName, env);
+    assert.ok(resolved.ok, `${providerId} 자격증명을 해석할 수 없습니다`);
+    if (resolved.ok) out.push({ providerId, envName: resolved.envName, value: resolved.value });
+  }
+  return out;
+}
+
 function bindingFor(env: NodeJS.ProcessEnv = FAKE_KEYS): CredentialBinding {
-  const binding = computeCredentialBinding(
-    [
-      { providerId: "openai", envName: "OPENAI_API_KEY" },
-      { providerId: "anthropic", envName: "ANTHROPIC_API_KEY" },
-    ],
-    env,
-    "a".repeat(64)
-  );
+  const binding = computeCredentialBinding(credentialsFrom(env), "a".repeat(64));
   assert.ok(binding, "binding을 만들 수 없습니다");
   return binding!;
 }
@@ -1862,7 +1906,7 @@ function expectationsAt(now: string): Parameters<typeof validateProbeEvidence>[1
     ...EVIDENCE_BINDING,
     executorModelId: "gpt-4.1",
     reviewerModelId: "claude-sonnet-5",
-    env: FAKE_KEYS,
+    credentials: credentialsFrom(FAKE_KEYS),
   };
 }
 
@@ -1899,13 +1943,16 @@ test("44. probe evidence는 만료·변조·모델 불일치·다른 키를 거�
   // 다른 자격증명
   const otherKey = validateProbeEvidence(evidence, {
     ...expectationsAt(inWindow),
-    env: { ...FAKE_KEYS, OPENAI_API_KEY: "different-key" },
+    credentials: credentialsFrom({ ...FAKE_KEYS, OPENAI_API_KEY: "different-key" }),
   });
   assert.equal(otherKey.ok, false);
   if (!otherKey.ok) assert.ok(otherKey.reasons.some((r) => r.includes("probe 당시와 다릅니다")));
 
   // 키가 사라진 경우
-  const noKey = validateProbeEvidence(evidence, { ...expectationsAt(inWindow), env: { OPENAI_API_KEY: "test-openai-key-value" } });
+  const noKey = validateProbeEvidence(evidence, {
+    ...expectationsAt(inWindow),
+    credentials: [{ providerId: "openai", envName: "OPENAI_API_KEY", value: "test-openai-key-value" }],
+  });
   assert.equal(noKey.ok, false);
 });
 
@@ -1954,7 +2001,7 @@ test("45. probe 결과가 Run Card readiness에 반영된다", () => {
   const withP0 = buildStagedCards({
     ...common,
     probeEvidence: validEvidence(),
-    p0Attestation: { attestationId: "p0-x", attestationHash: "hash-x" },
+    p0Attestation: { attestationId: "p0-x", attestationHash: "hash-x", path: "/tmp/run/approvals/attestations/p0-x.json" },
   });
   assert.equal(withP0.p1.status, "READY_FOR_P1_APPROVAL", withP0.p1.blockers.join(" / "));
   assert.equal(withP0.p1.p0AttestationId, "p0-x");
@@ -2000,13 +2047,17 @@ test("47. 카드 해시·단계·경로·인자·예산이 다르면 승인하�
   const request: CardExecutionRequest = {
     stage: "smoke",
     outputDir: card.outputDir,
-    fixtureIds: card.stage.fixtureIds,
+    // **현재 fixture 사실**을 넘긴다 — id뿐 아니라 내용 해시까지 비교된다(§2.4).
+    fixtures: card.fixtureHashes.map((f) => ({ ...f })),
     arms: card.stage.arms,
     repetitions: 1,
+    maxConcurrency: 1,
     seed: 1,
     maxCostUsd: 30,
     executorModelId: card.models!.executor.modelId,
     reviewerModelId: card.models!.reviewer.modelId,
+    runCardPath: card.immutableCardPath,
+    probeEvidencePath: card.probeEvidencePath!,
     now: "2026-07-30T01:00:00.000Z",
   };
   assert.equal(authorizeRunCard(card, request).ok, true, JSON.stringify(authorizeRunCard(card, request)));
@@ -2014,7 +2065,18 @@ test("47. 카드 해시·단계·경로·인자·예산이 다르면 승인하�
   const rejections: { label: string; patch: Partial<CardExecutionRequest> }[] = [
     { label: "단계", patch: { stage: "pilot" } },
     { label: "출력 경로", patch: { outputDir: "/tmp/other" } },
-    { label: "fixture", patch: { fixtureIds: ["nope"] } },
+    {
+      label: "fixture 집합",
+      patch: { fixtures: [{ fixtureId: "nope", category: "multi_file_contract", language: "typescript", hash: "h" }] },
+    },
+    {
+      // **같은 id인데 내용이 바뀐 경우** (§2.4). 예전 검증은 id 집합만 봐서 이걸 통과시켰다.
+      label: "fixture 내용",
+      patch: { fixtures: card.fixtureHashes.map((f) => ({ ...f, hash: `${f.hash}-changed` })) },
+    },
+    { label: "동시성", patch: { maxConcurrency: 4 } },
+    { label: "카드 경로", patch: { runCardPath: "/tmp/other-card.json" } },
+    { label: "evidence 경로", patch: { probeEvidencePath: "/tmp/other-evidence.json" } },
     { label: "arm", patch: { arms: ["A"] as ArmId[] } },
     { label: "반복", patch: { repetitions: 3 } },
     { label: "seed", patch: { seed: 99 } },
@@ -2030,9 +2092,10 @@ test("47. 카드 해시·단계·경로·인자·예산이 다르면 승인하�
 
   // 카드 파일을 손으로 고치면 해시 검증에서 막힌다.
   withDir((dir) => {
-    const stored: RunCard = { ...card, outputDir: dir };
-    writeRunCard(stored);
-    const file = runCardPath(dir, "smoke");
+    const stored: RunCard = { ...card, outputDir: dir, approvalsDir: path.join(dir, "approvals") };
+    const rehashed: RunCard = { ...stored, immutableCardPath: path.join(dir, "approvals", "cards", `${stored.cardId}.json`) };
+    const written = writeRunCard(rehashed);
+    const file = written.cardFile;
     const raw = JSON.parse(readFileSync(file, "utf8")) as RunCard;
     raw.approvedLimitUsd = 9_999;
     writeFileSync(file, JSON.stringify(raw, null, 2));
@@ -2080,7 +2143,7 @@ test("48. P0 attestation은 8건 전부 정상일 때만 만들어진다", () =>
   assert.equal(goodRecords.length, 8);
   const events = p0Events(goodRecords);
 
-  const ok = attestP0({ card, evidence, records: goodRecords, budgetEvents: events, createdAt: "2026-07-30T02:00:00.000Z" });
+  const ok = attestP0(attestInput(card, evidence, goodRecords, events));
   assert.equal(ok.ok, true, ok.ok ? "" : ok.reasons.join(" / "));
   if (!ok.ok) return;
   assert.equal(ok.attestation.actualRecords, 8);
@@ -2088,25 +2151,13 @@ test("48. P0 attestation은 8건 전부 정상일 때만 만들어진다", () =>
   assert.ok(ok.attestation.checks.every((c) => c.passed));
 
   // 부분 실행 → BLOCKED_P0_INCOMPLETE
-  const partial = attestP0({
-    card,
-    evidence,
-    records: goodRecords.slice(0, 7),
-    budgetEvents: p0Events(goodRecords.slice(0, 7)),
-    createdAt: "2026-07-30T02:00:00.000Z",
-  });
+  const partial = attestP0(attestInput(card, evidence, goodRecords.slice(0, 7), p0Events(goodRecords.slice(0, 7))));
   assert.equal(partial.ok, false);
   if (!partial.ok) assert.equal(partial.status, "BLOCKED_P0_INCOMPLETE");
 
   // 인프라 실패 1건 → BLOCKED_P0_FAILED
   const withFailure = goodRecords.map((r, i) => (i === 0 ? { ...r, failureClass: "auth_failure" as const } : r));
-  const failed = attestP0({
-    card,
-    evidence,
-    records: withFailure,
-    budgetEvents: p0Events(withFailure),
-    createdAt: "2026-07-30T02:00:00.000Z",
-  });
+  const failed = attestP0(attestInput(card, evidence, withFailure, p0Events(withFailure)));
   assert.equal(failed.ok, false);
   if (!failed.ok) assert.equal(failed.status, "BLOCKED_P0_FAILED");
 
@@ -2122,32 +2173,57 @@ test("48. P0 attestation은 8건 전부 정상일 때만 만들어진다", () =>
     correlationId: "leftover",
     reservedUsd: 1,
   };
-  const withOpen = attestP0({
-    card,
-    evidence,
-    records: goodRecords,
-    budgetEvents: [...events, openEvent],
-    createdAt: "2026-07-30T02:00:00.000Z",
-  });
+  const withOpen = attestP0(attestInput(card, evidence, goodRecords, [...events, openEvent]));
   assert.equal(withOpen.ok, false);
 
-  // 응답 envelope 모델 ID가 evidence와 다르면 attestation 없음 —
-  // **DraftProposal.model이 같아도** 통과하지 않는다.
-  const substituted = goodRecords.map((r) => ({ ...r, returnedModelId: "some-other-model" }));
-  const wrongModel = attestP0({
-    card,
-    evidence,
-    records: substituted,
-    budgetEvents: p0Events(substituted),
-    createdAt: "2026-07-30T02:00:00.000Z",
-  });
-  assert.equal(wrongModel.ok, false);
+  // ---- exact-model 검증의 근거는 **호출별 응답 envelope**뿐이다 (§2.8) ----
+  //
+  // 이 두 assertion은 짝이다. 예전 구현은 `returnedModelId`(= `DRAFT_RECEIVED.model`)를
+  // 근거로 삼았는데, 그 값은 어댑터가 `this.modelId`를 넣은 **자기보고 값**이라 조용한 대체를
+  // 절대 잡지 못했다. 이제 판정은 `providerCalls[*].providerReportedModelId`로만 한다.
+
+  // (1) 품질 메타데이터만 바뀐 것은 **판정에 영향이 없다.**
+  const metadataOnly = goodRecords.map((r) => ({ ...r, returnedModelId: "some-other-model" }));
+  const stillOk = attestP0(attestInput(card, evidence, metadataOnly, p0Events(metadataOnly)));
+  assert.equal(
+    stillOk.ok,
+    true,
+    `DRAFT_RECEIVED.model이 exact-model 판정에 쓰이고 있습니다: ${stillOk.ok ? "" : stillOk.reasons.join(" / ")}`
+  );
+
+  // (2) **응답 envelope**이 다르면 attestation을 만들지 않는다.
+  const substituted = goodRecords.map((r) => ({
+    ...r,
+    providerCalls: r.providerCalls.map((c) => ({ ...c, providerReportedModelId: "some-other-model" })),
+  }));
+  const wrongModel = attestP0(attestInput(card, evidence, substituted, p0Events(substituted)));
+  assert.equal(wrongModel.ok, false, "응답 envelope 모델 ID가 달라도 attestation을 만들었습니다");
   if (!wrongModel.ok) {
     assert.ok(
       wrongModel.reasons.some((r) => r.includes("응답 envelope 모델 ID")),
       wrongModel.reasons.join(" / ")
     );
   }
+
+  // (3) 응답 envelope 모델 ID가 **아예 없으면** 조용한 대체를 배제할 수 없으므로 거부한다.
+  const missing = goodRecords.map((r) => ({
+    ...r,
+    providerCalls: r.providerCalls.map(({ providerReportedModelId: _drop, ...c }) => c),
+  }));
+  const noEnvelope = attestP0(attestInput(card, evidence, missing, p0Events(missing)));
+  assert.equal(noEnvelope.ok, false, "응답 모델 ID가 없어도 attestation을 만들었습니다");
+
+  // (4) **역할을 서로 바꿔 통과시키지 않는다** — reviewer 호출이 executor 모델로 응답한 경우.
+  const swapped = goodRecords.map((r) => ({
+    ...r,
+    providerCalls: r.providerCalls.map((c) =>
+      c.role === "reviewer"
+        ? { ...c, providerReportedModelId: evidence.executor.providerReportedModelId }
+        : c
+    ),
+  }));
+  const roleSwap = attestP0(attestInput(card, evidence, swapped, p0Events(swapped)));
+  assert.equal(roleSwap.ok, false, "reviewer가 executor 모델로 응답했는데 통과했습니다");
 });
 
 test("49. 실패한·변조된 P0 attestation으로는 P1을 승인하지 않는다", () => {
@@ -2167,7 +2243,7 @@ test("49. 실패한·변조된 P0 attestation으로는 P1을 승인하지 않는
     joinPath: (a, b) => `${a}/${b}`,
   }).p0;
   const records = p0Records(card, evidence);
-  const outcome = attestP0({ card, evidence, records, budgetEvents: p0Events(records), createdAt: "2026-07-30T02:00:00.000Z" });
+  const outcome = attestP0(attestInput(card, evidence, records, p0Events(records)));
   assert.ok(outcome.ok);
   if (!outcome.ok) return;
 
@@ -2397,24 +2473,152 @@ test("53. 이 파일의 모든 provider 상호작용이 mock 또는 주입 어�
 // ---- 공용: P0 mock 기록과 이벤트 ----
 
 /** 카드가 요구하는 8건을 만든다. 실제 P0를 돌리지 않고 attestation 경로를 검증하기 위한 것이다. */
+const TEST_RECEIPT_ID = "receipt-smoke-test";
+const TEST_RECEIPT_HASH = "0".repeat(64);
+
+/** 이 카드/evidence를 승인한 것으로 간주하는 receipt. attestation 체인 검사의 상대편이다. */
+function receiptFor(card: RunCard, evidence: ProbeEvidence): ExecutionAuthorizationReceipt {
+  const facts: ReceiptFacts = {
+    cardId: card.cardId,
+    cardHash: card.cardHash,
+    immutableCardPath: card.immutableCardPath,
+    probeEvidenceId: evidence.evidenceId,
+    probeEvidenceHash: evidence.evidencePayloadHash,
+    immutableEvidencePath: card.probeEvidencePath!,
+    requiresP0Attestation: false,
+    protocolVersion: card.protocolVersion,
+    criteriaHash: card.criteriaHash,
+    registrySnapshotHash: evidence.registrySnapshotHash,
+    adapterContractVersion: evidence.adapterContractVersion,
+    stage: "smoke",
+    outputDir: card.outputDir,
+    fixtures: card.fixtureHashes.map((f) => ({ ...f })).sort((a, b) => (a.fixtureId < b.fixtureId ? -1 : 1)),
+    arms: [...card.stage.arms].sort(),
+    repetitions: card.stage.repetitions,
+    seed: card.seed,
+    maxConcurrency: card.maxConcurrency,
+    executor: { providerId: card.models!.executor.providerId, modelId: card.models!.executor.modelId },
+    reviewer: { providerId: card.models!.reviewer.providerId, modelId: card.models!.reviewer.modelId },
+    approvedLimitUsd: card.approvedLimitUsd!,
+    credentialBinding: buildCredentialBinding(RECEIPT_CREDENTIAL_PURPOSE, credentialsFrom(), "b".repeat(64)),
+  };
+  const receipt = buildExecutionReceipt({
+    facts,
+    spec: {
+      stage: "smoke",
+      fixtureIds: card.stage.fixtureIds,
+      arms: card.stage.arms,
+      repetitions: card.stage.repetitions,
+      maxConcurrency: card.maxConcurrency,
+      seed: card.seed,
+      outputDir: card.outputDir,
+      approvedLimitUsd: card.approvedLimitUsd!,
+      executorModelId: card.models!.executor.modelId,
+      reviewerModelId: card.models!.reviewer.modelId,
+      runCardPath: card.immutableCardPath,
+      probeEvidencePath: card.probeEvidencePath!,
+    },
+    createdAt: "2026-07-30T01:00:00.000Z",
+    receiptId: TEST_RECEIPT_ID,
+  });
+  return { ...receipt, receiptHash: TEST_RECEIPT_HASH };
+}
+
+/** attestP0의 나머지 입력. 테스트마다 다시 적으면 검사 축이 조용히 빠진다. */
+function attestInput(
+  card: RunCard,
+  evidence: ProbeEvidence,
+  records: readonly GateRunRecord[],
+  budgetEvents: readonly BudgetEvent[]
+): AttestationInput {
+  return {
+    card,
+    receipt: receiptFor(card, evidence),
+    evidence,
+    records,
+    budgetEvents,
+    currentFixtureHashes: new Map(card.fixtureHashes.map((f) => [f.fixtureId, f.hash])),
+    expectedModelFor: (arm, role) =>
+      modelForRole(arm, role, {
+        executorModelId: card.models!.executor.modelId,
+        reviewerModelId: card.models!.reviewer.modelId,
+      }),
+    modelIdAccepted: (modelId, reported) => {
+      const entry = lookupModel(modelId);
+      if (!entry) return { ok: false, reason: `레지스트리에 ${modelId} 엔트리가 없습니다` };
+      return providerModelIdAccepted(entry, reported);
+    },
+    createdAt: "2026-07-30T02:00:00.000Z",
+  };
+}
+
 function p0Records(card: RunCard, evidence: ProbeEvidence): GateRunRecord[] {
   const out: GateRunRecord[] = [];
   for (const fixtureId of card.stage.fixtureIds) {
     for (const arm of card.stage.arms) {
       const fixture = card.fixtureHashes.find((f) => f.fixtureId === fixtureId)!;
+      // arm마다 역할 배정이 다르다 — Arm B는 anthropic 하나뿐이라 reviewer가 드롭되고
+      // 카드의 reviewer 모델이 executor 자리에 앉는다(arms.ts `modelForRole`).
+      const executorModel = modelForRole(arm, "executor", {
+        executorModelId: evidence.executor.requestedModelId,
+        reviewerModelId: evidence.reviewer.requestedModelId,
+      })!;
+      const reviewerModel = modelForRole(arm, "reviewer", {
+        executorModelId: evidence.executor.requestedModelId,
+        reviewerModelId: evidence.reviewer.requestedModelId,
+      });
+      const reported = (modelId: string): string =>
+        modelId === evidence.executor.requestedModelId
+          ? evidence.executor.providerReportedModelId
+          : evidence.reviewer.providerReportedModelId;
+
+      const calls: ProviderCallFact[] = [
+        {
+          callId: "draft:1",
+          role: "executor",
+          attempt: 0,
+          providerId: "p",
+          requestedModelId: executorModel,
+          providerReportedModelId: reported(executorModel),
+          dispatchState: "response_received_with_usage",
+          inputTokens: 500,
+          outputTokens: 100,
+          costUsd: 0.01,
+          status: "succeeded",
+          startedAt: "2026-07-29T00:00:00Z",
+        },
+      ];
+      if (reviewerModel !== undefined) {
+        calls.push({
+          callId: "review:1",
+          role: "reviewer",
+          attempt: 0,
+          providerId: "p",
+          requestedModelId: reviewerModel,
+          providerReportedModelId: reported(reviewerModel),
+          dispatchState: "response_received_with_usage",
+          inputTokens: 0,
+          outputTokens: 0,
+          costUsd: 0,
+          status: "succeeded",
+          startedAt: "2026-07-29T00:00:01Z",
+        });
+      }
+
       out.push({
         ...sampleRecord(fixtureId, arm as "A" | "B" | "C" | "D", 1),
         fixtureHash: fixture.hash,
         category: fixture.category as GateRunRecord["category"],
-        providerCallCount: 1,
+        providerCallCount: calls.length,
         costUsd: 0.01,
         inputTokens: 500,
         outputTokens: 100,
-        // 응답 envelope이 실어 온 모델 ID. arm에 따라 executor/reviewer가 달라진다.
-        returnedModelId:
-          arm === "B"
-            ? evidence.reviewer.providerReportedModelId
-            : evidence.executor.providerReportedModelId,
+        providerCalls: calls,
+        eventsReadable: true,
+        receiptId: TEST_RECEIPT_ID,
+        receiptHash: TEST_RECEIPT_HASH,
+        // 품질 메타데이터일 뿐 — exact-model 검증의 근거가 아니다(§2.8).
+        returnedModelId: reported(executorModel),
         oracleVerificationPassed: true,
         publicVerificationPassed: true,
       });
@@ -2553,93 +2757,104 @@ test("54. --run-card 없는 유료 pilot은 기록을 하나도 만들지 않고
   });
 });
 
+/**
+ * CLI 수준 테스트가 쓰는 **완전한 승인 번들.**
+ *
+ * plan-pilot이 만드는 것과 같은 구조(immutable evidence + immutable card)를 만들고, 카드가
+ * 출력한 실행 argv를 그대로 돌려준다. 이렇게 하면 §2.9의 round trip("카드가 출력한 명령을
+ * 그대로 실행하면 그 카드의 authorization을 통과한다")이 **모든 CLI 테스트에서 자동으로**
+ * 검증된다 — 인자를 손으로 조립하면 그 보장이 사라진다.
+ */
+function approvalBundle(
+  base: string,
+  options: { credentialEnv?: NodeJS.ProcessEnv; executorModel?: string; reviewerModel?: string } = {}
+): { card: RunCard; cliArgs: string[]; evidenceFile: string; runDir: string } {
+  const fixtures = typescriptFixtures();
+  const now = new Date().toISOString();
+  const registry = new ModelRegistry(BUILTIN_MODELS);
+  const models = planModels({
+    credentialPresence: () => true,
+    ...(options.executorModel ? { executorModel: options.executorModel } : {}),
+    ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
+  });
+  assert.ok(isModelPlan(models));
+  if (!isModelPlan(models)) throw new Error("모델 계획 실패");
+
+  const binding = computeCredentialBinding(credentialsFrom(options.credentialEnv ?? CLI_FAKE_KEYS));
+  assert.ok(binding);
+  const evidence = buildProbeEvidence({
+    createdAt: now,
+    protocolVersion: CRITERIA.protocolVersion,
+    criteriaHash: criteriaHash(),
+    registrySnapshotHash: registry.snapshotHash(),
+    adapterContractVersion: "2",
+    executor: roleEvidenceFor(models.executor.modelId, models.executor.providerId),
+    reviewer: roleEvidenceFor(models.reviewer.modelId, models.reviewer.providerId),
+    approvedProbeLimitUsd: 1,
+    cumulativeProbeCostUsd: 0.004,
+    credentialBinding: binding!,
+  });
+  const approvals = approvalPaths(base);
+  const evidenceStore = storeApprovalArtifact(approvals.evidence, evidence.evidenceId, evidence);
+
+  const cards = buildStagedCards({
+    fixtures,
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: base,
+    p0ApprovedLimitUsd: 5,
+    p1ApprovedLimitUsd: 50,
+    models,
+    createdAt: now,
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => path.join(a, b),
+  });
+  assert.equal(cards.p0.status, "READY_FOR_P0_APPROVAL", cards.p0.blockers.join(" / "));
+  writeRunCard(cards.p0);
+
+  return {
+    card: cards.p0,
+    // 카드가 출력한 명령의 CLI 부분. **손으로 조립하지 않는다.**
+    cliArgs: ["pilot", ...cards.p0.runArgv.slice(cards.p0.runArgv.indexOf("--") + 1)],
+    evidenceFile: evidenceStore.file,
+    runDir: cards.p0.outputDir,
+  };
+}
+
 test("54b. 유효한 카드가 있어도 열린 예약이 있으면 provider를 부르지 않는다", () => {
   withDir((base) => {
-    const runDir = path.join(base, "p0-smoke");
-    const probeDir = path.join(base, "model-probe");
-    // **TypeScript 전용 fixture.** Rust가 섞이면 MSVC 유무가 결과를 바꾼다(위 주석).
-    const fixtures = typescriptFixtures();
-    const smoke = selectSmokeFixtures(fixtures);
-    const now = new Date().toISOString();
+    const bundle = approvalBundle(base);
 
-    // 이 환경의 (가짜) 키로 binding을 만든 evidence — CLI에 같은 환경을 넘긴다.
-    const binding = computeCredentialBinding(
-      [
-        { providerId: "openai", envName: "OPENAI_API_KEY" },
-        { providerId: "anthropic", envName: "ANTHROPIC_API_KEY" },
-      ],
-      CLI_FAKE_KEYS
+    // 열린 예약을 남긴다 — 이전 실행이 예약 개시 후 죽은 상태.
+    mkdirSync(bundle.runDir, { recursive: true });
+    appendFileSync(
+      path.join(bundle.runDir, "budget-events.jsonl"),
+      `${JSON.stringify({
+        eventVersion: 2,
+        type: "reservation_opened",
+        at: new Date().toISOString(),
+        runId: "previous",
+        stage: "smoke",
+        correlationId: "prev#1",
+        approvedLimitUsd: 5,
+        reservedUsd: 0.5,
+        cumulativeUsd: 0,
+      })}\n`
     );
-    assert.ok(binding);
-    const registry = new ModelRegistry(BUILTIN_MODELS);
-    const models = planModels({ credentialPresence: () => true });
-    assert.ok(isModelPlan(models));
-    if (!isModelPlan(models)) return;
-    const evidence = buildProbeEvidence({
-      createdAt: now,
-      protocolVersion: CRITERIA.protocolVersion,
-      criteriaHash: criteriaHash(),
-      registrySnapshotHash: registry.snapshotHash(),
-      adapterContractVersion: "2",
-      executor: roleEvidenceFor(models.executor.modelId, models.executor.providerId),
-      reviewer: roleEvidenceFor(models.reviewer.modelId, models.reviewer.providerId),
-      approvedProbeLimitUsd: 1,
-      cumulativeProbeCostUsd: 0.004,
-      credentialBinding: binding!,
-    });
-    writeProbeEvidence(probeDir, evidence);
 
-    const cards = buildStagedCards({
-      fixtures,
-      arms: ["A", "B", "C", "D"],
-      seed: 1,
-      maxConcurrency: 1,
-      outputRoot: base,
-      p0ApprovedLimitUsd: 5,
-      models,
-      createdAt: now,
-      credentialsPresent: true,
-      probeEvidence: evidence,
-      joinPath: (a, b) => path.join(a, b),
-    });
-    assert.equal(cards.p0.status, "READY_FOR_P0_APPROVAL", cards.p0.blockers.join(" / "));
-    writeRunCard(cards.p0);
-
-    // 이제 열린 예약을 남긴다 — 카드는 유효하지만 예산 원장을 신뢰할 수 없는 상태다.
-    crashAfterOpen(runDir);
-
-    const result = runCli(
-      [
-        "pilot",
-        "--fixtures",
-        smoke.map((f) => f.manifest.fixtureId).join(","),
-        "--stage",
-        "smoke",
-        "--arms",
-        "A,B,C,D",
-        "--repetitions",
-        "1",
-        "--seed",
-        "1",
-        "--max-cost-usd",
-        "5",
-        "--output",
-        runDir,
-        "--run-card",
-        runCardPath(runDir, "smoke"),
-      ],
-      CLI_FAKE_KEYS
-    );
+    const result = runCli(bundle.cliArgs, CLI_FAKE_KEYS);
     assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
     assertReachedGate(result);
-    // 카드는 통과했다는 것을 확인한다 — 그래야 다음 게이트가 실제로 막았음을 알 수 있다.
-    assert.ok(result.stdout.includes("Run Card 승인 확인"), result.stdout);
+    // 카드와 evidence는 통과했다 — 그래야 다음 게이트가 실제로 막았음을 알 수 있다.
+    assert.ok(result.stdout.includes("실행 승인 receipt"), result.stdout);
     assert.ok(result.stdout.includes("BLOCKED_UNRESOLVED_RESERVATION"), result.stdout);
     assert.ok(result.stdout.includes("사용 가능한 예산으로 되돌리지 않습니다"), result.stdout);
     // provider를 부르지 않았다.
-    assert.equal(existsSync(path.join(runDir, RECORDS_FILE)), false, "기록 파일이 생겼습니다");
+    assert.equal(existsSync(path.join(bundle.runDir, RECORDS_FILE)), false, "기록 파일이 생겼습니다");
     // 이벤트 파일을 고치지도 않았다.
-    const events = eventsIn(runDir);
+    const events = eventsIn(bundle.runDir);
     assert.equal(events.filter((e) => e.type === "reservation_opened").length, 1);
     assert.equal(events.filter((e) => e.type === "reservation_released").length, 0);
   });
@@ -2647,82 +2862,22 @@ test("54b. 유효한 카드가 있어도 열린 예약이 있으면 provider를 
 
 test("54c. evidence의 자격증명이 다르면 유효한 카드로도 실행되지 않는다", () => {
   withDir((base) => {
-    const runDir = path.join(base, "p0-smoke");
-    const probeDir = path.join(base, "model-probe");
-    const fixtures = typescriptFixtures();
-    const smoke = selectSmokeFixtures(fixtures);
-    const now = new Date().toISOString();
-    const models = planModels({ credentialPresence: () => true });
-    assert.ok(isModelPlan(models));
-    if (!isModelPlan(models)) return;
-
-    // **다른 키**로 binding을 만든다.
-    const binding = computeCredentialBinding(
-      [
-        { providerId: "openai", envName: "OPENAI_API_KEY" },
-        { providerId: "anthropic", envName: "ANTHROPIC_API_KEY" },
-      ],
-      { OPENAI_API_KEY: "some-other-openai-key", ANTHROPIC_API_KEY: "some-other-anthropic-key" }
-    );
-    assert.ok(binding);
-    const evidence = buildProbeEvidence({
-      createdAt: now,
-      protocolVersion: CRITERIA.protocolVersion,
-      criteriaHash: criteriaHash(),
-      registrySnapshotHash: new ModelRegistry(BUILTIN_MODELS).snapshotHash(),
-      adapterContractVersion: "2",
-      executor: roleEvidenceFor(models.executor.modelId, models.executor.providerId),
-      reviewer: roleEvidenceFor(models.reviewer.modelId, models.reviewer.providerId),
-      approvedProbeLimitUsd: 1,
-      cumulativeProbeCostUsd: 0.004,
-      credentialBinding: binding!,
+    // **다른 키**로 binding을 만든 evidence. 카드는 정상이지만 이 실행을 보증하지 않는다.
+    const bundle = approvalBundle(base, {
+      credentialEnv: { OPENAI_API_KEY: "some-other-openai-key", ANTHROPIC_API_KEY: "some-other-anthropic-key" },
     });
-    writeProbeEvidence(probeDir, evidence);
 
-    const cards = buildStagedCards({
-      fixtures,
-      arms: ["A", "B", "C", "D"],
-      seed: 1,
-      maxConcurrency: 1,
-      outputRoot: base,
-      p0ApprovedLimitUsd: 5,
-      models,
-      createdAt: now,
-      credentialsPresent: true,
-      probeEvidence: evidence,
-      joinPath: (a, b) => path.join(a, b),
-    });
-    writeRunCard(cards.p0);
-
-    const result = runCli(
-      [
-        "pilot",
-        "--fixtures",
-        smoke.map((f) => f.manifest.fixtureId).join(","),
-        "--stage",
-        "smoke",
-        "--arms",
-        "A,B,C,D",
-        "--repetitions",
-        "1",
-        "--seed",
-        "1",
-        "--max-cost-usd",
-        "5",
-        "--output",
-        runDir,
-        "--run-card",
-        runCardPath(runDir, "smoke"),
-      ],
-      CLI_FAKE_KEYS
-    );
+    const result = runCli(bundle.cliArgs, CLI_FAKE_KEYS);
     assert.equal(result.code, 2, `${result.stdout}\n${result.stderr}`);
     assertReachedGate(result);
     assert.ok(result.stdout.includes("BLOCKED_INVALID_PROBE_EVIDENCE"), result.stdout);
     assert.ok(result.stdout.includes("probe 당시와 다릅니다"), result.stdout);
-    assert.equal(existsSync(path.join(runDir, RECORDS_FILE)), false, "기록 파일이 생겼습니다");
+    assert.equal(existsSync(path.join(bundle.runDir, RECORDS_FILE)), false, "기록 파일이 생겼습니다");
+    // receipt도 만들지 않았다 — adapter 생성 전에 막혔다는 뜻이다.
+    assert.equal(existsSync(path.join(bundle.runDir, "execution-authorizations.jsonl")), false);
   });
 });
+
 
 test("55. 상한 없이 유료 실행/probe를 시작할 수 없다 (종료 코드 3)", () => {
   withDir((dir) => {
@@ -2760,4 +2915,841 @@ test("57. dry-run 출력이 reviewer를 포함한 총 상한을 쓴다", () => {
     assert.ok(result.stdout.includes("reviewer(검수 1 + revise 2): 432회"), result.stdout);
     assert.ok(!/최대 API 호출 수/.test(result.stdout), "executor-only 수치를 최대라고 불렀습니다");
   });
+});
+
+// ---------------------------------------------------------------------------
+// 58~72. M0.1 — 승인 아티팩트 무결성, 실행 증적 체인, 호출별 과금 사실 (§3)
+//
+// 이 절의 테스트들은 **하나의 결함군**을 겨냥한다: "해시가 있다"와 "해시가 지킨다"는 다르고,
+// "카드가 있다"와 "그 카드로 실행됐다"는 다르며, "실패했다"와 "안 썼다"는 다르다.
+// ---------------------------------------------------------------------------
+
+test("58. canonical JSON이 중첩 key를 재귀 정렬하고 배열 순서를 보존한다", () => {
+  // 같은 내용이면 key 순서와 무관하게 같은 문자열.
+  assert.equal(canonicalJson({ b: 1, a: { d: 2, c: 3 } }), canonicalJson({ a: { c: 3, d: 2 }, b: 1 }));
+  // 배열은 순서가 의미다 — 정렬하면 argv가 무의미해진다.
+  assert.notEqual(canonicalJson(["a", "b"]), canonicalJson(["b", "a"]));
+  // 중첩 깊이와 무관하게 값이 살아남는다(예전 array replacer가 여기서 전부 지웠다).
+  assert.ok(canonicalJson({ a: { b: { c: { d: "deep" } } } }).includes("deep"));
+
+  // 표현 불가능한 값은 **경로와 함께** 거부한다.
+  for (const [label, value] of [
+    ["undefined", { a: undefined }],
+    ["NaN", { a: Number.NaN }],
+    ["Infinity", { a: Number.POSITIVE_INFINITY }],
+    ["함수", { a: (): void => undefined }],
+    ["symbol", { a: Symbol("x") }],
+    ["bigint", { a: BigInt(1) }],
+    ["Date(toJSON)", { a: new Date(0) }],
+  ] as [string, unknown][]) {
+    assert.throws(() => canonicalJson(value), CanonicalJsonError, `${label}를 통과시켰습니다`);
+  }
+
+  // 해시는 64 hex 전체다 — 잘라 쓰지 않는다.
+  assert.match(artifactHash({ a: 1 }), /^[0-9a-f]{64}$/);
+});
+
+test("59. 승인 아티팩트의 모든 중첩 보안 필드 변경이 해시를 바꾼다", () => {
+  const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+  const evidence = validEvidence();
+  const cards = buildStagedCards({
+    fixtures,
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    p1ApprovedLimitUsd: 300,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => `${a}/${b}`,
+  });
+  const card = cards.p0;
+
+  // **중첩 필드를 하나씩** 바꾼다. 예전 구현은 이 전부를 통과시켰다 — array replacer가
+  // 중첩 객체를 `{}`로 만들었기 때문이다.
+  const mutations: { label: string; mutate: (c: RunCard) => RunCard }[] = [
+    {
+      label: "fixtureHashes[0].hash",
+      mutate: (c) => ({ ...c, fixtureHashes: c.fixtureHashes.map((f, i) => (i === 0 ? { ...f, hash: "x" } : f)) }),
+    },
+    {
+      label: "fixtureHashes[0].category",
+      mutate: (c) => ({
+        ...c,
+        fixtureHashes: c.fixtureHashes.map((f, i) => (i === 0 ? { ...f, category: "async_ordering" } : f)),
+      }),
+    },
+    {
+      label: "fixtureHashes[0].language",
+      mutate: (c) => ({
+        ...c,
+        fixtureHashes: c.fixtureHashes.map((f, i) => (i === 0 ? { ...f, language: "rust" } : f)),
+      }),
+    },
+    {
+      label: "models.executor.modelId",
+      mutate: (c) => ({ ...c, models: { ...c.models!, executor: { ...c.models!.executor, modelId: "other" } } }),
+    },
+    {
+      label: "models.executor.inputPerMTok",
+      mutate: (c) => ({ ...c, models: { ...c.models!, executor: { ...c.models!.executor, inputPerMTok: 999 } } }),
+    },
+    {
+      label: "models.reviewer.modelId",
+      mutate: (c) => ({ ...c, models: { ...c.models!, reviewer: { ...c.models!.reviewer, modelId: "other" } } }),
+    },
+    {
+      label: "models.readiness[0].credentialPresent",
+      mutate: (c) => ({
+        ...c,
+        models: {
+          ...c.models!,
+          readiness: c.models!.readiness.map((r, i) => (i === 0 ? { ...r, credentialPresent: !r.credentialPresent } : r)),
+        },
+      }),
+    },
+    {
+      label: "models.readiness[0].liveProbe",
+      mutate: (c) => ({
+        ...c,
+        models: {
+          ...c.models!,
+          readiness: c.models!.readiness.map((r, i) => (i === 0 ? { ...r, liveProbe: "failed" as const } : r)),
+        },
+      }),
+    },
+    { label: "stage.fixtureIds", mutate: (c) => ({ ...c, stage: { ...c.stage, fixtureIds: ["nope"] } }) },
+    { label: "stage.repetitions", mutate: (c) => ({ ...c, stage: { ...c.stage, repetitions: 9 } }) },
+    {
+      label: "stage.callBudget.total",
+      mutate: (c) => ({ ...c, stage: { ...c.stage, callBudget: { ...c.stage.callBudget, total: 1 } } }),
+    },
+    {
+      label: "stage.perArmMaxCostUsd[0].maxUsd",
+      mutate: (c) => ({
+        ...c,
+        stage: {
+          ...c.stage,
+          perArmMaxCostUsd: c.stage.perArmMaxCostUsd.map((a, i) => (i === 0 ? { ...a, maxUsd: 999 } : a)),
+        },
+      }),
+    },
+    {
+      label: "arms[0].providers",
+      mutate: (c) => ({ ...c, arms: c.arms.map((a, i) => (i === 0 ? { ...a, providers: ["evil"] } : a)) }),
+    },
+    {
+      label: "arms[0].reviewMode",
+      mutate: (c) => ({ ...c, arms: c.arms.map((a, i) => (i === 0 ? { ...a, reviewMode: "informed" } : a)) }),
+    },
+    {
+      label: "arms[0].draftSource",
+      mutate: (c) => ({ ...c, arms: c.arms.map((a, i) => (i === 0 ? { ...a, draftSource: "replay(Arm A)" } : a)) }),
+    },
+    { label: "runArgv", mutate: (c) => ({ ...c, runArgv: [...c.runArgv, "--evil"] }) },
+    { label: "resumeArgv", mutate: (c) => ({ ...c, resumeArgv: [...c.resumeArgv, "--evil"] }) },
+    { label: "approvedLimitUsd", mutate: (c) => ({ ...c, approvedLimitUsd: 9_999 }) },
+    { label: "probeEvidenceHash", mutate: (c) => ({ ...c, probeEvidenceHash: "0".repeat(64) }) },
+  ];
+
+  for (const mutation of mutations) {
+    const { cardHash: _drop, ...rest } = mutation.mutate(card);
+    assert.notEqual(
+      runCardHash(rest as Omit<RunCard, "cardHash">),
+      card.cardHash,
+      `${mutation.label}를 바꿔도 cardHash가 그대로입니다`
+    );
+  }
+});
+
+test("60. P0 attestation의 중첩 checks 변조가 해시를 바꾸고 검증에서 막힌다", () => {
+  const fixtures = loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT));
+  const evidence = validEvidence();
+  const card = buildStagedCards({
+    fixtures,
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => `${a}/${b}`,
+  }).p0;
+  const records = p0Records(card, evidence);
+  const outcome = attestP0(attestInput(card, evidence, records, p0Events(records)));
+  assert.ok(outcome.ok, outcome.ok ? "" : outcome.reasons.join(" / "));
+  if (!outcome.ok) return;
+  const attestation = outcome.attestation;
+
+  const expect = {
+    probeEvidenceId: evidence.evidenceId,
+    probeEvidenceHash: evidence.evidencePayloadHash,
+    criteriaHash: criteriaHash(),
+    protocolVersion: CRITERIA.protocolVersion,
+    executorModelId: card.models!.executor.modelId,
+    reviewerModelId: card.models!.reviewer.modelId,
+  };
+  assert.equal(validateP0Attestation(attestation, expect).ok, true);
+
+  // **중첩 checks 변조.** 예전 해시는 checks 배열 안을 전혀 보지 않았다 —
+  // 실패한 검사를 통과로 바꾸고 해시를 그대로 둬도 통과했다.
+  const mutations: { label: string; mutate: () => unknown }[] = [
+    {
+      label: "checks[0].passed",
+      mutate: () => ({ ...attestation, checks: attestation.checks.map((c, i) => (i === 0 ? { ...c, passed: false } : c)) }),
+    },
+    {
+      label: "checks[0].name",
+      mutate: () => ({ ...attestation, checks: attestation.checks.map((c, i) => (i === 0 ? { ...c, name: "x" } : c)) }),
+    },
+    {
+      label: "checks[0].detail",
+      mutate: () => ({ ...attestation, checks: attestation.checks.map((c, i) => (i === 0 ? { ...c, detail: "x" } : c)) }),
+    },
+    {
+      label: "attestedCalls[0].providerReportedModelId",
+      mutate: () => ({
+        ...attestation,
+        attestedCalls: attestation.attestedCalls.map((c, i) => (i === 0 ? { ...c, providerReportedModelId: "x" } : c)),
+      }),
+    },
+    {
+      label: "fixtures[0].hash",
+      mutate: () => ({ ...attestation, fixtures: attestation.fixtures.map((f, i) => (i === 0 ? { ...f, hash: "x" } : f)) }),
+    },
+    { label: "receiptId", mutate: () => ({ ...attestation, receiptId: "other" }) },
+  ];
+  for (const mutation of mutations) {
+    const verdict = validateP0Attestation(mutation.mutate(), expect);
+    assert.equal(verdict.ok, false, `${mutation.label}를 바꿔도 통과했습니다`);
+    if (!verdict.ok) assert.ok(verdict.reasons.some((r) => r.includes("해시")), `${mutation.label}: ${verdict.reasons.join(" / ")}`);
+  }
+});
+
+test("61. 승인 아티팩트는 같은 id에 다른 내용을 쓸 수 없다", () => {
+  withDir((dir) => {
+    const first = storeApprovalArtifact(dir, "card-1", { a: 1, nested: { b: 2 } });
+    assert.equal(first.created, true);
+
+    // 같은 내용의 재저장은 idempotent — 정상 흐름을 실패로 만들지 않는다.
+    const again = storeApprovalArtifact(dir, "card-1", { nested: { b: 2 }, a: 1 });
+    assert.equal(again.created, false);
+    assert.equal(again.file, first.file);
+
+    // **중첩 필드 하나만 달라도 충돌이다.**
+    assert.throws(
+      () => storeApprovalArtifact(dir, "card-1", { a: 1, nested: { b: 3 } }),
+      ArtifactConflictError,
+      "같은 id에 다른 내용을 덮어썼습니다"
+    );
+
+    // 경로를 벗어나는 id는 파일 이름이 되지 못한다.
+    for (const bad of ["../escape", "a/b", "", "."]) {
+      assert.throws(() => storeApprovalArtifact(dir, bad, { a: 1 }), /아티팩트 id/, `id ${JSON.stringify(bad)}`);
+    }
+  });
+});
+
+test("62. plan-pilot을 다시 실행해도 기존 카드가 바뀌지 않는다", () => {
+  withDir((dir) => {
+    const fixtures = typescriptFixtures();
+    const build = (createdAt: string, limit: number): RunCard =>
+      buildStagedCards({
+        fixtures,
+        arms: ["A", "B", "C", "D"],
+        seed: 1,
+        maxConcurrency: 1,
+        outputRoot: dir,
+        p0ApprovedLimitUsd: limit,
+        models: planModels({ credentialPresence: () => true }),
+        createdAt,
+        credentialsPresent: true,
+        probeEvidence: validEvidence(),
+        joinPath: (a, b) => path.join(a, b),
+      }).p0;
+
+    const first = build("2026-07-30T00:00:00.000Z", 30);
+    const firstWrite = writeRunCard(first);
+    const firstBytes = readFileSync(firstWrite.cardFile, "utf8");
+
+    // 조건을 바꿔 다시 계획하면 **새 id의 새 파일**이 생긴다.
+    const second = build("2026-07-30T03:00:00.000Z", 40);
+    const secondWrite = writeRunCard(second);
+    assert.notEqual(second.cardId, first.cardId);
+    assert.notEqual(secondWrite.cardFile, firstWrite.cardFile);
+
+    // 원래 카드는 바이트까지 그대로다.
+    assert.equal(readFileSync(firstWrite.cardFile, "utf8"), firstBytes);
+    const reloaded = loadRunCard(firstWrite.cardFile);
+    assert.equal(reloaded.ok, true);
+    if (reloaded.ok) assert.equal(reloaded.card.approvedLimitUsd, 30);
+
+    // 포인터는 최신을 가리키지만 **카드로 해석되지 않는다** — 승인 근거가 될 수 없다.
+    const pointerLoad = loadRunCard(secondWrite.pointerFile);
+    assert.equal(pointerLoad.ok, false);
+    if (!pointerLoad.ok) assert.ok(pointerLoad.reasons.some((r) => r.includes("안내용 포인터")));
+  });
+});
+
+test("63. 카드가 기록한 경로가 아닌 사본은 승인 근거가 되지 못한다", () => {
+  withDir((dir) => {
+    const card = buildStagedCards({
+      fixtures: typescriptFixtures(),
+      arms: ["A", "B", "C", "D"],
+      seed: 1,
+      maxConcurrency: 1,
+      outputRoot: dir,
+      p0ApprovedLimitUsd: 30,
+      models: planModels({ credentialPresence: () => true }),
+      createdAt: "2026-07-30T00:00:00.000Z",
+      credentialsPresent: true,
+      probeEvidence: validEvidence(),
+      joinPath: (a, b) => path.join(a, b),
+    }).p0;
+    const written = writeRunCard(card);
+
+    // 바이트가 같아도 **다른 경로**의 사본은 거부한다. 사본은 덮어쓰일 수 있다.
+    const copy = path.join(dir, "copy-of-card.json");
+    writeFileSync(copy, readFileSync(written.cardFile, "utf8"));
+    const loaded = loadRunCard(copy);
+    assert.equal(loaded.ok, false, "사본이 승인 근거로 통과했습니다");
+    if (!loaded.ok) assert.ok(loaded.reasons.some((r) => r.includes("다른 경로")), loaded.reasons.join(" / "));
+  });
+});
+
+test("64. 카드가 출력한 명령이 그 카드의 authorization을 통과한다 (모델 override 포함)", () => {
+  const fixtures = typescriptFixtures();
+  for (const override of [
+    {},
+    { executorModel: "gpt-5.1", reviewerModel: "claude-sonnet-5" },
+  ] as { executorModel?: string; reviewerModel?: string }[]) {
+    const models = planModels({ credentialPresence: () => true, ...override });
+    assert.ok(isModelPlan(models));
+    if (!isModelPlan(models)) continue;
+    const evidence = validEvidence({
+      executor: roleEvidenceFor(models.executor.modelId, models.executor.providerId),
+      reviewer: roleEvidenceFor(models.reviewer.modelId, models.reviewer.providerId),
+    });
+    const card = buildStagedCards({
+      fixtures,
+      arms: ["A", "B", "C", "D"],
+      seed: 7,
+      maxConcurrency: 1,
+      outputRoot: "/tmp/run",
+      p0ApprovedLimitUsd: 30,
+      models,
+      createdAt: "2026-07-30T00:00:00.000Z",
+      credentialsPresent: true,
+      probeEvidence: evidence,
+      joinPath: (a, b) => `${a}/${b}`,
+    }).p0;
+    assert.equal(card.status, "READY_FOR_P0_APPROVAL", card.blockers.join(" / "));
+
+    // **카드가 출력한 명령을 그대로 파싱해** 실행 요청을 만든다. 손으로 조립하지 않는다.
+    const parsed = parseArgs(["pilot", ...card.runArgv.slice(card.runArgv.indexOf("--") + 1)], "/tmp/default");
+    assert.equal(parsed.executorModel, models.executor.modelId, "카드 명령에 --executor-model이 없습니다");
+    assert.equal(parsed.reviewerModel, models.reviewer.modelId, "카드 명령에 --reviewer-model이 없습니다");
+    assert.equal(parsed.probeEvidence, path.resolve(card.probeEvidencePath!));
+    assert.equal(parsed.runCard, path.resolve(card.immutableCardPath));
+
+    const verdict = authorizeRunCard(card, {
+      stage: parsed.stage!,
+      outputDir: parsed.output,
+      fixtures: card.fixtureHashes.map((f) => ({ ...f })),
+      arms: parsed.arms,
+      repetitions: parsed.repetitions,
+      maxConcurrency: parsed.maxConcurrency,
+      seed: parsed.seed,
+      maxCostUsd: parsed.maxCostUsd,
+      executorModelId: parsed.executorModel!,
+      reviewerModelId: parsed.reviewerModel!,
+      runCardPath: card.immutableCardPath,
+      probeEvidencePath: card.probeEvidencePath!,
+      now: "2026-07-30T01:00:00.000Z",
+    });
+    assert.equal(
+      verdict.ok,
+      true,
+      `override=${JSON.stringify(override)}: ${verdict.ok ? "" : verdict.reasons.join(" / ")}`
+    );
+  }
+});
+
+test("65. P1 카드 명령은 P0 attestation 경로를 싣는다", () => {
+  const fixtures = typescriptFixtures();
+  const evidence = validEvidence();
+  const attestationPath = "/tmp/run/approvals/attestations/p0-abc.json";
+  const cards = buildStagedCards({
+    fixtures,
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    p1ApprovedLimitUsd: 300,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    p0Attestation: { attestationId: "p0-abc", attestationHash: "a".repeat(64), path: attestationPath },
+    joinPath: (a, b) => `${a}/${b}`,
+  });
+  assert.equal(cards.p1.status, "READY_FOR_P1_APPROVAL", cards.p1.blockers.join(" / "));
+  const parsed = parseArgs(["pilot", ...cards.p1.runArgv.slice(cards.p1.runArgv.indexOf("--") + 1)], "/tmp/d");
+  assert.equal(parsed.p0Attestation, path.resolve(attestationPath));
+
+  // P0 카드에는 attestation 플래그가 없다 — 요구하지 않는 단계다.
+  const p0Parsed = parseArgs(["pilot", ...cards.p0.runArgv.slice(cards.p0.runArgv.indexOf("--") + 1)], "/tmp/d");
+  assert.equal(p0Parsed.p0Attestation, undefined);
+});
+
+test("66. 실행 승인 receipt는 조건이 다르면 같은 디렉터리를 재사용하지 않는다", () => {
+  const evidence = validEvidence();
+  const card = buildStagedCards({
+    fixtures: typescriptFixtures(),
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => `${a}/${b}`,
+  }).p0;
+  const receipt = receiptFor(card, evidence);
+  const base = factsOf(receipt);
+
+  // 같은 조건 → 재사용.
+  assert.equal(reuseOrConflict([receipt], base).kind, "reuse");
+  // 아무것도 없으면 새로 만든다.
+  assert.equal(reuseOrConflict([], base).kind, "create");
+
+  // **조건이 하나라도 다르면 충돌이다** — 예산 상향도 새 승인이다.
+  const conflicts: { label: string; facts: ReceiptFacts }[] = [
+    { label: "예산 상향", facts: { ...base, approvedLimitUsd: base.approvedLimitUsd + 10 } },
+    {
+      label: "fixture 내용 변경",
+      facts: { ...base, fixtures: base.fixtures.map((f, i) => (i === 0 ? { ...f, hash: "changed" } : f)) },
+    },
+    { label: "seed", facts: { ...base, seed: 99 } },
+    { label: "모델", facts: { ...base, executor: { ...base.executor, modelId: "other" } } },
+    { label: "카드", facts: { ...base, cardId: "other-card" } },
+    { label: "evidence", facts: { ...base, probeEvidenceId: "other-evidence" } },
+  ];
+  for (const conflict of conflicts) {
+    const verdict = reuseOrConflict([receipt], conflict.facts);
+    assert.equal(verdict.kind, "conflict", `${conflict.label}가 달라도 재사용했습니다`);
+  }
+});
+
+test("67. receipt에 키 원문·prefix·suffix가 없고 해시가 내용을 지킨다", () => {
+  const evidence = validEvidence();
+  const card = buildStagedCards({
+    fixtures: typescriptFixtures(),
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => `${a}/${b}`,
+  }).p0;
+  const receipt = receiptFor(card, evidence);
+  const text = JSON.stringify(receipt);
+
+  for (const key of Object.values(FAKE_KEYS)) {
+    assert.ok(!text.includes(key), "receipt에 키 원문이 있습니다");
+    assert.ok(!text.includes(key.slice(0, 8)), "receipt에 키 prefix가 있습니다");
+    assert.ok(!text.includes(key.slice(-8)), "receipt에 키 suffix가 있습니다");
+  }
+  // 변수 이름은 남는다 — 그건 자격증명이 아니라 "어디서 읽었는가"다.
+  assert.ok(text.includes("OPENAI_API_KEY"));
+
+  // **HMAC 키가 API 키다**: 키가 다르면 다이제스트가 다르고, salt만 알아서는 만들 수 없다.
+  const withOtherKey = buildCredentialBinding(RECEIPT_CREDENTIAL_PURPOSE, [
+    { providerId: "openai", envName: "OPENAI_API_KEY", value: "a-different-key" },
+  ], "b".repeat(64));
+  assert.notEqual(withOtherKey.providers[0]!.digest, receipt.credentialBinding.providers[0]!.digest);
+  assert.equal(
+    credentialBindingMatchesResolved(receipt.credentialBinding, credentialsFrom()).ok,
+    true
+  );
+  assert.equal(
+    credentialBindingMatchesResolved(receipt.credentialBinding, [
+      { providerId: "openai", envName: "OPENAI_API_KEY", value: "wrong" },
+      { providerId: "anthropic", envName: "ANTHROPIC_API_KEY", value: "wrong" },
+    ]).ok,
+    false
+  );
+  // 목적 문자열이 메시지에 들어가므로 evidence용 다이제스트와 같아지지 않는다.
+  assert.notEqual(
+    credentialDigest({ purpose: "other", salt: "b".repeat(64), providerId: "openai", envName: "E", keyValue: "k" }),
+    credentialDigest({ purpose: RECEIPT_CREDENTIAL_PURPOSE, salt: "b".repeat(64), providerId: "openai", envName: "E", keyValue: "k" })
+  );
+});
+
+test("68. auth/429/5xx/timeout은 remote attempt 이후 예약을 해제하지 않는다", () => {
+  const call = (dispatchState: DispatchState, costUsd?: number): ProviderCallFact => ({
+    callId: "draft:1",
+    role: "executor",
+    attempt: 0,
+    providerId: "openai",
+    requestedModelId: "gpt-4.1",
+    dispatchState,
+    ...(costUsd !== undefined ? { costUsd } : {}),
+    status: costUsd === undefined ? "failed" : "succeeded",
+    startedAt: "T",
+  });
+
+  // **핵심 회귀**: 호출이 시작된 흔적이 없어도 HTTP 분류만으로 not_dispatched를 추론하지 않는다.
+  for (const failureClass of ["rate_limit", "provider_5xx", "network_timeout", "host_crash"]) {
+    assert.equal(
+      classifyDispatch({ providerCalls: [], eventsReadable: true, failureClass }),
+      "dispatched_no_response",
+      `${failureClass}를 not_dispatched로 판정했습니다`
+    );
+  }
+  // 호출 이전 단계의 실패만 해제 근거다.
+  for (const failureClass of ["auth_failure", "fixture_setup_failure", "toolchain_unavailable"]) {
+    assert.equal(classifyDispatch({ providerCalls: [], eventsReadable: true, failureClass }), "not_dispatched");
+  }
+  // 이벤트를 못 읽었으면 "모른다" — 절대 해제하지 않는다.
+  assert.equal(
+    classifyDispatch({ providerCalls: [], eventsReadable: false, failureClass: "auth_failure" }),
+    "dispatched_no_response"
+  );
+  // 개시만 있고 종결이 없는 호출(crash)도 불확실이다.
+  assert.equal(
+    classifyDispatch({ providerCalls: [call("dispatched_no_response")], eventsReadable: true }),
+    "dispatched_no_response"
+  );
+  // 전부 정상이면 정산 가능.
+  assert.equal(
+    classifyDispatch({
+      providerCalls: [call("response_received_with_usage", 0.01)],
+      eventsReadable: true,
+      costUsd: 0.01,
+    }),
+    "response_received_with_usage"
+  );
+});
+
+test("69. executor 성공 + reviewer 실패에서 확정 비용을 잃지 않는다", () => {
+  const executorCall: ProviderCallFact = {
+    callId: "draft:1",
+    role: "executor",
+    attempt: 0,
+    providerId: "openai",
+    requestedModelId: "gpt-4.1",
+    providerReportedModelId: "gpt-4.1",
+    dispatchState: "response_received_with_usage",
+    inputTokens: 1_000,
+    outputTokens: 200,
+    costUsd: 0.02,
+    status: "succeeded",
+    startedAt: "T1",
+  };
+  const reviewerFailure: ProviderCallFact = {
+    callId: "review:1",
+    role: "reviewer",
+    attempt: 0,
+    providerId: "anthropic",
+    requestedModelId: "claude-sonnet-5",
+    dispatchState: "dispatched_no_response",
+    errorKind: "transient",
+    status: "failed",
+    startedAt: "T2",
+  };
+  const record = { providerCalls: [executorCall, reviewerFailure], eventsReadable: true, costUsd: 0.02 };
+
+  // 판정은 "불확실"이지만 **확정분이 있다**는 사실이 함께 보존된다.
+  assert.equal(classifyDispatch(record), "dispatched_no_response");
+  const split = partitionSettlement(record);
+  assert.equal(split.measuredUsd, 0.02);
+  assert.equal(split.measuredCalls, 1);
+  assert.equal(split.uncertainCalls, 1);
+
+  // 원장은 확정분을 누적하고 나머지를 미해결로 남긴다 — **전액 해제하지 않는다.**
+  const events: BudgetEvent[] = [];
+  const ledger = createBudgetLedger(10, { runId: "r", stage: "smoke", onEvent: (e) => events.push(e), now: () => "T" });
+  const reservation = ledger.reserve({ maxUsd: 0.5, basis: "b" }, "rec");
+  assert.ok(reservation.ok);
+  if (!reservation.ok) return;
+  const outcome = reservation.reservation.settlePartial({
+    measured: {
+      cost: { measured: true, usd: split.measuredUsd },
+      usage: { measured: true, inputTokens: 1_000, outputTokens: 200 },
+      providerKind: "real",
+      requestedModelId: "gpt-4.1",
+      providerReportedModelId: "gpt-4.1",
+      dispatchState: "response_received_with_usage",
+    },
+    unresolved: { dispatchState: "dispatched_no_response", reason: "reviewer 5xx" },
+  });
+  assert.equal(outcome.ok, true);
+
+  const snapshot = ledger.snapshot();
+  assert.equal(snapshot.sessionCommittedUsd, 0.02, "확정된 executor 비용이 사라졌습니다");
+  assert.equal(snapshot.unresolvedUsd, 0.48, "남은 예약이 미해결로 남지 않았습니다");
+  assert.equal(snapshot.reservationsReleased, 0, "예약을 해제했습니다");
+  assert.equal(snapshot.state, "UNRESOLVED_RESERVATION");
+
+  // 상태 머신도 같은 사실을 말한다: 알려진 지출과 최대 미해결 노출이 **따로** 보인다.
+  const analysis = analyzeBudgetEvents(events);
+  assert.equal(analysis.settledUsd, 0.02);
+  assert.equal(analysis.unresolvedUsd, 0.48);
+  assert.equal(analysis.reservations[0]!.outcome, "partially_settled");
+  // 그리고 이 디렉터리는 자동 재개가 불가능하다.
+  assert.equal(reconcileBudget({ recordsUsd: 0.02, events }).ok, false);
+
+  const rendered = renderBudgetStatus(
+    budgetStatus({ runDir: "/tmp/x", records: [], eventRead: { ok: true, events, truncatedLastLine: false } })
+  ).join("\n");
+  assert.ok(rendered.includes("알려진 지출"), rendered);
+  assert.ok(rendered.includes("최대 미해결 노출"), rendered);
+});
+
+test("70. 재시도한 모든 attempt의 dispatch 사실이 보존된다", async () => {
+  const attempts: number[] = [];
+  const failure = (attempt: number): ProviderCallFailure =>
+    new ProviderCallFailure({
+      message: `attempt ${attempt} 실패`,
+      // 첫 시도는 usage까지 받았다(=과금됐다). 재시도는 응답을 못 받았다.
+      dispatchState: attempt === 0 ? "response_received_with_usage" : "dispatched_no_response",
+      classification: { kind: "transient", message: "5xx", retryable: true },
+      ...(attempt === 0 ? { usage: { inputTokens: 100, outputTokens: 10 }, providerReportedModelId: "gpt-4.1" } : {}),
+    });
+
+  await assert.rejects(
+    async () =>
+      callWithRetry(
+        async (attempt) => {
+          attempts.push(attempt);
+          throw failure(attempt);
+        },
+        { maxRetries: 1, rateLimitBaseMs: 0, rateLimitCapMs: 0, transientBaseMs: 0, transientCapMs: 0 },
+        { sleep: async () => undefined }
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof ProviderCallFailed);
+      const failed = error as ProviderCallFailed;
+      // **모든 attempt의 사실이 남는다.** 마지막만 보면 첫 시도의 과금이 보이지 않는다.
+      assert.equal(failed.facts.length, 2, JSON.stringify(failed.facts));
+      assert.equal(failed.facts[0]!.dispatchState, "response_received_with_usage");
+      assert.equal(failed.facts[0]!.usage?.inputTokens, 100);
+      assert.equal(failed.facts[0]!.providerReportedModelId, "gpt-4.1");
+      assert.equal(failed.facts[1]!.dispatchState, "dispatched_no_response");
+      return true;
+    }
+  );
+
+  // 평범한 Error는 dispatch를 **모르므로** 불확실이 기본이다.
+  assert.equal(attemptFacts(0, new Error("plain"), "unknown").dispatchState, "dispatched_no_response");
+});
+
+test("71. credential resolver가 별칭 하나는 허용하고 충돌은 차단한다", () => {
+  const primary = { OPENAI_API_KEY: "value-1" };
+  const alias = { TOMVERSE_OPENAI_API_KEY: "value-1" };
+  const same = { OPENAI_API_KEY: "value-1", TOMVERSE_OPENAI_API_KEY: "value-1" };
+  const conflicting = { OPENAI_API_KEY: "value-1", TOMVERSE_OPENAI_API_KEY: "value-2" };
+
+  const resolvedPrimary = resolveCredential("openai", "OPENAI_API_KEY", primary);
+  assert.equal(resolvedPrimary.ok, true);
+  if (resolvedPrimary.ok) assert.equal(resolvedPrimary.envName, "OPENAI_API_KEY");
+
+  // **별칭만 있어도 실행할 수 있어야 한다** — preflight가 인정하던 것을 factory도 인정한다.
+  const resolvedAlias = resolveCredential("openai", "OPENAI_API_KEY", alias);
+  assert.equal(resolvedAlias.ok, true);
+  if (resolvedAlias.ok) assert.equal(resolvedAlias.envName, "TOMVERSE_OPENAI_API_KEY");
+
+  // 값이 같으면 정본 이름을 쓴다.
+  const resolvedSame = resolveCredential("openai", "OPENAI_API_KEY", same);
+  assert.equal(resolvedSame.ok, true);
+  if (resolvedSame.ok) assert.deepEqual(resolvedSame.duplicates, ["TOMVERSE_OPENAI_API_KEY"]);
+
+  // **값이 다르면 조용히 고르지 않는다.**
+  const ambiguous = resolveCredential("openai", "OPENAI_API_KEY", conflicting);
+  assert.equal(ambiguous.ok, false);
+  if (!ambiguous.ok) {
+    assert.equal(ambiguous.kind, "ambiguous");
+    assert.ok(ambiguous.reason.includes("서로 다른 값"));
+    // 사유에 키 값이 들어가면 안 된다.
+    assert.ok(!ambiguous.reason.includes("value-1") && !ambiguous.reason.includes("value-2"));
+  }
+
+  // 없으면 **확인한 이름 전부**를 알려준다.
+  const missing = resolveCredential("openai", "OPENAI_API_KEY", {});
+  assert.equal(missing.ok, false);
+  if (!missing.ok) {
+    assert.equal(missing.kind, "missing");
+    assert.deepEqual(missing.checked, ["OPENAI_API_KEY", "TOMVERSE_OPENAI_API_KEY"]);
+  }
+
+  // preflight도 같은 판정을 쓴다 — "있지만 쓸 수 없다"를 "있다"로 보고하지 않는다.
+  assert.equal(credentialPresent("openai", alias), true);
+  assert.equal(credentialPresent("openai", conflicting), false);
+  assert.ok(credentialProblem("openai", conflicting)?.includes("서로 다른 값"));
+
+  // adapter factory도 같은 resolver를 지난다.
+  const entry = lookupModel("gpt-4.1")!;
+  assert.throws(
+    () => createAdapter(entry, { role: "executor", modelId: entry.modelId, providerId: entry.providerId, reason: "test" }, { env: conflicting }),
+    (error: unknown) => {
+      assert.ok(error instanceof MissingCredentialError);
+      assert.equal((error as MissingCredentialError).kind, "ambiguous");
+      return true;
+    },
+    "factory가 충돌하는 별칭 중 하나를 조용히 골랐습니다"
+  );
+});
+
+test("72. v1 승인 아티팩트는 fail-closed로 거부되고 다시 만들라고 안내한다", () => {
+  const evidence = validEvidence();
+  const card = buildStagedCards({
+    fixtures: typescriptFixtures(),
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => `${a}/${b}`,
+  }).p0;
+
+  withDir((dir) => {
+    // v1로 표기된 카드 — 자동 마이그레이션하지 않는다.
+    const file = path.join(dir, "old-card.json");
+    writeFileSync(file, JSON.stringify({ ...card, cardSchemaVersion: 1 }, null, 2));
+    const loaded = loadRunCard(file);
+    assert.equal(loaded.ok, false);
+    if (!loaded.ok) {
+      assert.ok(loaded.reasons.some((r) => r.includes("스키마 버전")), loaded.reasons.join(" / "));
+      assert.ok(loaded.reasons.some((r) => r.includes("plan-pilot")), "다시 만드는 방법을 알려주지 않습니다");
+    }
+  });
+
+  const oldEvidence = validateProbeEvidence(
+    { ...evidence, schemaVersion: 1 },
+    {
+      now: "2026-07-30T01:00:00.000Z",
+      ...EVIDENCE_BINDING,
+      executorModelId: "gpt-4.1",
+      reviewerModelId: "claude-sonnet-5",
+      credentials: credentialsFrom(),
+    }
+  );
+  assert.equal(oldEvidence.ok, false);
+  if (!oldEvidence.ok) assert.ok(oldEvidence.reasons.some((r) => r.includes("probe-models")));
+
+  // 32자리로 잘린 예전 해시는 형식 검사에서 먼저 걸린다.
+  const truncated = verifyArtifactHash({ ...card, cardHash: card.cardHash.slice(0, 32) }, "cardHash");
+  assert.equal(truncated.ok, false);
+  if (!truncated.ok) assert.ok(truncated.reason.includes("64자리"));
+});
+
+test("73. 서로 다른 실행 승인을 섞은 기록으로는 attestation을 만들지 않는다", () => {
+  const evidence = validEvidence();
+  const card = buildStagedCards({
+    fixtures: loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT)),
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => `${a}/${b}`,
+  }).p0;
+  const records = p0Records(card, evidence);
+
+  // 한 기록만 다른 승인을 가리킨다 — 두 승인의 결과가 한 디렉터리에 섞인 상태.
+  const mixed = records.map((r, i) => (i === 0 ? { ...r, receiptId: "other-receipt" } : r));
+  const verdict = attestP0(attestInput(card, evidence, mixed, p0Events(mixed)));
+  assert.equal(verdict.ok, false, "서로 다른 승인의 기록을 섞었는데 attestation을 만들었습니다");
+  if (!verdict.ok) {
+    assert.ok(
+      verdict.reasons.some((r) => r.includes("같은 실행 승인")),
+      verdict.reasons.join(" / ")
+    );
+  }
+
+  // receipt를 아예 달지 않은 기록도 마찬가지다 — "어느 승인으로 실행됐는지" 말할 수 없다.
+  const unlinked = records.map(({ receiptId: _a, receiptHash: _b, ...r }) => r);
+  assert.equal(attestP0(attestInput(card, evidence, unlinked, p0Events(unlinked))).ok, false);
+});
+
+test("74. P1은 카드가 가리키는 attestation이 바뀌면 실행 직전에 막힌다", () => {
+  const evidence = validEvidence();
+  const card = buildStagedCards({
+    fixtures: loadAllFixtures(FIXTURES_ROOT, listFixtureIds(FIXTURES_ROOT)),
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/tmp/run",
+    p0ApprovedLimitUsd: 30,
+    models: planModels({ credentialPresence: () => true }),
+    createdAt: "2026-07-30T00:00:00.000Z",
+    credentialsPresent: true,
+    probeEvidence: evidence,
+    joinPath: (a, b) => `${a}/${b}`,
+  }).p0;
+  const records = p0Records(card, evidence);
+  const made = attestP0(attestInput(card, evidence, records, p0Events(records)));
+  assert.ok(made.ok, made.ok ? "" : made.reasons.join(" / "));
+  if (!made.ok) return;
+  const attestation = made.attestation;
+
+  const baseExpect = {
+    probeEvidenceId: evidence.evidenceId,
+    probeEvidenceHash: evidence.evidencePayloadHash,
+    criteriaHash: criteriaHash(),
+    protocolVersion: CRITERIA.protocolVersion,
+    executorModelId: card.models!.executor.modelId,
+    reviewerModelId: card.models!.reviewer.modelId,
+  };
+
+  // P1 카드가 기록한 id/hash와 같으면 통과.
+  assert.equal(
+    validateP0Attestation(attestation, {
+      ...baseExpect,
+      attestationId: attestation.attestationId,
+      attestationHash: attestation.attestationHash,
+    }).ok,
+    true
+  );
+
+  // **카드를 만든 뒤 다른 attestation으로 바뀌었다면** 카드 해시로는 드러나지 않는다.
+  // 그래서 실행 직전에 id/hash를 다시 대조한다.
+  for (const drift of [
+    { attestationId: "p0-someone-else", attestationHash: attestation.attestationHash },
+    { attestationId: attestation.attestationId, attestationHash: "f".repeat(64) },
+    { receiptId: "other-receipt" },
+  ]) {
+    const verdict = validateP0Attestation(attestation, { ...baseExpect, ...drift });
+    assert.equal(verdict.ok, false, `${JSON.stringify(drift)}로도 통과했습니다`);
+  }
+
+  // 확인한 provider 호출이 0건인 attestation은 실행 경로를 증명하지 못한다.
+  // 해시까지 다시 계산해 둔다 — 해시 검사가 아니라 **내용 검사**가 막는지 확인하기 위해서다.
+  const { attestationHash: _drop, ...emptyCalls } = { ...attestation, attestedCalls: [] };
+  const rehashed = { ...emptyCalls, attestationHash: artifactHash(emptyCalls) };
+  const verdict = validateP0Attestation(rehashed, baseExpect);
+  assert.equal(verdict.ok, false, "확인한 호출이 0건인 attestation을 통과시켰습니다");
+  if (!verdict.ok) assert.ok(verdict.reasons.some((r) => r.includes("호출이 0건")), verdict.reasons.join(" / "));
 });
