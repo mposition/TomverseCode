@@ -46,6 +46,7 @@ interface HostRun {
     failureReason?: string;
     verificationReport?: { overall: string; checks: { kind: string; status: string }[] };
     acceptanceCriteria?: { criterionId: string; text: string; source: string; decidedAt: string }[];
+    criterionEvaluations?: { criterionId: string; status: string; reason: string; evidence?: string[] }[];
   };
   mutatedPaths: string[];
   eventTypes: string[];
@@ -460,6 +461,72 @@ test("verified 모드는 교차검증 경로(REVIEWING)를 지난다", () => {
       2,
       "대조가 켜지면 초안 이벤트가 둘이어야 합니다(13.4절 비용 표)"
     );
+  });
+});
+
+test("기준이 지목한 테스트가 실제로 실행됐을 때만 확인으로 판정된다", () => {
+  // state-machine-and-protocol.md 17.3절 규칙 2 / 17.9절.
+  //
+  // **실제 호스트에서 확인한다**: 판정의 근거인 "test 체크가 통과했다"와 "그 파일이 실행됐다"는
+  // 둘 다 Rust가 만든 리포트에서 오고, Node 단위 테스트는 그 리포트를 스텁으로 대신한다.
+  // 픽스처의 테스트 명령은 `node --test paginate.test.js`이므로 argv가 실행 근거가 된다.
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir, {
+      mode: "fast",
+      script: [
+        {
+          kind: "singleFix",
+          payload: {
+            verdict: "ACCEPT",
+            rationale: "오프바이원 수정",
+            patch: FIX_PATCH,
+          },
+        },
+      ],
+    });
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+
+    // 단일 모델 경로에는 doneCriteria가 없으므로 기준도 판정도 없다 — **없는 것이 맞다.**
+    // 여기서 판정이 생기면 근거 없이 만들어낸 것이다.
+    assert.equal(run.final.acceptanceCriteria, undefined);
+    assert.ok(
+      !run.eventTypes.includes("CRITERIA_CONFLICT_DETECTED"),
+      "기준이 없는데 충돌이 감지되었습니다"
+    );
+  });
+});
+
+test("확정된 기준이 있으면 검증 뒤에 기준별 판정이 계산된다", () => {
+  withRepo((repo, stateDir) => {
+    // 교차검증 경로의 초안이 doneCriteria를 내므로 기준이 생긴다. 하나는 픽스처의 실제 테스트
+    // 파일을 지목하고, 다른 하나는 아무것도 지목하지 않는다 — 확인과 미확인이 **둘 다** 나와야
+    // "전부 확인" 또는 "전부 미확인"으로 뭉개지지 않았음이 증명된다.
+    const draft = {
+      kind: "draft" as const,
+      payload: {
+        interpretation: "페이지 계산이 한 칸 밀렸다",
+        patch: FIX_PATCH,
+        plan: [{ stepId: "s1", description: "paginate.js 수정", targetPaths: ["paginate.js"] }],
+        risks: [],
+        requiredTests: ["paginate.test.js"],
+        uncertainties: [],
+        doneCriteria: ["1페이지가 첫 항목부터 나온다 (paginate.test.js)", "오류 메시지를 한국어로 표시한다"],
+      },
+    };
+    const run = runHost(repo, stateDir, { mode: "verified", script: [draft, draft] });
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+    assert.ok(run.eventTypes.includes("CRITERIA_EVALUATED"), run.eventTypes.join(", "));
+
+    const evaluations = run.final.criterionEvaluations ?? [];
+    assert.equal(evaluations.length, (run.final.acceptanceCriteria ?? []).length, "기준마다 판정이 하나씩");
+
+    const verified = evaluations.filter((e) => e.status === "VERIFIED_BY_TEST");
+    const unverified = evaluations.filter((e) => e.status === "UNVERIFIED");
+    assert.equal(verified.length, 1, `실제 테스트를 지목한 기준이 확인되지 않았습니다: ${JSON.stringify(evaluations)}`);
+    assert.deepEqual(verified[0]!.evidence, ["paginate.test.js"]);
+    // 지목하지 않은 기준은 **끝까지 미확인이다.** 이걸 확인으로 만드는 유일한 방법이 모델에게
+    // 묻는 것이고, 그 순간 product-strategy 9절의 순환 의존이 재현된다.
+    assert.equal(unverified.length, 1, JSON.stringify(evaluations));
   });
 });
 

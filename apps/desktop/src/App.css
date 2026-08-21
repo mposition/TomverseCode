@@ -826,3 +826,21 @@ button.tiny {
   margin-top: 10px;
   padding-top: 8px;
 }
+
+/* 기준 판정 상태별 표식. `✓`는 결정론적 근거가 있을 때만 초록이다 —
+   3.7절이 NOT_CONFIGURED를 통과색으로 그리지 않는 것과 같은 규칙이다. */
+.criterion-VERIFIED_BY_TEST .check-mark {
+  color: var(--ok);
+}
+
+.criterion-CONTRADICTED_BY_TEST .check-mark {
+  color: var(--error);
+}
+
+.criterion-CONFLICTS_WITH_CHANGE .check-mark {
+  color: var(--error);
+}
+
+.criterion-UNVERIFIED .check-mark {
+  color: var(--warn);
+}

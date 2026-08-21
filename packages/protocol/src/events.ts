@@ -39,6 +39,20 @@ export type TaskEventType =
    * **판정자의 판정이 감사 로그에 없으면** Agent Trace가 "왜 이렇게 만들었나"에 답할 수 없다.
    */
   | "USER_DECISION_RECORDED"
+  /**
+   * PLANNING에서 계획이 확정된 기준과 충돌했을 때 (17.3절 규칙 1).
+   *
+   * 재요청하든 그대로 진행하든 **언제나 남긴다** — 예산이 모자라 그냥 진행한 경우가
+   * 사후에 가장 알기 어려운 상태이기 때문이다.
+   */
+  | "CRITERIA_CONFLICT_DETECTED"
+  /**
+   * VERIFYING 직후의 기준별 판정 (17.3절 규칙 2).
+   *
+   * 판정은 매 검증마다 다시 계산되는 파생값이라 여러 번 나올 수 있다. 마지막 것이 최종 보고에
+   * 쓰이며, 이전 것들은 "fix loop 도중에 무엇이 확인/반증됐는가"의 기록으로 남는다.
+   */
+  | "CRITERIA_EVALUATED"
   | "ERROR"
   | "TASK_COMPLETED"
   | "TASK_FAILED"

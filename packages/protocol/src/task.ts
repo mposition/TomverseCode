@@ -1,5 +1,5 @@
 import type { ComplexityTier, ISODateTime } from "./common.js";
-import type { AcceptanceCriterion } from "./decision.js";
+import type { AcceptanceCriterion, CriterionEvaluation } from "./decision.js";
 import type { RoutingDecision } from "./registry.js";
 import type { CommandPolicy } from "./tools.js";
 import type { VerificationReport } from "./verification.js";
@@ -159,6 +159,16 @@ export interface FinalResult {
    * product-strategy.md 9절의 순환 의존이 그대로 재현된다.
    */
   acceptanceCriteria?: AcceptanceCriterion[];
+  /**
+   * 기준별 판정 결과 (17.3절 규칙 2·3).
+   *
+   * **`AcceptanceCriterion`에 상태 필드를 넣지 않고 별도 배열로 둔 이유**: 기준은 사용자가
+   * 확정한 사실이고 판정은 매 검증마다 다시 계산되는 파생값이다. 한 타입에 섞으면 "사용자가
+   * 정한 것"과 "우리가 계산한 것"의 경계가 흐려지고, 언젠가 모델이 그 필드를 채우게 된다.
+   *
+   * 비어 있거나 없으면 **아무것도 확인되지 않았다는 뜻**이다 — 충족했다는 뜻이 아니다.
+   */
+  criterionEvaluations?: CriterionEvaluation[];
   /**
    * 사용자에게 묻지 못한 채 남은 blocking 불일치 — 있으면 보고에 반드시 표시한다.
    * "물어볼 수 없었다"와 "쟁점이 없었다"는 다른 사실이다(17.4절).

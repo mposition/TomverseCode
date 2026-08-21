@@ -191,6 +191,21 @@ export interface UserDecisionInput {
   text: string;
 }
 
+/** 기준 하나에 대한 결정론적 판정 — state-machine-and-protocol.md 17.3절 규칙 2. */
+export type CriterionCheckStatus =
+  | "VERIFIED_BY_TEST"
+  | "CONTRADICTED_BY_TEST"
+  | "CONFLICTS_WITH_CHANGE"
+  | "UNVERIFIED";
+
+export interface CriterionEvaluation {
+  criterionId: string;
+  status: CriterionCheckStatus;
+  /** 왜 그 판정인지. 결정론적 근거만 들어간다 — 화면이 이 문장을 그대로 보여준다. */
+  reason: string;
+  evidence?: string[];
+}
+
 export interface FinalResult {
   taskId: string;
   status: "completed" | "failed" | "cancelled" | "rejected";
@@ -204,6 +219,10 @@ export interface FinalResult {
   acceptanceCriteria?: AcceptanceCriterion[];
   /** 예산이 모자라 묻지 못한 blocking 쟁점 — 있으면 숨기지 않는다(17.4절). */
   unresolvedDisagreements?: string[];
+  /**
+   * 기준별 판정. 비어 있거나 없으면 **아무것도 확인되지 않았다는 뜻**이지 충족했다는 뜻이 아니다.
+   */
+  criterionEvaluations?: CriterionEvaluation[];
 }
 
 export interface WorkspaceInfo {

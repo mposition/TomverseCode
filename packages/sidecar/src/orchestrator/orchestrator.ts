@@ -1,6 +1,7 @@
 import type {
   AcceptanceCriterion,
   ComplexityTier,
+  CriterionEvaluation,
   Disagreement,
   DraftProposal,
   ExperimentControls,
@@ -37,6 +38,12 @@ import { Router, RoutingError, type RouterOptions } from "../routing/router.js";
 import { ToolBridge } from "../tools/bridge.js";
 import { buildDigest } from "../verify/digest.js";
 import { contrastDrafts, fieldLabel, planQuestionRound } from "./contrast.js";
+import {
+  describeEvaluations,
+  evaluateCriteria,
+  findCriteriaConflicts,
+  type CriteriaContext,
+} from "./criteria.js";
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
 import { buildExecutionPlan, PlanningError } from "./planner.js";
 import { triageTask, type TriagePolicy } from "../triage.js";
@@ -111,6 +118,12 @@ export class Orchestrator {
   private baselineReport: VerificationReport | null = null;
   private lastReport: VerificationReport | null = null;
   private appliedDiffs: string[] = [];
+  /**
+   * 이 태스크가 실제로 바꾼 워크스페이스 경로. **계획이 아니라 성공한 실행에서만** 쌓인다 —
+   * 승인 거부나 실패로 적용되지 않은 파일을 "바꿨다"고 세면 기준 판정의 근거가 허구가 된다.
+   * (Rust의 `file_mutations`가 정본이고, 이건 판정에 쓰는 Node 쪽 사본이다.)
+   */
+  private readonly mutatedPaths: string[] = [];
   private answers: { question: string; answer: string }[] = [];
   /**
    * 확정된 기준 목록 — 사용자 판정이 프롬프트 문자열로 끝나지 않게 하는 자리(17.3절).
@@ -126,6 +139,13 @@ export class Orchestrator {
    * 조용히 버리면 "물어볼 수 없었다"와 "쟁점이 없었다"가 최종 보고에서 구별되지 않는다.
    */
   private unresolvedDisagreements: string[] = [];
+  /**
+   * 기준별 판정 (17.3절 규칙 2). VERIFYING마다 **다시 계산**된다 — 기준은 사용자가 확정한
+   * 사실이고 판정은 매 검증의 파생값이라, 누적하면 낡은 판정이 화면에 남는다.
+   */
+  private criterionEvaluations: CriterionEvaluation[] = [];
+  /** 직전 계획이 기준과 충돌해 다시 요청할 때 모델에게 전달할 사유. 재요청 후 비운다. */
+  private criteriaFeedback: string[] = [];
   private pendingQuestion: PendingQuestion | null = null;
   private eventIds: string[] = [];
   /**
@@ -315,24 +335,33 @@ export class Orchestrator {
     const crossVerified = this.routing.activeRoles.includes("reviewer");
 
     // ---- 실행 전 루프: DRAFTING→REVIEWING 또는 SINGLE_MODEL_FIX ----
-    let patch: string;
+    //
+    // 바깥 루프가 하나 더 있는 이유: PLANNING의 기준 게이트가 초안을 되돌릴 수 있다(17.3절
+    // 규칙 1). "기준과 충돌하는 patch는 FIX_LOOP가 아니라 재요청 대상"이므로 실행 이후의
+    // 루프가 아니라 **실행 전 경로로** 돌아가야 하고, 그러려면 여기까지 되감을 자리가 필요하다.
+    // 상한은 `reviseRounds`가 진다 — 실행 전 합의 실패에 이미 배정된 예산이다.
     for (;;) {
-      if (await this.cancelledHere()) return this.finish("cancelled", "분석 중 취소됨");
+      let patch: string;
+      for (;;) {
+        if (await this.cancelledHere()) return this.finish("cancelled", "분석 중 취소됨");
 
-      const outcome = crossVerified ? await this.runCrossVerifiedPath() : await this.runSingleModelPath();
+        const outcome = crossVerified ? await this.runCrossVerifiedPath() : await this.runSingleModelPath();
 
-      if (outcome.kind === "patch") {
-        patch = outcome.patch;
-        break;
+        if (outcome.kind === "patch") {
+          patch = outcome.patch;
+          break;
+        }
+        if (outcome.kind === "final") {
+          return outcome.result;
+        }
+        // outcome.kind === "retry" — 사용자 답변을 받아 DRAFTING으로 재진입한다.
       }
-      if (outcome.kind === "final") {
-        return outcome.result;
-      }
-      // outcome.kind === "retry" — 사용자 답변을 받아 DRAFTING으로 재진입한다.
+
+      // ---- PLANNING → EXECUTING → VERIFYING (fix loop 포함) ----
+      const executed = await this.executeAndVerifyLoop(patch);
+      if (executed.kind === "final") return executed.result;
+      // executed.kind === "redraft" — 기준 게이트가 되돌렸다. 초안부터 다시.
     }
-
-    // ---- PLANNING → EXECUTING → VERIFYING (fix loop 포함) ----
-    return this.executeAndVerifyLoop(patch);
   }
 
   /** DRAFTING → REVIEWING (교차검증 경로) */
@@ -419,6 +448,10 @@ export class Orchestrator {
       });
     }
 
+    // 재요청 사유는 이번 라운드에서 소비했다. 남겨두면 다음 라운드에도 "직전 초안이
+    // 거부됐다"가 붙어 이미 고쳐진 문제를 계속 고치라고 말하게 된다.
+    this.criteriaFeedback = [];
+
     // ---- 구조적 대조 ----
     //
     // 별도 phase를 만들지 않는다(17.1절). 대조는 LLM 호출이 아니라 필드 비교 연산이라
@@ -453,6 +486,9 @@ export class Orchestrator {
             userMessage: this.input.taskRequest.userMessage,
             draft: proposal,
             blind,
+            // 17.1절: 검수자의 역할이 "초안이 옳은지"에서 **"사용자가 고정한 기준이
+            // 반영됐는지 확인"**으로 좁아졌다. 자유 재량보다 훨씬 검증 가능한 역할이다.
+            acceptanceCriteria: this.criteriaForPrompt(),
           },
           ctx
         )
@@ -544,6 +580,10 @@ export class Orchestrator {
           snapshot: this.requireSnapshot(),
           userMessage: this.input.taskRequest.userMessage,
           userAnswers: this.answers.length > 0 ? this.answers : undefined,
+          // 17.3절 규칙 1: 확정된 기준을 프롬프트에 넣는다. 프롬프트가 강제력을 주지는
+          // 않지만(그래서 PLANNING 게이트가 따로 있다), 넣지 않으면 강제할 대상조차 없다.
+          acceptanceCriteria: this.criteriaForPrompt(),
+          criteriaFeedback: this.criteriaFeedback.length > 0 ? [...this.criteriaFeedback] : undefined,
         },
         ctx
       )
@@ -680,6 +720,8 @@ export class Orchestrator {
           snapshot: this.requireSnapshot(),
           userMessage: this.input.taskRequest.userMessage,
           userAnswers: this.answers.length > 0 ? this.answers : undefined,
+          acceptanceCriteria: this.criteriaForPrompt(),
+          criteriaFeedback: this.criteriaFeedback.length > 0 ? [...this.criteriaFeedback] : undefined,
         },
         ctx
       )
@@ -723,11 +765,13 @@ export class Orchestrator {
    *
    * fix loop 상한이 이 루프의 유일한 종료 보장이다.
    */
-  private async executeAndVerifyLoop(initialPatch: string): Promise<FinalResult> {
+  private async executeAndVerifyLoop(
+    initialPatch: string
+  ): Promise<{ kind: "final"; result: FinalResult } | { kind: "redraft" }> {
     let patch = initialPatch;
 
     for (;;) {
-      if (await this.cancelledHere()) return this.finish("cancelled", "실행 중 취소됨");
+      if (await this.cancelledHere()) return { kind: "final", result: await this.finish("cancelled", "실행 중 취소됨") };
 
       // ---- PLANNING ----
       await this.transition("PLANNING");
@@ -745,7 +789,7 @@ export class Orchestrator {
           // 모델이 낸 patch가 계획으로 변환되지 않는다. fix loop를 태울 수 있으면 태운다 —
           // 형태가 잘못된 patch는 검증 결과 없이도 모델에게 알려줄 수 있는 실패다.
           const retry = await this.enterFixLoopForBadPatch(error.message);
-          if (retry.kind === "final") return retry.result;
+          if (retry.kind === "final") return retry;
           patch = retry.patch;
           continue;
         }
@@ -755,7 +799,22 @@ export class Orchestrator {
         planId: plan.planId,
         toolRequests: plan.toolRequests.map((r) => ({ requestId: r.requestId, tool: r.tool, args: describeArgs(r) })),
         approvalRequired: plan.approvalRequired,
+        // 이 계획이 어떤 파일을 건드리는지 — 기준 대조의 근거이므로 로그에도 남는다.
+        changedPaths: planPaths(plan),
       });
+
+      // ---- 기준 게이트 (17.3절 규칙 1) ----
+      //
+      // "확정된 기준을 만족하지 못하는 계획은 만들지 않는다." 판정할 수 있는 것은 **위치**뿐이다
+      // (criteria.ts 참조) — 자유 문장의 충족 여부를 여기서 판정하려면 모델을 불러야 하고,
+      // 그건 9절 순환 의존이다.
+      const gate = await this.checkCriteriaBeforeExecuting(plan);
+      if (gate.kind === "final") return gate;
+      if (gate.kind === "redraft") return { kind: "redraft" };
+      if (gate.kind === "refix") {
+        patch = gate.patch;
+        continue;
+      }
 
       // ---- AWAITING_APPROVAL / EXECUTING ----
       //
@@ -768,15 +827,19 @@ export class Orchestrator {
       await this.transition("EXECUTING");
 
       const execution = await this.executePlan(plan);
-      if (execution.kind === "final") return execution.result;
+      if (execution.kind === "final") return execution;
 
       // ---- VERIFYING (항상 실행된다 — CLAUDE.md 원칙 1) ----
       await this.transition("VERIFYING");
       const report = await this.runVerification("post", this.state.counters.fixLoopRounds);
       this.lastReport = report;
 
+      // 17.3절 규칙 2: build/test/lint 결과 **옆에** 기준 체크리스트를 함께 낸다.
+      // 판정은 전부 결정론적이며, 이을 수 없는 것은 미확인으로 남는다.
+      await this.evaluateCriteriaAgainst(report);
+
       if (report.overall === "pass") {
-        return this.finish("completed", this.describeSuccess(report));
+        return { kind: "final", result: await this.finish("completed", this.describeSuccess(report)) };
       }
 
       // not_verified: 검증 명령이 없어서 판정할 수 없었던 경우.
@@ -786,23 +849,29 @@ export class Orchestrator {
         // 확정 기준도 함께 말한다. 검증 명령이 없는 프로젝트야말로 "무엇을 요구했는지"만
         // 남는 자리이므로, 여기서 기준을 감추면 보고에 아무 내용이 없게 된다.
         const criteria = this.describeCriteria();
-        return this.finish(
-          "completed",
-          "변경을 적용했으나 이 프로젝트에서 실행할 수 있는 검증 명령이 없어 **검증되지 않았습니다**. " +
-            "build/test/lint 스크립트를 추가하면 다음부터 자동으로 검증됩니다." +
-            (criteria ? ` · ${criteria}` : "")
-        );
+        return {
+          kind: "final",
+          result: await this.finish(
+            "completed",
+            "변경을 적용했으나 이 프로젝트에서 실행할 수 있는 검증 명령이 없어 **검증되지 않았습니다**. " +
+              "build/test/lint 스크립트를 추가하면 다음부터 자동으로 검증됩니다." +
+              (criteria ? ` · ${criteria}` : "")
+          ),
+        };
       }
 
       // ---- FIX_LOOP ----
       this.state.counters.fixLoopRounds += 1;
       if (this.state.counters.fixLoopRounds > this.policy.limits.fixLoopRounds) {
         await this.transition("FIX_LOOP");
-        return this.finish(
-          "failed",
-          `검증이 ${this.policy.limits.fixLoopRounds}회 재시도 후에도 실패했습니다. 변경사항은 그대로 남아 있으며 되돌릴 수 있습니다.`,
-          "fix_loop_exhausted"
-        );
+        return {
+          kind: "final",
+          result: await this.finish(
+            "failed",
+            `검증이 ${this.policy.limits.fixLoopRounds}회 재시도 후에도 실패했습니다. 변경사항은 그대로 남아 있으며 되돌릴 수 있습니다.`,
+            "fix_loop_exhausted"
+          ),
+        };
       }
 
       await this.transition("FIX_LOOP");
@@ -814,9 +883,110 @@ export class Orchestrator {
       });
 
       const fixed = await this.requestFix(report);
-      if (fixed.kind === "final") return fixed.result;
+      if (fixed.kind === "final") return fixed;
       patch = fixed.patch;
     }
+  }
+
+  /**
+   * PLANNING 기준 게이트 — 17.3절 규칙 1.
+   *
+   * "확정된 기준을 만족하지 못하는 계획은 만들지 않는다. 기준과 충돌하는 patch가 오면
+   * **FIX_LOOP가 아니라 재요청 대상**이다."
+   *
+   * FIX_LOOP가 아닌 이유를 코드로 옮기면 이렇다: FIX_LOOP의 전제는 "적용된 변경을 검증 결과를
+   * 근거로 고친다"인데, 여기서는 **아직 아무것도 적용되지 않았다.** 실행 후 예산(fixLoopRounds)을
+   * 실행 전 문제에 쓰면 정작 검증이 실패했을 때 쓸 예산이 줄어든다. 그래서 실행 전 합의 실패의
+   * 예산인 `reviseRounds`를 쓰고 초안 단계로 되돌아간다.
+   *
+   * **단, 이미 실행이 시작된 뒤(fix loop 안)라면 되돌리지 않는다.** 초안을 만든 근거인 스냅샷이
+   * 이미 낡았기 때문이다. 그때는 결정론적 사실을 근거로 다시 요청하는 FIX_LOOP 경로가 맞다.
+   */
+  private async checkCriteriaBeforeExecuting(
+    plan: ExecutionPlan
+  ): Promise<
+    | { kind: "ok" }
+    | { kind: "redraft" }
+    | { kind: "refix"; patch: string }
+    | { kind: "final"; result: FinalResult }
+  > {
+    const changedPaths = planPaths(plan);
+    const conflicts = findCriteriaConflicts(this.acceptanceCriteria, changedPaths, this.criteriaContext());
+    if (conflicts.length === 0) return { kind: "ok" };
+
+    await this.emit("CRITERIA_CONFLICT_DETECTED", {
+      conflicts,
+      // 재요청할지 그대로 진행할지는 예산이 정한다. 그 판단 근거도 로그에 남긴다.
+      fixLoopRounds: this.state.counters.fixLoopRounds,
+      reviseRounds: this.state.counters.reviseRounds,
+    });
+
+    const message = conflicts.map((c) => c.message).join(" ");
+
+    // 실행 이후(fix loop 안)라면 초안으로 되돌리지 않는다 — 스냅샷이 낡았다.
+    if (this.state.counters.fixLoopRounds > 0) {
+      const retry = await this.enterFixLoopForBadPatch(message);
+      if (retry.kind === "final") return retry;
+      return { kind: "refix", patch: retry.patch };
+    }
+
+    this.state.counters.reviseRounds += 1;
+    if (this.state.counters.reviseRounds > this.policy.limits.reviseRounds) {
+      // **실패시키지 않는다.** 이 충돌 판정은 문자열 대조 기반의 좁은 규칙이라 틀릴 수 있고,
+      // 휴리스틱으로 태스크를 죽이는 것이 잘못된 계획을 표시하고 진행하는 것보다 낫다는 보장이
+      // 없다. 대신 기준 판정에 `CONFLICTS_WITH_CHANGE`로 남아 최종 보고와 화면에 그대로 나온다.
+      await this.emit("PHASE_CHANGED_NOTE", {
+        note: "기준 충돌이 남아 있으나 재요청 예산을 소진해 그대로 진행합니다",
+        conflicts: conflicts.map((c) => c.criterionId),
+      });
+      return { kind: "ok" };
+    }
+
+    this.criteriaFeedback = conflicts.map((c) => c.message);
+    return { kind: "redraft" };
+  }
+
+  /**
+   * 기준별 판정을 계산해 이벤트로 남긴다 — 17.3절 규칙 2.
+   *
+   * **모델을 부르지 않는다.** 판정은 전부 `criteria.ts`의 결정론적 규칙이며, 통과/실패라는
+   * 사실은 Rust가 만든 리포트에서만 온다. 이 값은 파생이므로 UI가 Rust의 리포트를 옆에 함께
+   * 보여준다 — 이것만 보고 믿지 않도록.
+   */
+  private async evaluateCriteriaAgainst(report: VerificationReport): Promise<void> {
+    if (this.acceptanceCriteria.length === 0) {
+      this.criterionEvaluations = [];
+      return;
+    }
+    this.criterionEvaluations = evaluateCriteria({
+      criteria: this.acceptanceCriteria,
+      report,
+      changedPaths: this.mutatedPaths,
+      context: this.criteriaContext(),
+    });
+    await this.emit("CRITERIA_EVALUATED", {
+      reportId: report.reportId,
+      evaluations: this.criterionEvaluations,
+      // 개수를 payload에 함께 남긴다 — 나중에 "확인된 기준이 왜 늘 0인가"를 집계로 물을 수 있어야 한다.
+      verified: this.criterionEvaluations.filter((e) => e.status === "VERIFIED_BY_TEST").length,
+      unverified: this.criterionEvaluations.filter((e) => e.status === "UNVERIFIED").length,
+    });
+  }
+
+  /**
+   * 프롬프트에 넣을 기준 목록. 비어 있으면 `undefined`를 준다 — 빈 목록을 렌더링하면
+   * "기준 없음"이라는 헤더만 남아 모델에게 잡음이 된다.
+   *
+   * 읽는 쪽에서 재요청 사유(`criteriaFeedback`)를 소비하고 비운다. 남겨두면 다음 라운드에도
+   * "직전 초안이 거부됐다"가 붙어, 이미 고쳐진 문제를 계속 고치라고 말하게 된다.
+   */
+  private criteriaForPrompt(): AcceptanceCriterion[] | undefined {
+    return this.acceptanceCriteria.length > 0 ? [...this.acceptanceCriteria] : undefined;
+  }
+
+  /** 기준 대조의 근거가 되는 워크스페이스 사실. 실재하지 않는 경로는 근거가 될 수 없다. */
+  private criteriaContext(): CriteriaContext {
+    return { workspaceFiles: this.snapshot?.relevantFiles.map((f) => f.path) ?? [] };
   }
 
   /** 계획의 ToolRequest를 순차 실행한다. 재시도 상한은 `toolRetries`. */
@@ -835,6 +1005,10 @@ export class Orchestrator {
         if (result.status === "ok") {
           const diff = extractDiff(result.output);
           if (diff) this.appliedDiffs.push(diff);
+          const path = (request.args as { path?: unknown }).path;
+          if (typeof path === "string" && path.length > 0 && !this.mutatedPaths.includes(path)) {
+            this.mutatedPaths.push(path);
+          }
           break;
         }
 
@@ -1281,16 +1455,21 @@ export class Orchestrator {
   /**
    * 최종 보고의 기준 체크리스트 한 줄(17.3절 구멍 3 / ui-wireframes 3.10절).
    *
-   * **확인된 기준 수를 세지 않고 0으로 고정한다.** 기준↔테스트 자동 연결 방법이 아직 없고,
-   * 모델에게 "이 기준이 충족됐나"를 묻는 순간 product-strategy 9절의 순환 의존이 재현된다.
-   * "확인하지 못했다"를 "충족했다"로 바꾸는 것이 이 제품이 팔려는 것을 파는 행위다.
+   * 확인된 개수는 `criteria.ts`의 **결정론적 판정**에서 온다 — 모델에게 "이 기준이 충족됐나"를
+   * 묻는 순간 product-strategy 9절의 순환 의존이 재현되기 때문이다. 이을 근거가 없으면
+   * 미확인으로 남고, 그건 결함이 아니라 현재 상태의 정직한 표시다.
    */
   private describeCriteria(): string | null {
     if (this.acceptanceCriteria.length === 0) return null;
     const userDecided = this.acceptanceCriteria.filter((c) => c.source === "user_decision").length;
-    const total = this.acceptanceCriteria.length;
     const origin = userDecided > 0 ? `사용자 판정 ${userDecided}개 포함` : "전부 모델 제안";
-    return `기준 ${total}개(${origin}) 중 테스트로 확인된 것 0개 · ${total}개 미확인(기준↔테스트 자동 연결 미구현)`;
+
+    // 판정을 아직 계산하지 못한 경우(검증 전에 끝난 태스크)와 "확인된 것이 0개"인 경우는
+    // 다른 사실이다. 전자를 후자로 말하면 검증이 돌았다고 오해하게 된다.
+    if (this.criterionEvaluations.length === 0) {
+      return `기준 ${this.acceptanceCriteria.length}개(${origin}) · 검증 전에 종료되어 기준 판정 없음`;
+    }
+    return `${describeEvaluations(this.criterionEvaluations)}(${origin})`;
   }
 
   private executorRequester(): ToolRequester {
@@ -1398,6 +1577,8 @@ export class Orchestrator {
       acceptanceCriteria: this.acceptanceCriteria.length > 0 ? [...this.acceptanceCriteria] : undefined,
       unresolvedDisagreements:
         this.unresolvedDisagreements.length > 0 ? [...this.unresolvedDisagreements] : undefined,
+      criterionEvaluations:
+        this.criterionEvaluations.length > 0 ? [...this.criterionEvaluations] : undefined,
       completedAt: new Date().toISOString(),
     };
     await this.emit(eventType, {
@@ -1411,7 +1592,8 @@ export class Orchestrator {
       acceptanceCriteriaCount: this.acceptanceCriteria.length,
       // 확인된 기준 수를 이벤트에도 남긴다. 0인 것이 정상 상태라는 사실을 로그가 말해야
       // 나중에 "왜 전부 미확인이었나"를 되짚을 수 있다.
-      acceptanceCriteriaVerifiedCount: 0,
+      acceptanceCriteriaVerifiedCount: this.criterionEvaluations.filter((e) => e.status === "VERIFIED_BY_TEST")
+        .length,
       unresolvedDisagreementCount: this.unresolvedDisagreements.length,
     });
     return result;
@@ -1477,6 +1659,21 @@ function extractDiff(output: unknown): string | null {
   const record = output as { path?: unknown; bytesBefore?: unknown; bytesAfter?: unknown };
   if (typeof record.path !== "string") return null;
   return `# applied to ${record.path} (${String(record.bytesBefore)} → ${String(record.bytesAfter)} bytes)`;
+}
+
+/**
+ * 이 계획이 건드리는 워크스페이스 상대 경로.
+ *
+ * patch 본문을 다시 파싱하지 않고 **ToolRequest에서 읽는다** — planner가 이미 파일별로 쪼개
+ * 경로를 명시했고(planner.ts), 같은 사실을 두 곳에서 계산하면 어긋날 수 있다.
+ */
+function planPaths(plan: ExecutionPlan): string[] {
+  const paths = new Set<string>();
+  for (const request of plan.toolRequests) {
+    const path = (request.args as { path?: unknown }).path;
+    if (typeof path === "string" && path.length > 0) paths.add(path);
+  }
+  return [...paths];
 }
 
 function describeArgs(request: { tool: string; args: Record<string, unknown> }): Record<string, unknown> {

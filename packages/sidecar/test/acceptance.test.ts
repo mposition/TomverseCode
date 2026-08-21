@@ -207,7 +207,17 @@ test("최종 보고는 기준이 하나도 확인되지 않았음을 미확인�
 
   assert.equal(result.status, "completed");
   assert.match(result.summary, /미확인/, `요약이 미확인을 말하지 않습니다: ${result.summary}`);
-  assert.match(result.summary, /확인된 것 0개/, result.summary);
+  // 확인된 개수는 이제 결정론적 판정에서 나온다(criteria.ts). 이 fixture의 기준은 어떤 테스트도
+  // 지목하지 않으므로 0이어야 한다 — 0이 아니면 이을 근거 없이 확인을 만들어낸 것이다.
+  assert.match(result.summary, /테스트로 확인 0개/, result.summary);
+  const evaluations = result.criterionEvaluations ?? [];
+  assert.equal(evaluations.length, (result.acceptanceCriteria ?? []).length, "기준마다 판정이 하나씩 있어야 합니다");
+  assert.ok(
+    evaluations.every((e) => e.status === "UNVERIFIED"),
+    `이을 근거가 없는데 확인으로 판정됐습니다: ${JSON.stringify(evaluations)}`
+  );
+  // 판정에는 언제나 결정론적 근거 문장이 붙는다 — 화면의 물음표가 결함처럼 보이지 않도록.
+  assert.ok(evaluations.every((e) => e.reason.trim().length > 0));
   // 확인 여부를 담는 필드 자체가 없어야 한다 — 필드가 있으면 언젠가 모델이 그걸 채우게 되고,
   // 그 순간 product-strategy.md 9절의 순환 의존이 재현된다.
   for (const criterion of result.acceptanceCriteria ?? []) {

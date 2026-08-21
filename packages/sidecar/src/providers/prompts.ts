@@ -1,4 +1,4 @@
-import type { DraftProposal, VerificationDigest, WorkspaceSnapshot } from "@tomverse/protocol";
+import type { AcceptanceCriterion, DraftProposal, VerificationDigest, WorkspaceSnapshot } from "@tomverse/protocol";
 
 /**
  * 프롬프트 조립. 어댑터 두 개(OpenAI/Anthropic)가 공유한다 —
@@ -72,10 +72,42 @@ const PATCH_RULES = [
   "Only modify files that appear in the Files section above.",
 ].join("\n");
 
+/**
+ * 확정된 기준 블록 — docs/design/state-machine-and-protocol.md 17.3절 규칙 1.
+ *
+ * **`user_decision`을 위에 따로 두고 "반박 불가"라고 적는다.** 모델 제안(`draft_proposal`)과
+ * 한 목록에 섞으면 둘 다 참고 사항으로 읽히는데, 둘의 권위는 다르다 — 하나는 사용자가 정한
+ * 요구이고 다른 하나는 이전 라운드의 모델이 제안한 후보다(product-strategy.md 16.1절).
+ */
+function renderCriteria(criteria: readonly AcceptanceCriterion[] | undefined): string | null {
+  if (!criteria || criteria.length === 0) return null;
+  const decided = criteria.filter((c) => c.source === "user_decision");
+  const proposed = criteria.filter((c) => c.source !== "user_decision");
+  const parts = ["## Acceptance criteria"];
+
+  if (decided.length > 0) {
+    parts.push(
+      "These were decided by the USER and are not negotiable. A patch that does not satisfy them is wrong,",
+      "no matter how reasonable it looks:",
+      ...decided.map((c) => `- ${c.text}`)
+    );
+  }
+  if (proposed.length > 0) {
+    parts.push(
+      "",
+      "Proposed by an earlier draft (candidates — the user may overrule them):",
+      ...proposed.map((c) => `- ${c.text}`)
+    );
+  }
+  return parts.join("\n");
+}
+
 export function buildDraftPrompt(input: {
   userMessage: string;
   snapshot: WorkspaceSnapshot;
   userAnswers?: { question: string; answer: string }[];
+  acceptanceCriteria?: AcceptanceCriterion[];
+  criteriaFeedback?: string[];
 }): string {
   const parts = [
     "You are the executor in a verification-first coding agent. Your patch will be applied to a real repository and then judged by the project's build/test/lint commands — not by your own confidence.",
@@ -90,6 +122,20 @@ export function buildDraftPrompt(input: {
     );
   }
 
+  const criteria = renderCriteria(input.acceptanceCriteria);
+  if (criteria) parts.push(criteria);
+
+  if (input.criteriaFeedback && input.criteriaFeedback.length > 0) {
+    // **이건 검증 실패가 아니다.** 아직 아무것도 적용되지 않았고, 직전 초안이 사용자가 고정한
+    // 기준과 어긋나 다시 요청하는 것이다. FIX_LOOP 문구와 섞이면 모델이 "이미 적용된 변경을
+    // 고치는" 모드로 읽는다.
+    parts.push(
+      "## Your previous draft was rejected before it was applied\n" +
+        input.criteriaFeedback.map((f) => `- ${f}`).join("\n") +
+        "\nNothing has been applied to the repository. Produce a patch that satisfies the criteria above."
+    );
+  }
+
   parts.push(renderSnapshot(input.snapshot));
   parts.push(`## Output rules\n${PATCH_RULES}`);
   return parts.join("\n\n");
@@ -100,14 +146,27 @@ export function buildReviewPrompt(input: {
   snapshot: WorkspaceSnapshot;
   draft: DraftProposal;
   blind?: boolean;
+  acceptanceCriteria?: AcceptanceCriterion[];
 }): string {
   const parts = [
     "You are an independent reviewer. The draft below was written by a different model, which may be wrong.",
     "Re-derive the root cause yourself from the task and the files, then judge whether the proposed patch actually fixes it.",
     "",
     `## Task\n${input.userMessage}`,
-    renderSnapshot(input.snapshot),
   ];
+
+  // 17.1절: 검수자의 역할이 "초안이 옳은지"에서 **"사용자가 고정한 기준이 반영됐는지"**로
+  // 좁아졌다. 스냅샷보다 앞에 둔다 — 무엇을 확인해야 하는지를 먼저 읽어야 한다.
+  const criteria = renderCriteria(input.acceptanceCriteria);
+  if (criteria) {
+    parts.push(
+      criteria +
+        "\n\nYour first job is to check whether the patch satisfies the USER-decided criteria above." +
+        "\nIf it does not, that alone is grounds for REVISE or REJECT — regardless of whether the patch looks correct otherwise."
+    );
+  }
+
+  parts.push(renderSnapshot(input.snapshot));
 
   if (input.blind) {
     // product-strategy.md 4절 Blind Review — 초안 작성자의 자기설명을 숨겨 anchoring을 줄인다.
@@ -150,6 +209,8 @@ export function buildSingleModelFixPrompt(input: {
   userMessage: string;
   snapshot: WorkspaceSnapshot;
   userAnswers?: { question: string; answer: string }[];
+  acceptanceCriteria?: AcceptanceCriterion[];
+  criteriaFeedback?: string[];
 }): string {
   const parts = [
     "You are fixing a bug alone — this task was classified as low-complexity, so no second model will review your patch before it is applied.",
@@ -162,6 +223,15 @@ export function buildSingleModelFixPrompt(input: {
     parts.push(
       "## Clarifications already provided by the user\n" +
         input.userAnswers.map((a) => `Q: ${a.question}\nA: ${a.answer}`).join("\n\n")
+    );
+  }
+  const fixCriteria = renderCriteria(input.acceptanceCriteria);
+  if (fixCriteria) parts.push(fixCriteria);
+  if (input.criteriaFeedback && input.criteriaFeedback.length > 0) {
+    parts.push(
+      "## Your previous draft was rejected before it was applied\n" +
+        input.criteriaFeedback.map((f) => `- ${f}`).join("\n") +
+        "\nNothing has been applied to the repository."
     );
   }
   parts.push(renderSnapshot(input.snapshot));

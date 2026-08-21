@@ -7,6 +7,7 @@ import {
   STAGE_ORDER,
   type AcceptanceCriterion,
   type ApprovalRequest,
+  type CriterionEvaluation,
   type Disagreement,
   type FinalResult,
   type ProviderStatus,
@@ -78,6 +79,7 @@ export default function App() {
     task: TaskRow;
     events: StoredEvent[];
     criteria: AcceptanceCriterion[];
+    evaluations: CriterionEvaluation[];
   } | null>(null);
   const [storeError, setStoreError] = useState<string | null>(null);
 
@@ -316,7 +318,15 @@ export default function App() {
       // 지난 작업을 다시 열 때도 "무엇을 결정했는가"가 보여야 한다. 여기에는 FinalResult가
       // 없으므로 DB의 파생 캐시를 읽는다 — 이벤트를 재생하지 않는 것이 그 캐시의 존재 이유다.
       if (detail.task) {
-        setSelectedTask({ task: detail.task, events: storedEvents, criteria: detail.acceptanceCriteria ?? [] });
+        setSelectedTask({
+          task: detail.task,
+          events: storedEvents,
+          criteria: detail.acceptanceCriteria ?? [],
+          // **판정은 저장 테이블이 아니라 이벤트 로그에서 복원한다.** 판정은 매 검증의 파생값이라
+          // 캐시 테이블에 두면 어느 시점의 것인지 모호해진다 — 이벤트가 진실의 원천이므로
+          // 마지막 `CRITERIA_EVALUATED`가 그 작업의 최종 판정이다(CLAUDE.md 원칙 7).
+          evaluations: lastCriterionEvaluations(storedEvents),
+        });
       }
     } catch (error) {
       setNotice(`작업을 읽을 수 없습니다: ${String(error)}`);
@@ -607,6 +617,7 @@ export default function App() {
               {finalResult && (
                 <AcceptanceCriteriaPanel
                   criteria={finalResult.acceptanceCriteria ?? []}
+                  evaluations={finalResult.criterionEvaluations}
                   unresolvedDisagreements={finalResult.unresolvedDisagreements}
                 />
               )}
@@ -644,7 +655,7 @@ export default function App() {
             </button>
           </h2>
           <p className="muted small">{selectedTask.task.userMessage}</p>
-          <AcceptanceCriteriaPanel criteria={selectedTask.criteria} />
+          <AcceptanceCriteriaPanel criteria={selectedTask.criteria} evaluations={selectedTask.evaluations} />
           {/* 실시간 로그와 다른 패널에 그린다 — 같은 목록에 섞으면 이벤트가 두 번 보인다. */}
           <EventLog events={selectedTask.events} devMode={devMode} />
         </section>
@@ -653,6 +664,22 @@ export default function App() {
       {approval && <ApprovalModal request={approval} onRespond={respondApproval} />}
     </main>
   );
+}
+
+/**
+ * 저장된 이벤트에서 마지막 기준 판정을 복원한다.
+ *
+ * fix loop를 돌면 `CRITERIA_EVALUATED`가 여러 번 나온다. 최종 보고가 쓰는 것은 마지막 것이고,
+ * 앞의 것들은 "도중에 무엇이 확인/반증됐는가"의 기록이므로 여기서는 마지막만 본다.
+ */
+function lastCriterionEvaluations(events: StoredEvent[]): CriterionEvaluation[] {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i]!;
+    if (event.type !== "CRITERIA_EVALUATED") continue;
+    const evaluations = (event.payload as { evaluations?: CriterionEvaluation[] }).evaluations;
+    if (Array.isArray(evaluations)) return evaluations;
+  }
+  return [];
 }
 
 function statusLabel(status: FinalResult["status"]): string {

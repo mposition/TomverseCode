@@ -121,3 +121,41 @@ export interface UserDecisionInput {
   /** 고른 선택지의 라벨 또는 자유 입력 원문 — 판정의 실제 내용. */
   text: string;
 }
+
+// ---- 11. 기준이 실제로 참조되는 자리 (PLANNING / VERIFYING) ----
+//
+// docs/design/state-machine-and-protocol.md 17.3절 규칙 1·2. 사용자 판정을 기록만 하고
+// 이후 단계가 보지 않으면, 그 판정은 여전히 "소비되는 자리"가 없는 것이다.
+
+/**
+ * 기준 하나에 대한 **결정론적** 판정. 모델 의견은 여기 들어오지 않는다.
+ *
+ * 값이 5개인 이유는 `VerificationStatus`가 3값에서 5값으로 늘어난 것과 같다 —
+ * "확인하지 못했다"를 "충족했다"로도 "위반했다"로도 뭉개지 않기 위해서다.
+ */
+export type CriterionCheckStatus =
+  /** 기준이 지목한 테스트가 실제로 실행됐고, 그 검증이 통과했다. */
+  | "VERIFIED_BY_TEST"
+  /** 기준이 지목한 테스트가 있는데 그 검증이 실패했다. */
+  | "CONTRADICTED_BY_TEST"
+  /** 기준이 지목한 파일을 이번 변경이 하나도 건드리지 않았다 (PLANNING 게이트가 잡는다). */
+  | "CONFLICTS_WITH_CHANGE"
+  /**
+   * 자동으로 이을 근거가 없다. **대부분의 기준이 여기다.**
+   *
+   * 이걸 `VERIFIED_BY_TEST`로 만드는 유일한 방법이 모델에게 묻는 것인데, 그 순간
+   * product-strategy.md 9절의 순환 의존이 그대로 재현된다.
+   */
+  | "UNVERIFIED";
+
+export interface CriterionEvaluation {
+  criterionId: string;
+  status: CriterionCheckStatus;
+  /**
+   * 왜 그 판정인지. **결정론적 근거만 들어간다** — "모델이 그렇게 판단함"은 근거가 아니다.
+   * 화면과 감사 로그가 같은 문장을 쓴다.
+   */
+  reason: string;
+  /** 판정의 근거가 된 구체적 값(테스트 파일 경로, 변경된 파일 경로 등). */
+  evidence?: string[];
+}

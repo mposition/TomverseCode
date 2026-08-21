@@ -1,4 +1,5 @@
 import type {
+  AcceptanceCriterion,
   DraftProposal,
   ModelEntry,
   NormalizedProviderError,
@@ -34,12 +35,35 @@ export interface DraftInput {
   userMessage: string;
   /** AWAITING_USER_INPUT을 거쳐 돌아온 경우의 사용자 답변 */
   userAnswers?: { question: string; answer: string }[];
+  /**
+   * 확정된 기준 (state-machine-and-protocol.md 17.3절 규칙 1).
+   *
+   * `userAnswers`와 **따로** 넘긴다. 답변은 대화 기록이고 기준은 **구속 조건**이라, 프롬프트에서
+   * 같은 자리에 놓으면 모델이 참고 사항으로 읽는다. 프롬프트에 넣는다고 강제력이 생기는 것은
+   * 아니지만(그래서 PLANNING 게이트가 따로 있다), 넣지 않으면 강제할 대상조차 없다.
+   */
+  acceptanceCriteria?: AcceptanceCriterion[];
+  /**
+   * 직전 계획이 기준과 충돌해 다시 요청하는 경우의 사유.
+   *
+   * 검증 실패가 아니라 **실행 전** 사유이므로 FIX_LOOP digest와 섞지 않는다 —
+   * 아직 아무것도 적용되지 않았고, 모델이 "적용된 변경을 고치는" 모드로 읽으면 안 된다.
+   */
+  criteriaFeedback?: string[];
 }
 
 export interface ReviewInput {
   snapshot: WorkspaceSnapshot;
   userMessage: string;
   draft: DraftProposal;
+  /**
+   * 검수자가 확인해야 할 기준 (17.1절 REVIEWING 행).
+   *
+   * 검수자의 역할이 "초안이 옳은지 자유 재량으로 판단"에서 **"사용자가 고정한 기준이 반영됐는지
+   * 확인"**으로 바뀌었다. 자유 재량보다 훨씬 검증 가능한 역할이고, 검수자에게 결정론에 가까운
+   * 기준을 준다(product-strategy.md 16.3절).
+   */
+  acceptanceCriteria?: AcceptanceCriterion[];
   /**
    * Blind Review 여부 (product-strategy.md 4절).
    * true면 초안 작성자의 자기설명(`interpretation`, `risks` 등)을 검수자에게 보여주지 않는다.

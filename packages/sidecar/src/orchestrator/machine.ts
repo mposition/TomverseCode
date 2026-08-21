@@ -49,7 +49,25 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
   // 요청한다"이고, patch 파싱 실패는 모델 의견이 아니라 결정론적 사실이다. 프로토콜의
   // `VerificationKind`에 이미 `diff_review`가 있어 이 실패를 리포트로 표현할 수 있다.
   // 상한도 `fixLoopRounds`를 그대로 공유하므로 새 무한 루프가 생기지 않는다.
-  PLANNING: ["AWAITING_APPROVAL", "EXECUTING", "FIX_LOOP", "CANCELLING", "CANCELLED", "FAILED"],
+  // PLANNING → DRAFTING / SINGLE_MODEL_FIX는 **기준 게이트**의 되돌림이다
+  // (state-machine-and-protocol.md 17.3절 규칙 1).
+  //
+  // 왜 FIX_LOOP를 쓰지 않는가: FIX_LOOP의 전제는 "적용된 변경을 검증 결과를 근거로 고친다"인데,
+  // 이 시점에는 **아직 아무것도 적용되지 않았다.** 실행 후 예산(fixLoopRounds)을 실행 전
+  // 문제에 쓰면 정작 검증이 실패했을 때 쓸 예산이 줄어든다. 그래서 실행 전 합의 실패의 예산인
+  // `reviseRounds`를 쓰고 초안 단계로 되돌아간다 — 상한은 그대로이므로 새 무한 루프는 없다.
+  //
+  // 되돌아가는 대상이 둘인 이유는 경로가 둘이기 때문이다(교차검증 / 단일 모델).
+  PLANNING: [
+    "AWAITING_APPROVAL",
+    "EXECUTING",
+    "FIX_LOOP",
+    "DRAFTING",
+    "SINGLE_MODEL_FIX",
+    "CANCELLING",
+    "CANCELLED",
+    "FAILED",
+  ],
   AWAITING_APPROVAL: ["EXECUTING", "CANCELLING", "CANCELLED", "FAILED"],
   // EXECUTING → EXECUTING은 "다음 ToolRequest"를 뜻한다.
   EXECUTING: ["EXECUTING", "VERIFYING", "CANCELLING", "CANCELLED", "FAILED"],

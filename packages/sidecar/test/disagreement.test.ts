@@ -18,10 +18,14 @@ const WORKSPACE_FILES: FakeHostOptions = {
   files: [
     { path: "package.json", isDir: false, sizeBytes: 40 },
     { path: "src/app.ts", isDir: false, sizeBytes: 30 },
+    // 기준 충돌 판정은 **실재하는 경로**만 근거로 쓴다 — 두 번째 파일이 없으면
+    // "다른 파일을 고치려 한다"는 상황 자체를 만들 수 없다.
+    { path: "src/other.ts", isDir: false, sizeBytes: 30 },
   ],
   contents: {
     "package.json": '{"scripts":{"test":"node --test"}}',
     "src/app.ts": "export const a = 1;\n",
+    "src/other.ts": "export const b = 1;\n",
   },
   gitStatus: "## main",
 };
@@ -52,18 +56,30 @@ function build(
   return { orchestrator, host };
 }
 
+/** src/other.ts를 고치는 patch — 기준이 지목한 파일과 **다른 곳**을 건드리는 계획을 만들 때 쓴다. */
+const OTHER_PATCH = [
+  "--- a/src/other.ts",
+  "+++ b/src/other.ts",
+  "@@ -1,1 +1,1 @@",
+  "-export const b = 1;",
+  "+export const b = 2;",
+  "",
+].join("\n");
+
 /** 초안 payload 하나. 두 실행자가 다른 값을 내도록 스크립트를 만들 때 쓴다. */
 function draftStep(payload: {
   interpretation?: string;
   doneCriteria?: string[];
   targetPaths?: string[];
   requiredTests?: string[];
+  /** 실제 patch. 기준 충돌은 `targetPaths` 서술이 아니라 **patch가 건드리는 파일**로 판정된다. */
+  patch?: string;
 }): FakeScriptStep {
   return {
     kind: "draft",
     payload: {
       interpretation: payload.interpretation ?? "이메일 검증 누락",
-      patch: VALID_PATCH,
+      patch: payload.patch ?? VALID_PATCH,
       plan: [{ stepId: "s1", description: "고친다", targetPaths: payload.targetPaths ?? ["src/app.ts"] }],
       risks: [],
       requiredTests: payload.requiredTests ?? ["app.test.ts"],
@@ -284,6 +300,62 @@ test("재질문 상한을 소진해도 실패하지 않고, 못 물은 쟁점을
   assert.ok((result.unresolvedDisagreements?.length ?? 0) > 0, "묻지 못한 쟁점이 기록되지 않았습니다");
   // 요약이 그 사실을 말한다 — 질문 예산이 모자랐다는 것을 숨기지 않는다.
   assert.match(result.summary, /묻지 못한 쟁점/, result.summary);
+});
+
+test("사용자가 고른 파일을 건드리지 않는 계획은 실행 전에 되돌려진다", async () => {
+  // 17.3절 규칙 1: "기준과 충돌하는 patch가 오면 FIX_LOOP가 아니라 재요청 대상이다."
+  // 1라운드에서 수정 위치가 갈리고, 사용자가 src/app.ts를 고른다. 그런데 두 초안 모두
+  // src/other.ts를 고치는 patch를 낸다 → PLANNING 게이트가 잡아 초안부터 다시 요청한다.
+  const wrongPlace = draftStep({ targetPaths: ["src/other.ts"], doneCriteria: ["A"], patch: OTHER_PATCH });
+  const rightPlace = draftStep({ targetPaths: ["src/app.ts"], doneCriteria: ["A"], patch: VALID_PATCH });
+  const { orchestrator, host } = build({
+    defaultPatch: VALID_PATCH,
+    scriptByModel: twoExecutorScripts(
+      [draftStep({ targetPaths: ["src/app.ts"], doneCriteria: ["A"] }), wrongPlace, rightPlace],
+      [draftStep({ targetPaths: ["src/other.ts"], doneCriteria: ["A"], patch: OTHER_PATCH }), wrongPlace, rightPlace]
+    ),
+  });
+
+  const promise = orchestrator.run();
+  await waitFor(() => disagreementCard(host) !== undefined);
+  const target = disagreementCard(host)!.disagreements.find((d) => d.field === "targetPaths")!;
+  // 사용자가 "src/app.ts"를 고른다.
+  const option = target.question.options.find((o) => o.label.includes("src/app.ts"))!;
+  assert.ok(
+    orchestrator.provideUserInput(option.label, [
+      { disagreementId: target.disagreementId, optionId: option.optionId, text: option.label },
+    ])
+  );
+
+  const result = await promise;
+  assert.equal(result.status, "completed", result.summary);
+
+  // 충돌이 감지됐고, **FIX_LOOP가 아니라** 초안 재요청으로 처리됐다.
+  const conflict = host.events.find((e) => e.type === "CRITERIA_CONFLICT_DETECTED");
+  assert.ok(conflict, `기준 충돌이 감지되지 않았습니다: ${host.eventTypes().join(", ")}`);
+  assert.equal((conflict!.payload as { fixLoopRounds: number }).fixLoopRounds, 0);
+  assert.equal(orchestrator.counters.fixLoopRounds, 0, "실행 전 충돌에 fix loop 예산을 썼습니다");
+  assert.ok(orchestrator.counters.reviseRounds > 0, "실행 전 합의 실패 예산(reviseRounds)이 쓰이지 않았습니다");
+
+  // 되돌린 뒤 나온 계획은 사용자가 고른 파일을 건드린다.
+  const plans = host.events.filter((e) => e.type === "PLAN_CREATED");
+  const lastPlan = plans[plans.length - 1]!.payload as { changedPaths: string[] };
+  assert.deepEqual(lastPlan.changedPaths, ["src/app.ts"]);
+});
+
+test("VERIFYING 뒤에 기준 판정이 계산되고 근거 없는 기준은 미확인으로 남는다", async () => {
+  // 17.3절 규칙 2: 검증 결과 옆에 기준 체크리스트를 함께 낸다. **모델에게 판정시키지 않는다.**
+  const { orchestrator, host } = build({ defaultPatch: VALID_PATCH });
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  const evaluated = host.events.find((e) => e.type === "CRITERIA_EVALUATED");
+  assert.ok(evaluated, "기준 판정이 이벤트로 남지 않았습니다");
+  const payload = evaluated!.payload as { verified: number; evaluations: { status: string; reason: string }[] };
+  // fake 초안의 기준("테스트 통과")은 어떤 테스트 파일도 지목하지 않으므로 확인될 수 없다.
+  assert.equal(payload.verified, 0);
+  assert.ok(payload.evaluations.every((e) => e.status === "UNVERIFIED"));
+  assert.ok(payload.evaluations.every((e) => e.reason.trim().length > 0));
 });
 
 test("공급자가 셋이면 대조와 독립 검수를 동시에 만족한다", async () => {
