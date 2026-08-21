@@ -336,7 +336,14 @@ export interface ProviderTransmission {
   providerId: string;
   calls: number;
   roles: string[];
+  /** **요청한** 모델. 우리가 보낸 값이라 언제나 우리 기대와 같다. */
   models: string[];
+  /** **공급자가 응답했다고 밝힌** 모델. 비어 있으면 "같았다"가 아니라 "모른다"다. */
+  resolvedModels: string[];
+  /** 요청한 모델과 응답한 모델이 다른 호출이 있었는가 — 조용한 대체(product-strategy 6절). */
+  substituted: boolean;
+  /** 공급자 쪽 요청 id. 감사에서 공급자 로그와 대조할 유일한 열쇠다. */
+  providerRequestIds: string[];
   inputTokens: number;
   outputTokens: number;
   costUsd: number;

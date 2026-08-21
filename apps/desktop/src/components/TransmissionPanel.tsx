@@ -54,8 +54,27 @@ export function TransmissionPanel({ transmission }: { transmission: Transmission
               <strong>{p.providerId}</strong> — {p.calls}회 호출, 입력 {p.inputTokens.toLocaleString()} 토큰 / 출력{" "}
               {p.outputTokens.toLocaleString()} 토큰
               <div className="muted small">
-                역할: {p.roles.join(", ") || "(없음)"} · 모델: {p.models.join(", ") || "(없음)"}
+                역할: {p.roles.join(", ") || "(없음)"} · 요청한 모델: {p.models.join(", ") || "(없음)"}
               </div>
+              {/* **조용한 대체를 화면이 지우지 않는다**(product-strategy 6절). 요청한 모델만
+                  보여주면 공급자가 다른 모델로 답한 사실이 사라지는데, 감사 기록에서 그건
+                  빠뜨림이 아니라 거짓말에 가깝다. */}
+              {p.substituted ? (
+                <div className="warn small">
+                  <strong>요청한 것과 다른 모델이 응답했습니다</strong> — 실제 응답:{" "}
+                  {p.resolvedModels.join(", ")}
+                </div>
+              ) : (
+                p.resolvedModels.length > 0 && (
+                  <div className="muted small">응답한 모델: {p.resolvedModels.join(", ")}</div>
+                )
+              )}
+              {/* 비어 있는 것은 "같았다"가 아니라 "모른다"이므로 그렇게 말한다. */}
+              {p.resolvedModels.length === 0 && (
+                <div className="muted small">
+                  응답한 모델을 기록하지 못했습니다 — 같았다는 뜻이 아니라 확인할 수 없다는 뜻입니다.
+                </div>
+              )}
             </li>
           ))}
         </ul>

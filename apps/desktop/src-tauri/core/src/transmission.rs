@@ -38,9 +38,22 @@ pub struct ProviderTransmission {
     pub calls: u64,
     /// 어떤 역할로 불렸는가 (executor / co-executor / reviewer …). 중복 없이 정렬된다.
     pub roles: Vec<String>,
-    /// 요청한 모델. **공급자가 응답한 모델과 다를 수 있다**(조용한 대체) — 그 비교는
-    /// 라우팅 쪽 관심사라 여기서는 요청값만 보여주고, 대체 여부는 이벤트 로그가 답한다.
+    /// **요청한** 모델. 우리가 보낸 값이라 언제나 우리 기대와 같다.
     pub models: Vec<String>,
+    /// **공급자가 응답했다고 밝힌** 모델. 비어 있으면 "같았다"가 아니라 **"기록하기 전이었다"**
+    /// 또는 공급자가 알려주지 않았다는 뜻이다(스키마 v4 이전 행).
+    #[serde(rename = "resolvedModels")]
+    pub resolved_models: Vec<String>,
+    /// 요청한 모델과 응답한 모델이 다른 호출이 있었는가 — **조용한 대체**.
+    ///
+    /// 이걸 화면에 올리는 이유: 감사 기록이 요청값만 남기면 대체가 일어났다는 사실이 지워진다.
+    /// 모르는 것(둘 중 하나가 없음)은 대체로 세지 않는다 — 모름을 사고로 보고하면
+    /// 진짜 사고가 묻힌다.
+    pub substituted: bool,
+    /// 공급자 쪽 요청 id. **감사에서 공급자 로그와 대조할 수 있는 유일한 열쇠다** —
+    /// 우리 `callId`는 우리만 아는 값이라 상대에게 물을 수 없다.
+    #[serde(rename = "providerRequestIds")]
+    pub provider_request_ids: Vec<String>,
     #[serde(rename = "inputTokens")]
     pub input_tokens: u64,
     #[serde(rename = "outputTokens")]
@@ -218,6 +231,18 @@ mod tests {
     }
 
     fn usage(store: &Store, call: &str, role: &str, provider: &str, model: &str, input: i64) {
+        usage_resolved(store, call, role, provider, model, input, Some(model));
+    }
+
+    fn usage_resolved(
+        store: &Store,
+        call: &str,
+        role: &str,
+        provider: &str,
+        model: &str,
+        input: i64,
+        resolved: Option<&str>,
+    ) {
         store
             .record_provider_usage(&json!({
                 "taskId": "task-1",
@@ -225,6 +250,9 @@ mod tests {
                 "role": role,
                 "providerId": provider,
                 "modelId": model,
+                "requestedModelId": model,
+                "resolvedModelId": resolved,
+                "providerRequestId": format!("req-{call}"),
                 "usage": { "inputTokens": input, "outputTokens": 10 },
                 "costUsd": 0.5,
                 "latencyMs": 100,
@@ -257,6 +285,37 @@ mod tests {
 
         assert_eq!(t.sent_files.len(), 2);
         assert!(t.sent_files.iter().any(|f| f.path == "src/big.ts" && f.truncated));
+    }
+
+    /// **조용한 대체를 기록이 지우지 않는다.** `modelId`는 우리가 요청한 값이라 언제나 우리
+    /// 기대와 같으므로, 그것만 남기면 공급자가 다른 모델로 답한 사실이 사라진다.
+    #[test]
+    fn a_silently_substituted_model_is_visible_in_the_trace() {
+        let (_d, mut store) = seeded();
+        snapshot_event(&mut store);
+        usage_resolved(&store, "c1", "executor", "openai", "gpt-x", 100, Some("gpt-x-2026-01"));
+
+        let t = collect(&store, "task-1").unwrap();
+        let p = &t.providers[0];
+        assert_eq!(p.models, vec!["gpt-x"], "요청한 모델");
+        assert_eq!(p.resolved_models, vec!["gpt-x-2026-01"], "실제 응답한 모델");
+        assert!(p.substituted, "대체가 보고되지 않았습니다");
+        // 공급자 로그와 대조할 열쇠도 남는다.
+        assert_eq!(p.provider_request_ids, vec!["req-c1"]);
+    }
+
+    /// **모르는 것을 대체로 세지 않는다.** 스키마 v4 이전 행이나 공급자가 모델을 알려주지 않은
+    /// 호출은 `resolved_model_id`가 NULL이다. 그걸 대체로 보고하면 진짜 대체가 그 안에 묻힌다.
+    #[test]
+    fn an_unknown_resolved_model_is_not_reported_as_substitution() {
+        let (_d, mut store) = seeded();
+        snapshot_event(&mut store);
+        usage_resolved(&store, "c1", "executor", "openai", "gpt-x", 100, None);
+
+        let t = collect(&store, "task-1").unwrap();
+        let p = &t.providers[0];
+        assert!(!p.substituted, "모르는 것을 대체로 보고했습니다");
+        assert!(p.resolved_models.is_empty(), "{:?}", p.resolved_models);
     }
 
     /// **제외된 파일도 이름은 나간다.** 내용이 빠졌다고 아무것도 안 나간 것이 아니다 —

@@ -502,7 +502,15 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
       ctx.artifacts,
     ]) as {
       snapshotTaken: boolean;
-      providers: { providerId: string; calls: number; roles: string[]; inputTokens: number }[];
+      providers: {
+        providerId: string;
+        calls: number;
+        roles: string[];
+        inputTokens: number;
+        models: string[];
+        resolvedModels: string[];
+        substituted: boolean;
+      }[];
       sentFiles: { path: string }[];
       namedOnlyFiles: { path: string }[];
     };
@@ -522,6 +530,18 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
     assert.ok(
       !t.sentFiles.some((f) => f.path.endsWith(".env")),
       `secret 파일 내용이 전송 목록에 있습니다: ${JSON.stringify(t.sentFiles)}`
+    );
+
+    // product-strategy 6절: **공급자가 응답했다고 밝힌 모델**이 기록돼야 한다. 요청값만 남기면
+    // 조용한 대체가 감사 기록에서 지워진다. fake 공급자는 요청한 모델을 그대로 돌려주므로
+    // 여기서는 "기록됐고, 대체는 없었다"가 확인된다 — 기록 자체가 비면 그 구분을 할 수 없다.
+    assert.ok(
+      t.providers.every((p) => p.resolvedModels.length > 0),
+      `응답한 모델이 기록되지 않았습니다: ${JSON.stringify(t.providers)}`
+    );
+    assert.ok(
+      t.providers.every((p) => !p.substituted),
+      `대체가 없었는데 대체로 보고됐습니다: ${JSON.stringify(t.providers)}`
     );
   });
 });

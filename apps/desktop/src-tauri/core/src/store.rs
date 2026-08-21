@@ -24,7 +24,7 @@ use std::path::Path;
 /// 과정에서 잃는 것은 "append-only 진실의 원천"이라는 약속을 깨는 것이다.
 ///
 /// v3(M1): `acceptance_criteria` — 사용자 판정의 파생 캐시(문서 17.3절). 역시 additive다.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Store {
     conn: Connection,
@@ -161,6 +161,9 @@ impl Store {
         }
         if current < 3 {
             tx.execute_batch(SCHEMA_V3)?;
+        }
+        if current < 4 {
+            tx.execute_batch(SCHEMA_V4)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -533,6 +536,14 @@ impl Store {
     /// (작업 지침 4.4절: secret 원문을 DB나 로그에 남기지 않는다).
     pub fn record_provider_usage(&self, usage: &serde_json::Value) -> Result<()> {
         let get_str = |k: &str| usage.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // 없는 값은 NULL이다 — 아래 INSERT 주석 참조.
+        let opt_str = |k: &str| {
+            usage
+                .get(k)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.trim().is_empty())
+                .map(str::to_string)
+        };
         let get_u64 = |path: &[&str]| -> i64 {
             let mut cur = usage;
             for key in path {
@@ -545,8 +556,9 @@ impl Store {
         };
         self.conn.execute(
             "INSERT INTO provider_usage (task_id, call_id, role, provider_id, model_id,
-                                         input_tokens, output_tokens, cost_usd, latency_ms, attempt, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                         input_tokens, output_tokens, cost_usd, latency_ms, attempt, created_at,
+                                         requested_model_id, resolved_model_id, provider_request_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 get_str("taskId"),
                 get_str("callId"),
@@ -559,6 +571,11 @@ impl Store {
                 get_u64(&["latencyMs"]),
                 get_u64(&["attempt"]),
                 now_iso(),
+                // **빈 문자열이 아니라 NULL로 둔다.** 빈 문자열은 "그런 모델 이름"이 되어
+                // 집계에 섞이지만, NULL은 "모른다"로 남아 구별된다.
+                opt_str("requestedModelId"),
+                opt_str("resolvedModelId"),
+                opt_str("providerRequestId"),
             ],
         )?;
         Ok(())
@@ -577,7 +594,15 @@ impl Store {
                     SUM(output_tokens),
                     COALESCE(SUM(cost_usd), 0.0),
                     GROUP_CONCAT(DISTINCT role),
-                    GROUP_CONCAT(DISTINCT model_id)
+                    GROUP_CONCAT(DISTINCT model_id),
+                    GROUP_CONCAT(DISTINCT resolved_model_id),
+                    GROUP_CONCAT(DISTINCT provider_request_id),
+                    -- **둘 다 아는 행에서만** 대체를 센다. 한쪽이 NULL이면 모르는 것이고,
+                    -- 모름을 대체로 보고하면 진짜 대체가 그 안에 묻힌다.
+                    SUM(CASE WHEN resolved_model_id IS NOT NULL
+                              AND requested_model_id IS NOT NULL
+                              AND resolved_model_id <> requested_model_id
+                             THEN 1 ELSE 0 END)
              FROM provider_usage
              WHERE task_id = ?1
              GROUP BY provider_id
@@ -604,6 +629,9 @@ impl Store {
                 cost_usd: row.get(4)?,
                 roles: split(row.get(5)?),
                 models: split(row.get(6)?),
+                resolved_models: split(row.get(7)?),
+                provider_request_ids: split(row.get(8)?),
+                substituted: row.get::<_, i64>(9)? > 0,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1409,6 +1437,26 @@ CREATE TABLE IF NOT EXISTS acceptance_criteria (
 CREATE INDEX IF NOT EXISTS idx_acceptance_criteria_task ON acceptance_criteria(task_id);
 "#;
 
+/// v4 (M1) — **공급자가 실제로 응답한 모델**. product-strategy 6절 "Agent Trace 완성".
+///
+/// # 왜 필요한가 — 요청한 모델만 남기면 감사 기록이 거짓말을 한다
+///
+/// `model_id`는 우리가 **요청한** 값이라 언제나 우리 기대와 같다. 그걸로 "이 모델이 답했다"고
+/// 기록하면, 공급자가 조용히 다른 모델로 대체했을 때 로그가 그 사실을 지운다. sidecar는 이미
+/// 응답 envelope에서 `providerReportedModelId`를 뽑아 보내고 있었는데(`usage.record` payload),
+/// **DB 경계에서 버려지고 있었다.** 보내는 쪽은 맞았고 받는 쪽이 빠져 있었다.
+///
+/// `provider_request_id`를 함께 두는 이유: 감사에서 공급자 로그와 대조할 열쇠가 그것뿐이다.
+/// 우리 `call_id`는 우리만 아는 값이라 상대에게 물을 수 없다.
+///
+/// **전부 추가 연산이다**(16.4절 규칙). 기존 행은 NULL로 남고, NULL은 "다른 모델이었다"가
+/// 아니라 **"기록하기 전이었다"**를 뜻한다 — 그 구별을 집계가 지켜야 한다.
+const SCHEMA_V4: &str = r#"
+ALTER TABLE provider_usage ADD COLUMN requested_model_id TEXT;
+ALTER TABLE provider_usage ADD COLUMN resolved_model_id  TEXT;
+ALTER TABLE provider_usage ADD COLUMN provider_request_id TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1479,6 +1527,52 @@ mod tests {
         let task = store.get_task("old-task").unwrap().unwrap();
         assert_eq!(task.current_phase, "EXECUTING");
         assert!(task.workspace_path.is_none());
+    }
+
+    /// v3 DB를 v4로 올려도 기존 사용량 기록이 살아 있어야 한다. 그리고 **새 컬럼은 NULL**이며,
+    /// NULL은 "요청한 모델과 같았다"가 아니라 **"기록하기 전이었다"**를 뜻한다 —
+    /// 그 구별을 집계가 지키지 않으면 옛 기록이 전부 "대체 없음"으로 보고된다.
+    #[test]
+    fn migration_from_v3_keeps_usage_rows_and_leaves_new_columns_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let artifacts = ArtifactStore::new(dir.path().join("artifacts")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.pragma_update(None, "user_version", 3i64).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces VALUES ('ws-1', '/tmp/ws', 'ws', '{}', '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('sess-1', 'ws-1', NULL, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO provider_usage (task_id, call_id, role, provider_id, model_id,
+                                             input_tokens, output_tokens, cost_usd, latency_ms, attempt, created_at)
+                 VALUES ('old-task', 'c1', 'executor', 'openai', 'gpt-old', 10, 5, 0.1, 20, 1,
+                         '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db, artifacts).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let rows = store.provider_transmission("old-task").unwrap();
+        assert_eq!(rows.len(), 1, "마이그레이션이 기존 사용량 기록을 잃었습니다");
+        assert_eq!(rows[0].models, vec!["gpt-old"]);
+        assert!(
+            rows[0].resolved_models.is_empty(),
+            "옛 행에 응답 모델이 있을 수 없습니다"
+        );
+        assert!(!rows[0].substituted, "모르는 것을 대체로 보고했습니다");
     }
 
     #[test]

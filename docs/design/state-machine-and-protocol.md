@@ -899,6 +899,17 @@ CANCELLED로 **확정**해 사용자를 놓아준다. 프로세스를 죽이지�
 | `file_mutations` | `mutation_id`, `rollback_status`, `rolled_back_at` | 무엇이 아직 남아 있고 무엇이 되돌려졌는지 |
 | (신규) `verification_checks` | 체크별 행 | "test가 몇 번 실패했나"를 JSON 파싱 없이 질의 |
 
+#### 스키마 v4 — 응답한 모델 (M1)
+
+`SCHEMA_VERSION = 4`. 역시 **전부 추가 연산**이다.
+
+| 대상 | 추가 | 이유 |
+|---|---|---|
+| `provider_usage` | `requested_model_id`, `resolved_model_id`, `provider_request_id` | 요청한 모델만 남기면 **조용한 대체가 기록에서 지워진다**(product-strategy 6.1절). 공급자 요청 id는 감사에서 상대 로그와 대조할 유일한 열쇠다 |
+
+기존 행의 새 컬럼은 NULL이고, **NULL은 "같았다"가 아니라 "기록하기 전이었다"**를 뜻한다.
+집계가 그 구별을 지키지 않으면 옛 기록이 전부 "대체 없음"으로 보고된다.
+
 ### 16.5 트랜잭션 규칙
 
 **레코드와 그 이벤트는 같은 트랜잭션에 쓴다.** 이벤트 없이 상태가 바뀌거나, 상태 없이 이벤트만
