@@ -211,6 +211,79 @@ pub struct CardAnswers {
     pub cards_by_size: BTreeMap<u64, u64>,
 }
 
+/// 이 워크스페이스의 커밋이 **몇 개 파일을 담아 왔는가** — 19.6절 "커밋 단위"의 남은 항목.
+///
+/// 모집단은 `GIT_COMMIT_CREATED`가 있는 태스크뿐이다. 커밋하지 않은 태스크는 "커밋이 크다"라는
+/// 질문의 대상이 아니므로 넣으면 분포가 작은 쪽으로 휜다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct CommitSizes {
+    /// 분포에 들어간 커밋 수.
+    pub commits: u64,
+    #[serde(rename = "p50Files")]
+    pub p50_files: Option<u64>,
+    #[serde(rename = "p90Files")]
+    pub p90_files: Option<u64>,
+    #[serde(rename = "maxFiles")]
+    pub max_files: Option<u64>,
+}
+
+/// 표본이 부족할 때 "이 계획은 크다"고 볼 파일 수.
+///
+/// **이 값만은 유도하지 못했다.** 취소 소요와 달리 "정상 범위"를 관측에서 끌어낼 수 없는
+/// 첫 사용자가 있고, 그때 쓸 숫자가 필요하다. 승인 모달에서 눈으로 훑을 수 있는 변경의
+/// 크기를 어림한 것이며 **실측이 아니다.** 이 사실을 주석에 적어두는 이유는, 근거 없는 숫자가
+/// 근거 있는 숫자와 코드에서 구별되지 않기 때문이다.
+pub const DEFAULT_LARGE_CHANGE_FILES: u64 = 8;
+
+/// 유도한 임계값의 하한/상한.
+///
+/// 하한(3)보다 낮으면 거의 모든 작업에 안내가 떠서 읽히지 않고, 상한(50)보다 높으면 사실상
+/// 뜨지 않는다. 안내가 없는 것과 언제나 있는 것은 사용자에게 같은 것이다.
+pub const MIN_LARGE_CHANGE_FILES: u64 = 3;
+pub const MAX_LARGE_CHANGE_FILES: u64 = 50;
+
+/// 표본이 이만큼 쌓이기 전에는 관측값을 쓰지 않는다.
+pub const MIN_COMMIT_SIZE_SAMPLES: u64 = 10;
+
+/// "이 계획은 이 워크스페이스 기준으로 큰가"의 문턱과 **그 값이 어디서 왔는지**.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LargeChangeThreshold {
+    pub files: u64,
+    /// `measured` | `default_insufficient_samples`
+    pub source: &'static str,
+    #[serde(rename = "sampleCount")]
+    pub sample_count: u64,
+    #[serde(rename = "minSamples")]
+    pub min_samples: u64,
+}
+
+/// 관측된 커밋 크기에서 "크다"의 문턱을 정한다.
+///
+/// # 왜 max가 아니라 p90인가
+///
+/// 취소 소요(16.3절)에서는 max를 썼다. 거기서 답할 질문은 "이 취소가 **비정상**인가"였고,
+/// 정상 취소 중에 탈출구가 뜨는 것은 거짓 경보였기 때문이다.
+///
+/// 여기서 답할 질문은 다르다. "이 작업이 **이 워크스페이스 기준으로 큰 편인가**"이고, 큰 편인
+/// 것은 비정상이 아니다. 안내는 막지 않고 사실만 말하므로 가끔 떠도 손해가 작다. max를 쓰면
+/// 지금까지 가장 컸던 작업보다 커야만 뜨는데, 그러면 사실상 아무 때도 뜨지 않는다.
+pub fn suggest_large_change_files(sizes: &CommitSizes) -> LargeChangeThreshold {
+    match sizes.p90_files {
+        Some(p90) if sizes.commits >= MIN_COMMIT_SIZE_SAMPLES => LargeChangeThreshold {
+            files: p90.clamp(MIN_LARGE_CHANGE_FILES, MAX_LARGE_CHANGE_FILES),
+            source: "measured",
+            sample_count: sizes.commits,
+            min_samples: MIN_COMMIT_SIZE_SAMPLES,
+        },
+        _ => LargeChangeThreshold {
+            files: DEFAULT_LARGE_CHANGE_FILES,
+            source: "default_insufficient_samples",
+            sample_count: sizes.commits,
+            min_samples: MIN_COMMIT_SIZE_SAMPLES,
+        },
+    }
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Metrics {
     pub coverage: CriteriaCoverage,
@@ -218,6 +291,11 @@ pub struct Metrics {
     pub cancellation: CancellationLatency,
     #[serde(rename = "cardAnswers")]
     pub card_answers: CardAnswers,
+    #[serde(rename = "commitSizes")]
+    pub commit_sizes: CommitSizes,
+    /// 관측에서 유도한 "큰 변경" 문턱. **집계 결과이지 설정이 아니다.**
+    #[serde(rename = "largeChangeThreshold")]
+    pub large_change_threshold: Option<LargeChangeThreshold>,
     /// 관측에서 유도한 강제 포기 임계값. **집계 결과이지 설정이 아니다** —
     /// 데이터가 없으면 기본값과 그 사실을 그대로 돌려준다.
     #[serde(rename = "forceAbandonThreshold")]
@@ -235,6 +313,7 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
 
     let mut metrics = Metrics::default();
     let mut latencies: Vec<u64> = Vec::new();
+    let mut commit_files: Vec<u64> = Vec::new();
     for (task_id, terminal_status) in &tasks {
         metrics.tasks_scanned += 1;
         let events = store
@@ -304,6 +383,17 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
             }
         }
 
+        // ---- 커밋 크기: GIT_COMMIT_CREATED의 paths 개수 ----
+        if let Some(files) = events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == "GIT_COMMIT_CREATED")
+            .and_then(|e| e.payload.get("paths").and_then(Value::as_array))
+            .map(|paths| paths.len() as u64)
+        {
+            commit_files.push(files);
+        }
+
         // ---- 카드 답변: 자리별 분포 ----
         collect_card_answers(&events, &mut metrics.card_answers);
 
@@ -322,6 +412,14 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     }
 
     finalize_latency(&mut metrics.cancellation, &mut latencies);
+
+    commit_files.sort_unstable();
+    metrics.commit_sizes.commits = commit_files.len() as u64;
+    metrics.commit_sizes.p50_files = percentile(&commit_files, 50);
+    metrics.commit_sizes.p90_files = percentile(&commit_files, 90);
+    metrics.commit_sizes.max_files = commit_files.last().copied();
+    metrics.large_change_threshold = Some(suggest_large_change_files(&metrics.commit_sizes));
+
     metrics.force_abandon_threshold = Some(suggest_force_abandon_ms(&metrics.cancellation));
     Ok(metrics)
 }
@@ -651,6 +749,101 @@ mod tests {
         let m = collect(&store, None).unwrap();
         assert!(m.card_answers.by_position.is_empty(), "{:?}", m.card_answers);
         assert!(m.card_answers.cards_by_size.is_empty(), "{:?}", m.card_answers);
+    }
+
+    fn commit_of(store: &mut Store, task_id: &str, files: usize) {
+        let paths: Vec<String> = (0..files).map(|i| format!("src/f{i}.ts")).collect();
+        store
+            .append_event(task_id, "GIT_COMMIT_CREATED", &json!({ "sha": "abc", "paths": paths }))
+            .unwrap();
+    }
+
+    /// 커밋하지 않은 태스크는 **"커밋이 크다"라는 질문의 대상이 아니다.** 넣으면 분포가
+    /// 작은 쪽으로 휘어 문턱이 낮아지고, 안내가 아무 때나 뜬다.
+    #[test]
+    fn only_committed_tasks_enter_the_commit_size_distribution() {
+        let (_d, mut store) = seeded();
+        commit_of(&mut store, "task-1", 5);
+        store
+            .create_task("task-2", "sess-1", "ws-1", "/tmp/ws", "fast", "fix")
+            .unwrap();
+        // task-2는 커밋하지 않았다.
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.tasks_scanned, 2);
+        assert_eq!(m.commit_sizes.commits, 1);
+        assert_eq!(m.commit_sizes.max_files, Some(5));
+    }
+
+    /// 표본이 부족하면 관측값을 쓰지 않고, **그 사실을 source로 말한다.**
+    #[test]
+    fn large_change_threshold_falls_back_to_the_default_until_there_are_enough_commits() {
+        let (_d, mut store) = seeded();
+        commit_of(&mut store, "task-1", 30);
+
+        let t = collect(&store, None).unwrap().large_change_threshold.unwrap();
+        assert_eq!(t.files, DEFAULT_LARGE_CHANGE_FILES);
+        assert_eq!(t.source, "default_insufficient_samples");
+        assert_eq!(t.sample_count, 1);
+    }
+
+    /// 표본이 쌓이면 p90에서 유도한다. **max가 아닌 이유**: "큰 편인가"는 "비정상인가"와 다른
+    /// 질문이고, max를 쓰면 지금까지 가장 컸던 작업보다 커야만 떠서 사실상 뜨지 않는다.
+    #[test]
+    fn large_change_threshold_comes_from_the_ninetieth_percentile() {
+        let (_d, mut store) = seeded();
+        let mut add = |store: &mut Store, index: usize, files: usize| {
+            let id = format!("t{index}");
+            store
+                .create_task(&id, "sess-1", "ws-1", "/tmp/ws", "fast", "fix")
+                .unwrap();
+            commit_of(store, &id, files);
+        };
+        for i in 0..8 {
+            add(&mut store, i, 4);
+        }
+        // **이상치 하나는 p90을 움직이지 못한다.** max를 쓰지 않는 이유가 이것이다 —
+        // 한 번의 큰 작업이 앞으로의 모든 안내를 꺼버리면 안 된다.
+        add(&mut store, 8, 20);
+        add(&mut store, 9, 4);
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.commit_sizes.commits, 10);
+        assert_eq!(m.commit_sizes.p50_files, Some(4));
+        assert_eq!(m.commit_sizes.max_files, Some(20));
+        assert_eq!(
+            m.large_change_threshold.as_ref().unwrap().files,
+            4,
+            "이상치 하나가 문턱을 끌어올렸습니다"
+        );
+
+        // 큰 작업이 둘이 되면(10건 중 2건) 그때는 p90이 따라 올라간다 — 드물지 않은 크기라는 뜻이다.
+        add(&mut store, 10, 20);
+        add(&mut store, 11, 4);
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.commit_sizes.commits, 12);
+        let t = m.large_change_threshold.unwrap();
+        assert_eq!(t.source, "measured");
+        assert_eq!(t.files, 20);
+    }
+
+    /// 이상치 하나로 문턱이 사실상 사라지지 않는다. 안내가 없는 것과 언제나 있는 것은
+    /// 사용자에게 같은 것이다.
+    #[test]
+    fn large_change_threshold_is_clamped_at_both_ends() {
+        let huge = CommitSizes {
+            commits: 20,
+            p90_files: Some(5_000),
+            ..CommitSizes::default()
+        };
+        assert_eq!(suggest_large_change_files(&huge).files, MAX_LARGE_CHANGE_FILES);
+
+        let tiny = CommitSizes {
+            commits: 20,
+            p90_files: Some(1),
+            ..CommitSizes::default()
+        };
+        assert_eq!(suggest_large_change_files(&tiny).files, MIN_LARGE_CHANGE_FILES);
     }
 
     #[test]

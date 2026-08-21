@@ -301,6 +301,26 @@ export interface ForceAbandonThreshold {
 }
 
 /**
+ * "이 계획은 이 워크스페이스 기준으로 큰가"의 문턱 (19.6절).
+ *
+ * 파일 수로 재는 이유: 커밋 하나가 담는 것이 파일이고, 되돌리기가 전부-아니면-전무인 단위도
+ * 그 커밋이다. 줄 수로 재면 한 파일의 큰 변경과 여러 파일의 작은 변경이 같아 보이는데,
+ * 태스크를 쪼개는 문제에서 그 둘은 전혀 다르다.
+ */
+export interface LargeChangeThreshold {
+  files: number;
+  source: "measured" | "default_insufficient_samples";
+  sampleCount: number;
+  minSamples: number;
+}
+
+/** `derived_thresholds`가 돌려주는 것. 문턱은 워크스페이스를 열 때 한 번만 읽는다. */
+export interface DerivedThresholds {
+  forceAbandon: ForceAbandonThreshold | null;
+  largeChange: LargeChangeThreshold | null;
+}
+
+/**
  * 자유 텍스트에서 발견된 자격증명 **모양의 이름과 개수** (17.11절).
  *
  * 값 자체는 담기지 않는다 — UI는 이미 그 텍스트를 갖고 있고, 프로세스 경계를 넘는 곳마다

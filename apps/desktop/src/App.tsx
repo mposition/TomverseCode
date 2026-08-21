@@ -11,7 +11,9 @@ import {
   type Disagreement,
   type DraftNarrative,
   type FinalResult,
+  type DerivedThresholds,
   type ForceAbandonThreshold,
+  type LargeChangeThreshold,
   type ProviderStatus,
   type RevertOutcome,
   type SecretShapeHit,
@@ -57,6 +59,15 @@ import { VerificationPanel } from "./components/VerificationPanel";
  * 것이 아니라 근거를 붙이는 것이다.
  */
 const DEFAULT_FORCE_ABANDON_AFTER_MS = 5_000;
+
+/**
+ * 표본이 없을 때 "큰 변경"으로 볼 파일 수 (19.6절).
+ *
+ * **Rust의 `DEFAULT_LARGE_CHANGE_FILES`와 같은 값이어야 한다.** 두 곳에 두는 이유는 문턱을
+ * 읽지 못했을 때도 화면이 동작해야 하기 때문이고, 값이 갈리면 같은 상황에서 안내가 떴다
+ * 안 떴다 한다. 한쪽을 고칠 때 다른 쪽도 볼 것.
+ */
+const DEFAULT_LARGE_CHANGE_FILES = 8;
 
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
@@ -113,6 +124,17 @@ export default function App() {
   // 실제로 쓰는 값. 측정값이 없으면 기본값으로 돌아간다 — 화면이 임계값 없이 도는 상태를
   // 만들지 않기 위해서다(탈출구가 아예 안 뜨는 것이 이 기능이 고치려던 문제였다).
   const forceAbandonMs = forceAbandonAfter?.ms ?? DEFAULT_FORCE_ABANDON_AFTER_MS;
+  const [largeChange, setLargeChange] = useState<LargeChangeThreshold | null>(null);
+  /**
+   * 이번 계획이 건드리는 파일 — 19.6절 "커밋 단위"의 남은 항목.
+   *
+   * **계획 시점에 잡는다.** 커밋을 보고 "컸네"라고 말하는 것은 이미 늦었다 — 그때는 파일이
+   * 다 바뀐 뒤라 쪼갤 수 있는 것이 없다. 쪼개려면 실행 전이어야 한다.
+   */
+  const [plannedPaths, setPlannedPaths] = useState<string[]>([]);
+  // 실제로 쓰는 문턱. 측정값이 없으면 기본값이며, **그 사실은 개발자 모드에서만 노출한다** —
+  // 일반 사용자에게 "이 숫자가 어디서 왔는가"는 필요 없는 정보다.
+  const largeChangeFiles = largeChange?.files ?? DEFAULT_LARGE_CHANGE_FILES;
   // 보내기 전 자격증명 경고(17.11절). 요청문과 답변은 **그대로 프롬프트에 실려 나가므로**,
   // 저장 시 마스킹으로는 막을 수 없다 — 막을 수 있는 것은 보내기 전의 사용자뿐이다.
   const messageSecrets: SecretShapeHit[] = useSecretShapeScan(message);
@@ -224,6 +246,11 @@ export default function App() {
       // 프로세스가 실제로 죽었다는 사실은 호스트만 알고, 그 사실이 이벤트로 온다.
       if (payload.type.startsWith("TASK_") && payload.type !== "TASK_CREATED") setCancelling(false);
       // 확인 카드가 떠 있는 채로 취소되면 답변 입력창이 남는다.
+      if (payload.type === "PLAN_CREATED") {
+        const plan = payload.payload as { changedPaths?: string[]; purpose?: string };
+        // 커밋 계획은 파일을 바꾸지 않는다 — 여기 섞으면 "이 작업이 무엇을 바꾸는가"가 흐려진다.
+        if (plan.purpose !== "git_commit") setPlannedPaths(plan.changedPaths ?? []);
+      }
       if (payload.type === "GIT_COMMIT_CREATED") {
         const p = payload.payload as { sha?: string | null; branch?: string };
         setCommit({ sha: p.sha ?? null, branch: p.branch ?? "(unknown)" });
@@ -255,12 +282,12 @@ export default function App() {
       // **실패해도 작업을 막지 않는다.** 이건 편의 값이고, 없으면 기본값으로 돌아가면 된다 —
       // 계측을 읽지 못했다고 워크스페이스를 못 열게 하는 것은 꼬리가 몸통을 흔드는 것이다.
       try {
-        const measured = await invoke<{ threshold: ForceAbandonThreshold }>("force_abandon_threshold", {
-          workspacePath: info.rootPath,
-        });
-        setForceAbandonAfter(measured.threshold ?? null);
+        const measured = await invoke<DerivedThresholds>("derived_thresholds", { workspacePath: info.rootPath });
+        setForceAbandonAfter(measured.forceAbandon ?? null);
+        setLargeChange(measured.largeChange ?? null);
       } catch {
         setForceAbandonAfter(null);
+        setLargeChange(null);
       }
     } catch (error) {
       setOpenError(String(error));
@@ -278,6 +305,7 @@ export default function App() {
     setCommit(null);
     setQuestions(null);
     setNotice(null);
+    setPlannedPaths([]);
     setSelectedTask(null);
     setPhase("CREATED");
     startedAt.current = Date.now();
@@ -702,6 +730,33 @@ export default function App() {
               </div>
             )}
           </section>
+
+          {/* **커밋이 커서 문제라면 고칠 곳은 커밋이 아니라 요청 단위다**(19.6절).
+              커밋을 보고 "컸네"라고 말하는 것은 이미 늦다 — 그때는 파일이 다 바뀐 뒤라
+              쪼갤 수 있는 것이 없다. 그래서 계획 시점에, 아직 취소할 수 있을 때 말한다.
+
+              **막지 않는다.** 파일 30개를 건드리는 이름 바꾸기는 정당하게 한 작업이고,
+              무엇이 한 작업인지는 우리가 판정할 수 없다. 사실만 말하고 판단은 넘긴다. */}
+          {running && allowGitCommit && plannedPaths.length >= largeChangeFiles && (
+            <div className="warn small">
+              <p>
+                이 계획은 <strong>{plannedPaths.length}개 파일</strong>을 바꿉니다. 검증을 통과하면{" "}
+                <strong>커밋 하나</strong>로 남고, 나중에 되돌릴 때도 전부 아니면 전무입니다.
+              </p>
+              <p>
+                관심사가 섞여 있다면 지금 취소하고 더 작게 나눠 요청하는 편이 낫습니다 — 커밋을 쪼개는 것은 이 앱이
+                하지 않습니다. 조각마다 테스트를 돌린 적이 없어 <strong>"검증 통과"를 말할 수 없기</strong> 때문입니다.
+              </p>
+              {devMode && (
+                <p className="muted">
+                  문턱 {largeChangeFiles}개 —{" "}
+                  {largeChange?.source === "measured"
+                    ? `이 워크스페이스의 커밋 ${largeChange.sampleCount}건에서 유도(p90)`
+                    : `표본 부족(${largeChange?.sampleCount ?? 0}/${largeChange?.minSamples ?? 0})으로 기본값`}
+                </p>
+              )}
+            </div>
+          )}
 
           <StageBar current={stage} stages={STAGE_ORDER} phase={phase} devMode={devMode} />
           {notice && <p className="notice">{notice}</p>}
