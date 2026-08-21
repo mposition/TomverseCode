@@ -9,6 +9,7 @@ import {
   type ApprovalRequest,
   type CriterionEvaluation,
   type Disagreement,
+  type DraftNarrative,
   type FinalResult,
   type ForceAbandonThreshold,
   type ProviderStatus,
@@ -93,6 +94,8 @@ export default function App() {
    * 경우 vs 두 모델이 다른 답을 낸 경우), 같은 컴포넌트로 그리면 그 구별이 사라진다.
    */
   const [disagreements, setDisagreements] = useState<Disagreement[]>([]);
+  // 자유 서술은 질문이 아니라 참고 자료다 — 별도 상태로 두는 것이 그 사실의 표현이다(17.12절).
+  const [narratives, setNarratives] = useState<DraftNarrative[]>([]);
   const [answer, setAnswer] = useState("");
   const [devMode, setDevMode] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -203,13 +206,19 @@ export default function App() {
         if (to) setPhase(to);
       }
       if (payload.type === "APPROVAL_REQUESTED_NOTE") {
-        const note = payload.payload as { questionsForUser?: string[]; disagreements?: Disagreement[] };
+        const note = payload.payload as {
+          questionsForUser?: string[];
+          disagreements?: Disagreement[];
+          narratives?: DraftNarrative[];
+        };
         if (note.questionsForUser && note.questionsForUser.length > 0) setQuestions(note.questionsForUser);
         setDisagreements(note.disagreements ?? []);
+        setNarratives(note.narratives ?? []);
       }
       if (payload.type === "USER_MESSAGE_RECEIVED" || payload.type === "USER_DECISION_RECORDED") {
         setQuestions(null);
         setDisagreements([]);
+        setNarratives([]);
       }
       // terminal 이벤트가 오면 "취소 중"을 푼다. 타이머로 추측하지 않는다 —
       // 프로세스가 실제로 죽었다는 사실은 호스트만 알고, 그 사실이 이벤트로 온다.
@@ -222,6 +231,7 @@ export default function App() {
       if (payload.type === "CANCELLATION_REQUESTED") {
         setQuestions(null);
         setDisagreements([]);
+        setNarratives([]);
       }
     });
     const unlistenApproval = listen<ApprovalRequest>("approval-required", (event) => {
@@ -750,7 +760,12 @@ export default function App() {
               {/* 3.9절 불일치 카드가 3.4절 확인 필요 카드를 **대체한다** — 같이 뜨면
                   사용자가 같은 질문에 두 번 답하게 된다. 두 상황이 다르므로 카드도 다르다. */}
               {questions && disagreements.length > 0 && (
-                <DisagreementCard disagreements={disagreements} onSubmit={submitDecisions} devMode={devMode} />
+                <DisagreementCard
+                  disagreements={disagreements}
+                  narratives={narratives}
+                  onSubmit={submitDecisions}
+                  devMode={devMode}
+                />
               )}
 
               {questions && disagreements.length === 0 && (

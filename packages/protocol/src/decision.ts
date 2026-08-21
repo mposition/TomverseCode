@@ -54,10 +54,25 @@ export interface AcceptanceCriteriaCarrier {
 // 감지가 아니라 **관측된 모호함**이고, 한 모델만 돌렸다면 영원히 묻지 않았을 질문이 여기서 나온다.
 
 /** 대조 가능한 필드. DraftProposal의 부분집합이며, 자유 서술 필드는 제외한다. */
+/**
+ * **판정 가능한** 필드만 여기 있다 — 사용자에게 "어느 쪽입니까"를 물을 수 있는 것들.
+ *
+ * `interpretation`/`risks`는 여기 없다. 자유 서술이라 표현만 달라도 갈린 것으로 보이고,
+ * 그래서 "갈렸다"는 관측이 거의 언제나 참이 되어 아무것도 구별해주지 않는다.
+ * 그것들은 `NarrativeField`로 따로 다룬다 — 근거는 17.12절.
+ */
 export type DisagreementField =
   | "doneCriteria" // 완료 기준 — 갈리면 요구 자체가 모호하다는 뜻 (가장 강한 신호)
   | "requiredTests" // 무엇을 검증해야 하는가
-  | "targetPaths" // 어디를 고쳐야 하는가 — 문제의 위치에 대한 이견
+  | "targetPaths"; // 어디를 고쳐야 하는가 — 문제의 위치에 대한 이견
+
+/**
+ * 자유 서술 필드. **비교하지 않고 나란히 보여줄 뿐**이다.
+ *
+ * 두 초안의 서술은 거의 언제나 다르다. 그걸 "불일치"라고 부르면 이름이 발견을 주장하는데
+ * 실제로는 아무것도 발견하지 않은 것이고, 매번 채워지는 목록은 곧 읽히지 않는다(17.12절).
+ */
+export type NarrativeField =
   | "interpretation" // 근본 원인 진단
   | "risks"; // 한쪽만 본 위험
 
@@ -67,14 +82,18 @@ export type DisagreementField =
  * **이 순서는 추정이며 튜닝 대상이다** — 14절 지표(불일치 1건당 사용자가 뒤집은 비율)가
  * 쌓여야 조정 근거가 생긴다. 코드 여러 곳에 흩어놓지 않고 여기 한 줄로 둔 이유는,
  * 튜닝할 때 고칠 자리가 하나여야 하기 때문이다.
+ *
+ * 자유 서술이 빠지면서 이 순서에서 뒤 두 자리가 사라졌다. 그것들은 질문이 된 적이 없으므로
+ * **예산을 다투는 목록에 있을 이유도 없었다** — 있는 동안은 지표의 분모만 부풀렸다.
  */
 export const DISAGREEMENT_FIELD_RANK: readonly DisagreementField[] = [
   "doneCriteria",
   "targetPaths",
   "requiredTests",
-  "interpretation",
-  "risks",
 ];
+
+/** 자유 서술의 표시 순서. 랭킹이 아니다 — 자를 일이 없으므로 우선순위가 없다. */
+export const NARRATIVE_FIELD_ORDER: readonly NarrativeField[] = ["interpretation", "risks"];
 
 export interface Disagreement {
   disagreementId: string;
@@ -98,11 +117,31 @@ export interface Disagreement {
   };
 }
 
+/**
+ * 각 초안의 자유 서술. **차이를 주장하지 않는다.**
+ *
+ * `Disagreement`와 달리 `blocking`도 `question`도 없다. 물을 수 없는 것에 질문 구조를 달아두면
+ * 언젠가 누군가 "이것도 보여주자"며 카드에 넣게 되고, 그러면 답할 수 없는 질문이 예산을 먹는다.
+ */
+export interface DraftNarrative {
+  field: NarrativeField;
+  positions: { proposalId: string; value: string[] }[];
+}
+
 export interface DisagreementReport {
   taskId: string;
   reportId: string;
   proposalIds: string[];
+  /** **판정 가능한** 쟁점만. 자유 서술은 `narratives`에 있다(17.12절). */
   disagreements: Disagreement[];
+  /**
+   * 각 초안이 원인과 위험을 어떻게 서술했는가. 비교 결과가 아니라 **원문 나열**이다.
+   *
+   * 여기 있는 것이 `disagreements`에 없는 이유: 이 필드들은 거의 언제나 다르므로 "갈렸다"가
+   * 정보가 되지 않는다. 그렇다고 버리지도 않는다 — 두 초안이 문제를 어떻게 봤는지는 사용자가
+   * 읽을 가치가 있고, 다만 **발견으로 포장하지 않을 뿐**이다.
+   */
+  narratives: DraftNarrative[];
   /** 대조했으나 일치한 필드. **검증이 아니다** — 상관된 오류는 불일치를 만들지 않는다(16.5절). */
   agreedFields: DisagreementField[];
   createdAt: ISODateTime;

@@ -4,6 +4,7 @@ import type {
   CriteriaConflictOutcome,
   CriterionEvaluation,
   Disagreement,
+  DraftNarrative,
   DraftProposal,
   ExperimentControls,
   ExecutionPlan,
@@ -686,7 +687,10 @@ export class Orchestrator {
 
     const clarified = await this.askUser(
       asked.map((d) => d.question.text),
-      asked
+      asked,
+      // 자유 서술은 **질문이 아니라 참고 자료**로 카드에 실린다(17.12절). 물을 수 없는 것을
+      // 질문 목록에 넣지 않으면서도, 두 초안이 문제를 어떻게 봤는지는 볼 수 있게 한다.
+      report.narratives
     );
     if (clarified.kind === "final") return clarified;
     // 14.1절: 사용자 답변 후에는 항상 DRAFTING으로 재진입한다. 답변이 반영된 초안을 다시
@@ -1377,7 +1381,8 @@ export class Orchestrator {
 
   private async askUser(
     questions: string[],
-    disagreements: Disagreement[] = []
+    disagreements: Disagreement[] = [],
+    narratives: DraftNarrative[] = []
   ): Promise<{ kind: "answered" } | { kind: "final"; result: FinalResult }> {
     this.state.counters.clarificationRounds += 1;
     if (this.state.counters.clarificationRounds > this.policy.limits.clarificationRounds) {
@@ -1398,6 +1403,9 @@ export class Orchestrator {
     await this.emit("APPROVAL_REQUESTED_NOTE", {
       questionsForUser: questions,
       disagreements,
+      // **질문과 분리해서 싣는다.** 답할 수 없는 것을 질문과 같은 목록에 두면 화면이 그걸
+      // 질문처럼 그리게 되고, 그러면 답할 수 없는 항목이 사용자의 주의를 먹는다(17.12절).
+      narratives,
       // 카드 제목을 UI가 추측하지 않도록 종류를 명시한다.
       cardKind: disagreements.length > 0 ? "disagreement" : "clarification",
     });

@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import type { Disagreement, UserDecisionInput } from "../types";
+import type { Disagreement, DraftNarrative, NarrativeField, UserDecisionInput } from "../types";
 import { SecretShapeWarning, useSecretShapeScan } from "./SecretShapeWarning";
 
 /**
@@ -27,10 +27,13 @@ type Choice = { optionId?: string; text: string };
 
 export function DisagreementCard({
   disagreements,
+  narratives = [],
   onSubmit,
   devMode,
 }: {
   disagreements: Disagreement[];
+  /** 두 초안의 자유 서술. **질문이 아니다** — 아래 접힌 영역에만 쓴다(17.12절). */
+  narratives?: DraftNarrative[];
   onSubmit: (decisions: UserDecisionInput[]) => void;
   devMode: boolean;
 }) {
@@ -122,9 +125,13 @@ export function DisagreementCard({
         })}
       </ol>
 
+      {/* **갈렸지만 막지 않은 쟁점**과 **두 초안의 서술**은 다른 것이라 따로 접는다.
+          전자는 규칙이 "이건 물어볼 만큼은 아니다"라고 판정한 결과이고, 후자는 애초에
+          판정 대상이 아니다(17.12절). 하나로 묶으면 판정한 것과 판정하지 않은 것이 같은
+          목록에 섞여, 목록 전체가 "그냥 참고"로 읽힌다. */}
       {advisory.length > 0 && (
         <details className="disagreement-advisory">
-          <summary>두 초안의 전체 차이 보기 ({advisory.length}건)</summary>
+          <summary>갈렸지만 묻지 않은 쟁점 ({advisory.length}건)</summary>
           <ul>
             {advisory.map((d) => (
               <li key={d.disagreementId}>
@@ -136,12 +143,39 @@ export function DisagreementCard({
                     </li>
                   ))}
                 </ul>
+                {devMode && <p className="muted small">판정 근거: {d.blockingReason}</p>}
               </li>
             ))}
           </ul>
           <p className="muted small">
-            참고 항목입니다 — 답하지 않아도 진행합니다. 필수 항목과 섞어 놓으면 필수가 참고처럼
-            읽히기 때문에 따로 두었습니다.
+            규칙이 "묻지 않아도 된다"고 판정한 항목입니다 — 답하지 않아도 진행합니다. 필수 항목과
+            섞어 놓으면 필수가 참고처럼 읽히기 때문에 따로 두었습니다.
+          </p>
+        </details>
+      )}
+
+      {narratives.length > 0 && (
+        <details className="disagreement-advisory">
+          <summary>두 초안이 각각 어떻게 봤는지</summary>
+          <ul>
+            {narratives.map((n) => (
+              <li key={n.field}>
+                <span className="disagreement-field">{narrativeLabel(n.field)}</span>
+                <ul>
+                  {n.positions.map((p) => (
+                    <li key={p.proposalId} className="muted small">
+                      {p.value.join(" / ") || "(없음)"}
+                    </li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ul>
+          {/* **차이를 주장하지 않는다.** 서술은 거의 언제나 다르므로 "차이가 있습니다"는
+              참이지만 아무것도 알려주지 않고, 매번 채워지는 목록은 곧 읽히지 않는다. */}
+          <p className="muted small">
+            비교 결과가 아니라 두 초안의 서술을 그대로 옮긴 것입니다. 서술은 표현만 달라도 다르게
+            보이므로 여기서 "갈렸다"를 판정하지 않습니다.
           </p>
         </details>
       )}
@@ -183,6 +217,10 @@ export function DisagreementCard({
  * 않는다 — `types.ts` 주석 참조) 문자열을 이벤트에 실어 보내면 UI 문구를 sidecar가 정하게 되므로,
  * 표시 문자열은 표시하는 쪽이 갖는다. 한쪽을 고칠 때 다른 쪽도 볼 것.
  */
+function narrativeLabel(field: NarrativeField): string {
+  return field === "interpretation" ? "원인 진단" : "위험";
+}
+
 function fieldLabel(field: Disagreement["field"]): string {
   switch (field) {
     case "doneCriteria":
@@ -191,9 +229,5 @@ function fieldLabel(field: Disagreement["field"]): string {
       return "필요한 검증";
     case "targetPaths":
       return "수정 위치";
-    case "interpretation":
-      return "원인 진단";
-    case "risks":
-      return "위험";
   }
 }

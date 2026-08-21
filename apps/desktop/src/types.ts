@@ -158,12 +158,11 @@ export interface AcceptanceCriterion {
 }
 
 /** 대조 가능한 필드 — state-machine-and-protocol.md 17.2절. */
-export type DisagreementField =
-  | "doneCriteria"
-  | "requiredTests"
-  | "targetPaths"
-  | "interpretation"
-  | "risks";
+/** **판정 가능한** 필드만. 자유 서술은 `NarrativeField`다 — 근거는 17.12절. */
+export type DisagreementField = "doneCriteria" | "requiredTests" | "targetPaths";
+
+/** 자유 서술. 비교하지 않고 나란히 보여줄 뿐이다. */
+export type NarrativeField = "interpretation" | "risks";
 
 /**
  * 두 초안이 갈린 지점 하나. 프로토콜 `Disagreement`의 부분 미러.
@@ -182,6 +181,17 @@ export interface Disagreement {
     options: { optionId: string; label: string; fromProposalId: string }[];
     allowFreeform: true;
   };
+}
+
+/**
+ * 각 초안의 자유 서술. **차이를 주장하지 않는다** (17.12절).
+ *
+ * `Disagreement`와 달리 `blocking`도 `question`도 없다. 물을 수 없는 것에 질문 구조가 달려
+ * 있으면 언젠가 카드에 들어가고, 그러면 답할 수 없는 항목이 사용자의 주의를 먹는다.
+ */
+export interface DraftNarrative {
+  field: NarrativeField;
+  positions: { proposalId: string; value: string[] }[];
 }
 
 /** 3.9절 카드에서 사용자가 고른 답 하나. */

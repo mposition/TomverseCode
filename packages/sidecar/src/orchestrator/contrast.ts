@@ -3,9 +3,11 @@ import type {
   Disagreement,
   DisagreementField,
   DisagreementReport,
+  DraftNarrative,
   DraftProposal,
+  NarrativeField,
 } from "@tomverse/protocol";
-import { DISAGREEMENT_FIELD_RANK } from "@tomverse/protocol";
+import { DISAGREEMENT_FIELD_RANK, NARRATIVE_FIELD_ORDER } from "@tomverse/protocol";
 
 /**
  * 구조적 대조 — docs/design/state-machine-and-protocol.md 17절.
@@ -49,11 +51,14 @@ const EXTRACTORS: Record<DisagreementField, FieldExtractor> = {
   // **patch가 아니라 plan에서 뽑는다.** patch를 파싱하면 diff 형식 해석이 끼어들고, 그건
   // "모델이 어디를 고치려 했는가"가 아니라 "우리 파서가 무엇을 읽었는가"를 재는 것이 된다.
   targetPaths: (p) => p.plan.flatMap((step) => step.targetPaths ?? []),
+};
+
+const NARRATIVE_EXTRACTORS: Record<NarrativeField, FieldExtractor> = {
   interpretation: (p) => [p.interpretation],
   risks: (p) => p.risks,
 };
 
-const FIELD_LABEL: Record<DisagreementField, string> = {
+const FIELD_LABEL: Record<DisagreementField | NarrativeField, string> = {
   doneCriteria: "완료 기준",
   requiredTests: "필요한 검증",
   targetPaths: "수정 위치",
@@ -65,8 +70,6 @@ const QUESTION_TEXT: Record<DisagreementField, string> = {
   doneCriteria: "무엇을 만족해야 이 작업이 끝난 것입니까?",
   requiredTests: "무엇이 확인되어야 합니까?",
   targetPaths: "두 초안이 서로 다른 파일을 고치려 합니다. 어디를 고쳐야 합니까?",
-  interpretation: "두 초안이 원인을 다르게 봤습니다. 어느 쪽입니까?",
-  risks: "두 초안이 본 위험이 다릅니다. 어느 쪽을 고려해야 합니까?",
 };
 
 /**
@@ -80,6 +83,7 @@ const QUESTION_TEXT: Record<DisagreementField, string> = {
 export function contrastDrafts(input: ContrastInput): DisagreementReport {
   const { taskId, proposals, complexityTier, round } = input;
   const disagreements: Disagreement[] = [];
+  const narratives: DraftNarrative[] = [];
   const agreedFields: DisagreementField[] = [];
 
   if (proposals.length >= 2) {
@@ -113,6 +117,20 @@ export function contrastDrafts(input: ContrastInput): DisagreementReport {
         question: buildQuestion(field, positions),
       });
     }
+
+    // 자유 서술은 **비교하지 않는다.** 나란히 싣기만 한다(17.12절).
+    //
+    // 같은지 다른지도 보지 않는 이유: 같으면 `agreedFields`에 들어가 "두 모델이 동의했다"처럼
+    // 읽히는데 일치는 검증이 아니고(위 모듈 주석), 다르면 "갈렸다"가 되는데 그건 거의 언제나
+    // 참이라 아무것도 구별해주지 않는다. 어느 쪽으로도 주장하지 않는 것이 유일하게 정직하다.
+    for (const field of NARRATIVE_FIELD_ORDER) {
+      const positions = proposals.map((p) => ({
+        proposalId: p.proposalId,
+        value: normalizeValues(NARRATIVE_EXTRACTORS[field](p)),
+      }));
+      if (positions.every((p) => p.value.length === 0)) continue;
+      narratives.push({ field, positions });
+    }
   }
 
   return {
@@ -120,6 +138,7 @@ export function contrastDrafts(input: ContrastInput): DisagreementReport {
     reportId: `${taskId}-contrast-${round}`,
     proposalIds: proposals.map((p) => p.proposalId),
     disagreements,
+    narratives,
     agreedFields,
     createdAt: new Date().toISOString(),
   };
@@ -155,12 +174,6 @@ function judgeBlocking(
       return complexityTier === "standard"
         ? { blocking: true, reason: "교차검증 tier에서는 무엇을 검증할지의 이견을 넘기지 않습니다" }
         : { blocking: false, reason: "이 tier에서는 검증 항목 차이를 표시만 합니다" };
-
-    case "interpretation":
-    case "risks":
-      // 자유 서술이라 표현만 달라도 갈린 것으로 보인다. 이걸 blocking으로 만들면 거의 모든
-      // 태스크가 질문을 만들어내고, 질문 예산이 진짜 쟁점에 도달하기 전에 소진된다.
-      return { blocking: false, reason: "자유 서술 필드이므로 표시만 합니다" };
   }
 }
 
@@ -182,8 +195,13 @@ function buildQuestion(
   };
 }
 
-/** 사람이 읽을 필드 이름. 카드 제목과 감사 로그 요약이 같은 말을 쓰도록 여기서만 정한다. */
-export function fieldLabel(field: DisagreementField): string {
+/**
+ * 사람이 읽을 필드 이름. 카드 제목과 감사 로그 요약이 같은 말을 쓰도록 여기서만 정한다.
+ *
+ * UI(`DisagreementCard`)에도 같은 표가 있다 — 프로세스가 다르고 표시 문자열은 표시하는 쪽이
+ * 갖는다는 규칙 때문이다. 한쪽을 고칠 때 다른 쪽도 볼 것.
+ */
+export function fieldLabel(field: DisagreementField | NarrativeField): string {
   return FIELD_LABEL[field];
 }
 

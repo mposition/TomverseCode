@@ -113,28 +113,51 @@ test("targetPaths는 서로소일 때만 blocking이다", () => {
   assert.equal(overlapping.disagreements.find((d) => d.field === "targetPaths")?.blocking, false);
 });
 
-test("interpretation/risks는 갈려도 blocking이 아니다", () => {
-  // 자유 서술이라 표현만 달라도 갈린 것으로 보인다. blocking으로 만들면 거의 모든 태스크가
-  // 질문을 만들고, 예산이 진짜 쟁점에 도달하기 전에 소진된다.
+test("자유 서술은 불일치가 아니라 서술로 실린다", () => {
+  // 17.12절: 두 초안의 서술은 거의 언제나 다르다. 그걸 "불일치"라고 부르면 이름이 발견을
+  // 주장하는데 실제로는 아무것도 발견하지 않은 것이다. 그리고 그 항목들이 disagreements에
+  // 있으면 14절 지표(불일치 1건당 사용자가 뒤집은 비율)의 분모를 부풀린다 —
+  // 물어본 적이 없으므로 뒤집힐 수도 없는 항목들이다.
   const report = run(
     draft({ proposalId: "p1", interpretation: "오프바이원", risks: ["기존 호출부 영향"] }),
     draft({ proposalId: "p2", interpretation: "경계 조건 누락", risks: ["성능"] })
   );
-  for (const field of ["interpretation", "risks"] as const) {
-    const d = report.disagreements.find((x) => x.field === field);
-    assert.ok(d, `${field} 불일치가 감지되지 않았습니다`);
-    assert.equal(d!.blocking, false);
-  }
+  assert.deepEqual(
+    report.disagreements.map((d) => d.field),
+    [],
+    "자유 서술이 불일치로 셈해졌습니다"
+  );
+  assert.deepEqual(report.narratives.map((n) => n.field), ["interpretation", "risks"]);
+  // 버리지는 않는다 — 두 초안이 문제를 어떻게 봤는지는 읽을 가치가 있다.
+  const interpretation = report.narratives.find((n) => n.field === "interpretation")!;
+  assert.deepEqual(
+    interpretation.positions.map((p) => p.value).flat().sort(),
+    ["경계 조건 누락", "오프바이원"]
+  );
+});
+
+test("자유 서술은 같아도 일치로 세지 않는다", () => {
+  // 일치는 검증이 아니다(16.5절). 서술이 우연히 같을 때 agreedFields에 넣으면
+  // "두 모델이 동의했다"처럼 읽히는데, 상관된 오류는 불일치를 만들지 않는다.
+  const report = run(
+    draft({ proposalId: "p1", interpretation: "오프바이원", risks: ["성능"] }),
+    draft({ proposalId: "p2", interpretation: "오프바이원", risks: ["성능"] })
+  );
+  assert.deepEqual(report.agreedFields.filter((f) => f === ("interpretation" as never)), []);
+  // 그래도 서술로는 남는다.
+  assert.equal(report.narratives.length, 2);
 });
 
 test("양쪽 다 비어 있는 필드는 일치로도 불일치로도 세지 않는다", () => {
   // 침묵을 동의로 보고하면 agreedFields가 거짓말을 한다.
   const report = run(
-    draft({ proposalId: "p1", risks: [] }),
-    draft({ proposalId: "p2", risks: [] })
+    draft({ proposalId: "p1", requiredTests: [], risks: [] }),
+    draft({ proposalId: "p2", requiredTests: [], risks: [] })
   );
-  assert.ok(!report.agreedFields.includes("risks"));
-  assert.ok(!report.disagreements.some((d) => d.field === "risks"));
+  assert.ok(!report.agreedFields.includes("requiredTests"));
+  assert.ok(!report.disagreements.some((d) => d.field === "requiredTests"));
+  // 자유 서술도 마찬가지다 — 아무도 말하지 않은 것을 "서술"로 싣지 않는다.
+  assert.ok(!report.narratives.some((n) => n.field === "risks"));
 });
 
 test("blocking 판정에는 언제나 규칙 기반 근거가 붙는다", () => {
@@ -187,8 +210,9 @@ test("비-blocking 쟁점은 질문 목록에 들어가지 않는다", () => {
   const { asked, deferred } = planQuestionRound(report);
   assert.ok(asked.every((d) => d.blocking));
   assert.ok(deferred.every((d) => d.blocking));
-  assert.ok(!asked.some((d) => d.field === "interpretation"));
-  assert.ok(!deferred.some((d) => d.field === "interpretation"));
+  // 자유 서술은 애초에 disagreements에 없으므로 질문 목록에 들어갈 길 자체가 없다 —
+  // 필터로 거르는 것보다 **타입에서 갈라두는 것**이 더 강한 보장이다(17.12절).
+  assert.ok(report.narratives.some((n) => n.field === "interpretation"));
 });
 
 test("한 라운드 질문 상한은 한 화면에 들어가는 수다", () => {
