@@ -189,6 +189,15 @@ fn scan_input_for_secret_shapes(text: String) -> Result<Value, String> {
     Ok(json!({ "hits": tomverse_core::policy::secrets::scan_secret_shapes(&text) }))
 }
 
+/// 이 작업에서 무엇이 어느 공급자로 나갔는가 (product-strategy 7절).
+///
+/// **읽기 전용이고 아무것도 실행하지 않는다.** 사용자가 사후에 물을 수 있어야 하는 사실이라
+/// 진행 중 상태가 아니라 저장된 이벤트에서 만든다.
+#[tauri::command]
+fn task_transmission(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
+    state.task_transmission(&task_id)
+}
+
 /// 화면이 쓰는 문턱들과 그 근거 (16.3절 강제 포기 시점, 19.6절 "큰 변경" 안내).
 ///
 /// 값과 함께 `source`를 돌려주는 이유: 표본이 부족하면 그 값은 여전히 추정치인데, 숫자만
@@ -277,6 +286,7 @@ pub fn run() {
             get_task_events,
             list_tasks,
             derived_thresholds,
+            task_transmission,
             scan_input_for_secret_shapes,
             get_task,
             restart_task,

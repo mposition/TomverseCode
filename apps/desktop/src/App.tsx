@@ -17,6 +17,7 @@ import {
   type ProviderStatus,
   type RevertOutcome,
   type SecretShapeHit,
+  type Transmission,
   type RoutingInfo,
   type StoredEvent,
   type TaskEvent,
@@ -33,6 +34,7 @@ import { ApprovalModal } from "./components/ApprovalModal";
 import { DiffPanel } from "./components/DiffPanel";
 import { DisagreementCard } from "./components/DisagreementCard";
 import { SecretShapeWarning, useSecretShapeScan } from "./components/SecretShapeWarning";
+import { TransmissionPanel } from "./components/TransmissionPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
 import { TaskHistory } from "./components/TaskHistory";
@@ -132,6 +134,14 @@ export default function App() {
    * 다 바뀐 뒤라 쪼갤 수 있는 것이 없다. 쪼개려면 실행 전이어야 한다.
    */
   const [plannedPaths, setPlannedPaths] = useState<string[]>([]);
+  /**
+   * 이 작업에서 무엇이 어느 공급자로 나갔는가 (7절).
+   *
+   * **끝난 뒤에 읽는다.** 진행 중에 조금씩 채우면 화면이 "지금까지 나간 것"과 "전부 나간 것"을
+   * 구별해 말해야 하는데, 사용자가 묻는 시점은 끝난 뒤다. 저장된 이벤트에서 만들므로 앱을
+   * 다시 켠 뒤에도 같은 답이 나온다.
+   */
+  const [transmission, setTransmission] = useState<Transmission | null>(null);
   // 실제로 쓰는 문턱. 측정값이 없으면 기본값이며, **그 사실은 개발자 모드에서만 노출한다** —
   // 일반 사용자에게 "이 숫자가 어디서 왔는가"는 필요 없는 정보다.
   const largeChangeFiles = largeChange?.files ?? DEFAULT_LARGE_CHANGE_FILES;
@@ -306,6 +316,7 @@ export default function App() {
     setQuestions(null);
     setNotice(null);
     setPlannedPaths([]);
+    setTransmission(null);
     setSelectedTask(null);
     setPhase("CREATED");
     startedAt.current = Date.now();
@@ -313,6 +324,13 @@ export default function App() {
     try {
       const result = await invoke<FinalResult>("start_task", { message, mode, allowGitCommit });
       setFinalResult(result);
+      // 전송 내역은 **끝난 뒤에** 읽는다. 실패해도 결과 화면을 막지 않는다 — 이건 사후 조회이고,
+      // 읽지 못했다는 사실은 패널이 스스로 말한다(패널이 없으면 그냥 없는 것이다).
+      try {
+        setTransmission(await invoke<Transmission>("task_transmission", { taskId: result.taskId }));
+      } catch {
+        setTransmission(null);
+      }
       setTaskId(result.taskId);
     } catch (error) {
       setFinalResult({ taskId: taskId ?? "(unknown)", status: "failed", summary: String(error) });
@@ -905,6 +923,11 @@ export default function App() {
                   )}
                 </div>
               )}
+
+              {/* 7절 데이터 전송 투명성. 결과 **아래**에 두는 이유: 사용자가 먼저 묻는 것은
+                  "됐는가"이고, "무엇이 나갔는가"는 그 다음이다. 위에 두면 매번 그 다음 질문이
+                  먼저 눈에 들어와, 정작 결과를 읽기 전에 스크롤하게 된다. */}
+              {transmission && <TransmissionPanel transmission={transmission} />}
             </div>
 
             <div className="column">

@@ -844,3 +844,27 @@ button.tiny {
 .criterion-UNVERIFIED .check-mark {
   color: var(--warn);
 }
+
+/* 7절 데이터 전송 투명성. 목록이 길어질 수 있으므로 파일 목록만 스크롤을 준다 —
+   패널 전체를 스크롤하면 "무엇이 나갔는가"라는 제목과 내용이 따로 놀게 된다. */
+.transmission-providers,
+.transmission-files {
+  list-style: none;
+  padding: 0;
+  margin: 0.25rem 0 0.75rem;
+}
+
+.transmission-providers li,
+.transmission-files li {
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border, #2a2a2a);
+}
+
+.transmission-files {
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+.transmission-files code {
+  word-break: break-all;
+}

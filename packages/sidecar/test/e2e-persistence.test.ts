@@ -472,6 +472,60 @@ test("[시나리오 C] 정상 완료된 작업은 DB를 다시 열어도 상태�
   });
 });
 
+test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답할 수 있다", async () => {
+  // product-strategy 7절 "데이터 전송 투명성". 이 집계가 쓸모 있으려면 **실제 실행이 남긴
+  // 이벤트**에서 나와야 한다 — Rust 단위 테스트는 직접 넣은 이벤트를 세지만, 여기서는
+  // 스냅샷과 공급자 호출이 실제로 그 모양으로 남는지를 본다.
+  requireArtifacts();
+  await withCtx({}, (ctx) => {
+    const result = spawnSync(HOST_BIN, runArgs(ctx, ["--mode", "verified", "--timeout-secs", "180"]), {
+      encoding: "utf8",
+      timeout: 210_000,
+      env: hostEnv(),
+    });
+    const line = (result.stdout ?? "").trim().split("\n").filter(Boolean).pop();
+    assert.ok(line, `결과 JSON이 없습니다:\n${result.stdout}\n${result.stderr}`);
+    const run = JSON.parse(line) as { final: { status: string }; taskId: string };
+    assert.equal(run.final.status, "completed", `${JSON.stringify(run.final)}\n${result.stderr}`);
+
+    // 호스트는 이미 종료됐다. 새 프로세스가 DB만 열어서 답한다 — 앱을 다시 켠 뒤에도
+    // 같은 질문에 답할 수 있어야 투명성이다.
+    const t = hostQuery(ctx, [
+      "transmission",
+      "--workspace",
+      ctx.repo.root,
+      "--task",
+      run.taskId,
+      "--db",
+      ctx.db,
+      "--artifacts",
+      ctx.artifacts,
+    ]) as {
+      snapshotTaken: boolean;
+      providers: { providerId: string; calls: number; roles: string[]; inputTokens: number }[];
+      sentFiles: { path: string }[];
+      namedOnlyFiles: { path: string }[];
+    };
+
+    assert.equal(t.snapshotTaken, true, JSON.stringify(t));
+    assert.ok(t.sentFiles.length > 0, `나간 파일이 없습니다: ${JSON.stringify(t)}`);
+    assert.ok(t.providers.length > 0, `호출된 공급자가 없습니다: ${JSON.stringify(t)}`);
+    // 역할이 비어 있으면 "누가 무엇으로 불렸는가"를 말할 수 없다.
+    assert.ok(
+      t.providers.every((p) => p.roles.length > 0 && p.calls > 0),
+      JSON.stringify(t.providers)
+    );
+
+    // **secret 파일은 내용이 아니라 이름만 나간다.** 픽스처의 .env가 그 자리에 있어야 한다 —
+    // 내용이 나간 목록에 있으면 컨텍스트 차단이 뚫린 것이고, 어느 목록에도 없으면
+    // 화면이 "이름도 안 나갔다"고 잘못 말하게 된다.
+    assert.ok(
+      !t.sentFiles.some((f) => f.path.endsWith(".env")),
+      `secret 파일 내용이 전송 목록에 있습니다: ${JSON.stringify(t.sentFiles)}`
+    );
+  });
+});
+
 test("[시나리오 D] 저장된 이벤트에서 기준 계측을 집계할 수 있다", async () => {
   // 12절 미해결 두 항목("기준↔테스트 연결의 커버리지", "위치 충돌 규칙의 오탐률")은 집계로만
   // 답할 수 있는 질문이다. **실제 DB 파일**에서 그 집계가 나오는지를 여기서 확인한다 —

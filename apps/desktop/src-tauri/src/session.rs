@@ -186,6 +186,15 @@ impl SessionState {
         }))
     }
 
+    /// 이 작업에서 **무엇이 어느 공급자로 나갔는가** (product-strategy 7절).
+    ///
+    /// 태스크가 끝난 뒤에도 답할 수 있어야 하므로 이벤트와 `provider_usage`에서 만든다 —
+    /// 진행 중 상태를 들고 있다가 보여주면 앱을 다시 켠 뒤에는 답하지 못한다.
+    pub fn task_transmission(&self, task_id: &str) -> Result<Value, String> {
+        let out = self.with_store(|s| tomverse_core::transmission::collect(s, task_id))??;
+        serde_json::to_value(out).map_err(|e| format!("전송 내역을 직렬화할 수 없습니다: {e}"))
+    }
+
     pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>, String> {
         self.with_store(|s| s.get_task(task_id))?
             .map_err(|e| format!("작업을 읽을 수 없습니다: {e}"))

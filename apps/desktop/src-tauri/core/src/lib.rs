@@ -23,6 +23,7 @@ pub mod sidecar;
 pub mod store;
 pub mod time;
 pub mod tools;
+pub mod transmission;
 pub mod types;
 pub mod verify;
 #[cfg(windows)]

@@ -330,3 +330,32 @@ export interface SecretShapeHit {
   label: string;
   count: number;
 }
+
+/** 한 공급자에게 나간 것 (product-strategy.md 7절). */
+export interface ProviderTransmission {
+  providerId: string;
+  calls: number;
+  roles: string[];
+  models: string[];
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+}
+
+/**
+ * 이 작업에서 무엇이 어느 공급자로 나갔는가.
+ *
+ * `sentFiles`와 `namedOnlyFiles`를 **따로 두는 이유**: 내용이 나간 것과 경로만 나간 것은 다른
+ * 사실이다. 한 목록에 섞으면 둘 다 뜻을 잃고, 특히 후자가 "아무것도 안 나갔다"로 읽힌다.
+ */
+export interface Transmission {
+  taskId: string;
+  /** 컨텍스트를 모은 적이 있는가. false와 "빈 목록"은 다른 사실이다. */
+  snapshotTaken: boolean;
+  providers: ProviderTransmission[];
+  sentFiles: { path: string; reason: string; truncated: boolean }[];
+  namedOnlyFiles: { path: string; reason: string }[];
+  /** **저장 기록에서** 가려진 자격증명 모양의 수. 보낸 것에서 가려진 수가 아니다(17.11절). */
+  secretShapesMaskedInLog: number;
+  freeTextAnswers: number;
+}

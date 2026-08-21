@@ -190,7 +190,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>] [--verbose]\n\
      \n\
@@ -199,6 +199,7 @@ fn usage() -> String {
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
      tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
      show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다\n\
+     transmission — 이 작업에서 무엇이 어느 공급자로 나갔는지 (읽기 전용, --task 필요)\n\
      revert  — 이 작업이 만든 커밋을 git revert로 되돌린다 (0=되돌림, 1=되돌리지 않음·저장소 그대로, 2=revert 진행 중으로 남음)\n\
      metrics — 기준 계측(커버리지/충돌 결말)을 JSON으로 집계한다. 읽기 전용.\n\
                [--all-workspaces]로 워크스페이스 필터를 끈다"
@@ -386,6 +387,18 @@ fn real_main() -> Result<i32, String> {
             } else {
                 1
             })
+        }
+
+        // 데이터 전송 투명성 — **읽기 전용이다.** product-strategy 7절.
+        "transmission" => {
+            let task_id = args
+                .task_id
+                .clone()
+                .ok_or_else(|| "transmission에는 --task가 필요합니다".to_string())?;
+            let guard = store.lock().unwrap();
+            let out = tomverse_core::transmission::collect(&guard, &task_id)?;
+            println!("{}", serde_json::to_string(&out).unwrap_or_default());
+            Ok(0)
         }
 
         "metrics" => {

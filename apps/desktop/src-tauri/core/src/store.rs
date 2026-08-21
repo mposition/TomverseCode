@@ -564,6 +564,52 @@ impl Store {
         Ok(())
     }
 
+    /// 공급자별 전송 집계 — product-strategy 7절 "데이터 전송 투명성".
+    ///
+    /// SQL로 묶는 이유: 호출 수가 태스크당 수십 개까지 갈 수 있고, 화면이 필요로 하는 것은
+    /// 공급자별 합계 하나다. 행을 전부 올려 Rust에서 접는 것보다 여기서 접는 편이 싸고,
+    /// **역할·모델 목록은 중복 없이 정렬해야** 화면 문구가 실행마다 흔들리지 않는다.
+    pub fn provider_transmission(&self, task_id: &str) -> Result<Vec<crate::transmission::ProviderTransmission>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider_id,
+                    COUNT(*),
+                    SUM(input_tokens),
+                    SUM(output_tokens),
+                    COALESCE(SUM(cost_usd), 0.0),
+                    GROUP_CONCAT(DISTINCT role),
+                    GROUP_CONCAT(DISTINCT model_id)
+             FROM provider_usage
+             WHERE task_id = ?1
+             GROUP BY provider_id
+             ORDER BY provider_id",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            let split = |v: Option<String>| {
+                let mut items: Vec<String> = v
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                items.sort();
+                items.dedup();
+                items
+            };
+            Ok(crate::transmission::ProviderTransmission {
+                provider_id: row.get(0)?,
+                calls: row.get::<_, i64>(1)? as u64,
+                input_tokens: row.get::<_, i64>(2)? as u64,
+                output_tokens: row.get::<_, i64>(3)? as u64,
+                cost_usd: row.get(4)?,
+                roles: split(row.get(5)?),
+                models: split(row.get(6)?),
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn provider_usage_count(&self, task_id: &str) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM provider_usage WHERE task_id = ?1",
