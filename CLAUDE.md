@@ -15,18 +15,19 @@ Windows 데스크톱 AI 코딩 어시스턴트.
 
 | 문서 | 다루는 것 |
 |---|---|
-| [product-strategy.md](./docs/design/product-strategy.md) | 제품 포지셔닝, **기능 커버 범위와 출시 기준(8절)**, 로드맵(M0~M6), 북극성 지표, **가설 게이트** |
-| [state-machine-and-protocol.md](./docs/design/state-machine-and-protocol.md) | 태스크 상태 머신, 공통 프로토콜 타입, Policy Gate, `run_command` allowlist, SQLite 스키마, 롤백 |
+| [product-strategy.md](./docs/design/product-strategy.md) | 제품 포지셔닝, **기능 커버 범위와 출시 기준(8절)**, 로드맵(M0~M6), 북극성 지표, **가설 게이트**, **판정 권위의 계층(16절)** |
+| [state-machine-and-protocol.md](./docs/design/state-machine-and-protocol.md) | 태스크 상태 머신, 공통 프로토콜 타입, Policy Gate, `run_command` allowlist, SQLite 스키마, 롤백, **사용자 판정의 고정과 수명(17절)** |
 | [context-engine.md](./docs/design/context-engine.md) | `WorkspaceIndex`(세션) vs `WorkspaceSnapshot`(태스크), 관련 파일 선정, 토큰 예산, secret 제외 |
-| [multi-engine-routing.md](./docs/design/multi-engine-routing.md) | Model Registry, Role 추상화, 검수자 독립성 불변식, 라우터 부트스트랩 |
+| [multi-engine-routing.md](./docs/design/multi-engine-routing.md) | Model Registry, Role 추상화, 검수자 독립성 불변식, 라우터 부트스트랩, **co-executor 배정(13절)** |
 | [process-architecture.md](./docs/design/process-architecture.md) | UI / Rust core / Node sidecar 3프로세스 구조, stdio+NDJSON IPC, 신뢰 경계 |
-| [ui-wireframes.md](./docs/design/ui-wireframes.md) | 화면 인벤토리, `TaskPhase` → 사용자 노출 5단계 매핑 |
+| [ui-wireframes.md](./docs/design/ui-wireframes.md) | 화면 인벤토리, `TaskPhase` → 사용자 노출 5단계 매핑, **불일치 판정 카드(3.9)** |
 
 ## 절대 어기면 안 되는 원칙
 
 이 원칙들은 제품의 정체성이다. 편의를 위해 우회하지 말 것.
 
 1. **결정론적 검증이 모델 의견보다 우선한다.** build/test/lint 결과가 최종 판정자다. LLM 두 개가 합의해도 테스트가 실패하면 실패다. `VERIFYING`은 `complexityTier`와 무관하게 **항상** 실행된다.
+   **단, 결정론적 검증이 판정하는 것은 *결과*다.** *요구*에 대한 최종 권위는 사용자이며, 모델은 어느 쪽도 판정하지 않는다 — 모델의 역할은 쟁점 발굴이다. 세 권위의 관할은 product-strategy.md 16절에 있다. 모델 간 합의를 만들어 판정으로 쓰지 말 것: 합의는 사용자에게 올릴 질문을 지운다.
 2. **Rust가 신뢰 경계다.** Node sidecar는 파일·셸·자격증명에 직접 접근하지 않는다. 요청만 하고, 실행 여부는 Rust의 Policy Gate가 최종 결정한다. Node가 완전히 장악당해도 Rust 게이트를 반드시 통과해야 한다.
 3. **UI 프로세스는 API 키도 셸 실행 권한도 갖지 않는다.**
 4. **검수자는 실행자와 다른 공급자여야 한다.** 만족시킬 수 없으면 같은 공급자로 "검증한 척"하지 말고, 검수 역할을 드롭한 뒤 그 사실을 사용자에게 표시한다.

@@ -390,5 +390,61 @@ Insight는 `ai` + `@ai-sdk/{openai,anthropic,google}`를 쓰고, Code는 공급�
 - BYOK에서 공급자 6개 = 자격증명 6개일 때 Rust 쪽 Credential Store / 가용성 확인 UX
 - `evaluation` 데이터의 통계적 유의성 판단 기준 (표본 몇 개부터 라우팅에 반영할 것인가)
 - 사용자 워크스페이스별 공급자 허용 목록(기업용 데이터 주권 요구)이 Policy Gate와 어떻게 맞물리는지
+- **13.3절 절충의 실제 비용** — 공급자 2개 환경에서 reviewer가 대조 참가자와 공급자를 공유할 때 검수 품질이 실제로 떨어지는가. 3공급자 환경과 비교해 재야 하며 현재는 추정이다
 - **제품 유료 호출 경로에 `BudgetLedger` 적용** — 10.6절에 결정과 선행 조건 세 가지가 있다.
   현재 예약을 강제하는 것은 가설 게이트뿐이며, 제품은 예산 상한 없이 호출한다.
+
+## 13. co-executor — 대조를 위한 두 번째 실행자
+
+결정의 근거는 [product-strategy.md 16절](./product-strategy.md), 프로토콜/상태 머신 반영은 [state-machine-and-protocol.md 17절](./state-machine-and-protocol.md). 여기서는 **라우터가 무엇을 배정하고 무엇을 거부하는가**만 정한다.
+
+### 13.1 새 역할을 만들지 않는다 — executor 배정이 여러 개가 된다
+
+4절의 `EngineRole`은 그대로 `planner | executor | reviewer`다. `co-executor`라는 이름을 새로 만들지 않는 이유: 두 실행자가 하는 일이 **완전히 같기 때문**이다. 같은 스냅샷, 같은 프롬프트, 같은 출력 스키마로 독립 실행한다. 역할이 다른 게 아니라 표본이 둘인 것이다. 이름을 나누면 프롬프트가 갈라질 여지가 생기고, 그 순간 "모델 차이"와 "프롬프트 차이"가 섞여 측정이 오염된다(`providers/prompts.ts`가 어댑터 간 프롬프트 공유를 강제하는 것과 같은 이유).
+
+따라서 `RoutingDecision.assignments`에 `role: "executor"`인 항목이 **둘** 올 수 있다.
+
+- **순서가 의미를 갖는다.** 첫 번째가 primary executor다. `FIX_LOOP`처럼 하나만 필요한 단계는 primary를 쓴다.
+- 기존 코드가 `assignments.find(a => a.role === "executor")`로 첫 항목을 잡는 경로(`orchestrator.ts:918`)는 **그대로 두면 primary를 가리킨다** — 하위 호환이 자연스럽게 성립한다. 이건 우연이 아니라 순서 규칙을 그렇게 정한 이유다.
+- `activeRoles`에는 `executor`가 한 번만 들어간다. 개수는 `assignments`가 말한다.
+
+### 13.2 불변식 확장
+
+5절의 불변식에 한 줄이 붙는다.
+
+```
+불변식 1 (기존): activeRoles가 executor와 reviewer를 모두 포함하면
+                assignment(executor).providerId ≠ assignment(reviewer).providerId
+
+불변식 2 (신규): executor 배정이 둘이면
+                executors[0].providerId ≠ executors[1].providerId
+```
+
+**같은 공급자를 두 번 불러 만든 "불일치 없음"은 정보가 아니라 착시다.** 대조의 가치 전부가 두 표본이 독립이라는 데서 오므로, 만족시킬 수 없으면 5절과 같은 처리를 한다 — 같은 공급자로 두 번 부르지 않고 **대조 자체를 드롭**한 뒤 사유를 `appliedPolicies`에 남기고 UI에 표시한다.
+
+### 13.3 공급자가 2개뿐일 때 — 대조와 검수가 충돌한다
+
+BYOK 현실에서 흔한 경우다. 공급자가 둘이면 executor 두 자리를 채우는 순간 **reviewer는 반드시 둘 중 하나와 같은 공급자**가 된다. 불변식 1과 2를 동시에 만족시킬 수 없다.
+
+**결정: 대조가 검수보다 우선한다.**
+
+근거는 권위의 계층이다(16.1절). 대조는 **사용자 판정을 위한 질문을 만들고**, 검수는 **모델 의견을 하나 더 얻는다.** 사용자가 상위 권위이므로, 하나를 포기해야 하면 모델 의견 쪽을 포기한다.
+
+다만 검수를 통째로 버리지는 않는다. 이렇게 배정한다:
+
+- reviewer는 **사용자 판정에서 살아남지 않은 쪽 초안의 저자 공급자**에 배정한다. 즉 **자기가 쓴 안을 자기가 검수하지 않는다.**
+- 이건 공급자 독립성을 완전히 만족시키지 못한다. "자기 산출물 자기 승인"이라는 최악만 피하는 것이다.
+- `appliedPolicies`에 `reviewer_shares_provider_with_contrast_participant`를 남기고 UI에 표시한다. 17.1절에서 reviewer의 역할이 "사용자 기준이 반영됐는지 확인"으로 좁아진 덕분에 이 절충의 대가가 이전보다 작다 — 자유 재량 판단이 아니라 고정된 기준과의 대조이기 때문이다.
+- **공급자가 3개 이상이면 이 절충은 필요 없다.** 완전 독립 배정이 가능하고 라우터는 그걸 우선한다.
+
+### 13.4 비용
+
+| tier | LLM 호출 (fix loop 제외) |
+|---|---|
+| `simple` / `fast` | 1 (executor) |
+| `standard` / `verified` (대조 없음, 현행) | 2 (executor + reviewer) |
+| `verified` (대조 켜짐) | **3** (executor ×2 + reviewer) |
+
+13.1절 스파이크가 "쉬운 태스크엔 2회도 과하다"고 판정했음을 기억할 것. 3회는 `verified` 이상 전용이며, `RoutingDecision.estimatedCostUsd`가 이 증가를 반영해야 사용자가 tier를 올릴 때 무엇을 지불하는지 보인다.
+
+**planner는 여전히 기본 비활성이다**(4절). 대조가 켜지면 호출이 이미 3회이므로, planner까지 켜서 4회로 만드는 것은 실측 근거가 나오기 전까지 하지 않는다.

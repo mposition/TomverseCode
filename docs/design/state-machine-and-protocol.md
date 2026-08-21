@@ -526,7 +526,7 @@ CREATE INDEX idx_file_mutations_request ON file_mutations(request_id);
 
 롤백(10절)은 `tool_requests.task_id`로 해당 태스크의 모든 `request_id`를 찾고, `file_mutations`를 조인해 `path`별 최신 `pre_image`를 역방향 patch로 변환한다.
 
-`task_events.event_type` 값: `TASK_CREATED`, `SNAPSHOT_CREATED`, `DRAFT_RECEIVED`, `REVIEW_RECEIVED`, `PLAN_CREATED`, `APPROVAL_REQUESTED`, `APPROVAL_GRANTED`, `APPROVAL_DENIED`, `TOOL_REQUESTED`, `TOOL_COMPLETED`, `VERIFICATION_COMPLETED`, `FIX_LOOP_STARTED`, `PHASE_CHANGED`, `USER_MESSAGE_RECEIVED`, `TASK_COMPLETED`, `TASK_FAILED`, `TASK_CANCELLED`, `TASK_REJECTED`.
+`task_events.event_type` 값: `TASK_CREATED`, `SNAPSHOT_CREATED`, `DRAFT_RECEIVED`, `REVIEW_RECEIVED`, `PLAN_CREATED`, `APPROVAL_REQUESTED`, `APPROVAL_GRANTED`, `APPROVAL_DENIED`, `TOOL_REQUESTED`, `TOOL_COMPLETED`, `VERIFICATION_COMPLETED`, `FIX_LOOP_STARTED`, `PHASE_CHANGED`, `USER_MESSAGE_RECEIVED`, `TASK_COMPLETED`, `TASK_FAILED`, `TASK_CANCELLED`, `TASK_REJECTED`, `DISAGREEMENT_DETECTED`, `USER_DECISION_RECORDED`(17.3절).
 
 재시작 복구 절차: 앱 기동 시 `final_status IS NULL`인 `tasks` 행을 찾고, 각각의 최신 `task_events` 행 하나를 읽어 `phase`/`counters_json`이 이벤트 로그와 일치하는지 검증한다(불일치 시 이벤트 로그가 우선하며 `tasks` 행을 재계산). `EXECUTING` 중 크래시난 태스크는 재개하지 않고 `FAILED`(사유: "앱 재시작으로 중단됨")로 확정한 뒤 사용자에게 재시도를 맡긴다 — 부분 실행된 `ToolRequest`의 실행 재개는 멱등성 보장이 안 되면 위험하므로 MVP 범위에서는 자동 재개를 하지 않는다.
 
@@ -630,6 +630,9 @@ interface FileMutationRecord {
 - **프로세스 샌드박싱** (5.3절) — `run_command`가 실행한 프로세스의 파일·네트워크 접근 제한. Windows job object / 컨테이너 중 무엇을 쓸지, 그리고 그게 개발 도구(테스트 러너가 캐시 디렉터리를 쓰는 등)와 어디서 충돌하는지 조사 필요. 이게 없는 동안은 5.3절의 한계를 UI에도 정직하게 표시해야 한다. **M0.1에서 Windows Job Object가 이 항목과 합류했다 — 16.3절의 `taskkill /T` 한계도 같은 해법으로 닫힌다.**
 - 취소 중 UI가 "정리 중"에서 얼마나 기다려야 하는지에 대한 상한 — 현재는 자식이 SIGKILL에 반응할 때까지 기다린다. 응답 없는 프로세스에 대한 사용자 탈출구(강제 포기)가 없다
 - Git commit 자동 생성의 오케스트레이터 통합 — Policy Gate(항상 승인)와 도구는 있으나 `ExecutionPlan`에 commit 단계를 넣는 로직이 없다
+- **17.4절 blocking 판정 규칙과 랭킹 순서의 임계값** — `doneCriteria` > `targetPaths` > `requiredTests` 순서는 추정이다. 14절 지표(불일치 1건당 사용자가 뒤집은 비율)가 쌓여야 조정 근거가 생긴다
+- **기준 충족 여부의 자동 판정 범위**(17.3) — `AcceptanceCriterion`에 대응하는 테스트가 존재하는지를 어떻게 자동으로 잇는가. 모델에게 맡기면 9절 순환 의존이 재현되므로, 잇지 못하는 기준은 "미확인"으로 남기는 것이 현재 결정이다
+- **17.3절 세 구멍의 구현** — 사용자 답변 승격, `USER_DECISION_RECORDED` 원문 기록, `doneCriteria` 소비. 프로토콜 변경(되돌리기 비싼 결정)이므로 문서 확정 후 착수한다
 
 ## 15. M0 구현에서 드러난 설계 보완
 
@@ -910,3 +913,159 @@ TRIAGE가 추가되면서 생긴 구멍: `SINGLE_MODEL_FIX`가 verdict 개념이
 ### 14.2 `file_mutations` 테이블
 
 10절의 `FileMutationRecord`를 저장할 DDL을 7절 SQLite 스키마에 추가했다 — `tool_requests.request_id`를 외래키로 갖는 `(request_id, path)` 복합 PK 테이블. 롤백 시 태스크의 모든 `tool_requests`를 조회한 뒤 조인해서 각 파일의 `pre_image`를 역방향으로 적용한다(7절/10절 참조).
+
+## 17. 판정 권위의 프로토콜 반영 (요구 오라클 = 사용자)
+
+근거와 기각된 대안은 [product-strategy.md 16절](./product-strategy.md)에 있다. 요약: **요구에 대한 최종 권위는 사용자이고, 모델은 판정자가 아니라 쟁점 발굴기다.** 이 절은 그 결정이 상태 머신·프로토콜·스키마에서 무엇을 바꾸는지 적는다.
+
+### 17.1 상태는 하나도 추가되지 않는다
+
+multi-engine-routing.md 6절과 같은 결론이다. 바뀌는 것은 **`DRAFTING`이 executor를 몇 번 부르는가**와 **`AWAITING_USER_INPUT`이 무엇 때문에 진입하는가** 둘뿐이다.
+
+| Phase | 기존 | 변경 후 |
+|---|---|---|
+| `DRAFTING` | executor 1회 호출 → `DraftProposal` | executor N회(=1 또는 2) **독립** 호출 → `DraftProposal[]`. N=2면 대조 후 `DisagreementReport` 생성 |
+| `AWAITING_USER_INPUT` | verdict = `NEED_USER_INPUT`일 때만 진입 | **+ 해소되지 않은 blocking 불일치가 있을 때도 진입** |
+| `REVIEWING` | 초안이 옳은지 판단 | + **사용자가 고정한 `acceptanceCriteria`가 반영됐는지** 확인 |
+
+`DRAFTING`에 별도 phase(`CONTRASTING` 같은 것)를 만들지 않는 이유: 대조는 LLM 호출이 아니라 **필드 비교 연산**이라 사용자에게 노출할 단계가 아니고, 실패할 수 있는 외부 경계도 없다. 상태를 늘리면 2절 다이어그램과 UI 매핑(ui-wireframes.md 2절)만 복잡해지고 얻는 것이 없다.
+
+**N=2일 때 두 executor는 서로의 산출물을 보지 않는다.** 왕복 합의를 만들지 않는 이유는 product-strategy 16.3절 참조 — 라운드가 늘수록 두 산출물이 독립 표본이 아니게 되고, 합의는 사용자에게 올릴 질문을 지운다.
+
+### 17.2 추가되는 타입
+
+```typescript
+// ---- 9. 구조적 대조 결과 (DRAFTING에서 N=2일 때만 생성) ----
+
+/** 대조 가능한 필드. DraftProposal의 부분집합이며, 자유 서술 필드는 제외한다. */
+type DisagreementField =
+  | "doneCriteria"      // 완료 기준 — 갈리면 요구 자체가 모호하다는 뜻 (가장 강한 신호)
+  | "requiredTests"     // 무엇을 검증해야 하는가
+  | "targetPaths"       // 어디를 고쳐야 하는가 — 문제의 위치에 대한 이견
+  | "interpretation"    // 근본 원인 진단
+  | "risks";            // 한쪽만 본 위험
+
+interface Disagreement {
+  disagreementId: string;
+  field: DisagreementField;
+  /** 각 초안의 해당 필드 값. proposalId → 값. */
+  positions: { proposalId: string; value: string[] }[];
+  /**
+   * blocking이면 사용자 판정 없이 진행하지 않는다.
+   * 판정 기준은 17.4절 — 모델에게 "심각한가"를 묻지 않는다(그건 또 하나의 모델 의견이다).
+   */
+  blocking: boolean;
+  /** 강제 선택 질문. 개방형 확인("이렇게 이해했는데 맞나요?")을 만들지 않는다 — 16.2절 ②. */
+  question: {
+    text: string;
+    /** 각 선택지는 어느 초안에서 왔는지 추적 가능해야 한다. */
+    options: { optionId: string; label: string; fromProposalId: string }[];
+    /** 둘 다 아닐 수 있으므로 자유 입력을 항상 허용한다. */
+    allowFreeform: true;
+  };
+}
+
+interface DisagreementReport {
+  taskId: string;
+  reportId: string;
+  proposalIds: string[];
+  disagreements: Disagreement[];
+  /** 대조했으나 일치한 필드. **검증이 아니다** — 상관된 오류는 불일치를 만들지 않는다(16.5절). */
+  agreedFields: DisagreementField[];
+  createdAt: ISODateTime;
+}
+
+// ---- 10. 사용자 판정의 고정 ----
+
+interface AcceptanceCriterion {
+  criterionId: string;
+  text: string;
+  /**
+   * 이 기준이 어디서 왔는가. **`user_decision`만이 권위를 갖는다** —
+   * 나머지는 모델이 제안한 것이고 사용자가 뒤집을 수 있다.
+   */
+  source: "user_decision" | "draft_proposal" | "user_message";
+  /** source = user_decision일 때, 어떤 불일치에 대한 답이었는지 */
+  disagreementId?: string;
+  decidedAt: ISODateTime;
+}
+```
+
+`FinalResult`에 필드 두 개를 추가한다:
+
+```typescript
+interface FinalResult {
+  // ... 기존 필드 ...
+  /** 이 태스크에서 확정된 기준. 최종 보고가 이걸 체크리스트로 제시한다(17.3). */
+  acceptanceCriteria?: AcceptanceCriterion[];
+  /** 사용자에게 묻지 못한 채 남은 blocking 불일치 — 있으면 보고에 반드시 표시한다. */
+  unresolvedDisagreements?: string[];
+}
+```
+
+### 17.3 판정의 수명 — 프롬프트 문자열로 끝나면 안 된다
+
+**이 절이 17절 전체에서 가장 중요하다.** 사용자를 판정자로 세우려면 그 판정이 **소비되는 자리**가 있어야 한다. 현재 구현에는 없다:
+
+| 구멍 | 현재 | 결과 |
+|---|---|---|
+| 사용자 답변의 수명 | `answers[]`에 담겨 다음 프롬프트 문자열로만 주입됨 (`orchestrator.ts:331`, `458`) | 모델이 무시하면 그만. 강제력이 0이다 |
+| 감사 추적 | `USER_MESSAGE_RECEIVED` 이벤트에 **`answerLength`만** 기록 (`orchestrator.ts:913`) | **판정자의 판정이 감사 로그에 없다.** 6절 Agent Trace의 실제 구멍 |
+| `doneCriteria`/`requiredTests` | `DRAFT_SCHEMA`가 required로 강제해서 받아놓고(`prompts.ts:265`) 소비처가 protocol 타입 정의뿐 | 요구 분석의 결론이 수집만 되고 버려진다 |
+
+**규칙:** 사용자 답변은 `AcceptanceCriterion(source = "user_decision")`으로 승격되고, 이후 세 곳이 반드시 참조한다.
+
+1. **`PLANNING`** — 확정된 기준을 만족하지 못하는 계획은 만들지 않는다. 기준과 충돌하는 patch가 오면 `FIX_LOOP`가 아니라 재요청 대상이다.
+2. **`VERIFYING`** — build/test/lint 결과 옆에 기준 체크리스트를 함께 낸다. **단, 기준 충족 여부를 모델이 판정하게 하지 않는다.** 자동 판정이 가능한 것(대응하는 테스트가 존재)과 불가능한 것을 나눠 표시하고, 후자는 "미확인"으로 남긴다 — 여기서 모델에게 판정을 맡기면 9절 순환 의존이 그대로 재현된다.
+3. **`FinalResult`** — "사용자가 정한 기준 N개 중 M개가 테스트로 확인됨, K개 미확인"을 보고한다. 지금처럼 build/test/lint 결과만 요약하면 **사용자가 무엇을 결정했는지가 최종 보고에서 사라진다.**
+
+**이벤트 타입 추가** (7절 목록에 더한다):
+
+| 이벤트 | 언제 | payload |
+|---|---|---|
+| `DISAGREEMENT_DETECTED` | 대조 완료 시 (불일치 0건이어도 기록 — 대조를 돌렸다는 사실 자체가 감사 대상) | `DisagreementReport` |
+| `USER_DECISION_RECORDED` | 사용자 답변 수신 시 | **답변 원문**, `disagreementId`, 선택한 `optionId` 또는 자유 입력 |
+
+`USER_DECISION_RECORDED`는 `answerLength`가 아니라 원문을 남긴다. 8KB를 넘으면 7절 규칙대로 artifact로 밀어낸다. **비밀값 필터(16.7절)는 그대로 적용된다** — 사용자가 답변에 토큰을 붙여넣는 경우가 실제로 있다.
+
+**SQLite 스키마 추가** (`SCHEMA_VERSION = 3`, 16.4절과 같이 추가 전용 마이그레이션):
+
+```sql
+CREATE TABLE acceptance_criteria (
+  task_id        TEXT NOT NULL REFERENCES tasks(task_id),
+  criterion_id   TEXT NOT NULL,
+  text           TEXT NOT NULL,
+  source         TEXT NOT NULL,       -- user_decision | draft_proposal | user_message
+  disagreement_id TEXT,               -- source = user_decision 일 때
+  decided_at     TEXT NOT NULL,
+  PRIMARY KEY (task_id, criterion_id)
+);
+```
+
+`task_events`가 진실의 원천이고 이 테이블은 **파생 캐시**다(7번 원칙). `VERIFYING`과 최종 보고가 매번 이벤트를 재생하지 않도록 두는 것이며, `tasks.phase`와 같은 성격이다. 이벤트 없이 이 테이블만 갱신하는 경로를 만들지 말 것.
+
+### 17.4 질문 예산 — 상한은 그대로, 랭킹을 추가한다
+
+`clarificationRounds ≤ 2`(2.2절)는 **바꾸지 않는다.** 사용자가 위임한 이유는 그 일을 하기 싫어서이고, 무제한 질문은 제품 가치를 직접 깎는다. 대신 예산이 유한하므로 **무엇을 먼저 물을지**를 정해야 한다.
+
+- **한 라운드에 여러 불일치를 묶어서 묻는다.** 라운드 = 왕복 횟수이지 질문 개수가 아니다. 사용자에게는 한 화면에 강제 선택 3~4개가 낫지, 세 번 깨우는 것이 최악이다.
+- **blocking 판정은 규칙 기반이다.** 모델에게 "이게 심각한가"를 묻지 않는다 — 그러면 또 하나의 캘리브레이션 안 된 모델 의견이 게이트가 된다. 초안 규칙:
+  - `doneCriteria` 불일치 → 항상 blocking
+  - `targetPaths`가 **서로소**(겹치는 파일이 하나도 없음) → blocking. 두 모델이 문제의 위치 자체를 다르게 봤다는 뜻이다
+  - `requiredTests` 불일치 → `verified` 이상에서 blocking, 그 아래는 비-blocking
+  - `interpretation`/`risks` 불일치 → 비-blocking (표시만)
+- **랭킹 순서**(예산 초과 시): `doneCriteria` > `targetPaths` > `requiredTests` > `interpretation` > `risks`. **이 순서는 추정이며 튜닝 대상이다**(12절 미해결에 추가).
+- **못 물어본 blocking 불일치는 조용히 삼키지 않는다.** `FinalResult.unresolvedDisagreements`에 남기고 보고에 표시한다. "물어볼 수 없었다"와 "쟁점이 없었다"는 다른 사실이다.
+- 예산을 소진해도 `clarification_exhausted`로 곧장 FAILED 하지 않는다 — 기존 상한 규칙(재질문 상한 초과 시 FAILED)은 **모델이 계속 모호하다고 말하는 경우**를 위한 것이고, 이쪽은 사용자가 이미 답을 준 뒤 남은 저순위 쟁점이므로 진행하되 표시한다.
+
+### 17.5 tier 게이팅
+
+executor를 2회 부르는 것은 비용이 2배다. `complexityTier`가 4단계로 확장되면(product-strategy 5절) `verified` 이상에서만 켠다. 현재의 2단계에서는 `standard`가 그 자리다. `simple`/`fast`에서 켜지면 13.1절이 측정한 비용 절감이 사라진다.
+
+라우터가 독립적인 두 executor를 배정하지 못하면 — 5절 불변식과 같은 처리다 — **같은 공급자로 두 번 부르지 않는다.** 대조 자체를 드롭하고 사유를 `RoutingDecision.appliedPolicies`에 남긴다([multi-engine-routing.md 13절](./multi-engine-routing.md)). 같은 모델을 두 번 부른 "불일치 없음"은 정보가 아니라 착시다.
+
+### 17.6 이 설계가 만들지 않는 보장
+
+- **일치는 검증이 아니다.** 두 초안이 모든 필드에서 일치해도 둘 다 틀렸을 수 있다(상관된 오류, 9.2-B). `agreedFields`를 UI에서 초록색 체크로 그리면 안 된다.
+- **사용자 판정이 옳다는 보장은 없다.** 우리가 보장하는 것은 판정이 *기록되고 이후 단계가 그것을 참조한다*는 것뿐이다.
+- **`VERIFYING`을 대체하지 않는다.** 사용자는 의도의 오라클이지 결과의 오라클이 아니다(16.1절).
