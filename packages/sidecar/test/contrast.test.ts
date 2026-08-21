@@ -52,6 +52,18 @@ test("완전히 같은 초안 둘은 불일치를 만들지 않는다", () => {
   assert.ok(report.agreedFields.includes("targetPaths"));
 });
 
+test("항목을 이어 붙여 같아 보이는 두 목록을 일치로 세지 않는다", () => {
+  // 비교 키를 공백으로 이으면 ["A B"]와 ["A", "B"]가 같은 키가 되어, 기준을 하나로 적은
+  // 초안과 둘로 쪼갠 초안이 **일치로 세어진다.** 구분자가 정규화된 텍스트에 나타날 수 없는
+  // 문자여야 하는 이유다.
+  const report = run(
+    draft({ proposalId: "p1", doneCriteria: ["A B"] }),
+    draft({ proposalId: "p2", doneCriteria: ["A", "B"] })
+  );
+  assert.ok(!report.agreedFields.includes("doneCriteria"), "항목 개수가 다른데 일치로 세었습니다");
+  assert.ok(report.disagreements.some((d) => d.field === "doneCriteria"));
+});
+
 test("표기 차이(공백·대소문자·경로 구분자)는 불일치가 아니다", () => {
   const report = run(
     draft({ proposalId: "p1", plan: [{ stepId: "s", description: "d", targetPaths: ["src/validate.ts"] }] }),

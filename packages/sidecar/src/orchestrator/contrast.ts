@@ -211,12 +211,34 @@ function normalizeValues(values: string[]): string[] {
   return [...new Set(normalized)].sort((a, b) => a.localeCompare(b));
 }
 
-/** 비교는 정규화된 텍스트로 한다 — 대소문자·공백·경로 구분자 차이는 이견이 아니다. */
+/**
+ * 비교는 정규화된 텍스트로 한다 — 대소문자·공백·경로 구분자 차이는 이견이 아니다.
+ *
+ * # 구분자가 NUL인 이유
+ *
+ * 공백으로 이으면 `["a b"]`와 `["a", "b"]`가 같은 키가 되어 **항목 개수가 다른 두 초안이
+ * 일치로 세어진다.** NUL은 정규화를 거친 텍스트에 나타날 수 없으므로 그 충돌이 없다.
+ *
+ * **리터럴 NUL 문자를 소스에 박지 않고 `\u0000` 이스케이프를 쓴다.** 박아두면 파일이 grep·ripgrep
+ * 계열에서 **바이너리로 분류되어 검색 결과에서 통째로 빠진다** — 이 파일을 찾는 사람에게는
+ * 파일이 없는 것과 같다. git은 텍스트로 다루므로 diff에서는 드러나지 않고, 그래서 더 오래 남는다.
+ */
 function comparisonKey(values: string[]): string {
-  return values.map(canonical).sort((a, b) => a.localeCompare(b)).join(" ");
+  return values.map(canonical).sort((a, b) => a.localeCompare(b)).join("\u0000");
 }
 
 function canonical(value: string): string {
+  return canonicalText(value);
+}
+
+/**
+ * 표기 정규화. 대소문자·공백·경로 구분자 차이는 이견이 아니다.
+ *
+ * 대조 밖에서도 쓴다(오케스트레이터의 `interpretationTextChanged` 계측). 같은 정규화를 쓰는
+ * 이유는 "무엇을 표기 차이로 볼 것인가"의 답이 두 곳에서 갈리면, 한쪽이 이견으로 세는 것을
+ * 다른 쪽이 변경 없음으로 세게 되기 때문이다.
+ */
+export function canonicalText(value: string): string {
   return value.replace(/[\\]/g, "/").replace(/\s+/g, " ").trim().toLowerCase();
 }
 

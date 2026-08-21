@@ -305,6 +305,7 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
   아무것도 검증하지 못한 채 통과한다. 모델별로 나누려면 `scriptByModel`을 쓸 것. 같은 이유로
   `proposalId`에도 모델 ID가 들어간다(둘 다 cursor가 1이라 id가 겹쳤다).
 - **`ToolStatus::Ok`은 "명령이 성공했다"가 아니다.** `run_command`는 0이 아닌 종료 코드를 "도구 실행 실패"가 아니라 **"명령이 실패했다"는 사실**로 다뤄 `status`를 `Ok`로 두고 `exitCode`만 남긴다(검증 러너가 그 구분을 필요로 하기 때문이다). `status`만 보고 성공을 판정하면 **실패한 명령이 성공으로 읽힌다** — `revert_commit`이 실제로 그랬고, "tip 커밋만 되돌린다"는 우연한 조건이 그 결함을 가리고 있었다. git 호출은 `git_try`가 `(성공, stdout, stderr)`로 감싸고 성공 판정은 `exitCode == 0`이다.
+- **소스에 리터럴 NUL 문자를 박으면 그 파일이 검색에서 통째로 사라진다.** `join("\0")`처럼 구분자로 쓸 일이 있는데, grep·ripgrep 계열이 그 파일을 **바이너리로 분류해 결과에서 빼기** 때문에 파일을 찾는 사람에게는 없는 것과 같다. git은 텍스트로 다루므로 diff에서는 드러나지 않아 더 오래 남는다. `\u0000` 이스케이프를 쓸 것 — 의미는 같고 소스는 ASCII로 남는다.
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트

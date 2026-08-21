@@ -394,6 +394,84 @@ test("감지된 충돌은 결말이 빠짐없이 남는다 (집계의 두 수가
   assert.ok(outcomes.includes("proceeded_without_change"), outcomes.join(", "));
 });
 
+/**
+ * `plan_unchanged`가 났을 때 **해석 텍스트가 움직였는지**를 함께 남긴다 — 17.10절 ⑧.
+ *
+ * 두 실행을 대조한다. 계획이 그대로인 것은 같지만 원인이 다르고, 그 차이가 payload에 보여야
+ * 지표가 "고칠 곳이 게이트인가 프롬프트인가"를 가를 수 있다.
+ */
+async function planUnchangedOutcomes(interpretations: [string, string]): Promise<
+  { outcome: string; interpretationTextChanged: boolean | null }[]
+> {
+  const wrong = (interpretation: string) =>
+    draftStep({ interpretation, targetPaths: ["src/other.ts"], doneCriteria: ["A"], patch: OTHER_PATCH });
+  const { orchestrator, host } = build(
+    {
+      defaultPatch: OTHER_PATCH,
+      scriptByModel: twoExecutorScripts(
+        [
+          draftStep({ targetPaths: ["src/app.ts"], doneCriteria: ["A"] }),
+          wrong(interpretations[0]),
+          wrong(interpretations[1]),
+          wrong(interpretations[1]),
+        ],
+        [
+          draftStep({ targetPaths: ["src/other.ts"], doneCriteria: ["A"], patch: OTHER_PATCH }),
+          wrong(interpretations[0]),
+          wrong(interpretations[1]),
+          wrong(interpretations[1]),
+        ]
+      ),
+    },
+    { policy: { limits: { clarificationRounds: 2, reviseRounds: 1 } as never } }
+  );
+
+  const promise = orchestrator.run();
+  await waitFor(() => disagreementCard(host) !== undefined);
+  const target = disagreementCard(host)!.disagreements.find((d) => d.field === "targetPaths")!;
+  const option = target.question.options.find((o) => o.label.includes("src/app.ts"))!;
+  assert.ok(
+    orchestrator.provideUserInput(option.label, [
+      { disagreementId: target.disagreementId, optionId: option.optionId, text: option.label },
+    ])
+  );
+  await promise;
+
+  return host.events
+    .filter((e) => e.type === "CRITERIA_CONFLICT_RESOLVED")
+    .flatMap(
+      (e) =>
+        (e.payload as { outcomes: { outcome: string; interpretationTextChanged: boolean | null }[] }).outcomes
+    );
+}
+
+test("계획이 그대로일 때 해석 텍스트가 움직였는지를 함께 남긴다", async () => {
+  // 12절 "충돌 결말 실측": plan_unchanged 비율만으로는 고칠 곳을 알 수 없다. 다시 요청했는데
+  // **해석조차 그대로**면 모델이 피드백을 읽지 않은 쪽에 가깝고(고칠 곳은 프롬프트), 해석은
+  // 바뀌었는데 계획이 그대로면 읽고도 같은 곳을 고르겠다고 한 것이다(게이트를 의심할 자리).
+  const same = await planUnchangedOutcomes(["이메일 검증 누락", "이메일 검증 누락"]);
+  const unchanged = same.filter((o) => o.outcome === "plan_unchanged");
+  assert.ok(unchanged.length > 0, `plan_unchanged가 없어 이 테스트가 아무것도 검증하지 못합니다: ${JSON.stringify(same)}`);
+  assert.ok(
+    unchanged.every((o) => o.interpretationTextChanged === false),
+    JSON.stringify(same)
+  );
+
+  const moved = await planUnchangedOutcomes(["이메일 검증 누락", "경계 조건 처리 누락"]);
+  const movedUnchanged = moved.filter((o) => o.outcome === "plan_unchanged");
+  assert.ok(movedUnchanged.length > 0, JSON.stringify(moved));
+  assert.ok(
+    movedUnchanged.every((o) => o.interpretationTextChanged === true),
+    JSON.stringify(moved)
+  );
+
+  // **재요청이 일어나지 않은 결말은 언제나 null이다.** false로 쓰면 "다시 물었는데 해석이
+  // 그대로였다"로 읽히는데, 다시 묻지도 않았다.
+  const proceeded = same.filter((o) => o.outcome === "proceeded_without_change");
+  assert.ok(proceeded.length > 0, JSON.stringify(same));
+  assert.ok(proceeded.every((o) => o.interpretationTextChanged === null), JSON.stringify(same));
+});
+
 test("VERIFYING 뒤에 기준 판정이 계산되고 근거 없는 기준은 미확인으로 남는다", async () => {
   // 17.3절 규칙 2: 검증 결과 옆에 기준 체크리스트를 함께 낸다. **모델에게 판정시키지 않는다.**
   const { orchestrator, host } = build({ defaultPatch: VALID_PATCH });

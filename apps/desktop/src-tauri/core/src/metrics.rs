@@ -57,6 +57,21 @@ pub struct ConflictOutcomes {
     /// 기존 테스트는 통과할 수 있다. 약한 정황일 뿐이며, 그래서 이름이 "falsePositive"가 아니다.
     #[serde(rename = "proceededTaskTerminalStatus")]
     pub proceeded_task_terminal_status: BTreeMap<String, u64>,
+    /// `plan_unchanged`를 **재요청 뒤 해석 텍스트가 달라졌는지**로 쪼갠다 — 12절 "충돌 결말 실측".
+    ///
+    /// `plan_unchanged` 비율이 높다는 것만으로는 고칠 곳을 알 수 없다. 두 원인이 섞여 있다:
+    ///
+    /// - `unchanged` — 다시 요청했는데 **해석조차 그대로**다. 모델이 피드백을 반영하지 않은
+    ///   것에 가깝고, 그러면 고칠 곳은 게이트가 아니라 프롬프트다.
+    /// - `changed` — 해석은 바뀌었는데 계획은 그대로다. 모델이 읽고도 같은 곳을 고르겠다고
+    ///   한 것이므로, 게이트가 잡은 것이 실제 문제가 아니었을 가능성이 여기 있다.
+    ///
+    /// `unknown`은 비교할 새 초안이 없었던 경우다(예산 소진, 태스크 종료). **0으로 뭉개지
+    /// 않는다** — 재요청조차 못 한 것과 재요청했는데 그대로인 것은 다른 사실이다.
+    ///
+    /// 어느 쪽도 "규칙이 틀렸다"의 증거는 아니다. 이건 **원인을 가르는 재료**이지 판정이 아니다.
+    #[serde(rename = "planUnchangedByInterpretation")]
+    pub plan_unchanged_by_interpretation: BTreeMap<String, u64>,
 }
 
 /// 취소 소요 분포 — 12절 미해결 "강제 포기 노출 시점(5초)의 근거".
@@ -223,8 +238,23 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
                     for outcome in outcomes {
                         metrics.conflicts.settled += 1;
                         bump(&mut metrics.conflicts.by_outcome, outcome.get("outcome"));
-                        if outcome.get("outcome").and_then(Value::as_str) == Some("proceeded_without_change") {
+                        let kind = outcome.get("outcome").and_then(Value::as_str);
+                        if kind == Some("proceeded_without_change") {
                             proceeded = true;
+                        }
+                        // **`plan_unchanged`에만 쪼갠다.** 계획이 바뀐 건에도 붙이면 "해석이
+                        // 바뀌었다"가 두 결말에 걸쳐 세어져, 원인을 가르려던 분해가 다시 뭉개진다.
+                        if kind == Some("plan_unchanged") {
+                            let key = match outcome.get("interpretationTextChanged") {
+                                Some(Value::Bool(true)) => "changed",
+                                Some(Value::Bool(false)) => "unchanged",
+                                _ => "unknown",
+                            };
+                            *metrics
+                                .conflicts
+                                .plan_unchanged_by_interpretation
+                                .entry(key.to_string())
+                                .or_insert(0) += 1;
                         }
                     }
                 }
@@ -453,6 +483,39 @@ mod tests {
         assert_eq!(
             metrics.conflicts.proceeded_task_terminal_status.get("COMPLETED"),
             Some(&1)
+        );
+    }
+
+    /// **`plan_unchanged`의 두 원인을 가른다.** 비율만으로는 고칠 곳이 게이트인지 프롬프트인지
+    /// 알 수 없고, 그 구분이 없으면 이 지표는 "낮다/높다" 말고 아무것도 말하지 못한다.
+    #[test]
+    fn splits_plan_unchanged_by_whether_the_interpretation_text_moved() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "CRITERIA_CONFLICT_RESOLVED",
+                &json!({ "outcomes": [
+                    { "criterionId": "c-1", "outcome": "plan_unchanged", "interpretationTextChanged": false },
+                    { "criterionId": "c-2", "outcome": "plan_unchanged", "interpretationTextChanged": true },
+                    // 비교할 새 초안이 없었던 경우. **0으로 뭉개지 않는다.**
+                    { "criterionId": "c-3", "outcome": "plan_unchanged", "interpretationTextChanged": null },
+                    // 계획이 바뀐 건은 이 분해에 들어가지 않는다 — 들어가면 분해가 다시 뭉개진다.
+                    { "criterionId": "c-4", "outcome": "plan_changed_to_expected", "interpretationTextChanged": true },
+                ] }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.conflicts.settled, 4);
+        let split = &m.conflicts.plan_unchanged_by_interpretation;
+        assert_eq!(split.get("unchanged"), Some(&1), "{split:?}");
+        assert_eq!(split.get("changed"), Some(&1), "{split:?}");
+        assert_eq!(split.get("unknown"), Some(&1), "{split:?}");
+        // 분해의 합은 plan_unchanged 개수와 같아야 한다 — 어긋나면 어느 쪽이 맞는지 알 수 없다.
+        assert_eq!(
+            split.values().sum::<u64>(),
+            *m.conflicts.by_outcome.get("plan_unchanged").unwrap()
         );
     }
 

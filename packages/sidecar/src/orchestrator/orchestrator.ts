@@ -39,7 +39,7 @@ import { ModelRegistry } from "../routing/registry.js";
 import { Router, RoutingError, type RouterOptions } from "../routing/router.js";
 import { ToolBridge } from "../tools/bridge.js";
 import { buildDigest } from "../verify/digest.js";
-import { contrastDrafts, fieldLabel, planQuestionRound } from "./contrast.js";
+import { canonicalText, contrastDrafts, fieldLabel, planQuestionRound } from "./contrast.js";
 import {
   describeEvaluations,
   evaluateCriteria,
@@ -161,7 +161,21 @@ export class Orchestrator {
    * 재요청을 유발한 충돌. **결말은 다음 라운드에야 정해지므로** 감지 이벤트와 따로 기억한다 —
    * 한 이벤트에 담으려면 미래를 알아야 한다.
    */
-  private pendingConflicts: CriteriaConflict[] = [];
+  /**
+   * 직전 라운드가 재요청을 유발한 충돌 — 다음 라운드에서 **결말을 판정하기 위해** 기억한다.
+   *
+   * 충돌 목록과 그때의 해석을 **한 필드에 묶어 둔다.** 둘을 따로 두면 한쪽만 세우거나 한쪽만
+   * 비우는 경로가 생기고, 그러면 이번 라운드의 결말에 지난 라운드의 해석이 붙는다.
+   */
+  private pendingConflicts: { conflicts: CriteriaConflict[]; interpretation: string | null } | null = null;
+
+  /**
+   * 가장 최근 primary 초안의 해석. `interpretationTextChanged` 계측의 재료다(17.10절 ⑧).
+   *
+   * 초안 전체를 들고 있지 않는 이유: 필요한 것은 이 한 필드이고, 초안을 통째로 붙들면
+   * 나중에 다른 판정에 쓰고 싶은 유혹이 생긴다. 모델 산출물은 판정 근거가 아니다.
+   */
+  private lastInterpretation: string | null = null;
   private pendingQuestion: PendingQuestion | null = null;
   private eventIds: string[] = [];
   /**
@@ -455,6 +469,8 @@ export class Orchestrator {
     // **기준은 primary 초안에서만 흡수한다.** 두 초안의 doneCriteria를 합치면 사용자가 갈랐다고
     // 알려준 그 두 해석이 나란히 기준 목록에 들어가 서로 모순된다. 대조의 산출물은 기준이
     // 아니라 질문이고, 기준이 되는 것은 사용자의 답이다.
+    // 재요청 전후를 비교할 수 있도록 이번 라운드의 해석을 남긴다(17.10절 ⑧).
+    this.lastInterpretation = proposal.interpretation;
     const draftCriteria = this.absorbDraftCriteria(proposal);
     for (const [index, p] of proposals.entries()) {
       await this.emitDraftReceived(p, {
@@ -964,7 +980,7 @@ export class Orchestrator {
     if (this.state.counters.fixLoopRounds > 0) {
       // 이쪽도 결말을 남겨야 한다. fix loop는 PLANNING으로 되돌아오므로 다음 라운드가 판정한다 —
       // 여기서 기억하지 않으면 감지만 세고 결말이 새어 집계의 두 수가 어긋난다.
-      this.pendingConflicts = conflicts;
+      this.pendingConflicts = { conflicts, interpretation: this.lastInterpretation };
       const retry = await this.enterFixLoopForBadPatch(message);
       if (retry.kind === "final") return retry;
       return { kind: "refix", patch: retry.patch };
@@ -984,8 +1000,8 @@ export class Orchestrator {
     }
 
     this.criteriaFeedback = conflicts.map((c) => c.message);
-    // 다음 라운드에서 결말을 판정하기 위해 기억해 둔다.
-    this.pendingConflicts = conflicts;
+    // 다음 라운드에서 결말을 판정하기 위해 기억해 둔다. 해석을 함께 남기는 이유는 위 필드 주석에.
+    this.pendingConflicts = { conflicts, interpretation: this.lastInterpretation };
     return { kind: "redraft" };
   }
 
@@ -998,26 +1014,57 @@ export class Orchestrator {
    * 읽는 사람이 그 추론을 사실로 읽는다.
    */
   private async settlePendingConflicts(current: readonly CriteriaConflict[]): Promise<void> {
-    if (this.pendingConflicts.length === 0) return;
+    if (this.pendingConflicts === null) return;
     const stillConflicting = new Set(current.map((c) => c.criterionId));
-    const pending = this.pendingConflicts;
-    this.pendingConflicts = [];
+    const { conflicts: pending, interpretation: before } = this.pendingConflicts;
+    this.pendingConflicts = null;
 
     await this.emit("CRITERIA_CONFLICT_RESOLVED", {
       outcomes: pending.map((c) => ({
         criterionId: c.criterionId,
         outcome: stillConflicting.has(c.criterionId) ? "plan_unchanged" : "plan_changed_to_expected",
         expectedPaths: c.expectedPaths,
+        // **`plan_unchanged`의 두 원인을 가르는 유일한 관측**(17.10절 ⑧).
+        interpretationTextChanged: this.interpretationTextChanged(before),
       })),
     });
   }
 
+  /**
+   * 재요청 뒤 초안의 해석 **텍스트**가 달라졌는가. 비교할 짝이 없으면 `null`이다.
+   *
+   * # 이름이 "understanding"이 아니라 "text"인 이유
+   *
+   * 우리가 관측할 수 있는 것은 문자열이 달라졌다는 사실뿐이다. 같은 말을 다시 쓴 것도
+   * 변경으로 잡히고, 다른 말로 같은 오해를 반복한 것도 변경으로 잡힌다. 의미가 바뀌었는지는
+   * 또 하나의 모델 호출이라 하지 않는다(17.8절). 이름이 추론을 포함하면 집계를 읽는 사람이
+   * 그 추론을 사실로 읽으므로, 잰 것을 그대로 부른다(17.10절 ③과 같은 규칙).
+   *
+   * 대조와 **같은 정규화**를 쓴다 — 한쪽이 표기 차이로 보는 것을 다른 쪽이 변경으로 세면
+   * 두 지표가 같은 사건에 대해 다른 말을 하게 된다.
+   */
+  private interpretationTextChanged(before: string | null): boolean | null {
+    if (before === null || this.lastInterpretation === null) return null;
+    return canonicalText(before) !== canonicalText(this.lastInterpretation);
+  }
+
+  /**
+   * 재요청이 **일어나지 않은** 결말을 기록한다(예산 소진, 태스크 종료).
+   *
+   * `interpretationTextChanged`가 언제나 `null`인 이유: 비교할 새 초안이 없다. 여기서 `false`를
+   * 쓰면 "다시 물었는데 해석이 그대로였다"로 읽히는데, 다시 묻지도 않았다.
+   */
   private async emitConflictOutcomes(
     conflicts: readonly CriteriaConflict[],
     outcome: CriteriaConflictOutcome
   ): Promise<void> {
     await this.emit("CRITERIA_CONFLICT_RESOLVED", {
-      outcomes: conflicts.map((c) => ({ criterionId: c.criterionId, outcome, expectedPaths: c.expectedPaths })),
+      outcomes: conflicts.map((c) => ({
+        criterionId: c.criterionId,
+        outcome,
+        expectedPaths: c.expectedPaths,
+        interpretationTextChanged: null,
+      })),
     });
   }
 
@@ -1615,9 +1662,9 @@ export class Orchestrator {
     // 재요청을 유발한 충돌이 결말 없이 사라지지 않게 한다. 결말을 세는 지표는 결말이
     // **빠짐없이** 남을 때만 의미가 있다 — 감지 N건에 결말 M건(M<N)이면 차이가 어디서
     // 났는지 알 수 없고, 그 차이가 하필 실패한 태스크에 몰려 있으면 지표가 낙관 쪽으로 휜다.
-    if (this.pendingConflicts.length > 0) {
-      const pending = this.pendingConflicts;
-      this.pendingConflicts = [];
+    if (this.pendingConflicts !== null) {
+      const pending = this.pendingConflicts.conflicts;
+      this.pendingConflicts = null;
       await this.emitConflictOutcomes(pending, "task_ended_before_replan");
     }
 
