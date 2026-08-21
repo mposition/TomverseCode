@@ -210,6 +210,8 @@ test("blocking 불일치가 생기면 3.9절 카드로 묻고, 답이 기준으�
       // 카드에서의 자리와 고른 선택지 순번 — 상한 4의 근거를 재기 위한 것이다(17.10절 ⑨).
       cardPosition: 1,
       optionRank: 1,
+      // 어떤 필드였는지 — 랭킹(17.4절) 튜닝의 재료다(17.10절 ⑩).
+      field: target.field,
     },
   ]);
 });
@@ -249,7 +251,12 @@ test("카드에서의 자리와 고른 선택지 순번이 함께 기록된다",
   const recorded = host.events.find((e) => e.type === "USER_DECISION_RECORDED")!;
   const payload = recorded.payload as {
     cardSize: number;
-    decisions: { disagreementId: string; cardPosition: number | null; optionRank: number | null }[];
+    decisions: {
+      disagreementId: string;
+      cardPosition: number | null;
+      optionRank: number | null;
+      field: string | null;
+    }[];
   };
   // 띄운 개수를 그대로 남긴다 — 답이 오지 않은 항목이 있으면 결정 개수와 달라진다.
   assert.equal(payload.cardSize, card.disagreements.length);
@@ -258,6 +265,11 @@ test("카드에서의 자리와 고른 선택지 순번이 함께 기록된다",
   assert.equal(byId.get(first!.disagreementId)?.optionRank, 2);
   assert.equal(byId.get(second!.disagreementId)?.cardPosition, 2);
   assert.equal(byId.get(second!.disagreementId)?.optionRank, 1);
+
+  // 필드도 함께 남는다. **id에서 파싱하지 않는다** — id 형식을 바꾸는 순간 집계가 조용히
+  // 끊기고, 끊긴 것은 0으로 보인다(17.10절 ⑩).
+  assert.equal(byId.get(first!.disagreementId)?.field, first!.field);
+  assert.equal(byId.get(second!.disagreementId)?.field, second!.field);
 });
 
 test("자유 입력은 optionId 없이 freeform으로 기록된다", async () => {
@@ -285,7 +297,14 @@ test("자유 입력은 optionId 없이 freeform으로 기록된다", async () =>
   const decisions = (recorded!.payload as { decisions: { optionId: string | null; freeform: boolean }[] }).decisions;
   assert.deepEqual(decisions, [
     // 자유 입력에는 고른 선택지가 없으므로 순번도 없다. 0으로 쓰면 "첫 선택지"와 섞인다.
-    { disagreementId: target.disagreementId, optionId: null, freeform: true, cardPosition: 1, optionRank: null },
+    {
+      disagreementId: target.disagreementId,
+      optionId: null,
+      freeform: true,
+      cardPosition: 1,
+      optionRank: null,
+      field: target.field,
+    },
   ]);
 });
 

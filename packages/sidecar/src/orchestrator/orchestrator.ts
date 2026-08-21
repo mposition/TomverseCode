@@ -1532,6 +1532,7 @@ export class Orchestrator {
     // 카드에서의 자리와 고른 선택지의 순번. **한 카드 질문 상한(4)의 근거를 재기 위한 것**이다
     // (17.10절 ⑨). 지금은 화면 설계에서 나온 추정값이고, 실측 없이 늘리거나 줄일 수 없다.
     const positionOf = new Map(disagreements.map((d, index) => [d.disagreementId, index + 1]));
+    const fieldOf = new Map(disagreements.map((d) => [d.disagreementId, d.field]));
     const optionRankOf = (decision: UserDecisionInput): number | null => {
       if (decision.optionId === undefined) return null;
       const options = disagreements.find((d) => d.disagreementId === decision.disagreementId)?.question.options;
@@ -1564,6 +1565,9 @@ export class Orchestrator {
         cardPosition: positionOf.get(d.disagreementId) ?? null,
         // 고른 선택지가 그 질문에서 몇 번째였는가. 자유 입력이면 null이다.
         optionRank: optionRankOf(d),
+        // 어떤 필드의 쟁점이었는가. **랭킹(17.4절)을 튜닝하려면 필드별로 세야 한다** —
+        // id에서 파싱할 수도 있지만, 그러면 id 형식을 바꾸는 순간 집계가 조용히 끊긴다.
+        field: fieldOf.get(d.disagreementId) ?? null,
       })),
       acceptanceCriteria: criteria,
     });

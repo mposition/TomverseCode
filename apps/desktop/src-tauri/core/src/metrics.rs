@@ -186,6 +186,31 @@ pub struct PositionAnswers {
     pub unknown: u64,
 }
 
+/// 한 필드의 쟁점에 사용자가 무엇을 답했는가 — 17.4절 랭킹 튜닝의 재료.
+///
+/// # 왜 "primary를 골랐는가"로 세는가
+///
+/// 선택지 1번은 **언제나 primary 실행자의 값**이고, 사용자가 아무것도 판정하지 않았다면
+/// 결국 적용됐을 값이다. 그래서 "primary가 아닌 것을 골랐다"는 **그 쟁점을 물어서 실제로
+/// 무언가 달라졌다**는 뜻이고, 14절이 말하는 "불일치 1건당 사용자가 뒤집은 비율"이 재려던
+/// 것이 그것이다.
+///
+/// **primary를 골랐다고 그 질문이 쓸모없었다는 뜻은 아니다.** 사용자가 확인해준 것이고,
+/// 확인은 공짜가 아니다. 그래서 이름이 `wasted`가 아니라 `pickedPrimary`다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct FieldAnswers {
+    /// primary 실행자의 값(선택지 1번)을 골랐다.
+    #[serde(rename = "pickedPrimary")]
+    pub picked_primary: u64,
+    /// 다른 초안의 값을 골랐다.
+    #[serde(rename = "pickedOther")]
+    pub picked_other: u64,
+    /// 둘 다 아니라 직접 적었다 — **두 초안이 모두 틀렸다**는 가장 강한 신호다.
+    pub freeform: u64,
+    /// 순번을 알 수 없는 기록. 0으로 뭉개면 비율의 분모가 틀린다.
+    pub unknown: u64,
+}
+
 /// 3.9절 카드의 답변을 **자리별로** 쪼갠 집계 — 12절 "한 카드 질문 상한 4개의 근거".
 ///
 /// # 이 숫자가 말하는 것과 말하지 않는 것
@@ -209,6 +234,12 @@ pub struct CardAnswers {
     /// 스크롤이 생기는지는 크기에 달려 있다.
     #[serde(rename = "cardsBySize")]
     pub cards_by_size: BTreeMap<u64, u64>,
+    /// 필드 → 그 필드 쟁점의 답 분포. **`DISAGREEMENT_FIELD_RANK` 튜닝의 재료**다(17.10절 ⑩).
+    ///
+    /// 자리별 집계와 축이 다르다. 자리는 "화면의 어디에 있었나"이고 필드는 "무엇을 물었나"다.
+    /// 한 축으로 합치면 둘 중 어느 것이 비율을 움직였는지 알 수 없다.
+    #[serde(rename = "byField")]
+    pub by_field: BTreeMap<String, FieldAnswers>,
 }
 
 /// 이 워크스페이스의 커밋이 **몇 개 파일을 담아 왔는가** — 19.6절 "커밋 단위"의 남은 항목.
@@ -453,15 +484,33 @@ fn collect_card_answers(events: &[crate::store::StoredEvent], out: &mut CardAnsw
             let Some(position) = decision.get("cardPosition").and_then(Value::as_u64) else {
                 continue;
             };
+            let freeform = decision.get("freeform").and_then(Value::as_bool) == Some(true);
+            let rank = decision.get("optionRank").and_then(Value::as_u64);
+
             let slot = out.by_position.entry(position).or_default();
-            if decision.get("freeform").and_then(Value::as_bool) == Some(true) {
+            if freeform {
                 slot.freeform += 1;
-                continue;
+            } else {
+                match rank {
+                    Some(1) => slot.first_option += 1,
+                    Some(_) => slot.later_option += 1,
+                    None => slot.unknown += 1,
+                }
             }
-            match decision.get("optionRank").and_then(Value::as_u64) {
-                Some(1) => slot.first_option += 1,
-                Some(_) => slot.later_option += 1,
-                None => slot.unknown += 1,
+
+            // 필드는 payload가 말한다. **id에서 파싱하지 않는다** — id 형식을 바꾸는 순간
+            // 집계가 조용히 끊기고, 끊긴 것은 0으로 보인다.
+            if let Some(field) = decision.get("field").and_then(Value::as_str) {
+                let by_field = out.by_field.entry(field.to_string()).or_default();
+                if freeform {
+                    by_field.freeform += 1;
+                } else {
+                    match rank {
+                        Some(1) => by_field.picked_primary += 1,
+                        Some(_) => by_field.picked_other += 1,
+                        None => by_field.unknown += 1,
+                    }
+                }
             }
         }
     }
@@ -731,6 +780,78 @@ mod tests {
         assert_eq!(m.card_answers.by_position.get(&1).map(|p| p.later_option), Some(1));
         assert_eq!(m.card_answers.by_position.get(&2).map(|p| p.first_option), Some(1));
         assert_eq!(m.card_answers.by_position.get(&3).map(|p| p.freeform), Some(1));
+    }
+
+    /// **자리와 필드는 다른 축이다.** 한 축으로 합치면 비율을 움직인 것이 화면의 위치인지
+    /// 물어본 내용인지 알 수 없다 — 그런데 랭킹(17.4절)이 튜닝해야 하는 것은 후자다.
+    #[test]
+    fn card_answers_are_also_counted_per_field() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &json!({
+                    "cardSize": 3,
+                    "decisions": [
+                        // primary(선택지 1번)를 그대로 골랐다 — 물어서 달라진 것이 없다.
+                        { "disagreementId": "d1", "field": "doneCriteria", "cardPosition": 1, "optionRank": 1, "freeform": false },
+                        // 다른 초안을 골랐다 — 물어서 실제로 달라졌다.
+                        { "disagreementId": "d2", "field": "targetPaths", "cardPosition": 2, "optionRank": 2, "freeform": false },
+                        // 둘 다 틀렸다 — 가장 강한 신호.
+                        { "disagreementId": "d3", "field": "targetPaths", "cardPosition": 3, "optionRank": null, "freeform": true },
+                    ],
+                }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        let by_field = &m.card_answers.by_field;
+        assert_eq!(
+            by_field.get("doneCriteria").map(|f| f.picked_primary),
+            Some(1),
+            "{by_field:?}"
+        );
+        assert_eq!(
+            by_field.get("targetPaths").map(|f| f.picked_other),
+            Some(1),
+            "{by_field:?}"
+        );
+        assert_eq!(by_field.get("targetPaths").map(|f| f.freeform), Some(1), "{by_field:?}");
+        // 필드별 합계는 자리별 합계와 같아야 한다 — 어긋나면 한쪽이 답을 흘리고 있다.
+        let by_field_total: u64 = by_field
+            .values()
+            .map(|f| f.picked_primary + f.picked_other + f.freeform + f.unknown)
+            .sum();
+        let by_position_total: u64 = m
+            .card_answers
+            .by_position
+            .values()
+            .map(|p| p.first_option + p.later_option + p.freeform + p.unknown)
+            .sum();
+        assert_eq!(by_field_total, by_position_total);
+    }
+
+    /// 필드가 없는 기록은 필드 집계에 **들어가지 않는다.** 억지로 "unknown" 필드로 넣으면
+    /// 필드별 비율의 분모가 실제로 물어본 쟁점 수와 달라진다.
+    #[test]
+    fn decisions_without_a_field_do_not_create_an_unknown_field_bucket() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &json!({
+                    "cardSize": 1,
+                    "decisions": [{ "disagreementId": "d1", "cardPosition": 1, "optionRank": 1, "freeform": false }],
+                }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert!(m.card_answers.by_field.is_empty(), "{:?}", m.card_answers.by_field);
+        // 자리별로는 세어진다 — 자리는 payload에 있었다.
+        assert_eq!(m.card_answers.by_position.get(&1).map(|p| p.first_option), Some(1));
     }
 
     /// 3.4절 확인 필요 카드는 **다른 화면**이라 자리가 없다. 섞으면 자리 없는 답이 전부
