@@ -25,6 +25,8 @@ pub mod time;
 pub mod tools;
 pub mod types;
 pub mod verify;
+#[cfg(windows)]
+pub(crate) mod win_job;
 
 pub use artifacts::ArtifactStore;
 pub use cancel::{CancelOutcome, CancellationRegistry, CancellationToken};

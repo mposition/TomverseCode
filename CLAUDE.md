@@ -63,6 +63,9 @@ apps/desktop/        Tauri 2 + React
   src/               최소 UI — 단계 표시, 이벤트 로그, 승인 모달, diff, 검증 결과
   src-tauri/         Tauri 껍데기 — command/event 배관과 승인 왕복의 UI 쪽 절반. 보안 로직 없음
     core/            tomverse-core — Rust 신뢰 경계 전체. tauri에 의존하지 않는 별도 크레이트
+    core/src/win_job.rs  Windows Job Object — 프로세스 트리 종료 보장. **Linux에서는 컴파일되지
+                     않으므로 여기서 통과한 verify가 이 파일에 대해 말해주는 것이 없다.**
+                     별도 크레이트에서 실제 파일을 #[path]로 가리켜 타입 검증만 했다(문서 20.5절)
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
                      `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`.
                      `metrics`는 저장된 이벤트에서 계측을 집계한다 — 기준 커버리지·충돌 결말과

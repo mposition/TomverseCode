@@ -10,32 +10,34 @@
 //! 시그널을 보낸다(`killpg`). 자식이 스스로 그룹을 다시 바꾸지 않는 한 손자까지 확실히 죽는다.
 //! SIGTERM을 먼저 보내 정리 기회를 주고, 짧은 유예 후에도 살아 있으면 SIGKILL.
 //!
-//! **Windows**: 원래는 **Job Object**가 정답이다 — 커널이 트리를 보장한다. 지금은 채택하지
-//! 않았고 `taskkill /T /F /PID`를 쓴다. 한계:
+//! **Windows**: **Job Object**를 쓴다 — 커널이 소속을 관리하므로 트리 전체 종료를 보장한다
+//! (`win_job.rs`, 문서 20절). 만들지 못하거나 배정에 실패하면 `taskkill /T /F /PID`로
+//! 물러선다. **취소를 실패시키지 않는 것이 트리를 보장하는 것보다 우선하기 때문이다.**
 //!
-//! - `taskkill /T`는 **스냅샷 시점의 부모-자식 관계**를 따라 트리를 죽인다. 따라서
-//!   (a) 부모가 죽은 뒤 고아가 된 손자, (b) 종료 직후 새로 spawn된 프로세스는 놓칠 수 있다.
-//! - `CREATE_NEW_PROCESS_GROUP`으로 그룹을 만들어 두지만, 그룹 종료는 콘솔 애플리케이션에만
-//!   신뢰성 있게 동작하므로 taskkill을 주 수단으로 쓴다.
+//! taskkill 경로를 지우지 않고 남겨둔 이유는 그것이 여전히 도달 가능한 경로이기 때문이다:
+//! 구형 Windows나 이미 다른 job에 속한 환경에서는 중첩 배정이 거절될 수 있다. 그때
+//! `tree_guaranteed`는 거짓이 되고 화면이 그 사실을 그대로 말한다 —
+//! 죽지 않은 것을 죽었다고 보고하지 않기 위해서다.
 //!
-//! 즉 **Windows에서 프로세스 트리 종료는 best-effort다.** 그래서 `tree_guaranteed`가 false이고,
-//! 화면이 그 사실을 그대로 말한다 — 죽지 않은 것을 죽었다고 보고하지 않기 위해서다.
+//! taskkill의 한계(그래서 Job Object가 필요한 이유): `taskkill /T`는 **스냅샷 시점의
+//! 부모-자식 관계**를 따라가므로 (a) 부모가 죽은 뒤 고아가 된 손자, (b) 종료 직후 새로
+//! spawn된 프로세스를 놓친다. `CREATE_NEW_PROCESS_GROUP`은 계속 걸어두지만 그룹 종료는
+//! 콘솔 애플리케이션에만 신뢰성 있게 동작한다.
 //!
-//! # Job Object로 넘어갈 때 알아야 할 것 (문서 20절)
-//!
-//! 조사와 착지 기준은 state-machine-and-protocol.md 20절에 있다. 여기서는 **이 파일을 고칠
-//! 사람이 먼저 알아야 하는 세 가지**만 적어둔다.
+//! # 이 파일을 고치기 전에 (문서 20절)
 //!
 //! - **`KILL_ON_JOB_CLOSE`가 걸린 job에 우리 프로세스가 들어가면 앱이 스스로 죽는다.**
-//!   `AssignProcessToJobObject`는 **자식 핸들에만** 부를 것. 이것이 이 변경에서 가장 나쁜
-//!   실패 모드이며, 컴파일러는 잡아주지 않는다.
-//! - **spawn 직후 배정에는 경쟁 창이 있다.** 그 사이에 자식이 만든 손자는 job 밖에 남는다.
-//!   없애려면 `CREATE_SUSPENDED`로 띄우고 배정한 뒤 재개해야 하는데, `std`가 스레드 핸들을
-//!   주지 않아 Toolhelp 우회가 필요하다(20.3절). 어느 쪽을 골랐는지 여기 적을 것.
-//! - **이 저장소의 개발 환경(Linux)에서는 실행 검증이 불가능하다.** `windows-sys`는
-//!   `cargo check --target x86_64-pc-windows-msvc`로 타입 검증까지는 되지만(core 전체는
-//!   `rusqlite`의 bundled SQLite가 `lib.exe`를 요구해 막힌다), 동작은 Windows에서만 확인된다.
-//!   20.6절의 착지 기준을 전부 통과하기 전에는 `taskkill` 경로를 지울 것.
+//!   `AssignProcessToJobObject`를 부르는 곳은 `win_job.rs`에 하나뿐이고 인자는 자식 핸들뿐이다.
+//!   이것이 이 기능에서 가장 나쁜 실패 모드이며, **컴파일러는 잡아주지 않는다.**
+//! - **배정은 spawn 직후다.** 그 사이에 자식이 만든 손자는 job 밖에 남는다(마이크로초 단위의
+//!   창). 없애려면 `CREATE_SUSPENDED`로 띄웠다가 재개해야 하는데 `std`가 스레드 핸들을 주지
+//!   않아 Toolhelp 우회가 필요하고, 취소 경로의 `unsafe` 양이 늘어난다(20.3절).
+//! - **이 저장소의 개발 환경(Linux)에서는 실행 검증이 불가능하다.** `win_job.rs`와 이 파일의
+//!   Windows 분기는 `cargo check --target x86_64-pc-windows-msvc`로 **타입 검증만** 했다
+//!   (core 전체는 `rusqlite`의 bundled SQLite가 `lib.exe`를 요구해 그 방식으로 검사할 수 없어,
+//!   두 파일만 담은 별도 크레이트에서 확인했다). **타입 검증은 동작 검증이 아니다** —
+//!   Win32에서 컴파일되는 코드가 틀리는 흔한 방식은 핸들 수명이고, 그건 실행해야 드러난다.
+//!   20.6절의 착지 기준을 Windows에서 통과시키기 전에는 이 경로를 신뢰하지 말 것.
 //!
 //! 파일·네트워크 샌드박싱은 **이것과 다른 문제이고, 하지 않기로 했다**(20.2절) —
 //! Job Object에 그 기능이 없기도 하지만, 실제로 제한하는 수단들은 사용자의 개발 환경을
@@ -45,6 +47,8 @@ use std::process::Child;
 use std::time::{Duration, Instant};
 
 /// 종료 유예 — 이 시간 안에 스스로 끝나면 강제 종료하지 않는다.
+/// Unix 전용 — Windows에는 SIGTERM에 해당하는 단계가 없다(Job Object는 즉시 종료한다).
+#[cfg(unix)]
 const GRACE: Duration = Duration::from_millis(300);
 
 /// SIGKILL(또는 taskkill) 이후 **자식이 사라지기를 기다리는 상한**.
@@ -82,12 +86,52 @@ pub fn configure_group(command: &mut std::process::Command) {
 #[cfg(not(any(unix, windows)))]
 pub fn configure_group(_command: &mut std::process::Command) {}
 
+/// 자식과 수명을 같이하는 종료 보조물.
+///
+/// Windows에서는 Job Object 핸들을 담고, 그 밖에서는 **비어 있다** — Unix는 프로세스 그룹이
+/// 커널에 이미 있으므로 따로 들고 다닐 것이 없다. 그래도 타입을 두는 이유는 호출부의 모양을
+/// 플랫폼마다 다르게 만들지 않기 위해서다.
+///
+/// # Drop이 곧 정리다 (Windows)
+///
+/// job 핸들이 닫히면 커널이 안에 남은 프로세스를 죽인다(`KILL_ON_JOB_CLOSE`). 그래서
+/// 명령이 정상 종료했든, 취소됐든, 사용자가 강제 포기했든 **이 값이 스코프를 벗어나는 순간
+/// 남은 것이 정리된다.** 12절 "강제 포기 이후 남은 프로세스의 정리"가 이렇게 닫힌다 —
+/// PID를 추적할 필요가 없다.
+///
+/// **부작용을 숨기지 않는다**: 정상 종료한 명령이 뒤에 남긴 백그라운드 프로세스도 이때 죽는다.
+/// `run_command`의 allowlist는 빌드·테스트·lint용이고 데몬을 띄워 남겨두는 용도가 아니므로
+/// 그 편이 맞다고 본다. 남기고 싶은 프로세스가 생기면 이 결정을 다시 봐야 한다.
+#[derive(Default)]
+pub struct ProcessGuard {
+    #[cfg(windows)]
+    job: Option<crate::win_job::JobHandle>,
+}
+
+/// spawn 직후 자식을 종료 보조물에 편입시킨다.
+///
+/// **spawn 전이 아니라 직후인 이유**는 문서 20.3절에 있다 — 경쟁 창을 없애려면 정지 상태로
+/// 띄웠다가 재개해야 하는데 `std`가 스레드 핸들을 주지 않는다. 남는 창은 마이크로초 단위이고,
+/// 어느 쪽이든 taskkill보다 나빠지지 않는다.
+#[cfg(windows)]
+pub fn adopt(child: &std::process::Child) -> ProcessGuard {
+    ProcessGuard {
+        job: crate::win_job::JobHandle::create_and_assign(child),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn adopt(_child: &std::process::Child) -> ProcessGuard {
+    ProcessGuard::default()
+}
+
 /// 프로세스 트리를 종료한다. 반환값은 "트리 전체를 종료했다고 확신하는가"다.
 ///
 /// `false`는 실패가 아니라 **보장할 수 없다는 뜻**이며, 호출자가 그 불확실성을 사용자에게
 /// 전달할 수 있게 하기 위해 구별한다.
-pub fn terminate_tree(child: &mut Child) -> TreeKillOutcome {
+pub fn terminate_tree(child: &mut Child, guard: &ProcessGuard) -> TreeKillOutcome {
     let pid = child.id();
+    let _ = guard;
 
     #[cfg(unix)]
     {
@@ -110,21 +154,19 @@ pub fn terminate_tree(child: &mut Child) -> TreeKillOutcome {
 
     #[cfg(windows)]
     {
-        let tree_killed = windows_taskkill_tree(pid);
+        // Job Object가 있으면 그것만으로 충분하다 — 커널이 소속을 관리하므로 고아가 된 손자도
+        // 놓치지 않는다. 없으면(생성·배정 실패) taskkill로 물러선다. **취소를 실패시키지 않는
+        // 것이 트리를 보장하는 것보다 우선한다.**
+        let (covers_tree, method) = match guard.job.as_ref() {
+            Some(job) if job.terminate() => (true, "TerminateJobObject"),
+            // job은 있는데 종료 요청이 거절된 경우. 보장을 말할 수 없으므로 taskkill을 겹쳐 쓴다.
+            Some(_) => (false, taskkill_method(windows_taskkill_tree(pid))),
+            None => (false, taskkill_method(windows_taskkill_tree(pid))),
+        };
         let _ = child.kill();
         let reaped = reap_with_timeout(child);
-        return TreeKillOutcome::new(
-            pid,
-            reaped,
-            // taskkill은 스냅샷 기반이므로 보장이라고 말하지 않는다.
-            // Job Object로 바꾸면 이 인자가 true가 된다(문서 20절).
-            false,
-            if tree_killed {
-                "taskkill /T /F (best-effort)"
-            } else {
-                "kill(child) — taskkill 실패"
-            },
-        );
+        // `covers_tree`가 참이어도 수거에 실패하면 보장이 아니다 — 그 결합은 `new`가 강제한다.
+        return TreeKillOutcome::new(pid, reaped, covers_tree, method);
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -222,6 +264,15 @@ fn unix_kill_group(pid: u32) -> bool {
     }
     unsafe { libc::killpg(pgid, libc::SIGKILL) };
     true
+}
+
+#[cfg(windows)]
+fn taskkill_method(killed: bool) -> &'static str {
+    if killed {
+        "taskkill /T /F (best-effort)"
+    } else {
+        "kill(child) — taskkill 실패"
+    }
 }
 
 #[cfg(windows)]
@@ -391,7 +442,10 @@ mod tests {
         };
         assert!(is_alive(grandchild_pid), "손자가 살아 있어야 테스트가 의미 있습니다");
 
-        let outcome = terminate_tree(&mut child);
+        // 실제 경로와 같게 편입시킨 뒤 종료한다 — 보조물 없이 부르면 Windows에서 검사하는
+        // 것이 실제 동작과 달라진다.
+        let guard = adopt(&child);
+        let outcome = terminate_tree(&mut child, &guard);
         assert!(outcome.direct_child_terminated);
 
         // 부모는 반드시 죽는다.
@@ -438,7 +492,7 @@ mod tests {
         let _ = child.wait();
         // 이미 죽은 프로세스를 종료하려 해도 패닉하거나 오류를 내지 않아야 한다 —
         // 취소 경로는 경쟁 상황에서 늘 이 상태를 만난다.
-        let outcome = terminate_tree(&mut child);
+        let outcome = terminate_tree(&mut child, &ProcessGuard::default());
         assert!(outcome.direct_child_terminated);
     }
 

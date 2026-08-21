@@ -936,6 +936,12 @@ fn run_process(
         )
     })?;
 
+    // 자식을 종료 보조물에 편입시킨다 (Windows에서는 Job Object).
+    //
+    // **이 값의 수명이 곧 정리 시점이다** — 스코프를 벗어나면 job 핸들이 닫히고 커널이 안에
+    // 남은 프로세스를 죽인다. 정상 종료·취소·타임아웃 어느 경로로 나가도 같다(proctree.rs).
+    let guard = proctree::adopt(&child);
+
     // stdout/stderr를 별도 스레드로 읽는다. 파이프 버퍼가 차면 자식이 블록되므로
     // wait()만 하고 나중에 읽는 방식은 큰 출력에서 데드락이 된다.
     let mut stdout_pipe = child.stdout.take();
@@ -965,7 +971,7 @@ fn run_process(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if cancel.is_cancelled() {
-                    let outcome = proctree::terminate_tree(&mut child);
+                    let outcome = proctree::terminate_tree(&mut child, &guard);
                     termination = Termination::Cancelled {
                         tree_guaranteed: outcome.tree_guaranteed,
                         method: outcome.method,
@@ -975,7 +981,7 @@ fn run_process(
                 }
                 if start.elapsed() >= timeout {
                     // 타임아웃도 트리 종료를 쓴다 — npm이 타임아웃됐는데 node가 남는 것도 같은 문제다.
-                    let _ = proctree::terminate_tree(&mut child);
+                    let _ = proctree::terminate_tree(&mut child, &guard);
                     termination = Termination::TimedOut;
                     break None;
                 }
