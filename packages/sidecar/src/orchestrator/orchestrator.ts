@@ -1536,6 +1536,11 @@ export class Orchestrator {
       resolvedModelId: response.meta.providerReportedModelId,
       ...(response.meta.providerRequestId ? { providerRequestId: response.meta.providerRequestId } : {}),
       usage: response.usage,
+      // **우리 추정과 공급자가 보고한 실제를 함께 남긴다.** 하나만 남기면 추정이 상한이라는
+      // 주장을 사후에 검증할 수 없고, 계수를 고칠 근거가 감밖에 없다(context/budget.ts).
+      ...(response.meta.estimatedInputTokens !== undefined
+        ? { estimatedInputTokens: response.meta.estimatedInputTokens }
+        : {}),
       costUsd: this.registry.costUsd(adapter.modelId, response.usage),
       latencyMs: response.latencyMs,
       attempt,

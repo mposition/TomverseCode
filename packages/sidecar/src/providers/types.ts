@@ -113,6 +113,17 @@ export interface ProviderCallMetadata {
   providerRequestId?: string;
   /** 요청이 실제로 나갔는가 — 과금 가능성 판정의 근거다. */
   dispatchState: DispatchState;
+  /**
+   * **우리가** 이 요청의 입력 토큰으로 추정했던 수 (`context/budget.ts`).
+   *
+   * `usage.inputTokens`(공급자가 보고한 실제)와 나란히 두는 것이 요점이다. 우리 추정은
+   * 상한이라고 주장하는 값인데, 그 주장이 참인지는 두 수를 비교해야만 알 수 있다.
+   * 하나만 남기면 계수를 고칠 근거가 감밖에 없다.
+   *
+   * 없을 수 있다 — 추정하지 않은 경로가 있으면 그 사실이 `undefined`로 남아야 하고,
+   * 0으로 채우면 "추정이 0이었다"(=무한대 배 과소 추정)로 집계된다.
+   */
+  estimatedInputTokens?: number;
 }
 
 export interface ProviderResponse<T> {

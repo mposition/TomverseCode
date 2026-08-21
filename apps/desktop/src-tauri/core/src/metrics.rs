@@ -412,6 +412,38 @@ fn micros_to_usd(micros: u64) -> f64 {
     micros as f64 / 1_000_000.0
 }
 
+/// 우리 토큰 추정이 **실제로 상한이었는가.**
+///
+/// 컨텍스트 패킹은 "이보다 많지는 않을 것"이라고 주장하는 수로 예산을 짠다
+/// (context-engine.md 8절). 그 주장이 참인지는 공급자가 보고한 실제와 비교해야만 알 수 있고,
+/// 비교하지 않으면 계수를 고칠 근거가 감밖에 없다.
+///
+/// **비율의 정의는 `실제 / 추정`이다.** 1을 넘으면 추정이 상한이 아니었다는 뜻이고, 그 방향이
+/// 위험한 쪽이다 — 예약보다 많이 쓴 것이므로 원장이 `BUDGET_ESTIMATE_BREACH`로 막는다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct TokenEstimateAccuracy {
+    /// 추정과 실제를 **둘 다 아는** 호출 수. 이 수가 0이면 아래 값들은 아무것도 말하지 않는다.
+    pub calls: u64,
+    /// 추정이 없어 비교하지 못한 호출 수 (v5 이전 기록, 추정하지 않은 경로).
+    ///
+    /// 조용히 빼면 "표본이 적다"와 "배선이 끊겼다"를 구별할 수 없다.
+    #[serde(rename = "callsWithoutEstimate")]
+    pub calls_without_estimate: u64,
+    /// **실제가 추정을 넘은 호출 수.** 0이 아니면 그 추정은 상한이 아니다.
+    ///
+    /// 이름이 `overrun`이나 `error`가 아닌 이유: 무슨 일이 있었는지를 말하는 이름이어야 한다.
+    /// "초과"는 판정이고, 여기 있는 것은 관측이다.
+    #[serde(rename = "callsWhereActualExceededEstimate")]
+    pub calls_where_actual_exceeded_estimate: u64,
+    /// `실제 / 추정` × 100의 백분위. 100이면 정확히 맞은 것, 100 미만이면 과대 추정이다.
+    #[serde(rename = "p50RatioPercent")]
+    pub p50_ratio_percent: Option<u64>,
+    #[serde(rename = "p90RatioPercent")]
+    pub p90_ratio_percent: Option<u64>,
+    #[serde(rename = "maxRatioPercent")]
+    pub max_ratio_percent: Option<u64>,
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Metrics {
     pub coverage: CriteriaCoverage,
@@ -430,6 +462,8 @@ pub struct Metrics {
     pub force_abandon_threshold: Option<ForceAbandonThreshold>,
     #[serde(rename = "taskCosts")]
     pub task_costs: TaskCosts,
+    #[serde(rename = "tokenEstimate")]
+    pub token_estimate: TokenEstimateAccuracy,
     /// 관측에서 유도한 태스크당 예산 상한 제안. **집계 결과이지 설정이 아니다.**
     #[serde(rename = "taskBudgetThreshold")]
     pub task_budget_threshold: Option<TaskBudgetThreshold>,
@@ -449,6 +483,8 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     let mut commit_files: Vec<u64> = Vec::new();
     // 마이크로 달러 정수로 모은다 — 백분위를 다른 지표와 같은 함수로 내기 위해서다.
     let mut task_cost_micros: Vec<u64> = Vec::new();
+    // `실제 / 추정` × 100. 정수로 모으는 이유는 위와 같다.
+    let mut token_ratios: Vec<u64> = Vec::new();
     for (task_id, terminal_status) in &tasks {
         metrics.tasks_scanned += 1;
 
@@ -457,6 +493,18 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
         // 비용을 모르는 호출이 하나라도 있으면 **분포에서 뺀다.** 그 태스크의 합계는 하한이고,
         // 하한을 분포에 넣으면 유도된 상한이 실제보다 낮아진다 — 낮은 상한은 정상 태스크를
         // 거부하고, 그 거부의 원인이 데이터 결함이라는 사실은 어디에도 남지 않는다.
+        // ---- 토큰 추정의 정확도 ----
+        if let Ok((pairs, without_estimate)) = store.token_estimate_pairs(task_id) {
+            for (estimated, actual) in &pairs {
+                token_ratios.push(((*actual as f64 / *estimated as f64) * 100.0).round() as u64);
+                if actual > estimated {
+                    metrics.token_estimate.calls_where_actual_exceeded_estimate += 1;
+                }
+            }
+            metrics.token_estimate.calls += pairs.len() as u64;
+            metrics.token_estimate.calls_without_estimate += without_estimate;
+        }
+
         if let Ok((sum, calls, unpriced)) = store.task_cost_usd(task_id) {
             if calls > 0 {
                 if unpriced > 0 {
@@ -570,6 +618,11 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     metrics.commit_sizes.p90_files = percentile(&commit_files, 90);
     metrics.commit_sizes.max_files = commit_files.last().copied();
     metrics.large_change_threshold = Some(suggest_large_change_files(&metrics.commit_sizes));
+
+    token_ratios.sort_unstable();
+    metrics.token_estimate.p50_ratio_percent = percentile(&token_ratios, 50);
+    metrics.token_estimate.p90_ratio_percent = percentile(&token_ratios, 90);
+    metrics.token_estimate.max_ratio_percent = token_ratios.last().copied();
 
     task_cost_micros.sort_unstable();
     metrics.task_costs.tasks = task_cost_micros.len() as u64;
@@ -772,6 +825,65 @@ mod tests {
                 }))
                 .unwrap();
         }
+    }
+
+    fn seed_token_estimate(store: &Store, task_id: &str, call: &str, estimated: Option<i64>, actual: i64) {
+        let mut usage = json!({
+            "taskId": task_id,
+            "callId": call,
+            "role": "executor",
+            "providerId": "p",
+            "modelId": "m",
+            "usage": { "inputTokens": actual, "outputTokens": 10 },
+            "costUsd": 0.01,
+            "latencyMs": 1,
+            "attempt": 1,
+            "createdAt": "2026-01-01T00:00:00Z",
+        });
+        if let Some(e) = estimated {
+            usage["estimatedInputTokens"] = json!(e);
+        }
+        store.record_provider_usage(&usage).unwrap();
+    }
+
+    /// **추정이 상한이었는지를 이 숫자가 말한다.** 실제가 추정을 넘은 호출이 하나라도 있으면
+    /// 그 추정은 상한이 아니고, 그건 예약보다 많이 썼다는 뜻이다.
+    #[test]
+    fn counts_the_calls_where_the_actual_exceeded_our_estimate() {
+        let (_d, store) = seeded();
+        seed_token_estimate(&store, "task-1", "c1", Some(1_000), 500); // 과대 추정 — 안전한 방향
+        seed_token_estimate(&store, "task-1", "c2", Some(1_000), 1_000); // 정확
+        seed_token_estimate(&store, "task-1", "c3", Some(1_000), 2_000); // 과소 추정 — 위험한 방향
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.token_estimate.calls, 3);
+        assert_eq!(m.token_estimate.calls_where_actual_exceeded_estimate, 1);
+        assert_eq!(m.token_estimate.max_ratio_percent, Some(200));
+        assert_eq!(m.token_estimate.p50_ratio_percent, Some(100));
+    }
+
+    /// **추정이 없는 호출을 비율 1로 세지 않는다.** 없는 쪽을 채우면 "추정이 맞았다"는 결론이
+    /// 데이터 없이 나오고, 배선이 끊긴 것과 표본이 적은 것을 구별할 수 없게 된다.
+    #[test]
+    fn calls_without_an_estimate_are_counted_separately_not_as_agreement() {
+        let (_d, store) = seeded();
+        seed_token_estimate(&store, "task-1", "c1", None, 500);
+        seed_token_estimate(&store, "task-1", "c2", Some(0), 500);
+        seed_token_estimate(&store, "task-1", "c3", Some(400), 500);
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.token_estimate.calls, 1, "비교 가능한 호출만 센다");
+        assert_eq!(m.token_estimate.calls_without_estimate, 2, "0과 NULL 둘 다 비교 불가다");
+        assert_eq!(m.token_estimate.calls_where_actual_exceeded_estimate, 1);
+    }
+
+    /// 기록이 없으면 백분위는 `None`이다. 0으로 채우면 "추정이 0배로 정확했다"로 읽힌다.
+    #[test]
+    fn no_token_records_yield_no_percentiles() {
+        let (_d, store) = seeded();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.token_estimate.calls, 0);
+        assert_eq!(m.token_estimate.p90_ratio_percent, None);
     }
 
     /// **비용을 모르는 호출이 있는 태스크는 분포에서 빠진다.**

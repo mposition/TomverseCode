@@ -3,22 +3,116 @@ import type { RelevantFile } from "@tomverse/protocol";
 /**
  * 토큰 예산 패키징 — docs/design/context-engine.md 8절.
  *
- * 정확한 토크나이저를 도입하지 않은 이유(11절 미해결 항목): tiktoken 등을 넣으면 의존성과
- * WASM 로딩 비용이 생기고, 예산 초과의 대가는 "요청이 거부되고 재시도"이지 데이터 손실이 아니다.
- * 문자 수 근사로 시작하고, 실제로 예산 초과가 문제가 되면 그때 정확한 카운터를 넣는다.
- * 근사가 근사임을 숨기지 않기 위해 상수 이름에 APPROX를 붙였다.
+ * # 정확한 토큰 수는 **원리적으로 존재하지 않는다**
+ *
+ * 이 설계는 **하나의 스냅샷을 모든 공급자에게 보낸다**(`providers/prompts.ts`의 네 빌더가 전부
+ * 같은 `renderSnapshot`을 쓴다 — 그게 대조가 성립하는 조건이다). 그런데 같은 텍스트의 토큰
+ * 수는 토크나이저마다 다르다. 그러므로 "정확한 카운터를 넣는다"는 목표는 달성 가능한 목표가
+ * 아니다 — 공급자 A에게 정확한 수는 공급자 B에게 틀린 수다.
+ *
+ * 달성 가능한 목표는 **상한**이다. 그래서 이 모듈이 내는 값은 추정이 아니라 "이보다 많지는
+ * 않을 것"이고, 이름도 그렇게 붙였다.
+ *
+ * # 왜 tiktoken을 넣지 않는가
+ *
+ * 위 이유가 첫째다. 둘째, Anthropic은 오프라인 토크나이저를 배포하지 않는다 — 정확히 세려면
+ * **API 호출**이고, 그건 패킹할 때마다 지연과 비용이 붙는다는 뜻이다. 컨텍스트를 꾸리기 위해
+ * 유료 호출을 하는 것은 예산 상한(multi-engine-routing.md 10.6절)이 막으려는 것과 같은 종류의
+ * 지출이다. 셋째, WASM 로딩 비용과 의존성이 붙는다.
+ *
+ * # 과소 추정과 과대 추정의 대가는 대칭이 아니다
+ *
+ * **과대 추정의 대가**: 파일을 덜 싣는다. 모델이 볼 것이 줄어 패치 품질이 떨어지지만,
+ * 그 손해는 **보이지 않는다.**
+ *
+ * **과소 추정의 대가**: 예산보다 많이 보낸다. 종전 주석은 그 대가를 "요청이 거부되고 재시도"로
+ * 적었는데, **예산 상한이 붙으면서 달라졌다** — 실제 입력 토큰이 예약의 근거였던 수를 넘으면
+ * 실제 비용이 예약액을 넘고, 원장은 `BUDGET_ESTIMATE_BREACH`로 이후 호출을 막는다. 즉 이제
+ * 과소 추정은 **돈과 태스크를 함께 잃는다.**
+ *
+ * 그래서 계수는 보수적으로(=크게 나오게) 잡는다. 다만 최악의 토크나이저를 가정하지는 않는다 —
+ * 모든 문자를 1문자=3토큰으로 보면 컨텍스트가 1/3로 줄어 위의 "보이지 않는 손해"가 상시화된다.
+ * 우리가 실제로 라우팅하는 토크나이저들에 대해 성립하는 상한이면 되고, **그건 재봐야 안다.**
+ *
+ * # 그래서 재고 있다
+ *
+ * 모든 호출이 `meta.estimatedInputTokens`(우리 추정)와 `usage.inputTokens`(공급자가 보고한
+ * 실제)를 함께 남긴다. `tomverse-host metrics`의 `tokenEstimate`가 그 비율을 집계하고,
+ * **실제가 추정을 넘은 호출 수**를 따로 센다 — 그 수가 0이 아니면 이 모듈은 상한이 아니다.
+ * 계수를 고칠 근거는 이 숫자이지 감이 아니다.
+ *
+ * # 종전 근사가 틀렸던 방향
+ *
+ * 종전에는 전부 `문자 수 / 3.5`였다. 그 값은 영문 코드에는 대략 맞지만 **한글에는 3~7배
+ * 과소 추정**이다(한글 음절은 UTF-8로 3바이트이고 BPE는 바이트 위에서 도므로 보통 음절당
+ * 1토큰 이상이다). 이 제품의 사용자는 한국어로 요청을 쓰고 한국어 주석이 달린 코드를 다루므로,
+ * 그 오차는 예외적인 경우가 아니라 **기본 경로**에 있었다.
  */
 
-/** 영문 코드 기준 대략 1토큰 ≈ 3.5자. 한국어가 섞이면 더 나빠지므로 보수적으로 잡는다. */
-export const APPROX_CHARS_PER_TOKEN = 3.5;
+/**
+ * ASCII 문자 몇 개가 1토큰인가.
+ *
+ * **유도하지 못한 상수다.** 영문 산문·코드에서 흔히 관측되는 3.5~4.5보다 작게 잡아 상한 쪽으로
+ * 기울였다 — 압축된 코드나 base64 덩어리는 이보다 훨씬 나쁘다.
+ */
+export const ASCII_CHARS_PER_TOKEN = 3;
+
+/**
+ * ASCII가 아닌 문자 1개가 몇 토큰인가.
+ *
+ * **유도하지 못한 상수다.** 한글·CJK는 UTF-8로 3바이트이고, 현대 토크나이저는 보통 1~2음절을
+ * 1토큰으로 묶는다. 최악(음절당 3토큰, 바이트 단위 분해)을 가정하지 않는 이유는 위 모듈 주석에
+ * 있다 — 그러면 컨텍스트가 상시로 줄어든다.
+ */
+export const NON_ASCII_TOKENS_PER_CHAR = 1;
+
+/**
+ * 이 텍스트가 넘지 않을 토큰 수.
+ *
+ * 코드 포인트 단위로 센다 — `String.length`는 서로게이트 쌍을 2로 세므로 이모지가 든 텍스트에서
+ * 문자 수가 실제와 달라진다.
+ */
+export function estimateTokensUpperBound(text: string): number {
+  let ascii = 0;
+  let nonAscii = 0;
+  for (const ch of text) {
+    if (ch.codePointAt(0)! < 0x80) ascii += 1;
+    else nonAscii += 1;
+  }
+  return Math.ceil(ascii / ASCII_CHARS_PER_TOKEN) + nonAscii * NON_ASCII_TOKENS_PER_CHAR;
+}
+
+/**
+ * 추정 토큰이 `maxTokens`를 넘지 않는 **가장 긴 접두사**.
+ *
+ * 종전에는 `허용 토큰 × 문자당 토큰`으로 자를 문자 수를 역산했다. 계수가 문자 종류마다 다른
+ * 지금은 그 역산이 성립하지 않는다 — 한글 구간에서 역산하면 허용치의 3배를 잘라 넣는다.
+ * 그래서 앞에서부터 실제로 세면서 자른다.
+ *
+ * 코드 포인트 단위로 자르므로 **서로게이트 쌍이 반으로 쪼개지지 않는다.** 쪼개지면 잘린 자리에
+ * 깨진 문자가 남고, 그건 모델에게도 로그에도 잡음이다.
+ */
+export function truncateToTokens(text: string, maxTokens: number): string {
+  if (maxTokens <= 0) return "";
+  let ascii = 0;
+  let nonAscii = 0;
+  let end = 0;
+  for (const ch of text) {
+    const nextAscii = ch.codePointAt(0)! < 0x80 ? ascii + 1 : ascii;
+    const nextNonAscii = ch.codePointAt(0)! < 0x80 ? nonAscii : nonAscii + 1;
+    const cost =
+      Math.ceil(nextAscii / ASCII_CHARS_PER_TOKEN) + nextNonAscii * NON_ASCII_TOKENS_PER_CHAR;
+    if (cost > maxTokens) break;
+    ascii = nextAscii;
+    nonAscii = nextNonAscii;
+    end += ch.length;
+  }
+  return text.slice(0, end);
+}
 
 export interface TokenBudget {
   modelId: string;
   maxTokens: number;
-}
-
-export function approximateTokens(text: string): number {
-  return Math.ceil(text.length / APPROX_CHARS_PER_TOKEN);
 }
 
 export interface PackagedFiles {
@@ -50,7 +144,7 @@ export function packageFiles(files: RelevantFile[], maxTokens: number): Packaged
       continue;
     }
 
-    const tokens = approximateTokens(file.content);
+    const tokens = estimateTokensUpperBound(file.content);
     const allowance = Math.min(remaining, perFileCap);
 
     if (tokens <= allowance) {
@@ -59,8 +153,7 @@ export function packageFiles(files: RelevantFile[], maxTokens: number): Packaged
       continue;
     }
 
-    const allowedChars = Math.floor(allowance * APPROX_CHARS_PER_TOKEN);
-    const truncatedContent = file.content.slice(0, allowedChars);
+    const truncatedContent = truncateToTokens(file.content, allowance);
     out.push({
       ...file,
       content: truncatedContent,
@@ -68,7 +161,7 @@ export function packageFiles(files: RelevantFile[], maxTokens: number): Packaged
       includedBytes: truncatedContent.length,
       reasonDetail: `${file.reasonDetail} (토큰 예산으로 ${file.content.length}자 중 ${truncatedContent.length}자만 포함)`,
     });
-    used += approximateTokens(truncatedContent);
+    used += estimateTokensUpperBound(truncatedContent);
   }
 
   return { files: out, dropped };

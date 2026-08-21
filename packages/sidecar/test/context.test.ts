@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { ContextEngine, extractKeywords, extractMentions, hasUncommittedChanges, parseBranch, parseNpmScripts } from "../src/context/engine.js";
 import { classifyFile, MAX_INDEXED_FILE_BYTES } from "../src/context/exclude.js";
-import { approximateTokens, packageFiles } from "../src/context/budget.js";
+import { estimateTokensUpperBound, packageFiles, truncateToTokens } from "../src/context/budget.js";
 import { FakeHost } from "./helpers/fakeHost.js";
 import { ToolBridge } from "../src/tools/bridge.js";
 import { makeRelevantFile } from "./helpers/fixtures.js";
@@ -88,8 +88,48 @@ test("예산이 소진되면 뒤쪽 파일을 사유와 함께 버린다", () =>
   assert.ok(result.dropped[0]!.reason.includes("예산"));
 });
 
-test("토큰 근사는 문자 수에 비례한다", () => {
-  assert.ok(approximateTokens("x".repeat(350)) === 100);
+/**
+ * **한글은 영문보다 토큰을 훨씬 많이 먹는다.** 종전 근사는 둘을 같게 봤고, 그래서 한국어
+ * 텍스트를 3~7배 과소 추정했다 — 이 제품 사용자의 기본 경로에 있는 오차였다.
+ */
+test("같은 문자 수라도 한글이 영문보다 크게 추정된다", () => {
+  const ascii = estimateTokensUpperBound("x".repeat(300));
+  const hangul = estimateTokensUpperBound("가".repeat(300));
+  assert.ok(hangul > ascii * 2, `한글 ${hangul} vs 영문 ${ascii}`);
+  assert.equal(ascii, 100);
+  assert.equal(hangul, 300);
+});
+
+/** 서로게이트 쌍을 2문자로 세면 이모지가 든 텍스트의 추정이 실제와 어긋난다. */
+test("코드 포인트 단위로 센다", () => {
+  // 이모지 하나는 UTF-16에서 2단위지만 문자 하나다.
+  assert.equal(estimateTokensUpperBound("😀"), 1);
+});
+
+/**
+ * **자른 결과가 허용치를 넘지 않아야 한다.** 종전에는 `허용 토큰 × 문자당 토큰`으로 문자 수를
+ * 역산했는데, 계수가 문자 종류마다 다른 지금 그 역산은 한글 구간에서 허용치의 3배를 남긴다.
+ */
+test("토큰 기준 자르기는 허용치를 넘지 않는다", () => {
+  const mixed = ("가나다라마" + "abcdefghij").repeat(50);
+  for (const limit of [1, 7, 50, 137]) {
+    const cut = truncateToTokens(mixed, limit);
+    assert.ok(
+      estimateTokensUpperBound(cut) <= limit,
+      `limit ${limit}: 잘린 뒤 ${estimateTokensUpperBound(cut)} 토큰`
+    );
+  }
+  // 그리고 **가능한 만큼은 넣는다** — 0을 돌려주고 "넘지 않았다"고 하면 안 된다.
+  assert.ok(truncateToTokens(mixed, 137).length > 0);
+});
+
+/** 서로게이트 쌍이 반으로 쪼개지면 잘린 자리에 깨진 문자가 남는다. */
+test("자를 때 서로게이트 쌍을 쪼개지 않는다", () => {
+  const text = "😀".repeat(10);
+  for (let limit = 0; limit <= 10; limit += 1) {
+    const cut = truncateToTokens(text, limit);
+    assert.ok(!/[\uD800-\uDBFF]$/.test(cut), `limit ${limit}에서 상위 서로게이트로 끝났습니다`);
+  }
 });
 
 // ---- git 출력 파싱 ----

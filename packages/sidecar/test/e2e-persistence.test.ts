@@ -671,9 +671,20 @@ test("[시나리오 D] 저장된 이벤트에서 기준 계측을 집계할 수 
       tasksScanned: number;
       coverage: { criteria: number; byStatus: Record<string, number>; byCode: Record<string, number> };
       conflicts: { detected: number; settled: number };
+      tokenEstimate: { calls: number; callsWithoutEstimate: number; callsWhereActualExceededEstimate: number };
     };
 
     assert.equal(metrics.tasksScanned, 1);
+
+    // context-engine 8절: **우리 토큰 추정이 실제와 함께 기록됐는가.** 추정은 "이보다 많지는
+    // 않을 것"이라고 주장하는 값이고, 그 주장은 두 수가 나란히 있어야만 검증된다. fake
+    // 공급자는 고정 usage를 보고하므로 비율 자체에 의미는 없지만, **배선이 끊기면 여기서 걸린다.**
+    assert.ok(metrics.tokenEstimate.calls > 0, JSON.stringify(metrics.tokenEstimate));
+    assert.equal(
+      metrics.tokenEstimate.callsWithoutEstimate,
+      0,
+      `추정 없이 기록된 호출이 있습니다: ${JSON.stringify(metrics.tokenEstimate)}`
+    );
     // 교차검증 경로의 초안이 doneCriteria를 내므로 기준이 있고, 판정도 있다.
     assert.ok(metrics.coverage.criteria > 0, JSON.stringify(metrics));
     // 상태별 합계가 기준 총수와 같아야 한다 — 어긋나면 판정이 조용히 빠진 것이다.

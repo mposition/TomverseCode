@@ -9,6 +9,13 @@ import type {
 } from "@tomverse/protocol";
 import { validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
 import type { DispatchState } from "../budget/ledger.js";
+import { estimateTokensUpperBound } from "../context/budget.js";
+import {
+  buildDraftPrompt,
+  buildFixPrompt,
+  buildReviewPrompt,
+  buildSingleModelFixPrompt,
+} from "./prompts.js";
 import { normalizeProviderError } from "./errors.js";
 import { ProviderCallFailure } from "./types.js";
 import type {
@@ -145,7 +152,15 @@ export class FakeProviderAdapter implements ProviderAdapter {
    * fake가 이 필드를 안 채우면 fake로 도는 테스트는 exact-model 검증 경로를 전혀 지나지 않고,
    * 결함은 실제 공급자에서만 처음 드러난다. 그래서 fake도 envelope을 흉내낸다.
    */
-  private metaFor(step: FakeScriptStep | undefined): ProviderCallMetadata {
+  /**
+   * fake도 **실제 프롬프트를 조립해서** 입력 토큰을 추정한다.
+   *
+   * 네트워크로 나가지 않으므로 조립할 이유가 없어 보이지만, 그러면 추정→기록→집계 배선이
+   * fake 경로에서 통째로 비어 있게 된다 — e2e가 통과해도 그 통과가 배선에 대해 아무것도
+   * 말하지 않는다. 그리고 `renderSnapshot`을 실제로 태우므로 **스냅샷이 프롬프트에서
+   * 차지하는 크기**가 테스트에서 눈에 보인다.
+   */
+  private metaFor(step: FakeScriptStep | undefined, prompt?: string): ProviderCallMetadata {
     const scripted = step?.providerReportedModelId !== undefined ? step.providerReportedModelId : this.options.providerReportedModelId;
     const reported = scripted === undefined ? this.modelId : scripted;
     return {
@@ -153,6 +168,9 @@ export class FakeProviderAdapter implements ProviderAdapter {
       ...(reported === null ? {} : { providerReportedModelId: reported }),
       providerRequestId: `fake-req-${this.cursor}`,
       dispatchState: "response_received_with_usage",
+      // 프롬프트를 모르는 경로(오류 주입 등)에서는 **키를 넣지 않는다.** 0으로 채우면
+      // 집계가 그것을 "추정이 0이었다"로 읽고, 그건 무한대 배 과소 추정이다.
+      ...(prompt === undefined ? {} : { estimatedInputTokens: estimateTokensUpperBound(prompt) }),
     };
   }
 
@@ -179,7 +197,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
-      meta: this.metaFor(step),
+      meta: this.metaFor(step, buildDraftPrompt(input)),
     };
   }
 
@@ -200,7 +218,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
-      meta: this.metaFor(step),
+      meta: this.metaFor(step, buildReviewPrompt(input)),
     };
   }
 
@@ -219,7 +237,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
-      meta: this.metaFor(step),
+      meta: this.metaFor(step, buildSingleModelFixPrompt(input)),
     };
   }
 
@@ -238,7 +256,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
-      meta: this.metaFor(step),
+      meta: this.metaFor(step, buildFixPrompt(input)),
     };
   }
 

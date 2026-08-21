@@ -24,7 +24,7 @@ use std::path::Path;
 /// 과정에서 잃는 것은 "append-only 진실의 원천"이라는 약속을 깨는 것이다.
 ///
 /// v3(M1): `acceptance_criteria` — 사용자 판정의 파생 캐시(문서 17.3절). 역시 additive다.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub struct Store {
     conn: Connection,
@@ -164,6 +164,9 @@ impl Store {
         }
         if current < 4 {
             tx.execute_batch(SCHEMA_V4)?;
+        }
+        if current < 5 {
+            tx.execute_batch(SCHEMA_V5)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -557,8 +560,9 @@ impl Store {
         self.conn.execute(
             "INSERT INTO provider_usage (task_id, call_id, role, provider_id, model_id,
                                          input_tokens, output_tokens, cost_usd, latency_ms, attempt, created_at,
-                                         requested_model_id, resolved_model_id, provider_request_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                         requested_model_id, resolved_model_id, provider_request_id,
+                                         estimated_input_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 get_str("taskId"),
                 get_str("callId"),
@@ -576,6 +580,10 @@ impl Store {
                 opt_str("requestedModelId"),
                 opt_str("resolvedModelId"),
                 opt_str("providerRequestId"),
+                // **없으면 NULL이다.** `get_u64`는 없는 값을 0으로 주므로 여기서는 쓰지 않는다 —
+                // 0은 "추정이 0이었다"는 뜻이 되고, 그건 어떤 실제 값에 대해서도 무한대 배
+                // 과소 추정으로 집계된다.
+                usage.get("estimatedInputTokens").and_then(|v| v.as_i64()),
             ],
         )?;
         Ok(())
@@ -1044,7 +1052,8 @@ impl Store {
     pub fn provider_usage_rows(&self, task_id: &str) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self.conn.prepare(
             "SELECT call_id, role, provider_id, model_id, requested_model_id, resolved_model_id,
-                    provider_request_id, input_tokens, output_tokens, cost_usd, latency_ms, attempt, created_at
+                    provider_request_id, input_tokens, output_tokens, cost_usd, latency_ms, attempt, created_at,
+                    estimated_input_tokens
              FROM provider_usage WHERE task_id = ?1 ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map(params![task_id], |r| {
@@ -1063,9 +1072,38 @@ impl Store {
                 "latencyMs": r.get::<_, i64>(10)?,
                 "attempt": r.get::<_, i64>(11)?,
                 "createdAt": r.get::<_, String>(12)?,
+                // 우리가 보낸다고 생각했던 양. 실제와 나란히 있어야 감사에서 "예약이 왜
+                // 실제와 어긋났나"에 답할 수 있다. null은 비교할 수 없었다는 뜻이다.
+                "estimatedInputTokens": r.get::<_, Option<i64>>(13)?,
             }))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 추정 입력 토큰과 **공급자가 보고한 실제**의 쌍 — 둘 다 아는 호출만.
+    ///
+    /// 한쪽이 NULL인 행을 빼는 이유: 비율을 만들려면 두 수가 다 있어야 하고, 없는 쪽을 0이나
+    /// 추정값으로 채우면 그 순간 비율이 1이 되어 **"추정이 맞았다"는 결론이 데이터 없이 나온다.**
+    /// 빠진 행이 몇 개인지는 호출자가 전체 개수와 비교해 알 수 있다.
+    pub fn token_estimate_pairs(&self, task_id: &str) -> Result<(Vec<(i64, i64)>, u64)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT estimated_input_tokens, input_tokens
+             FROM provider_usage WHERE task_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![task_id], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut pairs = Vec::new();
+        let mut without = 0u64;
+        for row in rows {
+            let (estimated, actual) = row?;
+            match estimated {
+                Some(e) if e > 0 => pairs.push((e, actual)),
+                // NULL도 0도 "비교할 수 없다"는 같은 사실이다. 0을 분모로 쓰면 비율이 무한대가 된다.
+                _ => without += 1,
+            }
+        }
+        Ok((pairs, without))
     }
 
     /// 한 작업이 공급자 호출에 쓴 비용 — `(합계, 호출 수, 비용을 모르는 호출 수)`.
@@ -1535,6 +1573,18 @@ const SCHEMA_V4: &str = r#"
 ALTER TABLE provider_usage ADD COLUMN requested_model_id TEXT;
 ALTER TABLE provider_usage ADD COLUMN resolved_model_id  TEXT;
 ALTER TABLE provider_usage ADD COLUMN provider_request_id TEXT;
+"#;
+
+/// v5: **우리가 추정했던 입력 토큰**을 공급자가 보고한 실제 옆에 둔다.
+///
+/// 컨텍스트 패킹은 토큰 수를 추정으로 다루고(정확한 수는 토크나이저마다 다르므로 원리적으로
+/// 하나가 아니다 — context-engine.md 8절), 그 추정은 **상한이라고 주장**한다. 주장이 참인지는
+/// 두 수를 나란히 놓아야만 알 수 있다.
+///
+/// NULL을 허용한다. v5 이전 행과 추정하지 않은 경로는 **모르는 것**이고, 0으로 채우면 집계가
+/// 그걸 "추정이 0이었다"(=무한대 배 과소 추정)로 읽는다.
+const SCHEMA_V5: &str = r#"
+ALTER TABLE provider_usage ADD COLUMN estimated_input_tokens INTEGER;
 "#;
 
 #[cfg(test)]

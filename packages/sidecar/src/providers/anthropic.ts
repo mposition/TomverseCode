@@ -10,6 +10,7 @@ import type {
 } from "@tomverse/protocol";
 import { effectiveMaxOutputTokens } from "../budget/ledger.js";
 import { validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
+import { estimateTokensUpperBound } from "../context/budget.js";
 import { normalizeProviderError } from "./errors.js";
 import {
   buildDraftPrompt,
@@ -183,6 +184,11 @@ export class AnthropicAdapter implements ProviderAdapter {
     tool: { name: string; description: string; schema: unknown },
     ctx: ProviderCallContext
   ): Promise<{ parsed: unknown; usage: TokenUsage; latencyMs: number; meta: ProviderCallMetadata }> {
+    // 프롬프트 + 구조화 출력 정의가 이번 요청의 입력 전부다. 스키마를 빼고 세면 우리
+    // 추정이 실제보다 작아지는데, **상한을 재는 값이 과소하면 재는 의미가 없다.**
+    const estimatedTokens =
+      estimateTokensUpperBound(prompt) + estimateTokensUpperBound(`${tool.name}\n${tool.description}\n${JSON.stringify(tool.schema)}`);
+
     const controller = new AbortController();
     this.controllers.add(controller);
     const onAbort = () => controller.abort(ctx.signal.reason);
@@ -216,6 +222,9 @@ export class AnthropicAdapter implements ProviderAdapter {
         requestedModelId: this.modelId,
         ...envelopeIdentity(message),
         dispatchState: "response_received_with_usage",
+        // **우리가 추정했던 입력 토큰.** 공급자가 보고한 실제와 나란히 남겨야 우리 추정이
+        // 정말 상한이었는지 사후에 잴 수 있다(context/budget.ts).
+        estimatedInputTokens: estimatedTokens,
       };
       const block = message.content.find(
         (b): b is Anthropic.ToolUseBlock => b.type === "tool_use" && b.name === tool.name
