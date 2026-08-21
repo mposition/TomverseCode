@@ -306,7 +306,19 @@ impl SessionState {
     }
 
     /// 태스크 시작. sidecar 요청이 끝날 때까지 블록되므로 호출자는 별도 스레드에서 부른다.
-    pub fn start_task(&self, message: &str, mode: ExecutionMode, timeout: Duration) -> Result<Value, String> {
+    /// `allow_git_commit`은 **커밋을 제안할지**를 정할 뿐 승인 등급을 낮추지 않는다.
+    ///
+    /// Rust `TaskPolicy`는 워크스페이스를 열 때 고정되고 여기서 바뀌지 않는다. 그래서 UI 토글이
+    /// 켜져도 Policy Gate는 `git commit`을 계속 High 승인으로 다룬다 — **UI에서 켠 스위치가
+    /// 신뢰 경계의 위험 등급을 낮출 수 있으면 그건 게이트가 아니다**(원칙 2·3).
+    /// 토글이 하는 일은 "매 태스크마다 커밋 승인 모달을 띄울 것인가"뿐이다.
+    pub fn start_task(
+        &self,
+        message: &str,
+        mode: ExecutionMode,
+        allow_git_commit: bool,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let (sidecar, host, workspace_id, session_id) = self.with_active(|active| {
             Ok((
                 active.sidecar.clone(),
@@ -338,6 +350,7 @@ impl SessionState {
             },
             "policy": {
                 "executionMode": match mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
+                "allowGitCommit": allow_git_commit,
             },
             "workspaceName": self.info().and_then(|i| i.get("name").cloned()).unwrap_or(Value::Null),
             "availableProviders": available_providers(),
@@ -398,7 +411,9 @@ impl SessionState {
             Some("fast") => ExecutionMode::Fast,
             _ => ExecutionMode::Verified,
         };
-        self.start_task(&task.user_message, mode, timeout)
+        // 재실행은 커밋을 제안하지 않는다. 저장된 작업 행에는 그 토글이 남아 있지 않고,
+        // **기억나지 않는 설정으로 저장소 이력을 바꾸는 것**보다 제안하지 않는 편이 안전하다.
+        self.start_task(&task.user_message, mode, false, timeout)
     }
 
     /// 취소 요청. **두 방향 모두 필요하다:**

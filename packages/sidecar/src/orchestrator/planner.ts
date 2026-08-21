@@ -84,6 +84,107 @@ function parseDiffPath(line: string): string | null {
   return stripped.length > 0 ? stripped : null;
 }
 
+export interface CommitPlanInput {
+  taskId: string;
+  /** 이 태스크가 실제로 바꾼 워크스페이스 상대 경로. **계획이 아니라 성공한 실행에서 온다.** */
+  changedPaths: readonly string[];
+  message: string;
+  requestedBy: ToolRequester;
+}
+
+/**
+ * 검증 통과 후의 커밋 계획 — state-machine-and-protocol.md 12절 "Git commit 오케스트레이터 통합".
+ *
+ * # `git add -A`를 쓰지 않는다
+ *
+ * 사용자에게는 이 태스크와 무관한 미커밋 변경이 있을 수 있다. `-A`는 그걸 전부 우리 커밋에
+ * 쓸어담는데, 그건 사용자가 승인 모달에서 본 것과 **다른 일**이다. 승인 화면에 보이는 argv가
+ * 실제 실행되는 것과 100% 일치한다는 보장(CLAUDE.md 원칙 6)은 경로를 명시할 때만 성립한다.
+ *
+ * `--`로 경로 목록을 끊는 이유: `-`로 시작하는 파일명이 옵션으로 해석되지 않게 한다.
+ * 셸을 거치지 않으므로 인용은 필요 없지만, 옵션/경로 경계는 git 자체의 파싱 문제라 남는다.
+ *
+ * # 두 단계를 한 요청으로 합치지 않는다
+ *
+ * `git commit -a`나 `git add ... && git commit ...` 같은 형태를 쓰지 않는다. 전자는 위에서 말한
+ * 이유로 범위가 넓고, 후자는 셸 문자열이라 argv 계약이 깨진다. 두 개의 `run_command`로 나누면
+ * Policy Gate가 각각을 독립적으로 판정하고, 승인 모달도 각각을 보여준다.
+ */
+export function buildCommitPlan(input: CommitPlanInput): ExecutionPlan {
+  if (input.changedPaths.length === 0) {
+    throw new PlanningError("변경된 파일이 없어 커밋할 것이 없습니다.");
+  }
+  if (input.message.trim().length === 0) {
+    throw new PlanningError("커밋 메시지가 비어 있습니다.");
+  }
+
+  const paths = input.changedPaths.map((path, index) =>
+    assertRelativeWorkspacePath(path, `commit.changedPaths[${index}]`)
+  );
+  const createdAt = new Date().toISOString();
+
+  return {
+    taskId: input.taskId,
+    planId: `${input.taskId}-commit`,
+    toolRequests: [
+      {
+        requestId: `${input.taskId}-commit-add`,
+        taskId: input.taskId,
+        tool: "run_command",
+        args: { program: "git", args: ["add", "--", ...paths], cwd: "." },
+        requestedBy: input.requestedBy,
+        riskTier: "conditional",
+        createdAt,
+      },
+      {
+        requestId: `${input.taskId}-commit-commit`,
+        taskId: input.taskId,
+        tool: "run_command",
+        args: { program: "git", args: ["commit", "-m", input.message], cwd: "." },
+        requestedBy: input.requestedBy,
+        // git commit은 Rust가 별도 게이트를 하나 더 통과시킨다. Node의 분류는 그 사실을
+        // 미리 반영해 두지만, **최종 판정은 언제나 Rust다.**
+        riskTier: "user_approval",
+        createdAt,
+      },
+    ],
+    approvalRequired: true,
+  };
+}
+
+/**
+ * 커밋 메시지. **검증된 것 이상을 말하지 않는다.**
+ *
+ * 요약에 "테스트 통과"를 적을 수 있는 것은 `VerificationReport.overall === "pass"`일 때뿐이고,
+ * 이 함수는 그 경우에만 호출된다. 메시지에 모델 이름을 넣지 않는 이유: 커밋 로그는 저장소에
+ * 영구히 남는 기록이고, 어떤 모델이 썼는지는 그 시점의 라우팅 결정일 뿐이라 재현되지 않는다.
+ * 그 정보가 필요하면 `task_events`에 있다.
+ */
+export function buildCommitMessage(input: {
+  userMessage: string;
+  changedPaths: readonly string[];
+  verifiedChecks: readonly string[];
+}): string {
+  // 첫 줄은 50~72자 관례를 따른다. 사용자의 요청문을 그대로 쓰되 줄바꿈을 없앤다 —
+  // 여러 줄이 첫 줄에 들어가면 git log --oneline이 읽을 수 없게 된다.
+  const subject = truncate(input.userMessage.replace(/\s+/g, " ").trim(), 72);
+  const body = [
+    "",
+    `변경한 파일 (${input.changedPaths.length}개):`,
+    ...input.changedPaths.map((p) => `- ${p}`),
+    "",
+    input.verifiedChecks.length > 0
+      ? `검증 통과: ${input.verifiedChecks.join(", ")}`
+      : "검증: 실행된 체크 없음",
+  ];
+  return [subject, ...body].join("\n");
+}
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
+}
+
 export function buildExecutionPlan(input: PlanInput): ExecutionPlan {
   const files = splitDiffByFile(input.patch);
   if (files.length === 0) {

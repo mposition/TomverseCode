@@ -69,6 +69,8 @@ async fn start_task(
     app: tauri::AppHandle,
     message: String,
     mode: String,
+    /// 검증 통과 후 커밋을 **제안할지**. 승인 등급은 낮추지 않는다(session.rs 주석 참조).
+    allow_git_commit: Option<bool>,
     timeout_secs: Option<u64>,
 ) -> Result<Value, String> {
     let execution_mode = match mode.as_str() {
@@ -82,7 +84,7 @@ async fn start_task(
     // `respond_approval` command가 처리될 수 있다 — 같은 스레드면 교착된다.
     tauri::async_runtime::spawn_blocking(move || {
         let session = app.state::<SessionState>();
-        session.start_task(&message, execution_mode, timeout)
+        session.start_task(&message, execution_mode, allow_git_commit.unwrap_or(false), timeout)
     })
     .await
     .map_err(|e| format!("태스크 실행 스레드 오류: {e}"))?

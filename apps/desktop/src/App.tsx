@@ -60,6 +60,13 @@ export default function App() {
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<"fast" | "verified">("verified");
+  /**
+   * 검증 통과 후 커밋을 **제안할지**. 기본은 꺼짐이다.
+   *
+   * 이 토글은 승인 등급을 낮추지 않는다 — 켜져 있어도 Policy Gate는 `git commit`을 승인
+   * 대상으로 다룬다. 토글이 정하는 것은 "매 태스크마다 커밋 승인 모달을 띄울 것인가"뿐이다.
+   */
+  const [allowGitCommit, setAllowGitCommit] = useState(false);
 
   const [running, setRunning] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
@@ -229,7 +236,7 @@ export default function App() {
     startedAt.current = Date.now();
     setElapsedMs(0);
     try {
-      const result = await invoke<FinalResult>("start_task", { message, mode });
+      const result = await invoke<FinalResult>("start_task", { message, mode, allowGitCommit });
       setFinalResult(result);
       setTaskId(result.taskId);
     } catch (error) {
@@ -536,6 +543,19 @@ export default function App() {
                 <label>
                   <input type="radio" checked={mode === "verified"} onChange={() => setMode("verified")} />
                   Verified — 항상 독립 검수
+                </label>
+              </fieldset>
+              {/* 커밋은 **되돌리기가 파일만 복원하고 커밋은 남기는** 유일한 단계라 별도 스위치다.
+                  켜도 승인 없이 커밋되지 않는다 — 승인 모달이 실제 argv를 그대로 보여준다. */}
+              <fieldset className="modes" disabled={running}>
+                <legend>검증 통과 후</legend>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={allowGitCommit}
+                    onChange={(e) => setAllowGitCommit(e.target.checked)}
+                  />
+                  변경을 git에 커밋 (매번 승인을 묻습니다)
                 </label>
               </fieldset>
               <button onClick={runTask} disabled={running || message.trim().length === 0 || noProviders}>

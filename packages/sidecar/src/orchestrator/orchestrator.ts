@@ -47,7 +47,7 @@ import {
   type CriteriaContext,
 } from "./criteria.js";
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
-import { buildExecutionPlan, PlanningError } from "./planner.js";
+import { buildCommitMessage, buildCommitPlan, buildExecutionPlan, PlanningError } from "./planner.js";
 import { triageTask, type TriagePolicy } from "../triage.js";
 
 /**
@@ -846,7 +846,14 @@ export class Orchestrator {
       await this.evaluateCriteriaAgainst(report);
 
       if (report.overall === "pass") {
-        return { kind: "final", result: await this.finish("completed", this.describeSuccess(report)) };
+        // 검증을 통과한 **뒤에만** 커밋한다(12절 "Git commit 오케스트레이터 통합").
+        // 통과 전에 커밋하면 "검증이 최종 판정자"라는 원칙 1과 정면으로 어긋난다 —
+        // 커밋은 되돌리기 어려운 기록이므로 그 판정을 앞질러 남기지 않는다.
+        const commit = await this.maybeCommit(report);
+        return {
+          kind: "final",
+          result: await this.finish("completed", this.describeSuccess(report, commit)),
+        };
       }
 
       // not_verified: 검증 명령이 없어서 판정할 수 없었던 경우.
@@ -1663,7 +1670,79 @@ export class Orchestrator {
     return this.finish("rejected", reason);
   }
 
-  private describeSuccess(report: VerificationReport): string {
+  /**
+   * 검증 통과 후의 커밋 — 12절 "Git commit 자동 생성의 오케스트레이터 통합".
+   *
+   * # 실패해도 태스크를 실패로 만들지 않는다
+   *
+   * 코드 변경은 이미 적용됐고 검증도 통과했다. 커밋은 그 위에 얹는 **선택적 마무리**이므로,
+   * 사용자가 승인을 거부했거나 git이 실패했다고 해서 성공한 작업을 실패로 뒤집으면 안 된다.
+   * 그래서 이 함수는 `PathOutcome`을 돌려주지 않고 **결과를 서술하는 값**만 돌려준다.
+   *
+   * # 시도 자체를 opt-in으로 두는 이유
+   *
+   * `allowGitCommit`이 꺼져 있으면 아예 시도하지 않는다. Policy Gate가 어차피 승인을 요구하므로
+   * "시도해 보고 거부당하기"도 가능하지만, 그러면 커밋을 원하지 않는 사용자가 **매 태스크마다**
+   * 모달을 닫아야 한다. 승인 피로는 승인을 무의미하게 만든다(product-strategy 9.1절).
+   */
+  private async maybeCommit(report: VerificationReport): Promise<CommitOutcome> {
+    if (!this.policy.allowGitCommit) return { kind: "not_requested" };
+    if (this.mutatedPaths.length === 0) return { kind: "nothing_to_commit" };
+
+    // git 저장소가 아니면 커밋할 수 없다. 스냅샷이 브랜치를 알아내지 못한 경우가 그렇다.
+    const branch = this.snapshot?.gitBranch ?? "(unknown)";
+    if (branch === "(unknown)") return { kind: "not_a_repo" };
+
+    const verifiedChecks = report.checks.filter((c) => c.status === "PASSED").map((c) => c.kind);
+    let plan: ExecutionPlan;
+    try {
+      plan = buildCommitPlan({
+        taskId: this.taskId,
+        changedPaths: this.mutatedPaths,
+        message: buildCommitMessage({
+          userMessage: this.input.taskRequest.userMessage,
+          changedPaths: this.mutatedPaths,
+          verifiedChecks,
+        }),
+        requestedBy: this.executorRequester(),
+      });
+    } catch (error) {
+      return { kind: "failed", reason: errorMessage(error) };
+    }
+
+    await this.emit("PLAN_CREATED", {
+      planId: plan.planId,
+      toolRequests: plan.toolRequests.map((r) => ({ requestId: r.requestId, tool: r.tool, args: describeArgs(r) })),
+      approvalRequired: plan.approvalRequired,
+      // 이 계획은 파일을 바꾸지 않는다. 그래서 phase도 EXECUTING으로 옮기지 않는다(아래 주석).
+      purpose: "git_commit",
+    });
+
+    // **phase를 옮기지 않는다.** VERIFYING → EXECUTING 전이를 열면 그 뒤 COMPLETED로 가기 위해
+    // 다시 VERIFYING을 거쳐야 하는데(전이 표), 커밋은 추적 파일의 **내용을 바꾸지 않으므로**
+    // 두 번째 검증은 같은 결과만 낼 수밖에 없다. 순전한 낭비를 만들지 않기 위해 phase는 그대로
+    // 두고, 무엇이 실행됐는지는 이벤트가 말한다(원칙 7: 이벤트가 진실의 원천이다).
+    for (const request of plan.toolRequests) {
+      const { result, policy } = await this.requireBridge().executeRequest(request);
+      if (result.status === "ok") continue;
+
+      if (result.status === "denied") {
+        // 거부는 오류가 아니라 **사용자의 결정**이다. 커밋하지 않고 그대로 완료한다.
+        return { kind: "declined", reason: result.error ?? policy.reason };
+      }
+      return { kind: "failed", reason: result.error ?? `git 명령이 실패했습니다 (${request.requestId})` };
+    }
+
+    await this.emit("GIT_COMMIT_CREATED", {
+      planId: plan.planId,
+      branch,
+      paths: [...this.mutatedPaths],
+      verifiedChecks,
+    });
+    return { kind: "committed", branch };
+  }
+
+  private describeSuccess(report: VerificationReport, commit: CommitOutcome = { kind: "not_requested" }): string {
     const passed = report.checks.filter((c) => c.status === "PASSED").map((c) => c.kind);
     const notConfigured = report.checks.filter((c) => c.status === "NOT_CONFIGURED").map((c) => c.kind);
     const parts = [`검증 통과 (${passed.join(", ") || "실행된 체크 없음"})`];
@@ -1688,6 +1767,8 @@ export class Orchestrator {
     if (this.unresolvedDisagreements.length > 0) {
       parts.push(`묻지 못한 쟁점 ${this.unresolvedDisagreements.length}건`);
     }
+    const committed = describeCommit(commit);
+    if (committed) parts.push(committed);
     return parts.join(" · ");
   }
 
@@ -1704,6 +1785,41 @@ export class Orchestrator {
   private requireBridge(): ToolBridge {
     if (!this.bridge) throw new Error("ToolBridge가 아직 만들어지지 않았습니다");
     return this.bridge;
+  }
+}
+
+/**
+ * 커밋 시도의 결과. **성공/실패 두 값이 아닌 이유**: "요청되지 않음"과 "거부됨"과 "실패"는
+ * 사용자에게 전혀 다른 사실이고, 뭉치면 최종 보고가 "커밋 안 됨"이라고만 말하게 된다.
+ */
+type CommitOutcome =
+  | { kind: "not_requested" }
+  | { kind: "not_a_repo" }
+  | { kind: "nothing_to_commit" }
+  | { kind: "committed"; branch: string }
+  | { kind: "declined"; reason: string }
+  | { kind: "failed"; reason: string };
+
+/**
+ * 최종 요약에 붙일 커밋 한 줄. `not_requested`는 **아무 말도 하지 않는다** —
+ * 켜지 않은 기능을 매번 언급하면 요약이 잡음으로 덮인다.
+ */
+function describeCommit(outcome: CommitOutcome): string | null {
+  switch (outcome.kind) {
+    case "not_requested":
+      return null;
+    case "not_a_repo":
+      return "git 저장소가 아니어서 커밋하지 않음";
+    case "nothing_to_commit":
+      return "변경된 파일이 없어 커밋하지 않음";
+    case "committed":
+      // **되돌리기와의 관계를 명시한다.** 되돌리기는 파일 내용을 복원할 뿐 커밋을 지우지 않는다.
+      return `${outcome.branch}에 커밋함 (되돌리기는 파일만 복원하며 커밋은 남는다)`;
+    case "declined":
+      return `커밋을 승인하지 않아 건너뜀 (${outcome.reason})`;
+    case "failed":
+      // 실패를 조용히 넘기지 않는다 — 사용자는 커밋됐다고 믿을 수 있다.
+      return `커밋 실패: ${outcome.reason}`;
   }
 }
 

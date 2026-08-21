@@ -61,6 +61,15 @@ export type TaskEventType =
    * 이벤트에 담을 수 없는 이유는 결말이 다음 라운드에야 정해지기 때문이다.
    */
   | "CRITERIA_CONFLICT_RESOLVED"
+  /**
+   * 검증 통과 후 커밋이 실제로 만들어졌을 때.
+   *
+   * **커밋 시도 사실이 아니라 성공 사실만 남긴다** — 시도와 거부는 `TOOL_REQUESTED`/
+   * `POLICY_DECIDED`/`TOOL_COMPLETED`에 이미 다 있고, 이 이벤트는 "이 태스크가 저장소 이력을
+   * 바꿨다"는 **되돌리기 어려운 사실**의 표식이다. 되돌리기는 파일만 복원하고 커밋은 남으므로,
+   * 그 사실을 나중에 찾을 수 있어야 한다.
+   */
+  | "GIT_COMMIT_CREATED"
   | "ERROR"
   | "TASK_COMPLETED"
   | "TASK_FAILED"

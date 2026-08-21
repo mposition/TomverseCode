@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -106,8 +107,31 @@ setTimeout(() => {
 }, 60_000);
 `;
 
+/**
+ * 픽스처를 **실제 git 저장소**로 만든다 — 커밋 통합 e2e에 필요하다.
+ *
+ * 초기 커밋을 만드는 이유: 커밋이 하나도 없으면 `git status -b`가 "No commits yet on ..."을
+ * 내고 브랜치 파싱이 그 문장을 브랜치 이름으로 읽는다. 실제 저장소는 대개 커밋이 있으므로,
+ * 그 상태를 재현하는 편이 테스트가 검증하는 상황에 가깝다.
+ *
+ * `user.email`/`user.name`을 저장소 로컬로 박는 이유: CI나 컨테이너에는 전역 git identity가
+ * 없는 경우가 흔하고, 그러면 `git commit`이 실패한다 — **테스트하려는 것과 무관한 이유로**
+ * 실패하는 것이 가장 나쁘다. `commit.gpgsign=false`도 같은 이유다(서명 키가 없으면 실패한다).
+ */
+function initGitRepo(root: string): void {
+  const git = (args: string[]): void => {
+    execFileSync("git", args, { cwd: root, stdio: "ignore" });
+  };
+  git(["init"]);
+  git(["config", "user.email", "fixture@example.invalid"]);
+  git(["config", "user.name", "Tomverse Fixture"]);
+  git(["config", "commit.gpgsign", "false"]);
+  git(["add", "-A"]);
+  git(["commit", "-m", "initial"]);
+}
+
 export function createFixtureRepo(
-  options: { withPassingTest?: boolean; slowTest?: boolean } = {}
+  options: { withPassingTest?: boolean; slowTest?: boolean; gitRepo?: boolean } = {}
 ): FixtureRepo {
   const root = mkdtempSync(path.join(tmpdir(), "tomverse-fixture-"));
 
@@ -136,6 +160,10 @@ export function createFixtureRepo(
   writeFileSync(path.join(root, ".gitignore"), "node_modules/\nignored/\n");
   mkdirSync(path.join(root, "ignored"), { recursive: true });
   writeFileSync(path.join(root, "ignored", "junk.js"), "// gitignore된 파일\n");
+
+  if (options.gitRepo) {
+    initGitRepo(root);
+  }
 
   return {
     root,

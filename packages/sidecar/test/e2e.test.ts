@@ -63,6 +63,7 @@ interface RunOptions {
   script?: FakeScriptStep[];
   defaultPatch?: string;
   timeoutSecs?: number;
+  allowGitCommit?: boolean;
 }
 
 function hostAvailable(): boolean {
@@ -101,6 +102,7 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
     String(options.timeoutSecs ?? 180),
   ];
   if (options.autoApproveWrites) args.push("--auto-approve-writes");
+  if (options.allowGitCommit) args.push("--allow-git-commit");
 
   const fakeConfig = {
     ...(options.defaultPatch !== undefined ? { defaultPatch: options.defaultPatch } : { defaultPatch: FIX_PATCH }),
@@ -127,6 +129,12 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
 
   const parsed = JSON.parse(jsonLine) as Omit<HostRun, "exitCode" | "stderr">;
   return { ...parsed, exitCode: result.status ?? -1, stderr: result.stderr ?? "" };
+}
+
+/** 커밋 이력의 제목 목록 (최신 순). 커밋이 없으면 빈 배열이다. */
+function gitLogSubjects(root: string): string[] {
+  const out = execFileSync("git", ["log", "--format=%s"], { cwd: root, encoding: "utf8" });
+  return out.split("\n").filter((line) => line.trim().length > 0);
 }
 
 function withRepo(fn: (repo: FixtureRepo, stateDir: string) => void): void {
@@ -538,6 +546,55 @@ test("fast 모드 + 단일 파일은 단일 모델 경로를 타지만 검증은
     // 그러나 검증은 생략되지 않는다 — CLAUDE.md 원칙 1.
     assert.equal(run.final.verificationReport?.overall, "pass");
   });
+});
+
+test("검증을 통과하면 실제 git 커밋이 만들어진다", () => {
+  // 12절 "Git commit 자동 생성의 오케스트레이터 통합" — **실제 저장소에 실제 커밋 객체**가
+  // 생기는지를 본다. Node 단위 테스트는 "git add/commit을 요청했다"까지만 볼 수 있고,
+  // 그 argv가 실제 git에서 동작하는지는 여기서만 확인된다.
+  const repo = createFixtureRepo({ gitRepo: true });
+  const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
+  try {
+    const before = gitLogSubjects(repo.root);
+    const run = runHost(repo, stateDir, { mode: "fast", allowGitCommit: true });
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+
+    const after = gitLogSubjects(repo.root);
+    assert.equal(after.length, before.length + 1, `커밋이 만들어지지 않았습니다:\n${after.join("\n")}`);
+    // 커밋 제목은 사용자의 요청문이다 — 모델 이름이나 우리 도구 이름이 아니다.
+    assert.match(after[0]!, /페이지 계산/, after[0]);
+
+    // 우리가 바꾼 파일이 실제로 커밋됐다 — 워킹 트리가 그 파일에 대해 깨끗하다.
+    const status = execFileSync("git", ["status", "--porcelain", "--", "paginate.js"], {
+      cwd: repo.root,
+      encoding: "utf8",
+    });
+    assert.equal(status.trim(), "", `변경이 커밋되지 않았습니다: ${status}`);
+
+    assert.ok(run.eventTypes.includes("GIT_COMMIT_CREATED"), run.eventTypes.join(", "));
+    // 되돌리기와의 관계를 요약이 말한다 — 되돌려도 커밋은 남는다.
+    assert.match(run.final.summary, /되돌리기는 파일만 복원/, run.final.summary);
+  } finally {
+    repo.cleanup();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("allowGitCommit이 꺼져 있으면 저장소가 있어도 커밋하지 않는다", () => {
+  // 기본값은 커밋하지 않는 것이다. 켜지 않은 사용자가 매 태스크마다 승인 모달을 닫아야 하면
+  // 승인이 의미를 잃는다(product-strategy 9.1절 승인 피로).
+  const repo = createFixtureRepo({ gitRepo: true });
+  const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
+  try {
+    const before = gitLogSubjects(repo.root);
+    const run = runHost(repo, stateDir, { mode: "fast" });
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+    assert.deepEqual(gitLogSubjects(repo.root), before, "켜지 않았는데 커밋이 생겼습니다");
+    assert.ok(!run.eventTypes.includes("GIT_COMMIT_CREATED"));
+  } finally {
+    repo.cleanup();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });
 
 test("gitignore된 파일은 컨텍스트 후보에 들어가지 않는다", () => {
