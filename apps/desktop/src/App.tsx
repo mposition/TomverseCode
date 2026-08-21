@@ -10,6 +10,7 @@ import {
   type CriterionEvaluation,
   type Disagreement,
   type FinalResult,
+  type ForceAbandonThreshold,
   type ProviderStatus,
   type RevertOutcome,
   type RoutingInfo,
@@ -44,13 +45,15 @@ import { VerificationPanel } from "./components/VerificationPanel";
  * 모든 동작은 `invoke`로 Rust에 요청하고, Rust의 Policy Gate가 최종 판단한다.
  */
 /**
- * "취소 중"이 이만큼 이어지면 강제 포기 버튼을 연다.
+ * 표본이 없을 때 "취소 중"이 이만큼 이어지면 강제 포기 버튼을 연다.
  *
- * 정상 취소는 1초 안에 끝난다(Rust의 종료 상한이 2초이고, 그 전에 대부분 끝난다). 여유를 두되
- * 사용자가 "멈췄다"고 느끼기 전이어야 하므로 그 사이에 둔다. **실측이 아니라 추정값이며**,
- * 너무 짧으면 정상 취소 중에 탈출구가 떠서 불안을 만들고 너무 길면 탈출구가 없는 것과 같다.
+ * **이 값 자체는 여전히 추정이다.** 달라진 것은 이게 유일한 답이 아니라는 것이다 —
+ * 워크스페이스에 취소 기록이 충분히 쌓이면 Rust가 관측된 분포에서 임계값을 유도하고
+ * (`force_abandon_threshold`, 16.3절), 화면은 그 값을 쓴다. 여기 남은 상수는 데이터가 없는
+ * 첫 사용자를 위한 출발점이며, 종전 동작과 같은 값이어야 한다 — 이 작업의 목적은 값을 바꾸는
+ * 것이 아니라 근거를 붙이는 것이다.
  */
-const FORCE_ABANDON_AFTER_MS = 5_000;
+const DEFAULT_FORCE_ABANDON_AFTER_MS = 5_000;
 
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
@@ -101,6 +104,10 @@ export default function App() {
    */
   const cancelStartedAt = useRef<number | null>(null);
   const [cancelElapsedMs, setCancelElapsedMs] = useState(0);
+  const [forceAbandonAfter, setForceAbandonAfter] = useState<ForceAbandonThreshold | null>(null);
+  // 실제로 쓰는 값. 측정값이 없으면 기본값으로 돌아간다 — 화면이 임계값 없이 도는 상태를
+  // 만들지 않기 위해서다(탈출구가 아예 안 뜨는 것이 이 기능이 고치려던 문제였다).
+  const forceAbandonMs = forceAbandonAfter?.ms ?? DEFAULT_FORCE_ABANDON_AFTER_MS;
   const [tasks, setTasks] = useState<TaskRow[]>([]);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [selectedTask, setSelectedTask] = useState<{
@@ -226,6 +233,19 @@ export default function App() {
     try {
       const info = await invoke<WorkspaceInfo>("open_workspace", { path: workspacePath });
       setWorkspace(info);
+      // 임계값은 워크스페이스를 열 때 한 번만 읽는다. 취소마다 다시 계산하면 탈출구가 뜨는
+      // 시점이 매번 달라지는데, 그 흔들림 자체가 사용자에게는 불안이다.
+      //
+      // **실패해도 작업을 막지 않는다.** 이건 편의 값이고, 없으면 기본값으로 돌아가면 된다 —
+      // 계측을 읽지 못했다고 워크스페이스를 못 열게 하는 것은 꼬리가 몸통을 흔드는 것이다.
+      try {
+        const measured = await invoke<{ threshold: ForceAbandonThreshold }>("force_abandon_threshold", {
+          workspacePath: info.rootPath,
+        });
+        setForceAbandonAfter(measured.threshold ?? null);
+      } catch {
+        setForceAbandonAfter(null);
+      }
     } catch (error) {
       setOpenError(String(error));
     } finally {
@@ -632,10 +652,11 @@ export default function App() {
                   {(cancelElapsedMs / 1000).toFixed(1)}초 경과). 이미 변경된 파일은 자동으로 되돌아가지 않습니다.
                   아래 결과에서 되돌리기를 선택할 수 있습니다.
                 </p>
-                {/* 정상 취소는 1초 안에 끝난다. 이 시간을 넘겼다는 것은 죽지 않는 프로세스가
-                    있거나 sidecar가 응답하지 않는다는 뜻이므로 탈출구를 연다 — 탈출구가 없으면
-                    사용자에게는 앱이 멈춘 것과 구별되지 않는다. */}
-                {cancelElapsedMs >= FORCE_ABANDON_AFTER_MS && (
+                {/* 이 시간을 넘겼다는 것은 죽지 않는 프로세스가 있거나 sidecar가 응답하지
+                    않는다는 뜻이므로 탈출구를 연다 — 탈출구가 없으면 사용자에게는 앱이 멈춘
+                    것과 구별되지 않는다. 시점은 이 워크스페이스에서 **실제로 관측된** 취소
+                    소요에서 온다(16.3절). 표본이 부족하면 기본값으로 돌아간다. */}
+                {cancelElapsedMs >= forceAbandonMs && (
                   <div className="row">
                     <button className="secondary" onClick={forceAbandon}>
                       강제 포기
@@ -645,6 +666,18 @@ export default function App() {
                       죽이는 것이 아닙니다 — 실행 중이던 명령이 계속 돌고 있을 수 있습니다.
                     </span>
                   </div>
+                )}
+                {/* 개발 모드에서만 근거를 노출한다. 일반 사용자에게 "이 숫자가 어디서 왔는가"는
+                    필요 없는 정보지만, 임계값이 이상하게 느껴질 때 확인할 곳은 있어야 한다. */}
+                {devMode && (
+                  <p className="muted small">
+                    탈출구 시점 {(forceAbandonMs / 1000).toFixed(1)}초 —{" "}
+                    {forceAbandonAfter?.source === "measured"
+                      ? `관측 ${forceAbandonAfter.sampleCount}건에서 유도`
+                      : `표본 부족(${forceAbandonAfter?.sampleCount ?? 0}/${
+                          forceAbandonAfter?.minSamples ?? 0
+                        })으로 기본값`}
+                  </p>
                 )}
               </div>
             )}

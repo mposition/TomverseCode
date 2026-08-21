@@ -166,6 +166,21 @@ impl SessionState {
             .map_err(|e| format!("작업 목록을 읽을 수 없습니다: {e}"))
     }
 
+    /// 강제 포기 버튼을 열 시점. **저장된 취소 이벤트에서 유도한다** — 12절 미해결
+    /// "강제 포기 노출 시점(5초)의 근거"가 추정이었던 자리다(16.3절).
+    ///
+    /// 워크스페이스를 열 때 한 번만 부른다. 집계가 전체 태스크의 이벤트를 훑기 때문인데,
+    /// 취소마다 다시 계산할 이유는 없다 — 임계값은 한 세션 안에서 흔들리지 않는 편이
+    /// 사용자에게도 낫다(탈출구가 뜨는 시점이 매번 달라지면 그 자체가 불안이다).
+    pub fn force_abandon_threshold(&self, workspace_path: Option<&str>) -> Result<Value, String> {
+        let metrics = self.with_store(|s| tomverse_core::metrics::collect(s, workspace_path))??;
+        Ok(json!({
+            "threshold": metrics.force_abandon_threshold,
+            // 분포도 함께 준다. 임계값만 주면 화면이 그 숫자의 출처를 설명할 수 없다.
+            "latency": metrics.cancellation,
+        }))
+    }
+
     pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>, String> {
         self.with_store(|s| s.get_task(task_id))?
             .map_err(|e| format!("작업을 읽을 수 없습니다: {e}"))

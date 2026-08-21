@@ -172,6 +172,18 @@ fn get_task_events(
     state.get_task_events(&task_id, after_event_id)
 }
 
+/// 강제 포기 버튼을 열 시점과 그 근거.
+///
+/// 값과 함께 `source`를 돌려주는 이유: 표본이 부족하면 이 값은 여전히 추정치인데, 숫자만
+/// 넘기면 화면이 그것을 측정값으로 말하게 된다. 12절 항목이 지적한 문제가 정확히 그것이었다.
+#[tauri::command]
+fn force_abandon_threshold(
+    state: tauri::State<'_, SessionState>,
+    workspace_path: Option<String>,
+) -> Result<Value, String> {
+    state.force_abandon_threshold(workspace_path.as_deref())
+}
+
 /// 최근 작업 목록. `workspace_path`가 없으면 전체.
 #[tauri::command]
 fn list_tasks(
@@ -247,6 +259,7 @@ pub fn run() {
             revert_task_commit,
             get_task_events,
             list_tasks,
+            force_abandon_threshold,
             get_task,
             restart_task,
         ])

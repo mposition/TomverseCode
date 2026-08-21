@@ -163,6 +163,34 @@ test("[시나리오 A] 오래 도는 명령 실행 중 취소하면 프로세스
     const task = detail.task as { terminalStatus: string; cancellationRequestedAt: string | null };
     assert.equal(task.terminalStatus, "CANCELLED");
     assert.ok(task.cancellationRequestedAt, "취소 요청 시각이 기록되지 않았습니다");
+
+    // 7) 이 취소가 **소요 분포의 표본이 된다** — 16.3절. 강제 포기 노출 시점이 추정이었던
+    //    자리를 관측으로 바꾸려면, 실제 실행이 남긴 이벤트에서 간격이 뽑혀야 한다.
+    //    Rust 단위 테스트는 직접 만든 타임스탬프를 재지만, 여기서는 진짜 시각이다.
+    const metrics = hostQuery(ctx, [
+      "metrics",
+      "--workspace",
+      ctx.repo.root,
+      "--db",
+      ctx.db,
+      "--artifacts",
+      ctx.artifacts,
+    ]) as {
+      cancellation: { settled: number; unresolved: number; forceAbandoned: number; unparsedTimestamps: number; maxMs: number | null };
+      forceAbandonThreshold: { ms: number; source: string; sampleCount: number; minSamples: number };
+    };
+    assert.equal(metrics.cancellation.settled, 1, JSON.stringify(metrics.cancellation));
+    assert.equal(metrics.cancellation.unresolved, 0, JSON.stringify(metrics.cancellation));
+    assert.equal(metrics.cancellation.forceAbandoned, 0, JSON.stringify(metrics.cancellation));
+    // 타임스탬프를 못 읽으면 표본이 조용히 사라진다 — 그 경우를 0이 아닌 값으로 드러낸다.
+    assert.equal(metrics.cancellation.unparsedTimestamps, 0, JSON.stringify(metrics.cancellation));
+    assert.ok(metrics.cancellation.maxMs !== null, JSON.stringify(metrics.cancellation));
+
+    // 표본 하나로는 임계값을 정하지 않는다. **그리고 그 사실을 source가 말한다** —
+    // 숫자만 넘기면 화면이 기본값을 측정값으로 말하게 된다.
+    assert.equal(metrics.forceAbandonThreshold.source, "default_insufficient_samples");
+    assert.equal(metrics.forceAbandonThreshold.sampleCount, 1);
+    assert.equal(metrics.forceAbandonThreshold.ms, 5000);
   });
 });
 

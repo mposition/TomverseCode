@@ -65,8 +65,9 @@ apps/desktop/        Tauri 2 + React
     core/            tomverse-core — Rust 신뢰 경계 전체. tauri에 의존하지 않는 별도 크레이트
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
                      `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`.
-                     `metrics`는 기준 계측(커버리지·충돌 결말)을 저장된 이벤트에서 집계한다 —
-                     DB는 Rust의 것이므로 집계도 여기 둔다(Node가 SQLite를 직접 열지 않는다)
+                     `metrics`는 저장된 이벤트에서 계측을 집계한다 — 기준 커버리지·충돌 결말과
+                     **취소 소요 분포**(강제 포기 탈출구가 뜨는 시점의 근거). DB는 Rust의 것이므로
+                     집계도 여기 둔다(Node가 SQLite를 직접 열지 않는다)
 spike/               Phase 0 가설 검증 하네스 (프로덕션 코드 아님, 실험 기록 — 보존하되 수정하지 않는다)
 evals/hypothesis-gate/  가설 게이트 G — 어려운 태스크에서 교차검증이 실제 이득인지 측정한다.
                      제품 코드가 아니라 **측정 도구**이며, production 실행 경로(tomverse-host)를

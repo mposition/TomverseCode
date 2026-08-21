@@ -3,9 +3,9 @@
 //!
 //! # 왜 이게 필요한가
 //!
-//! 12절 미해결 두 항목("기준↔테스트 연결의 커버리지", "위치 충돌 규칙의 오탐률")은 **집계로만**
-//! 답할 수 있는 질문이다. 이벤트는 이미 쌓이고 있지만, 한 태스크의 로그를 눈으로 읽어서는
-//! "얼마나"를 알 수 없다.
+//! 12절 미해결 항목 중 몇 개는 **집계로만** 답할 수 있는 질문이다("기준↔테스트 연결의
+//! 커버리지", "위치 충돌 규칙의 오탐률", "강제 포기 노출 시점의 근거"). 이벤트는 이미 쌓이고
+//! 있지만, 한 태스크의 로그를 눈으로 읽어서는 "얼마나"를 알 수 없다.
 //!
 //! # 왜 Rust인가
 //!
@@ -59,22 +59,125 @@ pub struct ConflictOutcomes {
     pub proceeded_task_terminal_status: BTreeMap<String, u64>,
 }
 
+/// 취소 소요 분포 — 12절 미해결 "강제 포기 노출 시점(5초)의 근거".
+///
+/// # 무엇을 세고 무엇을 빼는가
+///
+/// `CANCELLATION_REQUESTED`부터 그 뒤 첫 터미널 이벤트까지의 간격을 잰다. 세 갈래로 갈리고,
+/// **셋을 섞으면 숫자가 자기 자신을 먹는다.**
+///
+/// - `settled` — 정상적으로 끝난 취소. 이것만 분포에 들어간다.
+/// - `force_abandoned` — 사용자가 기다리기를 그만둔 것. **분포에서 뺀다.** 이 간격은
+///   "취소가 얼마나 걸렸는가"가 아니라 "임계값 + 사용자의 반응 시간"이다. 넣으면 임계값이
+///   자기 자신을 근거로 매번 커지는 되먹임이 생긴다 — 탈출구를 쓸수록 탈출구가 늦게 뜬다.
+/// - `unresolved` — 요청은 있는데 터미널이 없다. 유한한 소요 시간이 **없는** 경우이므로
+///   분포에 넣을 수 없다. 그러나 조용히 빼면 안 된다: 이것이 탈출구가 존재하는 이유 그 자체라,
+///   개수가 보이지 않으면 분포가 실제보다 건강해 보인다.
 #[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct CriteriaMetrics {
+pub struct CancellationLatency {
+    /// 분포에 들어간 표본 수.
+    pub settled: u64,
+    #[serde(rename = "forceAbandoned")]
+    pub force_abandoned: u64,
+    pub unresolved: u64,
+    /// 타임스탬프를 읽지 못한 쌍. 0이 아니면 아래 숫자를 믿기 전에 여기를 봐야 한다 —
+    /// 조용히 빼면 표본이 적은 것과 파서가 깨진 것을 구별할 수 없다.
+    #[serde(rename = "unparsedTimestamps")]
+    pub unparsed_timestamps: u64,
+    #[serde(rename = "p50Ms")]
+    pub p50_ms: Option<u64>,
+    #[serde(rename = "p90Ms")]
+    pub p90_ms: Option<u64>,
+    #[serde(rename = "p95Ms")]
+    pub p95_ms: Option<u64>,
+    #[serde(rename = "maxMs")]
+    pub max_ms: Option<u64>,
+}
+
+/// 표본이 이만큼 쌓이기 전에는 측정값을 쓰지 않는다.
+///
+/// 하나짜리 표본으로 임계값을 정하면 그 한 번의 실행이 앞으로의 모든 취소를 지배한다.
+/// 10은 "분포라고 부를 수 있는 최소"에 대한 관례적 선택이고 **이것도 실측이 아니다** —
+/// 다만 이 값이 틀렸을 때의 대가는 임계값이 틀렸을 때보다 작다(기본값으로 남을 뿐이다).
+pub const MIN_LATENCY_SAMPLES: u64 = 10;
+
+/// 표본이 없을 때의 기본값. 종전에 UI에 하드코딩되어 있던 추정치와 같다 —
+/// 값을 바꾸는 것이 아니라 **근거를 붙이는 것**이 이 작업의 목적이므로, 데이터가 없을 때의
+/// 동작은 종전과 같아야 한다.
+pub const DEFAULT_FORCE_ABANDON_MS: u64 = 5_000;
+
+/// 측정값에서 임계값을 만들 때의 하한/상한.
+///
+/// 하한이 `REAP_TIMEOUT`(2초)보다 큰 이유: 그 안에서는 정상 취소가 **아직 진행 중**이므로
+/// 탈출구가 뜨면 거짓 경보다. 상한이 있는 이유: 이상치 하나가 max를 끌어올리면 탈출구가
+/// 사실상 사라지는데, 탈출구가 없는 것이 이 기능이 고치려던 문제였다.
+pub const MIN_FORCE_ABANDON_MS: u64 = 3_000;
+pub const MAX_FORCE_ABANDON_MS: u64 = 30_000;
+
+/// 강제 포기 버튼을 여는 시점과 **그 값이 어디서 왔는지**.
+///
+/// `source`를 값과 함께 돌려주는 이유: 5초가 추정이라는 사실을 지운 채 숫자만 넘기면
+/// 읽는 쪽이 그것을 측정값으로 읽는다. 12절 항목이 지적한 문제가 정확히 그것이었다.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ForceAbandonThreshold {
+    pub ms: u64,
+    /// `measured` | `default_insufficient_samples`
+    pub source: &'static str,
+    #[serde(rename = "sampleCount")]
+    pub sample_count: u64,
+    #[serde(rename = "minSamples")]
+    pub min_samples: u64,
+}
+
+/// 관측된 취소 소요에서 탈출구를 열 시점을 정한다.
+///
+/// # 왜 p95가 아니라 max인가
+///
+/// 탈출구가 답해야 하는 질문은 "이 취소가 비정상인가"이지 "느린 편인가"가 아니다. p95를 쓰면
+/// **정상 취소 20번에 한 번은** 탈출구가 떠서, 곧 정상적으로 끝날 작업에 대고 "예상보다 오래
+/// 걸리고 있습니다"라고 말하게 된다. 그건 탈출구가 없는 것과는 다른 종류의 거짓말이다.
+///
+/// max에 여유를 곱하는 이유는 max 자체가 표본에 따라 흔들리기 때문이고, 1.5는 관례적 선택이다.
+/// p50/p90/p95도 함께 보고하므로 이 규칙이 틀렸을 때 사람이 다시 판단할 재료는 남는다.
+pub fn suggest_force_abandon_ms(latency: &CancellationLatency) -> ForceAbandonThreshold {
+    match latency.max_ms {
+        Some(max) if latency.settled >= MIN_LATENCY_SAMPLES => ForceAbandonThreshold {
+            ms: (max.saturating_mul(3) / 2).clamp(MIN_FORCE_ABANDON_MS, MAX_FORCE_ABANDON_MS),
+            source: "measured",
+            sample_count: latency.settled,
+            min_samples: MIN_LATENCY_SAMPLES,
+        },
+        _ => ForceAbandonThreshold {
+            ms: DEFAULT_FORCE_ABANDON_MS,
+            source: "default_insufficient_samples",
+            sample_count: latency.settled,
+            min_samples: MIN_LATENCY_SAMPLES,
+        },
+    }
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct Metrics {
     pub coverage: CriteriaCoverage,
     pub conflicts: ConflictOutcomes,
+    pub cancellation: CancellationLatency,
+    /// 관측에서 유도한 강제 포기 임계값. **집계 결과이지 설정이 아니다** —
+    /// 데이터가 없으면 기본값과 그 사실을 그대로 돌려준다.
+    #[serde(rename = "forceAbandonThreshold")]
+    pub force_abandon_threshold: Option<ForceAbandonThreshold>,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
 }
 
 /// 저장된 이벤트에서 두 지표를 집계한다. **아무것도 쓰지 않는다.**
-pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<CriteriaMetrics, String> {
+pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, String> {
     let tasks = store
         .all_tasks_for_metrics(workspace_path)
         .map_err(|e| format!("작업 목록을 읽을 수 없습니다: {e}"))?;
 
-    let mut metrics = CriteriaMetrics::default();
+    let mut metrics = Metrics::default();
+    let mut latencies: Vec<u64> = Vec::new();
     for (task_id, terminal_status) in &tasks {
         metrics.tasks_scanned += 1;
         let events = store
@@ -129,6 +232,9 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<CriteriaMe
             }
         }
 
+        // ---- 취소 소요: CANCELLATION_REQUESTED → 그 뒤 첫 터미널 ----
+        collect_cancellation(&events, &mut metrics.cancellation, &mut latencies);
+
         if proceeded {
             // phase가 아니라 terminal_status를 쓴다 — 진행 중 태스크와 끝난 태스크를 섞지 않는다.
             let status = terminal_status.clone().unwrap_or_else(|| "RUNNING".to_string());
@@ -140,7 +246,80 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<CriteriaMe
         }
     }
 
+    finalize_latency(&mut metrics.cancellation, &mut latencies);
+    metrics.force_abandon_threshold = Some(suggest_force_abandon_ms(&metrics.cancellation));
     Ok(metrics)
+}
+
+/// 한 태스크의 이벤트에서 취소 소요를 뽑는다.
+///
+/// 한 태스크에 `CANCELLATION_REQUESTED`가 여러 번 있을 수 있다(사용자가 취소를 두 번 눌러도
+/// `already_requested`로 흡수되지만, 이벤트 자체는 남는 경로가 있다). **첫 번째만** 쓴다 —
+/// 두 번째 요청은 이미 진행 중인 취소에 대한 것이라 그 간격은 취소가 걸린 시간이 아니다.
+fn collect_cancellation(events: &[crate::store::StoredEvent], out: &mut CancellationLatency, samples: &mut Vec<u64>) {
+    let Some(requested_at) = events
+        .iter()
+        .find(|e| e.event_type == "CANCELLATION_REQUESTED")
+        .map(|e| e.created_at.as_str())
+    else {
+        return;
+    };
+
+    // 요청 **뒤에** 온 터미널만 본다. 앞에 있는 것은 다른 사건이다.
+    let requested_index = events
+        .iter()
+        .position(|e| e.event_type == "CANCELLATION_REQUESTED")
+        .unwrap_or(0);
+    let Some(terminal) = events[requested_index..]
+        .iter()
+        .find(|e| e.event_type.starts_with("TASK_") && e.event_type != "TASK_CREATED")
+    else {
+        out.unresolved += 1;
+        return;
+    };
+
+    if terminal.payload.get("forceAbandoned").and_then(Value::as_bool) == Some(true) {
+        out.force_abandoned += 1;
+        return;
+    }
+
+    match (parse_ms(requested_at), parse_ms(&terminal.created_at)) {
+        (Some(a), Some(b)) => {
+            out.settled += 1;
+            // 음수는 시계가 뒤로 간 경우다. 0으로 눕히되 표본에서 빼지는 않는다 —
+            // 빼면 "빠른 취소"가 통째로 사라져 분포가 느린 쪽으로 치우친다.
+            samples.push((b - a).max(0) as u64);
+        }
+        _ => out.unparsed_timestamps += 1,
+    }
+}
+
+fn parse_ms(text: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
+fn finalize_latency(out: &mut CancellationLatency, samples: &mut Vec<u64>) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_unstable();
+    out.p50_ms = percentile(samples, 50);
+    out.p90_ms = percentile(samples, 90);
+    out.p95_ms = percentile(samples, 95);
+    out.max_ms = samples.last().copied();
+}
+
+/// 최근접 순위 백분위. 보간하지 않는 이유: 표본이 수십 개 수준이라 보간이 만들어내는 값은
+/// 관측된 적 없는 숫자이고, 여기서 필요한 것은 "실제로 이만큼 걸린 적이 있다"는 사실이다.
+fn percentile(sorted: &[u64], p: u64) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let n = sorted.len() as u64;
+    let rank = (p * n).div_ceil(100).max(1);
+    sorted.get((rank - 1) as usize).copied()
 }
 
 /// 문자열 값 하나를 집계 맵에 더한다. 값이 없거나 문자열이 아니면 `unknown`으로 센다 —
@@ -293,6 +472,136 @@ mod tests {
         assert_eq!(metrics.coverage.criteria, 1);
         assert_eq!(metrics.coverage.by_status.get("unknown"), Some(&1));
         assert_eq!(metrics.coverage.by_code.get("unknown"), Some(&1));
+    }
+
+    /// `CANCELLATION_REQUESTED` → 터미널 쌍 하나를 만든다. 밀리초 오프셋으로 시각을 준다.
+    fn cancel_pair(offset_ms: i64, terminal_payload: Value) -> Vec<crate::store::StoredEvent> {
+        let base = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(20_000);
+        let at = |ms: i64| {
+            (base + time::Duration::milliseconds(ms))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let ev = |seq: i64, ty: &str, created_at: String, payload: Value| crate::store::StoredEvent {
+            event_id: seq,
+            seq,
+            event_type: ty.to_string(),
+            payload,
+            created_at,
+            phase: None,
+        };
+        vec![
+            ev(1, "CANCELLATION_REQUESTED", at(0), json!({})),
+            ev(2, "TASK_CANCELLED", at(offset_ms), terminal_payload),
+        ]
+    }
+
+    fn latency_of(pairs: Vec<Vec<crate::store::StoredEvent>>) -> CancellationLatency {
+        let mut out = CancellationLatency::default();
+        let mut samples = Vec::new();
+        for events in &pairs {
+            collect_cancellation(events, &mut out, &mut samples);
+        }
+        finalize_latency(&mut out, &mut samples);
+        out
+    }
+
+    /// **강제 포기한 취소는 분포에 들어가면 안 된다.**
+    ///
+    /// 그 간격은 "취소가 얼마나 걸렸는가"가 아니라 "임계값 + 사용자의 반응 시간"이다. 넣으면
+    /// 임계값이 자기 자신을 근거로 매번 커지고, 탈출구를 쓸수록 탈출구가 늦게 뜨게 된다.
+    #[test]
+    fn force_abandoned_cancellations_do_not_feed_back_into_the_threshold() {
+        let mut pairs: Vec<Vec<crate::store::StoredEvent>> = (0..10).map(|_| cancel_pair(500, json!({}))).collect();
+        // 강제 포기는 임계값(5초) 언저리에서 일어난다 — 넣으면 max가 500 → 6000이 된다.
+        for _ in 0..5 {
+            pairs.push(cancel_pair(6_000, json!({ "forceAbandoned": true })));
+        }
+
+        let latency = latency_of(pairs);
+        assert_eq!(latency.settled, 10);
+        assert_eq!(latency.force_abandoned, 5);
+        assert_eq!(latency.max_ms, Some(500), "강제 포기가 분포에 섞였습니다");
+
+        let threshold = suggest_force_abandon_ms(&latency);
+        assert_eq!(threshold.source, "measured");
+        // 500 * 1.5 = 750이지만 하한이 3초다 — 그 안은 정상 취소가 아직 진행 중인 구간이다.
+        assert_eq!(threshold.ms, MIN_FORCE_ABANDON_MS);
+    }
+
+    /// 끝나지 않은 취소는 **유한한 소요 시간이 없다.** 분포에 넣을 수 없지만 조용히 빼면
+    /// 안 된다 — 이것이 탈출구가 존재하는 이유 그 자체라, 안 보이면 분포가 실제보다 건강해 보인다.
+    #[test]
+    fn unresolved_cancellations_are_counted_not_dropped() {
+        let base = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(20_000);
+        let stuck = vec![crate::store::StoredEvent {
+            event_id: 1,
+            seq: 1,
+            event_type: "CANCELLATION_REQUESTED".to_string(),
+            payload: json!({}),
+            created_at: base.format(&time::format_description::well_known::Rfc3339).unwrap(),
+            phase: None,
+        }];
+        let latency = latency_of(vec![stuck, cancel_pair(400, json!({}))]);
+        assert_eq!(latency.unresolved, 1);
+        assert_eq!(latency.settled, 1);
+    }
+
+    /// 표본이 적으면 **측정값을 쓰지 않는다.** 한 번의 실행이 앞으로의 모든 취소를 지배하면
+    /// 그건 측정이 아니라 우연이다. 그리고 그 사실을 `source`로 함께 말한다 — 숫자만 넘기면
+    /// 읽는 쪽이 기본값을 측정값으로 읽는다.
+    #[test]
+    fn threshold_falls_back_to_the_default_until_there_are_enough_samples() {
+        let latency = latency_of(
+            (0..(MIN_LATENCY_SAMPLES - 1))
+                .map(|_| cancel_pair(9_000, json!({})))
+                .collect(),
+        );
+        let threshold = suggest_force_abandon_ms(&latency);
+        assert_eq!(threshold.ms, DEFAULT_FORCE_ABANDON_MS);
+        assert_eq!(threshold.source, "default_insufficient_samples");
+        assert_eq!(threshold.sample_count, MIN_LATENCY_SAMPLES - 1);
+    }
+
+    /// 이상치 하나가 max를 끌어올려도 탈출구가 사라지지는 않는다.
+    #[test]
+    fn threshold_is_capped_so_the_escape_hatch_never_disappears() {
+        let mut pairs: Vec<Vec<crate::store::StoredEvent>> = (0..10).map(|_| cancel_pair(400, json!({}))).collect();
+        pairs.push(cancel_pair(600_000, json!({})));
+        let latency = latency_of(pairs);
+        assert_eq!(latency.max_ms, Some(600_000));
+        assert_eq!(suggest_force_abandon_ms(&latency).ms, MAX_FORCE_ABANDON_MS);
+    }
+
+    /// 백분위는 관측된 값 중에서 고른다 — 보간하면 실제로 걸린 적 없는 숫자가 나온다.
+    #[test]
+    fn percentile_picks_an_observed_value() {
+        let sorted: Vec<u64> = (1..=10).map(|n| n * 100).collect();
+        assert_eq!(percentile(&sorted, 50), Some(500));
+        assert_eq!(percentile(&sorted, 90), Some(900));
+        assert_eq!(percentile(&sorted, 95), Some(1000));
+        assert_eq!(percentile(&[], 50), None);
+    }
+
+    /// 실제 저장소를 한 번 지나 배선을 확인한다. 단위 테스트가 직접 만든 이벤트만 세면
+    /// `collect`가 이 집계를 부르지 않게 되어도 아무도 모른다.
+    #[test]
+    fn collect_wires_cancellation_latency_through_the_store() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "CANCELLATION_REQUESTED", &json!({}))
+            .unwrap();
+        store
+            .finish_task("task-1", "CANCELLED", "TASK_CANCELLED", None, &json!({}))
+            .unwrap();
+
+        let metrics = collect(&store, None).unwrap();
+        assert_eq!(metrics.cancellation.settled, 1);
+        assert_eq!(metrics.cancellation.unparsed_timestamps, 0);
+        assert!(metrics.cancellation.p50_ms.is_some());
+        // 표본 하나로는 임계값을 정하지 않는다.
+        let threshold = metrics.force_abandon_threshold.unwrap();
+        assert_eq!(threshold.source, "default_insufficient_samples");
     }
 
     #[test]

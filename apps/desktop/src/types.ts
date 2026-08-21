@@ -276,3 +276,16 @@ export interface RevertOutcome {
   conflicts?: string[];
   reason?: string;
 }
+
+/**
+ * 강제 포기 버튼을 열 시점과 **그 값이 어디서 왔는지** (state-machine-and-protocol.md 16.3절).
+ *
+ * `source`가 값과 함께 오는 이유: 표본이 부족하면 `ms`는 여전히 추정치인데, 숫자만 받으면
+ * 화면이 그것을 측정값으로 말하게 된다. 12절이 지적한 문제가 정확히 그것이었다.
+ */
+export interface ForceAbandonThreshold {
+  ms: number;
+  source: "measured" | "default_insufficient_samples";
+  sampleCount: number;
+  minSamples: number;
+}
