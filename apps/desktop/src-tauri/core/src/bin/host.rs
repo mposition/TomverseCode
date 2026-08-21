@@ -12,7 +12,7 @@
 //! tomverse-host run --workspace <path> --message "..." [--mode fast|verified]
 //!                   [--approve auto|deny] [--db <path>] [--artifacts <path>]
 //!                   [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit]
-//!                   [--cancel-after-ms <n>] [--verbose]
+//!                   [--cancel-after-ms <n>] [--budget-usd <n>] [--verbose]
 //! tomverse-host rollback --workspace <path> --task <taskId> --db <path> [--artifacts <path>]
 //! tomverse-host recover  --workspace <path> --db <path>
 //! tomverse-host tasks    --workspace <path> --db <path>
@@ -80,6 +80,13 @@ struct Args {
     sidecar: Option<PathBuf>,
     auto_approve_writes: bool,
     allow_git_commit: bool,
+    /// 이 태스크의 예산 상한(USD). `None`이면 **상한 없이** 돈다.
+    ///
+    /// 헤드리스 호스트의 기본값이 "상한 없음"인 이유: 이 바이너리를 쓰는 것은 e2e와 가설
+    /// 게이트이고, 둘 다 자기 예산 통제를 따로 갖는다(게이트는 Run Card와 원장). 여기에
+    /// 기본 상한을 넣으면 그 통제 위에 우리가 모르는 두 번째 상한이 얹힌다.
+    /// **UI 경로의 기본값은 이것과 다르다** — 거기서는 상한 없음이 명시적 선택이어야 한다.
+    budget_usd: Option<f64>,
     timeout_secs: u64,
     verbose: bool,
     /// 시나리오 A용: 실행 시작 후 N ms 뒤에 스스로 취소를 요청한다.
@@ -124,6 +131,7 @@ fn parse_args() -> Result<Args, String> {
         sidecar: None,
         auto_approve_writes: false,
         allow_git_commit: false,
+        budget_usd: None,
         timeout_secs: 600,
         verbose: false,
         cancel_after_ms: None,
@@ -152,6 +160,16 @@ fn parse_args() -> Result<Args, String> {
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
             "--auto-approve-writes" => args.auto_approve_writes = true,
             "--allow-git-commit" => args.allow_git_commit = true,
+            "--budget-usd" => {
+                let text = value()?;
+                let parsed: f64 = text
+                    .parse()
+                    .map_err(|_| format!("--budget-usd 값이 수가 아닙니다: {text}"))?;
+                if !parsed.is_finite() || parsed <= 0.0 {
+                    return Err(format!("--budget-usd는 0보다 큰 유한한 수여야 합니다: {text}"));
+                }
+                args.budget_usd = Some(parsed);
+            }
             "--timeout-secs" => {
                 args.timeout_secs = value()?
                     .parse()
@@ -192,7 +210,7 @@ fn parse_args() -> Result<Args, String> {
 fn usage() -> String {
     "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
-     [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>] [--verbose]\n\
+     [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>] [--budget-usd <n>] [--verbose]\n\
      \n\
      가설 게이트 전용: [--providers <csv>] [--review-mode blind|informed] [--replay-draft <file>]\n\
      \n\
@@ -596,6 +614,9 @@ fn run_task(
         "policy": {
             "autoApproveWorkspaceWrites": args.auto_approve_writes,
             "allowGitCommit": args.allow_git_commit,
+            // null은 "기본값을 쓰라"가 아니라 **"상한 없음"**이다. 키를 빼면 sidecar의
+            // 기본 상한이 적용되어, 이 바이너리를 쓰는 하네스가 모르는 상한이 생긴다.
+            "budgetUsd": args.budget_usd,
             "executionMode": match args.mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
         },
         "workspaceName": workspace_name(host.root()),

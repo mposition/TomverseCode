@@ -233,6 +233,8 @@ export interface FinalResult {
    * 기준별 판정. 비어 있거나 없으면 **아무것도 확인되지 않았다는 뜻**이지 충족했다는 뜻이 아니다.
    */
   criterionEvaluations?: CriterionEvaluation[];
+  /** 예산 결말. 성공·실패를 가리지 않고 온다 — 돈은 결과와 무관하게 나갔다. */
+  budget?: TaskBudgetOutcome;
 }
 
 export interface WorkspaceInfo {
@@ -314,10 +316,43 @@ export interface LargeChangeThreshold {
   minSamples: number;
 }
 
+/**
+ * 태스크당 예산 상한의 **제안값** (multi-engine-routing.md 10.6절).
+ *
+ * 제안은 승인이 아니다 — 화면은 이 값으로 입력란을 채우고, 실제로 강제되는 것은 사용자가
+ * 확인한 값이다. `source`가 함께 오는 이유는 다른 문턱들과 같다: 표본이 부족하면 그 값은
+ * 여전히 추정치인데, 숫자만 넘기면 화면이 그것을 측정값으로 말하게 된다.
+ */
+export interface TaskBudgetThreshold {
+  usd: number;
+  source: "measured" | "default_insufficient_samples";
+  sampleCount: number;
+  minSamples: number;
+  /** 관측된 지출에 곱한 여유 배수. 예약은 최대 비용으로 열리고 확정은 실제 비용으로 되므로 필요하다. */
+  headroomMultiplier: number;
+}
+
 /** `derived_thresholds`가 돌려주는 것. 문턱은 워크스페이스를 열 때 한 번만 읽는다. */
 export interface DerivedThresholds {
   forceAbandon: ForceAbandonThreshold | null;
   largeChange: LargeChangeThreshold | null;
+  taskBudget: TaskBudgetThreshold | null;
+}
+
+/**
+ * 이 태스크가 공급자 호출에 실제로 쓴 돈 (multi-engine-routing.md 10.6절).
+ *
+ * `not_enforced`를 `ok`와 같게 그리지 않는 것이 이 타입의 요점이다 — "상한 안에서 끝났다"와
+ * "상한이 없었다"는 정반대의 사실이다.
+ */
+export interface TaskBudgetOutcome {
+  limitUsd: number | null;
+  /** 가격을 아는 호출만 더한 값. `unpricedCalls > 0`이면 **하한이다.** */
+  spentUsd: number;
+  unresolvedUsd: number;
+  unpricedCalls: number;
+  state: "not_enforced" | "ok" | "limit_reached" | "blocked";
+  detail?: string;
 }
 
 /**

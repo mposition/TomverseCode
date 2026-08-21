@@ -492,7 +492,10 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
   // 스냅샷과 공급자 호출이 실제로 그 모양으로 남는지를 본다.
   requireArtifacts();
   await withCtx({ gitRepo: true }, (ctx) => {
-    const result = spawnSync(HOST_BIN, runArgs(ctx, ["--mode", "verified", "--timeout-secs", "180"]), {
+    // `--budget-usd`를 여기서만 준다. **fake 공급자는 단가가 0이라 상한이 무엇도 막지 않으므로**
+    // 이 시나리오가 확인하는 것은 강제 동작이 아니라 **배선**이다 — Rust가 받은 값이 정책 JSON을
+    // 거쳐 Node의 원장까지 도달하는가. 강제 동작은 가격이 붙은 레지스트리로 단위 테스트가 본다.
+    const result = spawnSync(HOST_BIN, runArgs(ctx, ["--mode", "verified", "--timeout-secs", "180", "--budget-usd", "10"]), {
       encoding: "utf8",
       timeout: 210_000,
       env: hostEnv(),
@@ -546,6 +549,13 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
       "--artifacts",
       ctx.artifacts,
     ]) as { events: { type: string; payload: Record<string, unknown> }[] };
+    // 상한이 Node까지 도달했는가. `enforced: false`면 배선 어딘가에서 값이 사라진 것이고,
+    // 그때 사용자는 상한을 걸었다고 믿는 채로 상한 없이 돌게 된다.
+    const budgetPolicy = detail.events.find((e) => e.type === "BUDGET_POLICY");
+    assert.ok(budgetPolicy, "BUDGET_POLICY 이벤트가 없습니다");
+    assert.equal(budgetPolicy!.payload.enforced, true, JSON.stringify(budgetPolicy!.payload));
+    assert.equal(budgetPolicy!.payload.limitUsd, 10);
+
     const fingerprint = detail.events.find((e) => e.type === "WORKSPACE_FINGERPRINT");
     assert.ok(fingerprint, "워크스페이스 지문 이벤트가 없습니다");
     // 픽스처는 git 저장소이므로 잴 수 있어야 한다 — available:false면 그 자체가 결함이다.

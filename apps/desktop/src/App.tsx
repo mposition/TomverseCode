@@ -22,6 +22,7 @@ import {
   type StoredEvent,
   type TaskEvent,
   type TaskPhase,
+  type TaskBudgetThreshold,
   type TaskRow,
   type UserDecisionInput,
   type UsageTotals,
@@ -35,6 +36,7 @@ import { DiffPanel } from "./components/DiffPanel";
 import { DisagreementCard } from "./components/DisagreementCard";
 import { SecretShapeWarning, useSecretShapeScan } from "./components/SecretShapeWarning";
 import { TransmissionPanel } from "./components/TransmissionPanel";
+import { BudgetPanel } from "./components/BudgetPanel";
 import { AuditExportPanel } from "./components/AuditExportPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
@@ -72,6 +74,25 @@ const DEFAULT_FORCE_ABANDON_AFTER_MS = 5_000;
  */
 const DEFAULT_LARGE_CHANGE_FILES = 8;
 
+/**
+ * 입력란의 문자열을 `start_task`의 두 인자로 바꾼다.
+ *
+ * **비어 있는 것과 "상한 없음"을 여기서만 잇는다.** 두 인자로 보내는 이유는 Rust 쪽 주석에
+ * 있다 — 인자를 빠뜨린 화면이 상한을 조용히 끄지 못하게 하기 위해서다. 그러려면 화면도
+ * "없음"을 명시적으로 말해야 하고, 그 변환 지점이 한 곳뿐이어야 한다.
+ */
+function budgetArgs(text: string): { budgetUsd: number | null; budgetUnlimited: boolean } {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return { budgetUsd: null, budgetUnlimited: true };
+  const value = Number(trimmed);
+  if (!Number.isFinite(value) || value <= 0) {
+    // 잘못된 값을 "없음"으로 바꾸지 않는다. Rust가 거부하고 그 사유가 화면에 뜬다 —
+    // 여기서 조용히 무제한으로 바꾸면 오타 하나가 상한을 지운다.
+    return { budgetUsd: value, budgetUnlimited: false };
+  }
+  return { budgetUsd: value, budgetUnlimited: false };
+}
+
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [workspacePath, setWorkspacePath] = useState("");
@@ -88,6 +109,15 @@ export default function App() {
    * 대상으로 다룬다. 토글이 정하는 것은 "매 태스크마다 커밋 승인 모달을 띄울 것인가"뿐이다.
    */
   const [allowGitCommit, setAllowGitCommit] = useState(false);
+  /**
+   * 이 작업의 예산 상한 (multi-engine-routing.md 10.6절).
+   *
+   * `""`(빈 문자열)는 **상한 없음**이다. `0`이나 `null`로 표현하지 않는 이유: 입력란을 비운
+   * 것과 0을 적은 것은 사용자에게 다른 행동이고, 0은 "아무것도 못 도는 상한"이라 우리가
+   * 그것을 "무제한"으로 읽으면 정반대로 해석하는 것이다.
+   */
+  const [budgetText, setBudgetText] = useState<string>("");
+  const [budgetSuggestion, setBudgetSuggestion] = useState<TaskBudgetThreshold | null>(null);
   /**
    * 이 작업이 만든 커밋. **되돌리기 화면의 선택지가 이 값에 달려 있다** —
    * 커밋이 없으면 파일 되돌리기 하나뿐이고, 있으면 사용자가 무엇을 되돌릴지 골라야 한다.
@@ -296,9 +326,14 @@ export default function App() {
         const measured = await invoke<DerivedThresholds>("derived_thresholds", { workspacePath: info.rootPath });
         setForceAbandonAfter(measured.forceAbandon ?? null);
         setLargeChange(measured.largeChange ?? null);
+        // **제안은 승인이 아니다.** 입력란을 채우기만 하고, 강제되는 것은 사용자가 확인한 값이다.
+        setBudgetSuggestion(measured.taskBudget ?? null);
+        setBudgetText(measured.taskBudget ? String(measured.taskBudget.usd) : "");
       } catch {
         setForceAbandonAfter(null);
         setLargeChange(null);
+        setBudgetSuggestion(null);
+        setBudgetText("");
       }
     } catch (error) {
       setOpenError(String(error));
@@ -323,7 +358,12 @@ export default function App() {
     startedAt.current = Date.now();
     setElapsedMs(0);
     try {
-      const result = await invoke<FinalResult>("start_task", { message, mode, allowGitCommit });
+      const result = await invoke<FinalResult>("start_task", {
+        message,
+        mode,
+        allowGitCommit,
+        ...budgetArgs(budgetText),
+      });
       setFinalResult(result);
       // 전송 내역은 **끝난 뒤에** 읽는다. 실패해도 결과 화면을 막지 않는다 — 이건 사후 조회이고,
       // 읽지 못했다는 사실은 패널이 스스로 말한다(패널이 없으면 그냥 없는 것이다).
@@ -567,7 +607,8 @@ export default function App() {
       startedAt.current = Date.now();
       setElapsedMs(0);
       try {
-        const result = await invoke<FinalResult>("restart_task", { taskId: id });
+        // 다시 실행은 **새 승인**이다 — 지금 입력란에 있는 값이 이 실행의 상한이다.
+        const result = await invoke<FinalResult>("restart_task", { taskId: id, ...budgetArgs(budgetText) });
         setFinalResult(result);
         setTaskId(result.taskId);
       } catch (error) {
@@ -696,6 +737,37 @@ export default function App() {
                   />
                   변경을 git에 커밋 (매번 승인을 묻습니다)
                 </label>
+              </fieldset>
+              {/* 예산 상한 (multi-engine-routing.md 10.6절).
+                  **비워 두면 상한 없음이고, 화면이 그렇게 말한다.** 0을 "무제한"으로 읽지
+                  않는 이유는 budgetArgs 주석에 있다. */}
+              <fieldset className="modes" disabled={running}>
+                <legend>이 작업의 예산 상한</legend>
+                <label className="budget-input">
+                  $
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    value={budgetText}
+                    placeholder="비우면 상한 없음"
+                    onChange={(e) => setBudgetText(e.target.value)}
+                  />
+                </label>
+                {budgetText.trim().length === 0 ? (
+                  <p className="small warn">
+                    <strong>상한 없이 실행합니다.</strong> 공급자 호출은 사용자 키로 청구되며, 이 앱은 그것을
+                    막지 않습니다.
+                  </p>
+                ) : (
+                  <p className="muted small">
+                    이 작업 하나에만 적용됩니다 — 다시 실행하면 상한만큼 다시 쓸 수 있습니다.
+                    {budgetSuggestion &&
+                      (budgetSuggestion.source === "measured"
+                        ? ` 제안값은 이 워크스페이스의 지난 작업 ${budgetSuggestion.sampleCount}건에서 유도했습니다(p90 × ${budgetSuggestion.headroomMultiplier}).`
+                        : ` 제안값은 아직 관측이 부족해(${budgetSuggestion.sampleCount}/${budgetSuggestion.minSamples}건) 기본값입니다.`)}
+                  </p>
+                )}
               </fieldset>
               {/* 막지 않고 문구만 바꾼다. 자격증명 모양이 진짜 요구의 일부일 수 있고
                   ("sk-로 시작하는 키를 거부해야 한다"), 무엇이 자기 요구인지는 사용자가
@@ -928,6 +1000,10 @@ export default function App() {
               {/* 7절 데이터 전송 투명성. 결과 **아래**에 두는 이유: 사용자가 먼저 묻는 것은
                   "됐는가"이고, "무엇이 나갔는가"는 그 다음이다. 위에 두면 매번 그 다음 질문이
                   먼저 눈에 들어와, 정작 결과를 읽기 전에 스크롤하게 된다. */}
+              {/* 비용은 전송 내역보다 **위**다. "무엇이 나갔는가"보다 "얼마가 나갔는가"를
+                  먼저 묻고, 특히 상한 없이 돌았다면 그 사실이 눈에 먼저 들어와야 한다. */}
+              {finalResult?.budget && <BudgetPanel budget={finalResult.budget} />}
+
               {transmission && <TransmissionPanel transmission={transmission} />}
 
               {/* 6.3절 감사 export. 전송 패널보다 **아래**에 둔다 — "무엇이 나갔는가"는 이 작업을

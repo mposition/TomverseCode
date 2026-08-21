@@ -55,7 +55,41 @@ export interface TaskPolicy {
   /** 단일 명령 실행 상한 (ms) */
   commandTimeoutMs: number;
   executionMode: ExecutionMode;
+  /**
+   * 이 **태스크 하나**가 공급자 호출에 쓸 수 있는 상한(USD). `null`이면 상한이 없다.
+   *
+   * # 왜 태스크당인가 (multi-engine-routing.md 10.6절)
+   *
+   * BYOK이므로 청구는 사용자 계정에서 일어나고, 같은 키를 다른 도구도 쓴다. 우리가 "이번 달
+   * 지출"이라고 부를 수 있는 숫자는 **우리가 낸 호출만**의 합이라 실제 청구와 다르고, 그런
+   * 숫자를 상한의 근거로 쓰면 틀린 값이 권위 있게 읽힌다. 반면 태스크는 사용자가 요청을 적고
+   * 시작을 누르는 **승인의 단위**이며, 그 안에서 일어나는 호출은 전부 우리가 안다.
+   *
+   * 대가는 명시적이다: **다시 실행하면 상한만큼 다시 쓸 수 있다.** 그건 결함이 아니라 승인
+   * 단위가 태스크라는 뜻이고, 화면이 그렇게 말해야 한다.
+   *
+   * # `null`을 남겨두는 이유
+   *
+   * 가격을 모르는 모델(레지스트리에 없거나 단가가 비어 있는)에는 상한을 강제할 수 없다.
+   * 그때 우리가 할 수 있는 것은 둘뿐이다 — 호출을 거부하거나, 상한 없이 도는 것이다.
+   * 사용자가 자기 키로 자기 모델을 쓰겠다는 것을 우리가 막는 것은 요구의 최종 권위를
+   * 뒤집는 것이므로(원칙 1), **선택지로 남기고 그 사실을 기록한다.**
+   */
+  budgetUsd: number | null;
 }
+
+/**
+ * 상한을 유도할 과거가 없을 때의 기본값(USD).
+ *
+ * **유도하지 못한 상수다.** 첫 사용자에게는 관측할 과거가 없다. 실사용 비용이 쌓이면
+ * `tomverse-host metrics`의 `taskCosts`에서 유도하고(`derived_thresholds`), 이 값은 지워지는
+ * 대신 **표본이 부족할 때의 기본값으로 밀려난다** — 강제 포기 문턱(16.3절)과 같은 취급이다.
+ *
+ * 5달러인 이유는 "충분히 크다"가 아니라 **한 번의 호출 최대 비용보다 확실히 크다**는 조건에서
+ * 왔다. 상한이 한 호출의 최대 예약보다 작으면 첫 호출부터 거부되어 아무것도 돌지 않는다.
+ * 가장 비싼 등록 모델의 한 호출 최대치가 약 $2이므로 그보다 여유를 둔다.
+ */
+export const DEFAULT_TASK_BUDGET_USD = 5;
 
 export const DEFAULT_TASK_POLICY: TaskPolicy = {
   limits: DEFAULT_LOOP_LIMITS,
@@ -64,6 +98,7 @@ export const DEFAULT_TASK_POLICY: TaskPolicy = {
   allowGitCommit: false,
   commandTimeoutMs: 120_000,
   executionMode: "verified",
+  budgetUsd: DEFAULT_TASK_BUDGET_USD,
 };
 
 export type TaskPhase =
@@ -138,7 +173,56 @@ export type FailureReason =
   /** Policy Gate가 계획의 필수 도구를 거부해 계획 자체를 실행할 수 없는 경우 */
   | "policy_denied"
   /** 내부 불변식 위반 (잘못된 상태 전이 등) — 조용히 넘기지 않고 실패로 드러낸다 */
-  | "internal_invariant_violated";
+  | "internal_invariant_violated"
+  /**
+   * 이 태스크의 예산 상한을 넘겨 **호출을 하지 않고** 멈췄다.
+   *
+   * `provider_config_error`와 섞지 않는 이유: 저쪽은 고칠 것이 설정에 있고, 이쪽은 사용자가
+   * 정한 값에 도달한 정상 동작이다. 같은 이름으로 보고하면 사용자가 키나 모델을 의심한다.
+   */
+  | "budget_exceeded";
+
+/**
+ * 이 태스크가 공급자 호출에 **실제로 쓴 돈**과 상한이 강제됐는지 여부.
+ *
+ * 상한이 없어도 지출은 보고한다 — "얼마를 썼는가"는 상한과 무관한 사실이고, 상한을 끄는
+ * 선택을 한 사용자야말로 그 숫자를 봐야 한다.
+ */
+export interface TaskBudgetOutcome {
+  /** 사용자가 승인한 상한. `null`이면 이 태스크는 **상한 없이** 돌았다. */
+  limitUsd: number | null;
+  /**
+   * 확정 지출. 가격을 아는 호출만 더한 값이므로 `unpricedCalls > 0`이면 **하한이다.**
+   * 모르는 것을 0으로 더하면 이 숫자가 "썼는데 안 썼다"고 말하게 된다.
+   */
+  spentUsd: number;
+  /** 과금 여부가 불확실해 미해결로 남은 예약액. 사용 가능한 예산으로 돌아오지 않는다. */
+  unresolvedUsd: number;
+  /** 비용을 계산할 수 없었던 호출 수. 0이 아니면 `spentUsd`는 하한이다. */
+  unpricedCalls: number;
+  state: TaskBudgetState;
+  /**
+   * `state`가 뭉뚱그린 원장 상태의 원래 이름(`BUDGET_ESTIMATE_BREACH` 등).
+   *
+   * 화면은 네 가지만 구별하면 되지만 감사에서는 어느 이유로 막혔는지가 다른 사실이다.
+   */
+  detail?: string;
+}
+
+/**
+ * 예산 상태의 **제품 수준 분류.** 원장의 다섯 상태를 화면이 구별해야 하는 넷으로 접는다.
+ *
+ * `not_enforced`를 `ok`와 같은 값으로 접지 않는 것이 요점이다 — "상한 안에서 끝났다"와
+ * "상한이 없었다"는 정반대의 사실인데 둘 다 초록색으로 보이면 화면이 거짓 안심을 준다.
+ */
+export type TaskBudgetState =
+  /** 상한이 없었거나(사용자 선택) 강제할 수 없었다. */
+  | "not_enforced"
+  | "ok"
+  /** 남은 예산으로 다음 호출을 예약할 수 없어 멈췄다. */
+  | "limit_reached"
+  /** 원장을 신뢰할 수 없어 이후 호출을 막았다(추정 초과·비용 측정 불가 등). */
+  | "blocked";
 
 export interface FinalResult {
   taskId: string;
@@ -169,6 +253,10 @@ export interface FinalResult {
    * 비어 있거나 없으면 **아무것도 확인되지 않았다는 뜻**이다 — 충족했다는 뜻이 아니다.
    */
   criterionEvaluations?: CriterionEvaluation[];
+  /**
+   * 이 태스크의 예산 결말. **성공·실패를 가리지 않고 담는다** — 돈은 결과와 무관하게 나갔다.
+   */
+  budget?: TaskBudgetOutcome;
   /**
    * 사용자에게 묻지 못한 채 남은 blocking 불일치 — 있으면 보고에 반드시 표시한다.
    * "물어볼 수 없었다"와 "쟁점이 없었다"는 다른 사실이다(17.4절).

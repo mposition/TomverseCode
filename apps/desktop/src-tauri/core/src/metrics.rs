@@ -315,6 +315,103 @@ pub fn suggest_large_change_files(sizes: &CommitSizes) -> LargeChangeThreshold {
     }
 }
 
+/// 태스크 하나가 공급자 호출에 실제로 쓴 비용의 분포 (마이크로 달러, 1 USD = 1_000_000).
+///
+/// **정수로 다루는 이유**는 백분위 계산을 다른 지표와 같은 함수로 하기 위해서다. 달러를
+/// f64로 정렬하면 NaN 하나가 정렬 순서를 무의미하게 만드는데, 그 NaN은 "비용을 모른다"에서
+/// 온다 — 그건 분포에 넣을 값이 아니라 분포에서 **빼야 하는 사실**이다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct TaskCosts {
+    /// 분포에 들어간 태스크 수 — 공급자 호출이 있었고 **모든 호출의 비용을 아는** 태스크.
+    pub tasks: u64,
+    /// 비용을 모르는 호출이 하나라도 있어 분포에서 제외된 태스크 수.
+    ///
+    /// 조용히 빼면 "표본이 적다"와 "가격 정보가 없다"를 구별할 수 없다. 이 수가 크면
+    /// 고칠 곳은 표본이 아니라 레지스트리의 단가다.
+    #[serde(rename = "tasksWithUnpricedCalls")]
+    pub tasks_with_unpriced_calls: u64,
+    #[serde(rename = "p50Usd")]
+    pub p50_usd: Option<f64>,
+    #[serde(rename = "p90Usd")]
+    pub p90_usd: Option<f64>,
+    #[serde(rename = "maxUsd")]
+    pub max_usd: Option<f64>,
+}
+
+/// 상한을 유도할 과거가 없을 때의 기본값(USD). protocol의 `DEFAULT_TASK_BUDGET_USD`와 **같아야 한다**.
+///
+/// 두 곳에 있는 이유는 둘이 다른 시점에 쓰이기 때문이다: 이 값은 화면이 입력란을 채울 때,
+/// 저쪽은 정책이 병합될 때 쓰인다. 어긋나면 화면이 제안한 값과 실제로 강제되는 값이 달라진다.
+pub const DEFAULT_TASK_BUDGET_USD: f64 = 5.0;
+
+/// 유도값의 하한/상한.
+///
+/// 하한이 $1인 이유: 가장 비싼 등록 모델의 **한 호출** 최대 비용이 약 $2이므로 그보다 낮은
+/// 상한은 첫 호출부터 거부되어 아무것도 돌지 않는다. 상한이 $50인 이유: 이상치 하나가
+/// 제안을 끌어올리면 상한이 사실상 없어지는데, 없는 상한이 이 기능이 고치려던 문제다.
+pub const MIN_TASK_BUDGET_USD: f64 = 1.0;
+pub const MAX_TASK_BUDGET_USD: f64 = 50.0;
+
+/// 표본이 이만큼 쌓이기 전에는 관측값을 쓰지 않는다.
+pub const MIN_TASK_COST_SAMPLES: u64 = 10;
+
+/// 관측된 지출에 곱하는 여유 배수.
+///
+/// **유도하지 못한 상수다.** 필요한 이유는 분명하다: 예약은 그 호출의 **최대** 비용으로 열리고
+/// 확정은 **실제** 비용으로 되므로, 상한을 과거 실제 지출에 맞추면 남은 예산이 다음 호출의
+/// 최대치를 못 덮어 정상 태스크가 거부된다. 그 간극이 얼마인지는 `BUDGET_RESERVATION_OPENED`의
+/// `reservedUsd`가 쌓이면 **측정할 수 있다** — 그때 이 상수를 관측으로 바꾼다.
+pub const TASK_BUDGET_HEADROOM: f64 = 3.0;
+
+/// 태스크당 예산 상한의 제안값과 **그 값이 어디서 왔는지**.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskBudgetThreshold {
+    pub usd: f64,
+    /// `measured` | `default_insufficient_samples`
+    pub source: &'static str,
+    #[serde(rename = "sampleCount")]
+    pub sample_count: u64,
+    #[serde(rename = "minSamples")]
+    pub min_samples: u64,
+    /// 관측값에 곱한 여유 배수. 값만 넘기면 화면이 이걸 관측된 지출로 말하게 된다.
+    #[serde(rename = "headroomMultiplier")]
+    pub headroom_multiplier: f64,
+}
+
+/// 관측된 태스크 비용에서 상한 제안을 만든다.
+///
+/// # 왜 max가 아니라 p90인가
+///
+/// 상한을 지금까지 가장 비쌌던 태스크에 맞추면 이상치 하나가 상한을 무의미하게 만든다.
+/// 반대로 p50에 맞추면 절반이 거부된다. "가끔 거부되고, 그때 사용자가 올릴 수 있다"가
+/// 이 값이 목표하는 자리다 — 거부는 손실이 아니라 멈춤이고, 되돌릴 수 있다.
+pub fn suggest_task_budget_usd(costs: &TaskCosts) -> TaskBudgetThreshold {
+    match costs.p90_usd {
+        Some(p90) if costs.tasks >= MIN_TASK_COST_SAMPLES => TaskBudgetThreshold {
+            usd: round_cents((p90 * TASK_BUDGET_HEADROOM).clamp(MIN_TASK_BUDGET_USD, MAX_TASK_BUDGET_USD)),
+            source: "measured",
+            sample_count: costs.tasks,
+            min_samples: MIN_TASK_COST_SAMPLES,
+            headroom_multiplier: TASK_BUDGET_HEADROOM,
+        },
+        _ => TaskBudgetThreshold {
+            usd: DEFAULT_TASK_BUDGET_USD,
+            source: "default_insufficient_samples",
+            sample_count: costs.tasks,
+            min_samples: MIN_TASK_COST_SAMPLES,
+            headroom_multiplier: TASK_BUDGET_HEADROOM,
+        },
+    }
+}
+
+fn round_cents(usd: f64) -> f64 {
+    (usd * 100.0).round() / 100.0
+}
+
+fn micros_to_usd(micros: u64) -> f64 {
+    micros as f64 / 1_000_000.0
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Metrics {
     pub coverage: CriteriaCoverage,
@@ -331,6 +428,11 @@ pub struct Metrics {
     /// 데이터가 없으면 기본값과 그 사실을 그대로 돌려준다.
     #[serde(rename = "forceAbandonThreshold")]
     pub force_abandon_threshold: Option<ForceAbandonThreshold>,
+    #[serde(rename = "taskCosts")]
+    pub task_costs: TaskCosts,
+    /// 관측에서 유도한 태스크당 예산 상한 제안. **집계 결과이지 설정이 아니다.**
+    #[serde(rename = "taskBudgetThreshold")]
+    pub task_budget_threshold: Option<TaskBudgetThreshold>,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
@@ -345,8 +447,26 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     let mut metrics = Metrics::default();
     let mut latencies: Vec<u64> = Vec::new();
     let mut commit_files: Vec<u64> = Vec::new();
+    // 마이크로 달러 정수로 모은다 — 백분위를 다른 지표와 같은 함수로 내기 위해서다.
+    let mut task_cost_micros: Vec<u64> = Vec::new();
     for (task_id, terminal_status) in &tasks {
         metrics.tasks_scanned += 1;
+
+        // ---- 태스크당 지출 ----
+        //
+        // 비용을 모르는 호출이 하나라도 있으면 **분포에서 뺀다.** 그 태스크의 합계는 하한이고,
+        // 하한을 분포에 넣으면 유도된 상한이 실제보다 낮아진다 — 낮은 상한은 정상 태스크를
+        // 거부하고, 그 거부의 원인이 데이터 결함이라는 사실은 어디에도 남지 않는다.
+        if let Ok((sum, calls, unpriced)) = store.task_cost_usd(task_id) {
+            if calls > 0 {
+                if unpriced > 0 {
+                    metrics.task_costs.tasks_with_unpriced_calls += 1;
+                } else if sum.is_finite() && sum >= 0.0 {
+                    task_cost_micros.push((sum * 1_000_000.0).round() as u64);
+                }
+            }
+        }
+
         let events = store
             .events(task_id)
             .map_err(|e| format!("이벤트를 읽을 수 없습니다: {e}"))?;
@@ -450,6 +570,13 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     metrics.commit_sizes.p90_files = percentile(&commit_files, 90);
     metrics.commit_sizes.max_files = commit_files.last().copied();
     metrics.large_change_threshold = Some(suggest_large_change_files(&metrics.commit_sizes));
+
+    task_cost_micros.sort_unstable();
+    metrics.task_costs.tasks = task_cost_micros.len() as u64;
+    metrics.task_costs.p50_usd = percentile(&task_cost_micros, 50).map(micros_to_usd);
+    metrics.task_costs.p90_usd = percentile(&task_cost_micros, 90).map(micros_to_usd);
+    metrics.task_costs.max_usd = task_cost_micros.last().copied().map(micros_to_usd);
+    metrics.task_budget_threshold = Some(suggest_task_budget_usd(&metrics.task_costs));
 
     metrics.force_abandon_threshold = Some(suggest_force_abandon_ms(&metrics.cancellation));
     Ok(metrics)
@@ -622,6 +749,109 @@ mod tests {
                 }))
                 .collect::<Vec<_>>(),
         })
+    }
+
+    /// 여러 태스크에 공급자 호출 비용을 심는다.
+    fn seed_task_with_cost(store: &mut Store, task_id: &str, costs: &[Option<f64>]) {
+        store
+            .create_task(task_id, "sess-1", "ws-1", "/tmp/ws", "verified", "fix")
+            .unwrap();
+        for (i, cost) in costs.iter().enumerate() {
+            store
+                .record_provider_usage(&json!({
+                    "taskId": task_id,
+                    "callId": format!("{task_id}-c{i}"),
+                    "role": "executor",
+                    "providerId": "p",
+                    "modelId": "m",
+                    "usage": { "inputTokens": 100, "outputTokens": 10 },
+                    "costUsd": cost,
+                    "latencyMs": 1,
+                    "attempt": 1,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                }))
+                .unwrap();
+        }
+    }
+
+    /// **비용을 모르는 호출이 있는 태스크는 분포에서 빠진다.**
+    ///
+    /// 그 태스크의 합계는 하한이고, 하한을 분포에 넣으면 유도된 상한이 실제보다 낮아진다 —
+    /// 낮은 상한은 정상 태스크를 거부하는데, 그 원인이 데이터 결함이라는 사실은 어디에도
+    /// 남지 않는다. 그래서 빼되 **뺐다는 사실을 센다.**
+    #[test]
+    fn a_task_with_unpriced_calls_is_excluded_but_counted() {
+        let (_d, mut store) = seeded();
+        seed_task_with_cost(&mut store, "task-priced", &[Some(0.10), Some(0.20)]);
+        seed_task_with_cost(&mut store, "task-unpriced", &[Some(0.10), None]);
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.task_costs.tasks, 1, "가격을 모르는 태스크가 분포에 들어갔습니다");
+        assert_eq!(m.task_costs.tasks_with_unpriced_calls, 1);
+        assert_eq!(m.task_costs.max_usd, Some(0.30));
+    }
+
+    /// 호출이 아예 없었던 태스크(스냅샷 전에 끝난 것 등)는 "0달러를 쓴 태스크"가 아니다.
+    /// 분포에 넣으면 유도값이 0쪽으로 끌려 내려간다.
+    #[test]
+    fn a_task_with_no_provider_calls_is_not_a_zero_dollar_sample() {
+        let (_d, store) = seeded();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.task_costs.tasks, 0);
+        assert_eq!(m.task_costs.p90_usd, None);
+    }
+
+    /// 표본이 부족하면 관측값을 쓰지 않고 **기본값과 그 사실**을 함께 돌려준다.
+    #[test]
+    fn an_insufficient_sample_yields_the_default_and_says_so() {
+        let costs = TaskCosts {
+            tasks: 3,
+            p90_usd: Some(0.5),
+            ..TaskCosts::default()
+        };
+        let t = suggest_task_budget_usd(&costs);
+        assert_eq!(t.usd, DEFAULT_TASK_BUDGET_USD);
+        assert_eq!(t.source, "default_insufficient_samples");
+        assert_eq!(t.sample_count, 3);
+    }
+
+    /// 표본이 충분하면 p90에 여유를 곱한다. **여유 배수를 값에 녹이지 않고 함께 돌려주는**
+    /// 이유: 그러지 않으면 화면이 이 숫자를 관측된 지출로 말하게 된다.
+    #[test]
+    fn a_sufficient_sample_yields_a_measured_suggestion_with_its_headroom() {
+        let costs = TaskCosts {
+            tasks: MIN_TASK_COST_SAMPLES,
+            p90_usd: Some(2.0),
+            ..TaskCosts::default()
+        };
+        let t = suggest_task_budget_usd(&costs);
+        assert_eq!(t.source, "measured");
+        assert_eq!(t.headroom_multiplier, TASK_BUDGET_HEADROOM);
+        assert_eq!(t.usd, 6.0);
+    }
+
+    /// **하한이 없으면 유도된 상한이 첫 호출조차 못 덮는다.** 가장 비싼 등록 모델의 한 호출
+    /// 최대 비용이 약 $2이므로, 값싼 태스크만 쌓인 워크스페이스에서 제안이 그 아래로 내려가면
+    /// 사용자는 아무것도 돌릴 수 없게 된다.
+    #[test]
+    fn a_cheap_history_does_not_suggest_a_limit_that_blocks_everything() {
+        let costs = TaskCosts {
+            tasks: MIN_TASK_COST_SAMPLES,
+            p90_usd: Some(0.0001),
+            ..TaskCosts::default()
+        };
+        assert_eq!(suggest_task_budget_usd(&costs).usd, MIN_TASK_BUDGET_USD);
+    }
+
+    /// 반대쪽: 이상치 하나가 제안을 끌어올리면 상한이 사실상 사라진다.
+    #[test]
+    fn an_outlier_cannot_remove_the_limit() {
+        let costs = TaskCosts {
+            tasks: MIN_TASK_COST_SAMPLES,
+            p90_usd: Some(10_000.0),
+            ..TaskCosts::default()
+        };
+        assert_eq!(suggest_task_budget_usd(&costs).usd, MAX_TASK_BUDGET_USD);
     }
 
     #[test]

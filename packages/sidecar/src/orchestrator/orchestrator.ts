@@ -35,7 +35,7 @@ import {
   type RetryPolicy,
 } from "../providers/retry.js";
 import type { ProviderAdapter, ProviderCallContext, ProviderResponse } from "../providers/types.js";
-import { ModelRegistry } from "../routing/registry.js";
+import { ModelRegistry, providerKindOf } from "../routing/registry.js";
 import { Router, RoutingError, type RouterOptions } from "../routing/router.js";
 import { ToolBridge } from "../tools/bridge.js";
 import { buildDigest } from "../verify/digest.js";
@@ -50,6 +50,7 @@ import {
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
 import { buildCommitMessage, buildCommitPlan, buildExecutionPlan, PlanningError } from "./planner.js";
 import { triageTask, type TriagePolicy } from "../triage.js";
+import { BudgetRefused, TaskBudget } from "./budget.js";
 
 /**
  * Orchestrator — 태스크 하나의 상태 머신을 소유한다.
@@ -185,6 +186,13 @@ export class Orchestrator {
   private terminalReached = false;
   /** 취소가 요청됐는지. abort signal만 보면 타임아웃 abort와 구별되지 않는다. */
   private cancelRequested = false;
+  /**
+   * 이 태스크의 예산 강제기 (multi-engine-routing.md 10.6절).
+   *
+   * `drive()` 초입에서 만든다 — 상한이 잘못된 값이면 첫 유료 호출 전에 멈춰야 하고,
+   * 그러려면 태스크가 한참 돈 뒤가 아니라 시작 지점에서 검증해야 한다.
+   */
+  private budget: TaskBudget | null = null;
 
   constructor(private readonly input: RunInput, deps: OrchestratorDeps) {
     this.deps = deps;
@@ -285,6 +293,32 @@ export class Orchestrator {
 
   private async drive(): Promise<FinalResult> {
     this.bridge = new ToolBridge(this.deps.transport, this.taskId);
+
+    // ---- 예산 상한 ----
+    //
+    // **첫 유료 호출 전에 검증한다.** 상한이 NaN이거나 0 이하인 채로 시작하면 스냅샷·라우팅을
+    // 다 돈 뒤 첫 호출에서 죽고, 사용자는 무엇이 잘못됐는지 알 수 없다.
+    //
+    // 원장 이벤트는 `task_events`로 나간다 — 별도 테이블을 만들지 않는 이유는 10.6절에 있다.
+    const budget = TaskBudget.create(this.policy.budgetUsd, {
+      taskId: this.taskId,
+      onEvent: (event) => {
+        void this.emit(`BUDGET_${event.type.toUpperCase()}`, event);
+      },
+    });
+    if (!budget.ok) {
+      return this.finish("failed", `예산 상한이 올바르지 않습니다: ${budget.reason}`, "budget_exceeded");
+    }
+    this.budget = budget.budget;
+    await this.emit("BUDGET_POLICY", {
+      limitUsd: this.policy.budgetUsd,
+      enforced: this.budget.enforced,
+      // 상한이 없다는 사실을 **시작 시점에** 남긴다. 결과에만 담으면 진행 중에는 화면이
+      // "상한 안에서 돌고 있다"와 구별할 수 없다.
+      note: this.budget.enforced
+        ? "이 태스크의 공급자 호출은 상한 안에서만 실행된다"
+        : "상한 없이 실행된다 — 지출은 집계하지만 강제하지 않는다",
+    });
 
     // ---- SNAPSHOTTING ----
     await this.transition("SNAPSHOTTING");
@@ -443,7 +477,7 @@ export class Orchestrator {
       const drafted = await Promise.all([
         this.generateDraft(adapters.executor, `draft:${round}`),
         adapters.coExecutor
-          ? this.generateDraft(adapters.coExecutor, `draft-co:${round}`)
+          ? this.generateDraft(adapters.coExecutor, `draft-co:${round}`, { optionalSample: true })
           : Promise.resolve<DraftOutcome>({ kind: "absent" }),
       ]);
 
@@ -467,13 +501,15 @@ export class Orchestrator {
       const co = drafted[1];
       if (co.kind === "draft") {
         proposals.push(co.value);
-      } else if (co.kind === "final") {
-        // 여기서 finish하지 않는다 — 이미 primary 초안이 있으므로 진행할 수 있다.
-        // 다만 조용히 넘기지 않는다: 대조를 하지 못했다는 사실이 로그에 남아야
-        // "쟁점이 없었다"와 구별된다.
+      } else if (adapters.coExecutor) {
+        // co-executor가 배정됐는데 초안이 없다. 취소(`final`)이거나 공급자 실패·예산 거부로
+        // 건너뛴 것(`absent`)이며, **어느 쪽이든 태스크는 진행한다.**
+        //
+        // 조용히 넘기지 않는다: 대조를 하지 못했다는 사실이 로그에 남아야 "쟁점이 없었다"와
+        // 구별된다. 대조 없이 나온 "불일치 0"은 정보가 아니라 착시다.
         await this.emit("ERROR", {
           stage: "DRAFTING",
-          message: "co-executor 초안 생성에 실패해 이번 라운드는 대조 없이 진행합니다",
+          message: "co-executor 초안을 얻지 못해 이번 라운드는 대조 없이 진행합니다",
         });
       }
     }
@@ -617,8 +653,16 @@ export class Orchestrator {
   }
 
   /** 초안 1개 생성. primary/co-executor가 **같은 입력**으로 이 함수를 지난다 — 13.1절. */
-  private async generateDraft(adapter: ProviderAdapter, callId: string): Promise<DraftOutcome> {
-    const draft = await this.callProvider(adapter, "executor", callId, (ctx) =>
+  private async generateDraft(
+    adapter: ProviderAdapter,
+    callId: string,
+    options: { optionalSample?: boolean } = {}
+  ): Promise<DraftOutcome> {
+    const draft = await this.callProviderMaybeOptional(
+      adapter,
+      "executor",
+      callId,
+      (ctx) =>
       adapter.generateDraft(
         {
           snapshot: this.requireSnapshot(),
@@ -629,10 +673,13 @@ export class Orchestrator {
           acceptanceCriteria: this.criteriaForPrompt(),
           criteriaFeedback: this.criteriaFeedback.length > 0 ? [...this.criteriaFeedback] : undefined,
         },
-        ctx
-      )
+          ctx
+        ),
+      options
     );
     if (draft.kind === "final") return draft;
+    // 예산으로 건너뛴 선택적 표본은 **없는 표본**이다 — 실패가 아니라 대조가 줄어든 것이다.
+    if (draft.kind === "skipped") return { kind: "absent" };
     return { kind: "draft", value: draft.value };
   }
 
@@ -1335,18 +1382,66 @@ export class Orchestrator {
     callId: string,
     call: (ctx: ProviderCallContext) => Promise<ProviderResponse<T>>
   ): Promise<{ kind: "value"; value: T } | { kind: "final"; result: FinalResult }> {
+    const outcome = await this.callProviderMaybeOptional(adapter, role, callId, call, {});
+    // `optionalSample`을 주지 않았으므로 `skipped`는 나올 수 없다. 조용히 넘기지 않고 드러낸다 —
+    // 이 경로가 실제로 실행되면 그건 예산 처리가 필수 호출을 건너뛰었다는 뜻이고, 그때
+    // 태스크가 조용히 진행되면 "왜 검수 없이 끝났나"에 답할 수 없다.
+    if (outcome.kind === "skipped") {
+      throw new Error(`내부 불변식 위반: 필수 공급자 호출(${role}/${callId})이 건너뛰어졌습니다`);
+    }
+    return outcome;
+  }
+
+  private async callProviderMaybeOptional<T>(
+    adapter: ProviderAdapter,
+    role: "executor" | "reviewer",
+    callId: string,
+    call: (ctx: ProviderCallContext) => Promise<ProviderResponse<T>>,
+    options: { optionalSample?: boolean }
+  ): Promise<{ kind: "value"; value: T } | { kind: "final"; result: FinalResult } | { kind: "skipped" }> {
     const retryPolicy = this.deps.retryPolicy ?? DEFAULT_RETRY_POLICY;
     const timeoutMs = this.deps.providerTimeoutMs ?? 120_000;
+
+    // **예약은 재시도마다 한다.** 재시도도 유료 호출이므로 한 번 예약하고 세 번 부르면
+    // 상한이 최대 세 배까지 새어 나간다.
+    const entry = this.registry.get(adapter.modelId);
+    const providerKind = entry ? providerKindOf(entry) : "real";
+    // **거부 사실을 따로 기억한다.** 던진 예외는 `callWithRetry`가 `ProviderCallFailed`로
+    // 감싸므로 catch에서 타입으로는 알아볼 수 없다. 감싸기 전의 사실을 남겨두고 먼저 본다.
+    let refusedReason: string | null = null;
 
     try {
       const { value, attempts } = await callWithRetry(
         async (attempt) => {
+          const reserved = this.budget?.reserve(entry, `${role}/${callId}#${attempt}`) ?? {
+            ok: true as const,
+            reservation: null,
+          };
+          if (!reserved.ok) {
+            refusedReason = reserved.reason;
+            throw new BudgetRefused(reserved.reason);
+          }
+
           const scoped = withTimeout(this.abort.signal, timeoutMs);
+          // 요청이 실제로 나갔는가 — 나간 뒤의 실패는 과금됐을 수 있으므로 예약을 풀지 않는다.
+          let dispatched = false;
           try {
+            dispatched = true;
             const response = await call({ taskId: this.taskId, callId, signal: scoped.signal, timeoutMs });
+            this.budget?.settle(reserved.reservation, {
+              costUsd: this.registry.costUsd(adapter.modelId, response.usage),
+              usage: response.usage,
+              providerKind,
+              requestedModelId: response.meta.requestedModelId,
+              providerReportedModelId: response.meta.providerReportedModelId,
+              providerRequestId: response.meta.providerRequestId,
+            });
             await this.recordUsage(adapter, role, callId, response, attempt);
             return response.value;
           } catch (error) {
+            // **예약을 여기서 정리한다.** 응답을 받지 못한 실패는 과금 여부를 모르므로
+            // 해제가 아니라 미해결이다 — 해제하면 쓴 돈을 안 쓴 것으로 만든다.
+            this.budget?.abandon(reserved.reservation, dispatched, errorMessage(error));
             // SDK는 타임아웃과 사용자 취소를 모두 AbortError로 던진다. 둘의 처리가 다르므로
             // (타임아웃은 재시도 후 FAILED, 취소는 즉시 CANCELLED) 신호를 만든 쪽에서 되살린다.
             if (scoped.timedOut()) throw asTimeoutError(error, timeoutMs);
@@ -1375,6 +1470,24 @@ export class Orchestrator {
       if (attempts > 1) this.state.counters.providerRetries[callId] = attempts - 1;
       return { kind: "value", value };
     } catch (error) {
+      // 예산 거부는 **공급자 오류가 아니다.** 호출은 나가지 않았고, 고칠 것은 설정이 아니라
+      // 사용자가 정한 상한이다. `provider_config_error`로 보고하면 키나 모델을 의심하게 된다.
+      if (refusedReason !== null) {
+        // **선택적 표본(co-executor)은 돈이 모자란다고 태스크를 죽이지 않는다.** 대조는 질문을
+        // 만드는 장치이지 진행 조건이 아니므로, 검수자 독립성을 만족시킬 수 없을 때 검수 역할을
+        // 드롭하고 그 사실을 표시하는 것(원칙 4)과 같은 처리를 한다 — 드롭하되 조용히 하지 않는다.
+        //
+        // 검수자는 반대다. 검수를 돈 때문에 드롭하면 사용자가 고른 verified가 조용히
+        // verified가 아니게 된다. 그건 사용자의 요구를 우리가 바꾸는 것이므로 멈춘다.
+        await this.emit("BUDGET_REFUSED", {
+          callId,
+          role,
+          reason: refusedReason,
+          skipped: options.optionalSample === true,
+        });
+        if (options.optionalSample) return { kind: "skipped" };
+        return { kind: "final", result: await this.finish("failed", refusedReason, "budget_exceeded") };
+      }
       if (error instanceof ProviderCallFailed) {
         const { normalized, exhausted } = error;
         if (normalized.kind === "cancelled") {
@@ -1382,6 +1495,17 @@ export class Orchestrator {
         }
         const reason: FailureReason = exhausted ? "provider_retry_exhausted" : "provider_config_error";
         await this.emit("ERROR", { stage: role, callId, errorKind: normalized.kind, message: normalized.message });
+        // **선택적 표본의 공급자 실패도 태스크를 죽이지 않는다.**
+        //
+        // 구현하면서 드러난 결함: 종전에는 여기서 `finish("failed")`를 부른 뒤 호출자가
+        // "여기서 finish하지 않는다 — 이미 primary 초안이 있으므로 진행할 수 있다"는 주석과
+        // 함께 계속 진행했다. 그러면 **태스크는 완료까지 가는데 이벤트 로그에는 TASK_FAILED가
+        // 남고**, 마지막 finish는 "(이미 FAILED로 종료된 태스크)"를 돌려준다. 대조 하나를
+        // 잃은 것이 태스크 전체의 실패로 기록되는 것이므로, 호출자의 주석이 참이 되게 고친다.
+        //
+        // 취소는 예외다 — 그건 이 호출만의 문제가 아니라 태스크 전체의 것이고, primary도
+        // 같은 신호로 끊긴다.
+        if (options.optionalSample) return { kind: "skipped" };
         return {
           kind: "final",
           result: await this.finish("failed", providerFailureMessage(normalized), reason),
@@ -1748,6 +1872,9 @@ export class Orchestrator {
         this.unresolvedDisagreements.length > 0 ? [...this.unresolvedDisagreements] : undefined,
       criterionEvaluations:
         this.criterionEvaluations.length > 0 ? [...this.criterionEvaluations] : undefined,
+      // 성공·실패를 가리지 않고 담는다 — 돈은 결과와 무관하게 나갔고, 실패한 태스크야말로
+      // "얼마를 썼나"를 묻게 되는 자리다.
+      budget: this.budget?.outcome(),
       completedAt: new Date().toISOString(),
     };
     await this.emit(eventType, {
@@ -1764,6 +1891,7 @@ export class Orchestrator {
       acceptanceCriteriaVerifiedCount: this.criterionEvaluations.filter((e) => e.status === "VERIFIED_BY_TEST")
         .length,
       unresolvedDisagreementCount: this.unresolvedDisagreements.length,
+      budget: this.budget?.outcome() ?? null,
     });
     return result;
   }

@@ -1068,6 +1068,23 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// 한 작업이 공급자 호출에 쓴 비용 — `(합계, 호출 수, 비용을 모르는 호출 수)`.
+    ///
+    /// **`cost_usd`가 NULL인 행을 0으로 더하지 않는다.** 0은 "공짜"라는 뜻이고, 모르는 것을
+    /// 0으로 더하면 그 합계가 "썼는데 안 썼다"고 말한다. 그래서 개수로 따로 돌려주고,
+    /// 그 수가 0이 아니면 합계는 **하한**이다.
+    pub fn task_cost_usd(&self, task_id: &str) -> Result<(f64, u64, u64)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*),
+                    SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
+             FROM provider_usage WHERE task_id = ?1",
+        )?;
+        let row = stmt.query_row(params![task_id], |r| {
+            Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        Ok((row.0, row.1.max(0) as u64, row.2.max(0) as u64))
+    }
+
     /// 검증 체크 행 — JSON을 파싱하지 않고 "무엇이 몇 번 실패했나"를 물을 수 있어야 한다.
     pub fn verification_checks(&self, task_id: &str) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self.conn.prepare(

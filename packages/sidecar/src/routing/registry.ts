@@ -209,6 +209,20 @@ export function registrySnapshotHash(entries: readonly ModelEntry[]): string {
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex").slice(0, 16);
 }
 
+/**
+ * 이 항목이 **실제 공급자인가.**
+ *
+ * 예산 정산이 이걸 필요로 한다: 실제 호출이 입력·출력 토큰 0을 보고하면 그건 측정 실패이지만,
+ * fake는 0이 정상이다. 두 경우를 구별하지 못하면 "0달러 썼다"가 언제나 통과한다.
+ *
+ * **판단 근거를 주소 스킴에 둔다.** `local://`는 이 레지스트리에서 하네스용 fake에만 쓰는
+ * 구조적 표시이고, providerId 문자열의 `fake-` 접두사처럼 이름 규칙에 기대는 것보다 낫다 —
+ * 이름은 바뀌지만 "네트워크로 나가지 않는다"는 성질은 주소가 말한다.
+ */
+export function providerKindOf(entry: ModelEntry): "real" | "fake" {
+  return entry.apiBaseUrl.startsWith("local://") ? "fake" : "real";
+}
+
 export class ModelRegistry {
   private readonly entries: ModelEntry[];
 

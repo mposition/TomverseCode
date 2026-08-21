@@ -142,6 +142,22 @@ export interface LedgerOptions extends Partial<LedgerContext> {
    * 사람에게 보여줄 때 쓰는 경로다.
    */
   initialUnresolvedUsd?: number;
+  /**
+   * 미해결 예약이 생겼을 때 **이후 유료 호출을 전부 막을지.** 기본은 `true`(막는다).
+   *
+   * # 왜 옵션인가 — 두 사용처가 다른 것을 지키기 때문이다
+   *
+   * **가설 게이트는 막아야 한다.** 그 실행은 측정이고, 장부가 깨끗하지 않은 채로 얻은 숫자는
+   * 판정에 쓸 수 없다. 게다가 게이트는 프로세스를 넘어 재개하므로, 미해결을 안고 계속하면
+   * 재시작마다 같은 예산을 다시 쓸 수 있게 된다(10.7절이 고친 결함).
+   *
+   * **제품은 막으면 안 된다.** 제품에서 미해결을 만드는 가장 흔한 원인은 **타임아웃**이고,
+   * 타임아웃은 재시도 대상으로 설계된 정상적인 실패다(원칙 5). 한 번의 타임아웃이 태스크의
+   * 남은 호출을 전부 막으면, 사용자는 "예산이 모자랍니다"라는 **틀린 이유**로 실패한 태스크를
+   * 보게 된다. 그리고 막지 않아도 상한은 지켜진다 — 미해결액은 `available()`에서 계속 빠져
+   * 있으므로, 그 돈은 이미 쓴 것으로 취급된다. 막는 것과 빼두는 것은 다른 보호다.
+   */
+  blockOnUnresolved?: boolean;
 }
 
 /** 이 호출/작업이 낼 수 있는 **최대** 비용과 그 근거. */
@@ -407,6 +423,9 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
   let settledCount = 0;
   let releasedCount = 0;
   let unresolvedCount = 0;
+  const blockOnUnresolved = options.blockOnUnresolved ?? true;
+  // 복원된 미해결은 옵션과 무관하게 차단한다. 그건 **이전 프로세스가 남긴** 사실이고,
+  // 그 상태로 재개하면 재시작 횟수만큼 같은 예산을 다시 쓸 수 있다(10.7절).
   let ledgerState: LedgerState = initialUnresolved > 0 ? "UNRESOLVED_RESERVATION" : "OK";
 
   const available = (): number => approvedLimitUsd - historical - session - reserved - unresolved;
@@ -566,7 +585,9 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
             reason: grounds.reason,
             dispatchState: grounds.dispatchState,
           });
-          block("UNRESOLVED_RESERVATION", id, grounds.reason);
+          if (blockOnUnresolved) {
+            block("UNRESOLVED_RESERVATION", id, grounds.reason);
+          }
         },
       };
       return { ok: true, reservation };

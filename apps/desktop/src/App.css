@@ -879,3 +879,15 @@ button.tiny {
   padding: 0.5rem;
   border-radius: 4px;
 }
+
+/* 예산 입력 — 숫자 칸을 좁게 둔다. 넓으면 자유 텍스트처럼 보인다. */
+.budget-input input {
+  width: 6rem;
+  margin-left: 0.25rem;
+}
+
+/* 쓴 금액은 이 패널에서 가장 먼저 읽혀야 하는 숫자다. */
+.budget-amount {
+  font-size: 1.4rem;
+  margin: 0.25rem 0 0.5rem;
+}

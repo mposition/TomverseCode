@@ -183,6 +183,10 @@ impl SessionState {
             // 분포도 함께 준다. 문턱만 주면 화면이 그 숫자의 출처를 설명할 수 없다.
             "latency": metrics.cancellation,
             "commitSizes": metrics.commit_sizes,
+            // 태스크당 예산 상한의 **제안값**이다. 화면이 입력란을 채우는 데 쓰고,
+            // 사용자가 바꾸면 그 값이 강제된다 — 제안은 승인이 아니다.
+            "taskBudget": metrics.task_budget_threshold,
+            "taskCosts": metrics.task_costs,
         }))
     }
 
@@ -350,11 +354,15 @@ impl SessionState {
     /// 켜져도 Policy Gate는 `git commit`을 계속 High 승인으로 다룬다 — **UI에서 켠 스위치가
     /// 신뢰 경계의 위험 등급을 낮출 수 있으면 그건 게이트가 아니다**(원칙 2·3).
     /// 토글이 하는 일은 "매 태스크마다 커밋 승인 모달을 띄울 것인가"뿐이다.
+    /// `budget_usd`가 `None`이면 **상한 없이** 실행한다 — 사용자가 명시적으로 고른 경우이거나
+    /// (가격을 모르는 모델) 화면이 그렇게 보낸 경우다. 값을 우리가 대신 채워 넣지 않는다:
+    /// 상한은 사용자의 승인이고, 코드가 만들어낸 승인은 승인이 아니다.
     pub fn start_task(
         &self,
         message: &str,
         mode: ExecutionMode,
         allow_git_commit: bool,
+        budget_usd: Option<f64>,
         timeout: Duration,
     ) -> Result<Value, String> {
         let (sidecar, host, workspace_id, session_id) = self.with_active(|active| {
@@ -389,6 +397,9 @@ impl SessionState {
             "policy": {
                 "executionMode": match mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
                 "allowGitCommit": allow_git_commit,
+                // null은 "기본값을 쓰라"가 아니라 **"상한 없음"**이다. sidecar의 mergePolicy가
+                // 키의 부재와 null을 구별하므로 여기서 항상 키를 넣는다.
+                "budgetUsd": budget_usd,
             },
             "workspaceName": self.info().and_then(|i| i.get("name").cloned()).unwrap_or(Value::Null),
             "availableProviders": available_providers(),
@@ -441,7 +452,7 @@ impl SessionState {
     ///
     /// 이전 명령을 자동 재개하지 않는 이유(state-machine-and-protocol.md 7절): 부분 실행된
     /// `ToolRequest`의 재개는 멱등성 보장이 없으면 위험하다. 같은 요청 문구로 처음부터 다시 돈다.
-    pub fn restart_task(&self, task_id: &str, timeout: Duration) -> Result<Value, String> {
+    pub fn restart_task(&self, task_id: &str, budget_usd: Option<f64>, timeout: Duration) -> Result<Value, String> {
         let task = self
             .get_task(task_id)?
             .ok_or_else(|| format!("작업을 찾을 수 없습니다: {task_id}"))?;
@@ -451,7 +462,9 @@ impl SessionState {
         };
         // 재실행은 커밋을 제안하지 않는다. 저장된 작업 행에는 그 토글이 남아 있지 않고,
         // **기억나지 않는 설정으로 저장소 이력을 바꾸는 것**보다 제안하지 않는 편이 안전하다.
-        self.start_task(&task.user_message, mode, false, timeout)
+        // **다시 실행은 새 승인이다.** 이전 태스크의 상한을 이어받지 않고 화면이 준 값을 쓴다 —
+        // 상한이 태스크당이라는 결정의 직접적 귀결이고, 그 사실은 화면이 말해야 한다.
+        self.start_task(&task.user_message, mode, false, budget_usd, timeout)
     }
 
     /// 취소 요청. **두 방향 모두 필요하다:**

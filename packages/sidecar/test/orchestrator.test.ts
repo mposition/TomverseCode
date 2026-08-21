@@ -407,6 +407,42 @@ test("공급자 타임아웃은 재시도 상한 후 provider_retry_exhausted가
   assert.ok(result.summary.includes("타임아웃"), result.summary);
 });
 
+/**
+ * **대조 하나를 잃은 것이 태스크 전체의 실패로 기록되면 안 된다.**
+ *
+ * 구현 중 드러난 결함: co-executor 호출이 실패하면 `finish("failed")`가 불렸고, 호출부는
+ * "이미 primary 초안이 있으므로 진행할 수 있다"며 계속 진행했다. 그 결과 태스크는 완료까지
+ * 가는데 **이벤트 로그에는 TASK_FAILED가 남았다.** 여기서 그 두 사실이 어긋나지 않는 것을
+ * 고정한다 — 로그가 결과와 다르면 감사 기록으로서 쓸모가 없다.
+ */
+test("co-executor 실패는 대조만 잃고 태스크를 죽이지 않는다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    {
+      defaultPatch: VALID_PATCH,
+      // 공급자가 셋이면 reviewer가 fake-third로 가므로, 이 스크립트는 **co-executor에만** 걸린다.
+      scriptByModel: {
+        "fake-reviewer": [{ kind: "draft", throws: { message: "invalid api key", status: 401 } }],
+      },
+    },
+    { providers: ["fake-a", "fake-b", "fake-c"] }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "completed", result.summary);
+  assert.ok(
+    !host.events.some((e) => e.type === "TASK_FAILED"),
+    "완료된 태스크에 TASK_FAILED가 남았습니다"
+  );
+  // 대조를 하지 못했다는 사실은 남아야 한다 — 대조 없이 나온 "불일치 0"은 착시다.
+  assert.ok(
+    host.events.some(
+      (e) => e.type === "ERROR" && String((e.payload as { message?: string }).message).includes("대조 없이")
+    ),
+    "대조를 잃은 사실이 로그에 없습니다"
+  );
+});
+
 test("인증 오류는 재시도 없이 provider_config_error가 된다", async () => {
   const { orchestrator, host } = build(
     { verifyResults: [{ overall: "pass" }] },

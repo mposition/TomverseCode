@@ -289,7 +289,11 @@ type FailureReason =
   | "tool_retry_exhausted"       // 도구 실행 재시도 상한 초과 (7절 toolRetries)
   | "provider_retry_exhausted"   // LLM 호출 인프라 재시도 상한 초과 (9절 providerRetries)
   | "provider_config_error"      // API 키/설정 오류 등 재시도 무의미한 오류
-  | "app_restart_interrupted";   // EXECUTING 도중 앱 재시작으로 중단 (10절)
+  | "app_restart_interrupted"    // EXECUTING 도중 앱 재시작으로 중단 (10절)
+  // 이 태스크의 예산 상한에 도달해 **호출하지 않고** 멈췄다
+  // (multi-engine-routing.md 10.6절). provider_config_error와 섞지 않는다 —
+  // 저쪽은 고칠 것이 설정에 있고, 이쪽은 사용자가 정한 값에 도달한 정상 동작이다.
+  | "budget_exceeded";
 
 interface FinalResult {
   taskId: string;
@@ -299,6 +303,10 @@ interface FinalResult {
   finalDiff?: string;
   verificationReport?: VerificationReport;
   auditTrailEventIds: string[];
+  // 이 태스크가 공급자 호출에 실제로 쓴 돈. **성공·실패를 가리지 않고 담는다** —
+  // 돈은 결과와 무관하게 나갔고, 실패한 태스크야말로 "얼마를 썼나"를 묻게 되는 자리다.
+  // state가 "not_enforced"이면 상한 없이 돌았다는 뜻이며 "ok"와 다른 사실이다.
+  budget?: TaskBudgetOutcome;
   completedAt: ISODateTime;
 }
 ```
@@ -650,6 +658,7 @@ interface FileMutationRecord {
 - **충돌 결말 실측** — 두 원인을 가를 계측이 17.10절 ⑧에서 붙었다(`interpretationTextChanged`, `metrics`의 `planUnchangedByInterpretation`). **비율 자체는 실사용 데이터가 있어야 나오므로 이 항목은 열려 있다.** 다만 이제 답이 나올 수 있는 형태다: `plan_unchanged`가 해석이 그대로인 쪽에 몰리면 고칠 곳은 프롬프트, 해석이 달라진 쪽에 몰리면 게이트가 잡은 것이 실제 문제였는지를 봐야 한다. 남은 계측 공백: 해석이 **의미상** 바뀌었는지는 재지 않는다 — 그건 모델 호출이라 하지 않는다(17.8절)
 - ~~**17.3절 세 구멍의 구현** — 사용자 답변 승격, `USER_DECISION_RECORDED` 원문 기록, `doneCriteria` 소비~~ → 구현 완료. 구현이 드러낸 문서의 틀린 부분과 새로 정한 규칙은 17.7절에 있다
 - ~~**자유 텍스트 비밀값 마스킹의 모양 목록**(17.7)~~ — 17.11절에서 입력 시점 경고를 붙였다. 구현하면서 **17.7①의 위험 평가가 틀렸다는 것이 드러났다**: 마스킹은 저장 직전에 돌아 감사 로그만 지키고, 답변은 프롬프트에 실려 **모델 공급자로 그대로 나간다.** 그 경로에서 입력 시점 경고는 보완이 아니라 유일한 통제다. 막지는 않는다 — 자격증명 모양이 진짜 요구일 수 있고 요구의 최종 권위는 사용자다(원칙 1). 남은 것: **목록 자체는 여전히 완결되지 않는다.** 달라진 것은 사용자가 그 사실을 보내기 전에 안다는 것뿐이고, 그래서 경고 문구가 "아는 모양만 찾습니다"를 함께 말한다
+- ~~**제품 유료 호출의 예산 상한**~~ — [multi-engine-routing.md 10.6절](./multi-engine-routing.md)에서 해결. `FailureReason`에 `budget_exceeded`가, `FinalResult`에 `budget`이 붙었고(3절), 원장 이벤트는 별도 테이블이 아니라 `task_events`에 남는다 — **원칙 7이 이미 정본을 정해두었고**, 별도 테이블이 필요했던 이유(재개 시 한도 복원)가 태스크당 상한에서는 발생하지 않는다. 구현이 드러낸 것 둘: (a) 타임아웃이 남긴 미해결 예약으로 원장을 차단하면 정상적인 재시도가 "예산 부족"이라는 **틀린 이유**로 실패한다(실측으로 기존 타임아웃 테스트가 깨졌다) — 제품은 차단하지 않고 금액만 빼둔다, (b) **co-executor 호출 실패가 태스크를 FAILED로 기록하고 있었다** — 호출부는 "진행할 수 있다"며 계속 갔으므로 완료된 태스크의 로그에 `TASK_FAILED`가 남는 상태였고, 예산 거부에 같은 경로를 붙이면서 드러나 함께 고쳤다
 - **재현 러너** — 감사 export가 재현의 **재료**를 담게 됐지만(product-strategy 6.3절), 그 재료를 실제로 다시 적용하는 실행기는 없다. 만들 때 먼저 정해야 하는 것은 기능이 아니라 **판정 규칙**이다: 재현은 워크스페이스가 `workspaceFingerprint`와 같은 상태일 때만 의미가 있는데, 다르면 (a) 거부할지 (b) 경고 후 진행할지가 갈린다. 지금 답하지 않는 이유는 근거가 없어서다 — 감사에서 재현을 돌리는 사람이 대개 **같은 상태를 만들 수 없는** 머신에 있는지, 아니면 원본 저장소를 그대로 들고 있는지에 따라 답이 반대가 된다. 그리고 재현 단계는 `run_command`를 포함하므로 **Policy Gate를 그대로 지나야 한다**: 기록에 있다는 것이 승인 근거가 되면 export 파일 하나로 임의 명령을 돌리는 경로가 생긴다
 
 ## 15. M0 구현에서 드러난 설계 보완

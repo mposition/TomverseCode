@@ -71,6 +71,10 @@ async fn start_task(
     mode: String,
     /// 검증 통과 후 커밋을 **제안할지**. 승인 등급은 낮추지 않는다(session.rs 주석 참조).
     allow_git_commit: Option<bool>,
+    /// 이 태스크의 예산 상한(USD). `budget_unlimited`와 함께 해석된다 —
+    /// **인자를 빠뜨린 화면이 상한을 조용히 끄지 못하게** 하는 것이 두 인자로 받는 이유다.
+    budget_usd: Option<f64>,
+    budget_unlimited: Option<bool>,
     timeout_secs: Option<u64>,
 ) -> Result<Value, String> {
     let execution_mode = match mode.as_str() {
@@ -78,13 +82,14 @@ async fn start_task(
         "verified" => ExecutionMode::Verified,
         other => return Err(format!("알 수 없는 실행 정책: {other}")),
     };
+    let budget = tomverse_core::budget::resolve_budget(budget_usd, budget_unlimited)?;
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(900));
 
     // 태스크 실행은 승인 대기 때문에 오래 블록된다. 별도 스레드로 보내야 그 사이에
     // `respond_approval` command가 처리될 수 있다 — 같은 스레드면 교착된다.
     tauri::async_runtime::spawn_blocking(move || {
         let session = app.state::<SessionState>();
-        session.start_task(&message, execution_mode, allow_git_commit.unwrap_or(false), timeout)
+        session.start_task(&message, execution_mode, allow_git_commit.unwrap_or(false), budget, timeout)
     })
     .await
     .map_err(|e| format!("태스크 실행 스레드 오류: {e}"))?
@@ -252,11 +257,20 @@ fn get_task(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Va
 
 /// 저장된 작업을 **새 task_id로** 처음부터 다시 실행한다 (부분 재개가 아니다).
 #[tauri::command]
-async fn restart_task(app: tauri::AppHandle, task_id: String, timeout_secs: Option<u64>) -> Result<Value, String> {
+async fn restart_task(
+    app: tauri::AppHandle,
+    task_id: String,
+    budget_usd: Option<f64>,
+    budget_unlimited: Option<bool>,
+    timeout_secs: Option<u64>,
+) -> Result<Value, String> {
+    // 재실행은 **새 승인**이다. 이전 태스크의 상한을 이어받지 않는다 — 상한이 태스크당이라는
+    // 결정의 직접적 귀결이고, 이어받으면 사용자가 승인한 적 없는 값이 강제된다.
+    let budget = tomverse_core::budget::resolve_budget(budget_usd, budget_unlimited)?;
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(900));
     tauri::async_runtime::spawn_blocking(move || {
         let session = app.state::<SessionState>();
-        session.restart_task(&task_id, timeout)
+        session.restart_task(&task_id, budget, timeout)
     })
     .await
     .map_err(|e| format!("재실행 스레드 오류: {e}"))?
