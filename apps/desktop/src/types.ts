@@ -157,6 +157,40 @@ export interface AcceptanceCriterion {
   decidedAt: string;
 }
 
+/** 대조 가능한 필드 — state-machine-and-protocol.md 17.2절. */
+export type DisagreementField =
+  | "doneCriteria"
+  | "requiredTests"
+  | "targetPaths"
+  | "interpretation"
+  | "risks";
+
+/**
+ * 두 초안이 갈린 지점 하나. 프로토콜 `Disagreement`의 부분 미러.
+ *
+ * **`positions[].proposalId`를 평소 화면에 그리지 않는다**(ui-wireframes 3.9절) — 출처가 보이면
+ * 사용자가 요구가 아니라 모델 선호로 판단한다. 개발자 모드 전용이다.
+ */
+export interface Disagreement {
+  disagreementId: string;
+  field: DisagreementField;
+  positions: { proposalId: string; value: string[] }[];
+  blocking: boolean;
+  blockingReason: string;
+  question: {
+    text: string;
+    options: { optionId: string; label: string; fromProposalId: string }[];
+    allowFreeform: true;
+  };
+}
+
+/** 3.9절 카드에서 사용자가 고른 답 하나. */
+export interface UserDecisionInput {
+  disagreementId: string;
+  optionId?: string;
+  text: string;
+}
+
 export interface FinalResult {
   taskId: string;
   status: "completed" | "failed" | "cancelled" | "rejected";

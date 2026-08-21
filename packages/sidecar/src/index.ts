@@ -108,12 +108,12 @@ export function createSidecar(
   });
 
   transport.onRequest("task.userInput", async (params) => {
-    const { taskId, message } = params as TaskUserInputParams;
+    const { taskId, message, decisions } = params as TaskUserInputParams;
     const orchestrator = running.get(taskId);
     if (!orchestrator) {
       return { taskId, accepted: false, reason: "진행 중인 태스크가 아닙니다" };
     }
-    const accepted = orchestrator.provideUserInput(message);
+    const accepted = orchestrator.provideUserInput(message, decisions);
     return { taskId, accepted, phase: orchestrator.phase };
   });
 

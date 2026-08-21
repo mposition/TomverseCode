@@ -20,7 +20,17 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
   SNAPSHOTTING: ["TRIAGE", "CANCELLING", "CANCELLED", "FAILED"],
   // TRIAGE는 complexityTier에 따라 갈린다.
   TRIAGE: ["DRAFTING", "SINGLE_MODEL_FIX", "CANCELLING", "CANCELLED", "FAILED"],
-  DRAFTING: ["REVIEWING", "CANCELLING", "CANCELLED", "FAILED"],
+  /**
+   * `AWAITING_USER_INPUT`이 추가된 이유 — state-machine-and-protocol.md 17.1절.
+   *
+   * 구조적 대조에서 blocking 불일치가 나오면 **검수 전에** 사용자에게 묻는다. 검수까지 간 뒤에
+   * 묻지 않는 이유: 검수자의 역할이 "사용자가 고정한 기준이 반영됐는지 확인"으로 바뀌었으므로,
+   * 기준이 아직 없는 상태에서 검수를 돌리면 확인할 대상이 없다.
+   *
+   * **새 상태를 만들지 않았다.** 대조는 LLM 호출이 아니라 필드 비교 연산이라 사용자에게 노출할
+   * 단계가 아니고, 상태를 늘리면 2절 다이어그램과 UI 매핑만 복잡해진다.
+   */
+  DRAFTING: ["REVIEWING", "AWAITING_USER_INPUT", "CANCELLING", "CANCELLED", "FAILED"],
   // SINGLE_MODEL_FIX의 verdict: ACCEPT → PLANNING, NEED_USER_INPUT → AWAITING_USER_INPUT,
   // REJECT → REJECTED (문서 14.1절)
   SINGLE_MODEL_FIX: ["PLANNING", "AWAITING_USER_INPUT", "REJECTED", "CANCELLING", "CANCELLED", "FAILED"],

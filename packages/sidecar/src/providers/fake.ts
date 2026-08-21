@@ -76,6 +76,16 @@ export interface FakeProviderOptions {
   /** 순서대로 소비되는 스크립트. 비면 기본 동작(아래 defaults)으로 응답한다. */
   script?: FakeScriptStep[];
   /**
+   * 모델별 스크립트. **대조(executor ×2)를 테스트하려면 이게 필요하다.**
+   *
+   * `script` 하나만 있으면 두 실행자가 같은 스크립트를 **각자 처음부터** 소비한다 —
+   * 어댑터 인스턴스가 다르니 커서도 따로이기 때문이다. 그러면 두 초안이 언제나 같아져
+   * 불일치를 만들 수 없다. 실측으로 그렇게 대조 테스트가 조용히 통과했다.
+   *
+   * 여기 키가 있으면 그 모델은 이 스크립트를 쓰고, 없으면 `script`로 떨어진다.
+   */
+  scriptByModel?: Record<string, FakeScriptStep[]>;
+  /**
    * 기본 응답에서 쓸 patch. 지정하지 않으면 "변경 없음"을 뜻하는 빈 patch를 낸다 —
    * 조용히 그럴듯한 patch를 지어내면 테스트가 무엇을 검증하는지 불분명해진다.
    */
@@ -160,7 +170,10 @@ export class FakeProviderAdapter implements ProviderAdapter {
     return {
       value: validateDraftProposal(payload, {
         taskId: ctx.taskId,
-        proposalId: `${ctx.taskId}-proposal-${this.cursor}`,
+        // **모델 ID를 넣는다.** 대조에서는 초안이 둘이고 둘 다 cursor가 1이라, 모델을 빼면
+        // 두 초안의 proposalId가 같아진다 — 그러면 `Disagreement.positions`가 어느 초안의
+        // 값인지 추적하지 못한다(3.9절 선택지 출처).
+        proposalId: `${ctx.taskId}-${this.modelId}-proposal-${this.cursor}`,
         model: this.modelId,
         createdAt: new Date().toISOString(),
       }),
@@ -237,7 +250,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
     this.calls.push({ kind, callId: ctx.callId });
     this.throwIfAborted(ctx);
 
-    const script = this.options.script;
+    const script = this.options.scriptByModel?.[this.modelId] ?? this.options.script;
     let step: FakeScriptStep | undefined;
     if (script) {
       // 이 kind에 해당하는 다음 스텝을 찾는다 — 스크립트를 호출 순서에 정확히 맞추지 않아도

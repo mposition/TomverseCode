@@ -2,6 +2,7 @@
 // 요청/응답은 id로 매칭되는 JSON-RPC 스타일, 진행상황은 응답을 기다리지 않는 별도 이벤트로 흐른다.
 
 import type { ISODateTime } from "./common.js";
+import type { UserDecisionInput } from "./decision.js";
 import type { TaskEventType } from "./events.js";
 import type { DraftProposal } from "./proposal.js";
 import type { TaskPolicy, TaskRequest } from "./task.js";
@@ -90,11 +91,29 @@ export interface ExperimentControls {
    * 판단·도구 실행·검증은 전부 실제 경로를 탄다. 기록에 `draftSource: "replayed"`로 남는다.
    */
   replayDraft?: DraftProposal;
+  /**
+   * 대조(executor ×2)를 켤지 — multi-engine-routing.md 13절.
+   *
+   * production은 tier가 `standard`면 항상 켜지만(17.5절), **하네스에서는 기본이 꺼짐**이다.
+   * arm을 고정해 비교하는 실험에서 호출이 하나 더 생기면 그 차이가 arm 때문인지 대조 때문인지
+   * 구별되지 않는다. 켤 때는 하네스가 명시적으로 켠다.
+   */
+  contrast?: boolean;
 }
 
 export interface TaskUserInputParams {
   taskId: string;
   message: string;
+  /**
+   * 3.9절 불일치 카드의 구조적 답변 (17.2절 `UserDecisionInput`).
+   *
+   * `message` 하나로 합치지 않는 이유: 감사 로그가 **어떤 쟁점에 대한 답인지**를 남겨야 하는데,
+   * 사람이 읽을 문장으로 뭉쳐놓으면 그 대응 관계를 다시 파싱해야 하고 파싱은 틀린다.
+   * `message`는 계속 사람이 읽는 요약이고, 이 배열이 기계가 읽는 대응이다.
+   *
+   * 3.4절 확인 필요 카드(모델이 "모르겠다"고 한 경우)에는 쟁점 id가 없으므로 이 필드가 없다.
+   */
+  decisions?: UserDecisionInput[];
 }
 
 export interface ToolExecuteParams {

@@ -1,6 +1,7 @@
 import type {
   AcceptanceCriterion,
   ComplexityTier,
+  Disagreement,
   DraftProposal,
   ExperimentControls,
   ExecutionPlan,
@@ -9,6 +10,7 @@ import type {
   RoutingDecision,
   SingleModelFixResult,
   TaskCounters,
+  UserDecisionInput,
   TaskPhase,
   TaskPolicy,
   TaskRequest,
@@ -34,6 +36,7 @@ import { ModelRegistry } from "../routing/registry.js";
 import { Router, RoutingError, type RouterOptions } from "../routing/router.js";
 import { ToolBridge } from "../tools/bridge.js";
 import { buildDigest } from "../verify/digest.js";
+import { contrastDrafts, fieldLabel, planQuestionRound } from "./contrast.js";
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
 import { buildExecutionPlan, PlanningError } from "./planner.js";
 import { triageTask, type TriagePolicy } from "../triage.js";
@@ -76,8 +79,22 @@ export interface RunInput {
 
 interface PendingQuestion {
   questions: string[];
-  resolve: (answer: string) => void;
+  /** 3.9절 카드로 물은 경우의 쟁점들. 3.4절 확인 필요 카드에서는 빈 배열이다. */
+  disagreements: Disagreement[];
+  resolve: (answer: UserAnswer) => void;
 }
+
+/** 사용자 답변. `decisions`는 3.9절 카드에서만 온다. */
+interface UserAnswer {
+  message: string;
+  decisions?: UserDecisionInput[];
+}
+
+/** 초안 1개 생성 결과. `absent`는 "이 자리에 실행자가 배정되지 않았다"이다. */
+type DraftOutcome =
+  | { kind: "draft"; value: DraftProposal }
+  | { kind: "absent" }
+  | { kind: "final"; result: FinalResult };
 
 export class Orchestrator {
   private readonly deps: OrchestratorDeps;
@@ -103,6 +120,12 @@ export class Orchestrator {
    * 감사 기록의 모양이 따라 바뀐다.
    */
   private acceptanceCriteria: AcceptanceCriterion[] = [];
+  /**
+   * 사용자에게 묻지 못한 채 남은 blocking 쟁점 (17.4절).
+   *
+   * 조용히 버리면 "물어볼 수 없었다"와 "쟁점이 없었다"가 최종 보고에서 구별되지 않는다.
+   */
+  private unresolvedDisagreements: string[] = [];
   private pendingQuestion: PendingQuestion | null = null;
   private eventIds: string[] = [];
   /**
@@ -162,8 +185,9 @@ export class Orchestrator {
 
     this.abort.abort(new Error("사용자가 태스크를 취소했습니다"));
     this.adapters?.executor.cancel();
+    this.adapters?.coExecutor?.cancel();
     this.adapters?.reviewer?.cancel();
-    this.pendingQuestion?.resolve("");
+    this.pendingQuestion?.resolve({ message: "" });
     return true;
   }
 
@@ -176,12 +200,17 @@ export class Orchestrator {
     return this.abort.signal;
   }
 
-  /** AWAITING_USER_INPUT에 대한 사용자 답변 전달. */
-  provideUserInput(message: string): boolean {
+  /**
+   * AWAITING_USER_INPUT에 대한 사용자 답변 전달.
+   *
+   * `decisions`는 3.9절 불일치 카드에서만 온다 — 어떤 쟁점에 대한 답인지를 문장 파싱이 아니라
+   * id로 남기기 위한 것이다(17.2절 `UserDecisionInput`).
+   */
+  provideUserInput(message: string, decisions?: UserDecisionInput[]): boolean {
     if (!this.pendingQuestion) return false;
     const pending = this.pendingQuestion;
     this.pendingQuestion = null;
-    pending.resolve(message);
+    pending.resolve({ message, decisions });
     return true;
   }
 
@@ -257,6 +286,7 @@ export class Orchestrator {
         complexityTier: tier.tier,
         availableProviders: this.input.availableProviders,
         appliedPolicies: tier.appliedPolicies,
+        contrast: this.contrastRequested(tier.tier),
       });
     } catch (error) {
       if (error instanceof RoutingError) {
@@ -308,8 +338,7 @@ export class Orchestrator {
   /** DRAFTING → REVIEWING (교차검증 경로) */
   private async runCrossVerifiedPath(): Promise<PathOutcome> {
     const adapters = this.requireAdapters();
-    const reviewer = adapters.reviewer;
-    if (!reviewer) {
+    if (!adapters.reviewer) {
       // 여기 도달하면 라우터의 불변식과 실제 어댑터가 어긋난 것이다 — 조용히 단일 모델로
       // 넘어가지 않고 실패로 드러낸다. "검증한 척"보다 나쁜 것은 "검증했다고 착각하는 코드"다.
       return {
@@ -328,44 +357,88 @@ export class Orchestrator {
     // 재질문 왕복이 있었다면 주입된 초안은 그 답변을 반영하지 못하므로 쓰지 않는다.
     const replayed = this.answers.length === 0 ? this.input.experiment?.replayDraft : undefined;
     let proposal: DraftProposal;
+    /** 대조 대상 — primary가 첫 번째다. 대조가 드롭됐으면 길이가 1이다. */
+    let proposals: DraftProposal[];
+
     if (replayed) {
       proposal = replayed;
+      proposals = [replayed];
     } else {
-      const draftCall = `draft:${this.state.counters.clarificationRounds + 1}`;
-      const draft = await this.callProvider(adapters.executor, "executor", draftCall, (ctx) =>
-        adapters.executor.generateDraft(
-          {
-            snapshot: this.requireSnapshot(),
-            userMessage: this.input.taskRequest.userMessage,
-            userAnswers: this.answers.length > 0 ? this.answers : undefined,
-          },
-          ctx
-        )
-      );
-      if (draft.kind === "final") return draft;
-      proposal = draft.value;
+      const round = this.state.counters.clarificationRounds + 1;
+      // **두 실행자는 서로의 산출물을 보지 않는다**(17.1절). 같은 스냅샷·같은 프롬프트로
+      // 동시에 부르는 것이 그 독립성의 구현이다 — 순차로 부르면서 앞의 결과를 넘기고 싶은
+      // 유혹이 생기지 않도록 구조 자체를 병렬로 둔다. 왕복 합의를 만들면 2라운드째부터
+      // 두 산출물이 독립 표본이 아니게 되고, 합의는 사용자에게 올릴 질문을 지운다(16.3절).
+      const drafted = await Promise.all([
+        this.generateDraft(adapters.executor, `draft:${round}`),
+        adapters.coExecutor
+          ? this.generateDraft(adapters.coExecutor, `draft-co:${round}`)
+          : Promise.resolve<DraftOutcome>({ kind: "absent" }),
+      ]);
+
+      // **primary 실패는 실패다.** co-executor 실패는 대조를 잃을 뿐 태스크를 죽이지 않는다 —
+      // 대조는 질문을 만드는 장치이지 진행 조건이 아니다.
+      const primary = drafted[0];
+      if (primary.kind === "final") return primary;
+      if (primary.kind === "absent") {
+        return {
+          kind: "final",
+          result: await this.finish(
+            "failed",
+            "primary executor가 초안을 내지 않았습니다 (내부 불변식 위반)",
+            "internal_invariant_violated"
+          ),
+        };
+      }
+      proposal = primary.value;
+      proposals = [primary.value];
+
+      const co = drafted[1];
+      if (co.kind === "draft") {
+        proposals.push(co.value);
+      } else if (co.kind === "final") {
+        // 여기서 finish하지 않는다 — 이미 primary 초안이 있으므로 진행할 수 있다.
+        // 다만 조용히 넘기지 않는다: 대조를 하지 못했다는 사실이 로그에 남아야
+        // "쟁점이 없었다"와 구별된다.
+        await this.emit("ERROR", {
+          stage: "DRAFTING",
+          message: "co-executor 초안 생성에 실패해 이번 라운드는 대조 없이 진행합니다",
+        });
+      }
     }
+
+    // **기준은 primary 초안에서만 흡수한다.** 두 초안의 doneCriteria를 합치면 사용자가 갈랐다고
+    // 알려준 그 두 해석이 나란히 기준 목록에 들어가 서로 모순된다. 대조의 산출물은 기준이
+    // 아니라 질문이고, 기준이 되는 것은 사용자의 답이다.
     const draftCriteria = this.absorbDraftCriteria(proposal);
-    await this.emit("DRAFT_RECEIVED", {
-      proposalId: proposal.proposalId,
-      model: proposal.model,
-      interpretation: proposal.interpretation,
-      risks: proposal.risks,
-      uncertainties: proposal.uncertainties,
-      hasPatch: Boolean(proposal.patch && proposal.patch.trim().length > 0),
-      // **초안 본문을 이벤트에 남긴다.** 이전에는 `hasPatch`만 남겨서, 검수자가 REJECT하면
-      // "무엇을 제안했는지"가 어디에도 기록되지 않았다 — Agent Trace 투명성의 실제 구멍이었다.
-      // 8KB를 넘으면 Rust가 artifact로 밀어내고 참조만 남긴다(store.rs INLINE_PAYLOAD_LIMIT_BYTES).
-      patch: proposal.patch ?? null,
-      plan: proposal.plan,
-      // 주입된 초안인지 — 이 값이 "replayed"인 실행은 실험 하네스가 만든 것이다.
-      draftSource: replayed ? "replayed" : "generated",
-      // 요구 분석의 결론을 수집만 하고 버리지 않는다(17.3절 구멍 3). Rust가 이 이벤트를
-      // 기록하는 **같은 트랜잭션 안에서** acceptance_criteria 캐시를 갱신한다.
-      acceptanceCriteria: draftCriteria,
-      // 재질문 뒤 새 초안이 오면 이전 초안의 doneCriteria는 철회된 해석이다 — 쌓지 않고 대체한다.
-      acceptanceCriteriaReplaces: "draft_proposal",
-    });
+    for (const [index, p] of proposals.entries()) {
+      await this.emitDraftReceived(p, {
+        replayed: Boolean(replayed),
+        primary: index === 0,
+        criteria: index === 0 ? draftCriteria : undefined,
+      });
+    }
+
+    // ---- 구조적 대조 ----
+    //
+    // 별도 phase를 만들지 않는다(17.1절). 대조는 LLM 호출이 아니라 필드 비교 연산이라
+    // 사용자에게 노출할 단계가 아니고, 실패할 수 있는 외부 경계도 없다.
+    const contrastOutcome = await this.contrastAndMaybeAsk(proposals);
+    if (contrastOutcome.kind !== "proceed") return contrastOutcome;
+
+    // 13.3절 절충: 검수자가 살아남은 초안의 저자와 같은 모델이면 대조 참가자 중 다른 쪽으로
+    // 바꿔 낀다. 자기가 쓴 안을 자기가 검수하지 않는다.
+    const reviewer = this.selectReviewer(proposal, adapters);
+    if (!reviewer) {
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          "살아남은 초안의 저자가 아닌 검수자를 찾지 못했습니다 — 자기 산출물을 자기가 검수하지 않습니다.",
+          "provider_config_error"
+        ),
+      };
+    }
 
     // ---- REVIEWING ----
     for (;;) {
@@ -395,6 +468,10 @@ export class Orchestrator {
         // 어떤 정보를 보고 판정했는지. blind/informed 불일치율 지표의 근거다
         // (product-strategy.md 14절) — 모델이 주장하는 값이 아니라 우리가 구성한 사실이다.
         reviewMode: decision.reviewMode,
+        // 라우터가 배정한 검수자와 **실제로 부른 검수자**가 다를 수 있다(13.3절 절충).
+        // 배정만 남기면 로그가 실제로 누가 검수했는지에 답하지 못한다.
+        assignedReviewerModel: adapters.reviewerModelId ?? null,
+        actualReviewerModel: reviewer.modelId,
       });
 
       switch (decision.verdict) {
@@ -457,6 +534,138 @@ export class Orchestrator {
         }
       }
     }
+  }
+
+  /** 초안 1개 생성. primary/co-executor가 **같은 입력**으로 이 함수를 지난다 — 13.1절. */
+  private async generateDraft(adapter: ProviderAdapter, callId: string): Promise<DraftOutcome> {
+    const draft = await this.callProvider(adapter, "executor", callId, (ctx) =>
+      adapter.generateDraft(
+        {
+          snapshot: this.requireSnapshot(),
+          userMessage: this.input.taskRequest.userMessage,
+          userAnswers: this.answers.length > 0 ? this.answers : undefined,
+        },
+        ctx
+      )
+    );
+    if (draft.kind === "final") return draft;
+    return { kind: "draft", value: draft.value };
+  }
+
+  private async emitDraftReceived(
+    proposal: DraftProposal,
+    meta: { replayed: boolean; primary: boolean; criteria?: AcceptanceCriterion[] }
+  ): Promise<void> {
+    await this.emit("DRAFT_RECEIVED", {
+      proposalId: proposal.proposalId,
+      model: proposal.model,
+      interpretation: proposal.interpretation,
+      risks: proposal.risks,
+      uncertainties: proposal.uncertainties,
+      hasPatch: Boolean(proposal.patch && proposal.patch.trim().length > 0),
+      // **초안 본문을 이벤트에 남긴다.** 이전에는 `hasPatch`만 남겨서, 검수자가 REJECT하면
+      // "무엇을 제안했는지"가 어디에도 기록되지 않았다 — Agent Trace 투명성의 실제 구멍이었다.
+      // 8KB를 넘으면 Rust가 artifact로 밀어내고 참조만 남긴다(store.rs INLINE_PAYLOAD_LIMIT_BYTES).
+      patch: proposal.patch ?? null,
+      plan: proposal.plan,
+      // 주입된 초안인지 — 이 값이 "replayed"인 실행은 실험 하네스가 만든 것이다.
+      draftSource: meta.replayed ? "replayed" : "generated",
+      // 대조가 켜지면 DRAFT_RECEIVED가 라운드당 둘 나온다. 어느 쪽이 이후 단계로 가는지가
+      // 로그만으로 구별되어야 한다 — 아니면 "왜 이 patch가 적용됐나"에 답할 수 없다.
+      primaryExecutor: meta.primary,
+      // 요구 분석의 결론을 수집만 하고 버리지 않는다(17.3절 구멍 3). Rust가 이 이벤트를
+      // 기록하는 **같은 트랜잭션 안에서** acceptance_criteria 캐시를 갱신한다.
+      ...(meta.criteria
+        ? {
+            acceptanceCriteria: meta.criteria,
+            // 재질문 뒤 새 초안이 오면 이전 초안의 doneCriteria는 철회된 해석이다 — 쌓지 않고 대체한다.
+            acceptanceCriteriaReplaces: "draft_proposal",
+          }
+        : {}),
+    });
+  }
+
+  /**
+   * 대조 → (필요하면) 사용자 판정 → 진행 여부 결정. 17.3~17.4절.
+   *
+   * `DISAGREEMENT_DETECTED`는 **불일치 0건이어도 발행한다.** 대조를 돌렸다는 사실 자체가
+   * 감사 대상이고, "쟁점이 없었다"와 "대조하지 않았다"는 다른 사실이기 때문이다.
+   */
+  private async contrastAndMaybeAsk(
+    proposals: DraftProposal[]
+  ): Promise<{ kind: "proceed" } | PathOutcome> {
+    const round = this.state.counters.clarificationRounds + 1;
+    const report = contrastDrafts({
+      taskId: this.taskId,
+      proposals,
+      complexityTier: this.state.complexityTier ?? "standard",
+      round,
+    });
+    const { asked, deferred } = planQuestionRound(report);
+    await this.emit("DISAGREEMENT_DETECTED", {
+      ...report,
+      // 대조를 돌렸는지 자체를 payload가 말해야 한다. proposalIds 길이로도 알 수 있지만,
+      // 로그를 읽는 사람이 그 추론을 하도록 두지 않는다.
+      contrasted: proposals.length >= 2,
+      blockingCount: report.disagreements.filter((d) => d.blocking).length,
+      askedCount: asked.length,
+      deferredCount: deferred.length,
+    });
+
+    // **예산을 넘긴 blocking 쟁점을 조용히 삼키지 않는다**(17.4절).
+    for (const d of deferred) this.recordUnresolved(d, "질문 예산(한 화면 상한)을 넘겨 묻지 못함");
+
+    if (asked.length === 0) return { kind: "proceed" };
+
+    // 예산을 소진했으면 **실패시키지 않고** 진행한다(17.4절 마지막 항목). 기존 상한 규칙은
+    // "모델이 계속 모호하다고 말하는 경우"를 위한 것이고, 이쪽은 이미 사용자가 답을 준 뒤
+    // 남은 쟁점이므로 성질이 다르다.
+    if (this.state.counters.clarificationRounds + 1 > this.policy.limits.clarificationRounds) {
+      for (const d of asked) this.recordUnresolved(d, "재질문 상한에 걸려 묻지 못함");
+      await this.emit("PHASE_CHANGED_NOTE", {
+        note: "재질문 상한을 소진해 남은 불일치를 묻지 못한 채 진행합니다",
+        unresolved: this.unresolvedDisagreements.length,
+      });
+      return { kind: "proceed" };
+    }
+
+    const clarified = await this.askUser(
+      asked.map((d) => d.question.text),
+      asked
+    );
+    if (clarified.kind === "final") return clarified;
+    // 14.1절: 사용자 답변 후에는 항상 DRAFTING으로 재진입한다. 답변이 반영된 초안을 다시
+    // 받아야 하고, 그래야 "판정이 반영됐는가"를 검수자가 확인할 대상이 생긴다.
+    return { kind: "retry" };
+  }
+
+  /**
+   * 실제 검수자 어댑터 선택 — multi-engine-routing.md 13.3절.
+   *
+   * 공급자가 둘뿐이면 라우터가 검수자를 대조 참가자 중 하나로 **잠정** 배정한다. 여기서
+   * "살아남은 초안의 저자가 아닌 쪽"으로 확정한다. 완전한 공급자 독립은 아니지만
+   * **자기 산출물 자기 승인**이라는 최악은 피한다.
+   */
+  private selectReviewer(surviving: DraftProposal, adapters: RoleAdapters): ProviderAdapter | undefined {
+    const reviewer = adapters.reviewer;
+    if (!reviewer) return undefined;
+    if (reviewer.modelId !== surviving.model) return reviewer;
+    // 검수자가 살아남은 초안의 저자와 같은 모델이다. 대조 참가자 중 다른 쪽으로 바꿔 끼운다.
+    const alternative =
+      adapters.coExecutor && adapters.coExecutor.modelId !== surviving.model
+        ? adapters.coExecutor
+        : adapters.executor.modelId !== surviving.model
+          ? adapters.executor
+          : undefined;
+    // 바꿔 낄 대상이 없으면 **자기 검수를 하지 않는다** — 검수 없이 진행하는 편이
+    // "검증한 척"보다 안전하다(CLAUDE.md 원칙 4).
+    return alternative;
+  }
+
+  /** 못 물어본 blocking 쟁점을 기록한다. "물어볼 수 없었다"와 "쟁점이 없었다"는 다른 사실이다. */
+  private recordUnresolved(disagreement: Disagreement, reason: string): void {
+    const label = `${fieldLabel(disagreement.field)}: ${disagreement.question.text} (${reason})`;
+    if (!this.unresolvedDisagreements.includes(label)) this.unresolvedDisagreements.push(label);
   }
 
   /** SINGLE_MODEL_FIX (단일 모델 경로) */
@@ -774,6 +983,23 @@ export class Orchestrator {
 
   // ---- 보조 ----
 
+  /**
+   * 대조(executor ×2)를 요청할 것인가 — 17.5절 tier 게이팅.
+   *
+   * `verified` 이상에서만 켠다는 것이 규칙이고, tier가 2단계인 현재는 `standard`가 그 자리다.
+   * `simple`에서 켜면 13.1절 스파이크가 측정한 비용 절감이 통째로 사라진다.
+   *
+   * **실험 하네스에서는 명시적으로 켜지 않는 한 끈다.** 하네스는 arm을 고정해 비교하는데,
+   * 호출이 하나 더 생기면 그게 arm 차이인지 대조 때문인지 구별되지 않는다 — 측정 도구가
+   * production 경로를 그대로 타되 축은 하네스가 정한다는 원칙(README)의 연장이다.
+   */
+  private contrastRequested(tier: ComplexityTier): boolean {
+    if (tier !== "standard") return false;
+    const experiment = this.input.experiment;
+    if (!experiment) return true;
+    return experiment.contrast === true;
+  }
+
   private decideTier(): { tier: ComplexityTier; appliedPolicies: string[] } {
     const appliedPolicies: string[] = [];
 
@@ -904,7 +1130,10 @@ export class Orchestrator {
     return response.report;
   }
 
-  private async askUser(questions: string[]): Promise<{ kind: "answered" } | { kind: "final"; result: FinalResult }> {
+  private async askUser(
+    questions: string[],
+    disagreements: Disagreement[] = []
+  ): Promise<{ kind: "answered" } | { kind: "final"; result: FinalResult }> {
     this.state.counters.clarificationRounds += 1;
     if (this.state.counters.clarificationRounds > this.policy.limits.clarificationRounds) {
       return {
@@ -918,21 +1147,37 @@ export class Orchestrator {
     }
 
     await this.transition("AWAITING_USER_INPUT");
-    await this.emit("APPROVAL_REQUESTED_NOTE", { questionsForUser: questions });
-
-    const answer = await new Promise<string>((resolve) => {
-      this.pendingQuestion = { questions, resolve };
+    // **3.4절 확인 필요 카드와 3.9절 불일치 카드를 같은 이벤트로 보낸다.** 다른 이벤트를 만들면
+    // UI가 둘 중 하나를 놓쳤을 때 화면이 멈춘 것처럼 보인다. 카드 종류는 `disagreements`의
+    // 유무로 구별한다 — 모델이 "모르겠다"고 한 경우에는 쟁점 id가 없다.
+    await this.emit("APPROVAL_REQUESTED_NOTE", {
+      questionsForUser: questions,
+      disagreements,
+      // 카드 제목을 UI가 추측하지 않도록 종류를 명시한다.
+      cardKind: disagreements.length > 0 ? "disagreement" : "clarification",
     });
 
-    if (this.abort.signal.aborted || answer.trim().length === 0) {
+    const answer = await new Promise<UserAnswer>((resolve) => {
+      this.pendingQuestion = { questions, disagreements, resolve };
+    });
+
+    const decisions = answer.decisions ?? [];
+    // 자유 입력만 온 경우(3.4절 카드)에는 message가 곧 답이다. 3.9절 카드에서는 강제 선택이
+    // 답이므로 message가 비어 있어도 취소가 아니다 — 그걸 구별하지 않으면 선택만 하고
+    // 보낸 사용자의 판정이 "취소"로 처리된다.
+    if (this.abort.signal.aborted || (answer.message.trim().length === 0 && decisions.length === 0)) {
       return { kind: "final", result: await this.finish("cancelled", "사용자 확인 대기 중 취소됨") };
     }
 
-    this.answers.push({ question: questions.join("\n"), answer });
+    const answerText =
+      decisions.length > 0
+        ? decisions.map((d) => d.text.trim()).filter((t) => t.length > 0).join("\n")
+        : answer.message;
+    this.answers.push({ question: questions.join("\n"), answer: answerText });
     // 프롬프트 주입(answers)과 **별개로** 기준 목록에 고정한다 — 프롬프트는 요청이고
     // 기준은 기록이다. 모델이 프롬프트를 무시해도 기록은 남고 최종 보고가 참조한다.
-    await this.recordUserDecision(questions, answer);
-    await this.emit("USER_MESSAGE_RECEIVED", { answerLength: answer.length });
+    await this.recordUserDecision(questions, answerText, decisions, disagreements);
+    await this.emit("USER_MESSAGE_RECEIVED", { answerLength: answerText.length });
     return { kind: "answered" };
   }
 
@@ -943,14 +1188,47 @@ export class Orchestrator {
    * 사용자의 판정이 다시 모델의 해석을 거치게 되고, 권위를 사용자에게 두기로 한 결정이
    * 그 자리에서 무효가 된다.
    */
-  private async recordUserDecision(questions: string[], answer: string): Promise<void> {
-    const criterion: AcceptanceCriterion = {
-      criterionId: `${this.taskId}-user-${this.state.counters.clarificationRounds}`,
-      text: answer.trim(),
-      source: "user_decision",
-      decidedAt: new Date().toISOString(),
-    };
-    this.acceptanceCriteria.push(criterion);
+  private async recordUserDecision(
+    questions: string[],
+    answer: string,
+    decisions: UserDecisionInput[] = [],
+    disagreements: Disagreement[] = []
+  ): Promise<void> {
+    const decidedAt = new Date().toISOString();
+    const round = this.state.counters.clarificationRounds;
+
+    // 3.9절 카드에서 왔으면 **쟁점 하나당 기준 하나**를 만든다. 세 개를 한 문장으로 합치면
+    // 최종 보고의 체크리스트가 "사용자가 답한 것 전부"라는 한 줄이 되어 항목별 확인이 불가능해진다.
+    const criteria: AcceptanceCriterion[] =
+      decisions.length > 0
+        ? decisions
+            .filter((d) => d.text.trim().length > 0)
+            .map((d, index) => ({
+              criterionId: `${this.taskId}-user-${round}-${index}`,
+              text: d.text.trim(),
+              source: "user_decision" as const,
+              disagreementId: d.disagreementId,
+              decidedAt,
+            }))
+        : [
+            {
+              criterionId: `${this.taskId}-user-${round}`,
+              text: answer.trim(),
+              source: "user_decision" as const,
+              decidedAt,
+            },
+          ];
+
+    this.acceptanceCriteria.push(...criteria);
+    // 답을 받은 쟁점은 더 이상 미해결이 아니다.
+    const answered = new Set(decisions.map((d) => d.disagreementId));
+    for (const d of disagreements) {
+      if (!answered.has(d.disagreementId) && decisions.length > 0) {
+        // 카드에 띄웠는데 답이 오지 않은 항목 — 조용히 넘기지 않는다.
+        this.recordUnresolved(d, "카드에 표시했으나 답변이 오지 않음");
+      }
+    }
+
     await this.emit("USER_DECISION_RECORDED", {
       questions,
       /**
@@ -960,11 +1238,16 @@ export class Orchestrator {
        * Node가 스스로 지키는 규칙은 Node가 장악당하면 사라진다(CLAUDE.md 원칙 2).
        */
       answer,
-      // 대조 로직이 생기면 채워진다(다음 작업). 지금 null인 것은 "불일치에 대한 답이 아니라
-      // 모델이 스스로 모호하다고 말해서 나온 질문에 대한 답"이라는 사실이다.
-      disagreementId: null,
-      optionId: null,
-      acceptanceCriteria: [criterion],
+      // 어떤 쟁점에 대한 답이었는지. 3.4절 확인 필요 카드(모델이 스스로 모호하다고 말한 경우)
+      // 에서는 쟁점 id가 없으므로 빈 배열이다 — 그 자체가 "대조에서 나온 질문이 아니었다"는 사실이다.
+      decisions: decisions.map((d) => ({
+        disagreementId: d.disagreementId,
+        optionId: d.optionId ?? null,
+        // 자유 입력이었는가. 선택지를 고르지 않았다는 것은 **두 초안 모두 틀렸다**는 뜻이라
+        // 나중에 가장 값진 신호가 된다(14절 "불일치 1건당 사용자가 뒤집은 비율").
+        freeform: d.optionId === undefined,
+      })),
+      acceptanceCriteria: criteria,
     });
   }
 
@@ -1065,13 +1348,17 @@ export class Orchestrator {
       };
     }
 
+    // **플래그를 await보다 먼저 세운다.** 대조가 켜지면 executor 호출이 동시에 둘 진행되고,
+    // 취소되면 둘 다 여기 도달한다. 검사와 표시 사이에 await가 있으면 두 호출이 모두 검사를
+    // 통과해 terminal 이벤트가 두 번 남는다 — 실측으로 `TASK_CANCELLED`가 둘 기록됐다.
+    // JS는 단일 스레드지만 await가 곧 양보 지점이므로, 이 구간은 동기여야 한다.
+    this.terminalReached = true;
+
     // 취소로 끝나는 경우 CANCELLING을 거친다 — UI가 "취소 중"을 보여줄 수 있어야 하고,
     // 이벤트 로그에도 요청 시점과 완료 시점이 남아야 한다.
     if (status === "cancelled" && this.state.phase !== "CANCELLING" && isValidTransition(this.state.phase, "CANCELLING")) {
       await this.transition("CANCELLING");
     }
-
-    this.terminalReached = true;
 
     const targetPhase: TaskPhase =
       status === "completed" ? "COMPLETED" : status === "failed" ? "FAILED" : status === "cancelled" ? "CANCELLED" : "REJECTED";
@@ -1109,6 +1396,8 @@ export class Orchestrator {
       // 성공/실패/취소를 가리지 않고 담는다 — 사용자가 무엇을 결정했는지는 결과와 무관한 사실이고,
       // 실패한 태스크야말로 "무엇을 요구했는지"를 다시 보게 되는 자리다.
       acceptanceCriteria: this.acceptanceCriteria.length > 0 ? [...this.acceptanceCriteria] : undefined,
+      unresolvedDisagreements:
+        this.unresolvedDisagreements.length > 0 ? [...this.unresolvedDisagreements] : undefined,
       completedAt: new Date().toISOString(),
     };
     await this.emit(eventType, {
@@ -1123,6 +1412,7 @@ export class Orchestrator {
       // 확인된 기준 수를 이벤트에도 남긴다. 0인 것이 정상 상태라는 사실을 로그가 말해야
       // 나중에 "왜 전부 미확인이었나"를 되짚을 수 있다.
       acceptanceCriteriaVerifiedCount: 0,
+      unresolvedDisagreementCount: this.unresolvedDisagreements.length,
     });
     return result;
   }
@@ -1152,6 +1442,10 @@ export class Orchestrator {
     // 17.3절 구멍 3: build/test/lint만 요약하면 사용자가 무엇을 결정했는지가 최종 보고에서 사라진다.
     const criteria = this.describeCriteria();
     if (criteria) parts.push(criteria);
+    // 17.4절: 질문 예산이 모자랐다는 사실을 성공 요약에서 숨기지 않는다.
+    if (this.unresolvedDisagreements.length > 0) {
+      parts.push(`묻지 못한 쟁점 ${this.unresolvedDisagreements.length}건`);
+    }
     return parts.join(" · ");
   }
 

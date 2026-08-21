@@ -66,7 +66,17 @@ export function createAdapter(
 /** 역할별 어댑터 묶음. */
 export interface RoleAdapters {
   executor: ProviderAdapter;
+  /**
+   * 대조용 두 번째 실행자 (multi-engine-routing.md 13.1절).
+   *
+   * **역할 이름이 아니라 두 번째 `executor` 배정이다.** 하는 일이 primary와 완전히 같으므로
+   * (같은 스냅샷, 같은 프롬프트, 같은 스키마) 별도 역할을 만들지 않았다. 여기서 필드 이름을
+   * 나눈 것은 호출 지점에서 "어느 쪽이 primary인가"를 헷갈리지 않기 위한 것뿐이다.
+   */
+  coExecutor?: ProviderAdapter;
   reviewer?: ProviderAdapter;
+  /** 검수자가 배정된 모델. 13.3절 절충에서 실제 검수자를 바꿔 끼울 때 비교 기준이 된다. */
+  reviewerModelId?: string;
 }
 
 export function createRoleAdapters(
@@ -74,15 +84,23 @@ export function createRoleAdapters(
   lookup: (modelId: string) => ModelEntry | undefined,
   options: AdapterFactoryOptions = {}
 ): RoleAdapters {
-  const build = (role: "executor" | "reviewer"): ProviderAdapter | undefined => {
-    const assignment = assignments.find((a) => a.role === role);
+  const buildFrom = (assignment: RoleAssignment | undefined): ProviderAdapter | undefined => {
     if (!assignment) return undefined;
     const entry = lookup(assignment.modelId);
     if (!entry) throw new Error(`레지스트리에 ${assignment.modelId} 엔트리가 없습니다`);
     return createAdapter(entry, assignment, options);
   };
 
-  const executor = build("executor");
+  // **순서가 의미를 갖는다** — 첫 번째 executor 배정이 primary다(13.1절).
+  const executors = assignments.filter((a) => a.role === "executor");
+  const executor = buildFrom(executors[0]);
   if (!executor) throw new Error("executor 역할이 배정되지 않았습니다");
-  return { executor, reviewer: build("reviewer") };
+
+  const reviewerAssignment = assignments.find((a) => a.role === "reviewer");
+  return {
+    executor,
+    coExecutor: buildFrom(executors[1]),
+    reviewer: buildFrom(reviewerAssignment),
+    reviewerModelId: reviewerAssignment?.modelId,
+  };
 }

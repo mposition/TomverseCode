@@ -7,6 +7,7 @@ import {
   STAGE_ORDER,
   type AcceptanceCriterion,
   type ApprovalRequest,
+  type Disagreement,
   type FinalResult,
   type ProviderStatus,
   type RoutingInfo,
@@ -14,6 +15,7 @@ import {
   type TaskEvent,
   type TaskPhase,
   type TaskRow,
+  type UserDecisionInput,
   type UsageTotals,
   type UserStage,
   type VerificationReport,
@@ -22,6 +24,7 @@ import {
 import { AcceptanceCriteriaPanel } from "./components/AcceptanceCriteriaPanel";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { DiffPanel } from "./components/DiffPanel";
+import { DisagreementCard } from "./components/DisagreementCard";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
 import { TaskHistory } from "./components/TaskHistory";
@@ -55,6 +58,13 @@ export default function App() {
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [finalResult, setFinalResult] = useState<FinalResult | null>(null);
   const [questions, setQuestions] = useState<string[] | null>(null);
+  /**
+   * 3.9절 불일치 카드로 물은 쟁점들. 비어 있으면 3.4절 확인 필요 카드다.
+   *
+   * 한 상태에 합치지 않는 이유: 두 카드는 사용자에게 **다른 상황**이고(모델이 모르겠다고 한
+   * 경우 vs 두 모델이 다른 답을 낸 경우), 같은 컴포넌트로 그리면 그 구별이 사라진다.
+   */
+  const [disagreements, setDisagreements] = useState<Disagreement[]>([]);
   const [answer, setAnswer] = useState("");
   const [devMode, setDevMode] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -136,15 +146,22 @@ export default function App() {
         if (to) setPhase(to);
       }
       if (payload.type === "APPROVAL_REQUESTED_NOTE") {
-        const q = (payload.payload as { questionsForUser?: string[] }).questionsForUser;
-        if (q && q.length > 0) setQuestions(q);
+        const note = payload.payload as { questionsForUser?: string[]; disagreements?: Disagreement[] };
+        if (note.questionsForUser && note.questionsForUser.length > 0) setQuestions(note.questionsForUser);
+        setDisagreements(note.disagreements ?? []);
       }
-      if (payload.type === "USER_MESSAGE_RECEIVED" || payload.type === "USER_DECISION_RECORDED") setQuestions(null);
+      if (payload.type === "USER_MESSAGE_RECEIVED" || payload.type === "USER_DECISION_RECORDED") {
+        setQuestions(null);
+        setDisagreements([]);
+      }
       // terminal 이벤트가 오면 "취소 중"을 푼다. 타이머로 추측하지 않는다 —
       // 프로세스가 실제로 죽었다는 사실은 호스트만 알고, 그 사실이 이벤트로 온다.
       if (payload.type.startsWith("TASK_") && payload.type !== "TASK_CREATED") setCancelling(false);
       // 확인 카드가 떠 있는 채로 취소되면 답변 입력창이 남는다.
-      if (payload.type === "CANCELLATION_REQUESTED") setQuestions(null);
+      if (payload.type === "CANCELLATION_REQUESTED") {
+        setQuestions(null);
+        setDisagreements([]);
+      }
     });
     const unlistenApproval = listen<ApprovalRequest>("approval-required", (event) => {
       setApproval(event.payload);
@@ -246,10 +263,32 @@ export default function App() {
       await invoke("provide_user_input", { taskId: id, message: answer });
       setAnswer("");
       setQuestions(null);
+      setDisagreements([]);
     } catch (error) {
       setNotice(`답변 전달 실패: ${String(error)}`);
     }
   }, [events, taskId, answer]);
+
+  /** 3.9절 카드의 답변. 어떤 쟁점에 대한 답인지를 id로 함께 보낸다 — 문장 파싱은 틀린다. */
+  const submitDecisions = useCallback(
+    async (decisions: UserDecisionInput[]) => {
+      const id = currentTaskId(events, taskId);
+      if (!id) return;
+      try {
+        await invoke("provide_user_input", {
+          taskId: id,
+          // 사람이 읽는 요약. 기계가 읽는 대응은 decisions가 담는다.
+          message: decisions.map((d) => d.text).join("\n"),
+          decisions,
+        });
+        setQuestions(null);
+        setDisagreements([]);
+      } catch (error) {
+        setNotice(`판정 전달 실패: ${String(error)}`);
+      }
+    },
+    [events, taskId]
+  );
 
   const rollback = useCallback(async () => {
     const id = finalResult?.taskId ?? taskId;
@@ -510,7 +549,13 @@ export default function App() {
                 )}
               </div>
 
-              {questions && (
+              {/* 3.9절 불일치 카드가 3.4절 확인 필요 카드를 **대체한다** — 같이 뜨면
+                  사용자가 같은 질문에 두 번 답하게 된다. 두 상황이 다르므로 카드도 다르다. */}
+              {questions && disagreements.length > 0 && (
+                <DisagreementCard disagreements={disagreements} onSubmit={submitDecisions} devMode={devMode} />
+              )}
+
+              {questions && disagreements.length === 0 && (
                 <div className="panel highlight">
                   <h2>확인이 필요합니다</h2>
                   <ul>

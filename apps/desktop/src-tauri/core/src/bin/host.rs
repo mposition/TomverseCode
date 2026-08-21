@@ -451,6 +451,11 @@ fn run_task(
         let mut p = providers;
         p.push("fake-a".to_string());
         p.push("fake-b".to_string());
+        // 셋째를 넣는 이유: 둘뿐이면 대조(executor ×2)를 켤 때 검수자가 대조 참가자와 같은
+        // 공급자가 되는 **절충 경로만** e2e에서 돌게 된다(multi-engine-routing.md 13.3절).
+        // 완전 독립 배정이 가능한 경로도 실제 바이너리로 확인할 수 있어야 한다.
+        // `--providers`가 좁히기만 하므로 필요하면 e2e가 둘로 줄여 절충 경로를 따로 볼 수 있다.
+        p.push("fake-c".to_string());
         p
     } else {
         providers

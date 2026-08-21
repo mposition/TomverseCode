@@ -292,6 +292,14 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
   루트 `gate:g:build`가 체인을 함께 빌드하고, dist를 소비하는 워크스페이스의 `build`가
   `scripts/assertDepsFresh.mjs`로 산출물 신선도를 먼저 확인한다. 두 장치를
   `packages/toolchain/test/buildOrder.test.ts`가 지킨다.
+- **동시에 두 공급자 호출을 띄우면 "정확히 한 번" 가드가 깨진다.** `terminalReached`를 검사한 뒤
+  `await`를 하고 나서 플래그를 세우면, 두 호출이 취소될 때 **둘 다 검사를 통과**해
+  `TASK_CANCELLED`가 두 번 기록된다(대조로 executor를 둘 부르면서 실측). JS가 단일 스레드라는
+  것은 위안이 되지 않는다 — `await`가 곧 양보 지점이다. 검사와 표시 사이에 `await`를 두지 말 것.
+- **fake provider의 스크립트는 어댑터 인스턴스별로 소비된다.** 그래서 `script` 하나로 두 실행자를
+  다르게 만들 수 없다 — 둘 다 처음부터 소비해 **언제나 같은 산출물**이 나오고, 대조 테스트가
+  아무것도 검증하지 못한 채 통과한다. 모델별로 나누려면 `scriptByModel`을 쓸 것. 같은 이유로
+  `proposalId`에도 모델 ID가 들어간다(둘 다 cursor가 1이라 id가 겹쳤다).
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트

@@ -772,3 +772,57 @@ button.tiny {
   margin-top: 8px;
   padding-top: 8px;
 }
+
+/* 3.9절 불일치 판정 카드.
+   3.4절 확인 필요 카드(.highlight)와 **다른 테두리 색**을 쓴다 — 모델이 "모르겠다"고 한 것과
+   두 모델이 다른 답을 낸 것은 사용자에게 전혀 다른 상황이고, 같아 보이면 그 구별이 사라진다. */
+.card-disagreement {
+  border-left: 3px solid var(--warn);
+}
+
+.disagreements {
+  list-style: decimal;
+  padding-left: 20px;
+  margin: 12px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.disagreement-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.disagreement-field {
+  font-weight: 600;
+}
+
+.badge-required {
+  background: var(--warn);
+  color: #14161a;
+}
+
+.disagreement-question {
+  margin: 4px 0 6px;
+}
+
+.disagreement-option {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.disagreement-freeform {
+  width: 100%;
+  margin: 4px 0 0 20px;
+}
+
+.disagreement-advisory {
+  border-top: 1px solid var(--border);
+  margin-top: 10px;
+  padding-top: 8px;
+}

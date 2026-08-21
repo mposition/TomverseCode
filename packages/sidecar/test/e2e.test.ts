@@ -447,6 +447,19 @@ test("verified 모드는 교차검증 경로(REVIEWING)를 지난다", () => {
       criteria.every((c) => !("verified" in c) && !("status" in c)),
       `기준에 충족 여부 필드가 생겼습니다: ${JSON.stringify(criteria)}`
     );
+
+    // 17절: 대조가 실제로 돌았다. 불일치 0건이어도 이벤트가 남아야 "쟁점이 없었다"와
+    // "대조하지 않았다"를 구별할 수 있다. **실제 호스트에서** 확인한다 — 초안이 둘 생기는
+    // 것은 Node 안에서 끝나는 일이 아니라 이벤트 로그와 비용에 그대로 나타나는 사실이다.
+    assert.ok(
+      run.eventTypes.includes("DISAGREEMENT_DETECTED"),
+      `대조 이벤트가 없습니다: ${run.eventTypes.join(", ")}`
+    );
+    assert.equal(
+      run.eventTypes.filter((t) => t === "DRAFT_RECEIVED").length,
+      2,
+      "대조가 켜지면 초안 이벤트가 둘이어야 합니다(13.4절 비용 표)"
+    );
   });
 });
 

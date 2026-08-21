@@ -520,9 +520,19 @@ test("공급자 사용량을 역할·모델과 함께 기록한다", async () =>
   await orchestrator.run();
 
   // 북극성 지표(product-strategy.md 14절)의 원천 데이터.
-  assert.equal(host.usage.length, 2, "executor + reviewer 두 번의 호출이 기록되어야 합니다");
+  //
+  // **대조가 켜지면 3회다**(multi-engine-routing.md 13.4절: executor ×2 + reviewer).
+  // 이 숫자가 조용히 늘면 사용자가 tier를 올릴 때 무엇을 지불하는지 알 수 없게 되므로
+  // 비용 표를 테스트로 고정한다.
+  assert.equal(host.usage.length, 3, "executor ×2 + reviewer 세 번의 호출이 기록되어야 합니다");
   const roles = host.usage.map((u) => (u as { role: string }).role).sort();
-  assert.deepEqual(roles, ["executor", "reviewer"]);
+  assert.deepEqual(roles, ["executor", "executor", "reviewer"]);
+  // 두 실행자는 **서로 다른 공급자**여야 한다(13.2절 불변식 2) — 같은 공급자로 두 번 부른
+  // "불일치 없음"은 정보가 아니라 착시다.
+  const executorModels = host.usage
+    .filter((u) => (u as { role: string }).role === "executor")
+    .map((u) => (u as { modelId: string }).modelId);
+  assert.equal(new Set(executorModels).size, 2, `두 실행자가 같은 모델입니다: ${executorModels.join(", ")}`);
   for (const record of host.usage) {
     const typed = record as { usage: { inputTokens: number }; costUsd?: number; modelId: string };
     assert.ok(typed.usage.inputTokens > 0);

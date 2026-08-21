@@ -394,7 +394,7 @@ Insight는 `ai` + `@ai-sdk/{openai,anthropic,google}`를 쓰고, Code는 공급�
 - **제품 유료 호출 경로에 `BudgetLedger` 적용** — 10.6절에 결정과 선행 조건 세 가지가 있다.
   현재 예약을 강제하는 것은 가설 게이트뿐이며, 제품은 예산 상한 없이 호출한다.
 
-## 13. co-executor — 대조를 위한 두 번째 실행자
+## 13. co-executor — 대조를 위한 두 번째 실행자 (구현됨)
 
 결정의 근거는 [product-strategy.md 16절](./product-strategy.md), 프로토콜/상태 머신 반영은 [state-machine-and-protocol.md 17절](./state-machine-and-protocol.md). 여기서는 **라우터가 무엇을 배정하고 무엇을 거부하는가**만 정한다.
 
@@ -448,3 +448,11 @@ BYOK 현실에서 흔한 경우다. 공급자가 둘이면 executor 두 자리�
 13.1절 스파이크가 "쉬운 태스크엔 2회도 과하다"고 판정했음을 기억할 것. 3회는 `verified` 이상 전용이며, `RoutingDecision.estimatedCostUsd`가 이 증가를 반영해야 사용자가 tier를 올릴 때 무엇을 지불하는지 보인다.
 
 **planner는 여전히 기본 비활성이다**(4절). 대조가 켜지면 호출이 이미 3회이므로, planner까지 켜서 4회로 만드는 것은 실측 근거가 나오기 전까지 하지 않는다.
+
+### 13.5 구현에서 정해진 것
+
+- **`decide()`가 `contrast` 인자를 받는다.** 라우터가 스스로 켜지 않는 이유: 켜면 호출이 3회가 되므로 이건 비용에 관한 결정이고, 그 근거(tier, 실험 하네스 여부)를 라우터는 모른다. 라우터는 **배정 가능성**만 판단한다.
+- **13.3절 절충의 검수자는 REVIEWING 시점에 확정된다.** "살아남은 초안의 저자가 아닌 쪽"은 라우팅 시점에 알 수 없으므로, 라우터는 non-primary를 잠정 배정하고 `RoleAssignment.reason`에 그 사실을 적는다. 오케스트레이터가 살아남은 초안을 보고 바꿔 끼우며, `REVIEW_RECEIVED`에 `assignedReviewerModel`과 `actualReviewerModel`을 **둘 다** 남긴다 — 배정만 남기면 로그가 실제로 누가 검수했는지에 답하지 못한다.
+- **바꿔 낄 대상이 없으면 검수를 드롭한다.** 자기가 쓴 안을 자기가 검수하느니 검수 없이 진행하는 편이 안전하다(CLAUDE.md 원칙 4).
+- **같은 모델 ID를 두 executor 자리에 넣지 않는다.** 공급자가 달라도 모델이 같으면 표본이 하나다. `pick()`이 co-executor 배정에서 primary의 모델 ID를 후보에서 뺀다 — 설정 override가 두 자리를 같은 모델로 채우는 경우를 막는다.
+- **fake 공급자를 셋으로 늘렸다**(`fake-a`/`fake-b`/`fake-c`). 둘뿐이면 13.3절 절충 경로만 테스트하게 된다. 셋이면 "완전 독립 배정"과 "절충 배정"을 둘 다 실제로 돌려볼 수 있다.

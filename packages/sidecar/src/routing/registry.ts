@@ -94,8 +94,11 @@ export const BUILTIN_MODELS: ModelEntry[] = [
    * 그냥 하나의 공급자이므로 "검수자 독립성" 같은 불변식이 fake 조합에도 그대로 적용되고,
    * 그래서 그 불변식을 실제로 테스트할 수 있다.
    *
-   * providerId가 두 개(fake-a/fake-b)인 것도 그 때문이다 — 하나뿐이면 교차검증 경로를
-   * 테스트할 수 없다.
+   * providerId가 세 개(fake-a/fake-b/fake-c)인 것도 그 때문이다 — 하나뿐이면 교차검증 경로를
+   * 테스트할 수 없고, 둘뿐이면 **대조와 검수가 충돌하는 경우만** 테스트하게 된다
+   * (multi-engine-routing.md 13.3절). 셋이면 "완전 독립 배정"과 "절충 배정"을 둘 다 실제로
+   * 돌려볼 수 있다. 실제 배정은 `availableProviders`가 결정하므로, 세 번째가 있다고 해서
+   * 자격증명이 둘뿐인 사용자의 경로가 바뀌지는 않는다.
    */
   {
     modelId: "fake-executor",
@@ -124,6 +127,26 @@ export const BUILTIN_MODELS: ModelEntry[] = [
       structuredOutput: "forced_tool_use",
       imageInput: false,
       maxContextTokens: 128_000,
+      maxOutputTokens: 8_192,
+    },
+    economics: { inputPerMTok: 0, outputPerMTok: 0, pricingAsOf: PRICING_AS_OF },
+    availability: { requiresOrgVerification: false },
+  },
+  {
+    // 세 번째 공급자 — 대조(executor ×2)와 독립 검수를 **동시에** 만족시킬 수 있는 경우를
+    // 실제로 돌려보기 위한 것이다. 정적 우선순위에서 뒤로 가도록 컨텍스트를 작게 둔다:
+    // 앞의 둘이 그대로 executor/co-executor로 뽑히고 이 항목이 reviewer가 되어야
+    // 기존 테스트의 기대가 유지된다.
+    modelId: "fake-third",
+    providerId: "fake-c",
+    protocol: "native",
+    apiBaseUrl: "local://fake",
+    apiKeyEnvName: "TOMVERSE_FAKE_KEY",
+    capabilities: {
+      toolCalling: "basic",
+      structuredOutput: "forced_tool_use",
+      imageInput: false,
+      maxContextTokens: 64_000,
       maxOutputTokens: 8_192,
     },
     economics: { inputPerMTok: 0, outputPerMTok: 0, pricingAsOf: PRICING_AS_OF },

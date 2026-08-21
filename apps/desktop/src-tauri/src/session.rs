@@ -430,15 +430,27 @@ impl SessionState {
         }))
     }
 
-    pub fn provide_user_input(&self, task_id: &str, message: &str) -> Result<Value, String> {
+    /// `decisions`는 3.9절 불일치 카드의 구조적 답변이다(state-machine-and-protocol.md 17.2절).
+    ///
+    /// **Rust는 내용을 해석하지 않는다.** 어떤 쟁점에 대한 답인지는 Node 상태 머신의 관심사이고,
+    /// 신뢰 경계가 판단할 것이 없다 — 이 값으로는 파일도 셸도 건드릴 수 없다. 그대로 통과시킨다
+    /// (process-architecture.md 4절: Rust는 승인·정책·실행만 판단한다).
+    pub fn provide_user_input(
+        &self,
+        task_id: &str,
+        message: &str,
+        decisions: Option<Value>,
+    ) -> Result<Value, String> {
         self.with_active(|active| {
+            let mut params = json!({ "taskId": task_id, "message": message });
+            if let Some(decisions) = decisions.clone() {
+                if !decisions.is_null() {
+                    params["decisions"] = decisions;
+                }
+            }
             active
                 .sidecar
-                .request(
-                    "task.userInput",
-                    json!({ "taskId": task_id, "message": message }),
-                    Duration::from_secs(10),
-                )
+                .request("task.userInput", params, Duration::from_secs(10))
                 .map_err(|e| e)
         })
     }

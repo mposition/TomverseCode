@@ -104,14 +104,18 @@ fn cancel_task(state: tauri::State<'_, SessionState>, task_id: String) -> Result
     state.cancel_task(&task_id)
 }
 
-/// ui-wireframes.md 3.4절 확인 필요 카드의 답변.
+/// ui-wireframes.md 3.4절 확인 필요 카드 / 3.9절 불일치 카드의 답변.
+///
+/// `decisions`는 3.9절 카드에서만 온다 — 어떤 쟁점에 대한 답인지를 문장 파싱이 아니라 id로
+/// 남기기 위한 것이다. Rust는 그 내용을 해석하지 않고 sidecar로 통과시킨다.
 #[tauri::command]
 fn provide_user_input(
     state: tauri::State<'_, SessionState>,
     task_id: String,
     message: String,
+    decisions: Option<Value>,
 ) -> Result<Value, String> {
-    state.provide_user_input(&task_id, &message)
+    state.provide_user_input(&task_id, &message, decisions)
 }
 
 /// ui-wireframes.md 3.6절 롤백. 일반 ToolRequest 경로와 이벤트 로그를 그대로 탄다.
