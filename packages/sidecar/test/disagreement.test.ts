@@ -202,7 +202,62 @@ test("blocking 불일치가 생기면 3.9절 카드로 묻고, 답이 기준으�
   const recorded = host.events.find((e) => e.type === "USER_DECISION_RECORDED");
   const decisions = (recorded!.payload as { decisions: { disagreementId: string; optionId: string | null }[] })
     .decisions;
-  assert.deepEqual(decisions, [{ disagreementId: target.disagreementId, optionId: option.optionId, freeform: false }]);
+  assert.deepEqual(decisions, [
+    {
+      disagreementId: target.disagreementId,
+      optionId: option.optionId,
+      freeform: false,
+      // 카드에서의 자리와 고른 선택지 순번 — 상한 4의 근거를 재기 위한 것이다(17.10절 ⑨).
+      cardPosition: 1,
+      optionRank: 1,
+    },
+  ]);
+});
+
+test("카드에서의 자리와 고른 선택지 순번이 함께 기록된다", async () => {
+  // 12절 "한 카드 질문 상한 4개의 근거": 4는 화면 설계에서 나온 추정값이다. 그 임계를 물으려면
+  // **자리별로** 무엇을 골랐는지가 남아야 한다 — 자리를 잃으면 남는 것은 "첫 선택지를 몇 번
+  // 골랐나"뿐이고, 그 수는 상한에 대해 아무것도 말하지 않는다(17.10절 ⑨).
+  const { orchestrator, host } = build({
+    defaultPatch: VALID_PATCH,
+    scriptByModel: twoExecutorScripts(
+      [draftStep({ doneCriteria: ["A"], targetPaths: ["src/app.ts"] }), draftStep({ doneCriteria: ["A"] })],
+      [
+        draftStep({ doneCriteria: ["B"], targetPaths: ["src/other.ts"], patch: OTHER_PATCH }),
+        draftStep({ doneCriteria: ["A"] }),
+      ]
+    ),
+  });
+
+  const promise = orchestrator.run();
+  await waitFor(() => disagreementCard(host) !== undefined);
+  const card = disagreementCard(host)!;
+  assert.ok(card.disagreements.length >= 2, `쟁점이 하나뿐이면 자리를 검증할 수 없습니다`);
+
+  // 첫 질문은 두 번째 선택지, 두 번째 질문은 첫 번째 선택지를 고른다.
+  const [first, second] = card.disagreements;
+  const firstPick = first!.question.options[1]!;
+  const secondPick = second!.question.options[0]!;
+  assert.ok(
+    orchestrator.provideUserInput("답변", [
+      { disagreementId: first!.disagreementId, optionId: firstPick.optionId, text: firstPick.label },
+      { disagreementId: second!.disagreementId, optionId: secondPick.optionId, text: secondPick.label },
+    ])
+  );
+  await promise;
+
+  const recorded = host.events.find((e) => e.type === "USER_DECISION_RECORDED")!;
+  const payload = recorded.payload as {
+    cardSize: number;
+    decisions: { disagreementId: string; cardPosition: number | null; optionRank: number | null }[];
+  };
+  // 띄운 개수를 그대로 남긴다 — 답이 오지 않은 항목이 있으면 결정 개수와 달라진다.
+  assert.equal(payload.cardSize, card.disagreements.length);
+  const byId = new Map(payload.decisions.map((d) => [d.disagreementId, d]));
+  assert.equal(byId.get(first!.disagreementId)?.cardPosition, 1);
+  assert.equal(byId.get(first!.disagreementId)?.optionRank, 2);
+  assert.equal(byId.get(second!.disagreementId)?.cardPosition, 2);
+  assert.equal(byId.get(second!.disagreementId)?.optionRank, 1);
 });
 
 test("자유 입력은 optionId 없이 freeform으로 기록된다", async () => {
@@ -228,7 +283,10 @@ test("자유 입력은 optionId 없이 freeform으로 기록된다", async () =>
   assert.equal(result.status, "completed", result.summary);
   const recorded = host.events.find((e) => e.type === "USER_DECISION_RECORDED");
   const decisions = (recorded!.payload as { decisions: { optionId: string | null; freeform: boolean }[] }).decisions;
-  assert.deepEqual(decisions, [{ disagreementId: target.disagreementId, optionId: null, freeform: true }]);
+  assert.deepEqual(decisions, [
+    // 자유 입력에는 고른 선택지가 없으므로 순번도 없다. 0으로 쓰면 "첫 선택지"와 섞인다.
+    { disagreementId: target.disagreementId, optionId: null, freeform: true, cardPosition: 1, optionRank: null },
+  ]);
 });
 
 test("여러 blocking 쟁점은 한 라운드에 묶어서 묻는다", async () => {

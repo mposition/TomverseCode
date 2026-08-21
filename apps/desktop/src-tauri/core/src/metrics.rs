@@ -171,11 +171,53 @@ pub fn suggest_force_abandon_ms(latency: &CancellationLatency) -> ForceAbandonTh
     }
 }
 
+/// 한 자리(카드에서 몇 번째 질문)에서 사용자가 무엇을 골랐는가.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct PositionAnswers {
+    /// 그 질문의 **첫 번째** 선택지를 골랐다.
+    #[serde(rename = "firstOption")]
+    pub first_option: u64,
+    /// 두 번째 이후 선택지를 골랐다.
+    #[serde(rename = "laterOption")]
+    pub later_option: u64,
+    /// 둘 다 아니라 직접 적었다.
+    pub freeform: u64,
+    /// 순번을 알 수 없는 기록(옛 이벤트 등). 0으로 뭉개면 비율의 분모가 틀린다.
+    pub unknown: u64,
+}
+
+/// 3.9절 카드의 답변을 **자리별로** 쪼갠 집계 — 12절 "한 카드 질문 상한 4개의 근거".
+///
+/// # 이 숫자가 말하는 것과 말하지 않는 것
+///
+/// **첫 선택지를 골랐다는 것은 부주의의 증거가 아니다.** 그 선택지가 맞았을 수 있다. 그래서
+/// 필드 이름이 `careless`가 아니라 `firstOption`이다 — 잰 것을 그대로 부른다(17.10절 ③).
+///
+/// 이 집계를 쓸 수 있게 하는 것은 **카드 안에서 자리끼리 비교한다**는 점이다. 선택지 1번은
+/// 언제나 primary 실행자의 값이라 자리와 무관하게 한쪽으로 치우칠 수 있는데, 그 치우침은 한
+/// 카드 안의 모든 질문에 똑같이 걸린다. 따라서 **자리에 따라 비율이 달라지면** 그건 모델 품질이
+/// 아니라 자리 때문이다. 그것이 "아래쪽 질문은 그럴듯하면 아무거나 눌린다"는 가설이 예측하는
+/// 모양이고, 상한 4의 근거를 물을 수 있는 유일한 관측이다.
+///
+/// 그래도 이건 **신호이지 판정이 아니다.** 비율이 올라간다고 상한이 틀렸다는 증명은 아니다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct CardAnswers {
+    /// 자리(1부터) → 그 자리의 답 분포.
+    #[serde(rename = "byPosition")]
+    pub by_position: BTreeMap<u64, PositionAnswers>,
+    /// 카드 크기별 카드 수. "3개 중 3번째"와 "4개 중 3번째"는 다른 상황이고,
+    /// 스크롤이 생기는지는 크기에 달려 있다.
+    #[serde(rename = "cardsBySize")]
+    pub cards_by_size: BTreeMap<u64, u64>,
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Metrics {
     pub coverage: CriteriaCoverage,
     pub conflicts: ConflictOutcomes,
     pub cancellation: CancellationLatency,
+    #[serde(rename = "cardAnswers")]
+    pub card_answers: CardAnswers,
     /// 관측에서 유도한 강제 포기 임계값. **집계 결과이지 설정이 아니다** —
     /// 데이터가 없으면 기본값과 그 사실을 그대로 돌려준다.
     #[serde(rename = "forceAbandonThreshold")]
@@ -262,6 +304,9 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
             }
         }
 
+        // ---- 카드 답변: 자리별 분포 ----
+        collect_card_answers(&events, &mut metrics.card_answers);
+
         // ---- 취소 소요: CANCELLATION_REQUESTED → 그 뒤 첫 터미널 ----
         collect_cancellation(&events, &mut metrics.cancellation, &mut latencies);
 
@@ -279,6 +324,49 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     finalize_latency(&mut metrics.cancellation, &mut latencies);
     metrics.force_abandon_threshold = Some(suggest_force_abandon_ms(&metrics.cancellation));
     Ok(metrics)
+}
+
+/// `USER_DECISION_RECORDED`에서 카드 자리별 답을 센다.
+///
+/// 3.4절 확인 필요 카드(모델이 스스로 모호하다고 말한 경우)에는 쟁점도 자리도 없다.
+/// 그건 **다른 화면**이므로 이 집계에 섞지 않는다 — 섞으면 자리 없는 답이 전부 `unknown`으로
+/// 쌓여 분모를 부풀린다.
+fn collect_card_answers(events: &[crate::store::StoredEvent], out: &mut CardAnswers) {
+    for event in events {
+        if event.event_type != "USER_DECISION_RECORDED" {
+            continue;
+        }
+        let Some(decisions) = event.payload.get("decisions").and_then(Value::as_array) else {
+            continue;
+        };
+        if decisions.is_empty() {
+            continue;
+        }
+        // 카드 크기는 payload가 말한다. 결정 개수로 추론하지 않는 이유: 답이 오지 않은 항목이
+        // 있으면 둘이 달라지고, 그때 필요한 것은 **띄운 개수**다.
+        let size = event
+            .payload
+            .get("cardSize")
+            .and_then(Value::as_u64)
+            .unwrap_or(decisions.len() as u64);
+        *out.cards_by_size.entry(size).or_insert(0) += 1;
+
+        for decision in decisions {
+            let Some(position) = decision.get("cardPosition").and_then(Value::as_u64) else {
+                continue;
+            };
+            let slot = out.by_position.entry(position).or_default();
+            if decision.get("freeform").and_then(Value::as_bool) == Some(true) {
+                slot.freeform += 1;
+                continue;
+            }
+            match decision.get("optionRank").and_then(Value::as_u64) {
+                Some(1) => slot.first_option += 1,
+                Some(_) => slot.later_option += 1,
+                None => slot.unknown += 1,
+            }
+        }
+    }
 }
 
 /// 한 태스크의 이벤트에서 취소 소요를 뽑는다.
@@ -517,6 +605,52 @@ mod tests {
             split.values().sum::<u64>(),
             *m.conflicts.by_outcome.get("plan_unchanged").unwrap()
         );
+    }
+
+    /// 카드 답변은 **자리별로** 쌓여야 "아래쪽 질문이 대충 눌리는가"를 물을 수 있다.
+    /// 자리를 잃으면 남는 것은 "첫 선택지를 몇 번 골랐나"뿐이고, 그 수는 상한 4에 대해
+    /// 아무것도 말하지 않는다.
+    #[test]
+    fn card_answers_are_counted_per_position() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &json!({
+                    "cardSize": 3,
+                    "decisions": [
+                        { "disagreementId": "d1", "cardPosition": 1, "optionRank": 2, "freeform": false },
+                        { "disagreementId": "d2", "cardPosition": 2, "optionRank": 1, "freeform": false },
+                        { "disagreementId": "d3", "cardPosition": 3, "optionRank": null, "freeform": true },
+                    ],
+                }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.card_answers.cards_by_size.get(&3), Some(&1));
+        assert_eq!(m.card_answers.by_position.get(&1).map(|p| p.later_option), Some(1));
+        assert_eq!(m.card_answers.by_position.get(&2).map(|p| p.first_option), Some(1));
+        assert_eq!(m.card_answers.by_position.get(&3).map(|p| p.freeform), Some(1));
+    }
+
+    /// 3.4절 확인 필요 카드는 **다른 화면**이라 자리가 없다. 섞으면 자리 없는 답이 전부
+    /// unknown으로 쌓여 자리별 비율의 분모가 부풀려진다.
+    #[test]
+    fn clarification_answers_without_positions_do_not_enter_the_card_aggregate() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &json!({ "decisions": [], "answer": "빈 문자열은 거부한다" }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert!(m.card_answers.by_position.is_empty(), "{:?}", m.card_answers);
+        assert!(m.card_answers.cards_by_size.is_empty(), "{:?}", m.card_answers);
     }
 
     #[test]

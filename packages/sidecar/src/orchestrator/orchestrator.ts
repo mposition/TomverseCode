@@ -1529,8 +1529,21 @@ export class Orchestrator {
       }
     }
 
+    // 카드에서의 자리와 고른 선택지의 순번. **한 카드 질문 상한(4)의 근거를 재기 위한 것**이다
+    // (17.10절 ⑨). 지금은 화면 설계에서 나온 추정값이고, 실측 없이 늘리거나 줄일 수 없다.
+    const positionOf = new Map(disagreements.map((d, index) => [d.disagreementId, index + 1]));
+    const optionRankOf = (decision: UserDecisionInput): number | null => {
+      if (decision.optionId === undefined) return null;
+      const options = disagreements.find((d) => d.disagreementId === decision.disagreementId)?.question.options;
+      const index = options?.findIndex((o) => o.optionId === decision.optionId) ?? -1;
+      return index >= 0 ? index + 1 : null;
+    };
+
     await this.emit("USER_DECISION_RECORDED", {
       questions,
+      // 이 카드에 몇 개가 함께 떠 있었는가. 자리(position)만으로는 "3개 중 3번째"와
+      // "4개 중 3번째"를 구별할 수 없는데, 스크롤이 생기는지는 카드 크기에 달려 있다.
+      cardSize: disagreements.length,
       /**
        * **원문이다.** `answerLength`만 남기면 판정자의 판정이 감사 로그에 없다.
        *
@@ -1546,6 +1559,11 @@ export class Orchestrator {
         // 자유 입력이었는가. 선택지를 고르지 않았다는 것은 **두 초안 모두 틀렸다**는 뜻이라
         // 나중에 가장 값진 신호가 된다(14절 "불일치 1건당 사용자가 뒤집은 비율").
         freeform: d.optionId === undefined,
+        // 카드에서 몇 번째 질문이었는가 (1부터). 답을 자리와 이어야 "아래쪽 질문이 대충
+        // 눌리는가"를 물을 수 있다. 카드에서 오지 않은 답(3.4절)에는 자리가 없으므로 null이다.
+        cardPosition: positionOf.get(d.disagreementId) ?? null,
+        // 고른 선택지가 그 질문에서 몇 번째였는가. 자유 입력이면 null이다.
+        optionRank: optionRankOf(d),
       })),
       acceptanceCriteria: criteria,
     });
