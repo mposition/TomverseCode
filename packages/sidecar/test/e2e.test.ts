@@ -580,6 +580,94 @@ test("검증을 통과하면 실제 git 커밋이 만들어진다", () => {
   }
 });
 
+test("커밋한 작업은 revert로 되돌릴 수 있고, 이력에는 두 커밋이 남는다", () => {
+  // 19절: 되돌리기는 커밋이 있으면 두 가지 뜻을 갖는다. `revert`는 **이력을 다시 쓰지 않고**
+  // 취소 커밋을 하나 더 만든다 — 이미 공유한 브랜치에서도 안전한 유일한 선택지다.
+  const repo = createFixtureRepo({ gitRepo: true });
+  const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
+  try {
+    const run = runHost(repo, stateDir, { mode: "fast", allowGitCommit: true });
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+    const afterCommit = gitLogSubjects(repo.root);
+    const fixed = repo.read("paginate.js");
+
+    const result = spawnSync(
+      HOST_BIN,
+      [
+        "revert",
+        "--workspace",
+        repo.root,
+        "--task",
+        run.taskId,
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+      ],
+      // `revert`는 sidecar를 띄우지 않으므로 fake 공급자 환경이 필요 없다.
+      { encoding: "utf8", env: process.env }
+    );
+    const payload = JSON.parse((result.stdout ?? "").trim().split("\n").filter(Boolean).pop() as string) as {
+      reverted: boolean;
+      sha?: string;
+      reason?: string;
+    };
+    assert.equal(payload.reverted, true, `되돌리지 못했습니다: ${payload.reason}\n${result.stderr}`);
+
+    // **이력이 다시 쓰이지 않았다** — 커밋이 하나 더 늘었다.
+    const afterRevert = gitLogSubjects(repo.root);
+    assert.equal(afterRevert.length, afterCommit.length + 1, afterRevert.join("\n"));
+    assert.match(afterRevert[0]!, /^Revert /, afterRevert[0]);
+
+    // 파일 내용이 실제로 되돌아갔다.
+    assert.notEqual(repo.read("paginate.js"), fixed, "revert했는데 파일이 그대로입니다");
+    // 워킹 트리는 깨끗하다 — revert가 커밋까지 만들었으므로 중간 상태가 남지 않는다.
+    const status = execFileSync("git", ["status", "--porcelain"], { cwd: repo.root, encoding: "utf8" });
+    assert.equal(status.trim(), "", `되돌린 뒤 워킹 트리가 지저분합니다: ${status}`);
+  } finally {
+    repo.cleanup();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("커밋이 없는 작업에는 커밋 되돌리기를 제안하지 않는다", () => {
+  // 추측으로 이력을 건드리지 않는다 — 커밋을 특정할 수 없으면 아무것도 하지 않는다.
+  const repo = createFixtureRepo({ gitRepo: true });
+  const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
+  try {
+    const run = runHost(repo, stateDir, { mode: "fast" });
+    assert.equal(run.final.status, "completed", run.final.summary);
+    const before = gitLogSubjects(repo.root);
+
+    const result = spawnSync(
+      HOST_BIN,
+      [
+        "revert",
+        "--workspace",
+        repo.root,
+        "--task",
+        run.taskId,
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+      ],
+      // `revert`는 sidecar를 띄우지 않으므로 fake 공급자 환경이 필요 없다.
+      { encoding: "utf8", env: process.env }
+    );
+    const payload = JSON.parse((result.stdout ?? "").trim().split("\n").filter(Boolean).pop() as string) as {
+      reverted: boolean;
+      reason?: string;
+    };
+    assert.equal(payload.reverted, false);
+    assert.match(payload.reason ?? "", /특정할 수 없습니다/);
+    assert.deepEqual(gitLogSubjects(repo.root), before, "아무것도 하지 않아야 하는데 이력이 바뀌었습니다");
+  } finally {
+    repo.cleanup();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("allowGitCommit이 꺼져 있으면 저장소가 있어도 커밋하지 않는다", () => {
   // 기본값은 커밋하지 않는 것이다. 켜지 않은 사용자가 매 태스크마다 승인 모달을 닫아야 하면
   // 승인이 의미를 잃는다(product-strategy 9.1절 승인 피로).

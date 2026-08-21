@@ -166,6 +166,14 @@ pub fn default_command_policy() -> CommandPolicy {
             allow("git", &["branch", "--list"], RuleEffect::Auto),
             allow("git", &["add", "**"], RuleEffect::Conditional),
             allow("git", &["commit", "**"], RuleEffect::Conditional),
+            // `git revert`는 되돌리기 화면이 쓴다(state-machine-and-protocol.md 19절).
+            // Conditional인 이유: 이력을 바꾸는 쓰기 동작이므로 승인을 거쳐야 하고,
+            // 되돌리기 화면에서 사용자가 이미 고른 것이라 1클릭이면 충분하다.
+            //
+            // **`reset`은 넣지 않는다.** `reset --hard`는 커밋되지 않은 작업을 복구 불가능하게
+            // 지우고 이력을 다시 쓴다 — 그 커밋이 이미 공유됐는지 우리는 알 수 없으므로,
+            // 되돌릴 수 없는 동작을 우리가 대신 실행하지 않는다(19.2절).
+            allow("git", &["revert", "**"], RuleEffect::Conditional),
             allow("git", &["checkout", "**"], RuleEffect::Conditional),
             // 테스트/빌드 러너. auto가 아니라 conditional인 이유: npm 스크립트는 임의 코드를
             // 실행할 수 있으므로 "무음 허용"은 과하다. 승인 1클릭으로 노출한다.

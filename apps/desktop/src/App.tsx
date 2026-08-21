@@ -67,6 +67,11 @@ export default function App() {
    * 대상으로 다룬다. 토글이 정하는 것은 "매 태스크마다 커밋 승인 모달을 띄울 것인가"뿐이다.
    */
   const [allowGitCommit, setAllowGitCommit] = useState(false);
+  /**
+   * 이 작업이 만든 커밋. **되돌리기 화면의 선택지가 이 값에 달려 있다** —
+   * 커밋이 없으면 파일 되돌리기 하나뿐이고, 있으면 사용자가 무엇을 되돌릴지 골라야 한다.
+   */
+  const [commit, setCommit] = useState<{ sha: string | null; branch: string } | null>(null);
 
   const [running, setRunning] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
@@ -196,6 +201,10 @@ export default function App() {
       // 프로세스가 실제로 죽었다는 사실은 호스트만 알고, 그 사실이 이벤트로 온다.
       if (payload.type.startsWith("TASK_") && payload.type !== "TASK_CREATED") setCancelling(false);
       // 확인 카드가 떠 있는 채로 취소되면 답변 입력창이 남는다.
+      if (payload.type === "GIT_COMMIT_CREATED") {
+        const p = payload.payload as { sha?: string | null; branch?: string };
+        setCommit({ sha: p.sha ?? null, branch: p.branch ?? "(unknown)" });
+      }
       if (payload.type === "CANCELLATION_REQUESTED") {
         setQuestions(null);
         setDisagreements([]);
@@ -229,6 +238,7 @@ export default function App() {
     setCancelling(false);
     setEvents([]);
     setFinalResult(null);
+    setCommit(null);
     setQuestions(null);
     setNotice(null);
     setSelectedTask(null);
@@ -351,6 +361,29 @@ export default function App() {
       setNotice(`강제 포기 실패: ${String(error)}`);
     }
   }, [events, taskId]);
+
+  /**
+   * 커밋 되돌리기 — `git revert`. **파일 되돌리기와 다른 동작**이라 버튼도 따로다.
+   *
+   * 충돌 없이 되돌릴 수 없으면 Rust가 **아무것도 하지 않고 이유를 돌려준다.** 그 이유를 그대로
+   * 보여주는 것이, 우리가 추측해서 이력을 건드리는 것보다 낫다.
+   */
+  const revertCommit = useCallback(async () => {
+    const id = finalResult?.taskId ?? taskId;
+    if (!id) return;
+    try {
+      const result = await invoke<{ reverted: boolean; sha?: string; reason?: string }>("revert_task_commit", {
+        taskId: id,
+      });
+      setNotice(
+        result.reverted
+          ? `커밋 ${(result.sha ?? "").slice(0, 8)}를 되돌리는 커밋을 만들었습니다. 이력에는 두 커밋이 모두 남습니다.`
+          : `커밋을 되돌리지 못했습니다: ${result.reason ?? "사유 없음"}`
+      );
+    } catch (error) {
+      setNotice(`커밋 되돌리기 실패: ${String(error)}`);
+    }
+  }, [finalResult, taskId]);
 
   const rollback = useCallback(async () => {
     const id = finalResult?.taskId ?? taskId;
@@ -688,12 +721,49 @@ export default function App() {
                         ))}
                       </ul>
                       <button className={finalResult.status === "failed" ? "" : "secondary"} onClick={rollback}>
-                        되돌리기
+                        {commit ? "파일만 되돌리기" : "되돌리기"}
                       </button>
+                      {/* 커밋이 있으면 되돌리기가 두 가지 뜻을 갖는다. 어느 쪽인지 **사용자가
+                          고르게 한다** — 공유된 브랜치인지 아닌지는 우리가 알 수 없고,
+                          그 답에 따라 옳은 선택이 달라지기 때문이다(19절). */}
+                      {commit && (
+                        <button className="secondary" onClick={revertCommit} disabled={!commit.sha}>
+                          커밋 되돌리기 (revert)
+                        </button>
+                      )}
                       {finalResult.status === "failed" && (
                         <p className="muted small">
                           실패한 작업은 되돌리기가 기본 권장입니다 — 깨진 상태를 방치하지 않기 위해서입니다.
                         </p>
+                      )}
+                      {commit && (
+                        <div className="warn small">
+                          <p>
+                            이 작업은 <code>{commit.branch}</code>에 커밋했습니다
+                            {commit.sha && <> ({commit.sha.slice(0, 8)})</>}.
+                          </p>
+                          <ul>
+                            <li>
+                              <strong>파일만 되돌리기</strong> — 파일 내용을 작업 전으로 복원합니다.{" "}
+                              <strong>커밋은 그대로 남고</strong> 워킹 트리가 커밋과 달라집니다.
+                            </li>
+                            <li>
+                              <strong>커밋 되돌리기(revert)</strong> — 그 커밋을 취소하는 **새 커밋**을 만듭니다.
+                              이력이 다시 쓰이지 않으므로 이미 공유(push)한 브랜치에서도 안전합니다.
+                            </li>
+                          </ul>
+                          {/* 이력 재작성을 우리가 대신 하지 않는 이유를 화면에서도 말한다. */}
+                          <p>
+                            커밋 자체를 이력에서 지우는 것(<code>git reset</code>)은 이 앱이 하지 않습니다 — 되돌릴 수
+                            없고, 그 커밋을 이미 다른 사람이 받았는지 알 수 없기 때문입니다. 필요하면 직접 실행하세요.
+                          </p>
+                          {!commit.sha && (
+                            <p className="error">
+                              커밋 sha를 확인하지 못해 커밋 되돌리기를 제안할 수 없습니다. 추측으로 이력을 건드리지
+                              않습니다.
+                            </p>
+                          )}
+                        </div>
                       )}
                     </>
                   )}

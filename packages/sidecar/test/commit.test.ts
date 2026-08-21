@@ -85,7 +85,9 @@ test("add와 commit을 한 요청으로 합치지 않는다", () => {
     message: "고침",
     requestedBy: { role: "orchestrator" },
   });
-  assert.equal(plan.toolRequests.length, 2);
+  // add / commit / rev-parse 셋이다. 마지막은 만든 커밋의 sha를 읽는 **읽기 전용** 단계로,
+  // 그게 없으면 나중에 "이 태스크가 만든 커밋"을 특정할 수 없어 revert를 제안할 수조차 없다(19.4절).
+  assert.equal(plan.toolRequests.length, 3);
   for (const request of plan.toolRequests) {
     const args = request.args as { program: string; args: string[] };
     assert.ok(!args.args.some((a) => a.includes("&&") || a.includes("|")), JSON.stringify(args));
@@ -95,6 +97,10 @@ test("add와 commit을 한 요청으로 합치지 않는다", () => {
   // 커밋은 언제나 승인 대상이다 — Node의 1차 분류도 그 사실을 반영한다.
   assert.equal(plan.toolRequests[1]!.riskTier, "user_approval");
   assert.equal(plan.approvalRequired, true);
+  // sha 조회는 읽기 전용이라 자동이다 — 이걸 승인 대상으로 만들면 모달이 하나 더 는다.
+  const sha = plan.toolRequests[2]!.args as { args: string[] };
+  assert.deepEqual(sha.args, ["rev-parse", "HEAD"]);
+  assert.equal(plan.toolRequests[2]!.riskTier, "auto");
 });
 
 test("변경이 없거나 메시지가 비면 계획을 만들지 않는다", () => {
@@ -160,12 +166,15 @@ test("검증을 통과하면 커밋한다", async () => {
   const commands = commandsOf(host);
   assert.deepEqual(
     commands.map((c) => `${c.program} ${c.args[0]}`),
-    ["git add", "git commit"]
+    ["git add", "git commit", "git rev-parse"]
   );
   // 실제로 바뀐 파일만 스테이징된다.
   assert.deepEqual(commands[0]!.args, ["add", "--", "src/app.ts"]);
 
-  assert.ok(host.eventTypes().includes("GIT_COMMIT_CREATED"));
+  const created = host.events.find((e) => e.type === "GIT_COMMIT_CREATED");
+  assert.ok(created, "커밋 이벤트가 없습니다");
+  // **sha 키가 반드시 있어야 한다.** 없으면 되돌리기가 이 커밋을 특정할 수 없다(19.4절).
+  assert.ok("sha" in (created!.payload as Record<string, unknown>));
   // 되돌리기와의 관계를 요약이 말한다 — 되돌려도 커밋은 남는다.
   assert.match(result.summary, /커밋함/, result.summary);
   assert.match(result.summary, /되돌리기는 파일만 복원/, result.summary);

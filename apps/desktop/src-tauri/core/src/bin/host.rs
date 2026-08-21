@@ -190,7 +190,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|recover|tasks|show|metrics> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>] [--verbose]\n\
      \n\
@@ -199,6 +199,7 @@ fn usage() -> String {
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
      tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
      show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다\n\
+     revert  — 이 작업이 만든 커밋을 git revert로 되돌린다 (충돌 없이 가능할 때만)\n\
      metrics — 기준 계측(커버리지/충돌 결말)을 JSON으로 집계한다. 읽기 전용.\n\
                [--all-workspaces]로 워크스페이스 필터를 끈다"
         .to_string()
@@ -358,6 +359,31 @@ fn real_main() -> Result<i32, String> {
         }
 
         // 재시작 후에도 기록이 남아 있는지 확인하는 통로. DB만 읽고 아무것도 실행하지 않는다.
+        "revert" => {
+            // 되돌리기의 두 뜻 중 **커밋 되돌리기**. `rollback`(파일 복원)과 별도 명령인 이유는
+            // 저장소에 남기는 결과가 다르기 때문이다(19절).
+            let task_id = args
+                .task_id
+                .clone()
+                .ok_or_else(|| "revert에는 --task가 필요합니다".to_string())?;
+            let host = TaskHost::new(
+                root,
+                policy,
+                store,
+                artifacts,
+                approvals,
+                sink,
+                Arc::new(CancellationRegistry::new()),
+            );
+            let result = host.revert_commit(&task_id)?;
+            println!("{result}");
+            Ok(if result.get("reverted").and_then(Value::as_bool) == Some(true) {
+                0
+            } else {
+                1
+            })
+        }
+
         "metrics" => {
             // **읽기 전용이다.** 아무것도 쓰지 않고, 저장된 이벤트만 집계한다.
             // 사람이 눈으로 세는 대신 숫자를 내는 것이 목적이며, 답하지 못하는 것은

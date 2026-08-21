@@ -1722,9 +1722,13 @@ export class Orchestrator {
     // 다시 VERIFYING을 거쳐야 하는데(전이 표), 커밋은 추적 파일의 **내용을 바꾸지 않으므로**
     // 두 번째 검증은 같은 결과만 낼 수밖에 없다. 순전한 낭비를 만들지 않기 위해 phase는 그대로
     // 두고, 무엇이 실행됐는지는 이벤트가 말한다(원칙 7: 이벤트가 진실의 원천이다).
+    let sha: string | null = null;
     for (const request of plan.toolRequests) {
       const { result, policy } = await this.requireBridge().executeRequest(request);
-      if (result.status === "ok") continue;
+      if (result.status === "ok") {
+        if (request.requestId.endsWith("-commit-sha")) sha = readStdout(result.output).trim() || null;
+        continue;
+      }
 
       if (result.status === "denied") {
         // 거부는 오류가 아니라 **사용자의 결정**이다. 커밋하지 않고 그대로 완료한다.
@@ -1738,6 +1742,10 @@ export class Orchestrator {
       branch,
       paths: [...this.mutatedPaths],
       verifiedChecks,
+      // **sha가 없으면 되돌리기가 이 커밋을 특정할 수 없다.** null인 것은 실패가 아니라
+      // "확인하지 못했다"이며, 그 경우 커밋 되돌리기는 제안되지 않는다(추측으로 이력을
+      // 건드리지 않는다).
+      sha,
     });
     return { kind: "committed", branch };
   }
@@ -1827,6 +1835,13 @@ type PathOutcome =
   | { kind: "patch"; patch: string }
   | { kind: "retry" }
   | { kind: "final"; result: FinalResult };
+
+/** `run_command` 결과에서 stdout만 꺼낸다. 형태가 다르면 빈 문자열이다 — 추측하지 않는다. */
+function readStdout(output: unknown): string {
+  if (typeof output !== "object" || output === null) return "";
+  const stdout = (output as { stdout?: unknown }).stdout;
+  return typeof stdout === "string" ? stdout : "";
+}
 
 function extractDiff(output: unknown): string | null {
   // Rust는 diff를 별도로 돌려주지 않고 이벤트에만 담는다. patch 적용 결과에서

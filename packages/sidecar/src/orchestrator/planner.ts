@@ -147,6 +147,20 @@ export function buildCommitPlan(input: CommitPlanInput): ExecutionPlan {
         riskTier: "user_approval",
         createdAt,
       },
+      {
+        // 만든 커밋의 sha를 확인한다. 읽기 전용이라 자동 승인이다.
+        //
+        // 왜 필요한가: 이게 없으면 나중에 "이 태스크가 만든 커밋"을 특정할 수 없고, 그러면
+        // 커밋 되돌리기(`git revert <sha>`)를 제안할 수조차 없다. 시각이나 메시지로 추측하는
+        // 방법은 있지만 추측으로 저장소 이력을 건드리지 않는다.
+        requestId: `${input.taskId}-commit-sha`,
+        taskId: input.taskId,
+        tool: "run_command",
+        args: { program: "git", args: ["rev-parse", "HEAD"], cwd: "." },
+        requestedBy: input.requestedBy,
+        riskTier: "auto",
+        createdAt,
+      },
     ],
     approvalRequired: true,
   };

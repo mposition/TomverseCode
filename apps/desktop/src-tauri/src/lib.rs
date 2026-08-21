@@ -131,6 +131,21 @@ fn force_abandon_task(state: tauri::State<'_, SessionState>, task_id: String) ->
 
 /// ui-wireframes.md 3.6절 롤백. 일반 ToolRequest 경로와 이벤트 로그를 그대로 탄다.
 #[tauri::command]
+/// 이 작업이 만든 커밋을 `git revert`로 되돌린다 (19절).
+///
+/// 파일 되돌리기와 **별도 명령**인 이유: 둘은 저장소에 남기는 결과가 다르다. 하나로 합치고
+/// 내부에서 알아서 고르면, 사용자는 자기가 무엇을 눌렀는지 모른 채 이력이 바뀌는 것을 본다.
+#[tauri::command]
+async fn revert_task_commit(app: tauri::AppHandle, task_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = app.state::<SessionState>();
+        session.with_active(|active| active.host.revert_commit(&task_id))
+    })
+    .await
+    .map_err(|e| format!("되돌리기 스레드 오류: {e}"))?
+}
+
+#[tauri::command]
 async fn rollback_task(app: tauri::AppHandle, task_id: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let session = app.state::<SessionState>();
@@ -226,6 +241,7 @@ pub fn run() {
             provide_user_input,
             force_abandon_task,
             rollback_task,
+            revert_task_commit,
             get_task_events,
             list_tasks,
             get_task,

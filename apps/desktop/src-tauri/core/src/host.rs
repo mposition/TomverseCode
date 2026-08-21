@@ -17,8 +17,8 @@ use crate::store::{AppendedEvent, Store, StoreError, TerminalOutcome};
 use crate::time::now_iso;
 use crate::tools::{ToolRuntime, MAX_INLINE_OUTPUT_BYTES};
 use crate::types::{
-    ApprovalRequest, ApprovalRequestItem, PolicyDecision, TaskPolicy, ToolName, ToolRequest, ToolResult, ToolStatus,
-    VerificationPhase, VerificationReport,
+    ApprovalRequest, ApprovalRequestItem, PolicyDecision, RiskTier, TaskPolicy, ToolName, ToolRequest, ToolResult,
+    ToolStatus, VerificationPhase, VerificationReport,
 };
 use crate::verify::{CommandExecutor, VerificationRunner};
 use serde_json::{json, Value};
@@ -542,6 +542,160 @@ impl TaskHost {
 
     /// 롤백: 이 태스크가 건드린 파일을 pre-image로 되돌린다.
     /// 되돌리기도 일반 ToolRequest 경로와 이벤트 로그를 그대로 탄다(문서 10절).
+    /// 이 태스크가 만든 커밋을 `git revert`로 되돌린다 — 19절.
+    ///
+    /// # 왜 "안전하게 되돌릴 수 있을 때만" 하는가
+    ///
+    /// `git revert`는 충돌하면 저장소를 **revert 진행 중** 상태로 남긴다. 그 상태에서 빠져나오려면
+    /// `git revert --abort`가 필요한데, 그것도 승인을 거쳐야 하므로 사용자가 거부하면 충돌 마커가
+    /// 박힌 채로 남는다. 되돌리기를 눌렀는데 저장소가 더 나빠지는 것은 있을 수 없다.
+    ///
+    /// 그래서 **충돌이 불가능한 경우에만** 실행한다: 그 커밋이 아직 HEAD이고, 커밋된 경로들의
+    /// 워킹 트리가 깨끗할 때. 그 조건에서 tip 커밋을 되돌리는 것은 정의상 충돌하지 않는다.
+    /// 조건을 만족하지 못하면 **아무것도 하지 않고 이유를 돌려준다** — 사용자가 직접 판단할
+    /// 재료를 주는 것이 우리가 추측해서 이력을 건드리는 것보다 낫다.
+    ///
+    /// `reset --hard`를 쓰지 않는 이유는 19.2절에 있다.
+    pub fn revert_commit(&self, task_id: &str) -> Result<Value, String> {
+        let Some(sha) = self.committed_sha(task_id)? else {
+            return Ok(json!({
+                "reverted": false,
+                "reason": "이 작업이 만든 커밋을 특정할 수 없습니다 (커밋이 없거나 sha를 확인하지 못했습니다).",
+            }));
+        };
+
+        let head = self.git_output(task_id, &["rev-parse", "HEAD"])?;
+        if head.trim() != sha {
+            return Ok(json!({
+                "reverted": false,
+                "sha": sha,
+                // 그 위에 다른 커밋이 쌓였다. 되돌리면 충돌할 수 있고, 그 판단은 사용자의 몫이다.
+                "reason": format!(
+                    "이 작업의 커밋({sha}) 위에 다른 커밋이 쌓여 있어 충돌 없이 되돌릴 수 없습니다.                      직접 `git revert {sha}`를 실행하고 충돌을 해결하세요."
+                ),
+            }));
+        }
+
+        let paths = self.committed_paths(task_id)?;
+        let mut status_args: Vec<&str> = vec!["status", "--porcelain", "--"];
+        for path in &paths {
+            status_args.push(path.as_str());
+        }
+        let dirty = self.git_output(task_id, &status_args)?;
+        if !dirty.trim().is_empty() {
+            return Ok(json!({
+                "reverted": false,
+                "sha": sha,
+                "reason": format!(
+                    "커밋한 파일에 저장되지 않은 변경이 있어 충돌 없이 되돌릴 수 없습니다:\n{}",
+                    dirty.trim()
+                ),
+            }));
+        }
+
+        let request = self.git_request(task_id, "revert", &["revert", "--no-edit", &sha]);
+        let decision = self.gate.evaluate(&request, &self.root, &self.policy);
+        if !decision.allowed() {
+            return Ok(json!({ "reverted": false, "sha": sha, "reason": decision.reason }));
+        }
+        let token = CancellationToken::new();
+        let outcome = self.runtime.execute(&request, &decision, true, &token);
+        self.with_store(|s| s.record_tool_request(&request, "rollback", &decision))
+            .ok();
+        let payload =
+            json!({ "requestId": outcome.result.request_id, "status": outcome.result.status, "revert": true });
+        if let Ok(appended) =
+            self.with_store(|s| s.record_tool_result_with_event(&outcome.result, None, task_id, &payload))
+        {
+            self.relay(task_id, "TOOL_COMPLETED", &payload, &appended);
+        }
+        if outcome.result.status != ToolStatus::Ok {
+            return Ok(json!({
+                "reverted": false,
+                "sha": sha,
+                "reason": outcome.result.error.unwrap_or_else(|| "git revert가 실패했습니다".to_string()),
+            }));
+        }
+
+        let done = json!({ "reverted": true, "sha": sha, "paths": paths });
+        let _ = self.append_event(task_id, "ROLLBACK_COMPLETED", done.clone());
+        Ok(done)
+    }
+
+    /// 이벤트 로그에서 이 태스크가 만든 커밋 sha를 찾는다.
+    ///
+    /// 별도 컬럼에 저장하지 않는 이유: 이벤트가 진실의 원천이고(7번 원칙), 커밋 sha는 그
+    /// 이벤트에 이미 있다. 같은 사실을 두 곳에 두면 어긋날 수 있다.
+    fn committed_sha(&self, task_id: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .commit_event(task_id)?
+            .and_then(|p| p.get("sha").and_then(Value::as_str).map(str::to_string))
+            .filter(|s| !s.trim().is_empty()))
+    }
+
+    fn committed_paths(&self, task_id: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .commit_event(task_id)?
+            .and_then(|p| {
+                p.get("paths").and_then(Value::as_array).map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default())
+    }
+
+    fn commit_event(&self, task_id: &str) -> Result<Option<Value>, String> {
+        let events = self
+            .with_store(|s| s.events(task_id))
+            .map_err(|e| format!("이벤트 조회 실패: {e}"))?;
+        Ok(events
+            .into_iter()
+            .rev()
+            .find(|e| e.event_type == "GIT_COMMIT_CREATED")
+            .map(|e| e.payload))
+    }
+
+    /// 읽기 전용 git 조회. **Policy Gate와 Tool Runtime을 그대로 지난다** —
+    /// Rust가 자기 편의로 게이트를 우회하기 시작하면 게이트의 의미가 사라진다.
+    fn git_output(&self, task_id: &str, args: &[&str]) -> Result<String, String> {
+        let request = self.git_request(task_id, args[0], args);
+        let decision = self.gate.evaluate(&request, &self.root, &self.policy);
+        if !decision.allowed() {
+            return Err(format!("git {} 조회가 정책에 막혔습니다: {}", args[0], decision.reason));
+        }
+        let token = CancellationToken::new();
+        let outcome = self.runtime.execute(&request, &decision, true, &token);
+        if outcome.result.status != ToolStatus::Ok {
+            return Err(outcome
+                .result
+                .error
+                .unwrap_or_else(|| format!("git {} 실행 실패", args[0])));
+        }
+        Ok(outcome
+            .result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("stdout").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    fn git_request(&self, task_id: &str, label: &str, args: &[&str]) -> ToolRequest {
+        ToolRequest {
+            request_id: format!("{task_id}-git-{label}-{}", uuid::Uuid::new_v4()),
+            task_id: task_id.to_string(),
+            tool: ToolName::RunCommand,
+            args: json!({ "program": "git", "args": args, "cwd": "." }),
+            requested_by: json!({ "role": "orchestrator" }),
+            // Node의 1차 분류 자리다. Rust는 이 값을 판단 근거로 쓰지 않고 기록만 한다 —
+            // 실제 등급은 아래에서 `gate.evaluate`가 정한다.
+            risk_tier: Some(RiskTier::Auto),
+            created_at: Some(now_iso()),
+        }
+    }
+
     pub fn rollback(&self, task_id: &str) -> Result<Value, String> {
         let mutations = self
             .with_store(|s| s.rollback_targets(task_id))
@@ -912,6 +1066,27 @@ mod tests {
                 .push(payload.get("type").and_then(Value::as_str).unwrap_or("").to_string());
             self.payloads.lock().unwrap().push(payload.to_string());
         }
+    }
+
+    /// 테스트용 git 저장소. identity와 gpgsign을 저장소 로컬로 박는 이유는 픽스처와 같다 —
+    /// 전역 설정이 없는 환경에서 **검증하려는 것과 무관한 이유로** 실패하면 안 된다.
+    fn init_git_repo(root: &std::path::Path) {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git을 실행할 수 없습니다");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "initial"]);
     }
 
     fn host_with_sink(sink: Arc<RecordingSink>) -> (tempfile::TempDir, tempfile::TempDir, TaskHost) {
@@ -1375,6 +1550,54 @@ mod tests {
             .filter(|t| t.starts_with("TASK_") && t != "TASK_CREATED")
             .collect::<Vec<_>>();
         assert_eq!(terminal_events, vec!["TASK_COMPLETED"]);
+    }
+
+    #[test]
+    /// 19절: 커밋 sha를 모르면 **아무것도 하지 않는다.** 추측으로 이력을 건드리지 않는다.
+    #[test]
+    fn revert_does_nothing_when_the_commit_cannot_be_identified() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+
+        let result = host.revert_commit("task-1").unwrap();
+        assert_eq!(result.get("reverted").and_then(Value::as_bool), Some(false));
+        assert!(
+            result
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("특정할 수 없습니다"),
+            "{result}"
+        );
+    }
+
+    /// sha가 있어도 **그 커밋이 더 이상 HEAD가 아니면** 되돌리지 않는다.
+    ///
+    /// 그 위에 다른 커밋이 쌓였다는 것은 되돌리기가 충돌할 수 있다는 뜻이고, 충돌한 revert는
+    /// 저장소를 진행 중 상태로 남긴다 — 되돌리기를 눌렀는데 저장소가 더 나빠지면 안 된다.
+    #[test]
+    fn revert_refuses_when_the_commit_is_no_longer_head() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        init_git_repo(ws.path());
+
+        // 실제로 존재하지 않는 sha를 기록해 "HEAD가 아니다"를 만든다.
+        host.append_event(
+            "task-1",
+            "GIT_COMMIT_CREATED",
+            json!({ "sha": "0000000000000000000000000000000000000000", "paths": ["src/app.ts"], "branch": "main" }),
+        )
+        .unwrap();
+
+        let result = host.revert_commit("task-1").unwrap();
+        assert_eq!(result.get("reverted").and_then(Value::as_bool), Some(false));
+        let reason = result.get("reason").and_then(Value::as_str).unwrap_or("");
+        assert!(reason.contains("다른 커밋이 쌓여"), "{reason}");
+        // 아무것도 실행하지 않았으므로 저장소는 그대로다.
+        assert!(
+            !ws.path().join(".git/REVERT_HEAD").exists(),
+            "revert가 진행 중 상태로 남았습니다"
+        );
     }
 
     #[test]
