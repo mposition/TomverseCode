@@ -255,3 +255,24 @@ export interface UsageTotals {
   costUsd: number;
   calls: number;
 }
+
+/**
+ * `revert_task_commit`의 결과 — Rust `TaskHost::revert_commit`이 돌려주는 것과 같은 모양이다.
+ *
+ * `conflicted`와 `cleanedUp`을 **따로 두는 이유**: "충돌했다"와 "그래서 저장소가 어떤 상태인가"는
+ * 다른 사실이다. 충돌했지만 원상복구된 경우(사용자가 할 일 없음)와 충돌 후 원상복구까지 실패한
+ * 경우(저장소가 revert 진행 중, 사용자가 지금 손대야 함)를 하나의 불리언으로 합치면 화면이
+ * 후자를 전자처럼 말하게 된다.
+ */
+export interface RevertOutcome {
+  reverted: boolean;
+  sha?: string;
+  paths?: string[];
+  /** revert가 시작됐지만 충돌했는가. 시작조차 못 한 실패는 `false`다. */
+  conflicted?: boolean;
+  /** 저장소가 누르기 전 상태로 돌아왔는가. `false`면 revert 진행 중으로 남아 있다. */
+  cleanedUp?: boolean;
+  /** 충돌한 파일 — `git revert --abort` **전에** 읽은 것이라 abort 뒤에도 남는다. */
+  conflicts?: string[];
+  reason?: string;
+}

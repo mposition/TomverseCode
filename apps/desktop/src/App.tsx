@@ -11,6 +11,7 @@ import {
   type Disagreement,
   type FinalResult,
   type ProviderStatus,
+  type RevertOutcome,
   type RoutingInfo,
   type StoredEvent,
   type TaskEvent,
@@ -365,21 +366,42 @@ export default function App() {
   /**
    * 커밋 되돌리기 — `git revert`. **파일 되돌리기와 다른 동작**이라 버튼도 따로다.
    *
-   * 충돌 없이 되돌릴 수 없으면 Rust가 **아무것도 하지 않고 이유를 돌려준다.** 그 이유를 그대로
-   * 보여주는 것이, 우리가 추측해서 이력을 건드리는 것보다 낫다.
+   * 결과가 넷이고, **넷을 같은 문장으로 말하면 안 된다**(19.3절):
+   *
+   * 1. 되돌렸다 — 되돌리는 커밋이 새로 생겼다.
+   * 2. 시작조차 못 했다 — 저장소는 누르기 전과 같다. 사유를 그대로 보여준다.
+   * 3. 충돌해서 **원래대로 돌려놓았다** — 저장소는 누르기 전과 같다. 사용자가 할 일은 없고,
+   *    직접 되돌리고 싶다면 충돌 파일 목록이 출발점이다.
+   * 4. 충돌했는데 **원상복구까지 실패했다** — 저장소가 revert 진행 중으로 남았다. 사용자가
+   *    지금 손대야 하는 유일한 상태다. 3번과 같은 톤으로 말하면 "아무것도 안 바뀌었습니다"로
+   *    읽히고, 사용자는 저장소가 그 상태로 남은 줄 모른 채 다음 작업을 시작한다.
    */
   const revertCommit = useCallback(async () => {
     const id = finalResult?.taskId ?? taskId;
     if (!id) return;
     try {
-      const result = await invoke<{ reverted: boolean; sha?: string; reason?: string }>("revert_task_commit", {
-        taskId: id,
-      });
-      setNotice(
-        result.reverted
-          ? `커밋 ${(result.sha ?? "").slice(0, 8)}를 되돌리는 커밋을 만들었습니다. 이력에는 두 커밋이 모두 남습니다.`
-          : `커밋을 되돌리지 못했습니다: ${result.reason ?? "사유 없음"}`
-      );
+      const result = await invoke<RevertOutcome>("revert_task_commit", { taskId: id });
+      if (result.reverted) {
+        setNotice(
+          `커밋 ${(result.sha ?? "").slice(0, 8)}를 되돌리는 커밋을 만들었습니다. 이력에는 두 커밋이 모두 남습니다.`
+        );
+        return;
+      }
+      const conflicts = result.conflicts ?? [];
+      const conflictList = conflicts.length > 0 ? ` (${conflicts.join(", ")})` : "";
+      if (result.conflicted && result.cleanedUp === false) {
+        // 앱이 만든 상태이므로 앱이 사실을 그대로 말한다. 남은 일이 무엇인지까지.
+        setNotice(
+          `되돌리기가 충돌했고 원상복구도 실패했습니다 — 저장소가 revert 진행 중 상태입니다${conflictList}. ` +
+            `직접 \`git revert --abort\`를 실행하세요. ${result.reason ?? ""}`
+        );
+        return;
+      }
+      if (result.conflicted) {
+        setNotice(`되돌리기가 충돌해서 저장소를 원래대로 돌려놓았습니다 — 바뀐 것은 없습니다${conflictList}.`);
+        return;
+      }
+      setNotice(`커밋을 되돌리지 못했습니다: ${result.reason ?? "사유 없음"}`);
     } catch (error) {
       setNotice(`커밋 되돌리기 실패: ${String(error)}`);
     }

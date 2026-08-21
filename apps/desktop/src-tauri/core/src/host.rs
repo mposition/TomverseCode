@@ -540,20 +540,33 @@ impl TaskHost {
         Ok(json!({ "report": report }))
     }
 
-    /// 롤백: 이 태스크가 건드린 파일을 pre-image로 되돌린다.
-    /// 되돌리기도 일반 ToolRequest 경로와 이벤트 로그를 그대로 탄다(문서 10절).
     /// 이 태스크가 만든 커밋을 `git revert`로 되돌린다 — 19절.
     ///
-    /// # 왜 "안전하게 되돌릴 수 있을 때만" 하는가
+    /// # 충돌을 미리 배제하는 대신, 충돌하면 우리가 치운다
     ///
-    /// `git revert`는 충돌하면 저장소를 **revert 진행 중** 상태로 남긴다. 그 상태에서 빠져나오려면
-    /// `git revert --abort`가 필요한데, 그것도 승인을 거쳐야 하므로 사용자가 거부하면 충돌 마커가
-    /// 박힌 채로 남는다. 되돌리기를 눌렀는데 저장소가 더 나빠지는 것은 있을 수 없다.
+    /// 예전에는 **충돌이 불가능한 경우에만** 실행했다 — 그 커밋이 아직 HEAD이고 워킹 트리가
+    /// 깨끗할 때. 근거는 "충돌하면 `git revert --abort`도 승인을 받아야 하는데 사용자가 거부하면
+    /// 충돌 마커가 박힌 채 남는다"였다. 그 전제가 틀렸다: `--abort`는 새로운 작업이 아니라
+    /// **우리가 시작해 실패한 작업의 원상복구**다. 사용자는 "되돌리기"를 누르며 이 작업 하나를
+    /// 승인했고, 실패했을 때 원래대로 돌려놓는 것까지가 그 한 번의 승인 범위다. 별도 승인을
+    /// 묻는 쪽이 오히려 저장소를 망가진 채로 둘 수 있는 길이었다.
     ///
-    /// 그래서 **충돌이 불가능한 경우에만** 실행한다: 그 커밋이 아직 HEAD이고, 커밋된 경로들의
-    /// 워킹 트리가 깨끗할 때. 그 조건에서 tip 커밋을 되돌리는 것은 정의상 충돌하지 않는다.
-    /// 조건을 만족하지 못하면 **아무것도 하지 않고 이유를 돌려준다** — 사용자가 직접 판단할
-    /// 재료를 주는 것이 우리가 추측해서 이력을 건드리는 것보다 낫다.
+    /// 그래서 HEAD 조건을 버린다. 그 위에 다른 커밋이 쌓였어도 대부분은 깨끗하게 되돌아가고,
+    /// 안 되면 되돌려 놓으면 된다. 사용자에게 "직접 하세요"라고 미루던 경우의 대부분이
+    /// 사실은 우리가 해줄 수 있는 일이었다.
+    ///
+    /// # 워킹 트리 검사만 남긴다
+    ///
+    /// 커밋한 경로에 저장되지 않은 변경이 있으면 여전히 시작하지 않는다. 그건 실패했을 때
+    /// **사용자가 아직 저장하지 않은 작업**이 위험해지는 유일한 경우이고, `--abort`가 그것까지
+    /// 지켜준다고 보장할 수 없기 때문이다. 우리가 만든 상태는 우리가 되돌릴 수 있지만
+    /// 사용자가 만든 상태는 되돌릴 수 없다 — 이 비대칭이 두 조건의 운명을 갈랐다.
+    ///
+    /// # 남의 revert 위에서는 시작하지 않는다
+    ///
+    /// 시작 전에 `REVERT_HEAD`가 이미 있으면 거부한다. 진행 중인 revert가 있다는 뜻이고,
+    /// 그 위에서 우리가 실패해 `--abort`를 부르면 **사용자가 하던 작업을 지운다.** 실패 후에도
+    /// 같은 것을 다시 확인해서, 그 `REVERT_HEAD`가 **이번 실행이 만든 것일 때만** 치운다.
     ///
     /// `reset --hard`를 쓰지 않는 이유는 19.2절에 있다.
     pub fn revert_commit(&self, task_id: &str) -> Result<Value, String> {
@@ -564,15 +577,13 @@ impl TaskHost {
             }));
         };
 
-        let head = self.git_output(task_id, &["rev-parse", "HEAD"])?;
-        if head.trim() != sha {
+        if self.git_ref_exists(task_id, "REVERT_HEAD")? {
             return Ok(json!({
                 "reverted": false,
                 "sha": sha,
-                // 그 위에 다른 커밋이 쌓였다. 되돌리면 충돌할 수 있고, 그 판단은 사용자의 몫이다.
-                "reason": format!(
-                    "이 작업의 커밋({sha}) 위에 다른 커밋이 쌓여 있어 충돌 없이 되돌릴 수 없습니다.                      직접 `git revert {sha}`를 실행하고 충돌을 해결하세요."
-                ),
+                "conflicted": false,
+                "cleanedUp": true,
+                "reason": "이미 진행 중인 revert가 있습니다. 되돌리기가 실패하면 그것까지 취소해 버리므로 시작하지 않습니다 — 진행 중인 revert를 먼저 끝내거나 `git revert --abort`로 정리한 뒤 다시 시도하세요.",
             }));
         }
 
@@ -586,39 +597,90 @@ impl TaskHost {
             return Ok(json!({
                 "reverted": false,
                 "sha": sha,
+                "conflicted": false,
+                "cleanedUp": true,
                 "reason": format!(
-                    "커밋한 파일에 저장되지 않은 변경이 있어 충돌 없이 되돌릴 수 없습니다:\n{}",
+                    "커밋한 파일에 저장되지 않은 변경이 있습니다. 되돌리기가 충돌하면 이 변경까지 위험해지므로 실행하지 않습니다 — 저장하거나 따로 보관한 뒤 다시 시도하세요:\n{}",
                     dirty.trim()
                 ),
             }));
         }
 
-        let request = self.git_request(task_id, "revert", &["revert", "--no-edit", &sha]);
-        let decision = self.gate.evaluate(&request, &self.root, &self.policy);
-        if !decision.allowed() {
-            return Ok(json!({ "reverted": false, "sha": sha, "reason": decision.reason }));
-        }
-        let token = CancellationToken::new();
-        let outcome = self.runtime.execute(&request, &decision, true, &token);
-        self.with_store(|s| s.record_tool_request(&request, "rollback", &decision))
-            .ok();
-        let payload =
-            json!({ "requestId": outcome.result.request_id, "status": outcome.result.status, "revert": true });
-        if let Ok(appended) =
-            self.with_store(|s| s.record_tool_result_with_event(&outcome.result, None, task_id, &payload))
-        {
-            self.relay(task_id, "TOOL_COMPLETED", &payload, &appended);
-        }
-        if outcome.result.status != ToolStatus::Ok {
-            return Ok(json!({
-                "reverted": false,
-                "sha": sha,
-                "reason": outcome.result.error.unwrap_or_else(|| "git revert가 실패했습니다".to_string()),
-            }));
+        let (ok, _out, err) = self.git_try(task_id, "revert", &["revert", "--no-edit", &sha], true)?;
+        if !ok {
+            return self.abort_failed_revert(task_id, &sha, err);
         }
 
         let done = json!({ "reverted": true, "sha": sha, "paths": paths });
         let _ = self.append_event(task_id, "ROLLBACK_COMPLETED", done.clone());
+        Ok(done)
+    }
+
+    /// 실패한 `git revert`의 원상복구.
+    ///
+    /// **별도 승인을 묻지 않는다** — 사용자가 누른 "되돌리기" 한 번의 승인 범위 안이다
+    /// (위 주석). 여기서 다시 물으면 거부당했을 때 우리가 만든 충돌 상태를 사용자에게
+    /// 떠넘기게 된다.
+    fn abort_failed_revert(&self, task_id: &str, sha: &str, error: String) -> Result<Value, String> {
+        // revert가 **시작조차 못 한** 경우가 있다: 잘못된 sha, 인덱스에 남은 변경, 머지 커밋.
+        // 그때는 치울 것이 없고, 치우려 들면 남의 상태를 건드린다.
+        if !self.git_ref_exists(task_id, "REVERT_HEAD")? {
+            return Ok(json!({
+                "reverted": false,
+                "sha": sha,
+                "conflicted": false,
+                "cleanedUp": true,
+                "reason": format!("되돌리기를 시작하지 못했습니다: {}", error.trim()),
+            }));
+        }
+
+        // 어떤 파일이 충돌했는지는 `--abort` 뒤에는 알 수 없다. **지우기 전에** 읽어 둔다 —
+        // 사용자가 다음에 무엇을 해야 하는지는 이 목록에 달려 있다.
+        let conflicts: Vec<String> = self
+            .git_output(task_id, &["diff", "--name-only", "--diff-filter=U"])
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        let (aborted, _out, abort_err) = self.git_try(task_id, "revert-abort", &["revert", "--abort"], true)?;
+        if !aborted {
+            // 여기까지 오면 저장소가 revert 진행 중인 채로 남는다. **조용히 넘기지 않는다** —
+            // 사용자가 모르면 다음 작업이 전부 그 상태 위에서 벌어진다.
+            let done = json!({
+                "reverted": false,
+                "sha": sha,
+                "conflicted": true,
+                "cleanedUp": false,
+                "conflicts": conflicts,
+                "reason": format!(
+                    "되돌리기가 충돌했고, 원상복구(`git revert --abort`)까지 실패했습니다. \
+                     저장소가 revert 진행 중 상태로 남아 있습니다 — 직접 `git revert --abort`를 실행하세요.\n{}",
+                    abort_err.trim()
+                ),
+            });
+            let _ = self.append_event(task_id, "ROLLBACK_FAILED", done.clone());
+            return Ok(done);
+        }
+
+        let done = json!({
+            "reverted": false,
+            "sha": sha,
+            "conflicted": true,
+            "cleanedUp": true,
+            "conflicts": conflicts,
+            "reason": format!(
+                "되돌리기가 충돌해서 저장소를 원래대로 돌려놓았습니다 (아무것도 바뀌지 않았습니다). \
+                 충돌한 파일: {}. 되돌리려면 직접 `git revert {}`를 실행하고 충돌을 해결하세요.",
+                if conflicts.is_empty() { "(목록 없음)".to_string() } else { conflicts.join(", ") },
+                sha
+            ),
+        });
+        // 충돌해서 되돌리지 못한 것도 **이벤트로 남는다.** 저장소가 시작 전과 같다는 것은
+        // 아무 일도 없었다는 뜻이 아니다 — 사용자가 되돌리기를 눌렀고 우리가 하지 못했다.
+        let _ = self.append_event(task_id, "ROLLBACK_FAILED", done.clone());
         Ok(done)
     }
 
@@ -657,29 +719,98 @@ impl TaskHost {
             .map(|e| e.payload))
     }
 
-    /// 읽기 전용 git 조회. **Policy Gate와 Tool Runtime을 그대로 지난다** —
-    /// Rust가 자기 편의로 게이트를 우회하기 시작하면 게이트의 의미가 사라진다.
+    /// 읽기 전용 git 조회. 0이 아닌 종료 코드는 `Err`다.
     fn git_output(&self, task_id: &str, args: &[&str]) -> Result<String, String> {
-        let request = self.git_request(task_id, args[0], args);
+        let (ok, stdout, stderr) = self.git_try(task_id, args[0], args, false)?;
+        if !ok {
+            return Err(format!("git {} 실패: {}", args[0], stderr.trim()));
+        }
+        Ok(stdout)
+    }
+
+    /// git 명령 하나를 실행하고 `(성공, stdout, stderr)`를 준다.
+    /// **Policy Gate와 Tool Runtime을 그대로 지난다** — Rust가 자기 편의로 게이트를 우회하기
+    /// 시작하면 게이트의 의미가 사라진다.
+    ///
+    /// # `ToolStatus::Ok`을 성공으로 읽으면 안 된다
+    ///
+    /// `run_command`는 0이 아닌 종료 코드를 "도구 실행 실패"가 아니라 "명령이 실패했다"는
+    /// **사실**로 다루기 때문에 `status`는 `Ok`로 두고 `exitCode`만 남긴다(tools/mod.rs).
+    /// 그래서 성공 판정은 반드시 `exitCode == 0`까지 봐야 한다. 예전 `revert_commit`은
+    /// `status`만 보고 판정해서 **충돌한 revert를 "되돌렸습니다"로 보고할 수 있었다** —
+    /// tip 커밋만 되돌린다는 조건이 그 경우를 우연히 막고 있었을 뿐이고, 그 조건을 없애는
+    /// 순간 드러났을 결함이다.
+    ///
+    /// # 0이 아닌 종료를 `Err`로 만들지 않는 이유
+    ///
+    /// `revert`의 충돌이나 `rev-parse --verify`의 "그런 ref 없음"처럼 **0이 아닌 종료가 답
+    /// 그 자체**인 호출이 있다. 그것들을 오류로 뭉개면 호출부가 다시 문자열을 뒤져야 한다.
+    ///
+    /// `record`는 감사 로그에 남길지다. 상태를 묻기만 하는 내부 조회(`REVERT_HEAD`가 있는가)까지
+    /// 남기면 이벤트 로그가 사용자가 읽을 수 없는 것으로 가득 찬다 — 남기는 것은 **저장소를
+    /// 바꾸는 명령**뿐이다.
+    fn git_try(
+        &self,
+        task_id: &str,
+        label: &str,
+        args: &[&str],
+        record: bool,
+    ) -> Result<(bool, String, String), String> {
+        let request = self.git_request(task_id, label, args);
         let decision = self.gate.evaluate(&request, &self.root, &self.policy);
         if !decision.allowed() {
-            return Err(format!("git {} 조회가 정책에 막혔습니다: {}", args[0], decision.reason));
+            return Err(format!("git {}이(가) 정책에 막혔습니다: {}", args[0], decision.reason));
         }
         let token = CancellationToken::new();
         let outcome = self.runtime.execute(&request, &decision, true, &token);
+
+        if record {
+            self.with_store(|s| s.record_tool_request(&request, "rollback", &decision))
+                .ok();
+            let payload = json!({
+                "requestId": outcome.result.request_id,
+                "status": outcome.result.status,
+                "revert": true,
+            });
+            if let Ok(appended) =
+                self.with_store(|s| s.record_tool_result_with_event(&outcome.result, None, task_id, &payload))
+            {
+                self.relay(task_id, "TOOL_COMPLETED", &payload, &appended);
+            }
+        }
+
+        // 여기 걸리는 것은 spawn 실패·타임아웃·취소처럼 **명령의 결과를 얻지 못한** 경우다.
         if outcome.result.status != ToolStatus::Ok {
             return Err(outcome
                 .result
                 .error
                 .unwrap_or_else(|| format!("git {} 실행 실패", args[0])));
         }
-        Ok(outcome
+        let text = |name: &str| {
+            outcome
+                .result
+                .output
+                .as_ref()
+                .and_then(|o| o.get(name).and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let exit = outcome
             .result
             .output
             .as_ref()
-            .and_then(|o| o.get("stdout").and_then(Value::as_str))
-            .unwrap_or_default()
-            .to_string())
+            .and_then(|o| o.get("exitCode").and_then(Value::as_i64));
+        Ok((exit == Some(0), text("stdout"), text("stderr")))
+    }
+
+    /// ref가 존재하는가. 진행 중인 revert를 `REVERT_HEAD`로 감지하는 데 쓴다.
+    ///
+    /// `.git/REVERT_HEAD` 파일을 직접 보지 않는 이유: worktree나 `--git-dir`에서 그 경로가
+    /// 달라진다. git에게 묻는 것이 어디서나 맞는 유일한 방법이다.
+    fn git_ref_exists(&self, task_id: &str, name: &str) -> Result<bool, String> {
+        let (ok, _out, _err) =
+            self.git_try(task_id, "rev-parse", &["rev-parse", "--verify", "--quiet", name], false)?;
+        Ok(ok)
     }
 
     fn git_request(&self, task_id: &str, label: &str, args: &[&str]) -> ToolRequest {
@@ -696,6 +827,8 @@ impl TaskHost {
         }
     }
 
+    /// 롤백: 이 태스크가 건드린 파일을 pre-image로 되돌린다.
+    /// 되돌리기도 일반 ToolRequest 경로와 이벤트 로그를 그대로 탄다(문서 10절).
     pub fn rollback(&self, task_id: &str) -> Result<Value, String> {
         let mutations = self
             .with_store(|s| s.rollback_targets(task_id))
@@ -1070,6 +1203,33 @@ mod tests {
 
     /// 테스트용 git 저장소. identity와 gpgsign을 저장소 로컬로 박는 이유는 픽스처와 같다 —
     /// 전역 설정이 없는 환경에서 **검증하려는 것과 무관한 이유로** 실패하면 안 된다.
+    /// 테스트가 저장소 상태를 만들 때 쓰는 git. 종료 코드를 검사하지 않는다 —
+    /// 충돌하는 revert를 **일부러** 만드는 테스트가 있기 때문이다.
+    fn git_at(root: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("git을 실행할 수 없습니다");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// 이 태스크가 만든 커밋 하나를 흉내낸다: 파일을 바꾸고 커밋한 뒤 그 sha를 이벤트에 남긴다.
+    fn commit_as_task(host: &TaskHost, root: &std::path::Path, task_id: &str, body: &str) -> String {
+        fs::write(root.join("src/app.ts"), body).unwrap();
+        git_at(root, &["add", "-A"]);
+        git_at(root, &["commit", "-m", "task commit"]);
+        let sha = git_at(root, &["rev-parse", "HEAD"]).trim().to_string();
+        host.append_event(
+            task_id,
+            "GIT_COMMIT_CREATED",
+            json!({ "sha": sha, "paths": ["src/app.ts"], "branch": "main" }),
+        )
+        .unwrap();
+        sha
+    }
+
     fn init_git_repo(root: &std::path::Path) {
         let git = |args: &[&str]| {
             std::process::Command::new("git")
@@ -1552,7 +1712,6 @@ mod tests {
         assert_eq!(terminal_events, vec!["TASK_COMPLETED"]);
     }
 
-    #[test]
     /// 19절: 커밋 sha를 모르면 **아무것도 하지 않는다.** 추측으로 이력을 건드리지 않는다.
     #[test]
     fn revert_does_nothing_when_the_commit_cannot_be_identified() {
@@ -1571,17 +1730,16 @@ mod tests {
         );
     }
 
-    /// sha가 있어도 **그 커밋이 더 이상 HEAD가 아니면** 되돌리지 않는다.
+    /// revert가 **시작조차 못 한** 경우는 충돌이 아니다.
     ///
-    /// 그 위에 다른 커밋이 쌓였다는 것은 되돌리기가 충돌할 수 있다는 뜻이고, 충돌한 revert는
-    /// 저장소를 진행 중 상태로 남긴다 — 되돌리기를 눌렀는데 저장소가 더 나빠지면 안 된다.
+    /// 존재하지 않는 sha는 git이 아무것도 만들기 전에 거절한다. 치울 것이 없으므로
+    /// `--abort`를 부르면 안 된다 — 그때 `REVERT_HEAD`가 있다면 그건 **남의 것**이다.
     #[test]
-    fn revert_refuses_when_the_commit_is_no_longer_head() {
+    fn revert_that_never_started_is_not_reported_as_a_conflict() {
         let sink = Arc::new(RecordingSink::default());
         let (ws, _art, host) = host_with_sink(sink);
         init_git_repo(ws.path());
 
-        // 실제로 존재하지 않는 sha를 기록해 "HEAD가 아니다"를 만든다.
         host.append_event(
             "task-1",
             "GIT_COMMIT_CREATED",
@@ -1591,12 +1749,100 @@ mod tests {
 
         let result = host.revert_commit("task-1").unwrap();
         assert_eq!(result.get("reverted").and_then(Value::as_bool), Some(false));
-        let reason = result.get("reason").and_then(Value::as_str).unwrap_or("");
-        assert!(reason.contains("다른 커밋이 쌓여"), "{reason}");
-        // 아무것도 실행하지 않았으므로 저장소는 그대로다.
+        assert_eq!(result.get("conflicted").and_then(Value::as_bool), Some(false));
+        assert_eq!(result.get("cleanedUp").and_then(Value::as_bool), Some(true));
         assert!(
             !ws.path().join(".git/REVERT_HEAD").exists(),
             "revert가 진행 중 상태로 남았습니다"
+        );
+    }
+
+    /// **충돌하는 revert를 시도하고, 실패하면 우리가 되돌려 놓는다.**
+    ///
+    /// 예전에는 이 상황(커밋 위에 다른 커밋이 쌓임)에서 아무것도 하지 않고 거절했다. 지금은
+    /// 시도한다 — 실패해도 저장소가 시작 전과 같아야 한다는 것이 이 테스트의 계약이다.
+    ///
+    /// 이 테스트가 없으면 조용히 깨지는 것: `run_command`는 0이 아닌 종료 코드를 `ToolStatus::Ok`로
+    /// 보고하므로(tools/mod.rs), `status`만 보는 코드는 **충돌한 revert를 성공으로 읽는다.**
+    #[test]
+    fn revert_cleans_up_after_a_conflicting_revert() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        init_git_repo(ws.path());
+
+        // 이 태스크의 커밋: 가운데 줄을 바꾼다.
+        commit_as_task(&host, ws.path(), "task-1", "a\nB2\nc\n");
+        // 그 위에 **같은 줄을** 바꾼 커밋이 쌓인다 → revert는 반드시 충돌한다.
+        fs::write(ws.path().join("src/app.ts"), "a\nB3\nc\n").unwrap();
+        git_at(ws.path(), &["add", "-A"]);
+        git_at(ws.path(), &["commit", "-m", "someone else"]);
+
+        let result = host.revert_commit("task-1").unwrap();
+        assert_eq!(result.get("reverted").and_then(Value::as_bool), Some(false), "{result}");
+        assert_eq!(
+            result.get("conflicted").and_then(Value::as_bool),
+            Some(true),
+            "{result}"
+        );
+        assert_eq!(result.get("cleanedUp").and_then(Value::as_bool), Some(true), "{result}");
+
+        // 충돌한 파일 목록은 `--abort` **전에** 읽어야만 남는다.
+        let conflicts = result
+            .get("conflicts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            conflicts.iter().any(|c| c.as_str() == Some("src/app.ts")),
+            "충돌 파일 목록이 비었습니다: {result}"
+        );
+
+        // 저장소가 시작 전과 같다는 것은 **아무 일도 없었다는 뜻이 아니다** — 사용자가
+        // 되돌리기를 눌렀고 우리가 하지 못했다는 사실이 이벤트로 남는다.
+        let types = host.with_store(|s| s.event_types("task-1")).unwrap();
+        assert!(types.contains(&"ROLLBACK_FAILED".to_string()), "{types:?}");
+        assert!(!types.contains(&"ROLLBACK_COMPLETED".to_string()), "{types:?}");
+
+        // 저장소는 시작 전과 같다: 진행 중인 revert도, 충돌 마커도, 미커밋 변경도 없다.
+        assert!(
+            !ws.path().join(".git/REVERT_HEAD").exists(),
+            "revert가 진행 중 상태로 남았습니다"
+        );
+        assert_eq!(fs::read_to_string(ws.path().join("src/app.ts")).unwrap(), "a\nB3\nc\n");
+        assert_eq!(git_at(ws.path(), &["status", "--porcelain"]).trim(), "");
+    }
+
+    /// **남이 시작한 revert 위에서는 시작하지 않는다.**
+    ///
+    /// 우리가 실패했을 때 부르는 `git revert --abort`는 진행 중인 revert를 구별하지 않는다.
+    /// 사용자가 손으로 충돌을 절반쯤 풀어 놓은 상태에서 우리가 그걸 부르면 그 작업이 사라진다.
+    /// 그래서 시작 전 `REVERT_HEAD` 검사는 **워킹 트리 검사보다 먼저**다.
+    #[test]
+    fn revert_refuses_while_another_revert_is_in_progress() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        init_git_repo(ws.path());
+
+        let sha = commit_as_task(&host, ws.path(), "task-1", "a\nB2\nc\n");
+        fs::write(ws.path().join("src/app.ts"), "a\nB3\nc\n").unwrap();
+        git_at(ws.path(), &["add", "-A"]);
+        git_at(ws.path(), &["commit", "-m", "someone else"]);
+
+        // 사용자가 직접 같은 revert를 시작해 충돌 상태에 있다.
+        git_at(ws.path(), &["revert", "--no-edit", &sha]);
+        assert!(
+            ws.path().join(".git/REVERT_HEAD").exists(),
+            "테스트 전제가 성립하지 않았습니다"
+        );
+
+        let result = host.revert_commit("task-1").unwrap();
+        assert_eq!(result.get("reverted").and_then(Value::as_bool), Some(false), "{result}");
+        let reason = result.get("reason").and_then(Value::as_str).unwrap_or("");
+        assert!(reason.contains("이미 진행 중인 revert"), "{reason}");
+        // 사용자의 진행 중 상태를 건드리지 않았다.
+        assert!(
+            ws.path().join(".git/REVERT_HEAD").exists(),
+            "사용자가 진행 중이던 revert를 지웠습니다"
         );
     }
 

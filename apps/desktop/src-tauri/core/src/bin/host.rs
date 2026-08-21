@@ -199,7 +199,7 @@ fn usage() -> String {
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
      tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
      show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다\n\
-     revert  — 이 작업이 만든 커밋을 git revert로 되돌린다 (충돌 없이 가능할 때만)\n\
+     revert  — 이 작업이 만든 커밋을 git revert로 되돌린다 (0=되돌림, 1=되돌리지 않음·저장소 그대로, 2=revert 진행 중으로 남음)\n\
      metrics — 기준 계측(커버리지/충돌 결말)을 JSON으로 집계한다. 읽기 전용.\n\
                [--all-workspaces]로 워크스페이스 필터를 끈다"
         .to_string()
@@ -377,8 +377,12 @@ fn real_main() -> Result<i32, String> {
             );
             let result = host.revert_commit(&task_id)?;
             println!("{result}");
+            // 종료 코드로 세 결말을 구별한다. "되돌리지 못했다"와 "되돌리지 못한 데다 저장소가
+            // revert 진행 중으로 남았다"를 같은 1로 보고하면, 스크립트가 후자를 알아챌 방법이 없다.
             Ok(if result.get("reverted").and_then(Value::as_bool) == Some(true) {
                 0
+            } else if result.get("cleanedUp").and_then(Value::as_bool) == Some(false) {
+                2
             } else {
                 1
             })

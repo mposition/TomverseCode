@@ -303,6 +303,7 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
   다르게 만들 수 없다 — 둘 다 처음부터 소비해 **언제나 같은 산출물**이 나오고, 대조 테스트가
   아무것도 검증하지 못한 채 통과한다. 모델별로 나누려면 `scriptByModel`을 쓸 것. 같은 이유로
   `proposalId`에도 모델 ID가 들어간다(둘 다 cursor가 1이라 id가 겹쳤다).
+- **`ToolStatus::Ok`은 "명령이 성공했다"가 아니다.** `run_command`는 0이 아닌 종료 코드를 "도구 실행 실패"가 아니라 **"명령이 실패했다"는 사실**로 다뤄 `status`를 `Ok`로 두고 `exitCode`만 남긴다(검증 러너가 그 구분을 필요로 하기 때문이다). `status`만 보고 성공을 판정하면 **실패한 명령이 성공으로 읽힌다** — `revert_commit`이 실제로 그랬고, "tip 커밋만 되돌린다"는 우연한 조건이 그 결함을 가리고 있었다. git 호출은 `git_try`가 `(성공, stdout, stderr)`로 감싸고 성공 판정은 `exitCode == 0`이다.
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트

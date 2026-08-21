@@ -630,6 +630,67 @@ test("커밋한 작업은 revert로 되돌릴 수 있고, 이력에는 두 커�
   }
 });
 
+test("충돌하는 revert는 시도하되, 실패하면 저장소를 원래대로 돌려놓는다", () => {
+  // 19.3절: 예전에는 이 상황(커밋 위에 다른 커밋이 쌓임)에서 아무것도 하지 않고 거절했다.
+  // 지금은 시도한다 — **실패해도 저장소가 시작 전과 같다**는 것이 계약이고, 그것을
+  // 확인할 수 있는 곳은 실제 git이 도는 여기뿐이다.
+  const repo = createFixtureRepo({ gitRepo: true });
+  const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
+  try {
+    const run = runHost(repo, stateDir, { mode: "fast", allowGitCommit: true });
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+
+    // 누군가 같은 파일을 통째로 다시 썼다 — revert의 역hunk가 붙을 자리가 사라진다.
+    repo.write("paginate.js", "// 다른 사람이 이 파일을 통째로 다시 썼다\nexport const totalPages = () => 1;\n");
+    execFileSync("git", ["add", "-A"], { cwd: repo.root, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "rewrite paginate"], { cwd: repo.root, stdio: "ignore" });
+
+    const afterOther = gitLogSubjects(repo.root);
+    const rewritten = repo.read("paginate.js");
+
+    const result = spawnSync(
+      HOST_BIN,
+      [
+        "revert",
+        "--workspace",
+        repo.root,
+        "--task",
+        run.taskId,
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+      ],
+      { encoding: "utf8", env: process.env }
+    );
+    const payload = JSON.parse((result.stdout ?? "").trim().split("\n").filter(Boolean).pop() as string) as {
+      reverted: boolean;
+      conflicted?: boolean;
+      cleanedUp?: boolean;
+      conflicts?: string[];
+      reason?: string;
+    };
+
+    assert.equal(payload.reverted, false, result.stdout);
+    assert.equal(payload.conflicted, true, `충돌로 보고되지 않았습니다: ${result.stdout}`);
+    assert.equal(payload.cleanedUp, true, `원상복구되지 않았습니다: ${result.stdout}`);
+    // 충돌 파일 목록은 `--abort` **전에** 읽어야만 남는다 — 사용자가 직접 되돌릴 때의 출발점이다.
+    assert.deepEqual(payload.conflicts, ["paginate.js"], JSON.stringify(payload.conflicts));
+    // "되돌리지 못했다"이지 "저장소가 망가졌다"가 아니다.
+    assert.equal(result.status, 1, `종료 코드: ${result.status}\n${result.stdout}`);
+
+    // **저장소가 시작 전과 같다.** 이게 이 기능을 열 수 있게 한 조건 그 자체다.
+    assert.ok(!existsSync(path.join(repo.root, ".git", "REVERT_HEAD")), "revert 진행 중 상태로 남았습니다");
+    assert.deepEqual(gitLogSubjects(repo.root), afterOther, "이력이 바뀌었습니다");
+    assert.equal(repo.read("paginate.js"), rewritten, "파일이 바뀌었습니다");
+    const status = execFileSync("git", ["status", "--porcelain"], { cwd: repo.root, encoding: "utf8" });
+    assert.equal(status.trim(), "", `충돌 마커나 미커밋 변경이 남았습니다: ${status}`);
+  } finally {
+    repo.cleanup();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("커밋이 없는 작업에는 커밋 되돌리기를 제안하지 않는다", () => {
   // 추측으로 이력을 건드리지 않는다 — 커밋을 특정할 수 없으면 아무것도 하지 않는다.
   const repo = createFixtureRepo({ gitRepo: true });

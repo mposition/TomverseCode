@@ -76,7 +76,16 @@ export type TaskEventType =
   | "TASK_CANCELLED"
   | "TASK_REJECTED"
   | "ROLLBACK_STARTED"
-  | "ROLLBACK_COMPLETED";
+  | "ROLLBACK_COMPLETED"
+  /**
+   * 되돌리기를 시작했는데 되돌리지 못했다 — 지금은 충돌한 `git revert`가 유일한 출처다(19.3절).
+   *
+   * `ROLLBACK_COMPLETED`의 반대이지 "아무 일도 없었다"가 아니다. payload의 `cleanedUp`이
+   * **저장소가 지금 어떤 상태인가**를 말한다: `true`면 우리가 원래대로 돌려놓았고, `false`면
+   * revert 진행 중으로 남아 있다. 후자는 사용자가 손대야 하는 상태이므로 이벤트로 남겨야
+   * 나중에 "왜 이 저장소가 이 꼴인가"를 되짚을 수 있다.
+   */
+  | "ROLLBACK_FAILED";
 
 export interface TaskEvent<TPayload = unknown> {
   /** SQLite AUTOINCREMENT — 삽입 전에는 없다. */
