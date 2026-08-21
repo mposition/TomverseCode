@@ -162,12 +162,12 @@ fn list_tasks(
 #[tauri::command]
 fn get_task(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
     let task = state.get_task(&task_id)?;
-    let mutated = if task.is_some() {
-        state.task_mutations(&task_id)?
+    let (mutated, criteria) = if task.is_some() {
+        (state.task_mutations(&task_id)?, state.task_acceptance_criteria(&task_id)?)
     } else {
-        Vec::new()
+        (Vec::new(), Value::Null)
     };
-    Ok(json!({ "task": task, "mutatedPaths": mutated }))
+    Ok(json!({ "task": task, "mutatedPaths": mutated, "acceptanceCriteria": criteria }))
 }
 
 /// 저장된 작업을 **새 task_id로** 처음부터 다시 실행한다 (부분 재개가 아니다).

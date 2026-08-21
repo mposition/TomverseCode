@@ -244,6 +244,9 @@ impl TaskHost {
 
     /// 이벤트 로그 기록 + UI 릴레이. 이벤트 없이 상태가 바뀌지 않도록 모든 상태 변화가 이걸 지난다.
     pub fn append_event(&self, task_id: &str, event_type: &str, payload: Value) -> Result<Value, String> {
+        // 사용자 판정 원문은 저장 **전에** Rust가 가린다. Node가 스스로 가리게 두면
+        // 장악당한 Node에서 그 규칙이 사라진다(process-architecture.md 2절).
+        let payload = redact_user_decision(event_type, payload);
         let appended = self
             .with_store(|s| s.append_event(task_id, event_type, &payload))
             .map_err(|e| format!("이벤트 기록 실패: {e}"))?;
@@ -710,6 +713,52 @@ fn redact_args(args: &Value) -> Value {
     Value::Object(out)
 }
 
+/// `USER_DECISION_RECORDED`의 자유 텍스트에서 비밀값 모양을 가린다.
+///
+/// # 왜 이 이벤트만인가
+///
+/// 마스킹을 모든 이벤트에 걸면 `DRAFT_RECEIVED.patch`처럼 **원문 그대로여야 의미가 있는**
+/// 기록까지 변형된다. 감사 로그의 patch가 실제 적용된 patch와 다르면 그 로그는 감사에 쓸 수 없다.
+/// 그래서 대상을 "사용자가 자유 입력한 텍스트"로 좁힌다 — 여기가 붙여넣기가 실제로 일어나는
+/// 자리이고(문서 17.3절), 여기서는 마스킹된 텍스트가 원문의 역할을 그대로 한다.
+///
+/// 마스킹 **개수**를 payload에 남기는 이유: 0이 아니면 "가린 것이 있었다"가 로그에 보인다.
+/// 이건 "남은 것이 없다"는 주장이 아니다 — 모양 기반 탐지의 한계는 `secrets` 모듈에 적어두었다.
+fn redact_user_decision(event_type: &str, payload: Value) -> Value {
+    if event_type != "USER_DECISION_RECORDED" {
+        return payload;
+    }
+    let mut value = payload;
+    let mut total_masked = 0usize;
+
+    if let Some(Value::String(answer)) = value.get("answer") {
+        let (masked, count) = secrets::mask_secret_shapes(answer);
+        total_masked += count;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("answer".to_string(), Value::String(masked));
+        }
+    }
+    // 기준 텍스트는 답변 원문에서 만들어지므로 같은 값이 한 번 더 들어 있다.
+    // 한쪽만 가리면 다른 쪽으로 그대로 새고, 그 사본이 파생 캐시에까지 들어간다.
+    if let Some(items) = value.get_mut("acceptanceCriteria").and_then(Value::as_array_mut) {
+        for item in items {
+            let Some(Value::String(text)) = item.get("text") else {
+                continue;
+            };
+            let (masked, count) = secrets::mask_secret_shapes(text);
+            total_masked += count;
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("text".to_string(), Value::String(masked));
+            }
+        }
+    }
+
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("secretShapesMasked".to_string(), json!(total_masked));
+    }
+    value
+}
+
 /// `APPROVAL_REQUESTED` 이벤트용 축약. 승인 모달로 가는 원본은 건드리지 않는다.
 ///
 /// `preview`만 제거하는 이유: 나머지 필드(tool, riskLevel, reason, command argv, path)는
@@ -855,6 +904,81 @@ mod tests {
             Arc::new(CancellationRegistry::new()),
         );
         (ws, art, host)
+    }
+
+    /// 문서 17.3절: 판정 원문은 남되 비밀값 모양은 가려야 한다.
+    ///
+    /// **Node가 보낸 payload를 그대로 믿지 않는 경로를 검증한다.** Node가 마스킹하고 보내주기를
+    /// 기대하면, 장악당한 Node에서 그 규칙이 사라진다(원칙 2). 그래서 마스킹은 저장 직전
+    /// Rust에서 일어나고, DB와 UI 릴레이 **양쪽**에 가려진 값이 간다.
+    #[test]
+    fn user_decision_keeps_the_answer_but_masks_secret_shapes() {
+        const PASTED: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink.clone());
+
+        host.append_event(
+            "task-1",
+            "USER_DECISION_RECORDED",
+            json!({
+                "questions": ["빈 문자열 이메일은 통과입니까, 거부입니까?"],
+                "answer": format!("거부해주세요. 토큰은 {PASTED} 입니다"),
+                "acceptanceCriteria": [{
+                    "criterionId": "u-1",
+                    "text": format!("거부해주세요. 토큰은 {PASTED} 입니다"),
+                    "source": "user_decision",
+                    "decidedAt": "2024-01-01T00:00:00Z",
+                }],
+            }),
+        )
+        .unwrap();
+
+        let stored = host
+            .with_store(|s| s.events("task-1"))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "USER_DECISION_RECORDED")
+            .expect("USER_DECISION_RECORDED가 기록되지 않았습니다");
+        let payload = stored.payload.to_string();
+
+        assert!(
+            !payload.contains(PASTED),
+            "붙여넣은 토큰이 이벤트에 남았습니다:\n{payload}"
+        );
+        // 원문이 통째로 사라지면 판정자의 판정이 다시 감사 로그에서 없어진다 — 그게 이 작업이 고친 구멍이다.
+        assert!(payload.contains("거부해주세요"), "판정 원문이 사라졌습니다:\n{payload}");
+        assert_eq!(
+            stored.payload.get("secretShapesMasked").and_then(Value::as_u64),
+            Some(2)
+        );
+
+        // 파생 캐시에도 가려진 값이 들어가야 한다. 한쪽만 막으면 다른 쪽으로 샌다.
+        let criteria = host.with_store(|s| s.acceptance_criteria("task-1")).unwrap();
+        assert_eq!(criteria.len(), 1);
+        assert!(!criteria[0].text.contains(PASTED), "파생 캐시에 토큰이 남았습니다");
+
+        let relayed = sink.payloads.lock().unwrap().join("\n");
+        assert!(!relayed.contains(PASTED), "UI 릴레이로 토큰이 흘렀습니다:\n{relayed}");
+    }
+
+    /// 마스킹을 모든 이벤트에 걸면 감사 로그의 patch가 실제 적용된 patch와 달라진다.
+    /// 그러면 그 로그는 "무엇이 적용됐나"에 답할 수 없어 감사에 쓸 수 없다.
+    #[test]
+    fn other_events_are_not_reshaped_by_the_mask() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        let patch = "--- a/x\n+++ b/x\n-const token = \"sk-abcdefghijklmnopqrstuvwxyz012345\";\n";
+
+        host.append_event("task-1", "DRAFT_RECEIVED", json!({ "patch": patch }))
+            .unwrap();
+
+        let stored = host
+            .with_store(|s| s.events("task-1"))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "DRAFT_RECEIVED")
+            .unwrap();
+        assert_eq!(stored.payload.get("patch").and_then(Value::as_str), Some(patch));
     }
 
     /// 명세 §5 "DB 이벤트에 API 키와 비밀 값 저장 금지"의 실체.

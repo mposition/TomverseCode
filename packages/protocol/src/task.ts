@@ -1,4 +1,5 @@
 import type { ComplexityTier, ISODateTime } from "./common.js";
+import type { AcceptanceCriterion } from "./decision.js";
 import type { RoutingDecision } from "./registry.js";
 import type { CommandPolicy } from "./tools.js";
 import type { VerificationReport } from "./verification.js";
@@ -149,5 +150,19 @@ export interface FinalResult {
   auditTrailEventIds: string[];
   /** 이 태스크가 변경한 파일 목록 (롤백 UX가 쓴다 — state-machine-and-protocol.md 10절) */
   mutatedPaths?: string[];
+  /**
+   * 이 태스크에서 확정된 기준. 최종 보고가 이걸 체크리스트로 제시한다(17.3절).
+   *
+   * **충족 여부를 담는 필드가 없는 것은 누락이 아니라 설계다.** 기준↔테스트 자동 연결 방법이
+   * 아직 없으므로 현재 확인된 기준은 0개이고, 그 사실은 "확인됨 필드가 비어 있음"이 아니라
+   * "확인 여부를 말하는 필드 자체가 없음"으로 표현된다. 모델에게 판정을 맡기면
+   * product-strategy.md 9절의 순환 의존이 그대로 재현된다.
+   */
+  acceptanceCriteria?: AcceptanceCriterion[];
+  /**
+   * 사용자에게 묻지 못한 채 남은 blocking 불일치 — 있으면 보고에 반드시 표시한다.
+   * "물어볼 수 없었다"와 "쟁점이 없었다"는 다른 사실이다(17.4절).
+   */
+  unresolvedDisagreements?: string[];
   completedAt: ISODateTime;
 }

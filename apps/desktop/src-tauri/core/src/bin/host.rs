@@ -376,6 +376,9 @@ fn real_main() -> Result<i32, String> {
                 "mutations": guard.mutation_records(&task_id).map_err(|e| format!("변경 조회 실패: {e}"))?,
                 "toolExecutions": guard.tool_executions(&task_id).map_err(|e| format!("도구 조회 실패: {e}"))?,
                 "verificationChecks": guard.verification_checks(&task_id).map_err(|e| format!("검증 조회 실패: {e}"))?,
+                // 확정 기준. 이벤트를 재생하지 않고도 "무엇을 결정했는가"를 볼 수 있어야
+                // 진단이 가능하다 — UI의 get_task와 같은 자리를 헤드리스에서도 연다.
+                "acceptanceCriteria": guard.acceptance_criteria(&task_id).map_err(|e| format!("기준 조회 실패: {e}"))?,
             });
             println!("{output}");
             Ok(if task.is_some() { 0 } else { 1 })

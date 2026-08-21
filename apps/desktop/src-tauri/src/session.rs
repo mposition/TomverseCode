@@ -194,6 +194,15 @@ impl SessionState {
             .map_err(|e| format!("변경 목록을 읽을 수 없습니다: {e}"))
     }
 
+    /// 저장된 작업의 확정 기준. 히스토리에서 지난 작업을 열었을 때도 "무엇을 결정했는가"가
+    /// 보여야 한다 — 그 화면에는 FinalResult가 없고 DB뿐이다.
+    pub fn task_acceptance_criteria(&self, task_id: &str) -> Result<Value, String> {
+        let rows = self
+            .with_store(|s| s.acceptance_criteria(task_id))?
+            .map_err(|e| format!("기준 목록을 읽을 수 없습니다: {e}"))?;
+        Ok(serde_json::to_value(rows).unwrap_or(Value::Null))
+    }
+
     /// 워크스페이스를 열고 sidecar를 spawn한다. 이미 열려 있으면 교체한다.
     pub fn open_workspace(&self, app: &AppHandle, path: &str, policy: TaskPolicy) -> Result<Value, String> {
         let root = WorkspaceRoot::new(path).map_err(|e| format!("워크스페이스를 열 수 없습니다: {e}"))?;

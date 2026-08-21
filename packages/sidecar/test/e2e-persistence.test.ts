@@ -393,6 +393,16 @@ test("[시나리오 C] 정상 완료된 작업은 DB를 다시 열어도 상태�
     );
     assert.equal(mutations[0]!.rollbackStatus, "applied");
 
+    // 3-1) 확정 기준 테이블 — 실제 DB 파일에서 v3 스키마가 만들어지고 조회된다.
+    //      fast 경로는 doneCriteria를 내지 않으므로 **비어 있는 것이 정상**이다.
+    //      비어 있음을 확인하는 것이 무의미하지 않은 이유: 테이블이 없으면 조회가 에러로 죽는다.
+    assert.ok(Array.isArray(detail.acceptanceCriteria), "acceptance_criteria 조회가 배열을 주지 않았습니다");
+    assert.equal(
+      (detail.acceptanceCriteria as unknown[]).length,
+      0,
+      "단일 모델 경로에서 기준이 생겼습니다 — SINGLE_MODEL_FIX는 doneCriteria를 내지 않는다"
+    );
+
     // 4) 도구 실행 내역 — 정책 판단 없이 실행된 도구가 없다.
     const tools = detail.toolExecutions as { tool: string; policyDecision: string | null; executionStatus: string }[];
     assert.ok(tools.length > 0, "도구 실행 기록이 없습니다");

@@ -5,6 +5,7 @@ import "./App.css";
 import {
   phaseToStage,
   STAGE_ORDER,
+  type AcceptanceCriterion,
   type ApprovalRequest,
   type FinalResult,
   type ProviderStatus,
@@ -18,6 +19,7 @@ import {
   type VerificationReport,
   type WorkspaceInfo,
 } from "./types";
+import { AcceptanceCriteriaPanel } from "./components/AcceptanceCriteriaPanel";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { DiffPanel } from "./components/DiffPanel";
 import { EventLog } from "./components/EventLog";
@@ -62,7 +64,11 @@ export default function App() {
   const [cancelling, setCancelling] = useState(false);
   const [tasks, setTasks] = useState<TaskRow[]>([]);
   const [historyBusy, setHistoryBusy] = useState(false);
-  const [selectedTask, setSelectedTask] = useState<{ task: TaskRow; events: StoredEvent[] } | null>(null);
+  const [selectedTask, setSelectedTask] = useState<{
+    task: TaskRow;
+    events: StoredEvent[];
+    criteria: AcceptanceCriterion[];
+  } | null>(null);
   const [storeError, setStoreError] = useState<string | null>(null);
 
   const startedAt = useRef<number | null>(null);
@@ -133,7 +139,7 @@ export default function App() {
         const q = (payload.payload as { questionsForUser?: string[] }).questionsForUser;
         if (q && q.length > 0) setQuestions(q);
       }
-      if (payload.type === "USER_MESSAGE_RECEIVED") setQuestions(null);
+      if (payload.type === "USER_MESSAGE_RECEIVED" || payload.type === "USER_DECISION_RECORDED") setQuestions(null);
       // terminal 이벤트가 오면 "취소 중"을 푼다. 타이머로 추측하지 않는다 —
       // 프로세스가 실제로 죽었다는 사실은 호스트만 알고, 그 사실이 이벤트로 온다.
       if (payload.type.startsWith("TASK_") && payload.type !== "TASK_CREATED") setCancelling(false);
@@ -265,10 +271,14 @@ export default function App() {
     setHistoryBusy(true);
     try {
       const [detail, storedEvents] = await Promise.all([
-        invoke<{ task: TaskRow | null }>("get_task", { taskId: id }),
+        invoke<{ task: TaskRow | null; acceptanceCriteria: AcceptanceCriterion[] | null }>("get_task", { taskId: id }),
         invoke<StoredEvent[]>("get_task_events", { taskId: id }),
       ]);
-      if (detail.task) setSelectedTask({ task: detail.task, events: storedEvents });
+      // 지난 작업을 다시 열 때도 "무엇을 결정했는가"가 보여야 한다. 여기에는 FinalResult가
+      // 없으므로 DB의 파생 캐시를 읽는다 — 이벤트를 재생하지 않는 것이 그 캐시의 존재 이유다.
+      if (detail.task) {
+        setSelectedTask({ task: detail.task, events: storedEvents, criteria: detail.acceptanceCriteria ?? [] });
+      }
     } catch (error) {
       setNotice(`작업을 읽을 수 없습니다: ${String(error)}`);
     } finally {
@@ -547,6 +557,14 @@ export default function App() {
             </div>
 
             <div className="column">
+              {/* 3.10절: 검증 결과 **위에** 사용자가 정한 기준이 먼저 온다.
+                  build/test/lint만 보고하면 사용자가 무엇을 결정했는지가 최종 화면에서 사라진다. */}
+              {finalResult && (
+                <AcceptanceCriteriaPanel
+                  criteria={finalResult.acceptanceCriteria ?? []}
+                  unresolvedDisagreements={finalResult.unresolvedDisagreements}
+                />
+              )}
               <VerificationPanel reports={reports} />
               <DiffPanel diffs={diffs} />
             </div>
@@ -581,6 +599,7 @@ export default function App() {
             </button>
           </h2>
           <p className="muted small">{selectedTask.task.userMessage}</p>
+          <AcceptanceCriteriaPanel criteria={selectedTask.criteria} />
           {/* 실시간 로그와 다른 패널에 그린다 — 같은 목록에 섞으면 이벤트가 두 번 보인다. */}
           <EventLog events={selectedTask.events} devMode={devMode} />
         </section>

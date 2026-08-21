@@ -26,6 +26,19 @@ export type TaskEventType =
   | "PROVIDER_RETRY"
   | "TOOL_RETRY"
   | "USER_MESSAGE_RECEIVED"
+  /**
+   * 대조 완료 시 (17.3절). 불일치 0건이어도 기록한다 — 대조를 돌렸다는 사실 자체가 감사 대상이고,
+   * "쟁점이 없었다"와 "대조하지 않았다"는 다른 사실이다.
+   *
+   * **아직 아무도 발행하지 않는다.** 대조 로직은 다음 작업이며, 이벤트 타입만 먼저 둔다 —
+   * 이벤트 이름은 저장된 로그에 영구히 남는 값이라 나중에 바꾸는 비용이 크다.
+   */
+  | "DISAGREEMENT_DETECTED"
+  /**
+   * 사용자 답변 수신 시 (17.3절). `USER_MESSAGE_RECEIVED`가 길이만 남기던 자리를 대신한다 —
+   * **판정자의 판정이 감사 로그에 없으면** Agent Trace가 "왜 이렇게 만들었나"에 답할 수 없다.
+   */
+  | "USER_DECISION_RECORDED"
   | "ERROR"
   | "TASK_COMPLETED"
   | "TASK_FAILED"

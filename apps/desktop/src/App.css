@@ -729,3 +729,46 @@ button.tiny {
 .task-actions button {
   margin-left: 0;
 }
+
+/* 확정된 기준 체크리스트 (ui-wireframes.md 3.10절).
+   `?`(미확인)는 경고색으로 둔다 — 통과색(초록)에 섞이면 화면이 "다 됐다"로 읽힌다. */
+.criteria {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.criterion {
+  display: grid;
+  grid-template-columns: 20px 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.criterion .check-mark {
+  text-align: center;
+  color: var(--warn);
+}
+
+.criterion .muted {
+  grid-column: 2 / -1;
+}
+
+.criterion-user_decision .criterion-text {
+  /* 권위를 가진 것은 사용자 판정뿐이다 — 모델 제안과 같은 무게로 보이면 안 된다. */
+  font-weight: 600;
+}
+
+.badge-source {
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.unresolved {
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+  padding-top: 8px;
+}

@@ -45,6 +45,7 @@ interface HostRun {
     summary: string;
     failureReason?: string;
     verificationReport?: { overall: string; checks: { kind: string; status: string }[] };
+    acceptanceCriteria?: { criterionId: string; text: string; source: string; decidedAt: string }[];
   };
   mutatedPaths: string[];
   eventTypes: string[];
@@ -431,6 +432,21 @@ test("verified 모드는 교차검증 경로(REVIEWING)를 지난다", () => {
     // fake-a(executor)와 fake-b(reviewer)가 다른 공급자이므로 독립성 불변식이 만족된다.
     assert.ok(run.eventTypes.includes("REVIEW_RECEIVED"), `검수 단계가 실행되지 않았습니다: ${run.eventTypes.join(", ")}`);
     assert.ok(run.stderr.includes("REVIEWING"), "REVIEWING phase 전이가 보이지 않습니다");
+
+    // 17.3절: 초안의 doneCriteria가 수집만 되고 버려지지 않는다.
+    // **실제 호스트를 지나는 경로에서 확인한다** — Node 단위 테스트만으로는 프로토콜 필드가
+    // 실제 IPC 왕복에서 살아남는지 알 수 없다.
+    const criteria = run.final.acceptanceCriteria ?? [];
+    assert.ok(criteria.length > 0, `확정 기준이 최종 결과에 없습니다: ${JSON.stringify(run.final)}`);
+    assert.ok(
+      criteria.every((c) => ["user_decision", "draft_proposal", "user_message"].includes(c.source)),
+      `알 수 없는 기준 출처: ${JSON.stringify(criteria)}`
+    );
+    // 충족 여부 필드는 없어야 한다 — 있으면 언젠가 모델이 채우고 미확인이 확인으로 둔갑한다.
+    assert.ok(
+      criteria.every((c) => !("verified" in c) && !("status" in c)),
+      `기준에 충족 여부 필드가 생겼습니다: ${JSON.stringify(criteria)}`
+    );
   });
 });
 

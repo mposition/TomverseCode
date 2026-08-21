@@ -1,4 +1,5 @@
 import type {
+  AcceptanceCriterion,
   ComplexityTier,
   DraftProposal,
   ExperimentControls,
@@ -94,6 +95,14 @@ export class Orchestrator {
   private lastReport: VerificationReport | null = null;
   private appliedDiffs: string[] = [];
   private answers: { question: string; answer: string }[] = [];
+  /**
+   * 확정된 기준 목록 — 사용자 판정이 프롬프트 문자열로 끝나지 않게 하는 자리(17.3절).
+   *
+   * `answers`와 별도로 두는 이유: `answers`는 **다음 프롬프트에 넣을 재료**이고 이 목록은
+   * **최종 보고가 참조하는 기록**이다. 하나로 합치면 프롬프트 조립 방식이 바뀔 때마다
+   * 감사 기록의 모양이 따라 바뀐다.
+   */
+  private acceptanceCriteria: AcceptanceCriterion[] = [];
   private pendingQuestion: PendingQuestion | null = null;
   private eventIds: string[] = [];
   /**
@@ -336,6 +345,7 @@ export class Orchestrator {
       if (draft.kind === "final") return draft;
       proposal = draft.value;
     }
+    const draftCriteria = this.absorbDraftCriteria(proposal);
     await this.emit("DRAFT_RECEIVED", {
       proposalId: proposal.proposalId,
       model: proposal.model,
@@ -350,6 +360,11 @@ export class Orchestrator {
       plan: proposal.plan,
       // 주입된 초안인지 — 이 값이 "replayed"인 실행은 실험 하네스가 만든 것이다.
       draftSource: replayed ? "replayed" : "generated",
+      // 요구 분석의 결론을 수집만 하고 버리지 않는다(17.3절 구멍 3). Rust가 이 이벤트를
+      // 기록하는 **같은 트랜잭션 안에서** acceptance_criteria 캐시를 갱신한다.
+      acceptanceCriteria: draftCriteria,
+      // 재질문 뒤 새 초안이 오면 이전 초안의 doneCriteria는 철회된 해석이다 — 쌓지 않고 대체한다.
+      acceptanceCriteriaReplaces: "draft_proposal",
     });
 
     // ---- REVIEWING ----
@@ -559,10 +574,14 @@ export class Orchestrator {
       // 통과로 위장하지 않고, 실패로도 몰지 않는다 — 고칠 근거(실패 로그)가 없으므로
       // fix loop를 태우는 것은 의미가 없다. 완료로 처리하되 그 사실을 명시한다.
       if (report.overall === "not_verified") {
+        // 확정 기준도 함께 말한다. 검증 명령이 없는 프로젝트야말로 "무엇을 요구했는지"만
+        // 남는 자리이므로, 여기서 기준을 감추면 보고에 아무 내용이 없게 된다.
+        const criteria = this.describeCriteria();
         return this.finish(
           "completed",
           "변경을 적용했으나 이 프로젝트에서 실행할 수 있는 검증 명령이 없어 **검증되지 않았습니다**. " +
-            "build/test/lint 스크립트를 추가하면 다음부터 자동으로 검증됩니다."
+            "build/test/lint 스크립트를 추가하면 다음부터 자동으로 검증됩니다." +
+            (criteria ? ` · ${criteria}` : "")
         );
       }
 
@@ -910,8 +929,85 @@ export class Orchestrator {
     }
 
     this.answers.push({ question: questions.join("\n"), answer });
+    // 프롬프트 주입(answers)과 **별개로** 기준 목록에 고정한다 — 프롬프트는 요청이고
+    // 기준은 기록이다. 모델이 프롬프트를 무시해도 기록은 남고 최종 보고가 참조한다.
+    await this.recordUserDecision(questions, answer);
     await this.emit("USER_MESSAGE_RECEIVED", { answerLength: answer.length });
     return { kind: "answered" };
+  }
+
+  /**
+   * 사용자 답변을 `AcceptanceCriterion(source = "user_decision")`으로 승격한다(17.3절 구멍 1).
+   *
+   * 답변 원문을 그대로 기준 텍스트로 쓴다 — 모델에게 "이 답변에서 기준을 뽑아라"고 시키면
+   * 사용자의 판정이 다시 모델의 해석을 거치게 되고, 권위를 사용자에게 두기로 한 결정이
+   * 그 자리에서 무효가 된다.
+   */
+  private async recordUserDecision(questions: string[], answer: string): Promise<void> {
+    const criterion: AcceptanceCriterion = {
+      criterionId: `${this.taskId}-user-${this.state.counters.clarificationRounds}`,
+      text: answer.trim(),
+      source: "user_decision",
+      decidedAt: new Date().toISOString(),
+    };
+    this.acceptanceCriteria.push(criterion);
+    await this.emit("USER_DECISION_RECORDED", {
+      questions,
+      /**
+       * **원문이다.** `answerLength`만 남기면 판정자의 판정이 감사 로그에 없다.
+       *
+       * 비밀값 모양 마스킹과 8KB 초과분 artifact 밀어내기는 **Rust가** 한다 —
+       * Node가 스스로 지키는 규칙은 Node가 장악당하면 사라진다(CLAUDE.md 원칙 2).
+       */
+      answer,
+      // 대조 로직이 생기면 채워진다(다음 작업). 지금 null인 것은 "불일치에 대한 답이 아니라
+      // 모델이 스스로 모호하다고 말해서 나온 질문에 대한 답"이라는 사실이다.
+      disagreementId: null,
+      optionId: null,
+      acceptanceCriteria: [criterion],
+    });
+  }
+
+  /**
+   * `DraftProposal.doneCriteria`를 기준 목록에 흡수한다(17.3절 구멍 1).
+   *
+   * `DRAFT_SCHEMA`가 required로 강제해서 받아놓고 소비처가 타입 정의뿐이었다 —
+   * 요구 분석의 결론이 수집만 되고 버려지고 있었다.
+   *
+   * **user_decision을 덮지 않는다.** 모델이 낸 기준은 제안이고 사용자가 뒤집을 수 있으므로,
+   * 재초안이 와도 갈아치우는 것은 `draft_proposal` 몫뿐이다.
+   */
+  private absorbDraftCriteria(proposal: DraftProposal): AcceptanceCriterion[] {
+    const decidedAt = new Date().toISOString();
+    const absorbed: AcceptanceCriterion[] = proposal.doneCriteria
+      .map((text) => text.trim())
+      .filter((text) => text.length > 0)
+      .map((text, index) => ({
+        criterionId: `${proposal.proposalId}-done-${index}`,
+        text,
+        source: "draft_proposal" as const,
+        decidedAt,
+      }));
+    this.acceptanceCriteria = [
+      ...this.acceptanceCriteria.filter((c) => c.source !== "draft_proposal"),
+      ...absorbed,
+    ];
+    return absorbed;
+  }
+
+  /**
+   * 최종 보고의 기준 체크리스트 한 줄(17.3절 구멍 3 / ui-wireframes 3.10절).
+   *
+   * **확인된 기준 수를 세지 않고 0으로 고정한다.** 기준↔테스트 자동 연결 방법이 아직 없고,
+   * 모델에게 "이 기준이 충족됐나"를 묻는 순간 product-strategy 9절의 순환 의존이 재현된다.
+   * "확인하지 못했다"를 "충족했다"로 바꾸는 것이 이 제품이 팔려는 것을 파는 행위다.
+   */
+  private describeCriteria(): string | null {
+    if (this.acceptanceCriteria.length === 0) return null;
+    const userDecided = this.acceptanceCriteria.filter((c) => c.source === "user_decision").length;
+    const total = this.acceptanceCriteria.length;
+    const origin = userDecided > 0 ? `사용자 판정 ${userDecided}개 포함` : "전부 모델 제안";
+    return `기준 ${total}개(${origin}) 중 테스트로 확인된 것 0개 · ${total}개 미확인(기준↔테스트 자동 연결 미구현)`;
   }
 
   private executorRequester(): ToolRequester {
@@ -1010,6 +1106,9 @@ export class Orchestrator {
       finalDiff: this.appliedDiffs.length > 0 ? this.appliedDiffs.join("\n") : undefined,
       verificationReport: this.lastReport ?? undefined,
       auditTrailEventIds: this.eventIds,
+      // 성공/실패/취소를 가리지 않고 담는다 — 사용자가 무엇을 결정했는지는 결과와 무관한 사실이고,
+      // 실패한 태스크야말로 "무엇을 요구했는지"를 다시 보게 되는 자리다.
+      acceptanceCriteria: this.acceptanceCriteria.length > 0 ? [...this.acceptanceCriteria] : undefined,
       completedAt: new Date().toISOString(),
     };
     await this.emit(eventType, {
@@ -1020,6 +1119,10 @@ export class Orchestrator {
       complexityTier: this.state.complexityTier,
       reviewerIndependent: this.routing?.reviewerIndependent ?? false,
       verificationOverall: this.lastReport?.overall ?? null,
+      acceptanceCriteriaCount: this.acceptanceCriteria.length,
+      // 확인된 기준 수를 이벤트에도 남긴다. 0인 것이 정상 상태라는 사실을 로그가 말해야
+      // 나중에 "왜 전부 미확인이었나"를 되짚을 수 있다.
+      acceptanceCriteriaVerifiedCount: 0,
     });
     return result;
   }
@@ -1046,6 +1149,9 @@ export class Orchestrator {
       // 5절: 독립 검수 없이 진행했다는 사실을 성공 요약에서도 감추지 않는다.
       parts.push("교차검증 없이 진행됨(독립 공급자 없음)");
     }
+    // 17.3절 구멍 3: build/test/lint만 요약하면 사용자가 무엇을 결정했는지가 최종 보고에서 사라진다.
+    const criteria = this.describeCriteria();
+    if (criteria) parts.push(criteria);
     return parts.join(" · ");
   }
 

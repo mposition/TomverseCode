@@ -142,6 +142,21 @@ export interface StoredEvent {
   createdAt: string;
 }
 
+/**
+ * 프로토콜 `AcceptanceCriterion`의 부분 미러 — docs/design/state-machine-and-protocol.md 17.2절.
+ *
+ * **충족 여부 필드가 없는 것은 누락이 아니다.** 기준↔테스트 자동 연결 방법이 아직 없으므로
+ * 확인된 기준은 0개이고, 그 사실을 "확인됨: false"가 아니라 "그런 필드가 없음"으로 표현한다.
+ * 필드를 두면 언젠가 모델이 그걸 채우게 되고, 그 순간 미확인이 확인으로 둔갑한다.
+ */
+export interface AcceptanceCriterion {
+  criterionId: string;
+  text: string;
+  source: "user_decision" | "draft_proposal" | "user_message";
+  disagreementId?: string;
+  decidedAt: string;
+}
+
 export interface FinalResult {
   taskId: string;
   status: "completed" | "failed" | "cancelled" | "rejected";
@@ -151,6 +166,10 @@ export interface FinalResult {
   verificationReport?: VerificationReport;
   mutatedPaths?: string[];
   diffs?: [string, string][];
+  /** 이 작업에서 확정된 기준. 최종 화면이 체크리스트로 제시한다(ui-wireframes 3.10절). */
+  acceptanceCriteria?: AcceptanceCriterion[];
+  /** 예산이 모자라 묻지 못한 blocking 쟁점 — 있으면 숨기지 않는다(17.4절). */
+  unresolvedDisagreements?: string[];
 }
 
 export interface WorkspaceInfo {

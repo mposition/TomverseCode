@@ -22,7 +22,9 @@ use std::path::Path;
 /// v2(M0.1): 작업 영속화에 필요한 컬럼·테이블 추가. **기존 v1 DB를 파괴하지 않고 올라가야 하므로
 /// 전부 additive(ALTER TABLE ADD COLUMN / CREATE TABLE)다.** 사용자의 이벤트 로그를 마이그레이션
 /// 과정에서 잃는 것은 "append-only 진실의 원천"이라는 약속을 깨는 것이다.
-pub const SCHEMA_VERSION: i64 = 2;
+///
+/// v3(M1): `acceptance_criteria` — 사용자 판정의 파생 캐시(문서 17.3절). 역시 additive다.
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub struct Store {
     conn: Connection,
@@ -103,6 +105,19 @@ pub struct TaskRow {
     pub updated_at: String,
 }
 
+/// `acceptance_criteria` 한 줄. 프로토콜의 `AcceptanceCriterion`의 Rust 쪽 미러다.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AcceptanceCriterionRow {
+    #[serde(rename = "criterionId")]
+    pub criterion_id: String,
+    pub text: String,
+    pub source: String,
+    #[serde(rename = "disagreementId", skip_serializing_if = "Option::is_none")]
+    pub disagreement_id: Option<String>,
+    #[serde(rename = "decidedAt")]
+    pub decided_at: String,
+}
+
 type Result<T> = std::result::Result<T, StoreError>;
 
 impl Store {
@@ -143,6 +158,9 @@ impl Store {
         }
         if current < 2 {
             tx.execute_batch(SCHEMA_V2)?;
+        }
+        if current < 3 {
+            tx.execute_batch(SCHEMA_V3)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -294,6 +312,10 @@ impl Store {
                 params![serde_json::to_string(counters)?, now_iso(), task_id],
             )?;
         }
+
+        // 사용자 판정의 파생 캐시. `counters`와 같은 규칙으로, **이벤트를 쓰는 같은 트랜잭션
+        // 안에서만** 갱신된다 — 이벤트 없이 기준이 생기는 경로를 만들지 않기 위해서다(원칙 7).
+        sync_acceptance_criteria_tx(&tx, task_id, payload)?;
 
         tx.commit()?;
         Ok(appended)
@@ -450,6 +472,29 @@ impl Store {
             .conn
             .prepare("SELECT DISTINCT path FROM file_mutations WHERE task_id = ?1 ORDER BY path ASC")?;
         let rows = stmt.query_map(params![task_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 이 태스크에 고정된 기준. **파생 캐시를 읽을 뿐이고, 여기서 만들어지지 않는다.**
+    ///
+    /// 정렬을 `source` 우선으로 하는 이유: 권위를 가진 것(`user_decision`)이 먼저 보여야
+    /// 최종 보고 화면에서 사용자가 자기 판정을 먼저 읽는다. 알파벳 순으로 `draft_proposal`이
+    /// 앞서므로 명시적으로 뒤집는다.
+    pub fn acceptance_criteria(&self, task_id: &str) -> Result<Vec<AcceptanceCriterionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT criterion_id, text, source, disagreement_id, decided_at
+             FROM acceptance_criteria WHERE task_id = ?1
+             ORDER BY (source = 'user_decision') DESC, decided_at ASC, criterion_id ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id], |r| {
+            Ok(AcceptanceCriterionRow {
+                criterion_id: r.get(0)?,
+                text: r.get(1)?,
+                source: r.get(2)?,
+                disagreement_id: r.get(3)?,
+                decided_at: r.get(4)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -965,6 +1010,60 @@ fn truncate_for_event(text: &str, max: usize) -> String {
     format!("{}…(truncated)", &text[..end])
 }
 
+/// 이벤트 payload가 실어온 `acceptanceCriteria`를 파생 캐시에 반영한다.
+///
+/// **payload에 그 키가 없으면 아무것도 하지 않는다** — 대부분의 이벤트가 그렇다.
+///
+/// `acceptanceCriteriaReplaces`가 있으면 그 source의 기존 행을 먼저 지운다. 재질문 왕복 뒤
+/// 새 초안이 오면 이전 초안의 `doneCriteria`는 **철회된 해석**이고, 그대로 쌓아두면 최종 보고가
+/// 아무도 지지하지 않는 기준을 사용자에게 보여준다. 캐시를 지우는 것은 append-only 규칙과
+/// 충돌하지 않는다 — 지워지는 것은 파생 캐시이고 대체 사실 자체는 이벤트로 남는다.
+///
+/// 형태가 잘못된 항목은 조용히 건너뛰지 않고 오류로 만든다. 감사 기록의 캐시가 조용히
+/// 비는 것은 "기준이 없었다"와 구별되지 않기 때문이다.
+fn sync_acceptance_criteria_tx(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    payload: &serde_json::Value,
+) -> std::result::Result<(), StoreError> {
+    let Some(raw) = payload.get("acceptanceCriteria") else {
+        return Ok(());
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| StoreError::Invariant("acceptanceCriteria는 배열이어야 합니다".to_string()))?;
+
+    if let Some(source) = payload.get("acceptanceCriteriaReplaces").and_then(|v| v.as_str()) {
+        tx.execute(
+            "DELETE FROM acceptance_criteria WHERE task_id = ?1 AND source = ?2",
+            params![task_id, source],
+        )?;
+    }
+
+    for item in items {
+        let field = |name: &str| -> std::result::Result<String, StoreError> {
+            item.get(name)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| StoreError::Invariant(format!("AcceptanceCriterion에 \"{name}\"이 없음")))
+        };
+        let criterion_id = field("criterionId")?;
+        let text = field("text")?;
+        let source = field("source")?;
+        let decided_at = field("decidedAt")?;
+        let disagreement_id = item.get("disagreementId").and_then(|v| v.as_str());
+
+        tx.execute(
+            "INSERT INTO acceptance_criteria (task_id, criterion_id, text, source, disagreement_id, decided_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(task_id, criterion_id) DO UPDATE SET
+               text = ?3, source = ?4, disagreement_id = ?5, decided_at = ?6",
+            params![task_id, criterion_id, text, source, disagreement_id, decided_at],
+        )?;
+    }
+    Ok(())
+}
+
 /// 트랜잭션 안에서의 이벤트 삽입. `seq`는 (task_id, seq) unique 제약과 함께 순번을 보장한다.
 fn append_event_tx(
     tx: &Transaction<'_>,
@@ -1229,6 +1328,25 @@ CREATE TABLE IF NOT EXISTS verification_checks (
 CREATE INDEX IF NOT EXISTS idx_verification_checks_task ON verification_checks(task_id);
 "#;
 
+const SCHEMA_V3: &str = r#"
+-- 사용자 판정의 고정 (docs/design/state-machine-and-protocol.md 17.3절).
+--
+-- `task_events`가 진실의 원천이고 이 테이블은 **파생 캐시**다(CLAUDE.md 원칙 7).
+-- VERIFYING과 최종 보고가 매번 이벤트를 재생하지 않도록 두는 것이며 `tasks.phase`와 같은 성격이다.
+-- 그래서 이 테이블을 갱신하는 유일한 경로가 `append_event`의 트랜잭션 안에 있다 —
+-- 이벤트 없이 이 테이블만 바꾸는 공개 API는 만들지 않는다.
+CREATE TABLE IF NOT EXISTS acceptance_criteria (
+  task_id        TEXT NOT NULL REFERENCES tasks(task_id),
+  criterion_id   TEXT NOT NULL,
+  text           TEXT NOT NULL,
+  source         TEXT NOT NULL,       -- user_decision | draft_proposal | user_message
+  disagreement_id TEXT,               -- source = user_decision 일 때
+  decided_at     TEXT NOT NULL,
+  PRIMARY KEY (task_id, criterion_id)
+);
+CREATE INDEX IF NOT EXISTS idx_acceptance_criteria_task ON acceptance_criteria(task_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,6 +1417,170 @@ mod tests {
         let task = store.get_task("old-task").unwrap().unwrap();
         assert_eq!(task.current_phase, "EXECUTING");
         assert!(task.workspace_path.is_none());
+    }
+
+    #[test]
+    fn migration_from_v2_preserves_existing_data() {
+        // v2 DB를 v3로 올려도 기존 이벤트/작업이 살아 있어야 한다. 새 테이블 추가가
+        // 사용자의 감사 로그를 지우는 마이그레이션이 되면 "append-only 진실의 원천"이라는
+        // 약속이 깨진다 — v1→v2에서 지킨 것과 같은 규칙이다(문서 16.4절).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let artifacts = ArtifactStore::new(dir.path().join("artifacts")).unwrap();
+
+        {
+            // v1 + v2까지만 적용한 DB를 손으로 만든다.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (workspace_id, root_path, name, created_at)
+                 VALUES ('ws-old', '/tmp/old', 'old', '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_id, workspace_id, started_at)
+                 VALUES ('sess-old', 'ws-old', '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (task_id, session_id, workspace_id, user_message, phase,
+                                    counters_json, created_at, updated_at)
+                 VALUES ('v2-task', 'sess-old', 'ws-old', 'v2에서 만든 작업', 'VERIFYING', '{}',
+                         '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_events (task_id, seq, event_type, payload_json, phase, created_at)
+                 VALUES ('v2-task', 0, 'TASK_CREATED', '{}', 'CREATED', '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut store = Store::open(&db, artifacts).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+
+        let events = store.events("v2-task").unwrap();
+        assert_eq!(events.len(), 1, "마이그레이션이 기존 이벤트를 잃었습니다");
+        assert_eq!(events[0].event_type, "TASK_CREATED");
+        let task = store.get_task("v2-task").unwrap().unwrap();
+        assert_eq!(task.current_phase, "VERIFYING");
+        assert_eq!(task.user_message, "v2에서 만든 작업");
+
+        // 새 테이블은 비어 있고, 바로 쓸 수 있어야 한다.
+        assert!(store.acceptance_criteria("v2-task").unwrap().is_empty());
+        store
+            .append_event(
+                "v2-task",
+                "USER_DECISION_RECORDED",
+                &serde_json::json!({
+                    "answer": "빈 문자열은 거부",
+                    "acceptanceCriteria": [{
+                        "criterionId": "c-1", "text": "빈 문자열은 거부",
+                        "source": "user_decision", "decidedAt": "2020-01-02T00:00:00Z"
+                    }],
+                }),
+            )
+            .unwrap();
+        assert_eq!(store.acceptance_criteria("v2-task").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn acceptance_criteria_are_only_written_by_events() {
+        // 파생 캐시는 이벤트를 쓰는 **같은 트랜잭션**에서만 갱신된다(원칙 7).
+        // 이벤트가 실어오지 않으면 캐시는 비어 있어야 한다 — 다른 경로가 없다는 뜻이다.
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "DRAFT_RECEIVED", &serde_json::json!({ "model": "m" }))
+            .unwrap();
+        assert!(store.acceptance_criteria("task-1").unwrap().is_empty());
+
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &serde_json::json!({
+                    "acceptanceCriteria": [{
+                        "criterionId": "u-1", "text": "빈 문자열 이메일은 거부한다",
+                        "source": "user_decision", "decidedAt": "2024-01-01T00:00:00Z"
+                    }],
+                }),
+            )
+            .unwrap();
+        let rows = store.acceptance_criteria("task-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "user_decision");
+        assert_eq!(rows[0].text, "빈 문자열 이메일은 거부한다");
+    }
+
+    #[test]
+    fn a_new_draft_replaces_only_its_own_criteria() {
+        // 재초안이 오면 이전 초안의 doneCriteria는 철회된 해석이라 대체된다.
+        // 그러나 사용자 판정은 모델 산출물이 덮을 수 없다 — 권위가 다르다.
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &serde_json::json!({
+                    "acceptanceCriteria": [{
+                        "criterionId": "u-1", "text": "사용자 판정",
+                        "source": "user_decision", "decidedAt": "2024-01-01T00:00:00Z"
+                    }],
+                }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "task-1",
+                "DRAFT_RECEIVED",
+                &serde_json::json!({
+                    "acceptanceCriteria": [{
+                        "criterionId": "d-1", "text": "1차 초안 기준",
+                        "source": "draft_proposal", "decidedAt": "2024-01-01T00:01:00Z"
+                    }],
+                    "acceptanceCriteriaReplaces": "draft_proposal",
+                }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "task-1",
+                "DRAFT_RECEIVED",
+                &serde_json::json!({
+                    "acceptanceCriteria": [{
+                        "criterionId": "d-2", "text": "2차 초안 기준",
+                        "source": "draft_proposal", "decidedAt": "2024-01-01T00:02:00Z"
+                    }],
+                    "acceptanceCriteriaReplaces": "draft_proposal",
+                }),
+            )
+            .unwrap();
+
+        let rows = store.acceptance_criteria("task-1").unwrap();
+        let texts: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["사용자 판정", "2차 초안 기준"]);
+        // 권위를 가진 것이 먼저 나와야 한다 — 최종 보고 화면이 이 순서를 그대로 쓴다.
+        assert_eq!(rows[0].source, "user_decision");
+    }
+
+    #[test]
+    fn malformed_criteria_fail_loudly() {
+        // 조용히 건너뛰면 "기준이 없었다"와 "기록에 실패했다"가 구별되지 않는다.
+        let (_d, mut store) = seeded();
+        let err = store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &serde_json::json!({ "acceptanceCriteria": [{ "text": "criterionId가 없다" }] }),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invariant(_)), "{err:?}");
     }
 
     #[test]
