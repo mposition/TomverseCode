@@ -443,3 +443,50 @@ test("[시나리오 C] 정상 완료된 작업은 DB를 다시 열어도 상태�
     assert.deepEqual(recovery.interruptedTasks, [], "완료된 작업을 INTERRUPTED로 바꿨습니다");
   });
 });
+
+test("[시나리오 D] 저장된 이벤트에서 기준 계측을 집계할 수 있다", async () => {
+  // 12절 미해결 두 항목("기준↔테스트 연결의 커버리지", "위치 충돌 규칙의 오탐률")은 집계로만
+  // 답할 수 있는 질문이다. **실제 DB 파일**에서 그 집계가 나오는지를 여기서 확인한다 —
+  // Rust 단위 테스트는 직접 넣은 이벤트를 세지만, 여기서는 실제 실행이 남긴 이벤트를 센다.
+  requireArtifacts();
+  await withCtx({}, (ctx) => {
+    const result = spawnSync(HOST_BIN, runArgs(ctx, ["--mode", "verified", "--timeout-secs", "180"]), {
+      encoding: "utf8",
+      timeout: 210_000,
+      env: hostEnv(),
+    });
+    const line = (result.stdout ?? "").trim().split("\n").filter(Boolean).pop();
+    assert.ok(line, `결과 JSON이 없습니다:\n${result.stdout}\n${result.stderr}`);
+    const run = JSON.parse(line) as { final: { status: string } };
+    assert.equal(run.final.status, "completed", `${JSON.stringify(run.final)}\n${result.stderr}`);
+
+    // 호스트는 이미 종료됐다. 새 프로세스가 DB만 열어서 집계한다.
+    const metrics = hostQuery(ctx, [
+      "metrics",
+      "--workspace",
+      ctx.repo.root,
+      "--db",
+      ctx.db,
+      "--artifacts",
+      ctx.artifacts,
+    ]) as {
+      tasksScanned: number;
+      coverage: { criteria: number; byStatus: Record<string, number>; byCode: Record<string, number> };
+      conflicts: { detected: number; settled: number };
+    };
+
+    assert.equal(metrics.tasksScanned, 1);
+    // 교차검증 경로의 초안이 doneCriteria를 내므로 기준이 있고, 판정도 있다.
+    assert.ok(metrics.coverage.criteria > 0, JSON.stringify(metrics));
+    // 상태별 합계가 기준 총수와 같아야 한다 — 어긋나면 판정이 조용히 빠진 것이다.
+    const statusTotal = Object.values(metrics.coverage.byStatus).reduce((a, b) => a + b, 0);
+    assert.equal(statusTotal, metrics.coverage.criteria);
+    // **사유 코드가 채워져야 집계가 의미를 갖는다.** unknown뿐이면 계측이 끊긴 것이다.
+    assert.ok(!("unknown" in metrics.coverage.byCode), JSON.stringify(metrics.coverage.byCode));
+
+    // 이 실행에는 기준 충돌이 없다. 감지와 결말이 둘 다 0이어야 하고, 특히
+    // **감지보다 결말이 적으면** 결말이 새고 있다는 뜻이므로 그 불변식을 여기서 고정한다.
+    assert.equal(metrics.conflicts.detected, 0);
+    assert.ok(metrics.conflicts.settled <= metrics.conflicts.detected);
+  });
+});

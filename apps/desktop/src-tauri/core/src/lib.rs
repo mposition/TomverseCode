@@ -15,6 +15,7 @@
 pub mod artifacts;
 pub mod cancel;
 pub mod host;
+pub mod metrics;
 pub mod paths;
 pub mod policy;
 pub mod proctree;

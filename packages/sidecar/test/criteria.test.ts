@@ -118,6 +118,32 @@ test("존재하지 않는 테스트 파일을 적어도 확인이 되지 않는�
     context: CONTEXT,
   });
   assert.equal(evaluations[0]!.status, "UNVERIFIED");
+  // **"이름이 없었다"와 구별된다.** 고쳐야 할 곳이 다르므로 집계에서 뭉치면 안 된다.
+  assert.equal(evaluations[0]!.code, "test_reference_not_found");
+});
+
+test("미확인 사유는 코드로 구별된다 (집계가 한국어 문장을 파싱하지 않도록)", () => {
+  const cases: { text: string; report: VerificationReport | null; code: string }[] = [
+    { text: "오류 메시지를 한국어로 표시한다", report: report({}), code: "no_test_reference" },
+    { text: "확인은 imaginary.test.ts 로", report: report({}), code: "test_reference_not_found" },
+    {
+      text: "test/validate.test.ts 로 확인",
+      report: report({ status: "PASSED", detail: "ok 1 - unrelated" }),
+      code: "no_run_evidence",
+    },
+    { text: "test/validate.test.ts 로 확인", report: report({ status: "NOT_CONFIGURED" }), code: "test_not_configured" },
+    { text: "test/validate.test.ts 로 확인", report: report({ omitTest: true }), code: "test_check_missing" },
+    { text: "test/validate.test.ts 로 확인", report: null, code: "no_verification_report" },
+  ];
+  for (const c of cases) {
+    const [evaluation] = evaluateCriteria({
+      criteria: [criterion({ text: c.text })],
+      report: c.report,
+      changedPaths: [],
+      context: CONTEXT,
+    });
+    assert.equal(evaluation!.code, c.code, `${c.text} → ${evaluation!.code} (기대: ${c.code})`);
+  }
 });
 
 test("지목한 테스트를 포함한 검증이 실패하면 반증으로 판정한다", () => {
@@ -235,9 +261,9 @@ test("경로 구분자와 대소문자 차이는 충돌이 아니다", () => {
 
 test("요약은 상태별 개수를 뭉치지 않는다", () => {
   const line = describeEvaluations([
-    { criterionId: "a", status: "VERIFIED_BY_TEST", reason: "" },
-    { criterionId: "b", status: "UNVERIFIED", reason: "" },
-    { criterionId: "c", status: "CONTRADICTED_BY_TEST", reason: "" },
+    { criterionId: "a", status: "VERIFIED_BY_TEST", code: "verified_named_test_ran", reason: "" },
+    { criterionId: "b", status: "UNVERIFIED", code: "no_test_reference", reason: "" },
+    { criterionId: "c", status: "CONTRADICTED_BY_TEST", code: "named_test_check_failed", reason: "" },
   ]);
   assert.match(line!, /테스트로 확인 1개/);
   assert.match(line!, /테스트가 반증 1개/);
@@ -245,6 +271,6 @@ test("요약은 상태별 개수를 뭉치지 않는다", () => {
 });
 
 test("확인이 0개여도 그 사실을 말한다", () => {
-  const line = describeEvaluations([{ criterionId: "a", status: "UNVERIFIED", reason: "" }]);
+  const line = describeEvaluations([{ criterionId: "a", status: "UNVERIFIED", code: "no_test_reference", reason: "" }]);
   assert.match(line!, /테스트로 확인 0개/);
 });

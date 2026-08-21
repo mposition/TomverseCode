@@ -53,6 +53,14 @@ export type TaskEventType =
    * 쓰이며, 이전 것들은 "fix loop 도중에 무엇이 확인/반증됐는가"의 기록으로 남는다.
    */
   | "CRITERIA_EVALUATED"
+  /**
+   * 기준 충돌이 어떻게 끝났는지 (17.10절).
+   *
+   * `CRITERIA_CONFLICT_DETECTED`만 있으면 "충돌이 몇 번 났는가"밖에 셀 수 없다. 우리가 답해야
+   * 하는 질문은 "그 충돌이 쓸모 있었는가"이므로 **결말을 따로 남긴다** — 감지와 결말을 한
+   * 이벤트에 담을 수 없는 이유는 결말이 다음 라운드에야 정해지기 때문이다.
+   */
+  | "CRITERIA_CONFLICT_RESOLVED"
   | "ERROR"
   | "TASK_COMPLETED"
   | "TASK_FAILED"

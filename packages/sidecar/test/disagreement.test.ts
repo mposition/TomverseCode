@@ -343,6 +343,57 @@ test("사용자가 고른 파일을 건드리지 않는 계획은 실행 전에 
   assert.deepEqual(lastPlan.changedPaths, ["src/app.ts"]);
 });
 
+test("감지된 충돌은 결말이 빠짐없이 남는다 (집계의 두 수가 어긋나지 않도록)", async () => {
+  // 결말을 세는 지표는 결말이 빠짐없이 남을 때만 의미가 있다(17.10절 ②). 감지 N건에 결말
+  // M건(M<N)이면 차이가 어디서 났는지 알 수 없고, 그 차이가 하필 실패한 태스크에 몰려
+  // 있으면 지표가 낙관 쪽으로 휜다.
+  //
+  // 여기서는 **끝까지 다른 곳을 고치는** 모델을 재현한다 → 재요청 예산을 소진하고 진행한다.
+  const wrongPlace = draftStep({ targetPaths: ["src/other.ts"], doneCriteria: ["A"], patch: OTHER_PATCH });
+  const { orchestrator, host } = build(
+    {
+      defaultPatch: OTHER_PATCH,
+      scriptByModel: twoExecutorScripts(
+        [draftStep({ targetPaths: ["src/app.ts"], doneCriteria: ["A"] }), wrongPlace, wrongPlace, wrongPlace],
+        [
+          draftStep({ targetPaths: ["src/other.ts"], doneCriteria: ["A"], patch: OTHER_PATCH }),
+          wrongPlace,
+          wrongPlace,
+          wrongPlace,
+        ]
+      ),
+    },
+    { policy: { limits: { clarificationRounds: 2, reviseRounds: 1 } as never } }
+  );
+
+  const promise = orchestrator.run();
+  await waitFor(() => disagreementCard(host) !== undefined);
+  const target = disagreementCard(host)!.disagreements.find((d) => d.field === "targetPaths")!;
+  const option = target.question.options.find((o) => o.label.includes("src/app.ts"))!;
+  assert.ok(
+    orchestrator.provideUserInput(option.label, [
+      { disagreementId: target.disagreementId, optionId: option.optionId, text: option.label },
+    ])
+  );
+  const result = await promise;
+  assert.ok(result.status === "completed" || result.status === "failed", result.summary);
+
+  const detected = host.events
+    .filter((e) => e.type === "CRITERIA_CONFLICT_DETECTED")
+    .reduce((sum, e) => sum + (e.payload as { conflicts: unknown[] }).conflicts.length, 0);
+  const settled = host.events
+    .filter((e) => e.type === "CRITERIA_CONFLICT_RESOLVED")
+    .reduce((sum, e) => sum + (e.payload as { outcomes: unknown[] }).outcomes.length, 0);
+
+  assert.ok(detected > 0, "충돌이 감지되지 않아 이 테스트가 아무것도 검증하지 못합니다");
+  assert.equal(settled, detected, `감지 ${detected}건에 결말 ${settled}건 — 결말이 새고 있습니다`);
+  // 예산을 소진했으므로 마지막 결말은 "그대로 진행"이어야 한다.
+  const outcomes = host.events
+    .filter((e) => e.type === "CRITERIA_CONFLICT_RESOLVED")
+    .flatMap((e) => (e.payload as { outcomes: { outcome: string }[] }).outcomes.map((o) => o.outcome));
+  assert.ok(outcomes.includes("proceeded_without_change"), outcomes.join(", "));
+});
+
 test("VERIFYING 뒤에 기준 판정이 계산되고 근거 없는 기준은 미확인으로 남는다", async () => {
   // 17.3절 규칙 2: 검증 결과 옆에 기준 체크리스트를 함께 낸다. **모델에게 판정시키지 않는다.**
   const { orchestrator, host } = build({ defaultPatch: VALID_PATCH });

@@ -810,6 +810,22 @@ impl Store {
     // ---- 조회 (UI가 Tauri command를 통해서만 접근한다) ----
 
     /// 최근 작업 목록. `cursor`는 `updated_at` 값이며 그보다 오래된 것만 반환한다.
+    /// 집계용 전체 태스크 목록 (task_id, terminal_status).
+    ///
+    /// `list_tasks`를 쓰지 않는 이유: 그쪽은 **UI 목록용**이라 상한 200으로 잘린다(의도된
+    /// 제한이다 — 화면이 전체 이력을 한 번에 끌어오지 못하게 한다). 집계에 그 상한이 걸리면
+    /// 오래된 태스크가 조용히 빠지고, 그 사실이 결과 어디에도 나타나지 않는다. 지표는 표본이
+    /// 잘렸다는 것을 모르는 순간 틀린 답을 자신 있게 말한다.
+    pub fn all_tasks_for_metrics(&self, workspace_path: Option<&str>) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, final_status FROM tasks
+             WHERE (?1 IS NULL OR workspace_path = ?1)
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![workspace_path], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn list_tasks(&self, workspace_path: Option<&str>, limit: i64, cursor: Option<&str>) -> Result<Vec<TaskRow>> {
         let limit = limit.clamp(1, 200);
         let mut stmt = self.conn.prepare(

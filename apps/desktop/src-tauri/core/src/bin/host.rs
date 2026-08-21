@@ -87,6 +87,8 @@ struct Args {
     /// 테스트 편의 기능이지만, **실행되는 취소 경로는 실제 경로와 동일하다** —
     /// 같은 registry, 같은 토큰, 같은 프로세스 트리 종료 코드를 탄다. 별도 mock이 아니다.
     cancel_after_ms: Option<u64>,
+    /// `metrics` 전용: 워크스페이스 필터를 끄고 DB 전체를 집계한다.
+    all_workspaces: bool,
 
     // ---- 가설 게이트(evals/hypothesis-gate) 전용 ----
     //
@@ -125,6 +127,7 @@ fn parse_args() -> Result<Args, String> {
         timeout_secs: 600,
         verbose: false,
         cancel_after_ms: None,
+        all_workspaces: false,
         providers: None,
         review_mode: None,
         replay_draft: None,
@@ -179,6 +182,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--replay-draft" => args.replay_draft = Some(PathBuf::from(value()?)),
             "--verbose" => args.verbose = true,
+            "--all-workspaces" => args.all_workspaces = true,
             other => return Err(format!("알 수 없는 인자: {other}\n\n{}", usage())),
         }
     }
@@ -186,7 +190,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|recover|tasks|show> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|recover|tasks|show|metrics> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>] [--verbose]\n\
      \n\
@@ -194,7 +198,9 @@ fn usage() -> String {
      \n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
      tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
-     show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다"
+     show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다\n\
+     metrics — 기준 계측(커버리지/충돌 결말)을 JSON으로 집계한다. 읽기 전용.\n\
+               [--all-workspaces]로 워크스페이스 필터를 끈다"
         .to_string()
 }
 
@@ -352,6 +358,21 @@ fn real_main() -> Result<i32, String> {
         }
 
         // 재시작 후에도 기록이 남아 있는지 확인하는 통로. DB만 읽고 아무것도 실행하지 않는다.
+        "metrics" => {
+            // **읽기 전용이다.** 아무것도 쓰지 않고, 저장된 이벤트만 집계한다.
+            // 사람이 눈으로 세는 대신 숫자를 내는 것이 목적이며, 답하지 못하는 것은
+            // metrics.rs 모듈 주석에 적어두었다.
+            let guard = store.lock().unwrap();
+            let scope = if args.all_workspaces {
+                None
+            } else {
+                Some(args.workspace.to_string_lossy().to_string())
+            };
+            let metrics = tomverse_core::metrics::collect(&guard, scope.as_deref())?;
+            println!("{}", serde_json::to_string(&metrics).unwrap_or_default());
+            Ok(0)
+        }
+
         "show" => {
             let task_id = args
                 .task_id

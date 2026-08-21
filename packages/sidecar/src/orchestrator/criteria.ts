@@ -171,6 +171,7 @@ export function evaluateCriteria(input: EvaluateInput): CriterionEvaluation[] {
       return {
         criterionId: criterion.criterionId,
         status: "CONFLICTS_WITH_CHANGE" as const,
+        code: "changed_paths_disjoint" as const,
         reason: conflict.message,
         evidence: conflict.expectedPaths,
       };
@@ -178,15 +179,22 @@ export function evaluateCriteria(input: EvaluateInput): CriterionEvaluation[] {
 
     const named = extractExistingPaths(criterion.text, TEST_REFERENCE, context);
     if (named.length === 0) {
+      // **"이름이 없었다"와 "이름은 있는데 그런 파일이 없다"를 나눈다.** 고쳐야 할 곳이 다르다 —
+      // 전자는 기준을 적는 방식의 문제이고, 후자는 지어낸 이름을 근거로 쓰지 않는 규칙이
+      // 제대로 작동한 것이다. 한 덩어리로 세면 커버리지가 왜 낮은지 알 수 없다.
+      const mentioned = (criterion.text.match(TEST_REFERENCE) ?? []).length > 0;
       return {
         criterionId: criterion.criterionId,
         status: "UNVERIFIED" as const,
-        // 여기가 압도적 다수다. 이유를 적어두지 않으면 화면의 물음표가 결함처럼 보인다.
-        reason: "이 기준이 어떤 테스트로 확인되는지 자동으로 이을 수 없습니다 (기준 문장에 실재하는 테스트 파일이 없음).",
+        code: mentioned ? ("test_reference_not_found" as const) : ("no_test_reference" as const),
+        // 이유를 적어두지 않으면 화면의 물음표가 결함처럼 보인다.
+        reason: mentioned
+          ? "기준이 지목한 테스트 파일이 워크스페이스에 없어 근거로 쓸 수 없습니다."
+          : "이 기준이 어떤 테스트로 확인되는지 자동으로 이을 수 없습니다 (기준 문장에 테스트 파일이 언급되지 않음).",
       };
     }
 
-    return evaluateNamedTest(criterion, named, testCheck);
+    return evaluateNamedTest(criterion, named, testCheck, report !== null);
   });
 }
 
@@ -201,17 +209,24 @@ export function evaluateCriteria(input: EvaluateInput): CriterionEvaluation[] {
 function evaluateNamedTest(
   criterion: AcceptanceCriterion,
   named: string[],
-  testCheck: VerificationCheck | undefined
+  testCheck: VerificationCheck | undefined,
+  hasReport: boolean
 ): CriterionEvaluation {
   const base = { criterionId: criterion.criterionId, evidence: named };
 
   if (!testCheck) {
-    return { ...base, status: "UNVERIFIED", reason: "검증 리포트에 test 체크가 없습니다." };
+    return {
+      ...base,
+      status: "UNVERIFIED",
+      code: hasReport ? "test_check_missing" : "no_verification_report",
+      reason: hasReport ? "검증 리포트에 test 체크가 없습니다." : "검증이 아직 실행되지 않았습니다.",
+    };
   }
   if (testCheck.status === "NOT_CONFIGURED") {
     return {
       ...base,
       status: "UNVERIFIED",
+      code: "test_not_configured",
       reason: "이 프로젝트에 테스트 명령이 없어 지목된 테스트를 실행하지 못했습니다.",
     };
   }
@@ -220,6 +235,7 @@ function evaluateNamedTest(
     return {
       ...base,
       status: "CONTRADICTED_BY_TEST",
+      code: "named_test_check_failed",
       reason: `이 기준이 지목한 ${named.join(", ")}를 포함한 검증(test)이 실패했습니다.`,
     };
   }
@@ -227,6 +243,7 @@ function evaluateNamedTest(
     return {
       ...base,
       status: "UNVERIFIED",
+      code: "test_check_inconclusive",
       reason: `test 체크가 ${testCheck.status} 상태라 확인 근거가 되지 못합니다.`,
     };
   }
@@ -240,6 +257,7 @@ function evaluateNamedTest(
     return {
       ...base,
       status: "UNVERIFIED",
+      code: "no_run_evidence",
       reason:
         `test 체크는 통과했지만 실행 명령과 출력 어디에서도 ${named.join(", ")}가 실제로 실행된 근거를 ` +
         "찾지 못했습니다 (러너가 그 파일을 포함하지 않았을 수 있습니다).",
@@ -248,6 +266,7 @@ function evaluateNamedTest(
   return {
     ...base,
     status: "VERIFIED_BY_TEST",
+    code: "verified_named_test_ran",
     reason: `${ran.join(", ")}가 실행됐고 test 체크가 통과했습니다. 이 기준을 그 테스트가 확인했다는 뜻이 아니라, 그 테스트가 실행되어 통과했다는 뜻입니다.`,
     evidence: ran,
   };

@@ -1,6 +1,7 @@
 import type {
   AcceptanceCriterion,
   ComplexityTier,
+  CriteriaConflictOutcome,
   CriterionEvaluation,
   Disagreement,
   DraftProposal,
@@ -42,6 +43,7 @@ import {
   describeEvaluations,
   evaluateCriteria,
   findCriteriaConflicts,
+  type CriteriaConflict,
   type CriteriaContext,
 } from "./criteria.js";
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
@@ -146,6 +148,11 @@ export class Orchestrator {
   private criterionEvaluations: CriterionEvaluation[] = [];
   /** 직전 계획이 기준과 충돌해 다시 요청할 때 모델에게 전달할 사유. 재요청 후 비운다. */
   private criteriaFeedback: string[] = [];
+  /**
+   * 재요청을 유발한 충돌. **결말은 다음 라운드에야 정해지므로** 감지 이벤트와 따로 기억한다 —
+   * 한 이벤트에 담으려면 미래를 알아야 한다.
+   */
+  private pendingConflicts: CriteriaConflict[] = [];
   private pendingQuestion: PendingQuestion | null = null;
   private eventIds: string[] = [];
   /**
@@ -912,6 +919,12 @@ export class Orchestrator {
   > {
     const changedPaths = planPaths(plan);
     const conflicts = findCriteriaConflicts(this.acceptanceCriteria, changedPaths, this.criteriaContext());
+
+    // 직전 라운드에 재요청을 유발한 충돌이 **어떻게 끝났는지**를 먼저 남긴다.
+    // 감지만 세면 "충돌이 몇 번 났는가"밖에 알 수 없고, 우리가 답해야 하는 질문은
+    // "그 충돌이 쓸모 있었는가"다(12절 미해결 "위치 충돌 규칙의 오탐률").
+    await this.settlePendingConflicts(conflicts);
+
     if (conflicts.length === 0) return { kind: "ok" };
 
     await this.emit("CRITERIA_CONFLICT_DETECTED", {
@@ -925,6 +938,9 @@ export class Orchestrator {
 
     // 실행 이후(fix loop 안)라면 초안으로 되돌리지 않는다 — 스냅샷이 낡았다.
     if (this.state.counters.fixLoopRounds > 0) {
+      // 이쪽도 결말을 남겨야 한다. fix loop는 PLANNING으로 되돌아오므로 다음 라운드가 판정한다 —
+      // 여기서 기억하지 않으면 감지만 세고 결말이 새어 집계의 두 수가 어긋난다.
+      this.pendingConflicts = conflicts;
       const retry = await this.enterFixLoopForBadPatch(message);
       if (retry.kind === "final") return retry;
       return { kind: "refix", patch: retry.patch };
@@ -939,11 +955,46 @@ export class Orchestrator {
         note: "기준 충돌이 남아 있으나 재요청 예산을 소진해 그대로 진행합니다",
         conflicts: conflicts.map((c) => c.criterionId),
       });
+      await this.emitConflictOutcomes(conflicts, "proceeded_without_change");
       return { kind: "ok" };
     }
 
     this.criteriaFeedback = conflicts.map((c) => c.message);
+    // 다음 라운드에서 결말을 판정하기 위해 기억해 둔다.
+    this.pendingConflicts = conflicts;
     return { kind: "redraft" };
+  }
+
+  /**
+   * 재요청을 유발했던 충돌의 결말을 기록한다 — 12절 미해결 "위치 충돌 규칙의 오탐률".
+   *
+   * **"이 충돌이 진짜 잘못된 계획이었는가"의 정답은 어디에도 없다.** 사용자가 매번 판정해주지
+   * 않는 한 관측 가능한 것은 "재요청했더니 계획이 바뀌었다/안 바뀌었다"뿐이다. 그래서 결말
+   * 이름을 추론이 아니라 **일어난 일 그대로** 붙였다 — 지표 이름이 추론을 포함하면 집계를
+   * 읽는 사람이 그 추론을 사실로 읽는다.
+   */
+  private async settlePendingConflicts(current: readonly CriteriaConflict[]): Promise<void> {
+    if (this.pendingConflicts.length === 0) return;
+    const stillConflicting = new Set(current.map((c) => c.criterionId));
+    const pending = this.pendingConflicts;
+    this.pendingConflicts = [];
+
+    await this.emit("CRITERIA_CONFLICT_RESOLVED", {
+      outcomes: pending.map((c) => ({
+        criterionId: c.criterionId,
+        outcome: stillConflicting.has(c.criterionId) ? "plan_unchanged" : "plan_changed_to_expected",
+        expectedPaths: c.expectedPaths,
+      })),
+    });
+  }
+
+  private async emitConflictOutcomes(
+    conflicts: readonly CriteriaConflict[],
+    outcome: CriteriaConflictOutcome
+  ): Promise<void> {
+    await this.emit("CRITERIA_CONFLICT_RESOLVED", {
+      outcomes: conflicts.map((c) => ({ criterionId: c.criterionId, outcome, expectedPaths: c.expectedPaths })),
+    });
   }
 
   /**
@@ -1532,6 +1583,15 @@ export class Orchestrator {
     // 통과해 terminal 이벤트가 두 번 남는다 — 실측으로 `TASK_CANCELLED`가 둘 기록됐다.
     // JS는 단일 스레드지만 await가 곧 양보 지점이므로, 이 구간은 동기여야 한다.
     this.terminalReached = true;
+
+    // 재요청을 유발한 충돌이 결말 없이 사라지지 않게 한다. 결말을 세는 지표는 결말이
+    // **빠짐없이** 남을 때만 의미가 있다 — 감지 N건에 결말 M건(M<N)이면 차이가 어디서
+    // 났는지 알 수 없고, 그 차이가 하필 실패한 태스크에 몰려 있으면 지표가 낙관 쪽으로 휜다.
+    if (this.pendingConflicts.length > 0) {
+      const pending = this.pendingConflicts;
+      this.pendingConflicts = [];
+      await this.emitConflictOutcomes(pending, "task_ended_before_replan");
+    }
 
     // 취소로 끝나는 경우 CANCELLING을 거친다 — UI가 "취소 중"을 보여줄 수 있어야 하고,
     // 이벤트 로그에도 요청 시점과 완료 시점이 남아야 한다.
