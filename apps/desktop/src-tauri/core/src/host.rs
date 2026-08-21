@@ -22,6 +22,7 @@ use crate::types::{
 };
 use crate::verify::{CommandExecutor, VerificationRunner};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -684,6 +685,80 @@ impl TaskHost {
         Ok(done)
     }
 
+    /// 태스크 시작 시점의 **워크스페이스 지문** — product-strategy 6절.
+    ///
+    /// # 왜 `git_head`만으로는 부족한가
+    ///
+    /// 같은 HEAD에서도 워킹 트리가 다르면 **다른 실행**이다. 커밋되지 않은 변경을 반영하지 않는
+    /// 지문은 서로 다른 상태를 같다고 말하고, 감사에서 그건 빠뜨림이 아니라 오답이다.
+    ///
+    /// # 무엇을 섞는가
+    ///
+    /// 세 가지를 이어 붙여 SHA-256을 낸다. 전부 **읽기 전용** 명령이고 이미 allowlist에 있다.
+    ///
+    /// | 재료 | 담기는 것 |
+    /// |---|---|
+    /// | `git rev-parse HEAD` | 커밋된 상태 |
+    /// | `git status --porcelain -uall` | 변경·추가·삭제된 **경로** (추적되지 않는 파일 포함) |
+    /// | `git diff HEAD` | 추적되는 파일의 **내용 변경** |
+    ///
+    /// # 이 지문이 놓치는 것 — 숨기지 않는다
+    ///
+    /// **추적되지 않는 파일은 경로만 들어가고 내용은 들어가지 않는다.** `git diff HEAD`가
+    /// 추적되는 파일만 보기 때문이다. 그래서 추적되지 않는 파일의 **내용만** 바뀐 두 실행은
+    /// 같은 지문을 낸다.
+    ///
+    /// 이걸 문서 한 줄로 덮지 않고 `untrackedFiles` 개수를 함께 남긴다 — **그 수가 0이면 이
+    /// 한계가 이번 실행에 적용되지 않는다**는 뜻이고, 0이 아닐 때만 화면이 정밀도가 낮다고
+    /// 말하면 된다. 항상 붙는 면책 문구는 아무도 읽지 않는다.
+    ///
+    /// git 저장소가 아니면 지문을 내지 않는다(`available: false`). **빈 해시를 만들어 내면
+    /// "상태가 비어 있었다"로 읽히는데, 실제로는 "잴 수 없었다"이다.**
+    pub fn record_workspace_fingerprint(&self, task_id: &str) -> Result<Value, String> {
+        let payload = self.workspace_fingerprint(task_id);
+        let _ = self.append_event(task_id, "WORKSPACE_FINGERPRINT", payload.clone());
+        Ok(payload)
+    }
+
+    fn workspace_fingerprint(&self, task_id: &str) -> Value {
+        let Ok(head) = self.git_output(task_id, &["rev-parse", "HEAD"]) else {
+            // git 저장소가 아니거나 커밋이 하나도 없다. 둘 다 "잴 수 없었다"이지 "비어 있었다"가 아니다.
+            return json!({ "available": false, "reason": "git 저장소가 아니거나 아직 커밋이 없습니다" });
+        };
+        let Ok(status) = self.git_output(task_id, &["status", "--porcelain", "-uall"]) else {
+            return json!({ "available": false, "reason": "git status를 읽지 못했습니다" });
+        };
+        let Ok(diff) = self.git_output(task_id, &["diff", "HEAD"]) else {
+            return json!({ "available": false, "reason": "git diff를 읽지 못했습니다" });
+        };
+
+        let untracked = status.lines().filter(|l| l.starts_with("?? ")).count() as u64;
+        let dirty = !status.trim().is_empty();
+
+        let mut hasher = Sha256::new();
+        // 구분자를 넣는 이유: 재료를 그냥 이으면 한 재료의 끝과 다음 재료의 시작이 붙어
+        // **서로 다른 조합이 같은 바이트열**이 될 수 있다.
+        hasher.update(b"head\n");
+        hasher.update(head.trim().as_bytes());
+        hasher.update(b"\nstatus\n");
+        hasher.update(status.as_bytes());
+        hasher.update(b"\ndiff\n");
+        hasher.update(diff.as_bytes());
+        let digest = hasher.finalize();
+
+        json!({
+            "available": true,
+            "fingerprint": format!("sha256:{digest:x}"),
+            "gitHead": head.trim(),
+            "dirty": dirty,
+            // 0이면 위 한계(추적되지 않는 파일의 내용 미반영)가 이번 실행에 적용되지 않는다.
+            "untrackedFiles": untracked,
+            // **무엇으로 만든 지문인지 남긴다.** 나중에 재료가 바뀌면 옛 지문과 비교할 수 없는데,
+            // 그 사실을 알 방법이 없으면 "상태가 달라졌다"로 잘못 읽는다.
+            "inputs": ["rev-parse HEAD", "status --porcelain -uall", "diff HEAD"],
+        })
+    }
+
     /// 이벤트 로그에서 이 태스크가 만든 커밋 sha를 찾는다.
     ///
     /// 별도 컬럼에 저장하지 않는 이유: 이벤트가 진실의 원천이고(7번 원칙), 커밋 sha는 그
@@ -962,6 +1037,19 @@ impl SidecarHandler for TaskHost {
                 };
                 let attempt = params.get("attemptNumber").and_then(Value::as_u64).unwrap_or(0) as u32;
                 self.run_verification(task_id, phase, attempt)
+            }
+
+            // 워크스페이스 지문 — product-strategy 6절 "Agent Trace 완성".
+            //
+            // **Rust가 계산하고 Rust가 기록한다.** Node는 "지금 찍어라"만 말할 수 있고 값에는
+            // 손대지 못한다 — `verify.run`과 같은 이유다(Node가 "검증했다"를 만들어낼 수 없어야
+            // 하듯, "이 상태였다"도 만들어낼 수 없어야 한다).
+            "workspace.fingerprint" => {
+                let task_id = params
+                    .get("taskId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "workspace.fingerprint params에 \"taskId\"가 없음".to_string())?;
+                self.record_workspace_fingerprint(task_id)
             }
 
             "usage.record" => {
@@ -1710,6 +1798,107 @@ mod tests {
             .filter(|t| t.starts_with("TASK_") && t != "TASK_CREATED")
             .collect::<Vec<_>>();
         assert_eq!(terminal_events, vec!["TASK_COMPLETED"]);
+    }
+
+    fn fingerprint_of(host: &TaskHost) -> Value {
+        host.record_workspace_fingerprint("task-1").unwrap()
+    }
+
+    /// **같은 HEAD라도 워킹 트리가 다르면 다른 실행이다.** `git_head`만 남기는 지문이
+    /// 놓치는 것이 이것이고, 6절이 "uncommitted 상태 미반영"이라고 적은 자리다.
+    #[test]
+    fn the_fingerprint_changes_when_a_tracked_file_changes_without_a_commit() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        init_git_repo(ws.path());
+
+        let before = fingerprint_of(&host);
+        assert_eq!(before.get("available").and_then(Value::as_bool), Some(true), "{before}");
+        assert_eq!(before.get("dirty").and_then(Value::as_bool), Some(false));
+
+        fs::write(ws.path().join("src/app.ts"), "a\nCHANGED\nc\n").unwrap();
+        let after = fingerprint_of(&host);
+
+        assert_eq!(
+            before.get("gitHead"),
+            after.get("gitHead"),
+            "커밋하지 않았으므로 HEAD는 같아야 한다 — 그래서 HEAD만으로는 부족하다"
+        );
+        assert_ne!(
+            before.get("fingerprint"),
+            after.get("fingerprint"),
+            "커밋되지 않은 변경이 지문에 반영되지 않았습니다"
+        );
+        assert_eq!(after.get("dirty").and_then(Value::as_bool), Some(true));
+    }
+
+    /// 같은 상태에서 두 번 재면 같은 지문이 나와야 한다 — 재현 확인에 쓸 수 없으면
+    /// 지문이 아니다.
+    #[test]
+    fn the_fingerprint_is_stable_for_an_unchanged_workspace() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        init_git_repo(ws.path());
+        assert_eq!(
+            fingerprint_of(&host).get("fingerprint"),
+            fingerprint_of(&host).get("fingerprint")
+        );
+    }
+
+    /// **추적되지 않는 파일은 경로가 지문에 들어간다.** 내용은 들어가지 않지만(git diff HEAD가
+    /// 추적되는 파일만 보므로), 파일이 생겼다 없어졌다는 사실 자체는 잡힌다.
+    /// 그리고 그 한계가 이번 실행에 적용되는지를 `untrackedFiles`가 말한다.
+    #[test]
+    fn an_untracked_file_enters_the_fingerprint_by_path_and_is_counted() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        init_git_repo(ws.path());
+
+        let clean = fingerprint_of(&host);
+        assert_eq!(clean.get("untrackedFiles").and_then(Value::as_u64), Some(0));
+
+        fs::write(ws.path().join("scratch.txt"), "temp").unwrap();
+        let dirty = fingerprint_of(&host);
+        assert_ne!(
+            clean.get("fingerprint"),
+            dirty.get("fingerprint"),
+            "새 파일이 지문에 없습니다"
+        );
+        assert_eq!(
+            dirty.get("untrackedFiles").and_then(Value::as_u64),
+            Some(1),
+            "한계가 적용되는지를 화면이 알 수 없습니다"
+        );
+    }
+
+    /// git 저장소가 아니면 **지문을 만들어 내지 않는다.** 빈 해시를 내면 "상태가 비어 있었다"로
+    /// 읽히는데 실제로는 "잴 수 없었다"이다.
+    #[test]
+    fn a_non_git_workspace_reports_unavailable_not_an_empty_hash() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        let out = fingerprint_of(&host);
+        assert_eq!(out.get("available").and_then(Value::as_bool), Some(false), "{out}");
+        assert!(
+            out.get("fingerprint").is_none(),
+            "잴 수 없었는데 지문이 있습니다: {out}"
+        );
+    }
+
+    /// 지문은 **Rust가 기록한다.** Node는 "지금 찍어라"만 말할 수 있고 값에는 손대지 못한다.
+    #[test]
+    fn the_fingerprint_is_written_to_the_event_log_by_rust() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        init_git_repo(ws.path());
+        let out = fingerprint_of(&host);
+
+        let events = host.with_store(|s| s.events("task-1")).unwrap();
+        let recorded = events
+            .iter()
+            .find(|e| e.event_type == "WORKSPACE_FINGERPRINT")
+            .expect("지문 이벤트가 없습니다");
+        assert_eq!(recorded.payload.get("fingerprint"), out.get("fingerprint"));
     }
 
     /// 19절: 커밋 sha를 모르면 **아무것도 하지 않는다.** 추측으로 이력을 건드리지 않는다.

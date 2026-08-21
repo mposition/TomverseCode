@@ -290,6 +290,18 @@ export class Orchestrator {
     await this.transition("SNAPSHOTTING");
     if (await this.cancelledHere()) return this.finish("cancelled", "SNAPSHOTTING 중 취소됨");
 
+    // 태스크 시작 시점의 워크스페이스 지문 (product-strategy 6절).
+    //
+    // **Rust가 계산하고 Rust가 기록한다.** 여기서 하는 일은 "지금 찍어라"뿐이고 값은 받아서
+    // 쓰지 않는다 — Node가 값을 만질 수 있으면 감사 기록이 Node의 정직함에 의존하게 된다.
+    // 스냅샷을 만들기 **직전**에 찍는 이유: 스냅샷이 읽는 파일 상태와 최대한 가까워야 한다.
+    //
+    // 실패해도 태스크를 세우지 않는다. 지문은 감사 재료이지 실행 조건이 아니다 —
+    // 그리고 못 찍었다는 사실은 이벤트가 없다는 것으로 드러난다.
+    await this.deps.transport
+      .request("workspace.fingerprint", { taskId: this.taskId })
+      .catch(() => undefined);
+
     this.snapshot = await this.contextEngine.createSnapshot(this.bridge, {
       workspaceId: this.input.taskRequest.workspaceId,
       userMessage: this.input.taskRequest.userMessage,

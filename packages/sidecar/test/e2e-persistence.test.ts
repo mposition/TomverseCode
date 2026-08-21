@@ -52,8 +52,11 @@ interface Ctx {
   artifacts: string;
 }
 
-function withCtx(options: { slowTest?: boolean }, fn: (ctx: Ctx) => void | Promise<void>): Promise<void> {
-  const repo = createFixtureRepo({ slowTest: options.slowTest });
+function withCtx(
+  options: { slowTest?: boolean; gitRepo?: boolean },
+  fn: (ctx: Ctx) => void | Promise<void>
+): Promise<void> {
+  const repo = createFixtureRepo({ slowTest: options.slowTest, gitRepo: options.gitRepo });
   const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-m01-"));
   const ctx: Ctx = {
     repo,
@@ -477,7 +480,7 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
   // 이벤트**에서 나와야 한다 — Rust 단위 테스트는 직접 넣은 이벤트를 세지만, 여기서는
   // 스냅샷과 공급자 호출이 실제로 그 모양으로 남는지를 본다.
   requireArtifacts();
-  await withCtx({}, (ctx) => {
+  await withCtx({ gitRepo: true }, (ctx) => {
     const result = spawnSync(HOST_BIN, runArgs(ctx, ["--mode", "verified", "--timeout-secs", "180"]), {
       encoding: "utf8",
       timeout: 210_000,
@@ -516,6 +519,29 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
     };
 
     assert.equal(t.snapshotTaken, true, JSON.stringify(t));
+
+    // product-strategy 6절: 태스크 시작 시점의 워크스페이스 지문이 남아야 한다.
+    // 이 시나리오만 픽스처를 git 저장소로 만든다 — 지문을 **실제로 잴 수 있는 경로**를
+    // 확인해야 하고, git이 아니면 available:false가 정답이라 아무것도 검증하지 못한다.
+    // **Rust가 쓴 이벤트**이므로 Node를 거치지 않은 사실이다.
+    const detail = hostQuery(ctx, [
+      "show",
+      "--workspace",
+      ctx.repo.root,
+      "--task",
+      run.taskId,
+      "--db",
+      ctx.db,
+      "--artifacts",
+      ctx.artifacts,
+    ]) as { events: { type: string; payload: Record<string, unknown> }[] };
+    const fingerprint = detail.events.find((e) => e.type === "WORKSPACE_FINGERPRINT");
+    assert.ok(fingerprint, "워크스페이스 지문 이벤트가 없습니다");
+    // 픽스처는 git 저장소이므로 잴 수 있어야 한다 — available:false면 그 자체가 결함이다.
+    assert.equal(fingerprint!.payload.available, true, JSON.stringify(fingerprint!.payload));
+    assert.match(String(fingerprint!.payload.fingerprint), /^sha256:[0-9a-f]{64}$/);
+    // 무엇으로 만든 지문인지 남아야 재료가 바뀐 뒤에도 옛 지문을 해석할 수 있다.
+    assert.ok(Array.isArray(fingerprint!.payload.inputs), JSON.stringify(fingerprint!.payload));
     assert.ok(t.sentFiles.length > 0, `나간 파일이 없습니다: ${JSON.stringify(t)}`);
     assert.ok(t.providers.length > 0, `호출된 공급자가 없습니다: ${JSON.stringify(t)}`);
     // 역할이 비어 있으면 "누가 무엇으로 불렸는가"를 말할 수 없다.

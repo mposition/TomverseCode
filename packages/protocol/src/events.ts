@@ -69,6 +69,17 @@ export type TaskEventType =
    * 바꿨다"는 **되돌리기 어려운 사실**의 표식이다. 되돌리기는 파일만 복원하고 커밋은 남으므로,
    * 그 사실을 나중에 찾을 수 있어야 한다.
    */
+  /**
+   * 태스크 시작 시점의 워크스페이스 지문 — product-strategy 6절 "Agent Trace 완성".
+   *
+   * **Rust가 계산하고 Rust가 append한다.** Node는 "지금 찍어라"만 말할 수 있다 —
+   * 감사 기록이 Node의 정직함에 의존하면 그건 감사가 아니다(원칙 2).
+   *
+   * `git_head`만으로는 부족하다: 같은 HEAD에서도 워킹 트리가 다르면 다른 실행이다.
+   * 지문이 놓치는 것(추적되지 않는 파일의 **내용**)은 payload의 `untrackedFiles`가
+   * "이번 실행에 그 한계가 적용되는가"로 답한다.
+   */
+  | "WORKSPACE_FINGERPRINT"
   | "GIT_COMMIT_CREATED"
   | "ERROR"
   | "TASK_COMPLETED"
