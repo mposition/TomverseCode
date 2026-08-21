@@ -676,14 +676,21 @@ impl ToolRuntime {
             Termination::Cancelled {
                 tree_guaranteed,
                 method,
+                surviving_pid,
             } => (
                 ToolStatus::Cancelled,
-                Some(if *tree_guaranteed {
-                    format!("사용자 취소로 중단됨 (프로세스 트리 종료: {method})")
-                } else {
+                Some(match (surviving_pid, tree_guaranteed) {
+                    // 가장 나쁜 경우를 가장 분명하게 말한다: 기다리기를 포기했고 무엇이 남았는지.
+                    (Some(pid), _) => format!(
+                        "사용자 취소로 중단을 요청했으나 프로세스 {pid}가 종료 상한 안에 끝나지 않았습니다 \
+                         (종료 시도: {method}). 아직 실행 중일 수 있으니 직접 확인이 필요합니다."
+                    ),
+                    (None, true) => format!("사용자 취소로 중단됨 (프로세스 트리 종료: {method})"),
                     // 보장하지 못한다는 사실을 감추지 않는다 — 사용자가 남은 프로세스를
                     // 직접 확인해야 할 수도 있다.
-                    format!("사용자 취소로 중단됨 (프로세스 종료: {method} — 하위 프로세스 종료를 보장하지 못함)")
+                    (None, false) => {
+                        format!("사용자 취소로 중단됨 (프로세스 종료: {method} — 하위 프로세스 종료를 보장하지 못함)")
+                    }
                 }),
             ),
             // 0이 아닌 종료 코드는 "도구 실행 실패"가 아니라 "명령이 실패했다"는 사실이다.
@@ -709,8 +716,8 @@ impl ToolRuntime {
             "timedOut": matches!(execution.termination, Termination::TimedOut),
             "cancelled": matches!(execution.termination, Termination::Cancelled { .. }),
             "treeKill": match &execution.termination {
-                Termination::Cancelled { tree_guaranteed, method } => {
-                    json!({ "guaranteed": tree_guaranteed, "method": method })
+                Termination::Cancelled { tree_guaranteed, method, surviving_pid } => {
+                    json!({ "guaranteed": tree_guaranteed, "method": method, "survivingPid": surviving_pid })
                 }
                 _ => serde_json::Value::Null,
             },
@@ -821,6 +828,11 @@ enum Termination {
     Cancelled {
         tree_guaranteed: bool,
         method: &'static str,
+        /// 종료 상한 안에 자식이 사라지지 않아 **기다리기를 포기한** 경우의 PID.
+        ///
+        /// 이걸 남기는 이유: "취소했습니다"만 말하고 프로세스가 계속 도는 것이 이 기능에서 할
+        /// 수 있는 가장 나쁜 일이다. 무엇이 남았는지 알려줘야 사용자가 직접 정리할 수 있다.
+        surviving_pid: Option<u32>,
     },
 }
 
@@ -882,6 +894,7 @@ fn run_process(
             termination: Termination::Cancelled {
                 tree_guaranteed: true, // 아예 시작하지 않았으므로 남은 프로세스가 없다
                 method: "not-started",
+                surviving_pid: None,
             },
             duration_ms: 0,
             resolved,
@@ -956,6 +969,7 @@ fn run_process(
                     termination = Termination::Cancelled {
                         tree_guaranteed: outcome.tree_guaranteed,
                         method: outcome.method,
+                        surviving_pid: outcome.surviving_pid,
                     };
                     break None;
                 }

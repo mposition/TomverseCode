@@ -455,6 +455,28 @@ impl SessionState {
         })
     }
 
+    /// 강제 포기 — ui-wireframes.md 3.5절, 12절 미해결 "취소 중 상한".
+    ///
+    /// 취소를 **다시 한 번 보내고** 나서 포기한다. 순서가 중요한 이유: 포기가 "취소를 취소한다"는
+    /// 뜻으로 읽히면 안 된다. 죽이려는 시도는 계속하되 **기다리기만** 그만두는 것이다.
+    pub fn force_abandon_task(&self, task_id: &str) -> Result<Value, String> {
+        let guard = self.inner.lock().unwrap();
+        let Some(active) = guard.as_ref() else {
+            return Err("먼저 워크스페이스를 선택하세요.".to_string());
+        };
+        let host = active.host.clone();
+        let sidecar = active.sidecar.clone();
+        drop(guard);
+
+        // 취소 토큰을 확실히 켠다. 이미 켜져 있으면 idempotent다.
+        let _ = host.cancel_task(task_id);
+        // sidecar 응답을 **기다리지 않는다** — 응답하지 않는 것이 이 경로의 전제다.
+        // 짧은 타임아웃으로 한 번만 밀어 넣고, 실패해도 진행한다.
+        let _ = sidecar.request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(1));
+
+        host.force_abandon(task_id)
+    }
+
     pub fn respond_approval(&self, approval_id: &str, granted: bool, note: Option<String>) -> Result<Value, String> {
         let sender = self.pending_approvals.lock().unwrap().remove(approval_id);
         let Some(sender) = sender else {

@@ -118,6 +118,15 @@ fn provide_user_input(
     state.provide_user_input(&task_id, &message, decisions)
 }
 
+/// "취소 중"에서 기다리기를 그만둔다 (12절 미해결 "취소 중 상한").
+///
+/// **프로세스를 죽이지 않는다** — 죽일 수 있었으면 이 명령이 필요하지 않았다. 태스크를
+/// 터미널로 확정해 사용자를 놓아주고, 남은 프로세스가 있을 수 있다는 사실을 기록한다.
+#[tauri::command]
+fn force_abandon_task(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
+    state.force_abandon_task(&task_id)
+}
+
 /// ui-wireframes.md 3.6절 롤백. 일반 ToolRequest 경로와 이벤트 로그를 그대로 탄다.
 #[tauri::command]
 async fn rollback_task(app: tauri::AppHandle, task_id: String) -> Result<Value, String> {
@@ -213,6 +222,7 @@ pub fn run() {
             respond_approval,
             cancel_task,
             provide_user_input,
+            force_abandon_task,
             rollback_task,
             get_task_events,
             list_tasks,

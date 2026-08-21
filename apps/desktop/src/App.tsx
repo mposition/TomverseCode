@@ -42,6 +42,15 @@ import { VerificationPanel } from "./components/VerificationPanel";
  * 이 프로세스가 갖지 않는 것: API 키, 셸 실행, 파일 쓰기. 아래 코드에 그런 것이 없다 —
  * 모든 동작은 `invoke`로 Rust에 요청하고, Rust의 Policy Gate가 최종 판단한다.
  */
+/**
+ * "취소 중"이 이만큼 이어지면 강제 포기 버튼을 연다.
+ *
+ * 정상 취소는 1초 안에 끝난다(Rust의 종료 상한이 2초이고, 그 전에 대부분 끝난다). 여유를 두되
+ * 사용자가 "멈췄다"고 느끼기 전이어야 하므로 그 사이에 둔다. **실측이 아니라 추정값이며**,
+ * 너무 짧으면 정상 취소 중에 탈출구가 떠서 불안을 만들고 너무 길면 탈출구가 없는 것과 같다.
+ */
+const FORCE_ABANDON_AFTER_MS = 5_000;
+
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [workspacePath, setWorkspacePath] = useState("");
@@ -73,6 +82,12 @@ export default function App() {
   // 취소는 즉시 끝나지 않는다. 버튼을 누른 순간부터 terminal 이벤트가 올 때까지가 "취소 중"이고,
   // 그 사이에 버튼을 다시 누를 수 있으면 안 된다(요청 자체는 멱등이지만 사용자에게 혼란스럽다).
   const [cancelling, setCancelling] = useState(false);
+  /**
+   * 취소를 요청한 시각. **"취소 중"이 얼마나 이어졌는지를 화면이 알아야** 탈출구를 언제
+   * 보여줄지 정할 수 있다(12절 미해결 "취소 중 상한").
+   */
+  const cancelStartedAt = useRef<number | null>(null);
+  const [cancelElapsedMs, setCancelElapsedMs] = useState(0);
   const [tasks, setTasks] = useState<TaskRow[]>([]);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [selectedTask, setSelectedTask] = useState<{
@@ -136,6 +151,20 @@ export default function App() {
     }, 200);
     return () => clearInterval(timer);
   }, [running]);
+
+  // 취소 경과 시간. 정상 취소는 1초 안에 끝나므로 이 값이 커지는 것 자체가 신호다.
+  useEffect(() => {
+    if (!cancelling) {
+      cancelStartedAt.current = null;
+      setCancelElapsedMs(0);
+      return;
+    }
+    if (cancelStartedAt.current === null) cancelStartedAt.current = Date.now();
+    const timer = setInterval(() => {
+      if (cancelStartedAt.current !== null) setCancelElapsedMs(Date.now() - cancelStartedAt.current);
+    }, 200);
+    return () => clearInterval(timer);
+  }, [cancelling]);
 
   // Rust가 릴레이하는 이벤트 구독. 진행 상태 표시는 전부 여기서 파생된다 —
   // UI가 독자적으로 진행 상태를 추측하지 않는다.
@@ -291,6 +320,30 @@ export default function App() {
     },
     [events, taskId]
   );
+
+  /**
+   * 강제 포기 — 기다리기를 그만둔다.
+   *
+   * **취소를 취소하는 것이 아니다.** 죽이려는 시도는 계속되고, 사용자를 "취소 중" 화면에서
+   * 놓아줄 뿐이다. 그래서 안내 문구가 "정리됐습니다"가 아니라 "남아 있을 수 있습니다"다.
+   */
+  const forceAbandon = useCallback(async () => {
+    const id = currentTaskId(events, taskId);
+    if (!id) return;
+    try {
+      const result = await invoke<{ abandoned: boolean; status: string; reason?: string }>("force_abandon_task", {
+        taskId: id,
+      });
+      setCancelling(false);
+      setNotice(
+        result.abandoned
+          ? "작업을 강제로 종료했습니다. 실행 중이던 프로세스가 남아 있을 수 있으니 확인이 필요할 수 있습니다."
+          : `기다리는 사이에 작업이 ${result.status}로 끝났습니다.`
+      );
+    } catch (error) {
+      setNotice(`강제 포기 실패: ${String(error)}`);
+    }
+  }, [events, taskId]);
 
   const rollback = useCallback(async () => {
     const id = finalResult?.taskId ?? taskId;
@@ -498,10 +551,27 @@ export default function App() {
               어느 정책을 골라도 빌드·테스트 검증은 생략되지 않습니다. Fast는 LLM 두 개의 상호 검토만 건너뜁니다.
             </p>
             {cancelling && (
-              <p className="warn small">
-                취소를 요청했습니다 — 실행 중인 명령을 종료하고 남은 단계를 건너뛰는 중입니다. 이미 변경된 파일은
-                자동으로 되돌아가지 않습니다. 아래 결과에서 되돌리기를 선택할 수 있습니다.
-              </p>
+              <div className="warn small">
+                <p>
+                  취소를 요청했습니다 — 실행 중인 명령을 종료하고 남은 단계를 건너뛰는 중입니다 (
+                  {(cancelElapsedMs / 1000).toFixed(1)}초 경과). 이미 변경된 파일은 자동으로 되돌아가지 않습니다.
+                  아래 결과에서 되돌리기를 선택할 수 있습니다.
+                </p>
+                {/* 정상 취소는 1초 안에 끝난다. 이 시간을 넘겼다는 것은 죽지 않는 프로세스가
+                    있거나 sidecar가 응답하지 않는다는 뜻이므로 탈출구를 연다 — 탈출구가 없으면
+                    사용자에게는 앱이 멈춘 것과 구별되지 않는다. */}
+                {cancelElapsedMs >= FORCE_ABANDON_AFTER_MS && (
+                  <div className="row">
+                    <button className="secondary" onClick={forceAbandon}>
+                      강제 포기
+                    </button>
+                    <span>
+                      예상보다 오래 걸리고 있습니다. 강제 포기는 <strong>기다리기를 그만두는 것</strong>이지 프로세스를
+                      죽이는 것이 아닙니다 — 실행 중이던 명령이 계속 돌고 있을 수 있습니다.
+                    </span>
+                  </div>
+                )}
+              </div>
             )}
           </section>
 

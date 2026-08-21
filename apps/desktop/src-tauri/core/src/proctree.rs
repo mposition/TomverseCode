@@ -30,6 +30,20 @@ use std::time::{Duration, Instant};
 /// 종료 유예 — 이 시간 안에 스스로 끝나면 강제 종료하지 않는다.
 const GRACE: Duration = Duration::from_millis(300);
 
+/// SIGKILL(또는 taskkill) 이후 **자식이 사라지기를 기다리는 상한**.
+///
+/// # 왜 상한이 필요한가
+///
+/// `Child::wait()`은 무한히 기다린다. 보통은 SIGKILL을 받으면 즉시 죽으므로 문제가 없지만,
+/// **uninterruptible sleep(D 상태)에 들어간 프로세스는 SIGKILL로도 즉시 죽지 않는다** —
+/// 응답 없는 네트워크 파일 시스템이나 멈춘 드라이버를 기다리는 경우가 실제로 그렇다.
+/// 그 상태에서 무한히 기다리면 "취소 중"이 영원히 끝나지 않고, 사용자에게는 앱이 멈춘 것과
+/// 구별되지 않는다(12절 미해결 "취소 중 상한").
+///
+/// 그래서 기다리되 **포기할 줄 안다.** 포기했다는 사실은 숨기지 않고 `child_still_running`으로
+/// 올려보낸다 — 죽지 않은 것을 죽었다고 보고하는 것이 이 기능에서 할 수 있는 가장 나쁜 일이다.
+const REAP_TIMEOUT: Duration = Duration::from_millis(2_000);
+
 /// `Command`에 플랫폼별 그룹 설정을 붙인다. spawn 전에 호출해야 한다.
 #[cfg(unix)]
 pub fn configure_group(command: &mut std::process::Command) {
@@ -63,10 +77,12 @@ pub fn terminate_tree(child: &mut Child) -> TreeKillOutcome {
         let group_killed = unix_kill_group(pid);
         // 그룹 시그널이 닿지 않는 경우(이미 죽어 pgid가 사라짐 등)에도 직접 자식은 확실히 정리한다.
         let _ = child.kill();
-        let _ = child.wait();
+        let reaped = reap_with_timeout(child);
         return TreeKillOutcome {
-            direct_child_terminated: true,
-            tree_guaranteed: group_killed,
+            direct_child_terminated: reaped,
+            child_still_running: !reaped,
+            surviving_pid: if reaped { None } else { Some(pid) },
+            tree_guaranteed: group_killed && reaped,
             method: if group_killed {
                 "killpg(SIGTERM→SIGKILL)"
             } else {
@@ -79,9 +95,11 @@ pub fn terminate_tree(child: &mut Child) -> TreeKillOutcome {
     {
         let tree_killed = windows_taskkill_tree(pid);
         let _ = child.kill();
-        let _ = child.wait();
+        let reaped = reap_with_timeout(child);
         return TreeKillOutcome {
-            direct_child_terminated: true,
+            direct_child_terminated: reaped,
+            child_still_running: !reaped,
+            surviving_pid: if reaped { None } else { Some(pid) },
             // taskkill은 스냅샷 기반이므로 보장이라고 말하지 않는다.
             tree_guaranteed: false,
             method: if tree_killed {
@@ -95,18 +113,46 @@ pub fn terminate_tree(child: &mut Child) -> TreeKillOutcome {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = child.kill();
-        let _ = child.wait();
+        let reaped = reap_with_timeout(child);
         TreeKillOutcome {
-            direct_child_terminated: true,
+            direct_child_terminated: reaped,
+            child_still_running: !reaped,
+            surviving_pid: if reaped { None } else { Some(pid) },
             tree_guaranteed: false,
             method: "kill(child)",
         }
     }
 }
 
+/// `REAP_TIMEOUT` 안에 자식이 사라졌는가.
+///
+/// `wait()` 대신 `try_wait()` 폴링을 쓰는 이유는 하나뿐이다 — **포기할 수 있어야 하기 때문이다.**
+/// 표준 라이브러리에는 시간 제한이 있는 wait이 없다.
+fn reap_with_timeout(child: &mut Child) -> bool {
+    let deadline = Instant::now() + REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            // 종료됐다. 또는 이미 누군가 거둬갔다(Err) — 어느 쪽이든 이 자식은 더 없다.
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeKillOutcome {
+    /// 직접 자식이 실제로 사라졌는가. **상한 안에 사라지지 않으면 false다** — 죽였다고 믿는 것과
+    /// 죽은 것을 확인한 것은 다르다.
     pub direct_child_terminated: bool,
+    /// 상한을 넘겨 포기했는가. true면 그 프로세스는 아직 돌고 있을 수 있다.
+    pub child_still_running: bool,
+    /// 살아남았을 수 있는 PID. 사용자에게 무엇이 남았는지 알려주기 위한 것이다 —
+    /// "뭔가 남았을 수 있습니다"만으로는 사용자가 할 수 있는 일이 없다.
+    pub surviving_pid: Option<u32>,
     /// 트리 전체 종료를 **보장**하는가. Windows의 taskkill 경로는 false다.
     pub tree_guaranteed: bool,
     pub method: &'static str,
@@ -176,6 +222,55 @@ pub fn is_alive(_pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    /// 종료 상한이 실제로 **포기하는지** 확인한다 (12절 미해결 "취소 중 상한").
+    ///
+    /// SIGKILL을 무시하는 프로세스를 만들 수는 없으므로(그건 커널이 정한다), 여기서는
+    /// `reap_with_timeout`에 **이미 다른 곳에서 거둬간** 자식을 주는 대신 살아 있는 자식을
+    /// 주고 상한이 지나면 false가 나오는지를 본다. 죽이지 않은 채 기다리기만 하는 상황이
+    /// D 상태 프로세스와 같은 관측 결과를 만든다.
+    #[cfg(unix)]
+    #[test]
+    fn reaping_gives_up_instead_of_waiting_forever() {
+        let mut child = Command::new("node")
+            .args(["-e", "setInterval(() => {}, 1000)"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("node를 실행할 수 없습니다");
+
+        let started = Instant::now();
+        // **죽이지 않고** 거두기만 시도한다 — 죽지 않는 프로세스를 기다리는 것과 같은 상황이다.
+        let reaped = reap_with_timeout(&mut child);
+        let elapsed = started.elapsed();
+
+        assert!(!reaped, "살아 있는 프로세스를 거뒀다고 보고했습니다");
+        // 무한히 기다리지 않았다. 이게 없으면 "취소 중"이 영원히 끝나지 않는다.
+        assert!(
+            elapsed < REAP_TIMEOUT + Duration::from_millis(1_500),
+            "종료 상한을 지키지 못했습니다: {elapsed:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// 정상적으로 죽는 프로세스는 상한을 다 쓰지 않는다 — 상한이 지연을 만들면 안 된다.
+    #[test]
+    fn reaping_returns_immediately_for_a_process_that_exits() {
+        let mut child = Command::new("node")
+            .args(["-e", "process.exit(0)"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("node를 실행할 수 없습니다");
+
+        let started = Instant::now();
+        assert!(reap_with_timeout(&mut child));
+        assert!(started.elapsed() < REAP_TIMEOUT, "정상 종료인데 상한을 다 썼습니다");
+    }
 
     /// 손자 프로세스까지 죽는지 확인한다 — 이게 이 모듈의 존재 이유다.
     #[test]

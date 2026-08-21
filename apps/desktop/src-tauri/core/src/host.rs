@@ -166,6 +166,48 @@ impl TaskHost {
         })
     }
 
+    /// **강제 포기** — 사용자가 "취소 중"에서 기다리기를 그만둔다 (12절 미해결 항목).
+    ///
+    /// # 왜 필요한가
+    ///
+    /// 취소는 즉시 끝나지 않는다. 보통은 몇 백 ms지만, `REAP_TIMEOUT`을 넘겨도 죽지 않는
+    /// 프로세스가 있거나 sidecar가 응답하지 않으면 태스크가 터미널에 도달하지 못한다. 그러면
+    /// 화면은 영원히 "취소 중"이고, 사용자에게는 앱이 멈춘 것과 구별되지 않는다.
+    ///
+    /// # 무엇을 하고 무엇을 하지 않는가
+    ///
+    /// 하는 일: 태스크를 **CANCELLED로 확정**해 사용자를 놓아준다. `finish_task`의 원자적 경로를
+    /// 그대로 쓰므로 나중에 sidecar가 자기 terminal을 보고해도 이미 확정된 쪽이 남는다.
+    ///
+    /// 하지 않는 일: **프로세스를 죽이지 않는다.** 죽일 수 있었으면 이 함수가 필요하지 않았다.
+    /// 그래서 "정리됐다"고 말하지 않고 `forceAbandoned`와 함께 그 사실을 기록한다 —
+    /// 남은 프로세스가 있을 수 있다는 것이 이 경로의 **정의**이지 예외가 아니다.
+    pub fn force_abandon(&self, task_id: &str) -> Result<Value, String> {
+        let outcome = self.finish_task(
+            task_id,
+            "CANCELLED",
+            "TASK_CANCELLED",
+            None,
+            json!({
+                "status": "cancelled",
+                "summary": "사용자가 강제 포기했습니다. 취소 요청은 보냈지만 정리 완료를 확인하지 못했으므로                             실행 중이던 프로세스가 남아 있을 수 있습니다.",
+                "source": "force-abandon",
+                "forceAbandoned": true,
+            }),
+        )?;
+
+        Ok(match outcome {
+            TerminalOutcome::Recorded { status, .. } => {
+                json!({ "abandoned": true, "status": status })
+            }
+            // 기다리는 사이에 정상적으로 끝난 경우다. 이건 실패가 아니라 **좋은 소식**이므로
+            // 오류로 만들지 않는다 — 다만 무엇으로 끝났는지는 알려준다.
+            TerminalOutcome::AlreadyTerminal { status } => {
+                json!({ "abandoned": false, "status": status, "reason": "이미 종료된 태스크입니다" })
+            }
+        })
+    }
+
     pub fn cancellation_token(&self, task_id: &str) -> CancellationToken {
         self.cancels.token(task_id)
     }
@@ -904,6 +946,58 @@ mod tests {
             Arc::new(CancellationRegistry::new()),
         );
         (ws, art, host)
+    }
+
+    /// 12절 미해결 "취소 중 상한" — 기다리기를 그만두는 탈출구.
+    #[test]
+    fn force_abandon_terminalizes_the_task_without_claiming_cleanup() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink.clone());
+
+        let result = host.force_abandon("task-1").unwrap();
+        assert_eq!(result.get("abandoned").and_then(Value::as_bool), Some(true));
+
+        // 태스크가 실제로 터미널이 됐다 — 사용자가 "취소 중" 화면에서 풀려난다.
+        let task = host.with_store(|s| s.get_task("task-1")).unwrap().unwrap();
+        assert_eq!(task.terminal_status.as_deref(), Some("CANCELLED"));
+
+        // **"정리됐다"고 말하지 않는다.** 남은 프로세스가 있을 수 있다는 것이 이 경로의
+        // 정의이지 예외가 아니므로, 그 사실이 이벤트에 남아야 한다.
+        let event = host
+            .with_store(|s| s.events("task-1"))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "TASK_CANCELLED")
+            .expect("terminal 이벤트가 없습니다");
+        assert_eq!(event.payload.get("forceAbandoned").and_then(Value::as_bool), Some(true));
+        let summary = event.payload.get("summary").and_then(Value::as_str).unwrap_or("");
+        assert!(
+            summary.contains("남아 있을 수 있"),
+            "남은 프로세스 가능성을 알리지 않습니다: {summary}"
+        );
+    }
+
+    /// 기다리는 사이에 정상 종료된 경우는 **오류가 아니라 좋은 소식**이다.
+    #[test]
+    fn force_abandon_does_not_override_an_already_finished_task() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+
+        host.finish_task(
+            "task-1",
+            "COMPLETED",
+            "TASK_COMPLETED",
+            None,
+            json!({ "status": "completed" }),
+        )
+        .unwrap();
+
+        let result = host.force_abandon("task-1").unwrap();
+        assert_eq!(result.get("abandoned").and_then(Value::as_bool), Some(false));
+        assert_eq!(result.get("status").and_then(Value::as_str), Some("COMPLETED"));
+        // 완료를 취소로 덮어쓰지 않는다 — 먼저 확정된 쪽이 남는다.
+        let task = host.with_store(|s| s.get_task("task-1")).unwrap().unwrap();
+        assert_eq!(task.terminal_status.as_deref(), Some("COMPLETED"));
     }
 
     /// 문서 17.3절: 판정 원문은 남되 비밀값 모양은 가려야 한다.
