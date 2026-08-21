@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import type { Disagreement, UserDecisionInput } from "../types";
+import { SecretShapeWarning, useSecretShapeScan } from "./SecretShapeWarning";
 
 /**
  * 불일치 판정 카드 — docs/design/ui-wireframes.md 3.9절.
@@ -43,6 +44,22 @@ export function DisagreementCard({
   const complete = answered.length === blocking.length && blocking.length > 0;
 
   const setChoice = (id: string, choice: Choice) => setChoices((prev) => ({ ...prev, [id]: choice }));
+
+  // **직접 입력만 검사한다.** 선택지의 라벨은 모델 초안에서 온 문구라 사용자가 붙여넣은 것이
+  // 아니고, 거기까지 검사하면 모델이 예시로 적은 키 모양에 매번 경고가 뜬다. 검사 대상은
+  // "사용자가 방금 친 것"이다(17.11절).
+  //
+  // 한 문자열로 합쳐 한 번만 검사하는 이유: 쟁점마다 따로 부르면 입력 하나에 프로세스 경계를
+  // 여러 번 넘게 되고, 경고는 어차피 카드 하나에 한 번 뜬다.
+  const freeformText = useMemo(
+    () =>
+      Object.values(choices)
+        .filter((choice) => choice.optionId === undefined)
+        .map((choice) => choice.text)
+        .join("\n"),
+    [choices]
+  );
+  const freeformSecrets = useSecretShapeScan(freeformText);
 
   return (
     <div className="panel card-disagreement">
@@ -129,6 +146,8 @@ export function DisagreementCard({
         </details>
       )}
 
+      <SecretShapeWarning hits={freeformSecrets} />
+
       <div className="row">
         <button
           onClick={() =>
@@ -145,7 +164,7 @@ export function DisagreementCard({
           }
           disabled={!complete}
         >
-          확인
+          {freeformSecrets.length > 0 ? "그대로 확인" : "확인"}
         </button>
         {!complete && (
           <span className="muted small">

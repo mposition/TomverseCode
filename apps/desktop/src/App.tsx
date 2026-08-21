@@ -13,6 +13,7 @@ import {
   type ForceAbandonThreshold,
   type ProviderStatus,
   type RevertOutcome,
+  type SecretShapeHit,
   type RoutingInfo,
   type StoredEvent,
   type TaskEvent,
@@ -28,6 +29,7 @@ import { AcceptanceCriteriaPanel } from "./components/AcceptanceCriteriaPanel";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { DiffPanel } from "./components/DiffPanel";
 import { DisagreementCard } from "./components/DisagreementCard";
+import { SecretShapeWarning, useSecretShapeScan } from "./components/SecretShapeWarning";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
 import { TaskHistory } from "./components/TaskHistory";
@@ -108,6 +110,10 @@ export default function App() {
   // 실제로 쓰는 값. 측정값이 없으면 기본값으로 돌아간다 — 화면이 임계값 없이 도는 상태를
   // 만들지 않기 위해서다(탈출구가 아예 안 뜨는 것이 이 기능이 고치려던 문제였다).
   const forceAbandonMs = forceAbandonAfter?.ms ?? DEFAULT_FORCE_ABANDON_AFTER_MS;
+  // 보내기 전 자격증명 경고(17.11절). 요청문과 답변은 **그대로 프롬프트에 실려 나가므로**,
+  // 저장 시 마스킹으로는 막을 수 없다 — 막을 수 있는 것은 보내기 전의 사용자뿐이다.
+  const messageSecrets: SecretShapeHit[] = useSecretShapeScan(message);
+  const answerSecrets: SecretShapeHit[] = useSecretShapeScan(answer);
   const [tasks, setTasks] = useState<TaskRow[]>([]);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [selectedTask, setSelectedTask] = useState<{
@@ -608,6 +614,7 @@ export default function App() {
               rows={3}
               disabled={running}
             />
+            <SecretShapeWarning hits={messageSecrets} />
             <div className="row">
               <fieldset className="modes" disabled={running}>
                 <legend>실행 정책</legend>
@@ -633,8 +640,11 @@ export default function App() {
                   변경을 git에 커밋 (매번 승인을 묻습니다)
                 </label>
               </fieldset>
+              {/* 막지 않고 문구만 바꾼다. 자격증명 모양이 진짜 요구의 일부일 수 있고
+                  ("sk-로 시작하는 키를 거부해야 한다"), 무엇이 자기 요구인지는 사용자가
+                  판정한다(원칙 1). 대신 그대로 보내는 중이라는 사실은 눈에 남긴다. */}
               <button onClick={runTask} disabled={running || message.trim().length === 0 || noProviders}>
-                {running ? "실행 중..." : "실행"}
+                {running ? "실행 중..." : messageSecrets.length > 0 ? "그대로 실행" : "실행"}
               </button>
               {running && (
                 <button className="secondary" onClick={cancel} disabled={cancelling}>
@@ -751,10 +761,11 @@ export default function App() {
                       <li key={q}>{q}</li>
                     ))}
                   </ul>
+                  <SecretShapeWarning hits={answerSecrets} />
                   <div className="row">
                     <input value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder="답변 입력" />
                     <button onClick={submitAnswer} disabled={answer.trim().length === 0}>
-                      전송
+                      {answerSecrets.length > 0 ? "그대로 전송" : "전송"}
                     </button>
                   </div>
                 </div>

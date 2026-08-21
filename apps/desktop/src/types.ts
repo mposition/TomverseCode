@@ -289,3 +289,14 @@ export interface ForceAbandonThreshold {
   sampleCount: number;
   minSamples: number;
 }
+
+/**
+ * 자유 텍스트에서 발견된 자격증명 **모양의 이름과 개수** (17.11절).
+ *
+ * 값 자체는 담기지 않는다 — UI는 이미 그 텍스트를 갖고 있고, 프로세스 경계를 넘는 곳마다
+ * 자격증명 사본이 하나씩 늘어나는 것은 그 자체로 노출면이다.
+ */
+export interface SecretShapeHit {
+  label: string;
+  count: number;
+}

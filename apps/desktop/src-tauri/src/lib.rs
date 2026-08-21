@@ -172,6 +172,23 @@ fn get_task_events(
     state.get_task_events(&task_id, after_event_id)
 }
 
+/// 보내기 **전에** 자격증명처럼 보이는 값이 있는지 본다 (17.11절).
+///
+/// # 왜 이 명령이 필요한가
+///
+/// `mask_secret_shapes`는 저장 직전에 도는 것이라 **감사 로그만 지킨다.** 사용자 답변과 요청문은
+/// 그대로 프롬프트에 실려 모델 공급자로 나가고, 그건 우리가 되돌릴 수 있는 일이 아니다.
+/// 나가는 것을 막을 수 있는 것은 보내기 전의 사용자뿐이므로, 알려주는 것 말고 할 수 있는 일이 없다.
+///
+/// # 상태를 만들지 않는다
+///
+/// 입력을 저장하지도, 이벤트를 남기지도 않는다. 편집 중인 텍스트를 기록하기 시작하면 이 기능이
+/// 막으려는 것(자격증명이 어딘가에 남는 것)을 이 기능이 하게 된다.
+#[tauri::command]
+fn scan_input_for_secret_shapes(text: String) -> Result<Value, String> {
+    Ok(json!({ "hits": tomverse_core::policy::secrets::scan_secret_shapes(&text) }))
+}
+
 /// 강제 포기 버튼을 열 시점과 그 근거.
 ///
 /// 값과 함께 `source`를 돌려주는 이유: 표본이 부족하면 이 값은 여전히 추정치인데, 숫자만
@@ -260,6 +277,7 @@ pub fn run() {
             get_task_events,
             list_tasks,
             force_abandon_threshold,
+            scan_input_for_secret_shapes,
             get_task,
             restart_task,
         ])

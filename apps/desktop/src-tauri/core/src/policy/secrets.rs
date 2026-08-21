@@ -20,12 +20,19 @@
 //! 이름 기반 하드 필터가 약속할 수 있는 것만 약속한다 —
 //! context-engine.md 7절의 "진입 자체를 막는다"와 같은 태도다.
 //!
-//! # 예외: 경로가 없는 자유 텍스트 (`mask_secret_shapes`)
+//! # 예외: 경로가 없는 자유 텍스트 (`mask_secret_shapes` / `scan_secret_shapes`)
 //!
-//! 위 규칙의 유일한 예외가 아래 `mask_secret_shapes`다. 사용자 판정 원문
-//! (`USER_DECISION_RECORDED`)에는 **검사할 경로 자체가 없어서** 이름 기반 필터를 적용할 대상이
-//! 없다. 그 함수는 "안전하다"를 주장하지 않고 알려진 모양만 가리는 완화이며, 그래서 마스킹
-//! 개수를 함께 돌려준다 — 자세한 근거는 그 함수의 주석에 있다.
+//! 위 규칙의 유일한 예외가 아래 두 함수다. 사용자 판정 원문(`USER_DECISION_RECORDED`)에는
+//! **검사할 경로 자체가 없어서** 이름 기반 필터를 적용할 대상이 없다. 둘 다 "안전하다"를
+//! 주장하지 않고 알려진 모양만 다루는 완화다.
+//!
+//! 둘이 답하는 질문은 다르다. `mask_secret_shapes`는 **무엇을 저장할 것인가**(저장 직전 Rust가
+//! 가린다), `scan_secret_shapes`는 **사용자에게 무엇을 알릴 것인가**(보내기 전에 경고한다).
+//! 마스킹은 감사 로그만 지키고 **모델 공급자로 나가는 것은 막지 못한다** — 그건 사용자만
+//! 막을 수 있으므로 알려야 한다. 근거는 17.11절.
+//!
+//! 모양 목록은 `SECRET_SHAPES` 하나뿐이다. 두 함수가 각자 목록을 가지면 경고 없이 가리거나
+//! 가리지 않고 경고하는 상태가 생기고, 둘 다 사용자를 잘못 안심시킨다.
 
 /// 경로가 비밀값을 담을 수 있는 것으로 분류되는가.
 ///
@@ -116,31 +123,109 @@ pub fn mask_secret_shapes(text: &str) -> (String, usize) {
     (out.into_owned(), masked)
 }
 
-/// 알려진 자격증명 모양. **완결 목록이 아니다** — 새 공급자가 새 접두사를 쓰면 여기 없다.
+/// 알려진 자격증명 모양과 **사람이 읽을 이름**. 완결 목록이 아니다 —
+/// 새 공급자가 새 접두사를 쓰면 여기 없다.
+///
+/// # 이름을 함께 두는 이유
+///
+/// 입력 시점 경고(17.11절)가 "무언가 자격증명처럼 보입니다"만 말하면 사용자는 긴 답변의
+/// 어디를 봐야 하는지 알 수 없다. **값은 한 글자도 돌려주지 않으므로** 이름이 유일한 단서다.
+///
+/// 목록이 하나인 것도 결정이다. 가리는 쪽(`mask_secret_shapes`)과 경고하는 쪽
+/// (`scan_secret_shapes`)이 각자 목록을 가지면, 경고하지 않고 가리거나 가리지 않고 경고하는
+/// 상태가 생긴다. 둘 다 사용자를 잘못 안심시킨다.
+const SECRET_SHAPES: &[(&str, &str)] = &[
+    // OpenAI / Anthropic 계열 접두사 + 충분히 긴 본문
+    ("OpenAI·Anthropic 계열 키", r"(?:sk|pk|rk)-[A-Za-z0-9_\-]{16,}"),
+    ("Stripe 계열 키", r"sk_(?:live|test)_[A-Za-z0-9]{16,}"),
+    ("Google API 키", r"AIza[A-Za-z0-9_\-]{20,}"),
+    // GitHub 토큰 (ghp_/gho_/ghu_/ghs_/ghr_)
+    ("GitHub 토큰", r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    ("GitHub 개인 액세스 토큰", r"github_pat_[A-Za-z0-9_]{20,}"),
+    ("Slack 토큰", r"xox[abposr]-[A-Za-z0-9\-]{10,}"),
+    ("AWS 액세스 키 ID", r"(?:AKIA|ASIA)[A-Z0-9]{16}"),
+    ("JWT", r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
+    (
+        "PEM 개인키",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+    ),
+    // `Authorization: Bearer <token>` 의 토큰 부분
+    ("Bearer 토큰", r"(?i:bearer)\s+[A-Za-z0-9_\-\.=]{20,}"),
+];
+
+/// 위 목록을 하나로 합친 정규식. **가리는 것과 세는 것의 정본**이다.
 fn secret_shape_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(concat!(
-            // OpenAI / Anthropic / Google 계열 접두사 + 충분히 긴 본문
-            r"(?:sk|pk|rk)-[A-Za-z0-9_\-]{16,}",
-            r"|sk_(?:live|test)_[A-Za-z0-9]{16,}",
-            r"|AIza[A-Za-z0-9_\-]{20,}",
-            // GitHub 토큰 (ghp_/gho_/ghu_/ghs_/ghr_/github_pat_)
-            r"|gh[pousr]_[A-Za-z0-9]{20,}",
-            r"|github_pat_[A-Za-z0-9_]{20,}",
-            // Slack
-            r"|xox[abposr]-[A-Za-z0-9\-]{10,}",
-            // AWS access key id + secret access key 대입 형태
-            r"|(?:AKIA|ASIA)[A-Z0-9]{16}",
-            // JWT
-            r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}",
-            // PEM 개인키 블록 전체
-            r"|-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
-            // `Authorization: Bearer <token>` 의 토큰 부분
-            r"|(?i:bearer)\s+[A-Za-z0-9_\-\.=]{20,}",
-        ))
-        .expect("secret shape regex는 컴파일 시점에 고정된 상수다")
+        // 각 모양을 `(?:)`로 감싼다 — 감싸지 않으면 모양 안의 `|`가 바깥 교대와 섞여
+        // 목록에 항목을 추가하는 순간 조용히 다른 것을 매칭하게 된다.
+        let joined = SECRET_SHAPES
+            .iter()
+            .map(|(_, pattern)| format!("(?:{pattern})"))
+            .collect::<Vec<_>>()
+            .join("|");
+        regex::Regex::new(&joined).expect("secret shape regex는 컴파일 시점에 고정된 상수다")
     })
+}
+
+/// 모양별 정규식. **양끝을 고정한다** — 고정하지 않으면 `Bearer eyJ…`가 JWT로 이름 붙는다
+/// (JWT 모양이 그 안에 들어 있기 때문이다). 이름이 틀리면 사용자가 엉뚱한 곳을 본다.
+fn anchored_shape_regexes() -> &'static [regex::Regex] {
+    static RES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    RES.get_or_init(|| {
+        SECRET_SHAPES
+            .iter()
+            .map(|(_, pattern)| regex::Regex::new(&format!("^(?:{pattern})$")).expect("고정된 상수다"))
+            .collect()
+    })
+}
+
+/// 자유 텍스트에서 발견된 자격증명 모양의 **이름과 개수**. 값은 담지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SecretShapeHit {
+    pub label: String,
+    pub count: usize,
+}
+
+/// 텍스트를 **바꾸지 않고** 자격증명처럼 보이는 것이 있는지만 본다 — 입력 시점 경고용(17.11절).
+///
+/// # 왜 마스킹과 별개의 함수인가
+///
+/// 두 함수가 답하는 질문이 다르다. `mask_secret_shapes`는 "무엇을 저장할 것인가"이고,
+/// 이건 "사용자에게 무엇을 알릴 것인가"다. 경고 단계에서 텍스트를 바꾸면 사용자가 자기가
+/// 쓴 것과 다른 것을 보게 되고, 그건 편집 중인 입력에 할 수 있는 일이 아니다.
+///
+/// # 값을 돌려주지 않는다
+///
+/// 발견된 값 자체는 결과에 담지 않는다. UI는 이미 그 텍스트를 갖고 있으므로 필요가 없고,
+/// 프로세스 경계를 넘는 곳마다 자격증명 사본이 하나씩 늘어나는 것은 그 자체로 노출면이다.
+///
+/// **개수는 결합 정규식에서 센다.** 모양별로 따로 세면 겹치는 모양(`Bearer` 안의 JWT)이
+/// 두 번 세어져, 가려질 개수와 경고에 적힌 개수가 어긋난다.
+pub fn scan_secret_shapes(text: &str) -> Vec<SecretShapeHit> {
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+    for matched in secret_shape_regex().find_iter(text) {
+        *counts.entry(shape_label(matched.as_str())).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(label, count)| SecretShapeHit {
+            label: label.to_string(),
+            count,
+        })
+        .collect()
+}
+
+fn shape_label(matched: &str) -> &'static str {
+    for (index, (label, _)) in SECRET_SHAPES.iter().enumerate() {
+        if anchored_shape_regexes()[index].is_match(matched) {
+            return label;
+        }
+    }
+    // 결합 정규식이 잡았는데 어떤 모양도 고정 매칭되지 않는 경우는 정의상 없다.
+    // 그래도 패닉하지 않는다 — 이름 하나 때문에 입력창을 죽이는 것은 균형이 맞지 않는다.
+    // 테스트가 이 값이 나오지 않음을 지킨다.
+    "알 수 없는 모양"
 }
 
 #[cfg(test)]
@@ -165,6 +250,72 @@ mod tests {
                 masked.contains("[REDACTED:"),
                 "{raw}의 마스킹 결과에 표식이 없습니다: {masked}"
             );
+        }
+    }
+
+    /// 결합 정규식이 잡은 것에는 **반드시 이름이 붙어야 한다.** 이름이 "알 수 없는 모양"으로
+    /// 떨어지면 경고가 사용자에게 어디를 보라고 말하지 못한다.
+    #[test]
+    fn every_matched_shape_gets_a_name() {
+        for raw in [
+            "sk-abcdefghijklmnopqrstuvwxyz012345",
+            "sk_live_0123456789abcdefghij",
+            "AIzaSyA0123456789abcdefghijklmnopqrstu",
+            "ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+            "github_pat_11ABCDEFG0abcdefghij_KLMNOPQRSTUVWXYZ0123456789",
+            "xoxb-1234567890-abcdefghij",
+            "AKIAIOSFODNN7EXAMPLE",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop",
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9abcdefghijklmnop",
+        ] {
+            let hits = scan_secret_shapes(raw);
+            assert!(!hits.is_empty(), "{raw}에서 아무것도 잡히지 않았습니다");
+            for hit in &hits {
+                assert_ne!(hit.label, "알 수 없는 모양", "{raw} → {hit:?}");
+            }
+        }
+    }
+
+    /// **겹치는 모양을 두 번 세지 않는다.** `Bearer eyJ…`는 Bearer 안에 JWT가 들어 있어서,
+    /// 모양별로 따로 세면 2개가 된다. 그러면 경고에 적힌 개수가 실제로 가려질 개수와 어긋나고,
+    /// 사용자는 하나를 지운 뒤에도 경고가 남는 이유를 알 수 없다.
+    #[test]
+    fn overlapping_shapes_are_counted_once_and_named_by_the_outer_one() {
+        let hits = scan_secret_shapes("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9abcdefghijklmnop");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].count, 1, "{hits:?}");
+        assert_eq!(hits[0].label, "Bearer 토큰", "{hits:?}");
+
+        // 세는 방식이 마스킹과 같아야 한다 — 두 숫자가 다르면 어느 쪽이 맞는지 알 수 없다.
+        let (_masked, count) = mask_secret_shapes("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9abcdefghijklmnop");
+        assert_eq!(count, hits.iter().map(|h| h.count).sum::<usize>());
+    }
+
+    /// **검사는 텍스트를 바꾸지 않는다.** 편집 중인 입력을 사용자 몰래 고치면, 사용자가 자기가
+    /// 쓴 것과 다른 것을 보게 된다.
+    #[test]
+    fn scanning_reports_names_and_counts_but_never_the_value() {
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let hits = scan_secret_shapes(&format!("이 키 {secret} 를 쓰세요"));
+        assert_eq!(hits.len(), 1);
+        // 값 조각이 결과에 들어가면 프로세스 경계를 넘는 곳마다 사본이 하나씩 는다.
+        let serialized = serde_json::to_string(&hits).unwrap();
+        assert!(
+            !serialized.contains("abcdefghij"),
+            "값이 결과에 담겼습니다: {serialized}"
+        );
+    }
+
+    #[test]
+    fn ordinary_text_is_not_flagged() {
+        // 거짓 경보는 공짜가 아니다 — 매번 뜨면 사용자가 경고를 읽지 않게 된다.
+        for raw in [
+            "빈 문자열은 거부한다",
+            "sk-짧음",
+            "validate.test.ts:41 을 보세요",
+            "AKIA_TOO_SHORT",
+        ] {
+            assert!(scan_secret_shapes(raw).is_empty(), "{raw}가 자격증명으로 잡혔습니다");
         }
     }
 
