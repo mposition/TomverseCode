@@ -86,6 +86,54 @@ pub fn configure_group(command: &mut std::process::Command) {
 #[cfg(not(any(unix, windows)))]
 pub fn configure_group(_command: &mut std::process::Command) {}
 
+/// 수거 상한을 넘긴 자식을 백그라운드에서 계속 거두는 상한.
+///
+/// 상한이 있는 이유는 원칙 5다 — 끝나지 않는 스레드를 명령마다 하나씩 만드는 것은
+/// 그 자체가 누수이고, 우리가 고치려던 누수와 성질이 같다.
+const ORPHAN_REAP_CAP: Duration = Duration::from_secs(300);
+const ORPHAN_POLL: Duration = Duration::from_millis(500);
+
+/// 수거를 포기한 자식을 **넘겨받아 계속 거둔다.** 소유권을 가져가는 것이 핵심이다.
+///
+/// # 왜 필요한가 — 버리면 좀비가 남는다
+///
+/// Rust의 `Child::drop`은 기다리지도 죽이지도 않는다(문서화된 동작이다). 그래서
+/// `reap_with_timeout`이 상한을 넘겨 포기한 자식을 그냥 버리면, 그 프로세스가 **나중에 죽을 때
+/// 좀비가 되고 우리 앱이 살아 있는 한 사라지지 않는다.** 취소를 여러 번 하면 그만큼 쌓인다.
+///
+/// # 그리고 우리 보고가 영원히 틀린 채로 남는다
+///
+/// `is_alive`는 `kill(pid, 0)`이라 **좀비를 살아 있다고 보고한다.** 즉 사용자에게 "PID 1234가
+/// 남아 있을 수 있습니다"라고 말해 놓고, 사용자가 나중에 확인해도 계속 살아 있는 것으로 보인다 —
+/// 실제로는 그 프로세스가 이미 죽었고 **우리가 거두지 않아서** 그렇게 보이는 것인데도.
+/// 죽은 것을 살아 있다고 보고하는 것은 그 반대만큼은 아니어도 여전히 거짓말이다.
+///
+/// # 이것이 프로세스를 죽이지는 않는다
+///
+/// SIGKILL은 `terminate_tree`에서 이미 보냈고, 그 시그널은 **이미 걸려 있다.** D 상태에서
+/// 빠져나오는 순간 적용되므로 다시 보낼 것이 없다. 이 함수가 하는 일은 죽이는 것이 아니라
+/// **죽었을 때 뒷정리를 하는 것**이다.
+///
+/// Windows에는 좀비 개념이 없어 무해하지만 같은 경로를 타게 둔다 — 플랫폼 분기를 하나 줄이는
+/// 편이, 한쪽만 고쳐 두 플랫폼의 의미가 갈리는 것보다 낫다.
+pub fn adopt_orphan(mut child: Child) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + ORPHAN_REAP_CAP;
+        loop {
+            match child.try_wait() {
+                // 거뒀거나(Ok(Some)) 이미 누군가 거뒀다(Err) — 어느 쪽이든 할 일이 끝났다.
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                // 상한을 넘겼다. **포기한다** — 여기서 더 기다리면 이 스레드가 누수가 된다.
+                return;
+            }
+            std::thread::sleep(ORPHAN_POLL);
+        }
+    });
+}
+
 /// 자식과 수명을 같이하는 종료 보조물.
 ///
 /// Windows에서는 Job Object 핸들을 담고, 그 밖에서는 **비어 있다** — Unix는 프로세스 그룹이
@@ -313,6 +361,57 @@ pub fn is_alive(_pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// 수거를 포기한 자식을 **버리면 좀비가 남는다.** `adopt_orphan`이 그걸 거둔다.
+    ///
+    /// `/proc/<pid>`의 존재로 확인하는 이유: 좀비는 `kill(pid, 0)`에 응답하므로 `is_alive`로는
+    /// 구별되지 않는다 — 그게 이 함수가 필요한 이유 그 자체다. 거두지 않은 좀비는 부모(테스트
+    /// 프로세스)가 살아 있는 한 `/proc`에 남고, 거두면 사라진다.
+    ///
+    /// **대조군이 없으면 이 테스트는 아무것도 증명하지 못한다** — 프로세스가 그냥 빨리
+    /// 사라진 것과 우리가 거둔 것을 구별할 수 없기 때문이다.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_abandoned_child_is_reaped_instead_of_left_as_a_zombie() {
+        fn spawn_short_lived() -> Child {
+            Command::new("node")
+                .args(["-e", "setTimeout(() => process.exit(0), 200)"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        }
+        let exists = |pid: u32| std::path::Path::new(&format!("/proc/{pid}")).exists();
+
+        // 대조군: 거두지 않고 버린다 → 죽은 뒤 좀비로 남는다.
+        let abandoned = spawn_short_lived();
+        let zombie_pid = abandoned.id();
+        drop(abandoned);
+
+        // 실험군: 넘겨서 거두게 한다.
+        let adopted = spawn_short_lived();
+        let reaped_pid = adopted.id();
+        adopt_orphan(adopted);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while exists(reaped_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !exists(reaped_pid),
+            "넘긴 자식이 거둬지지 않았습니다 (pid {reaped_pid})"
+        );
+
+        // 대조군은 여전히 남아 있어야 한다 — 남아 있지 않으면 위 결과가 우연이다.
+        assert!(
+            exists(zombie_pid),
+            "버린 자식이 스스로 사라졌습니다 — 이 테스트는 아무것도 검증하지 못합니다 (pid {zombie_pid})"
+        );
+        // 그리고 좀비는 `is_alive`에 살아 있는 것으로 보인다. 사용자에게 "남아 있을 수 있습니다"가
+        // 영원히 참으로 남는 자리가 여기다.
+        assert!(is_alive(zombie_pid), "좀비가 kill(pid, 0)에 응답하지 않습니다");
+    }
 
     /// **살아남은 프로세스가 있으면 보장을 말하지 않는다.** 수단이 트리를 덮더라도 그렇다.
     ///

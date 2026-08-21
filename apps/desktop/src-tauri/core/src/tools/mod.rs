@@ -966,12 +966,17 @@ fn run_process(
 
     // 타임아웃과 취소를 **동시에** 감시한다. 폴링 간격이 곧 취소 응답 지연이므로 짧게 유지한다.
     let mut termination = Termination::Exited;
+    // 수거를 포기한 자식은 **버리지 않고 넘긴다**(proctree::adopt_orphan). 버리면 나중에 죽을 때
+    // 좀비로 남고, `is_alive`가 좀비를 살아 있다고 보고하므로 "남아 있을 수 있습니다"라는
+    // 우리 보고가 영원히 틀린 채로 남는다.
+    let mut unreaped = false;
     let exit_status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if cancel.is_cancelled() {
                     let outcome = proctree::terminate_tree(&mut child, &guard);
+                    unreaped = outcome.child_still_running;
                     termination = Termination::Cancelled {
                         tree_guaranteed: outcome.tree_guaranteed,
                         method: outcome.method,
@@ -981,7 +986,7 @@ fn run_process(
                 }
                 if start.elapsed() >= timeout {
                     // 타임아웃도 트리 종료를 쓴다 — npm이 타임아웃됐는데 node가 남는 것도 같은 문제다.
-                    let _ = proctree::terminate_tree(&mut child, &guard);
+                    unreaped = proctree::terminate_tree(&mut child, &guard).child_still_running;
                     termination = Termination::TimedOut;
                     break None;
                 }
@@ -990,6 +995,12 @@ fn run_process(
             Err(e) => return Err(format!("자식 프로세스 상태를 확인할 수 없음: {e}")),
         }
     };
+
+    if unreaped {
+        // 상한 안에 사라지지 않은 자식. 소유권을 넘겨 나중에라도 거두게 한다 —
+        // 죽이는 것이 아니라 **죽었을 때 뒷정리를 하는 것**이다(proctree.rs).
+        proctree::adopt_orphan(child);
+    }
 
     // 출력 수집으로 무기한 대기하지 않는다.
     //
