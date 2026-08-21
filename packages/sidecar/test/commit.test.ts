@@ -130,6 +130,57 @@ test("커밋 메시지는 검증된 것 이상을 말하지 않는다", () => {
   assert.ok(!/fake-|gpt|claude/i.test(message), message);
 });
 
+test("한 번에 통과한 커밋에는 재시도 줄이 없다", () => {
+  // 없는 사실을 적지 않는다. "재시도: 0회"는 참이지만, 모든 커밋에 붙으면 그 줄이
+  // 아무것도 구별해주지 않으면서 메시지만 길게 만든다.
+  const message = buildCommitMessage({
+    userMessage: "고침",
+    changedPaths: ["a.ts"],
+    verifiedChecks: ["test"],
+    taskId: "task-1",
+    fixLoopRounds: 0,
+    failedChecks: [],
+  });
+  assert.ok(!message.includes("재시도"), message);
+});
+
+test("여러 번 고쳐서 통과한 커밋은 그 사실을 메시지에 남긴다", () => {
+  // 19.6절: 태스크 하나가 커밋 하나이므로 **중간 시도는 git 이력에 없다.** 그 줄이 없으면
+  // 세 번 고쳐 통과한 변경과 처음부터 맞았던 변경이 이력에서 구별되지 않는데, 그 둘은
+  // 나중에 이 커밋을 의심할 이유가 서로 다르다.
+  const message = buildCommitMessage({
+    userMessage: "고침",
+    changedPaths: ["a.ts"],
+    verifiedChecks: ["test", "lint"],
+    taskId: "task-42",
+    fixLoopRounds: 2,
+    // 같은 체크가 두 번 실패했다 — 중복은 메시지에서 지운다.
+    failedChecks: ["test", "test"],
+  });
+  assert.ok(message.includes("재시도: 2회 (도중 실패: test)"), message);
+
+  // 태스크 id는 **trailer**다. 이 id는 로컬 기록을 가리키는 열쇠라 저장소를 받은 다른
+  // 사람에게는 뜻이 없고, 본문 산문으로 적으면 따라갈 수 있는 것으로 오해된다.
+  const lines = message.split("\n");
+  assert.equal(lines[lines.length - 1], "Tomverse-Task: task-42", message);
+  assert.equal(lines[lines.length - 2], "", "trailer 앞에 빈 줄이 없으면 git이 trailer로 읽지 않는다");
+});
+
+test("실패한 체크를 모르면 횟수만 적는다", () => {
+  // 모르는 것을 지어내지 않는다 — "(도중 실패: )"처럼 빈 괄호를 남기지도 않는다.
+  const message = buildCommitMessage({
+    userMessage: "고침",
+    changedPaths: ["a.ts"],
+    verifiedChecks: ["test"],
+    fixLoopRounds: 1,
+    failedChecks: [],
+  });
+  assert.ok(message.includes("재시도: 1회"), message);
+  assert.ok(!message.includes("도중 실패"), message);
+  // taskId가 없으면 trailer도 없다.
+  assert.ok(!message.includes("Tomverse-Task"), message);
+});
+
 test("검증 체크가 없으면 통과했다고 적지 않는다", () => {
   const message = buildCommitMessage({ userMessage: "고침", changedPaths: ["a.ts"], verifiedChecks: [] });
   assert.ok(message.includes("검증: 실행된 체크 없음"), message);

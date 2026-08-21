@@ -572,6 +572,13 @@ test("검증을 통과하면 실제 git 커밋이 만들어진다", () => {
     assert.equal(status.trim(), "", `변경이 커밋되지 않았습니다: ${status}`);
 
     assert.ok(run.eventTypes.includes("GIT_COMMIT_CREATED"), run.eventTypes.join(", "));
+
+    // 커밋 본문이 **여러 줄 그대로** 저장소에 도착했는지 확인한다. 메시지는 argv 하나로
+    // Rust까지 내려가므로(셸을 거치지 않는다), 줄바꿈이 도중에 잘리면 여기서만 드러난다.
+    // 그리고 19.6절: 태스크 하나가 커밋 하나이므로 전체 기록으로 가는 열쇠를 trailer로 남긴다.
+    const body = execFileSync("git", ["log", "-1", "--pretty=%B"], { cwd: repo.root, encoding: "utf8" });
+    assert.match(body, /변경한 파일 \(\d+개\)/, body);
+    assert.ok(body.trim().endsWith(`Tomverse-Task: ${run.taskId}`), body);
     // 되돌리기와의 관계를 요약이 말한다 — 되돌려도 커밋은 남는다.
     assert.match(run.final.summary, /되돌리기는 파일만 복원/, run.final.summary);
   } finally {

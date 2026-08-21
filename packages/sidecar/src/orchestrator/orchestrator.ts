@@ -121,6 +121,14 @@ export class Orchestrator {
   private lastReport: VerificationReport | null = null;
   private appliedDiffs: string[] = [];
   /**
+   * fix loop를 돌게 만든 체크 종류들. **커밋 메시지가 "몇 번 만에 통과했는지"를 말하기 위한
+   * 재료**다(19.6절). 중간 시도는 검증에 실패한 상태라 커밋으로 남지 않으므로, 이 흔적이
+   * 없으면 세 번 고쳐 통과한 변경과 처음부터 맞았던 변경이 이력에서 같아 보인다.
+   *
+   * `lastReport`로 대신할 수 없다: 그건 **통과한** 마지막 리포트라 실패 이력이 이미 지워졌다.
+   */
+  private readonly failedChecksAlongTheWay: string[] = [];
+  /**
    * 이 태스크가 실제로 바꾼 워크스페이스 경로. **계획이 아니라 성공한 실행에서만** 쌓인다 —
    * 승인 거부나 실패로 적용되지 않은 파일을 "바꿨다"고 세면 기준 판정의 근거가 허구가 된다.
    * (Rust의 `file_mutations`가 정본이고, 이건 판정에 쓰는 Node 쪽 사본이다.)
@@ -886,6 +894,11 @@ export class Orchestrator {
             "fix_loop_exhausted"
           ),
         };
+      }
+
+      // 무엇 때문에 다시 도는지를 여기서 잡아둔다 — 통과한 뒤에는 이 정보가 남지 않는다.
+      for (const check of report.checks) {
+        if (check.status === "FAILED" || check.status === "TIMED_OUT") this.failedChecksAlongTheWay.push(check.kind);
       }
 
       await this.transition("FIX_LOOP");
@@ -1703,6 +1716,11 @@ export class Orchestrator {
           userMessage: this.input.taskRequest.userMessage,
           changedPaths: this.mutatedPaths,
           verifiedChecks,
+          // 태스크 하나가 커밋 하나이므로 중간 시도는 이력에 남지 않는다. 그 사실을 감추지
+          // 않고 "몇 번 만에 통과했는지"와 전체 기록을 찾아갈 열쇠를 남긴다(19.6절).
+          taskId: this.taskId,
+          fixLoopRounds: this.state.counters.fixLoopRounds,
+          failedChecks: this.failedChecksAlongTheWay,
         }),
         requestedBy: this.executorRequester(),
       });

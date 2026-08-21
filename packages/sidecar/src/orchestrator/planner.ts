@@ -173,11 +173,27 @@ export function buildCommitPlan(input: CommitPlanInput): ExecutionPlan {
  * 이 함수는 그 경우에만 호출된다. 메시지에 모델 이름을 넣지 않는 이유: 커밋 로그는 저장소에
  * 영구히 남는 기록이고, 어떤 모델이 썼는지는 그 시점의 라우팅 결정일 뿐이라 재현되지 않는다.
  * 그 정보가 필요하면 `task_events`에 있다.
+ *
+ * # 재시도 흔적을 본문에 남기는 이유 — 19.6절 "커밋 단위"
+ *
+ * 태스크 하나가 커밋 하나이므로 **fix loop의 중간 시도는 git 이력에 남지 않는다.** 그건
+ * 의도된 것이다(중간 시도는 검증에 **실패한** 상태이고, 그걸 커밋하면 "이 저장소의 커밋은
+ * 검증을 통과했다"는 성질이 깨진다). 다만 "무엇을 시도했는지 잃는다"는 걱정은 남는데,
+ * 실제로는 잃는 것이 아니라 **git이 아닌 곳에 있다** — `task_events`와 검증 출력 artifact.
+ *
+ * 그 주장이 성립하려면 커밋에서 그곳으로 갈 수 있어야 한다. 그래서 두 가지를 남긴다:
+ * 몇 번 만에 통과했는지(누구나 읽을 수 있는 본문)와 태스크 id(trailer).
  */
 export function buildCommitMessage(input: {
   userMessage: string;
   changedPaths: readonly string[];
   verifiedChecks: readonly string[];
+  /** 이 태스크가 만든 기록을 찾아갈 열쇠. trailer로 남긴다 (아래 주석). */
+  taskId?: string;
+  /** fix loop를 돈 횟수. 0이면 첫 시도에 통과했다는 뜻이라 아무것도 적지 않는다. */
+  fixLoopRounds?: number;
+  /** 도중에 실패했던 체크 종류. 중복은 부른 쪽이 아니라 여기서 지운다. */
+  failedChecks?: readonly string[];
 }): string {
   // 첫 줄은 50~72자 관례를 따른다. 사용자의 요청문을 그대로 쓰되 줄바꿈을 없앤다 —
   // 여러 줄이 첫 줄에 들어가면 git log --oneline이 읽을 수 없게 된다.
@@ -191,6 +207,23 @@ export function buildCommitMessage(input: {
       ? `검증 통과: ${input.verifiedChecks.join(", ")}`
       : "검증: 실행된 체크 없음",
   ];
+
+  const rounds = input.fixLoopRounds ?? 0;
+  if (rounds > 0) {
+    // **"몇 번 만에"가 없으면 한 번에 통과한 것과 구별되지 않는다.** 커밋이 남기는 것은
+    // 최종 상태뿐이라, 이 한 줄이 없으면 세 번 고쳐서 통과한 변경과 처음부터 맞았던 변경이
+    // 이력에서 같아 보인다. 그 둘은 나중에 이 커밋을 의심할 이유가 서로 다르다.
+    const failed = [...new Set(input.failedChecks ?? [])].filter((c) => c.length > 0);
+    body.push(failed.length > 0 ? `재시도: ${rounds}회 (도중 실패: ${failed.join(", ")})` : `재시도: ${rounds}회`);
+  }
+
+  if (input.taskId && input.taskId.trim().length > 0) {
+    // **trailer로 두는 이유**: 이 id는 이 기계의 로컬 기록(`state.db`)을 가리키는 열쇠라
+    // 저장소를 받은 다른 사람에게는 아무 뜻이 없다. 본문 산문으로 적으면 읽는 사람이
+    // 따라갈 수 있는 것으로 오해하지만, trailer는 관례상 도구용이라 무시해도 되는 자리다.
+    body.push("", `Tomverse-Task: ${input.taskId.trim()}`);
+  }
+
   return [subject, ...body].join("\n");
 }
 
