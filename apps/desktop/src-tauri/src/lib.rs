@@ -198,6 +198,15 @@ fn task_transmission(state: tauri::State<'_, SessionState>, task_id: String) -> 
     state.task_transmission(&task_id)
 }
 
+/// 한 작업의 감사 export (product-strategy 6절).
+///
+/// **읽기 전용이다.** 값만 돌려주고 파일은 쓰지 않는다 — 이유는 `SessionState::task_export`에
+/// 적어두었다.
+#[tauri::command]
+fn task_export(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
+    state.task_export(&task_id)
+}
+
 /// 화면이 쓰는 문턱들과 그 근거 (16.3절 강제 포기 시점, 19.6절 "큰 변경" 안내).
 ///
 /// 값과 함께 `source`를 돌려주는 이유: 표본이 부족하면 그 값은 여전히 추정치인데, 숫자만
@@ -287,6 +296,7 @@ pub fn run() {
             list_tasks,
             derived_thresholds,
             task_transmission,
+            task_export,
             scan_input_for_secret_shapes,
             get_task,
             restart_task,

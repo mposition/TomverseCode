@@ -985,7 +985,8 @@ impl Store {
     pub fn tool_executions(&self, task_id: &str) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self.conn.prepare(
             "SELECT request_id, tool_name, policy_decision, approval_status, execution_status,
-                    requested_at, started_at, completed_at, duration_ms, error_summary
+                    requested_at, started_at, completed_at, duration_ms, error_summary,
+                    output_artifact_path
              FROM tool_executions WHERE task_id = ?1 ORDER BY requested_at, request_id",
         )?;
         let rows = stmt.query_map(params![task_id], |r| {
@@ -1000,6 +1001,68 @@ impl Store {
                 "completedAt": r.get::<_, Option<String>>(7)?,
                 "durationMs": r.get::<_, Option<i64>>(8)?,
                 "error": r.get::<_, Option<String>>(9)?,
+                // 본문이 아니라 **참조**다. 감사 export가 종료 코드 하나를 꺼내려면 이게 필요하고,
+                // 본문을 export에 싣지 않겠다는 결정은 그대로 유지된다.
+                "outputRef": r.get::<_, Option<String>>(10)?,
+            }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 도구 요청 **원문** — `args_json`까지 포함한다.
+    ///
+    /// `tool_executions` 뷰가 args를 빼는 이유는 진단 화면이 그걸 필요로 하지 않기 때문이지만,
+    /// **감사 export에는 반드시 있어야 한다.** 이 제품이 약속하는 것이 "승인 화면에 보인 argv가
+    /// 실제 실행된 것과 같다"인데(원칙 6), argv가 빠진 기록으로는 그 약속을 사후에 확인할 수 없다.
+    /// 그리고 재현의 재료도 이 args다.
+    pub fn tool_requests_full(&self, task_id: &str) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT request_id, plan_id, tool, args_json, risk_tier, requested_by,
+                    policy_decision, policy_reason, created_at
+             FROM tool_requests WHERE task_id = ?1 ORDER BY created_at, request_id",
+        )?;
+        let rows = stmt.query_map(params![task_id], |r| {
+            let args: String = r.get(3)?;
+            Ok(serde_json::json!({
+                "requestId": r.get::<_, String>(0)?,
+                "planId": r.get::<_, String>(1)?,
+                "tool": r.get::<_, String>(2)?,
+                // 파싱에 실패하면 원문 문자열로 남긴다 — 감사 기록에서 값을 버리지 않는다.
+                "args": serde_json::from_str::<serde_json::Value>(&args)
+                    .unwrap_or(serde_json::Value::String(args)),
+                "riskTier": r.get::<_, String>(4)?,
+                "requestedBy": r.get::<_, String>(5)?,
+                "policyDecision": r.get::<_, String>(6)?,
+                "policyReason": r.get::<_, String>(7)?,
+                "createdAt": r.get::<_, String>(8)?,
+            }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 공급자 호출 **한 건씩**. 집계(`provider_transmission`)와 달리 감사용 원본이다.
+    pub fn provider_usage_rows(&self, task_id: &str) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT call_id, role, provider_id, model_id, requested_model_id, resolved_model_id,
+                    provider_request_id, input_tokens, output_tokens, cost_usd, latency_ms, attempt, created_at
+             FROM provider_usage WHERE task_id = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![task_id], |r| {
+            Ok(serde_json::json!({
+                "callId": r.get::<_, String>(0)?,
+                "role": r.get::<_, String>(1)?,
+                "providerId": r.get::<_, String>(2)?,
+                "modelId": r.get::<_, String>(3)?,
+                "requestedModelId": r.get::<_, Option<String>>(4)?,
+                // null은 "같았다"가 아니라 "기록하기 전이었다"다 (스키마 v4).
+                "resolvedModelId": r.get::<_, Option<String>>(5)?,
+                "providerRequestId": r.get::<_, Option<String>>(6)?,
+                "inputTokens": r.get::<_, i64>(7)?,
+                "outputTokens": r.get::<_, i64>(8)?,
+                "costUsd": r.get::<_, Option<f64>>(9)?,
+                "latencyMs": r.get::<_, i64>(10)?,
+                "attempt": r.get::<_, i64>(11)?,
+                "createdAt": r.get::<_, String>(12)?,
             }))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

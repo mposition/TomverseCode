@@ -195,6 +195,15 @@ impl SessionState {
         serde_json::to_value(out).map_err(|e| format!("전송 내역을 직렬화할 수 없습니다: {e}"))
     }
 
+    /// 한 작업의 **감사 export**를 만든다 (product-strategy 6절).
+    ///
+    /// **값을 돌려줄 뿐 파일을 쓰지 않는다.** 임의 경로 쓰기를 UI가 시킬 수 있게 만들면
+    /// 모델 요청이 Policy Gate를 지나야 한다는 규칙과 나란히, 게이트를 지나지 않는 두 번째
+    /// 쓰기 경로가 생긴다. 파일로 떨구는 것은 `tomverse-host export`가 한다.
+    pub fn task_export(&self, task_id: &str) -> Result<Value, String> {
+        self.with_store(|s| tomverse_core::export::collect(s, task_id))?
+    }
+
     pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>, String> {
         self.with_store(|s| s.get_task(task_id))?
             .map_err(|e| format!("작업을 읽을 수 없습니다: {e}"))

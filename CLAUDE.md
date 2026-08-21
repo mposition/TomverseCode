@@ -71,7 +71,7 @@ apps/desktop/        Tauri 2 + React
                      않으므로 여기서 통과한 verify가 이 파일에 대해 말해주는 것이 없다.**
                      별도 크레이트에서 실제 파일을 #[path]로 가리켜 타입 검증만 했다(문서 20.5절)
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
-                     `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`.
+                     `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`.
                      `metrics`는 저장된 이벤트에서 계측을 집계한다 — 기준 커버리지·충돌 결말과
                      **취소 소요 분포**(강제 포기 탈출구가 뜨는 시점의 근거). DB는 Rust의 것이므로
                      집계도 여기 둔다(Node가 SQLite를 직접 열지 않는다)

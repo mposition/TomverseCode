@@ -35,6 +35,7 @@ import { DiffPanel } from "./components/DiffPanel";
 import { DisagreementCard } from "./components/DisagreementCard";
 import { SecretShapeWarning, useSecretShapeScan } from "./components/SecretShapeWarning";
 import { TransmissionPanel } from "./components/TransmissionPanel";
+import { AuditExportPanel } from "./components/AuditExportPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
 import { TaskHistory } from "./components/TaskHistory";
@@ -928,6 +929,10 @@ export default function App() {
                   "됐는가"이고, "무엇이 나갔는가"는 그 다음이다. 위에 두면 매번 그 다음 질문이
                   먼저 눈에 들어와, 정작 결과를 읽기 전에 스크롤하게 된다. */}
               {transmission && <TransmissionPanel transmission={transmission} />}
+
+              {/* 6.3절 감사 export. 전송 패널보다 **아래**에 둔다 — "무엇이 나갔는가"는 이 작업을
+                  보는 사람의 질문이고, "감사에 낼 기록을 다오"는 다른 시점의 질문이다. */}
+              {finalResult && <AuditExportPanel taskId={finalResult.taskId} />}
             </div>
 
             <div className="column">

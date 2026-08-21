@@ -190,7 +190,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>] [--verbose]\n\
      \n\
@@ -200,6 +200,8 @@ fn usage() -> String {
      tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
      show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다\n\
      transmission — 이 작업에서 무엇이 어느 공급자로 나갔는지 (읽기 전용, --task 필요)\n\
+     export  — 한 작업의 감사 기록을 형식 버전이 붙은 JSON으로 출력한다 (읽기 전용, --task 필요).\n\
+                show와 다르다 — 도구 argv·patch 원문과 보장 범위가 파일 안에 들어 있다\n\
      revert  — 이 작업이 만든 커밋을 git revert로 되돌린다 (0=되돌림, 1=되돌리지 않음·저장소 그대로, 2=revert 진행 중으로 남음)\n\
      metrics — 기준 계측(커버리지/충돌 결말)을 JSON으로 집계한다. 읽기 전용.\n\
                [--all-workspaces]로 워크스페이스 필터를 끈다"
@@ -398,6 +400,21 @@ fn real_main() -> Result<i32, String> {
             let guard = store.lock().unwrap();
             let out = tomverse_core::transmission::collect(&guard, &task_id)?;
             println!("{}", serde_json::to_string(&out).unwrap_or_default());
+            Ok(0)
+        }
+
+        // 감사 export — **읽기 전용이다.** product-strategy 6절.
+        "export" => {
+            let task_id = args
+                .task_id
+                .clone()
+                .ok_or_else(|| "export에는 --task가 필요합니다".to_string())?;
+            let guard = store.lock().unwrap();
+            let out = tomverse_core::export::collect(&guard, &task_id)?;
+            // **이것만 pretty로 찍는다.** 다른 하위 명령의 출력은 도구가 바로 먹지만,
+            // export는 파일로 저장되어 사람이 읽고 diff하는 것이 용도다 — 한 줄로 내보내면
+            // 그 용도가 사라진다.
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
             Ok(0)
         }
 

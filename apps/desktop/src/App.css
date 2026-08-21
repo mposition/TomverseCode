@@ -868,3 +868,14 @@ button.tiny {
 .transmission-files code {
   word-break: break-all;
 }
+
+/* 감사 export 미리보기 — 길어질 수 있으므로 높이를 묶고 스크롤한다.
+   묶지 않으면 이 패널 하나가 화면을 통째로 밀어낸다. */
+.export-json {
+  max-height: 20rem;
+  overflow: auto;
+  white-space: pre;
+  background: var(--panel-2);
+  padding: 0.5rem;
+  border-radius: 4px;
+}

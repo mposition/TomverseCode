@@ -99,6 +99,17 @@ function hostQuery(ctx: Ctx, args: string[]): Record<string, unknown> {
   return JSON.parse(line) as Record<string, unknown>;
 }
 
+/// export만 **stdout 전체**를 파싱한다. 다른 하위 명령은 한 줄 JSON이라 마지막 줄만 보면
+/// 되지만, export는 사람이 읽고 diff하라고 pretty로 나온다 — 마지막 줄만 떼면 `}` 하나가 된다.
+/// 그래서 이 헬퍼가 "여러 줄이어야 한다"까지 확인한다: 한 줄로 바뀌면 여기서 걸린다.
+function hostExport(ctx: Ctx, args: string[]): Record<string, unknown> {
+  const result = spawnSync(HOST_BIN, args, { encoding: "utf8", env: hostEnv() });
+  const text = (result.stdout ?? "").trim();
+  assert.ok(text, `출력이 없습니다 (export):\nstdout: ${result.stdout}\nstderr: ${result.stderr}`);
+  assert.ok(text.includes("\n"), "export가 한 줄로 나왔습니다 — 파일로 저장해 읽는 용도가 아니게 됩니다");
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
 function isAlive(pid: number): boolean {
   try {
     // 시그널 0은 아무것도 보내지 않고 존재 여부만 확인한다.
@@ -568,6 +579,55 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
     assert.ok(
       t.providers.every((p) => !p.substituted),
       `대체가 없었는데 대체로 보고됐습니다: ${JSON.stringify(t.providers)}`
+    );
+
+    // product-strategy 6절 export — **같은 실행에서** 감사 기록이 나오는지 본다. Rust 단위
+    // 테스트는 직접 넣은 행을 읽지만, 여기서는 실제 실행이 남긴 것으로 만들어진다.
+    const exported = hostExport(ctx, [
+      "export",
+      "--workspace",
+      ctx.repo.root,
+      "--task",
+      run.taskId,
+      "--db",
+      ctx.db,
+      "--artifacts",
+      ctx.artifacts,
+    ]) as {
+      formatVersion: number;
+      guarantees: Record<string, string>;
+      workspaceFingerprint: { fingerprint?: string } | null;
+      reproduce: { steps: { tool: string; args: Record<string, unknown>; recordedOutcome: unknown }[] };
+      toolRequests: { tool: string; args: Record<string, unknown> }[];
+    };
+
+    assert.equal(exported.formatVersion, 1);
+    // 재현과 재실행이 둘 다 적혀야 한다 — 하나만 적으면 독자가 나머지를 같은 것으로 읽는다.
+    assert.ok(exported.guarantees.reproduce && exported.guarantees.reRun, JSON.stringify(exported.guarantees));
+    // 재현의 전제가 최상위에 있어야 한다.
+    assert.equal(
+      exported.workspaceFingerprint?.fingerprint,
+      fingerprint!.payload.fingerprint,
+      "export의 지문이 이벤트의 지문과 다릅니다"
+    );
+
+    // **argv/patch 원문이 있어야 원칙 6의 약속을 사후에 확인할 수 있다.** 실제 실행이 남긴
+    // 요청에서 인자가 비어 있으면 감사 기록으로서 쓸모가 없다.
+    assert.ok(exported.toolRequests.length > 0, "도구 요청 기록이 비었습니다");
+    assert.ok(
+      exported.toolRequests.every((r) => r.args !== undefined && r.args !== null),
+      `인자 없이 기록된 요청이 있습니다: ${JSON.stringify(exported.toolRequests)}`
+    );
+
+    // 재현 목록은 읽기 전용 도구를 빼고, 남은 것에는 기록된 결과가 붙는다.
+    assert.ok(exported.reproduce.steps.length > 0, "재현 단계가 비었습니다");
+    assert.ok(
+      exported.reproduce.steps.every((s) => !["read_file", "search_text", "list_files"].includes(s.tool)),
+      `읽기 전용 도구가 재현 목록에 있습니다: ${JSON.stringify(exported.reproduce.steps.map((s) => s.tool))}`
+    );
+    assert.ok(
+      exported.reproduce.steps.every((s) => s.recordedOutcome !== undefined),
+      "재현 단계에 기록된 결과가 없습니다 — status만으로는 명령의 성공 여부를 말할 수 없습니다"
     );
   });
 });

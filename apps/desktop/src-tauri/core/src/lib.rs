@@ -14,6 +14,7 @@
 
 pub mod artifacts;
 pub mod cancel;
+pub mod export;
 pub mod host;
 pub mod metrics;
 pub mod paths;
