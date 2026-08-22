@@ -193,6 +193,39 @@ for (const target of ADAPTERS) {
     );
   });
 
+  /**
+   * **자격증명 확인은 유료 호출을 하지 않는다** (17절). 여기서 확인하는 것은 결과 분류가
+   * 공급자와 무관하게 같다는 것이다 — 같은 401이 한쪽에서는 `auth_failed`, 다른 쪽에서는
+   * `unreachable`이면 화면이 사용자에게 다른 조치를 시킨다.
+   */
+  test(`[적합성/${label}] 자격증명 확인 결과를 같은 이름으로 분류한다`, async () => {
+    const cases: [number, string][] = [
+      [200, "listed"],
+      [401, "auth_failed"],
+      [403, "auth_failed"],
+      [500, "unreachable"],
+    ];
+    for (const [status, expected] of cases) {
+      const adapter = target.create(entry, stubFetch(target, { status }));
+      const check = await adapter.checkCredential();
+      assert.equal(check.status, expected, `${status} → ${check.status} (${check.detail})`);
+      assert.equal(check.providerId, target.providerId);
+      assert.equal(check.modelId, target.modelId);
+    }
+  });
+
+  /**
+   * **"조회된다"와 "호출된다"는 다른 사실이다.** 조직 인증이 필요한 모델은 조회되고 추론에서
+   * 죽는다(gpt-5 사례). 성공 문구가 그 구별을 말하지 않으면 사용자는 확인을 보증으로 읽는다.
+   */
+  test(`[적합성/${label}] 확인 성공 문구가 보증으로 읽히지 않는다`, async () => {
+    const adapter = target.create(entry, stubFetch(target, {}));
+    const check = await adapter.checkCredential();
+    assert.equal(check.status, "listed");
+    assert.ok(check.detail.includes("조회"), check.detail);
+    assert.ok(check.detail.includes("보장"), `한계를 말하지 않습니다: ${check.detail}`);
+  });
+
   test(`[적합성/${label}] 전송과 무관한 계약`, () => {
     assertTransportIndependentContract(target.create(entry, stubFetch(target, {})), entry, label);
   });

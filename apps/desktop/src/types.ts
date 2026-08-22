@@ -251,6 +251,19 @@ export interface AvailableModel {
   maxContextTokens: number;
 }
 
+/**
+ * 자격증명 확인 결과 (multi-engine-routing.md 17절).
+ *
+ * `listed`는 **"조회된다"이지 "호출된다"가 아니다.** 조직 인증이 필요한 모델은 조회되고
+ * 추론에서 죽는다(gpt-5 사례) — 화면이 이 구별을 지우면 확인이 보증으로 읽힌다.
+ */
+export interface CredentialCheck {
+  providerId: string;
+  modelId: string;
+  status: "listed" | "auth_failed" | "model_unavailable" | "unreachable";
+  detail: string;
+}
+
 export interface WorkspaceInfo {
   rootPath: string;
   name: string;

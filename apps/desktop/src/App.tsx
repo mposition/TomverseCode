@@ -23,6 +23,7 @@ import {
   type TaskEvent,
   type TaskPhase,
   type AvailableModel,
+  type CredentialCheck,
   type TaskBudgetThreshold,
   type TaskRow,
   type UserDecisionInput,
@@ -121,6 +122,9 @@ export default function App() {
    * 이미 떠 있는 백엔드에는 예전 키가 들어 있다. 몰래 재시작하면 진행 중인 작업이 죽는다.
    */
   const [allowlistNotice, setAllowlistNotice] = useState<string | null>(null);
+  /** 자격증명 확인 결과 (17절). `null`은 아직 확인하지 않은 것이며 "문제없음"이 아니다. */
+  const [credentialChecks, setCredentialChecks] = useState<CredentialCheck[] | null>(null);
+  const [probing, setProbing] = useState(false);
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<"fast" | "verified">("verified");
   /**
@@ -403,6 +407,20 @@ export default function App() {
     },
     [workspace, providerStatus]
   );
+
+  const probeProviders = useCallback(async () => {
+    setProbing(true);
+    try {
+      const result = await invoke<{ checks: CredentialCheck[] }>("probe_providers", {});
+      setCredentialChecks(result.checks);
+    } catch (error) {
+      // 확인 자체가 실패한 것과 "키가 나쁘다"는 다른 사실이다 — 결과 자리에 오류를 섞지 않고
+      // 안내 줄에 둔다.
+      setAllowlistNotice(`자격증명 확인에 실패했습니다: ${error}`);
+    } finally {
+      setProbing(false);
+    }
+  }, []);
 
   const runTask = useCallback(async () => {
     if (!workspace || message.trim().length === 0) return;
@@ -755,6 +773,36 @@ export default function App() {
             </p>
           )}
           {allowlistNotice && <p className="warn small">{allowlistNotice}</p>}
+
+          {/* 17절 자격증명 확인. **무료 조회만 하므로 눌러도 돈이 나가지 않는다** —
+              그 사실을 버튼 옆에 적는다. 안 적으면 예산 상한을 건 사용자가 누르기를 망설인다. */}
+          {workspace && (
+            <div className="row">
+              <button className="secondary" onClick={() => void probeProviders()} disabled={probing}>
+                {probing ? "확인 중..." : "자격증명 확인"}
+              </button>
+              <span className="muted small">무료 조회만 합니다 — 누른다고 비용이 나가지 않습니다.</span>
+            </div>
+          )}
+          {credentialChecks?.map((c) => (
+            <p key={c.providerId} className={c.status === "listed" ? "muted small" : "warn small"}>
+              <strong>{c.providerId}</strong>{" "}
+              {c.status === "listed"
+                ? `조회됨 (${c.modelId})`
+                : c.status === "auth_failed"
+                  ? "키가 거부됐습니다"
+                  : c.status === "model_unavailable"
+                    ? "키는 받아들여졌지만 그 모델이 없습니다"
+                    : "확인할 수 없었습니다 (네트워크)"}{" "}
+              — {c.detail}
+            </p>
+          ))}
+          {credentialChecks && credentialChecks.some((c) => c.status === "listed") && (
+            <p className="muted small">
+              <strong>"조회됨"은 "호출된다"가 아닙니다.</strong> 조직 인증이 필요한 모델은 조회는 되고 실제 호출에서
+              실패합니다 — 이 확인은 키가 틀렸거나 만료된 경우를 잡습니다.
+            </p>
+          )}
           {noProviders && (
             <p>
               API 키가 설정되지 않았습니다. <code>OPENAI_API_KEY</code> 또는 <code>ANTHROPIC_API_KEY</code> 환경변수를

@@ -222,6 +222,18 @@ fn task_export(state: tauri::State<'_, SessionState>, task_id: String) -> Result
     state.task_export(&task_id)
 }
 
+/// 자격증명 확인 (multi-engine-routing.md 17절). **유료 호출을 하지 않는다.**
+#[tauri::command]
+async fn probe_providers(app: tauri::AppHandle, timeout_secs: Option<u64>) -> Result<Value, String> {
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = app.state::<SessionState>();
+        session.probe_providers(timeout)
+    })
+    .await
+    .map_err(|e| format!("자격증명 확인 스레드 오류: {e}"))?
+}
+
 /// 이 워크스페이스에서 쓸 공급자를 정한다 (multi-engine-routing.md 16절).
 ///
 /// `allowed`가 없으면 **제한 없음**, 빈 배열이면 **아무것도 허용하지 않음**이다 —
@@ -348,6 +360,7 @@ pub fn run() {
             task_export,
             list_models,
             set_allowed_providers,
+            probe_providers,
             scan_input_for_secret_shapes,
             get_task,
             restart_task,

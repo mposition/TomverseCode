@@ -3,6 +3,7 @@ import type { FinalResult, TaskPolicy, TaskStartParams, TaskUserInputParams } fr
 import { DEFAULT_TASK_POLICY } from "@tomverse/protocol";
 import { NdjsonTransport } from "./ipc/transport.js";
 import { Orchestrator, type OrchestratorDeps } from "./orchestrator/orchestrator.js";
+import { createAdapter } from "./providers/factory.js";
 import { ModelRegistry } from "./routing/registry.js";
 import { routerOptionsFromEnv } from "./routing/router.js";
 import type { FakeProviderOptions } from "./providers/fake.js";
@@ -63,6 +64,52 @@ export function createSidecar(
    * 단가를 함께 보낸다 — 모델 선택은 대부분 비용에 관한 결정이고, 숫자 없이 고르라고 하면
    * 사용자는 이름으로 고른다.
    */
+  /**
+   * 자격증명 확인 (multi-engine-routing.md 17절).
+   *
+   * **공급자마다 한 번**, 그 공급자의 후보 중 하나로 확인한다 — 모델마다 확인하면 호출 수가
+   * 모델 수만큼 늘어나는데, 여기서 잡으려는 실패(키가 틀렸다·만료됐다)는 공급자 단위다.
+   *
+   * 무료 조회 엔드포인트만 쓴다. 유료 확인은 태스크에 속하지 않아 예산 원장에도 전송 기록에도
+   * 자리가 없고, **기록되지 않는 지출**을 만들지 않기 위해서다.
+   */
+  transport.onRequest("providers.probe", async (params) => {
+    const { availableProviders } = (params ?? {}) as { availableProviders?: string[] };
+    const registry = new ModelRegistry();
+    const entries = registry.available(availableProviders ?? [], {
+      allowOrgVerified: routerOptionsFromEnv().allowOrgVerified,
+    });
+
+    const byProvider = new Map<string, (typeof entries)[number]>();
+    for (const entry of entries) {
+      if (!byProvider.has(entry.providerId)) byProvider.set(entry.providerId, entry);
+    }
+
+    const checks = await Promise.all(
+      [...byProvider.values()].map(async (entry) => {
+        try {
+          const adapter = createAdapter(entry, {
+            role: "executor",
+            modelId: entry.modelId,
+            providerId: entry.providerId,
+            reason: "자격증명 확인",
+          });
+          return await adapter.checkCredential();
+        } catch (error) {
+          // 어댑터를 만들지도 못한 경우(키 없음 등)도 **결과의 한 종류**다 — 예외로 던지면
+          // 공급자 하나 때문에 나머지 확인 결과가 통째로 사라진다.
+          return {
+            providerId: entry.providerId,
+            modelId: entry.modelId,
+            status: "auth_failed" as const,
+            detail: error instanceof Error ? error.message : String(error),
+          };
+        }
+      })
+    );
+    return { checks };
+  });
+
   transport.onRequest("models.list", async (params) => {
     const { availableProviders } = (params ?? {}) as { availableProviders?: string[] };
     const registry = new ModelRegistry();

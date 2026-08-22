@@ -20,6 +20,7 @@ import { normalizeProviderError } from "./errors.js";
 import { ProviderCallFailure } from "./types.js";
 import type {
   AdapterDeps,
+  CredentialCheck,
   DraftInput,
   FixInput,
   ProviderAdapter,
@@ -98,6 +99,8 @@ export interface FakeProviderOptions {
    */
   defaultPatch?: string;
   defaultVerdict?: "ACCEPT" | "REVISE" | "REJECT" | "NEED_USER_INPUT";
+  /** 자격증명 확인 결과를 주입한다. 없으면 `listed`. */
+  credentialCheck?: CredentialCheck;
 }
 
 const DEFAULT_USAGE: TokenUsage = { inputTokens: 1_200, outputTokens: 340 };
@@ -140,6 +143,23 @@ export class FakeProviderAdapter implements ProviderAdapter {
       inputTokens: candidate.inputTokens ?? 0,
       outputTokens: candidate.outputTokens ?? 0,
     };
+  }
+
+  /**
+   * fake는 네트워크로 나가지 않으므로 **언제나 조회된다.**
+   *
+   * `credentialCheck` 옵션으로 실패를 주입할 수 있게 둔 이유: 화면이 "확인 실패"를 어떻게
+   * 그리는지는 fake 위에서만 만져볼 수 있다. 기본값이 성공이므로 기존 테스트는 그대로다.
+   */
+  async checkCredential(): Promise<CredentialCheck> {
+    return (
+      this.options.credentialCheck ?? {
+        providerId: this.providerId,
+        modelId: this.modelId,
+        status: "listed",
+        detail: "fake 공급자 — 네트워크로 나가지 않습니다",
+      }
+    );
   }
 
   normalizeError(raw: unknown): NormalizedProviderError {

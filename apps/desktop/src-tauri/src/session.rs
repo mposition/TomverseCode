@@ -223,6 +223,20 @@ impl SessionState {
         }))
     }
 
+    /// 자격증명 확인 (multi-engine-routing.md 17절).
+    ///
+    /// **유료 호출을 하지 않는다** — sidecar가 무료 모델 조회 엔드포인트만 쓴다.
+    /// 그래서 이 버튼은 예산 상한과 무관하고, 누른다고 돈이 나가지 않는다.
+    pub fn probe_providers(&self, timeout: Duration) -> Result<Value, String> {
+        let (sidecar, allowed) =
+            self.with_active(|active| Ok((active.sidecar.clone(), active.allowed_providers.clone())))?;
+        sidecar.request(
+            "providers.probe",
+            json!({ "availableProviders": available_providers_for(allowed.as_deref()) }),
+            timeout,
+        )
+    }
+
     /// 이 자격증명으로 실제로 쓸 수 있는 모델 목록 (multi-engine-routing.md 15절).
     ///
     /// **sidecar에 묻는다** — 레지스트리는 Node의 것이고, Rust가 별도 목록을 들고 있으면 두

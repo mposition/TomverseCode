@@ -25,6 +25,7 @@ import {
 import { ProviderCallFailure } from "./types.js";
 import type {
   AdapterDeps,
+  CredentialCheck,
   DraftInput,
   FixInput,
   ProviderAdapter,
@@ -97,6 +98,37 @@ export class OpenAIAdapter implements ProviderAdapter {
       inputTokens: usage.input_tokens ?? usage.prompt_tokens ?? 0,
       outputTokens: usage.output_tokens ?? usage.completion_tokens ?? 0,
     };
+  }
+
+  /**
+   * 이 자격증명으로 이 모델이 **조회되는가** (multi-engine-routing.md 17절).
+   *
+   * 무료 모델 조회 엔드포인트만 쓴다 — 유료 호출은 태스크에 속하지 않아 예산 원장에도
+   * 전송 기록에도 자리가 없고, 기록되지 않는 지출을 만들지 않기 위해서다.
+   *
+   * **오류를 재분류하지 않고 공용 분류기를 쓴다.** 여기서 따로 판단하면 같은 401이
+   * 호출 경로와 확인 경로에서 다르게 읽힌다.
+   */
+  async checkCredential(signal?: AbortSignal): Promise<CredentialCheck> {
+    try {
+      await this.client.models.retrieve(this.modelId, ...((signal ? [{ signal }] : []) as []));
+      return {
+        providerId: this.providerId,
+        modelId: this.modelId,
+        status: "listed",
+        // "된다"가 아니라 "조회된다"라고 쓴다 — 조직 인증이 필요한 모델은 조회되고 호출에서 죽는다.
+        detail: "이 자격증명으로 모델이 조회됩니다 (실제 호출 성공을 보장하지는 않습니다)",
+      };
+    } catch (raw) {
+      const normalized = normalizeProviderError(raw);
+      const status: CredentialCheck["status"] =
+        normalized.kind === "auth"
+          ? "auth_failed"
+          : normalized.kind === "model_unavailable"
+            ? "model_unavailable"
+            : "unreachable";
+      return { providerId: this.providerId, modelId: this.modelId, status, detail: normalized.message };
+    }
   }
 
   normalizeError(raw: unknown): NormalizedProviderError {

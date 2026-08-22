@@ -177,11 +177,52 @@ export class ProviderCallFailure extends Error {
   }
 }
 
+/**
+ * 자격증명 확인 결과 (multi-engine-routing.md 17절).
+ *
+ * # 이 확인이 증명하는 것과 증명하지 못하는 것
+ *
+ * **증명하는 것**: 이 키로 이 모델을 조회할 수 있다. 키가 틀렸거나 만료됐거나 다른
+ * 프로젝트의 것이면 여기서 걸린다 — 실사용에서 가장 흔한 실패다.
+ *
+ * **증명하지 못하는 것**: 실제 호출이 성공한다는 것. 조직 인증이 필요한 모델은 목록 조회는
+ * 되고 추론에서 `model_not_found`가 난다(gpt-5 사례). 그래서 결과 이름이 `ok`가 아니라
+ * `listed`다 — "된다"가 아니라 "조회된다"이고, 그 차이가 이 제품이 지키려는 구별이다.
+ *
+ * # 왜 무료 엔드포인트인가
+ *
+ * 최소 추론 호출로 확인하면 더 강한 사실을 얻지만 **돈이 나간다.** 그리고 그 호출은 태스크에
+ * 속하지 않으므로 예산 원장에도 전송 기록에도 자리가 없다 — 기록되지 않는 지출이 생긴다.
+ * 유료 확인은 가설 게이트의 `probe-models`가 하고(그건 Run Card로 승인받는다), 제품은
+ * 무료로 알 수 있는 것까지만 한다.
+ */
+export interface CredentialCheck {
+  providerId: string;
+  modelId: string;
+  /**
+   * `listed` — 이 자격증명으로 모델이 조회됐다.
+   * `auth_failed` — 키가 거부됐다(401/403).
+   * `model_unavailable` — 키는 받아들여졌지만 그 모델이 없다.
+   * `unreachable` — 네트워크/타임아웃. **키 문제가 아니다**를 구별해야 사용자가 키를 다시 만들지 않는다.
+   */
+  status: "listed" | "auth_failed" | "model_unavailable" | "unreachable";
+  /** 사람이 읽는 사유. 자격증명 값은 담지 않는다. */
+  detail: string;
+}
+
 export interface ProviderAdapter {
   readonly providerId: string;
   readonly modelId: string;
 
   capabilities(): ProviderCapabilitiesView;
+
+  /**
+   * 이 자격증명으로 이 모델이 **조회되는가** (17절).
+   *
+   * 유료 호출을 하지 않는다 — 무료 모델 조회 엔드포인트만 쓴다. 그래서 "호출된다"는
+   * 증명하지 못하며, 결과 타입이 그 사실을 이름으로 말한다.
+   */
+  checkCredential(signal?: AbortSignal): Promise<CredentialCheck>;
 
   /** DRAFTING / SINGLE_MODEL_FIX — executor 역할 */
   generateDraft(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<DraftProposal>>;
