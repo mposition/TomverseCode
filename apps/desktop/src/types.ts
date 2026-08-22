@@ -256,6 +256,18 @@ export interface WorkspaceInfo {
   name: string;
   workspaceId: string;
   sessionId: string;
+  /**
+   * 이 워크스페이스에서 허용된 공급자 (multi-engine-routing.md 16절).
+   *
+   * `null`은 **제한 없음**, `[]`는 **아무것도 허용하지 않음**이다 — 다른 사실이다.
+   */
+  allowedProviders: string[] | null;
+  /**
+   * 키는 있는데 **정책이 막은** 공급자.
+   *
+   * "키가 없다"와 뭉개면 사용자는 없는 키를 찾아 헤매거나, 자기가 건 제한을 잊는다.
+   */
+  providersBlockedByPolicy: string[];
 }
 
 export interface ProviderStatus {

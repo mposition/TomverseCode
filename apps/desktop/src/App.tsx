@@ -114,6 +114,13 @@ export default function App() {
   const [opening, setOpening] = useState(false);
 
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
+  /**
+   * 허용 목록 변경 안내 (multi-engine-routing.md 16절).
+   *
+   * **즉시 적용되지 않는다.** 강제는 sidecar spawn 시 자격증명을 거르는 것으로 일어나므로
+   * 이미 떠 있는 백엔드에는 예전 키가 들어 있다. 몰래 재시작하면 진행 중인 작업이 죽는다.
+   */
+  const [allowlistNotice, setAllowlistNotice] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<"fast" | "verified">("verified");
   /**
@@ -372,6 +379,30 @@ export default function App() {
       setOpening(false);
     }
   }, [workspacePath]);
+
+  const toggleProvider = useCallback(
+    async (providerId: string, enable: boolean) => {
+      if (!workspace || !providerStatus) return;
+      // 제한이 없던 상태에서 하나를 끄면 **나머지 전부를 명시한 목록**이 된다.
+      // "이것만 빼고"를 저장할 방법이 없으므로, 끄는 순간 목록이 생긴다.
+      const current = workspace.allowedProviders ?? providerStatus.providers.map((p) => p.providerId);
+      const next = enable
+        ? [...new Set([...current, providerId])]
+        : current.filter((id) => id !== providerId);
+      // 전부 켜진 상태는 "제한 없음"으로 되돌린다 — 모든 공급자를 나열한 목록과 제한 없음은
+      // 지금은 같지만, 나중에 공급자가 늘면 다르다. 사용자가 의도한 것은 후자다.
+      const all = providerStatus.providers.map((p) => p.providerId);
+      const allowed = next.length === all.length ? null : next;
+      try {
+        const saved = await invoke<{ note: string }>("set_allowed_providers", { allowed });
+        setWorkspace({ ...workspace, allowedProviders: allowed, providersBlockedByPolicy: [] });
+        setAllowlistNotice(saved.note);
+      } catch (error) {
+        setAllowlistNotice(String(error));
+      }
+    },
+    [workspace, providerStatus]
+  );
 
   const runTask = useCallback(async () => {
     if (!workspace || message.trim().length === 0) return;
@@ -695,6 +726,35 @@ export default function App() {
               </span>
             ))}
           </div>
+          {/* 16절 워크스페이스 공급자 제한. **"키가 없다"와 "정책이 막았다"를 갈라 말한다** —
+              뭉개면 사용자는 없는 키를 찾아 헤매거나 자기가 건 제한을 잊는다. */}
+          {workspace && (
+            <div className="chips">
+              {providerStatus.providers.map((p) => {
+                const blocked = workspace.providersBlockedByPolicy.includes(p.providerId);
+                const allowed = workspace.allowedProviders === null || workspace.allowedProviders.includes(p.providerId);
+                return (
+                  <label key={`allow-${p.providerId}`} className="chip">
+                    <input
+                      type="checkbox"
+                      checked={allowed}
+                      disabled={running}
+                      onChange={(e) => void toggleProvider(p.providerId, e.target.checked)}
+                    />
+                    이 워크스페이스에서 {p.providerId} 허용
+                    {blocked && p.configured && <strong> (키는 있지만 정책이 막음)</strong>}
+                  </label>
+                );
+              })}
+            </div>
+          )}
+          {workspace?.allowedProviders?.length === 0 && (
+            <p className="warn small">
+              이 워크스페이스는 <strong>어떤 공급자도 허용하지 않습니다.</strong> 작업을 시작할 수 없습니다 — 위에서
+              하나 이상을 켜세요.
+            </p>
+          )}
+          {allowlistNotice && <p className="warn small">{allowlistNotice}</p>}
           {noProviders && (
             <p>
               API 키가 설정되지 않았습니다. <code>OPENAI_API_KEY</code> 또는 <code>ANTHROPIC_API_KEY</code> 환경변수를

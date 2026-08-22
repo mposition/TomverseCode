@@ -20,7 +20,10 @@ use tomverse_core::sidecar::{SidecarClient, SpawnConfig};
 use tomverse_core::store::Store;
 use tomverse_core::store::TaskRow;
 use tomverse_core::types::{ApprovalRequest, ExecutionMode, TaskPolicy};
-use tomverse_core::{available_providers, credential_env, CancellationRegistry, WorkspaceRoot, PROTOCOL_VERSION};
+use tomverse_core::{
+    available_providers, available_providers_for, credential_env_for, providers_blocked_by_policy,
+    CancellationRegistry, WorkspaceRoot, PROTOCOL_VERSION,
+};
 
 /// UI에 승인 요청을 emit하고 사용자 응답을 기다린다.
 ///
@@ -89,6 +92,11 @@ pub struct ActiveWorkspace {
     pub host: Arc<TaskHost>,
     pub workspace_id: String,
     pub session_id: String,
+    /// 이 워크스페이스에서 허용된 공급자 (multi-engine-routing.md 16절).
+    ///
+    /// **sidecar를 spawn할 때 이 목록으로 자격증명을 걸렀다.** 즉 이 값은 표시용 사본이고,
+    /// 실제 강제는 이미 일어났다 — 바꾸려면 sidecar를 다시 띄워야 한다.
+    pub allowed_providers: Option<Vec<String>>,
     sidecar: Arc<SidecarClient>,
 }
 
@@ -199,15 +207,34 @@ impl SessionState {
         serde_json::to_value(out).map_err(|e| format!("전송 내역을 직렬화할 수 없습니다: {e}"))
     }
 
+    /// 이 워크스페이스에서 쓸 공급자를 정한다 (multi-engine-routing.md 16절).
+    ///
+    /// **즉시 반영되지 않는다.** 강제는 sidecar spawn 시 자격증명을 거르는 것으로 일어나므로,
+    /// 이미 떠 있는 sidecar에는 예전 키가 들어 있다. 그래서 저장만 하고 "다시 열어야 적용된다"를
+    /// 호출자에게 알린다 — 여기서 몰래 sidecar를 재시작하면 진행 중인 태스크가 죽는다.
+    pub fn set_allowed_providers(&self, allowed: Option<Vec<String>>) -> Result<Value, String> {
+        let workspace_id = self.with_active(|active| Ok(active.workspace_id.clone()))?;
+        self.with_store(|s| s.set_allowed_providers(&workspace_id, allowed.as_deref()))?
+            .map_err(|e| format!("허용 목록을 저장할 수 없습니다: {e}"))?;
+        Ok(json!({
+            "saved": allowed,
+            "appliesAfterReopen": true,
+            "note": "이미 실행 중인 백엔드에는 이전 자격증명이 주입되어 있습니다. 워크스페이스를 다시 열면 적용됩니다.",
+        }))
+    }
+
     /// 이 자격증명으로 실제로 쓸 수 있는 모델 목록 (multi-engine-routing.md 15절).
     ///
     /// **sidecar에 묻는다** — 레지스트리는 Node의 것이고, Rust가 별도 목록을 들고 있으면 두
     /// 목록이 갈라져 "화면에서는 고를 수 있는데 시작하면 거부되는" 모델이 생긴다.
     pub fn list_models(&self, timeout: Duration) -> Result<Value, String> {
-        let sidecar = self.with_active(|active| Ok(active.sidecar.clone()))?;
+        let (sidecar, allowed) =
+            self.with_active(|active| Ok((active.sidecar.clone(), active.allowed_providers.clone())))?;
         sidecar.request(
             "models.list",
-            json!({ "availableProviders": available_providers() }),
+            // **허용 목록을 여기서도 적용한다.** 목록에 없는 공급자의 모델을 고를 수 있게
+            // 보여주면, 고른 뒤 "키가 없다"는 오류를 만나게 된다 — 키는 있고 정책이 막은 것인데.
+            json!({ "availableProviders": available_providers_for(allowed.as_deref()) }),
             timeout,
         )
     }
@@ -283,6 +310,15 @@ impl SessionState {
                 .map_err(|e| format!("세션 기록 실패: {e}"))?;
         }
 
+        // 허용 목록을 **spawn 전에** 읽는다. 읽지 못하면 진행하지 않는다 —
+        // 깨진 기록을 "제한 없음"으로 읽으면 사용자가 건 제한이 조용히 사라진다.
+        let allowed_providers = {
+            let guard = store.lock().unwrap();
+            guard
+                .allowed_providers(&workspace_id)
+                .map_err(|e| format!("공급자 허용 목록을 읽을 수 없습니다: {e}"))?
+        };
+
         let approvals = Arc::new(UiApprovalGateway::new(app.clone(), self.pending_approvals.clone()));
         let sink = Arc::new(TauriSink { app: app.clone() });
         let host = Arc::new(TaskHost::new(
@@ -302,7 +338,9 @@ impl SessionState {
                 program: "node".to_string(),
                 args: vec![sidecar_entry().to_string_lossy().to_string()],
                 working_dir: None,
-                env: credential_env(),
+                // **여기가 게이트다.** 허용되지 않은 공급자의 키를 주입하지 않으면 Node는
+                // 그 공급자를 호출할 수단 자체가 없다 — 검사를 지워도 키가 없다.
+                env: credential_env_for(allowed_providers.as_deref()),
             },
             host.clone(),
         )
@@ -335,6 +373,7 @@ impl SessionState {
             host,
             workspace_id,
             session_id,
+            allowed_providers,
             sidecar,
         });
         Ok(info)
@@ -356,6 +395,10 @@ impl SessionState {
                 "name": active.name,
                 "workspaceId": active.workspace_id,
                 "sessionId": active.session_id,
+                // 허용 목록과 **그 때문에 빠진 공급자**를 함께 준다. "키가 없다"와 "정책이
+                // 막았다"는 다른 사실이고, 화면이 뭉개면 사용자는 없는 키를 찾아 헤맨다.
+                "allowedProviders": active.allowed_providers,
+                "providersBlockedByPolicy": providers_blocked_by_policy(active.allowed_providers.as_deref()),
             })
         })
     }
@@ -379,12 +422,13 @@ impl SessionState {
         model_pins: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
-        let (sidecar, host, workspace_id, session_id) = self.with_active(|active| {
+        let (sidecar, host, workspace_id, session_id, allowed_providers) = self.with_active(|active| {
             Ok((
                 active.sidecar.clone(),
                 active.host.clone(),
                 active.workspace_id.clone(),
                 active.session_id.clone(),
+                active.allowed_providers.clone(),
             ))
         })?;
 
@@ -419,7 +463,9 @@ impl SessionState {
                 "modelPins": model_pins,
             },
             "workspaceName": self.info().and_then(|i| i.get("name").cloned()).unwrap_or(Value::Null),
-            "availableProviders": available_providers(),
+            // 라우터가 보는 후보도 같은 목록이어야 한다 — 주입된 키와 후보가 어긋나면
+            // "고를 수 있다고 했는데 호출이 실패"가 된다.
+            "availableProviders": available_providers_for(allowed_providers.as_deref()),
         });
 
         let result = sidecar.request("task.start", params, timeout);

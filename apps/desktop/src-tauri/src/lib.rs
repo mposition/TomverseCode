@@ -222,6 +222,18 @@ fn task_export(state: tauri::State<'_, SessionState>, task_id: String) -> Result
     state.task_export(&task_id)
 }
 
+/// 이 워크스페이스에서 쓸 공급자를 정한다 (multi-engine-routing.md 16절).
+///
+/// `allowed`가 없으면 **제한 없음**, 빈 배열이면 **아무것도 허용하지 않음**이다 —
+/// 둘은 다른 사실이므로 다른 값으로 저장된다.
+#[tauri::command]
+fn set_allowed_providers(
+    state: tauri::State<'_, SessionState>,
+    allowed: Option<Vec<String>>,
+) -> Result<Value, String> {
+    state.set_allowed_providers(allowed)
+}
+
 /// 이 자격증명으로 실제로 쓸 수 있는 모델 목록 (multi-engine-routing.md 15절).
 #[tauri::command]
 async fn list_models(app: tauri::AppHandle, timeout_secs: Option<u64>) -> Result<Value, String> {
@@ -335,6 +347,7 @@ pub fn run() {
             task_transmission,
             task_export,
             list_models,
+            set_allowed_providers,
             scan_input_for_secret_shapes,
             get_task,
             restart_task,

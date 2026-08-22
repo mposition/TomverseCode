@@ -24,7 +24,7 @@ use std::path::Path;
 /// 과정에서 잃는 것은 "append-only 진실의 원천"이라는 약속을 깨는 것이다.
 ///
 /// v3(M1): `acceptance_criteria` — 사용자 판정의 파생 캐시(문서 17.3절). 역시 additive다.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub struct Store {
     conn: Connection,
@@ -168,6 +168,9 @@ impl Store {
         if current < 5 {
             tx.execute_batch(SCHEMA_V5)?;
         }
+        if current < 6 {
+            tx.execute_batch(SCHEMA_V6)?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -187,6 +190,39 @@ impl Store {
             params![workspace_id, root_path, name, now_iso()],
         )?;
         Ok(())
+    }
+
+    /// 이 워크스페이스에서 쓸 수 있는 공급자 목록을 정한다 (multi-engine-routing.md 16절).
+    ///
+    /// `None`은 제한 없음, `Some(&[])`는 아무것도 허용하지 않음이다 — **다른 사실이므로 다른
+    /// 값으로 저장한다.**
+    pub fn set_allowed_providers(&self, workspace_id: &str, allowed: Option<&[String]>) -> Result<()> {
+        let json = match allowed {
+            Some(list) => Some(serde_json::to_string(list)?),
+            None => None,
+        };
+        self.conn.execute(
+            "UPDATE workspaces SET allowed_providers = ?2 WHERE workspace_id = ?1",
+            params![workspace_id, json],
+        )?;
+        Ok(())
+    }
+
+    /// 저장된 허용 목록. `None`이면 제한이 없다.
+    ///
+    /// **깨진 JSON을 "제한 없음"으로 읽지 않는다.** 그러면 저장이 망가진 순간 제한이
+    /// 조용히 사라지고, 사용자는 자기가 건 제한이 걸려 있다고 믿는다. 읽지 못하면
+    /// 오류를 올려 호출자가 멈추게 한다.
+    pub fn allowed_providers(&self, workspace_id: &str) -> Result<Option<Vec<String>>> {
+        let raw: Option<String> = self.conn.query_row(
+            "SELECT allowed_providers FROM workspaces WHERE workspace_id = ?1",
+            params![workspace_id],
+            |r| r.get(0),
+        )?;
+        match raw {
+            None => Ok(None),
+            Some(text) => Ok(Some(serde_json::from_str::<Vec<String>>(&text)?)),
+        }
     }
 
     pub fn upsert_session(&self, session_id: &str, workspace_id: &str, title: Option<&str>) -> Result<()> {
@@ -1587,6 +1623,21 @@ const SCHEMA_V5: &str = r#"
 ALTER TABLE provider_usage ADD COLUMN estimated_input_tokens INTEGER;
 "#;
 
+/// v6: 워크스페이스별 **공급자 허용 목록** (multi-engine-routing.md 16절).
+///
+/// # 왜 저장소 안의 파일이 아니라 여기인가
+///
+/// 워크스페이스 안의 설정 파일에 두면 **모델이 고칠 수 있는 파일이 자기 데이터가 어디로
+/// 나갈지를 정하게 된다.** 이 앱의 태스크는 워크스페이스 파일을 바꾸는 것이 일이므로, 그건
+/// "정책을 지키는 주체가 정책을 수정할 수 있는" 구조다. 앱의 상태 DB는 Rust의 것이고
+/// 어떤 도구도 여기 쓰지 못한다.
+///
+/// NULL은 **제한 없음**이고 빈 JSON 배열(`[]`)은 **아무것도 허용하지 않음**이다. 둘을 같게
+/// 다루면 빈 목록을 저장한 사용자가 전부 허용된다.
+const SCHEMA_V6: &str = r#"
+ALTER TABLE workspaces ADD COLUMN allowed_providers TEXT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2048,6 +2099,47 @@ mod tests {
         assert_eq!(new_only[0].payload["to"].as_str().unwrap(), "PLANNING");
         // 커서가 없으면 전부 반환한다.
         assert_eq!(store.events_after("task-1", None).unwrap().len(), 3);
+    }
+
+    /// **제한 없음과 빈 목록이 저장을 왕복해도 구별되어야 한다.**
+    ///
+    /// 어느 한쪽이 다른 쪽으로 접히면 그 순간 사용자가 건 제한이 사라지거나(빈 목록 → 전부 허용)
+    /// 아무것도 못 쓰게 된다(제한 없음 → 전부 차단). 저장 계층은 이 구별을 잃으면 안 된다.
+    #[test]
+    fn an_empty_allowlist_survives_a_round_trip_as_empty() {
+        let (_d, store) = seeded();
+        // 기본값은 제한 없음이다 — 기존 워크스페이스가 갑자기 막히지 않는다.
+        assert_eq!(store.allowed_providers("ws-1").unwrap(), None);
+
+        store.set_allowed_providers("ws-1", Some(&[])).unwrap();
+        assert_eq!(store.allowed_providers("ws-1").unwrap(), Some(vec![]));
+
+        store
+            .set_allowed_providers("ws-1", Some(&["anthropic".to_string()]))
+            .unwrap();
+        assert_eq!(
+            store.allowed_providers("ws-1").unwrap(),
+            Some(vec!["anthropic".to_string()])
+        );
+
+        // 제한을 다시 푸는 것도 가능해야 한다.
+        store.set_allowed_providers("ws-1", None).unwrap();
+        assert_eq!(store.allowed_providers("ws-1").unwrap(), None);
+    }
+
+    /// **깨진 기록을 "제한 없음"으로 읽지 않는다.** 그러면 저장이 망가진 순간 제한이 조용히
+    /// 사라지고, 사용자는 자기가 건 제한이 걸려 있다고 믿는다.
+    #[test]
+    fn a_corrupt_allowlist_is_an_error_not_unrestricted() {
+        let (_d, store) = seeded();
+        store
+            .conn
+            .execute(
+                "UPDATE workspaces SET allowed_providers = '{not a list}' WHERE workspace_id = 'ws-1'",
+                [],
+            )
+            .unwrap();
+        assert!(store.allowed_providers("ws-1").is_err());
     }
 
     #[test]
