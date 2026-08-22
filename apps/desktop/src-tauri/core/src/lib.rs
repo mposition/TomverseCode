@@ -12,6 +12,7 @@
 //!
 //! `tauri`에 의존하지 않으므로 GUI 시스템 라이브러리 없이 `cargo test`가 돌아간다.
 
+pub mod approvals;
 pub mod artifacts;
 pub mod budget;
 pub mod cancel;

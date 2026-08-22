@@ -371,6 +371,9 @@ impl TaskHost {
             let approval = ApprovalRequest {
                 approval_id: format!("approval-{}", uuid::Uuid::new_v4()),
                 task_id: request.task_id.clone(),
+                // Policy Gate가 벗어나지 못하게 지키는 바로 그 루트다. 승인 화면이 말하는
+                // 워크스페이스와 실제로 제한되는 워크스페이스가 같아야 한다.
+                workspace_root: self.root.display(),
                 items: vec![self.describe_for_approval(request, &decision)],
                 created_at: now_iso(),
             };

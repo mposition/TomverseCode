@@ -434,6 +434,17 @@ pub struct ApprovalRequest {
     pub approval_id: String,
     #[serde(rename = "taskId")]
     pub task_id: String,
+    /// **어느 워크스페이스의 명령인가.**
+    ///
+    /// 원칙 6은 "승인 화면에 보인 argv가 실제 실행되는 것과 같다"를 약속하는데, **같은 argv라도
+    /// 대상 저장소가 다르면 다른 동작**이다. 워크스페이스가 빠지면 그 약속이 절반만 성립한다 —
+    /// 여러 워크스페이스를 오가는 순간 사용자는 자기가 어느 프로젝트에서 `git clean`을
+    /// 승인하는지 알 수 없다.
+    ///
+    /// 그리고 이 값은 표시용만이 아니다. 응답이 **활성 워크스페이스의 것인지** 검사하는
+    /// 기준이 여기다(`approvals.rs`).
+    #[serde(rename = "workspaceRoot")]
+    pub workspace_root: String,
     pub items: Vec<ApprovalRequestItem>,
     #[serde(rename = "createdAt")]
     pub created_at: String,

@@ -130,6 +130,14 @@ export interface ApprovalRequestItem {
 export interface ApprovalRequest {
   approvalId: string;
   taskId: string;
+  /**
+   * 이 명령이 실행될 워크스페이스 루트 (Policy Gate가 제한하는 그 루트).
+   *
+   * **같은 argv라도 대상 저장소가 다르면 다른 동작이다.** 원칙 6의 "보인 것과 실행되는 것이
+   * 같다"는 워크스페이스까지 보여야 완성되고, 이 값은 표시용만이 아니라 **응답이 활성
+   * 워크스페이스의 것인지 검사하는 기준**이기도 하다(process-architecture.md 11절).
+   */
+  workspaceRoot: string;
   items: ApprovalRequestItem[];
   createdAt: ISODateTime;
 }

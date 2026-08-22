@@ -6,9 +6,7 @@
 //! docs/design/process-architecture.md 4절: 승인/거부는 정책 판단의 연장이므로 Rust 책임 소관이며
 //! Node를 거치지 않는다. `UiApprovalGateway`가 그 왕복의 Rust 쪽 절반이다.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,6 +22,7 @@ use tomverse_core::{
     available_providers, available_providers_for, credential_env_for, providers_blocked_by_policy,
     CancellationRegistry, WorkspaceRoot, PROTOCOL_VERSION,
 };
+use tomverse_core::approvals::PendingApprovals;
 
 /// UI에 승인 요청을 emit하고 사용자 응답을 기다린다.
 ///
@@ -32,12 +31,14 @@ use tomverse_core::{
 /// "응답이 없으면 허용"은 승인 게이트의 의미를 무너뜨린다.
 pub struct UiApprovalGateway {
     app: AppHandle,
-    pending: Arc<Mutex<HashMap<String, mpsc::Sender<ApprovalOutcome>>>>,
+    /// **워크스페이스별로 묶인 등록부**(core `approvals.rs`). 낡은 모달의 승인이 다른
+    /// 워크스페이스에서 실행되는 것을 막는 지점이 거기다.
+    pending: Arc<PendingApprovals>,
     timeout: Duration,
 }
 
 impl UiApprovalGateway {
-    pub fn new(app: AppHandle, pending: Arc<Mutex<HashMap<String, mpsc::Sender<ApprovalOutcome>>>>) -> Self {
+    pub fn new(app: AppHandle, pending: Arc<PendingApprovals>) -> Self {
         Self {
             app,
             pending,
@@ -48,8 +49,7 @@ impl UiApprovalGateway {
 
 impl ApprovalGateway for UiApprovalGateway {
     fn request_approval(&self, request: &ApprovalRequest) -> ApprovalOutcome {
-        let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(request.approval_id.clone(), tx);
+        let rx = self.pending.register(&request.approval_id, &request.workspace_root);
 
         // ui-wireframes.md 3.3절 승인 모달이 이 페이로드를 그대로 렌더링한다.
         // run_command 항목의 program/args/cwd는 실제 실행값과 같다 (argv 계약).
@@ -61,7 +61,7 @@ impl ApprovalGateway for UiApprovalGateway {
             )
             .is_err()
         {
-            self.pending.lock().unwrap().remove(&request.approval_id);
+            self.pending.forget(&request.approval_id);
             return ApprovalOutcome::Denied {
                 note: Some("UI에 승인 요청을 전달할 수 없었습니다".to_string()),
             };
@@ -70,7 +70,7 @@ impl ApprovalGateway for UiApprovalGateway {
         let outcome = rx.recv_timeout(self.timeout).unwrap_or(ApprovalOutcome::Denied {
             note: Some("승인 대기가 시간 초과되었습니다 — 안전을 위해 거부로 처리합니다".to_string()),
         });
-        self.pending.lock().unwrap().remove(&request.approval_id);
+        self.pending.forget(&request.approval_id);
         outcome
     }
 }
@@ -106,7 +106,7 @@ pub struct ActiveWorkspace {
 #[derive(Default)]
 pub struct SessionState {
     inner: Mutex<Option<ActiveWorkspace>>,
-    pub pending_approvals: Arc<Mutex<HashMap<String, mpsc::Sender<ApprovalOutcome>>>>,
+    pub pending_approvals: Arc<PendingApprovals>,
     /// 저장 계층은 **워크스페이스와 독립적으로** 살아 있어야 한다.
     ///
     /// 앱을 켜자마자(워크스페이스를 열기 전) 최근 작업 목록과 중단된 작업을 보여줘야 하기 때문이다.
@@ -439,6 +439,15 @@ impl SessionState {
         let mut guard = self.inner.lock().unwrap();
         if let Some(previous) = guard.take() {
             previous.sidecar.client().shutdown(Duration::from_secs(3));
+            // **떠나는 워크스페이스의 대기 승인을 거부로 정리한다.** 남겨두면 타임아웃(10분)까지
+            // 살아 있고, 그동안 낡은 모달에서 누른 승인이 이전 워크스페이스에서 실행될 창이
+            // 열려 있다. 거부가 기본인 이유는 승인 타임아웃과 같다.
+            let revoked = self
+                .pending_approvals
+                .revoke_workspace(&previous.root_display, "워크스페이스가 바뀌어 승인 요청을 취소했습니다");
+            if revoked > 0 {
+                eprintln!("[session] 이전 워크스페이스의 대기 승인 {revoked}건을 거부로 정리했습니다");
+            }
         }
         *guard = Some(ActiveWorkspace {
             root_display: root.display(),
@@ -696,19 +705,21 @@ impl SessionState {
         host.force_abandon(task_id)
     }
 
+    /// 승인 응답. **활성 워크스페이스의 것만 받는다**(core `approvals.rs`).
+    ///
+    /// 화면이 낡은 모달을 들고 있을 수 있고, 그때 승인이 통과하면 사용자가 보고 있지 않은
+    /// 저장소에서 명령이 돈다 — 이전 워크스페이스의 `TaskHost`가 그 워크스페이스 루트로
+    /// 판정하기 때문이다.
     pub fn respond_approval(&self, approval_id: &str, granted: bool, note: Option<String>) -> Result<Value, String> {
-        let sender = self.pending_approvals.lock().unwrap().remove(approval_id);
-        let Some(sender) = sender else {
-            return Err("해당 승인 요청을 찾을 수 없습니다 (이미 처리되었거나 시간이 초과되었습니다).".to_string());
-        };
+        let active_root = self.with_active(|active| Ok(active.root_display.clone()))?;
         let outcome = if granted {
             ApprovalOutcome::Granted
         } else {
             ApprovalOutcome::Denied { note }
         };
-        sender
-            .send(outcome)
-            .map_err(|_| "승인 응답을 전달할 수 없습니다 (요청이 이미 종료되었습니다).".to_string())?;
+        self.pending_approvals
+            .respond(approval_id, &active_root, outcome)
+            .map_err(|e| e.message())?;
         Ok(json!({ "ok": true }))
     }
 }

@@ -22,6 +22,11 @@ export function ApprovalModal({
     <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="승인이 필요합니다">
       <div className="modal">
         <h2>승인이 필요합니다</h2>
+        {/* **어느 저장소인지 먼저 말한다.** 같은 argv라도 대상이 다르면 다른 동작이고,
+            워크스페이스를 오간 뒤에는 화면의 다른 부분이 이미 새 워크스페이스를 가리킨다. */}
+        <p className="muted small approval-workspace">
+          대상 워크스페이스: <code>{request.workspaceRoot}</code>
+        </p>
         <ul className="approval-items">
           {request.items.map((item) => (
             <li key={item.requestId} className={`risk-${item.riskLevel}`}>

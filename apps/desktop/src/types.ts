@@ -89,6 +89,14 @@ export interface ApprovalItem {
 export interface ApprovalRequest {
   approvalId: string;
   taskId: string;
+  /**
+   * 이 명령이 실행될 워크스페이스 루트.
+   *
+   * **같은 argv라도 대상 저장소가 다르면 다른 동작이다.** 원칙 6이 약속하는 "보인 것과
+   * 실행되는 것이 같다"는 워크스페이스까지 보여야 완성된다 — 여러 프로젝트를 오가는 순간
+   * 사용자는 자기가 어느 저장소에서 `git clean`을 승인하는지 알 수 없다.
+   */
+  workspaceRoot: string;
   items: ApprovalItem[];
   createdAt: string;
 }
