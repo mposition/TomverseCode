@@ -80,6 +80,15 @@ export type TaskEventType =
    * "이번 실행에 그 한계가 적용되는가"로 답한다.
    */
   | "WORKSPACE_FINGERPRINT"
+  /**
+   * 인덱스 캐시 계측 (context-engine.md 2절, process-architecture.md 11.4절).
+   *
+   * **캐시가 이득인지는 아직 측정된 적이 없다.** 11.4절은 "전환을 싸게 만든다"고 적었을 뿐이고,
+   * 인덱스 구축이 실제로 얼마나 걸리는지 잰 기록이 없다. 두 이벤트가 그 답의 재료다 —
+   * 적중률(HIT 대 BUILT의 비)과 회피된 시간(`savedBuildMs`).
+   */
+  | "WORKSPACE_INDEX_BUILT"
+  | "WORKSPACE_INDEX_CACHE_HIT"
   | "GIT_COMMIT_CREATED"
   | "ERROR"
   | "TASK_COMPLETED"

@@ -288,6 +288,114 @@ test("같은 워크스페이스/HEAD에서는 인덱스를 재사용한다", asy
   assert.equal(listCallsAfterSecond, listCallsAfterFirst);
 });
 
+// ---- 인덱스 캐시 (context-engine.md 2절, process-architecture.md 11.4절) ----
+
+function indexHost(): FakeHost {
+  return new FakeHost({
+    files: [{ path: "src/app.ts", isDir: false, sizeBytes: 50 }],
+    contents: { "src/app.ts": "// x" },
+  });
+}
+
+function listCalls(host: FakeHost): number {
+  return host.toolRequests.filter((r) => r.tool === "list_files").length;
+}
+
+/**
+ * **캐시는 프로세스보다 오래 살아야 한다.** 워크스페이스를 전환하면 sidecar가 종료되므로
+ * (11.3절 — 살려두지 않는 이유는 자격증명이다) 프로세스 안 캐시로는 전환이 싸지지 않는다.
+ * 새 엔진이 저장된 인덱스를 그대로 집어야 한다.
+ */
+test("새 엔진이 저장된 인덱스를 재사용한다 — 전환 후에도 파일 목록을 다시 훑지 않는다", async () => {
+  const host = indexHost();
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+
+  await new ContextEngine().ensureIndex(bridge, "ws-1");
+  const afterFirst = listCalls(host);
+  assert.equal(host.indexSaves.length, 1, "인덱스를 저장하지 않았습니다");
+
+  // sidecar가 죽고 새로 뜬 상황 = 새 ContextEngine 인스턴스.
+  const index = await new ContextEngine().ensureIndex(bridge, "ws-1");
+  assert.equal(listCalls(host), afterFirst, "저장된 인덱스를 두고 다시 훑었습니다");
+  assert.equal(index.fileTree[0]?.path, "src/app.ts");
+});
+
+/**
+ * 워크스페이스가 바뀌면 **다시 만든다.** 이 판정을 지문에 맡기는 이유는 인덱스가 파일 집합이기
+ * 때문이다 — 낡은 파일 목록으로 모델을 부르면 조용히 틀린 답이 나온다.
+ */
+test("지문이 바뀌면 인덱스를 다시 만든다", async () => {
+  const host = indexHost();
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const engine = new ContextEngine();
+
+  await engine.ensureIndex(bridge, "ws-1");
+  const afterFirst = listCalls(host);
+
+  host.setIndexFingerprint("sha256:changed");
+  await engine.ensureIndex(bridge, "ws-1");
+  assert.ok(listCalls(host) > afterFirst, "워크스페이스가 바뀌었는데 캐시를 그대로 썼습니다");
+  // 새 상태의 인덱스도 저장된다 — 저장하지 않으면 전환 후 매번 다시 만든다.
+  assert.equal(host.indexSaves.length, 2);
+  assert.equal(host.indexSaves[1]?.fingerprint, "sha256:changed");
+});
+
+/**
+ * **지문을 낼 수 없으면 캐시를 쓰지 않는다.** git 저장소가 아닌 워크스페이스가 그렇다 —
+ * 같은 상태인지 판정할 방법이 없는데 재사용하면 "모른다"를 "같다"로 읽는 것이다.
+ * 그리고 저장도 하지 않는다: 어떤 상태의 인덱스인지 말할 수 없는 것을 저장하면 다음에
+ * 무엇과 비교해야 할지 알 수 없다.
+ */
+test("지문이 없는 워크스페이스에서는 캐시를 쓰지도 저장하지도 않는다", async () => {
+  const host = new FakeHost({
+    files: [{ path: "src/app.ts", isDir: false, sizeBytes: 50 }],
+    contents: { "src/app.ts": "// x" },
+    indexFingerprint: null,
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const engine = new ContextEngine();
+
+  await engine.ensureIndex(bridge, "ws-1");
+  const afterFirst = listCalls(host);
+  await engine.ensureIndex(bridge, "ws-1");
+
+  assert.ok(listCalls(host) > afterFirst, "판정할 수 없는데 재사용했습니다");
+  assert.equal(host.indexSaves.length, 0, "지문 없이 저장했습니다");
+});
+
+/**
+ * 캐시 RPC가 실패해도 **태스크는 진행된다.** 캐시는 잃어도 되는 데이터이고, 못 썼다고
+ * 작업을 세우는 것은 꼬리가 몸통을 흔드는 것이다.
+ */
+test("캐시를 읽지 못해도 인덱스를 만든다", async () => {
+  const host = indexHost();
+  const inner = host.asTransport();
+  const broken = {
+    request: (method: string, params: unknown) => {
+      if (method.startsWith("index.")) return Promise.reject(new Error("캐시 계층 고장"));
+      return inner.request(method, params);
+    },
+  } as unknown as typeof inner;
+
+  const bridge = new ToolBridge(broken, "task-1");
+  const index = await new ContextEngine().ensureIndex(bridge, "ws-1");
+  assert.equal(index.fileTree.length, 1, "캐시 고장이 인덱스 구축을 막았습니다");
+});
+
+/**
+ * 저장된 값의 **모양이 다르면 없는 것으로 다룬다.** 앱을 업데이트해 인덱스 모양이 바뀌면
+ * 옛 행이 그대로 남아 있고, 그걸 그대로 쓰면 조용히 빈 목록이 되거나 엉뚱한 곳에서 터진다.
+ */
+test("모양이 깨진 캐시는 무시하고 다시 만든다", async () => {
+  const host = indexHost();
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  // Rust가 지문은 맞다고 주지만 payload가 옛 모양인 상황.
+  await bridge.saveCachedIndex("sha256:fake", { workspaceId: "ws-1", notAnIndex: true }, 1);
+
+  const index = await new ContextEngine().ensureIndex(bridge, "ws-1");
+  assert.equal(index.fileTree[0]?.path, "src/app.ts", "깨진 캐시를 그대로 썼습니다");
+});
+
 test("M0 인덱스는 심볼 그래프를 비워두고 그 사실을 감추지 않는다", async () => {
   const host = new FakeHost({ files: [{ path: "src/app.ts", isDir: false, sizeBytes: 50 }], contents: { "src/app.ts": "// x" } });
   const bridge = new ToolBridge(host.asTransport(), "task-1");

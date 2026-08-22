@@ -27,6 +27,50 @@ export class ToolBridge {
     private readonly requestedBy: ToolRequester = { role: "orchestrator" }
   ) {}
 
+  // ---- WorkspaceIndex 캐시 (context-engine.md 2절) ----
+  //
+  // 도구 요청이 아니라 캐시 RPC지만 여기 두는 이유: transport와 taskId를 이미 들고 있고,
+  // Context Engine이 받는 것도 이 브릿지 하나다. 캐시를 위해 Context Engine에 transport를
+  // 넘기기 시작하면 **`node:fs`가 없는 것과 같은 이유의 경계**가 흐려진다.
+
+  /**
+   * 캐시된 인덱스를 읽는다.
+   *
+   * `fingerprint`가 `null`이면 **캐시를 쓸 수 없다**(지문을 낼 수 없는 워크스페이스).
+   * 그건 "캐시가 비었다"와 다른 사실이므로 호출자가 구별해야 한다 — 전자는 저장도 하면 안 된다.
+   */
+  async loadCachedIndex(): Promise<{
+    fingerprint: string | null;
+    index: unknown | null;
+    builtAt?: string | null;
+    buildMs?: number | null;
+  }> {
+    const response = await this.transport.request<{
+      fingerprint: string | null;
+      index: unknown | null;
+      builtAt?: string | null;
+      buildMs?: number | null;
+    }>("index.load", { taskId: this.taskId });
+    return response;
+  }
+
+  /**
+   * 인덱스를 캐시에 넣는다. `fingerprint`는 `loadCachedIndex`가 준 값을 그대로 돌려준다 —
+   * Rust가 저장 시점에 다시 재서 **그 사이 워크스페이스가 바뀌었으면 저장하지 않는다.**
+   */
+  async saveCachedIndex(
+    fingerprint: string,
+    index: unknown,
+    buildMs: number
+  ): Promise<{ saved: boolean; reason?: string }> {
+    return this.transport.request<{ saved: boolean; reason?: string }>("index.save", {
+      taskId: this.taskId,
+      fingerprint,
+      index,
+      buildMs,
+    });
+  }
+
   /** 특정 역할이 요청한 것으로 기록되는 브릿지를 만든다 (감사 로그용). */
   as(role: EngineRole, modelId: ModelId): ToolBridge {
     return new ToolBridge(this.transport, this.taskId, { role, modelId });

@@ -555,3 +555,45 @@ mod tests {
         assert_eq!(root.resolve_existing(".").unwrap().relative(), ".");
     }
 }
+
+/// 워크스페이스 루트 경로 → 워크스페이스 id.
+///
+/// **한 곳에만 둔다.** 종전에는 Tauri 껍데기와 헤드리스 호스트가 각자 같은 FNV 해시를
+/// 복사해 갖고 있었다. 두 벌이 갈라지면 같은 폴더가 서로 다른 워크스페이스가 되고, 그러면
+/// 작업 이력과 인덱스 캐시가 조용히 둘로 나뉜다 — 증상은 "이력이 사라졌다"로만 보인다.
+///
+/// 값 자체는 **경로의 함수**여야 한다(난수가 아니다). 앱을 다시 켜도 같은 폴더가 같은
+/// 워크스페이스여야 이력이 이어진다.
+pub fn workspace_id_for(root_display: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in root_display.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("ws-{hash:x}")
+}
+
+#[cfg(test)]
+mod workspace_id_tests {
+    use super::workspace_id_for;
+
+    /// 같은 경로는 언제나 같은 id. 앱을 다시 켜도 이력이 이어지는 근거다.
+    #[test]
+    fn the_same_path_always_maps_to_the_same_id() {
+        assert_eq!(workspace_id_for("/work/alpha"), workspace_id_for("/work/alpha"));
+    }
+
+    /// 다른 경로는 다른 id. 같아지면 두 프로젝트의 이력과 인덱스가 섞인다.
+    #[test]
+    fn different_paths_map_to_different_ids() {
+        assert_ne!(workspace_id_for("/work/alpha"), workspace_id_for("/work/beta"));
+        // 대소문자와 구분자 차이도 다른 값이다 — 정규화는 `WorkspaceRoot`가 이미 했다.
+        assert_ne!(workspace_id_for("/work/alpha"), workspace_id_for("/work/Alpha"));
+    }
+
+    /// 접두사가 붙어 있어야 로그에서 이 값이 무엇인지 알아볼 수 있다.
+    #[test]
+    fn the_id_is_prefixed() {
+        assert!(workspace_id_for("/work/alpha").starts_with("ws-"));
+    }
+}

@@ -24,7 +24,7 @@ use std::path::Path;
 /// 과정에서 잃는 것은 "append-only 진실의 원천"이라는 약속을 깨는 것이다.
 ///
 /// v3(M1): `acceptance_criteria` — 사용자 판정의 파생 캐시(문서 17.3절). 역시 additive다.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub struct Store {
     conn: Connection,
@@ -176,6 +176,9 @@ impl Store {
         }
         if current < 6 {
             tx.execute_batch(SCHEMA_V6)?;
+        }
+        if current < 7 {
+            tx.execute_batch(SCHEMA_V7)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1006,6 +1009,67 @@ impl Store {
         Ok(stmt.query_row(params![task_id], map_task_row).optional()?)
     }
 
+    // ---- WorkspaceIndex 캐시 ----
+
+    /// 이 워크스페이스의 캐시된 인덱스. **지문이 맞을 때만 준다.**
+    ///
+    /// 맞지 않으면 `None`이다 — 맞지 않는 인덱스를 주고 호출자가 판단하게 하면, 그 판단이
+    /// 한 곳만 틀려도 **낡은 파일 목록으로 모델을 부르게** 된다. 그건 조용히 틀린 답을 만든다.
+    pub fn cached_workspace_index(&self, workspace_id: &str, fingerprint: &str) -> Result<Option<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload_json, built_at, build_ms FROM workspace_index_cache
+             WHERE workspace_id = ?1 AND fingerprint = ?2",
+        )?;
+        let row = stmt
+            .query_row(params![workspace_id, fingerprint], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .optional()?;
+        let Some((payload, built_at, build_ms)) = row else {
+            return Ok(None);
+        };
+        // 저장된 것이 JSON이 아니면 **캐시가 없는 것으로 다룬다.** 캐시는 잃어도 되는 데이터이고,
+        // 깨진 값으로 오류를 올리면 고칠 수 없는 파일 하나가 워크스페이스를 못 열게 만든다.
+        let Ok(index) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::json!({
+            "index": index,
+            "builtAt": built_at,
+            "buildMs": build_ms,
+        })))
+    }
+
+    /// 인덱스를 캐시에 넣는다. 워크스페이스당 한 행이므로 **이전 것을 덮어쓴다.**
+    pub fn save_workspace_index(
+        &self,
+        workspace_id: &str,
+        fingerprint: &str,
+        git_head: Option<&str>,
+        index: &serde_json::Value,
+        build_ms: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO workspace_index_cache (workspace_id, fingerprint, git_head, payload_json, built_at, build_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(workspace_id) DO UPDATE SET
+               fingerprint = ?2, git_head = ?3, payload_json = ?4, built_at = ?5, build_ms = ?6",
+            params![
+                workspace_id,
+                fingerprint,
+                git_head,
+                serde_json::to_string(index)?,
+                now_iso(),
+                build_ms
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 증분 조회 — UI가 이미 받은 이벤트를 다시 받지 않도록 `after_event_id` 이후만 반환한다.
     pub fn events_after(&self, task_id: &str, after_event_id: Option<i64>) -> Result<Vec<StoredEvent>> {
         let mut stmt = self.conn.prepare(
@@ -1686,6 +1750,28 @@ ALTER TABLE provider_usage ADD COLUMN estimated_input_tokens INTEGER;
 /// 다루면 빈 목록을 저장한 사용자가 전부 허용된다.
 const SCHEMA_V6: &str = r#"
 ALTER TABLE workspaces ADD COLUMN allowed_providers TEXT;
+"#;
+
+/// `WorkspaceIndex` 캐시 (context-engine.md 2절, process-architecture.md 11.4절).
+///
+/// **워크스페이스당 한 행이다.** 여러 지문의 인덱스를 쌓아두지 않는 이유: 쓸 수 있는 것은
+/// 언제나 "지금 상태와 같은" 하나뿐이고, 나머지는 영원히 안 맞는 항목으로 남아 자란다.
+///
+/// 캐시이므로 **잃어도 정확성이 상하지 않는다** — 없으면 다시 만든다. 그래서 `task_events`와
+/// 달리 append-only가 아니고, 지워도 되는 유일한 테이블이다.
+const SCHEMA_V7: &str = r#"
+CREATE TABLE workspace_index_cache (
+  workspace_id   TEXT PRIMARY KEY REFERENCES workspaces(workspace_id),
+  -- 이 인덱스가 유효한 워크스페이스 상태. HEAD 하나가 아니라 **지문**이다:
+  -- HEAD가 같아도 워킹 트리가 다르면 파일 집합이 다르고, 그러면 인덱스도 다르다.
+  fingerprint    TEXT NOT NULL,
+  git_head       TEXT,
+  payload_json   TEXT NOT NULL,
+  built_at       TEXT NOT NULL,
+  -- 인덱스를 만드는 데 실제로 걸린 시간. **캐시의 이득을 재는 유일한 근거다** —
+  -- 이 값이 없으면 "캐시가 필요한가"라는 질문에 영원히 추정으로 답하게 된다.
+  build_ms       INTEGER
+);
 "#;
 
 #[cfg(test)]
@@ -2744,5 +2830,116 @@ mod tests {
         let rows = store.list_tasks(None, 10, None).unwrap();
         let cursor = Store::cursor_for(rows.last().unwrap());
         assert!(store.list_tasks(None, 10, Some(&cursor)).is_ok());
+    }
+
+    // ---- WorkspaceIndex 캐시 ----
+
+    fn index_payload(paths: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "workspaceId": "ws-1",
+            "fileTree": paths.iter().map(|p| serde_json::json!({ "path": p })).collect::<Vec<_>>(),
+            "projectMeta": {},
+        })
+    }
+
+    /// **지문이 맞을 때만 준다.** 맞지 않는 인덱스를 주고 호출자가 판단하게 하면, 그 판단이
+    /// 한 곳만 틀려도 낡은 파일 목록으로 모델을 부르게 된다.
+    #[test]
+    fn the_index_cache_only_answers_for_a_matching_fingerprint() {
+        let (_d, store) = seeded();
+        store
+            .save_workspace_index("ws-1", "sha256:aaa", None, &index_payload(&["src/app.ts"]), Some(42))
+            .unwrap();
+
+        let hit = store.cached_workspace_index("ws-1", "sha256:aaa").unwrap();
+        assert!(hit.is_some(), "지문이 같은데 캐시를 주지 않았습니다");
+        assert_eq!(
+            hit.as_ref().unwrap()["index"]["fileTree"][0]["path"],
+            serde_json::json!("src/app.ts")
+        );
+        assert_eq!(hit.as_ref().unwrap()["buildMs"], serde_json::json!(42));
+
+        assert!(
+            store.cached_workspace_index("ws-1", "sha256:다름").unwrap().is_none(),
+            "지문이 다른데 캐시를 줬습니다"
+        );
+        assert!(
+            store.cached_workspace_index("ws-없음", "sha256:aaa").unwrap().is_none(),
+            "다른 워크스페이스의 캐시를 줬습니다"
+        );
+    }
+
+    /// **워크스페이스당 한 행이다.** 지문마다 쌓아두면 영원히 안 맞는 항목이 늘어나기만 한다.
+    #[test]
+    fn saving_again_replaces_the_row_instead_of_accumulating() {
+        let (_d, store) = seeded();
+        store
+            .save_workspace_index("ws-1", "sha256:aaa", None, &index_payload(&["a.ts"]), Some(1))
+            .unwrap();
+        store
+            .save_workspace_index("ws-1", "sha256:bbb", None, &index_payload(&["b.ts"]), Some(2))
+            .unwrap();
+
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM workspace_index_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "지문마다 행이 쌓였습니다");
+        // 옛 지문은 더 이상 맞지 않는다.
+        assert!(store.cached_workspace_index("ws-1", "sha256:aaa").unwrap().is_none());
+        assert!(store.cached_workspace_index("ws-1", "sha256:bbb").unwrap().is_some());
+    }
+
+    /// 저장된 값이 깨졌으면 **캐시가 없는 것으로 다룬다.** 캐시는 잃어도 되는 데이터이고,
+    /// 깨진 값으로 오류를 올리면 고칠 수 없는 행 하나가 워크스페이스를 못 열게 만든다.
+    #[test]
+    fn a_corrupted_cache_row_reads_as_a_miss_not_an_error() {
+        let (_d, store) = seeded();
+        store
+            .conn
+            .execute(
+                "INSERT INTO workspace_index_cache (workspace_id, fingerprint, git_head, payload_json, built_at, build_ms)
+                 VALUES ('ws-1', 'sha256:aaa', NULL, '{ not json', '2030-01-01T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
+        assert!(store.cached_workspace_index("ws-1", "sha256:aaa").unwrap().is_none());
+    }
+
+    /// v6 DB를 v7로 올려도 기존 데이터가 살아 있고, 캐시 테이블이 생긴다.
+    /// **캐시는 비어 있는 채로 시작한다** — 마이그레이션이 지어낼 수 있는 값이 아니다.
+    #[test]
+    fn migration_from_v6_adds_an_empty_index_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let artifacts = ArtifactStore::new(dir.path().join("artifacts")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for batch in [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6] {
+                conn.execute_batch(batch).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 6i64).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces VALUES ('ws-1', '/tmp/ws', 'ws', '{}', '2020-01-01T00:00:00Z', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db, artifacts).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM workspace_index_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        // 기존 워크스페이스 행은 그대로다.
+        let name: String = store
+            .conn
+            .query_row("SELECT name FROM workspaces WHERE workspace_id = 'ws-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "ws");
     }
 }

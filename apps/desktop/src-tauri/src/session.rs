@@ -346,7 +346,7 @@ impl SessionState {
         let artifacts = self.artifacts()?;
         let store = self.store()?;
 
-        let workspace_id = format!("ws-{}", short_hash(&root.display()));
+        let workspace_id = tomverse_core::paths::workspace_id_for(&root.display());
         let name = root
             .path()
             .file_name()
@@ -732,11 +732,3 @@ fn app_state_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".tomverse"))
 }
 
-fn short_hash(input: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in input.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:x}")
-}

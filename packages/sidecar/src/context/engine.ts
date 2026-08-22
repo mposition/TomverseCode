@@ -28,6 +28,24 @@ import { packageFiles, type TokenBudget } from "./budget.js";
  * import가 없는 것은 실수가 아니라 신뢰 경계 원칙이다.
  */
 
+/**
+ * 저장된 캐시가 인덱스의 모양인가.
+ *
+ * **밖에서 온 값으로 다룬다.** 앱을 업데이트해 인덱스 모양이 바뀌면 옛 행이 그대로 남아 있고,
+ * 그걸 그대로 쓰면 `fileTree.find`가 `undefined`에서 터지거나 조용히 빈 목록이 된다.
+ * 캐시는 잃어도 되는 데이터이므로, 모양이 다르면 **없는 것으로 다루고 다시 만든다.**
+ */
+function isWorkspaceIndex(value: unknown): value is WorkspaceIndex {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<WorkspaceIndex>;
+  return (
+    typeof candidate.workspaceId === "string" &&
+    Array.isArray(candidate.fileTree) &&
+    typeof candidate.projectMeta === "object" &&
+    candidate.projectMeta !== null
+  );
+}
+
 /** 프로젝트 규칙 파일 — 우선순위 순서대로 찾아 항상 스냅샷에 포함한다 (4절). */
 const PROJECT_RULE_FILES = ["CLAUDE.md", "AGENTS.md", ".cursorrules", "CONTRIBUTING.md", "README.md"];
 
@@ -42,6 +60,13 @@ export interface ContextEngineOptions {
 
 export class ContextEngine {
   private index: WorkspaceIndex | null = null;
+  /**
+   * 지금 들고 있는 인덱스가 유효한 **워크스페이스 지문**.
+   *
+   * `gitHeadAtIndex`가 아닌 이유는 `ensureIndex` 주석에 있다. `null`이면 "지문을 낼 수 없어
+   * 재사용 판정을 할 수 없다"이지 "아무 상태에나 맞는다"가 아니다.
+   */
+  private indexKey: string | null = null;
   private readonly maxIndexedFiles: number;
   private readonly maxRelevantFiles: number;
 
@@ -53,16 +78,51 @@ export class ContextEngine {
   /**
    * 세션 스코프 인덱스 구축/재사용.
    *
-   * 3절 전략 C: 첫 태스크만 느리고, 이후에는 git HEAD가 같으면 그대로 재사용한다.
-   * HEAD가 바뀌면 전체 재구축한다 — 증분 갱신(6절)은 심볼 인덱스가 있을 때 의미가 커지므로
-   * M0에서는 전체 재구축이 더 단순하고 스테일 컨텍스트 위험도 없다.
+   * # 캐시는 프로세스보다 오래 산다
+   *
+   * 워크스페이스를 전환하면 sidecar가 종료되므로 프로세스 안 캐시는 함께 사라진다
+   * (process-architecture.md 11.3절 — sidecar를 살려두지 않는 이유는 자격증명 사본이다).
+   * 그래서 **프로세스가 아니라 결과를 저장한다**: Rust가 SQLite에 워크스페이스당 한 행으로
+   * 들고 있고, 지문이 맞을 때만 돌려준다.
+   *
+   * # 재사용 판정 키를 지문으로 바꿨다
+   *
+   * 종전 키는 `readGitHead`가 만드는 `브랜치@hash(git status --porcelain=v1 --branch)`였다.
+   * (문서 3절이 "git HEAD가 같으면 재사용"이라고 적은 것은 **코드보다 약하게 적힌 것**이다 —
+   * 실제로는 워킹 트리 변화도 대부분 잡고 있었다.) 다만 그 키에는 좁은 사각이 둘 있다.
+   *
+   * - `--porcelain`의 기본 untracked 모드는 **새 디렉터리를 한 줄로 접는다**(`?? newdir/`).
+   *   그 안에 파일을 더 만들어도 status 출력이 그대로이므로 키가 바뀌지 않고, 인덱스는 그
+   *   파일을 모른다. 선정 로직이 전부 `index.fileTree`를 보므로 **이름으로 지목해도
+   *   컨텍스트에 들어가지 않는다.**
+   * - 추적되는 파일을 계속 고쳐도 status에는 `M path` 한 줄뿐이라 키가 더 바뀌지 않는다.
+   *   인덱스의 `sizeBytes`가 그만큼 낡는다.
+   *
+   * Rust의 지문은 `HEAD` + `status --porcelain -uall` + `diff HEAD`이므로 둘 다 닫는다.
+   * 그리고 무엇보다 **같은 질문("이 워크스페이스가 그때와 같은가")에 답이 두 개 있을 이유가
+   * 없다** — 재현 전제 판정이 쓰는 값과 같은 것을 쓴다(state-machine 21절).
+   *
+   * 지문을 낼 수 없는 워크스페이스(git 저장소가 아님)에서는 **재사용도 저장도 하지 않는다** —
+   * 같은지 판정할 방법이 없는데 재사용하면 "모른다"를 "같다"로 읽는 것이다.
    */
   async ensureIndex(bridge: ToolBridge, workspaceId: string): Promise<WorkspaceIndex> {
-    const gitHead = await this.readGitHead(bridge);
-    if (this.index && this.index.workspaceId === workspaceId && this.index.gitHeadAtIndex === gitHead) {
+    const cached = await bridge.loadCachedIndex().catch(() => ({ fingerprint: null, index: null }));
+    const key = cached.fingerprint;
+
+    // 1) 이 프로세스가 이미 들고 있는 것. **지문이 없으면 재사용하지 않는다** —
+    //    `null === null`이 참이라는 이유로 통과시키면 판정 없이 재사용하게 된다.
+    if (key !== null && this.index && this.indexKey === key && this.index.workspaceId === workspaceId) {
       return this.index;
     }
 
+    // 2) 저장된 것. Rust가 지문을 확인한 뒤에만 준다.
+    if (key !== null && isWorkspaceIndex(cached.index) && cached.index.workspaceId === workspaceId) {
+      this.index = cached.index;
+      this.indexKey = key;
+      return this.index;
+    }
+
+    const startedAt = Date.now();
     const entries = await bridge.listFiles(".");
     const fileTree: WorkspaceIndexFileEntry[] = [];
     const excluded: { path: string; reason: string }[] = [];
@@ -91,7 +151,8 @@ export class ContextEngine {
     const projectMeta = await this.detectProjectMeta(bridge, fileTree);
 
     const now = new Date().toISOString();
-    this.index = {
+    const gitHead = await this.readGitHead(bridge);
+    const built: WorkspaceIndex = {
       workspaceId,
       gitHeadAtIndex: gitHead,
       fileTree,
@@ -102,7 +163,18 @@ export class ContextEngine {
       builtAt: now,
       lastIncrementalUpdateAt: now,
     };
-    return this.index;
+    this.index = built;
+    this.indexKey = key;
+
+    // 지문이 없으면 저장하지 않는다 — 어떤 상태의 인덱스인지 말할 수 없는 것을 저장하면
+    // 다음에 그걸 꺼내 쓸 때 무엇과 비교해야 할지 알 수 없다.
+    //
+    // **저장 실패는 태스크를 막지 않는다.** 이건 캐시이고, 없으면 다시 만들면 된다 —
+    // 캐시를 못 썼다고 작업을 세우는 것은 꼬리가 몸통을 흔드는 것이다.
+    if (key !== null) {
+      await bridge.saveCachedIndex(key, built, Date.now() - startedAt).catch(() => undefined);
+    }
+    return built;
   }
 
   /**

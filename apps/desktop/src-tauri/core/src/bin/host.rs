@@ -342,7 +342,7 @@ fn real_main() -> Result<i32, String> {
         Store::open(&db_path, artifacts.clone()).map_err(|e| format!("SQLite 오류: {e}"))?,
     ));
 
-    let workspace_id = format!("ws-{}", short_hash(&root.display()));
+    let workspace_id = tomverse_core::paths::workspace_id_for(&root.display());
     store
         .lock()
         .unwrap()
@@ -779,13 +779,4 @@ fn run_task(
 /// 배포판에서는 `--sidecar`로 번들된 진입점을 넘긴다.
 fn workspace_name(root: &WorkspaceRoot) -> &str {
     root.path().file_name().and_then(|n| n.to_str()).unwrap_or("workspace")
-}
-
-fn short_hash(input: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in input.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:x}")
 }

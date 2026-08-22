@@ -786,6 +786,56 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
   });
 });
 
+/**
+ * 인덱스 캐시가 **프로세스보다 오래 사는가** (context-engine.md 2절, process-architecture.md 11.4절).
+ *
+ * 이게 이 캐시의 존재 이유다. 프로세스 안 캐시는 이미 있었고, 워크스페이스를 전환하면
+ * sidecar가 종료되므로 함께 사라진다 — 전환이 싸지려면 저장된 것이 살아남아야 한다.
+ * 여기서는 **호스트를 완전히 새로 띄워서**(새 sidecar, 새 ContextEngine) 그걸 확인한다.
+ */
+test("[시나리오 F] 인덱스 캐시가 프로세스를 넘어 살아남는다", async () => {
+  requireArtifacts();
+  // **git 저장소여야 한다.** 지문을 낼 수 없는 워크스페이스에서는 캐시를 쓰지도 저장하지도
+  // 않는 것이 규칙이므로, `gitRepo: false`로 돌리면 이 시나리오는 성립하지 않는다.
+  await withCtx({ gitRepo: true }, (ctx) => {
+    const runOnce = () => {
+      const result = spawnSync(HOST_BIN, runArgs(ctx, ["--mode", "fast", "--timeout-secs", "180"]), {
+        encoding: "utf8",
+        timeout: 210_000,
+        env: hostEnv(),
+      });
+      const line = (result.stdout ?? "").trim().split("\n").filter(Boolean).pop();
+      assert.ok(line, `결과 JSON이 없습니다:\n${result.stdout}\n${result.stderr}`);
+      return JSON.parse(line) as { final: { status: string }; taskId: string; eventTypes: string[] };
+    };
+
+    const first = runOnce();
+    assert.ok(
+      first.eventTypes.includes("WORKSPACE_INDEX_BUILT"),
+      `첫 실행이 인덱스를 만들지 않았습니다: ${first.eventTypes.join(", ")}`
+    );
+    assert.ok(
+      !first.eventTypes.includes("WORKSPACE_INDEX_CACHE_HIT"),
+      "빈 캐시에서 적중이 났습니다 — 판정이 지문을 보지 않는다는 뜻입니다"
+    );
+
+    // 첫 실행이 파일을 바꿨으므로 지문이 달라졌다. 시작 상태로 되돌려야 **같은 상태**가 된다 —
+    // 되돌리지 않고 적중이 나면 그건 지문을 보지 않았다는 뜻이므로, 이 복원 자체가 검사의 일부다.
+    execFileSync("git", ["-C", ctx.repo.root, "checkout", "--", "."], { encoding: "utf8" });
+    execFileSync("git", ["-C", ctx.repo.root, "clean", "-qfd"], { encoding: "utf8" });
+
+    const second = runOnce();
+    assert.ok(
+      second.eventTypes.includes("WORKSPACE_INDEX_CACHE_HIT"),
+      `새 프로세스가 저장된 인덱스를 쓰지 않았습니다: ${second.eventTypes.join(", ")}`
+    );
+    assert.ok(
+      !second.eventTypes.includes("WORKSPACE_INDEX_BUILT"),
+      "적중했는데 다시 만들었습니다"
+    );
+  });
+});
+
 test("[시나리오 D] 저장된 이벤트에서 기준 계측을 집계할 수 있다", async () => {
   // 12절 미해결 두 항목("기준↔테스트 연결의 커버리지", "위치 충돌 규칙의 오탐률")은 집계로만
   // 답할 수 있는 질문이다. **실제 DB 파일**에서 그 집계가 나오는지를 여기서 확인한다 —

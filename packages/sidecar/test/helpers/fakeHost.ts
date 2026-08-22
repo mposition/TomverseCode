@@ -21,6 +21,14 @@ export interface FakeHostOptions {
   gitDiff?: string;
   /** verify.run 응답을 순서대로 소비한다. 첫 호출은 baseline이다. */
   verifyResults?: VerifyStub[];
+  /**
+   * 인덱스 캐시의 워크스페이스 지문.
+   *
+   * `null`이면 **지문을 낼 수 없는 워크스페이스**(git 저장소가 아님)를 흉내낸다 —
+   * 그 경우 캐시를 쓰지도 저장하지도 않아야 한다. 기본값을 주는 이유: 대부분의 테스트는
+   * 캐시를 신경 쓰지 않고 "인덱스를 재사용한다"만 확인한다.
+   */
+  indexFingerprint?: string | null;
   /** tool.execute 응답 override (requestId 순서대로) */
   toolResults?: {
     status: "ok" | "error" | "denied" | "timeout" | "cancelled";
@@ -41,15 +49,29 @@ export class FakeHost {
   readonly toolRequests: ToolRequest[] = [];
   readonly verifyCalls: { phase: string; attemptNumber: number }[] = [];
   readonly usage: unknown[] = [];
+  /** 저장된 인덱스 캐시 — Rust의 `workspace_index_cache` 한 행에 해당한다. */
+  private cachedIndex: { fingerprint: string; index: unknown; buildMs: number } | null = null;
+  /** 캐시 RPC가 몇 번 불렸는지 — 테스트가 "저장하지 않았다"를 확인할 수 있어야 한다. */
+  readonly indexSaves: { fingerprint: string; buildMs: number }[] = [];
   private eventSeq = 0;
   private toolCursor = 0;
   private verifyCursor = 0;
 
-  constructor(private readonly options: FakeHostOptions = {}) {}
+  constructor(private options: FakeHostOptions = {}) {}
 
   /** Orchestrator는 transport의 `request`만 쓰므로 그 형태만 만족시킨다. */
   asTransport(): NdjsonTransport {
     return { request: (method: string, params: unknown) => this.handle(method, params) } as unknown as NdjsonTransport;
+  }
+
+  /** 지금 워크스페이스 지문. 테스트가 도중에 바꿔 "상태가 변했다"를 만들 수 있다. */
+  private indexFingerprint(): string | null {
+    return this.options.indexFingerprint === undefined ? "sha256:fake" : this.options.indexFingerprint;
+  }
+
+  /** 테스트에서 워크스페이스가 변한 상황을 만든다. */
+  setIndexFingerprint(value: string | null): void {
+    this.options.indexFingerprint = value;
   }
 
   eventTypes(): string[] {
@@ -86,6 +108,32 @@ export class FakeHost {
         const stub = this.options.verifyResults?.[this.verifyCursor];
         this.verifyCursor += 1;
         return { report: this.buildReport(taskId, phase, attemptNumber, stub) };
+      }
+
+      // 실제 Rust는 지문을 스스로 계산하고 워크스페이스 id도 자기 루트에서 유도한다.
+      // 여기서는 그 **계약**만 흉내낸다: 지문이 맞을 때만 캐시를 준다.
+      case "index.load": {
+        const fingerprint = this.indexFingerprint();
+        if (fingerprint === null) return { fingerprint: null, index: null };
+        const hit = this.cachedIndex?.fingerprint === fingerprint ? this.cachedIndex : null;
+        return {
+          fingerprint,
+          index: hit?.index ?? null,
+          buildMs: hit?.buildMs ?? null,
+        };
+      }
+
+      case "index.save": {
+        const { fingerprint, index, buildMs } = params as {
+          fingerprint: string;
+          index: unknown;
+          buildMs: number;
+        };
+        this.indexSaves.push({ fingerprint, buildMs });
+        // Rust는 저장 시점에 지문을 다시 재서 그 사이 바뀌었으면 저장하지 않는다.
+        if (fingerprint !== this.indexFingerprint()) return { saved: false, reason: "그 사이 바뀜" };
+        this.cachedIndex = { fingerprint, index, buildMs };
+        return { saved: true, fingerprint };
       }
 
       case "tool.execute": {

@@ -732,6 +732,25 @@ impl TaskHost {
         crate::reproduce::fingerprint(|args| self.git_output(task_id, args))
     }
 
+    /// 인덱스 캐시의 키 — **워크스페이스 지문이다.**
+    ///
+    /// `gitHeadAtIndex` 하나로는 부족하다. HEAD가 같아도 워킹 트리가 다르면 **파일 집합이
+    /// 다르고**, 인덱스는 파일 집합이다. 종전 규칙("HEAD가 같으면 재사용")은 커밋 없이 만든
+    /// 파일을 인덱스에서 영영 빠뜨렸고, 그러면 사용자가 이름으로 지목해도 컨텍스트에 들어가지
+    /// 않는다 — 재현 전제 판정에서 같은 이유로 지문을 쓰기로 한 것과 같은 문제다.
+    ///
+    /// **이벤트를 남기지 않는다.** `record_workspace_fingerprint`와 달리 이건 캐시 판정이고,
+    /// 태스크마다 지문 이벤트가 두 개씩 쌓이면 감사 로그가 캐시 사정을 설명하게 된다.
+    fn index_cache_key(&self, task_id: &str) -> Option<String> {
+        let payload = crate::reproduce::fingerprint(|args| self.git_output(task_id, args));
+        payload.get("fingerprint").and_then(Value::as_str).map(str::to_string)
+    }
+
+    /// 이 호스트가 다루는 워크스페이스의 id. **루트에서 유도한다** — Node가 말한 값을 쓰지 않는다.
+    fn workspace_id(&self) -> String {
+        crate::paths::workspace_id_for(&self.root.display())
+    }
+
     /// 이벤트 로그에서 이 태스크가 만든 커밋 sha를 찾는다.
     ///
     /// 별도 컬럼에 저장하지 않는 이유: 이벤트가 진실의 원천이고(7번 원칙), 커밋 sha는 그
@@ -1023,6 +1042,92 @@ impl SidecarHandler for TaskHost {
                     .and_then(Value::as_str)
                     .ok_or_else(|| "workspace.fingerprint params에 \"taskId\"가 없음".to_string())?;
                 self.record_workspace_fingerprint(task_id)
+            }
+
+            // ---- WorkspaceIndex 캐시 (context-engine.md 2절, process-architecture.md 11.4절) ----
+            //
+            // **워크스페이스 id를 Node가 정하지 않는다.** Rust가 자기 루트에서 유도한다 —
+            // Node가 id를 말할 수 있으면 다른 워크스페이스의 캐시를 읽고 쓸 수 있고,
+            // 그건 "이 루트를 벗어날 수 없다"를 캐시 계층에서 우회하는 길이다.
+            "index.load" => {
+                let task_id = params
+                    .get("taskId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "index.load params에 \"taskId\"가 없음".to_string())?;
+                let fingerprint = self.index_cache_key(task_id);
+                let Some(key) = fingerprint.clone() else {
+                    // 지문을 낼 수 없으면(git 저장소가 아니면) **캐시를 쓰지 않는다.**
+                    // 워크스페이스가 그때와 같은지 판정할 방법이 없기 때문이다 —
+                    // "모른다"를 "같다"로 읽으면 낡은 파일 목록으로 모델을 부르게 된다.
+                    return Ok(
+                        json!({ "fingerprint": null, "index": null, "reason": "지문을 낼 수 없어 캐시를 쓰지 않습니다" }),
+                    );
+                };
+                let cached = self
+                    .with_store(|s| s.cached_workspace_index(&self.workspace_id(), &key))
+                    .map_err(|e| format!("인덱스 캐시 조회 실패: {e}"))?;
+                match cached {
+                    Some(hit) => {
+                        // **캐시의 이득을 재는 자리다.** 11.4절은 "전환을 싸게 만든다"고 적었는데
+                        // 그 이득은 아직 측정된 적이 없다 — 적중 여부와 원래 걸린 시간을 남긴다.
+                        let _ = self.append_event(
+                            task_id,
+                            "WORKSPACE_INDEX_CACHE_HIT",
+                            json!({
+                                "builtAt": hit.get("builtAt").cloned().unwrap_or(Value::Null),
+                                "savedBuildMs": hit.get("buildMs").cloned().unwrap_or(Value::Null),
+                            }),
+                        );
+                        Ok(json!({
+                            "fingerprint": key,
+                            "index": hit.get("index").cloned().unwrap_or(Value::Null),
+                            "builtAt": hit.get("builtAt").cloned().unwrap_or(Value::Null),
+                            "buildMs": hit.get("buildMs").cloned().unwrap_or(Value::Null),
+                        }))
+                    }
+                    None => Ok(json!({ "fingerprint": key, "index": null })),
+                }
+            }
+
+            "index.save" => {
+                let task_id = params
+                    .get("taskId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "index.save params에 \"taskId\"가 없음".to_string())?;
+                let claimed = params
+                    .get("fingerprint")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "index.save params에 \"fingerprint\"가 없음".to_string())?;
+                let index = params
+                    .get("index")
+                    .cloned()
+                    .ok_or_else(|| "index.save params에 \"index\"가 없음".to_string())?;
+                let build_ms = params.get("buildMs").and_then(Value::as_i64);
+
+                // **인덱스를 만드는 사이에 워크스페이스가 바뀌었으면 저장하지 않는다.**
+                // 그 인덱스는 지금 존재하지 않는 상태를 설명하므로, 어느 지문으로 저장해도
+                // 틀린다 — 옛 지문으로 저장하면 그 상태에 없던 내용이 들어가고, 새 지문으로
+                // 저장하면 아직 반영되지 않은 변경을 반영했다고 주장하게 된다.
+                let now = self.index_cache_key(task_id);
+                if now.as_deref() != Some(claimed) {
+                    return Ok(json!({
+                        "saved": false,
+                        "reason": "인덱스를 만드는 사이에 워크스페이스가 바뀌었습니다",
+                    }));
+                }
+                self.with_store(|s| s.save_workspace_index(&self.workspace_id(), claimed, None, &index, build_ms))
+                    .map_err(|e| format!("인덱스 캐시 저장 실패: {e}"))?;
+                let _ = self.append_event(
+                    task_id,
+                    "WORKSPACE_INDEX_BUILT",
+                    json!({
+                        "buildMs": build_ms,
+                        // 인덱스의 크기를 함께 남긴다 — 걸린 시간만으로는 그게 큰 저장소 때문인지
+                        // 느린 디스크 때문인지 구별되지 않는다.
+                        "fileCount": index.get("fileTree").and_then(Value::as_array).map(|a| a.len()),
+                    }),
+                );
+                Ok(json!({ "saved": true, "fingerprint": claimed }))
             }
 
             "usage.record" => {
