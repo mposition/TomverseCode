@@ -44,6 +44,7 @@ import { AuditExportPanel } from "./components/AuditExportPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
 import { TaskHistory } from "./components/TaskHistory";
+import { bannerFor, reopenTarget, type BackendStatus } from "./lib/backendStatus";
 import {
   EMPTY_TASK_LIST,
   TASK_PAGE_SIZE,
@@ -259,9 +260,20 @@ export default function App() {
     evaluations: CriterionEvaluation[];
   } | null>(null);
   const [storeError, setStoreError] = useState<string | null>(null);
+  // 백엔드 상태. **조회는 아무것도 다시 띄우지 않는다** — 물었더니 재spawn이 일어나면 조회가 아니다.
+  const [backend, setBackend] = useState<BackendStatus | null>(null);
 
   const startedAt = useRef<number | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
+
+  const refreshBackend = useCallback(async () => {
+    try {
+      setBackend(await invoke<BackendStatus>("backend_status"));
+    } catch {
+      // 상태를 못 읽은 것을 고장으로 보고하지 않는다 — 모르는 것과 죽은 것은 다르다.
+      setBackend(null);
+    }
+  }, []);
 
   const refreshTasks = useCallback(async () => {
     try {
@@ -408,6 +420,8 @@ export default function App() {
     try {
       const info = await invoke<WorkspaceInfo>("open_workspace", { path: workspacePath });
       setWorkspace(info);
+      // 다시 열었으면 감독자가 새로 만들어졌다 — 옛 배너를 그대로 두면 고쳐졌는데도 고장으로 보인다.
+      void refreshBackend();
       // 임계값은 워크스페이스를 열 때 한 번만 읽는다. 취소마다 다시 계산하면 탈출구가 뜨는
       // 시점이 매번 달라지는데, 그 흔들림 자체가 사용자에게는 불안이다.
       //
@@ -439,7 +453,24 @@ export default function App() {
     } finally {
       setOpening(false);
     }
-  }, [workspacePath]);
+  }, [workspacePath, refreshBackend]);
+
+  // 배너의 "다시 열기". 대상 경로는 **지금 열려 있는 워크스페이스**이지 입력란의 값이 아니다 —
+  // 입력란은 사용자가 다른 경로를 타이핑하던 중일 수 있고, 그러면 엉뚱한 곳이 열린다.
+  const banner = bannerFor(backend);
+  const reopenPath = reopenTarget(banner, workspace?.rootPath ?? null);
+  const reopenBackend = useCallback(async () => {
+    if (!reopenPath) return;
+    setOpening(true);
+    try {
+      setWorkspace(await invoke<WorkspaceInfo>("open_workspace", { path: reopenPath }));
+      await refreshBackend();
+    } catch (error) {
+      setOpenError(String(error));
+    } finally {
+      setOpening(false);
+    }
+  }, [reopenPath, refreshBackend]);
 
   const toggleProvider = useCallback(
     async (providerId: string, enable: boolean) => {
@@ -517,8 +548,11 @@ export default function App() {
       setRunning(false);
       setCancelling(false);
       void refreshTasks();
+      // 작업이 끝난 **뒤에** 본다. 실패의 원인이 백엔드였다면 여기서 드러나고, 아니었다면
+      // `alive`가 나와 배너가 뜨지 않는다.
+      void refreshBackend();
     }
-  }, [workspace, message, mode, taskId, refreshTasks]);
+  }, [workspace, message, mode, taskId, refreshTasks, refreshBackend]);
 
   const respondApproval = useCallback(
     async (granted: boolean) => {
@@ -1282,6 +1316,18 @@ export default function App() {
 
       {/* 히스토리는 워크스페이스 선택 여부와 무관하게 보인다 — 앱을 켜자마자
           중단된 작업이 있는지 알아야 하기 때문이다. */}
+      {/* 백엔드가 사용자 개입을 요구하는 상태일 때만 뜬다. 자동으로 복구될 상태에서는 뜨지
+          않는다 — 필요 없는 조치를 요구하면 사용자는 배너를 무시하는 법을 배운다. */}
+      {banner && (
+        <p className="error">
+          {banner.message}
+          {reopenPath && (
+            <button className="secondary tiny" onClick={() => void reopenBackend()} disabled={opening || running}>
+              워크스페이스 다시 열기
+            </button>
+          )}
+        </p>
+      )}
       {storeError && <p className="error">작업 기록을 읽을 수 없습니다: {storeError}</p>}
       <TaskHistory
         tasks={tasks}

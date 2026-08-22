@@ -222,6 +222,15 @@ fn task_export(state: tauri::State<'_, SessionState>, task_id: String) -> Result
     state.task_export(&task_id)
 }
 
+/// 백엔드(sidecar) 상태. **읽기 전용이다** — 물었다고 다시 띄우지 않는다.
+///
+/// `recovery`가 화면의 "다시 열기" 버튼을 정한다. 안내 문장을 화면이 문자열로 비교하게 두면
+/// 문구를 다듬는 순간 버튼이 사라진다.
+#[tauri::command]
+fn backend_status(state: tauri::State<'_, SessionState>) -> Result<Value, String> {
+    state.backend_status()
+}
+
 /// 자격증명 확인 (multi-engine-routing.md 17절). **유료 호출을 하지 않는다.**
 #[tauri::command]
 async fn probe_providers(app: tauri::AppHandle, timeout_secs: Option<u64>) -> Result<Value, String> {
@@ -366,6 +375,7 @@ pub fn run() {
             list_models,
             set_allowed_providers,
             probe_providers,
+            backend_status,
             scan_input_for_secret_shapes,
             get_task,
             restart_task,

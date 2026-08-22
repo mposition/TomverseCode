@@ -238,18 +238,29 @@ impl SessionState {
                 eprintln!("[session] 백엔드가 종료되어 다시 시작했습니다 ({attempt}/{MAX_SIDECAR_RESPAWNS})");
                 Ok(())
             }
-            // **사유를 문장으로 돌려준다.** "백엔드가 없습니다"만 말하면 사용자는 무엇을
-            // 해야 하는지 모른다 — 다시 열어야 하는지, 버그를 신고해야 하는지가 다르다.
-            RespawnOutcome::LimitReached { attempts } => Err(format!(
-                "백엔드가 {attempts}번 다시 시작한 뒤에도 계속 종료됩니다. 워크스페이스를 다시 열어 주세요."
-            )),
-            RespawnOutcome::ProtocolViolation { reason } => Err(format!(
-                "백엔드와의 통신이 프로토콜 위반으로 끊겼습니다. 다시 시작하지 않습니다 — 같은 위반이 반복될 뿐입니다. ({reason})"
-            )),
-            RespawnOutcome::SpawnFailed { attempt, error } => Err(format!(
-                "백엔드를 다시 시작할 수 없습니다 ({attempt}/{MAX_SIDECAR_RESPAWNS}): {error}"
-            )),
+            // **사유와 복구 방법은 core에서 온다.** 문장을 여기 두면 조회 경로(`backend_status`)와
+            // 갈라지고, 이 크레이트는 개발 환경에서 컴파일되지 않으므로 그 갈라짐이 드러나지 않는다.
+            other => match other.failure() {
+                Some((message, _recovery)) => Err(message),
+                // `failure()`가 None인 것은 성공뿐이고 그건 위에서 처리했다.
+                None => Ok(()),
+            },
         }
+    }
+
+    /// 백엔드 상태 조회. **아무것도 다시 띄우지 않는다** — 물었더니 재spawn이 일어나면
+    /// 그건 조회가 아니다.
+    ///
+    /// 화면이 "다시 열기" 버튼을 띄울지는 `recovery` 값이 정한다. 안내 문장을 문자열로
+    /// 비교하게 두면 문구를 다듬는 순간 버튼이 사라진다.
+    pub fn backend_status(&self) -> Result<Value, String> {
+        let guard = self.inner.lock().unwrap();
+        let Some(active) = guard.as_ref() else {
+            // 워크스페이스가 없는 것은 백엔드 고장이 아니다. 같은 칸에 넣으면 앱을 켜자마자
+            // "백엔드에 문제가 있습니다"가 뜬다.
+            return Ok(json!({ "state": "noWorkspace" }));
+        };
+        Ok(serde_json::to_value(active.sidecar.status()).unwrap_or(Value::Null))
     }
 
     /// 자격증명 확인 (multi-engine-routing.md 17절).

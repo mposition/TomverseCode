@@ -423,6 +423,67 @@ pub enum RespawnOutcome {
 /// 워크스페이스 세션 하나에서 허용하는 재spawn 횟수 (5절 표의 "최대 2회").
 pub const MAX_SIDECAR_RESPAWNS: u64 = 2;
 
+/// 사용자가 무엇을 할 수 있는가.
+///
+/// **버튼을 줄지 말지를 화면이 문장에서 읽어내게 두지 않는다.** 안내를 한국어 문장으로만
+/// 주면 화면은 그 문장을 문자열로 비교해야 하고, 문구를 다듬는 순간 버튼이 사라진다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Recovery {
+    /// 워크스페이스를 다시 열면 감독자가 새로 만들어지고 재spawn 상한이 초기화된다.
+    ReopenWorkspace,
+    /// 다시 열어도 달라지지 않는다. **버튼을 주지 않는다** — 눌러도 같은 결과가 나오는
+    /// 버튼은 목록이 전진하지 않는 "더 보기"와 같은 종류의 거짓말이다.
+    None,
+}
+
+/// 감독자의 **현재** 상태. `ensure_alive`와 달리 아무것도 바꾸지 않는다.
+///
+/// 세 값인 이유: "죽어 있다"가 곧 "사용자가 개입해야 한다"는 아니다. 상한이 남아 있으면
+/// 다음 태스크 시작 시 자동으로 다시 뜨므로 **사용자가 할 일이 없다.** 둘을 한 값으로 합치면
+/// 화면이 필요 없는 조치를 요구하게 된다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum SupervisorStatus {
+    Alive,
+    /// 죽어 있지만 다음 태스크에서 자동으로 다시 뜬다.
+    WillRespawn {
+        remaining: u64,
+    },
+    /// 사용자가 개입해야 한다.
+    Unavailable {
+        reason: String,
+        recovery: Recovery,
+    },
+}
+
+impl RespawnOutcome {
+    /// 실패했다면 (사용자에게 보일 문장, 복구 방법). 성공이면 `None`.
+    ///
+    /// 문장을 여기 두는 이유가 둘이다. **한 곳에서 나와야 조회 경로(`status`)와 실행 경로가
+    /// 갈라지지 않는다.** 그리고 Tauri 껍데기 크레이트는 이 개발 환경에서 컴파일되지 않으므로,
+    /// 거기 남는 문장은 검증되지 않는다.
+    pub fn failure(&self) -> Option<(String, Recovery)> {
+        match self {
+            RespawnOutcome::Alive | RespawnOutcome::Respawned { .. } => None,
+            RespawnOutcome::LimitReached { attempts } => Some((
+                format!("백엔드가 {attempts}번 다시 시작한 뒤에도 계속 종료됩니다."),
+                Recovery::ReopenWorkspace,
+            )),
+            RespawnOutcome::ProtocolViolation { reason } => Some((
+                format!(
+                    "백엔드와의 통신이 프로토콜 위반으로 끊겼습니다. 다시 시작하지 않습니다 — 같은 위반이 반복될 뿐입니다. ({reason})"
+                ),
+                Recovery::None,
+            )),
+            RespawnOutcome::SpawnFailed { attempt, error } => Some((
+                format!("백엔드를 다시 시작할 수 없습니다 ({attempt}/{MAX_SIDECAR_RESPAWNS}): {error}"),
+                Recovery::ReopenWorkspace,
+            )),
+        }
+    }
+}
+
 impl SidecarSupervisor {
     /// `factory`는 **같은 설정으로 다시 띄우는 방법**이다. 설정을 복제해 두는 대신 클로저로
     /// 받는 이유: 자격증명이 그 설정에 들어 있고(2절), 그걸 감독자가 들고 있으면 살아 있는
@@ -444,6 +505,44 @@ impl SidecarSupervisor {
 
     pub fn respawn_count(&self) -> u64 {
         self.respawns.load(Ordering::SeqCst)
+    }
+
+    /// 지금 상태를 **바꾸지 않고** 본다. 화면이 "다시 열기" 버튼을 띄울지 정하는 데 쓴다 —
+    /// 상태를 물었더니 재spawn이 일어나면 그건 조회가 아니다.
+    ///
+    /// 판정 규칙은 `ensure_alive`와 같은 순서를 따른다: 프로토콜 위반이 상한보다 먼저다.
+    /// 위반으로 닫힌 것은 상한이 남아 있어도 다시 띄우지 않기 때문이다.
+    pub fn status(&self) -> SupervisorStatus {
+        let guard = self.client.lock().unwrap();
+        if !guard.is_closed() {
+            return SupervisorStatus::Alive;
+        }
+        if let Some(reason) = guard.close_reason() {
+            if reason.starts_with(PROTOCOL_VIOLATION_PREFIX) {
+                let (message, recovery) = RespawnOutcome::ProtocolViolation { reason }
+                    .failure()
+                    .expect("프로토콜 위반은 실패다");
+                return SupervisorStatus::Unavailable {
+                    reason: message,
+                    recovery,
+                };
+            }
+        }
+        let used = self.respawns.load(Ordering::SeqCst);
+        if used >= self.max_respawns {
+            let (message, recovery) = RespawnOutcome::LimitReached {
+                attempts: self.max_respawns,
+            }
+            .failure()
+            .expect("상한 도달은 실패다");
+            return SupervisorStatus::Unavailable {
+                reason: message,
+                recovery,
+            };
+        }
+        SupervisorStatus::WillRespawn {
+            remaining: self.max_respawns - used,
+        }
     }
 
     /// 죽어 있으면 다시 띄운다. **호출자가 부르는 시점을 정한다** — 태스크를 시작하기 전이지,
@@ -729,5 +828,122 @@ mod supervisor_tests {
                 attempts: MAX_SIDECAR_RESPAWNS
             }
         );
+    }
+
+    /// **"죽어 있다"가 곧 "사용자가 개입해야 한다"는 아니다.** 상한이 남아 있으면 다음
+    /// 태스크에서 자동으로 다시 뜨므로 화면은 아무 조치도 요구하면 안 된다.
+    #[test]
+    fn a_dead_sidecar_with_attempts_left_asks_nothing_of_the_user() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let supervisor = SidecarSupervisor::new(dying_factory(spawns.clone())).unwrap();
+        wait_closed(&supervisor.client());
+
+        assert_eq!(
+            supervisor.status(),
+            SupervisorStatus::WillRespawn {
+                remaining: MAX_SIDECAR_RESPAWNS
+            }
+        );
+        // 조회가 상태를 바꾸지 않았다 — 물었더니 재spawn이 일어나면 그건 조회가 아니다.
+        assert_eq!(spawns.load(Ordering::SeqCst), 1, "status()가 sidecar를 다시 띄웠습니다");
+        assert_eq!(supervisor.respawn_count(), 0);
+    }
+
+    /// 상한에 도달하면 **다시 열기**를 제안한다 — 다시 열면 감독자가 새로 만들어져
+    /// 실제로 달라지기 때문이다.
+    #[test]
+    fn reaching_the_limit_offers_reopening_the_workspace() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let supervisor = SidecarSupervisor::new(dying_factory(spawns.clone())).unwrap();
+        for _ in 0..MAX_SIDECAR_RESPAWNS {
+            wait_closed(&supervisor.client());
+            supervisor.ensure_alive();
+        }
+        wait_closed(&supervisor.client());
+
+        match supervisor.status() {
+            SupervisorStatus::Unavailable { recovery, reason } => {
+                assert_eq!(recovery, Recovery::ReopenWorkspace);
+                assert!(reason.contains("계속 종료"), "{reason}");
+            }
+            other => panic!("상한에 도달했는데 다른 상태입니다: {other:?}"),
+        }
+    }
+
+    /// **프로토콜 위반에는 버튼을 주지 않는다.** 다시 열어도 같은 위반이 반복되므로,
+    /// 눌러도 같은 결과가 나오는 버튼이 남는다 — 그건 안내가 아니라 거짓말이다.
+    /// 그리고 위반은 **상한이 남아 있어도** 이 판정을 받는다.
+    #[test]
+    fn a_protocol_violation_offers_no_button() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let supervisor = SidecarSupervisor::new(dying_factory(spawns.clone())).unwrap();
+        wait_closed(&supervisor.client());
+        {
+            let client = supervisor.client();
+            let mut slot = client.close_reason.lock().unwrap();
+            *slot = Some(format!("{PROTOCOL_VIOLATION_PREFIX}한 줄이 너무 깁니다"));
+        }
+        assert_eq!(supervisor.respawn_count(), 0, "상한이 남아 있는 상태여야 합니다");
+
+        match supervisor.status() {
+            SupervisorStatus::Unavailable { recovery, reason } => {
+                assert_eq!(recovery, Recovery::None);
+                assert!(reason.contains("프로토콜 위반"), "{reason}");
+            }
+            other => panic!("위반인데 다른 상태입니다: {other:?}"),
+        }
+    }
+
+    /// 살아 있으면 살아 있다고 말한다 — 위 세 테스트가 "언제나 Unavailable"로 통과하지 않도록.
+    #[test]
+    fn a_live_sidecar_reports_alive() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let long_lived: Box<dyn Fn() -> std::io::Result<Arc<SidecarClient>> + Send + Sync> = {
+            let spawns = spawns.clone();
+            Box::new(move || {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                SidecarClient::spawn(
+                    SpawnConfig {
+                        program: "node".to_string(),
+                        args: vec!["-e".to_string(), "setTimeout(() => {}, 60000)".to_string()],
+                        working_dir: None,
+                        env: Vec::new(),
+                    },
+                    Arc::new(NoopHandler),
+                )
+            })
+        };
+        let supervisor = SidecarSupervisor::new(long_lived).unwrap();
+        assert_eq!(supervisor.status(), SupervisorStatus::Alive);
+    }
+
+    /// 조회와 실행이 **같은 문장**을 쓴다. 두 벌이 되면 화면과 로그가 다른 말을 하고,
+    /// 한쪽만 고쳐질 때 그 사실이 드러나지 않는다.
+    #[test]
+    fn the_message_comes_from_one_place() {
+        let outcome = RespawnOutcome::LimitReached {
+            attempts: MAX_SIDECAR_RESPAWNS,
+        };
+        let (message, recovery) = outcome.failure().unwrap();
+        assert_eq!(recovery, Recovery::ReopenWorkspace);
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let supervisor = SidecarSupervisor::new(dying_factory(spawns.clone())).unwrap();
+        for _ in 0..MAX_SIDECAR_RESPAWNS {
+            wait_closed(&supervisor.client());
+            supervisor.ensure_alive();
+        }
+        wait_closed(&supervisor.client());
+        match supervisor.status() {
+            SupervisorStatus::Unavailable { reason, .. } => assert_eq!(reason, message),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 성공한 결과는 실패 문장을 갖지 않는다 — 갖게 되면 화면이 정상 동작에도 배너를 띄운다.
+    #[test]
+    fn success_has_no_failure_message() {
+        assert!(RespawnOutcome::Alive.failure().is_none());
+        assert!(RespawnOutcome::Respawned { attempt: 1 }.failure().is_none());
     }
 }
