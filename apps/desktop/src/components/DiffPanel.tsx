@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { DEFAULT_DIFF_LINE_CAP, summarizeChange, summarizeDiff, visibleDiff } from "../lib/diffSummary";
+import { DEFAULT_DIFF_LINE_CAP, summarizeChange, visibleDiff } from "../lib/diffSummary";
+import { hiddenNotice, viewDiffs, type DiffSort } from "../lib/diffList";
 
 /**
  * Diff 패널 — docs/design/ui-wireframes.md 3.1절 우측 패널, 3.14절 대용량 변경.
@@ -16,10 +17,21 @@ import { DEFAULT_DIFF_LINE_CAP, summarizeChange, summarizeDiff, visibleDiff } fr
  *
  * 종전에는 `<details>` 안에 모든 줄을 미리 넣었다. `<details>`는 접혀 있어도 **내용이 DOM에
  * 있으므로**, 파일 50개짜리 변경에서 수천 개의 노드가 만들어졌다. 지금은 편 것만 그린다.
+ *
+ * # 필터와 정렬 — 규칙은 화면 밖에 있다
+ *
+ * 무엇을 숨기고 어떤 순서로 놓을지는 `lib/diffList.ts`가 정한다. 숨겨진 파일은 화면에서
+ * **그냥 없는 파일처럼 보이고**, 뒤섞인 순서는 그냥 다른 순서처럼 보인다 — 눈으로 검증할
+ * 수 없는 계산이므로 순수 함수로 뺐다.
+ *
+ * 요약 숫자(헤더의 파일 수와 +/−)는 **필터를 따르지 않는다.** 되돌리기는 전부 아니면
+ * 전무이므로, 화면의 숫자가 필터를 따라 줄어들면 되돌리기 범위와 어긋난다.
  */
 export function DiffPanel({ diffs, largeChangeFiles }: { diffs: [string, string][]; largeChangeFiles?: number }) {
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [filter, setFilter] = useState("");
+  const [sort, setSort] = useState<DiffSort>("applied");
 
   if (diffs.length === 0) {
     return (
@@ -30,7 +42,10 @@ export function DiffPanel({ diffs, largeChangeFiles }: { diffs: [string, string]
     );
   }
 
+  // **전체 요약이다.** 필터를 따르지 않는다 — 되돌리기 범위가 전체이기 때문이다.
   const total = summarizeChange(diffs);
+  const view = viewDiffs(diffs, { filter, sort });
+  const notice = hiddenNotice(view);
   // 파일이 하나면 펴 둔다 — 한 파일짜리 변경에서 한 번 더 누르게 하는 것은 이유가 없다.
   const isOpen = (key: string) => open[key] ?? diffs.length === 1;
   const large = largeChangeFiles !== undefined && total.files >= largeChangeFiles;
@@ -48,9 +63,43 @@ export function DiffPanel({ diffs, largeChangeFiles }: { diffs: [string, string]
           훑어보세요.
         </p>
       )}
-      {diffs.map(([path, diff], index) => {
-        const key = `${path}-${index}`;
-        const stat = summarizeDiff(diff);
+      {/* 목록이 두 개 이상일 때만 도구를 그린다 — 파일 하나짜리 변경에 필터와 정렬을
+          붙이는 것은 화면만 늘린다. */}
+      {diffs.length > 1 && (
+        <div className="diff-tools">
+          <input
+            type="search"
+            className="diff-filter"
+            placeholder="경로로 거르기"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            aria-label="경로로 거르기"
+          />
+          <label className="muted small">
+            정렬{" "}
+            <select value={sort} onChange={(e) => setSort(e.target.value as DiffSort)} aria-label="정렬 기준">
+              <option value="applied">적용 순서</option>
+              <option value="changes">변경이 큰 파일부터</option>
+              <option value="path">경로순</option>
+            </select>
+          </label>
+          {/* 정렬 중이라는 사실을 말한다. 각 행의 `#순번`이 원래 자리를 알려주지만,
+              **같은 파일을 두 번 고친 기록이 떨어질 수 있다**는 것은 순번으로 복원되지 않는다. */}
+          {sort !== "applied" && (
+            <span className="muted small">
+              적용 순서가 아닙니다 — 각 행의 <code>#</code>이 원래 순번입니다.
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* **숨긴 것을 말한다.** 되돌리기는 숨긴 파일까지 전부에 적용되므로, 화면에 보이는
+          것만으로 판단하면 안 된다. */}
+      {notice && <p className="warn small">{notice}</p>}
+
+      {view.rows.map(({ path, diff, appliedIndex, stat }) => {
+        // 키에 **적용 순번**을 쓴다 — 정렬로 자리가 바뀌어도 펼침 상태가 따라다녀야 한다.
+        const key = `${path}-${appliedIndex}`;
         const cap = expanded[key] ? Number.POSITIVE_INFINITY : DEFAULT_DIFF_LINE_CAP;
         const shown = isOpen(key) ? visibleDiff(diff, cap) : null;
         return (
@@ -60,7 +109,9 @@ export function DiffPanel({ diffs, largeChangeFiles }: { diffs: [string, string]
             onToggle={(e) => setOpen((prev) => ({ ...prev, [key]: (e.target as HTMLDetailsElement).open }))}
           >
             <summary>
-              <code>{path}</code>{" "}
+              {/* **적용 순번을 항상 보여준다.** 정렬의 대가는 "순서를 잃는 것"이고,
+                  이걸 보여주면 재배열돼도 원래 위치를 읽을 수 있다. */}
+              <span className="muted small applied-index">#{appliedIndex + 1}</span> <code>{path}</code>{" "}
               <span className="muted small">
                 +{stat.added} −{stat.removed}
               </span>

@@ -550,6 +550,28 @@ pre.diff {
   color: var(--muted);
 }
 
+/* 필터·정렬 도구. 목록 위에 한 줄로 붙는다 — 목록 자체보다 눈에 띄면 안 된다. */
+.diff-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.diff-filter {
+  flex: 1 1 12rem;
+  min-width: 8rem;
+}
+
+/* 적용 순번. **정렬해도 원래 자리를 읽을 수 있게** 하는 표시이므로 경로보다 앞에 온다. */
+.applied-index {
+  display: inline-block;
+  min-width: 2.2rem;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---- 이벤트 로그 ---- */
 
 .eventlog ol {
