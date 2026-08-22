@@ -44,6 +44,16 @@ import { AuditExportPanel } from "./components/AuditExportPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
 import { TaskHistory } from "./components/TaskHistory";
+import {
+  EMPTY_TASK_LIST,
+  TASK_PAGE_SIZE,
+  appendPage,
+  countLabel,
+  firstPage,
+  hasMore,
+  type TaskListState,
+  type TaskPage,
+} from "./lib/taskPaging";
 import { VerificationPanel } from "./components/VerificationPanel";
 
 /**
@@ -237,7 +247,10 @@ export default function App() {
   // 저장 시 마스킹으로는 막을 수 없다 — 막을 수 있는 것은 보내기 전의 사용자뿐이다.
   const messageSecrets: SecretShapeHit[] = useSecretShapeScan(message);
   const answerSecrets: SecretShapeHit[] = useSecretShapeScan(answer);
-  const [tasks, setTasks] = useState<TaskRow[]>([]);
+  // 목록은 커서 페이지네이션이다 — 한 번에 전부 읽지 않는다(5절). 이어 붙이는 규칙은
+  // 화면 밖 순수 함수에 있다: 중복과 전진하지 않는 커서는 화면에서 정상으로 보인다.
+  const [taskList, setTaskList] = useState<TaskListState>(EMPTY_TASK_LIST);
+  const tasks = taskList.tasks;
   const [historyBusy, setHistoryBusy] = useState(false);
   const [selectedTask, setSelectedTask] = useState<{
     task: TaskRow;
@@ -252,8 +265,11 @@ export default function App() {
 
   const refreshTasks = useCallback(async () => {
     try {
-      const result = await invoke<{ tasks: TaskRow[] }>("list_tasks", { limit: 50 });
-      setTasks(result.tasks);
+      const page = await invoke<TaskPage>("list_tasks", { limit: TASK_PAGE_SIZE });
+      // 새로고침은 **이미 읽은 페이지를 버린다.** 목록이 updated_at 내림차순이라 그 사이
+      // 갱신된 작업이 있으면 순서가 통째로 바뀌고, 옛 페이지를 남기면 어느 시점에도
+      // 존재한 적 없는 목록이 만들어진다.
+      setTaskList(firstPage(page));
       setStoreError(null);
     } catch (error) {
       // 저장 계층이 아직 안 열렸거나 열지 못한 상태. 새 작업 실행은 가능해야 하므로
@@ -261,6 +277,24 @@ export default function App() {
       setStoreError(String(error));
     }
   }, []);
+
+  const loadMoreTasks = useCallback(async () => {
+    // 커서가 없으면 마지막 페이지다. 커서를 **화면이 지어내지 않는다** — 형식은 Rust의 것이다.
+    if (!hasMore(taskList)) return;
+    setHistoryBusy(true);
+    try {
+      const page = await invoke<TaskPage>("list_tasks", {
+        limit: TASK_PAGE_SIZE,
+        cursor: taskList.cursor,
+      });
+      setTaskList((prev) => appendPage(prev, page));
+      setStoreError(null);
+    } catch (error) {
+      setStoreError(String(error));
+    } finally {
+      setHistoryBusy(false);
+    }
+  }, [taskList]);
 
   useEffect(() => {
     void invoke<ProviderStatus>("provider_status").then(setProviderStatus).catch(() => undefined);
@@ -1257,6 +1291,9 @@ export default function App() {
         onRollback={(id) => void rollbackTask(id)}
         onRestart={(id) => void restartTask(id)}
         onRefresh={() => void refreshTasks()}
+        hasMore={hasMore(taskList)}
+        countLabel={countLabel(taskList)}
+        onLoadMore={() => void loadMoreTasks()}
       />
 
       {selectedTask && (

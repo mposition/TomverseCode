@@ -281,9 +281,14 @@ fn list_tasks(
     // 상한을 두는 이유: UI가 limit를 크게 넘겨 전체 이력을 한 번에 끌어오지 못하게 한다.
     let limit = limit.unwrap_or(50).clamp(1, 200);
     let rows = state.list_tasks(workspace_path.as_deref(), limit, cursor.as_deref())?;
-    // 다음 페이지 커서는 마지막 행의 created_at — 목록이 limit을 채웠을 때만 의미가 있다.
+    // 커서는 **Store가 만든다.** 여기서 직접 조립하면 정렬 기준이 바뀔 때 화면과 질의가
+    // 조용히 갈라진다 — 실제로 갈라져 있었다(커서는 created_at인데 질의는 updated_at으로 잘랐다).
+    // 그러면 페이지 경계에서 행이 빠지거나 두 번 나오는데, 목록만 봐서는 알아챌 수 없다.
+    //
+    // 커서를 limit을 채웠을 때만 주는 이유: 덜 채운 페이지는 마지막 페이지이므로
+    // 커서를 주면 화면이 "더 보기"를 계속 띄우고, 누르면 늘 빈 결과가 돌아온다.
     let next_cursor = if rows.len() as i64 == limit {
-        rows.last().map(|r| r.created_at.clone())
+        rows.last().map(tomverse_core::store::Store::cursor_for)
     } else {
         None
     };

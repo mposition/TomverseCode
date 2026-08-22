@@ -64,6 +64,12 @@ pub enum StoreError {
     /// 완료와 취소가 경쟁할 때 **먼저 확정된 쪽만 남아야** 하고, 진 쪽은 그 사실을 알아야 한다.
     #[error("이미 터미널 상태입니다: {status}")]
     TerminalAlreadySet { status: String },
+    /// 형식이 틀린 목록 커서.
+    ///
+    /// 오류로 만든 이유: "처음부터"로 되읽으면 "더 보기"가 **첫 페이지를 다시 붙인다.**
+    /// 사용자에게 그건 오류가 아니라 "작업이 늘어났다"로 읽히고, 목록은 조용히 거짓말을 한다.
+    #[error("커서 형식이 올바르지 않습니다: {0}")]
+    InvalidCursor(String),
 }
 
 /// 터미널 상태로 확정하려는 시도의 결과.
@@ -944,8 +950,31 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// 목록 페이지 하나 (ui-wireframes.md 3.8절).
+    ///
+    /// # 커서는 `(updated_at, task_id)` 쌍이다
+    ///
+    /// `updated_at` 하나로 자르면 **같은 시각의 행이 통째로 사라진다.** 마지막 행의 시각으로
+    /// `< cursor`를 하면 그 시각을 공유하는 다른 행도 함께 잘리기 때문이다. 목록에서 사라진
+    /// 작업은 사용자에게 "없는 작업"이고, 그건 목록의 목적을 정면으로 어긴다.
+    ///
+    /// 그래서 정렬과 비교를 둘 다 `(updated_at, task_id)`로 한다 — `task_id`가 유일하므로
+    /// 쌍은 전순서가 되고, 어떤 행도 건너뛰거나 두 번 나오지 않는다.
+    ///
+    /// **커서 형식은 호출자에게 불투명하다.** 화면이 커서를 만들면 정렬 기준이 바뀔 때
+    /// 화면과 질의가 조용히 갈라진다 — 실제로 그렇게 갈라져 있었다(커서는 `created_at`인데
+    /// 질의는 `updated_at`으로 잘랐다).
     pub fn list_tasks(&self, workspace_path: Option<&str>, limit: i64, cursor: Option<&str>) -> Result<Vec<TaskRow>> {
         let limit = limit.clamp(1, 200);
+        let (cursor_updated, cursor_id) = match cursor {
+            Some(raw) => match raw.split_once('|') {
+                Some((updated, id)) => (Some(updated.to_string()), Some(id.to_string())),
+                // 형식이 틀린 커서를 "처음부터"로 읽지 않는다 — 그러면 "더 보기"가 첫 페이지를
+                // 다시 붙여 목록이 반복되고, 사용자는 그걸 데이터가 늘어난 것으로 읽는다.
+                None => return Err(StoreError::InvalidCursor(raw.to_string())),
+            },
+            None => (None, None),
+        };
         let mut stmt = self.conn.prepare(
             "SELECT t.task_id, t.session_id, t.workspace_id, t.workspace_path, t.mode, t.user_message,
                     t.phase, t.final_status, t.error_summary, t.cancellation_requested_at,
@@ -953,12 +982,17 @@ impl Store {
                     t.created_at, t.updated_at
              FROM tasks t
              WHERE (?1 IS NULL OR t.workspace_path = ?1)
-               AND (?2 IS NULL OR t.updated_at < ?2)
-             ORDER BY t.updated_at DESC
-             LIMIT ?3",
+               AND (?2 IS NULL OR (t.updated_at, t.task_id) < (?2, ?3))
+             ORDER BY t.updated_at DESC, t.task_id DESC
+             LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![workspace_path, cursor, limit], map_task_row)?;
+        let rows = stmt.query_map(params![workspace_path, cursor_updated, cursor_id, limit], map_task_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 이 행 다음 페이지를 가리키는 커서. **질의가 정렬에 쓰는 것과 같은 필드로 만든다.**
+    pub fn cursor_for(row: &TaskRow) -> String {
+        format!("{}|{}", row.updated_at, row.task_id)
     }
 
     pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>> {
@@ -2577,5 +2611,122 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(store.provider_usage_count("task-1").unwrap(), 1);
+    }
+
+    // ---- 목록 페이지네이션 ----
+
+    /// 시각을 직접 지정해 태스크를 만든다. `created_at`과 `updated_at`을 **따로** 받는 이유는
+    /// 둘이 갈라진 상태를 재현해야 하기 때문이다 — 실제 결함이 거기 있었다.
+    fn seed_task(store: &mut Store, task_id: &str, created_at: &str, updated_at: &str) {
+        store
+            .create_task(task_id, "sess-1", "ws-1", "/tmp/ws", "verified", "msg")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET created_at = ?2, updated_at = ?3 WHERE task_id = ?1",
+                params![task_id, created_at, updated_at],
+            )
+            .unwrap();
+    }
+
+    /// 커서만으로 끝까지 넘긴 결과를 모은다 — 화면의 "더 보기"가 하는 일 그대로.
+    fn page_through(store: &Store, limit: i64) -> Vec<String> {
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        // 상한을 두는 이유: 커서가 전진하지 않으면 테스트가 영원히 돈다.
+        for _ in 0..50 {
+            let rows = store.list_tasks(Some("/tmp/ws"), limit, cursor.as_deref()).unwrap();
+            if rows.is_empty() {
+                return seen;
+            }
+            let full = rows.len() as i64 == limit;
+            let last = Store::cursor_for(rows.last().unwrap());
+            seen.extend(rows.into_iter().map(|r| r.task_id));
+            if !full {
+                return seen;
+            }
+            cursor = Some(last);
+        }
+        panic!("커서가 전진하지 않아 페이지가 끝나지 않았습니다");
+    }
+
+    /// `updated_at`이 같은 행이 여럿일 때 **어느 것도 사라지지 않아야** 한다.
+    ///
+    /// 시각 하나로만 자르면 마지막 행과 시각을 공유하는 행이 통째로 잘린다. 사용자에게
+    /// 목록에서 사라진 작업은 없는 작업이므로, 이건 표시 문제가 아니라 데이터 손실로 읽힌다.
+    #[test]
+    fn list_tasks_paging_keeps_rows_that_share_updated_at() {
+        let (_d, mut store) = seeded();
+        // seeded()가 만든 task-1까지 포함해 7건이 **전부 같은 시각**을 갖게 한다.
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET created_at = '2030-01-01T00:00:00Z', updated_at = '2030-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        for i in 2..=7 {
+            seed_task(
+                &mut store,
+                &format!("task-{i}"),
+                "2030-01-01T00:00:00Z",
+                "2030-01-01T00:00:00Z",
+            );
+        }
+
+        let seen = page_through(&store, 2);
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "같은 행이 두 페이지에 나왔습니다: {seen:?}");
+        assert_eq!(sorted.len(), 7, "페이지 경계에서 행이 사라졌습니다: {seen:?}");
+    }
+
+    /// `created_at`과 `updated_at`이 갈라져도 페이지가 어긋나지 않아야 한다.
+    ///
+    /// 이 테스트가 잡는 실제 결함: 커서를 `created_at`으로 만들면서 질의는 `updated_at`으로
+    /// 잘랐다. 두 값이 같은 동안에는 통과하므로 **일부러 반대 순서로** 만들어야만 드러난다.
+    #[test]
+    fn list_tasks_cursor_uses_the_same_field_the_query_orders_by() {
+        let (_d, mut store) = seeded();
+        // seeded()가 만든 task-1은 양쪽 기준 모두에서 가장 오래된 것으로 밀어둔다.
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET created_at = '2029-01-01T00:00:00Z', updated_at = '2030-01-01T00:00:00Z'
+                 WHERE task_id = 'task-1'",
+                [],
+            )
+            .unwrap();
+        // created_at 오름차순과 updated_at 내림차순이 정확히 반대가 되도록 만든다.
+        for i in 0..6 {
+            seed_task(
+                &mut store,
+                &format!("p-{i}"),
+                &format!("2030-01-0{}T00:00:00Z", i + 1),
+                &format!("2030-02-0{}T00:00:00Z", 6 - i),
+            );
+        }
+
+        let seen = page_through(&store, 2);
+        assert_eq!(
+            seen,
+            vec!["p-0", "p-1", "p-2", "p-3", "p-4", "p-5", "task-1"],
+            "페이지를 이어 붙인 순서가 updated_at 내림차순과 다릅니다"
+        );
+    }
+
+    /// 형식이 틀린 커서는 **오류**다. 처음부터 되읽으면 "더 보기"가 첫 페이지를 다시 붙이고,
+    /// 사용자는 그걸 작업이 늘어난 것으로 읽는다 — 조용한 거짓말이 오류보다 나쁘다.
+    #[test]
+    fn list_tasks_rejects_malformed_cursor() {
+        let (_d, store) = seeded();
+        let err = store.list_tasks(None, 10, Some("2030-01-01T00:00:00Z")).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidCursor(_)), "예상과 다른 오류: {err:?}");
+        // 정상 커서는 그대로 동작한다 — 위 거부가 모든 커서를 막는 것이 아님을 확인한다.
+        let rows = store.list_tasks(None, 10, None).unwrap();
+        let cursor = Store::cursor_for(rows.last().unwrap());
+        assert!(store.list_tasks(None, 10, Some(&cursor)).is_ok());
     }
 }

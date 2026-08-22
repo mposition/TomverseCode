@@ -19,6 +19,9 @@ export function TaskHistory({
   onRollback,
   onRestart,
   onRefresh,
+  hasMore,
+  countLabel,
+  onLoadMore,
 }: {
   tasks: TaskRow[];
   selectedId: string | null;
@@ -27,13 +30,18 @@ export function TaskHistory({
   onRollback: (taskId: string) => void;
   onRestart: (taskId: string) => void;
   onRefresh: () => void;
+  /** 더 읽을 페이지가 남았는지. 남지 않았으면 "더 보기"를 아예 그리지 않는다. */
+  hasMore: boolean;
+  /** 건수 표기 — 더 남았으면 "이상"이 붙는다. 전체 건수는 **세지 않으므로 모른다**. */
+  countLabel: string;
+  onLoadMore: () => void;
 }) {
   const interrupted = tasks.filter((t) => t.terminalStatus === "INTERRUPTED");
 
   return (
     <section className="panel history">
       <h2>
-        최근 작업 <span className="muted small">({tasks.length}건)</span>
+        최근 작업 <span className="muted small">({countLabel})</span>
         <button className="secondary tiny" onClick={onRefresh} disabled={busy}>
           새로고침
         </button>
@@ -83,6 +91,17 @@ export function TaskHistory({
           })}
         </ul>
       )}
+      {/* "더 보기"는 남은 페이지가 있을 때만 그린다 — 눌러도 아무 일이 없는 버튼을 두면
+          사용자는 목록이 고장 났다고 읽는다. 마지막 페이지에서는 대신 끝임을 적는다. */}
+      {tasks.length > 0 &&
+        (hasMore ? (
+          <button className="secondary" onClick={onLoadMore} disabled={busy}>
+            더 보기
+          </button>
+        ) : (
+          <p className="muted small">모두 불러왔습니다.</p>
+        ))}
+
       <p className="muted small">
         "다시 실행"은 <strong>같은 요청 문구로 처음부터</strong> 새 작업을 만듭니다. 중단된 지점부터 이어서 하지
         않습니다 — 부분 실행된 도구를 다시 실행하는 것은 안전하지 않기 때문입니다.
