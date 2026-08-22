@@ -15,8 +15,8 @@ use tauri::{AppHandle, Emitter};
 use tomverse_core::artifacts::ArtifactStore;
 use tomverse_core::host::{ApprovalGateway, ApprovalOutcome, EventSink, TaskHost};
 use tomverse_core::sidecar::{RespawnOutcome, SidecarClient, SidecarSupervisor, MAX_SIDECAR_RESPAWNS};
-use tomverse_core::store::Store;
-use tomverse_core::store::TaskRow;
+use tomverse_core::store::{Store, StoreIssue, StoreOp, TaskRow};
+use tomverse_core::uimsg::{UiMessage, UserFacing};
 use tomverse_core::types::{ApprovalRequest, ExecutionMode, TaskPolicy};
 use tomverse_core::{
     available_providers, available_providers_for, credential_env_for, providers_blocked_by_policy,
@@ -123,16 +123,18 @@ impl SessionState {
     ///
     /// 자동 재실행하지 않는다(state-machine-and-protocol.md 7절): 부분 실행된 도구의 재개는
     /// 멱등성 보장이 없으면 위험하다. 사용자에게 되돌리기/재실행 선택을 준다.
-    pub fn initialize(&self) -> Result<Value, String> {
+    /// 실패는 **봉투**로 돌려준다 — 문장이 아니라 코드와 파라미터다(ui-wireframes.md 6절).
+    /// 화면이 그 코드로 문장을 만들 수 있어야 카탈로그 밖에 남는 문장이 생기지 않는다.
+    pub fn initialize(&self) -> Result<Value, UiMessage> {
         let state_dir = app_state_dir();
         let artifacts = ArtifactStore::new(state_dir.join("artifacts"))
-            .map_err(|e| format!("artifact 저장소를 만들 수 없습니다: {e}"))?;
+            .map_err(|e| StoreIssue::new(StoreOp::OpenArtifacts, e).ui())?;
         let mut store = Store::open(state_dir.join("state.db"), artifacts.clone())
-            .map_err(|e| format!("로컬 DB를 열 수 없습니다: {e}"))?;
+            .map_err(|e| StoreIssue::new(StoreOp::OpenDatabase, e).ui())?;
 
         let interrupted = store
             .mark_unfinished_as_interrupted()
-            .map_err(|e| format!("중단된 작업을 정리할 수 없습니다: {e}"))?;
+            .map_err(|e| StoreIssue::new(StoreOp::RecoverInterrupted, e).ui())?;
 
         *self.store.lock().unwrap() = Some(Arc::new(Mutex::new(store)));
         *self.artifacts.lock().unwrap() = Some(artifacts);
@@ -172,9 +174,12 @@ impl SessionState {
         workspace_path: Option<&str>,
         limit: i64,
         cursor: Option<&str>,
-    ) -> Result<Vec<TaskRow>, String> {
-        self.with_store(|s| s.list_tasks(workspace_path, limit, cursor))?
-            .map_err(|e| format!("작업 목록을 읽을 수 없습니다: {e}"))
+    ) -> Result<Vec<TaskRow>, UiMessage> {
+        // 저장 계층이 아직 안 열린 것도 "목록을 읽지 못했다"이다 — 화면이 보는 결과는 같고,
+        // 원인은 `detail`에 남는다.
+        self.with_store(|s| s.list_tasks(workspace_path, limit, cursor))
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTasks, e).ui())?
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTasks, e).ui())
     }
 
     /// 화면이 쓰는 문턱들. **저장된 이벤트에서 유도한다** — 추정값이던 상수들의 자리다

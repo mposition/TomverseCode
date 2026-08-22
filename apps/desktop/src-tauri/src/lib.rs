@@ -289,7 +289,19 @@ fn list_tasks(
 ) -> Result<Value, String> {
     // 상한을 두는 이유: UI가 limit를 크게 넘겨 전체 이력을 한 번에 끌어오지 못하게 한다.
     let limit = limit.unwrap_or(50).clamp(1, 200);
-    let rows = state.list_tasks(workspace_path.as_deref(), limit, cursor.as_deref())?;
+    // 실패를 `Err`가 아니라 봉투로 돌려준다. Tauri의 `Err`는 문자열 하나뿐이라 구조가 들어갈
+    // 자리가 없고, 문자열에 구조를 실으면 화면이 문장을 파싱하게 된다(ui-wireframes.md 6.4절).
+    let rows = match state.list_tasks(workspace_path.as_deref(), limit, cursor.as_deref()) {
+        Ok(rows) => rows,
+        Err(ui) => {
+            return Ok(json!({
+                "ok": false,
+                "code": ui.code,
+                "params": ui.params,
+                "message": ui.message,
+            }))
+        }
+    };
     // 커서는 **Store가 만든다.** 여기서 직접 조립하면 정렬 기준이 바뀔 때 화면과 질의가
     // 조용히 갈라진다 — 실제로 갈라져 있었다(커서는 created_at인데 질의는 updated_at으로 잘랐다).
     // 그러면 페이지 경계에서 행이 빠지거나 두 번 나오는데, 목록만 봐서는 알아챌 수 없다.
@@ -301,7 +313,7 @@ fn list_tasks(
     } else {
         None
     };
-    Ok(json!({ "tasks": rows, "nextCursor": next_cursor }))
+    Ok(json!({ "ok": true, "tasks": rows, "nextCursor": next_cursor }))
 }
 
 #[tauri::command]
@@ -349,9 +361,16 @@ pub fn run() {
             // 실패해도 앱을 죽이지 않는다: 이력을 못 봐도 새 작업은 할 수 있어야 한다.
             // 대신 UI에 알려서 조용한 데이터 손실로 보이지 않게 한다.
             let state = app.state::<SessionState>();
+            // 실패는 **봉투**로 나간다 — 화면이 코드로 문장을 만든다(ui-wireframes.md 6절).
+            // `error`는 그 봉투의 원문이며 화면이 코드를 모를 때의 대체 표시다.
             let payload = match state.initialize() {
                 Ok(info) => json!({ "ok": true, "recovery": info }),
-                Err(message) => json!({ "ok": false, "error": message }),
+                Err(ui) => json!({
+                    "ok": false,
+                    "code": ui.code,
+                    "params": ui.params,
+                    "error": ui.message,
+                }),
             };
             let _ = app.emit("store-ready", payload);
             Ok(())

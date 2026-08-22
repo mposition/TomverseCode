@@ -46,6 +46,7 @@ import { StageBar } from "./components/StageBar";
 import { TaskHistory } from "./components/TaskHistory";
 import { bannerFor, reopenTarget, type BackendStatus } from "./lib/backendStatus";
 import { render, type UiMessage } from "./lib/messages";
+
 import {
   EMPTY_TASK_LIST,
   TASK_PAGE_SIZE,
@@ -57,6 +58,18 @@ import {
   type TaskPage,
 } from "./lib/taskPaging";
 import { VerificationPanel } from "./components/VerificationPanel";
+
+/**
+ * `list_tasks`의 응답. 실패도 **봉투**로 온다 — Tauri의 `Err`는 문자열 하나뿐이라 구조가
+ * 들어갈 자리가 없고, 문자열에 구조를 실으면 화면이 문장을 파싱하게 된다(6.4절).
+ */
+type TaskPageResponse = ({ ok: true } & TaskPage) | ({ ok: false } & UiMessage);
+
+/** 봉투를 벗긴다. 실패면 **카탈로그가 만든 문장**으로 던진다 — 원문을 그대로 쓰지 않는다. */
+function unwrapPage(response: TaskPageResponse): TaskPage {
+  if (response.ok) return response;
+  throw new Error(render(response)?.text ?? response.message);
+}
 
 /**
  * M0 최소 UI — docs/design/ui-wireframes.md.
@@ -278,7 +291,7 @@ export default function App() {
 
   const refreshTasks = useCallback(async () => {
     try {
-      const page = await invoke<TaskPage>("list_tasks", { limit: TASK_PAGE_SIZE });
+      const page = unwrapPage(await invoke<TaskPageResponse>("list_tasks", { limit: TASK_PAGE_SIZE }));
       // 새로고침은 **이미 읽은 페이지를 버린다.** 목록이 updated_at 내림차순이라 그 사이
       // 갱신된 작업이 있으면 순서가 통째로 바뀌고, 옛 페이지를 남기면 어느 시점에도
       // 존재한 적 없는 목록이 만들어진다.
@@ -296,10 +309,12 @@ export default function App() {
     if (!hasMore(taskList)) return;
     setHistoryBusy(true);
     try {
-      const page = await invoke<TaskPage>("list_tasks", {
-        limit: TASK_PAGE_SIZE,
-        cursor: taskList.cursor,
-      });
+      const page = unwrapPage(
+        await invoke<TaskPageResponse>("list_tasks", {
+          limit: TASK_PAGE_SIZE,
+          cursor: taskList.cursor,
+        })
+      );
       setTaskList((prev) => appendPage(prev, page));
       setStoreError(null);
     } catch (error) {
@@ -318,22 +333,29 @@ export default function App() {
   // 앱 시작 시 저장 계층이 열리고 **중단된 작업이 INTERRUPTED로 확정되는** 시점.
   // 그 직후에 목록을 다시 읽어야 중단된 작업이 "진행 중"으로 남아 보이지 않는다.
   useEffect(() => {
-    const unlisten = listen<{ ok: boolean; error?: string; recovery?: { interruptedTasks?: string[] } }>(
-      "store-ready",
-      (event) => {
-        if (!event.payload.ok) {
-          setStoreError(event.payload.error ?? "저장 계층을 열 수 없습니다");
-          return;
-        }
-        const interrupted = event.payload.recovery?.interruptedTasks ?? [];
-        if (interrupted.length > 0) {
-          setNotice(
-            `이전 실행에서 완료되지 않은 작업 ${interrupted.length}건을 '중단됨'으로 표시했습니다. 자동으로 다시 실행하지 않습니다.`
-          );
-        }
-        void refreshTasks();
+    const unlisten = listen<{
+      ok: boolean;
+      code?: string;
+      params?: Record<string, unknown>;
+      error?: string;
+      recovery?: { interruptedTasks?: string[] };
+    }>("store-ready", (event) => {
+      if (!event.payload.ok) {
+        // 코드가 있으면 **카탈로그가 문장을 만든다.** 없으면(옛 페이로드) 원문으로 떨어진다.
+        const rendered = event.payload.code
+          ? render({ code: event.payload.code, params: event.payload.params, message: event.payload.error ?? "" })
+          : null;
+        setStoreError(rendered?.text ?? event.payload.error ?? "저장 계층을 열 수 없습니다");
+        return;
       }
-    );
+      const interrupted = event.payload.recovery?.interruptedTasks ?? [];
+      if (interrupted.length > 0) {
+        setNotice(
+          `이전 실행에서 완료되지 않은 작업 ${interrupted.length}건을 '중단됨'으로 표시했습니다. 자동으로 다시 실행하지 않습니다.`
+        );
+      }
+      void refreshTasks();
+    });
     return () => {
       void unlisten.then((fn) => fn());
     };

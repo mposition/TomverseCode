@@ -72,6 +72,80 @@ pub enum StoreError {
     InvalidCursor(String),
 }
 
+/// 저장 계층 실패 중 **화면에 그대로 뜨는 것**.
+///
+/// # 왜 `StoreError`와 따로 있나
+///
+/// `StoreError`는 **무엇이 잘못됐는가**(sqlite 오류, io 오류)이고, 이건 **사용자가 무엇을
+/// 하려다 실패했는가**다. 화면이 알아야 하는 것은 후자다 — "sqlite: database is locked"만
+/// 보여주면 사용자는 할 수 있는 일이 없고, "작업 목록을 읽을 수 없습니다"만 보여주면 원인이
+/// 사라진다. 둘을 코드와 파라미터로 나눠 담는다.
+///
+/// # 왜 core에 있나
+///
+/// 종전에는 이 문장들이 Tauri 껍데기 크레이트에 `format!`으로 흩어져 있었다. 그 크레이트는
+/// 개발 환경에서 **컴파일되지 않으므로** 거기 있는 문장은 검증되지 않고, 무엇보다 화면으로
+/// 나가는 문장이므로 카탈로그 밖에 남으면 안 된다(ui-wireframes.md 6절).
+///
+/// # 여기 있는 것이 전부가 아니다
+///
+/// **전환한 것만 코드를 갖는다.** 나머지 저장 계층 실패는 아직 껍데기에서 문장으로 나가고,
+/// 그것들에 코드를 미리 만들어 두지 않는다 — 카탈로그에 있지만 실제로는 코드가 도착하지 않는
+/// 항목이 생기면, "카탈로그가 코드를 안다"는 검사가 **번역됐다는 뜻이 아니게** 된다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreOp {
+    /// artifact 저장소를 만들 수 없었다.
+    OpenArtifacts,
+    /// 로컬 DB를 열 수 없었다.
+    OpenDatabase,
+    /// 비정상 종료된 작업을 INTERRUPTED로 확정하지 못했다.
+    RecoverInterrupted,
+    /// 작업 목록을 읽지 못했다.
+    ReadTasks,
+}
+
+/// 어떤 조작이 어떤 이유로 실패했는가.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreIssue {
+    pub op: StoreOp,
+    /// 원인. **문장에 이어 붙이는 대신 파라미터로 간다.**
+    pub detail: String,
+}
+
+impl StoreIssue {
+    pub fn new(op: StoreOp, detail: impl std::fmt::Display) -> Self {
+        Self {
+            op,
+            detail: detail.to_string(),
+        }
+    }
+}
+
+impl crate::uimsg::UserFacing for StoreIssue {
+    fn code(&self) -> &'static str {
+        match self.op {
+            StoreOp::OpenArtifacts => "storeOpenArtifacts",
+            StoreOp::OpenDatabase => "storeOpenDatabase",
+            StoreOp::RecoverInterrupted => "storeRecoverInterrupted",
+            StoreOp::ReadTasks => "storeReadTasks",
+        }
+    }
+
+    fn params(&self) -> serde_json::Value {
+        serde_json::json!({ "detail": self.detail })
+    }
+
+    fn korean(&self) -> String {
+        let what = match self.op {
+            StoreOp::OpenArtifacts => "artifact 저장소를 만들 수 없습니다",
+            StoreOp::OpenDatabase => "로컬 DB를 열 수 없습니다",
+            StoreOp::RecoverInterrupted => "중단된 작업을 정리할 수 없습니다",
+            StoreOp::ReadTasks => "작업 목록을 읽을 수 없습니다",
+        };
+        format!("{what}: {}", self.detail)
+    }
+}
+
 /// 터미널 상태로 확정하려는 시도의 결과.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalOutcome {
@@ -2941,5 +3015,51 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name, "ws");
+    }
+
+    // ---- 화면에 뜨는 저장 계층 실패 ----
+
+    /// **코드가 서로 달라야** 화면이 문장을 고를 수 있고, **원인은 파라미터로** 가야
+    /// 어순이 다른 언어에서도 자리를 옮길 수 있다.
+    #[test]
+    fn every_store_op_has_its_own_code_and_carries_the_cause_as_a_parameter() {
+        use crate::uimsg::UserFacing;
+        let ops = [
+            StoreOp::OpenArtifacts,
+            StoreOp::OpenDatabase,
+            StoreOp::RecoverInterrupted,
+            StoreOp::ReadTasks,
+        ];
+        let issues: Vec<StoreIssue> = ops
+            .iter()
+            .map(|op| StoreIssue::new(op.clone(), "database is locked"))
+            .collect();
+
+        let codes: std::collections::BTreeSet<&str> = issues.iter().map(|i| i.code()).collect();
+        assert_eq!(codes.len(), ops.len(), "코드가 겹칩니다: {codes:?}");
+
+        for issue in &issues {
+            assert_eq!(issue.params()["detail"], serde_json::json!("database is locked"));
+            // 원문에도 원인이 들어 있다 — 대체 표시용이지 화면이 파싱할 것이 아니다.
+            assert!(issue.korean().contains("database is locked"), "{}", issue.korean());
+            // 그리고 **무엇을 하려다 실패했는지**가 원문에 있어야 한다. 원인만 보여주면
+            // 사용자는 할 수 있는 일이 없다.
+            assert!(
+                issue.korean().len() > "database is locked".len() + 2,
+                "{}",
+                issue.korean()
+            );
+        }
+    }
+
+    /// `StoreError`에서 바로 만들 수 있어야 한다 — 호출부가 문자열을 조립하기 시작하면
+    /// 문장이 다시 껍데기로 새어 나간다.
+    #[test]
+    fn an_issue_can_be_built_from_a_store_error() {
+        use crate::uimsg::UserFacing;
+        let error = StoreError::Invariant("깨진 불변식".to_string());
+        let issue = StoreIssue::new(StoreOp::ReadTasks, error);
+        assert_eq!(issue.params()["detail"], serde_json::json!("깨진 불변식"));
+        assert_eq!(issue.code(), "storeReadTasks");
     }
 }

@@ -43,6 +43,13 @@ const KO: Record<string, Render> = {
   approvalWrongWorkspace: (p) =>
     `다른 워크스페이스(${p.belongsTo})의 승인 요청입니다. 그 사이 워크스페이스가 바뀌었으므로 처리하지 않았습니다.`,
   approvalGone: () => "승인 응답을 전달할 수 없습니다 (요청이 이미 종료되었습니다).",
+
+  // 저장 계층 — **원인은 `detail`로 온다.** 원인만 보여주면 사용자는 할 수 있는 일이 없고,
+  // 무엇을 하려다 실패했는지만 보여주면 원인이 사라진다.
+  storeOpenArtifacts: (p) => `artifact 저장소를 만들 수 없습니다: ${p.detail}`,
+  storeOpenDatabase: (p) => `로컬 DB를 열 수 없습니다: ${p.detail}`,
+  storeRecoverInterrupted: (p) => `중단된 작업을 정리할 수 없습니다: ${p.detail}`,
+  storeReadTasks: (p) => `작업 목록을 읽을 수 없습니다: ${p.detail}`,
 };
 
 export interface Rendered {
