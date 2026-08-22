@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tomverse_core::artifacts::ArtifactStore;
 use tomverse_core::host::{ApprovalGateway, ApprovalOutcome, EventSink, TaskHost};
-use tomverse_core::sidecar::{SidecarClient, SpawnConfig};
+use tomverse_core::sidecar::{RespawnOutcome, SidecarClient, SidecarSupervisor, SpawnConfig, MAX_SIDECAR_RESPAWNS};
 use tomverse_core::store::Store;
 use tomverse_core::store::TaskRow;
 use tomverse_core::types::{ApprovalRequest, ExecutionMode, TaskPolicy};
@@ -97,7 +97,10 @@ pub struct ActiveWorkspace {
     /// **sidecar를 spawn할 때 이 목록으로 자격증명을 걸렀다.** 즉 이 값은 표시용 사본이고,
     /// 실제 강제는 이미 일어났다 — 바꾸려면 sidecar를 다시 띄워야 한다.
     pub allowed_providers: Option<Vec<String>>,
-    sidecar: Arc<SidecarClient>,
+    /// **클라이언트가 아니라 감독자를 들고 있다** (process-architecture.md 5절).
+    /// Node가 죽으면 다음 태스크 전에 다시 띄운다 — 종전에는 한 번 닫히면 워크스페이스를
+    /// 다시 열기 전까지 모든 요청이 실패했고, 사용자에게는 앱이 죽은 것처럼 보였다.
+    sidecar: Arc<SidecarSupervisor>,
 }
 
 #[derive(Default)]
@@ -223,13 +226,39 @@ impl SessionState {
         }))
     }
 
+    /// sidecar가 죽어 있으면 **다음 태스크 전에** 다시 띄운다 (process-architecture.md 5절).
+    ///
+    /// 재spawn이 진행 중이던 태스크를 살리지는 못한다 — 그 상태는 죽은 프로세스에 있었다.
+    /// 여기서 하는 일은 **다음 태스크가 가능해지는 것**뿐이며, 그것도 상한 안에서다.
+    fn ensure_sidecar_alive(&self) -> Result<(), String> {
+        let supervisor = self.with_active(|active| Ok(active.sidecar.clone()))?;
+        match supervisor.ensure_alive() {
+            RespawnOutcome::Alive => Ok(()),
+            RespawnOutcome::Respawned { attempt } => {
+                eprintln!("[session] 백엔드가 종료되어 다시 시작했습니다 ({attempt}/{MAX_SIDECAR_RESPAWNS})");
+                Ok(())
+            }
+            // **사유를 문장으로 돌려준다.** "백엔드가 없습니다"만 말하면 사용자는 무엇을
+            // 해야 하는지 모른다 — 다시 열어야 하는지, 버그를 신고해야 하는지가 다르다.
+            RespawnOutcome::LimitReached { attempts } => Err(format!(
+                "백엔드가 {attempts}번 다시 시작한 뒤에도 계속 종료됩니다. 워크스페이스를 다시 열어 주세요."
+            )),
+            RespawnOutcome::ProtocolViolation { reason } => Err(format!(
+                "백엔드와의 통신이 프로토콜 위반으로 끊겼습니다. 다시 시작하지 않습니다 — 같은 위반이 반복될 뿐입니다. ({reason})"
+            )),
+            RespawnOutcome::SpawnFailed { attempt, error } => Err(format!(
+                "백엔드를 다시 시작할 수 없습니다 ({attempt}/{MAX_SIDECAR_RESPAWNS}): {error}"
+            )),
+        }
+    }
+
     /// 자격증명 확인 (multi-engine-routing.md 17절).
     ///
     /// **유료 호출을 하지 않는다** — sidecar가 무료 모델 조회 엔드포인트만 쓴다.
     /// 그래서 이 버튼은 예산 상한과 무관하고, 누른다고 돈이 나가지 않는다.
     pub fn probe_providers(&self, timeout: Duration) -> Result<Value, String> {
         let (sidecar, allowed) =
-            self.with_active(|active| Ok((active.sidecar.clone(), active.allowed_providers.clone())))?;
+            self.with_active(|active| Ok((active.sidecar.client(), active.allowed_providers.clone())))?;
         sidecar.request(
             "providers.probe",
             json!({ "availableProviders": available_providers_for(allowed.as_deref()) }),
@@ -243,7 +272,7 @@ impl SessionState {
     /// 목록이 갈라져 "화면에서는 고를 수 있는데 시작하면 거부되는" 모델이 생긴다.
     pub fn list_models(&self, timeout: Duration) -> Result<Value, String> {
         let (sidecar, allowed) =
-            self.with_active(|active| Ok((active.sidecar.clone(), active.allowed_providers.clone())))?;
+            self.with_active(|active| Ok((active.sidecar.client(), active.allowed_providers.clone())))?;
         sidecar.request(
             "models.list",
             // **허용 목록을 여기서도 적용한다.** 목록에 없는 공급자의 모델을 고를 수 있게
@@ -347,18 +376,26 @@ impl SessionState {
 
         // sidecar spawn: 여기서 API 키가 자식 환경으로 1회 주입된다.
         // 값은 UI로도 로그로도 나가지 않는다.
-        let sidecar = SidecarClient::spawn(
-            SpawnConfig {
-                program: "node".to_string(),
-                args: vec![sidecar_entry().to_string_lossy().to_string()],
-                working_dir: None,
-                // **여기가 게이트다.** 허용되지 않은 공급자의 키를 주입하지 않으면 Node는
-                // 그 공급자를 호출할 수단 자체가 없다 — 검사를 지워도 키가 없다.
-                env: credential_env_for(allowed_providers.as_deref()),
-            },
-            host.clone(),
-        )
+        // 재spawn이 **같은 설정으로** 일어나야 하므로 spawn 방법을 클로저로 넘긴다.
+        // 자격증명은 이 클로저 안에서 매번 다시 읽는다 — 감독자가 키 사본을 들고 있지 않다.
+        let allowed_for_spawn = allowed_providers.clone();
+        let host_for_spawn = host.clone();
+        let supervisor = SidecarSupervisor::new(Box::new(move || {
+            SidecarClient::spawn(
+                SpawnConfig {
+                    program: "node".to_string(),
+                    args: vec![sidecar_entry().to_string_lossy().to_string()],
+                    working_dir: None,
+                    // **여기가 게이트다.** 허용되지 않은 공급자의 키를 주입하지 않으면 Node는
+                    // 그 공급자를 호출할 수단 자체가 없다 — 검사를 지워도 키가 없다.
+                    env: credential_env_for(allowed_for_spawn.as_deref()),
+                },
+                host_for_spawn.clone(),
+            )
+        }))
         .map_err(|e| format!("백엔드(sidecar)를 시작할 수 없습니다: {e}"))?;
+        let supervisor = Arc::new(supervisor);
+        let sidecar = supervisor.client();
 
         let ready = sidecar.wait_ready(Duration::from_secs(10))?;
         let sidecar_version = ready.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
@@ -379,7 +416,7 @@ impl SessionState {
 
         let mut guard = self.inner.lock().unwrap();
         if let Some(previous) = guard.take() {
-            previous.sidecar.shutdown(Duration::from_secs(3));
+            previous.sidecar.client().shutdown(Duration::from_secs(3));
         }
         *guard = Some(ActiveWorkspace {
             root_display: root.display(),
@@ -388,7 +425,7 @@ impl SessionState {
             workspace_id,
             session_id,
             allowed_providers,
-            sidecar,
+            sidecar: supervisor,
         });
         Ok(info)
     }
@@ -436,9 +473,13 @@ impl SessionState {
         model_pins: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
+        // **태스크를 시작하기 전에** 살아 있는지 확인한다(5절). 도중에 바꿔치기하면 진행 중인
+        // 요청이 어느 프로세스의 것인지 알 수 없게 되므로, 재spawn 지점은 여기 한 곳이다.
+        self.ensure_sidecar_alive()?;
+
         let (sidecar, host, workspace_id, session_id, allowed_providers) = self.with_active(|active| {
             Ok((
-                active.sidecar.clone(),
+                active.sidecar.client(),
                 active.host.clone(),
                 active.workspace_id.clone(),
                 active.session_id.clone(),
@@ -562,7 +603,10 @@ impl SessionState {
             return Err("먼저 워크스페이스를 선택하세요.".to_string());
         };
         let host = active.host.clone();
-        let sidecar = active.sidecar.clone();
+        // **취소는 재spawn하지 않는다.** 취소가 향하는 곳은 그 태스크를 돌리고 있는
+        // 프로세스이고, 그게 죽었다면 태스크도 함께 죽었다 — 새로 띄운 프로세스에
+        // 취소를 보내는 것은 아무 의미가 없다.
+        let sidecar = active.sidecar.client();
         drop(guard);
 
         // 순서: Rust 먼저. 토큰이 켜져야 진행 중인 프로세스가 죽고 새 도구가 시작되지 않는다.
@@ -599,6 +643,7 @@ impl SessionState {
             }
             active
                 .sidecar
+                .client()
                 .request("task.userInput", params, Duration::from_secs(10))
                 .map_err(|e| e)
         })
@@ -614,7 +659,10 @@ impl SessionState {
             return Err("먼저 워크스페이스를 선택하세요.".to_string());
         };
         let host = active.host.clone();
-        let sidecar = active.sidecar.clone();
+        // **취소는 재spawn하지 않는다.** 취소가 향하는 곳은 그 태스크를 돌리고 있는
+        // 프로세스이고, 그게 죽었다면 태스크도 함께 죽었다 — 새로 띄운 프로세스에
+        // 취소를 보내는 것은 아무 의미가 없다.
+        let sidecar = active.sidecar.client();
         drop(guard);
 
         // 취소 토큰을 확실히 켠다. 이미 켜져 있으면 idempotent다.

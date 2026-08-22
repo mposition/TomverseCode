@@ -36,7 +36,7 @@ pub use cancel::{CancelOutcome, CancellationRegistry, CancellationToken};
 pub use host::{ApprovalGateway, ApprovalOutcome, AutoApprove, EventSink, TaskHost};
 pub use paths::{PathViolation, SafePath, WorkspaceRoot};
 pub use policy::PolicyGate;
-pub use sidecar::{SidecarClient, SidecarHandler, SpawnConfig};
+pub use sidecar::{RespawnOutcome, SidecarClient, SidecarHandler, SidecarSupervisor, SpawnConfig};
 pub use store::{Store, SCHEMA_VERSION};
 pub use tools::ToolRuntime;
 pub use verify::VerificationRunner;

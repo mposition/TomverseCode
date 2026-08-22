@@ -92,6 +92,12 @@ pub fn read_framed_line<R: BufRead>(reader: R, max_bytes: usize) -> FramedLine {
     }
 }
 
+/// **우리가 프로토콜 위반으로 닫았다**는 표시.
+///
+/// 재spawn 판정이 이 표시를 본다. 위반으로 닫은 연결을 다시 띄우면 같은 위반을 반복할 뿐이고,
+/// 그게 공격이라면 재시도가 곧 협조다 — 크래시(우리가 닫지 않았는데 끊긴 것)와 구별해야 한다.
+pub const PROTOCOL_VIOLATION_PREFIX: &str = "[protocol] ";
+
 /// Node가 Rust에 보낸 요청을 처리하는 쪽. host가 구현한다.
 pub trait SidecarHandler: Send + Sync {
     /// `tool.execute`, `db.appendEvent`, `verify.run` 등
@@ -196,7 +202,7 @@ impl SidecarClient {
                         // 32 MiB를 넘는 한 줄은 정상 상태가 아니고, 정상 아닌 것을 조용히
                         // 회복하는 것이 그 상태를 오래 남기는 방식이다.
                         exit_reason = Some(format!(
-                            "sidecar가 한 줄에 {bytes}바이트를 보냈습니다 (상한 {MAX_IPC_LINE_BYTES}).                              프로토콜 위반이므로 연결을 닫습니다."
+                            "{PROTOCOL_VIOLATION_PREFIX}sidecar가 한 줄에 {bytes}바이트를 보냈습니다 (상한 {MAX_IPC_LINE_BYTES}).                              프로토콜 위반이므로 연결을 닫습니다."
                         ));
                         break;
                     }
@@ -383,6 +389,113 @@ impl Drop for SidecarClient {
     }
 }
 
+/// 워크스페이스 하나가 쓰는 sidecar를 **감독한다** (process-architecture.md 5절).
+///
+/// # 재spawn이 태스크를 살리지는 못한다
+///
+/// Node가 죽으면 그 안에 있던 Orchestrator 상태도 함께 사라진다. 새 프로세스는 그 태스크를
+/// 모르므로, 재spawn이 하는 일은 **다음 태스크가 가능해지는 것**뿐이다. 진행 중이던 태스크는
+/// 재시작 복구 절차와 같이 처리된다(7절) — 그게 5절 표가 두 문장으로 적어둔 이유다.
+///
+/// 그런데 종전에는 그 "다음"도 없었다: 한 번 닫히면 `closed`가 영원히 true라 워크스페이스를
+/// 다시 열기 전까지 모든 요청이 실패했다. 사용자에게는 **앱이 죽은 것처럼 보인다.**
+///
+/// # 상한은 워크스페이스 세션당이다
+///
+/// 원칙 5는 모든 루프에 상한을 요구한다. "성공하면 리셋"은 상한이 아니다 — 태스크마다 한 번씩
+/// 죽는 sidecar가 영원히 재spawn된다. 그래서 카운터는 **워크스페이스를 여는 동안 누적**되고,
+/// 리셋하는 유일한 방법은 사용자가 다시 여는 것이다. 사람을 루프 안에 둔다.
+///
+/// # 프로토콜 위반은 재spawn하지 않는다
+///
+/// 우리가 위반으로 닫은 연결을 다시 띄우면 같은 위반을 반복할 뿐이고, 그게 공격이라면
+/// 재시도가 곧 협조다. 크래시(우리가 닫지 않았는데 끊긴 것)만 재spawn 대상이다.
+pub struct SidecarSupervisor {
+    factory: Box<dyn Fn() -> std::io::Result<Arc<SidecarClient>> + Send + Sync>,
+    client: Mutex<Arc<SidecarClient>>,
+    respawns: AtomicU64,
+    max_respawns: u64,
+}
+
+/// 재spawn을 하지 않기로 한 이유. **"안 했다"만 알면 사용자는 왜인지 모른다.**
+#[derive(Debug, PartialEq, Eq)]
+pub enum RespawnOutcome {
+    /// sidecar가 살아 있어 할 일이 없었다.
+    Alive,
+    /// 새로 띄웠다. 몇 번째인지 함께 준다.
+    Respawned { attempt: u64 },
+    /// 상한에 도달했다.
+    LimitReached { attempts: u64 },
+    /// 프로토콜 위반으로 우리가 닫았다 — 다시 띄우면 반복될 뿐이다.
+    ProtocolViolation { reason: String },
+    /// 다시 띄우려 했으나 spawn 자체가 실패했다.
+    SpawnFailed { attempt: u64, error: String },
+}
+
+/// 워크스페이스 세션 하나에서 허용하는 재spawn 횟수 (5절 표의 "최대 2회").
+pub const MAX_SIDECAR_RESPAWNS: u64 = 2;
+
+impl SidecarSupervisor {
+    /// `factory`는 **같은 설정으로 다시 띄우는 방법**이다. 설정을 복제해 두는 대신 클로저로
+    /// 받는 이유: 자격증명이 그 설정에 들어 있고(2절), 그걸 감독자가 들고 있으면 살아 있는
+    /// 사본이 하나 더 생긴다.
+    pub fn new(factory: Box<dyn Fn() -> std::io::Result<Arc<SidecarClient>> + Send + Sync>) -> std::io::Result<Self> {
+        let client = factory()?;
+        Ok(Self {
+            factory,
+            client: Mutex::new(client),
+            respawns: AtomicU64::new(0),
+            max_respawns: MAX_SIDECAR_RESPAWNS,
+        })
+    }
+
+    /// 지금 쓸 수 있는 클라이언트.
+    pub fn client(&self) -> Arc<SidecarClient> {
+        self.client.lock().unwrap().clone()
+    }
+
+    pub fn respawn_count(&self) -> u64 {
+        self.respawns.load(Ordering::SeqCst)
+    }
+
+    /// 죽어 있으면 다시 띄운다. **호출자가 부르는 시점을 정한다** — 태스크를 시작하기 전이지,
+    /// 태스크 도중이 아니다. 도중에 바꿔치기하면 진행 중인 요청이 어느 프로세스의 것인지
+    /// 알 수 없게 된다.
+    pub fn ensure_alive(&self) -> RespawnOutcome {
+        let mut guard = self.client.lock().unwrap();
+        if !guard.is_closed() {
+            return RespawnOutcome::Alive;
+        }
+        if let Some(reason) = guard.close_reason() {
+            if reason.starts_with(PROTOCOL_VIOLATION_PREFIX) {
+                return RespawnOutcome::ProtocolViolation { reason };
+            }
+        }
+        let attempt = self.respawns.load(Ordering::SeqCst) + 1;
+        if attempt > self.max_respawns {
+            return RespawnOutcome::LimitReached {
+                attempts: self.max_respawns,
+            };
+        }
+        match (self.factory)() {
+            Ok(fresh) => {
+                *guard = fresh;
+                self.respawns.store(attempt, Ordering::SeqCst);
+                RespawnOutcome::Respawned { attempt }
+            }
+            Err(e) => {
+                // **실패한 시도도 센다.** 세지 않으면 spawn이 계속 실패하는 환경에서
+                // 상한이 없는 것과 같아진다.
+                self.respawns.store(attempt, Ordering::SeqCst);
+                RespawnOutcome::SpawnFailed {
+                    attempt,
+                    error: e.to_string(),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +583,163 @@ mod tests {
             }
             other => panic!("예상치 못한 결과: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct NoopHandler;
+    impl SidecarHandler for NoopHandler {
+        fn handle_request(&self, _method: &str, _params: &Value) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        fn handle_event(&self, _task_id: &str, _event: &Value) {}
+    }
+
+    /// 즉시 죽는 sidecar. **실제 프로세스를 띄운다** — mock 클라이언트로 확인하면 "죽었다"의
+    /// 판정 자체(EOF 감지)가 검증에서 빠진다.
+    fn dying_factory(spawns: Arc<AtomicUsize>) -> Box<dyn Fn() -> std::io::Result<Arc<SidecarClient>> + Send + Sync> {
+        Box::new(move || {
+            spawns.fetch_add(1, Ordering::SeqCst);
+            SidecarClient::spawn(
+                SpawnConfig {
+                    program: "node".to_string(),
+                    args: vec!["-e".to_string(), "process.exit(0)".to_string()],
+                    working_dir: None,
+                    env: Vec::new(),
+                },
+                Arc::new(NoopHandler),
+            )
+        })
+    }
+
+    fn wait_closed(client: &SidecarClient) {
+        for _ in 0..200 {
+            if client.is_closed() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("sidecar가 종료를 보고하지 않았습니다");
+    }
+
+    /// **상한이 있고, 그 상한이 워크스페이스 세션당이다.** "성공하면 리셋"은 상한이 아니다 —
+    /// 태스크마다 한 번씩 죽는 sidecar가 영원히 재spawn된다.
+    #[test]
+    fn respawns_up_to_the_limit_and_then_stops() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let supervisor = SidecarSupervisor::new(dying_factory(spawns.clone())).unwrap();
+
+        for attempt in 1..=MAX_SIDECAR_RESPAWNS {
+            wait_closed(&supervisor.client());
+            assert_eq!(supervisor.ensure_alive(), RespawnOutcome::Respawned { attempt });
+        }
+
+        wait_closed(&supervisor.client());
+        assert_eq!(
+            supervisor.ensure_alive(),
+            RespawnOutcome::LimitReached {
+                attempts: MAX_SIDECAR_RESPAWNS
+            }
+        );
+        // 상한에 도달한 뒤에는 **더 띄우지 않는다.** 최초 1회 + 재spawn 2회.
+        assert_eq!(spawns.load(Ordering::SeqCst), (MAX_SIDECAR_RESPAWNS + 1) as usize);
+    }
+
+    /// 살아 있으면 아무것도 하지 않는다 — 멀쩡한 sidecar를 바꿔치기하면 진행 중인 요청이
+    /// 어느 프로세스의 것인지 알 수 없게 된다.
+    #[test]
+    fn a_live_sidecar_is_left_alone() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let long_lived: Box<dyn Fn() -> std::io::Result<Arc<SidecarClient>> + Send + Sync> = {
+            let spawns = spawns.clone();
+            Box::new(move || {
+                spawns.fetch_add(1, Ordering::SeqCst);
+                SidecarClient::spawn(
+                    SpawnConfig {
+                        program: "node".to_string(),
+                        args: vec!["-e".to_string(), "setTimeout(() => {}, 60000)".to_string()],
+                        working_dir: None,
+                        env: Vec::new(),
+                    },
+                    Arc::new(NoopHandler),
+                )
+            })
+        };
+        let supervisor = SidecarSupervisor::new(long_lived).unwrap();
+        assert_eq!(supervisor.ensure_alive(), RespawnOutcome::Alive);
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.respawn_count(), 0);
+    }
+
+    /// **프로토콜 위반은 재spawn하지 않는다.** 다시 띄우면 같은 위반을 반복할 뿐이고,
+    /// 그게 공격이라면 재시도가 곧 협조다.
+    #[test]
+    fn a_protocol_violation_is_not_respawned() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        // 상한을 넘는 한 줄을 뱉고 죽는 sidecar를 흉내내는 대신, 종료 사유를 직접 만든다 —
+        // 32 MiB를 실제로 쓰는 테스트는 느리고, 여기서 확인하려는 것은 **판정 규칙**이다.
+        // (상한 감지 자체는 `read_framed_line` 테스트가 확인한다.)
+        let supervisor = SidecarSupervisor::new(dying_factory(spawns.clone())).unwrap();
+        wait_closed(&supervisor.client());
+        {
+            let client = supervisor.client();
+            let mut slot = client.close_reason.lock().unwrap();
+            *slot = Some(format!("{PROTOCOL_VIOLATION_PREFIX}한 줄이 너무 깁니다"));
+        }
+        match supervisor.ensure_alive() {
+            RespawnOutcome::ProtocolViolation { reason } => {
+                assert!(reason.contains("너무 깁니다"), "{reason}");
+            }
+            other => panic!("위반인데 재spawn했습니다: {other:?}"),
+        }
+        assert_eq!(spawns.load(Ordering::SeqCst), 1, "다시 띄우면 안 됩니다");
+    }
+
+    /// spawn 자체가 실패한 시도도 **센다.** 세지 않으면 실행 파일이 없는 환경에서 상한이
+    /// 없는 것과 같아진다 — `ensure_alive`를 부를 때마다 새로 시도하게 된다.
+    #[test]
+    fn a_failed_spawn_still_counts_against_the_limit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory: Box<dyn Fn() -> std::io::Result<Arc<SidecarClient>> + Send + Sync> = {
+            let calls = calls.clone();
+            Box::new(move || {
+                // 첫 호출만 성공한다(그리고 바로 죽는다). 이후 재spawn은 전부 실패한다.
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                SidecarClient::spawn(
+                    SpawnConfig {
+                        program: if first { "node" } else { "tomverse-not-a-real-program" }.to_string(),
+                        args: if first {
+                            vec!["-e".to_string(), "process.exit(0)".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                        working_dir: None,
+                        env: Vec::new(),
+                    },
+                    Arc::new(NoopHandler),
+                )
+            })
+        };
+
+        let supervisor = SidecarSupervisor::new(factory).unwrap();
+        wait_closed(&supervisor.client());
+
+        for attempt in 1..=MAX_SIDECAR_RESPAWNS {
+            match supervisor.ensure_alive() {
+                RespawnOutcome::SpawnFailed { attempt: got, .. } => assert_eq!(got, attempt),
+                other => panic!("spawn이 실패했는데 다른 결과가 나왔습니다: {other:?}"),
+            }
+        }
+        // 실패한 시도가 세어졌으므로 상한에 도달한다 — 세지 않았다면 영원히 재시도했을 것이다.
+        assert_eq!(
+            supervisor.ensure_alive(),
+            RespawnOutcome::LimitReached {
+                attempts: MAX_SIDECAR_RESPAWNS
+            }
+        );
     }
 }
