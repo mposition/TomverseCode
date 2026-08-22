@@ -11,6 +11,7 @@ import type {
 import { effectiveMaxOutputTokens } from "../budget/ledger.js";
 import { validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
 import { estimateTokensUpperBound } from "../context/budget.js";
+import { envelopeIdentity } from "./envelope.js";
 import { normalizeProviderError } from "./errors.js";
 import {
   buildDraftPrompt,
@@ -64,6 +65,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       // 재시도는 우리 정책(state-machine-and-protocol.md 9절)으로 관리하므로 SDK 재시도를 끈다.
       // 두 층이 각각 재시도하면 실제 시도 횟수가 곱해지고 카운터가 사실과 달라진다.
       maxRetries: 0,
+      ...(deps.fetch ? { fetch: deps.fetch } : {}),
     });
   }
 
@@ -227,6 +229,27 @@ export class OpenAIAdapter implements ProviderAdapter {
         estimatedInputTokens: estimatedTokens,
       };
       const text = extractOutputText(response);
+      if (text === undefined) {
+        // 구조화 출력을 강제했는데도 텍스트가 없으면 스키마 계약 위반이다.
+        // **응답은 이미 받았고 과금됐다** — 아는 사실을 오류에 실어 보낸다.
+        // (Anthropic 어댑터의 "tool_use 블록 없음"과 같은 경우이며, 적합성 스위트가 두
+        // 어댑터에 같은 것을 요구한다.)
+        throw new ProviderCallFailure({
+          message: "OpenAI 응답에서 구조화 출력 텍스트를 찾을 수 없음",
+          dispatchState: meta.dispatchState,
+          classification: {
+            kind: "schema_violation",
+            message: "구조화 출력 텍스트 없음",
+            status: 400,
+            retryable: false,
+          },
+          usage,
+          ...(meta.providerReportedModelId ? { providerReportedModelId: meta.providerReportedModelId } : {}),
+          ...(meta.providerRequestId ? { providerRequestId: meta.providerRequestId } : {}),
+          latencyMs,
+          status: 400,
+        });
+      }
       let parsed: unknown;
       try {
         parsed = JSON.parse(text);
@@ -256,26 +279,13 @@ export class OpenAIAdapter implements ProviderAdapter {
 }
 
 /**
- * `output_text` 편의 프로퍼티가 없거나 빈 SDK 형태에 대한 폴백.
- * 스파이크에서 이미 필요했던 방어이므로 그대로 유지한다.
- */
-/**
- * 응답 envelope에서 모델 ID와 요청 ID를 뽑는다.
+ * 구조화 출력 텍스트를 꺼낸다. `output_text` 편의 프로퍼티가 없거나 빈 SDK 형태에 대한
+ * 폴백까지 본다 — 스파이크에서 이미 필요했던 방어다.
  *
- * **없으면 채우지 않는다.** `this.modelId`로 폴백하면 "요청한 모델이 그대로 왔다"가 항상
- * 참이 되어 검증이 무의미해진다 — 그 폴백이 정확히 이번에 고친 결함이다.
+ * **찾지 못하면 `undefined`다.** 예전에는 여기서 평범한 `Error`를 던졌는데, 그러면 호출자가
+ * 이미 받은 응답의 usage·모델 ID를 오류에 실을 수 없다(적합성 스위트가 잡은 결함).
  */
-function envelopeIdentity(response: unknown): { providerReportedModelId?: string; providerRequestId?: string } {
-  const candidate = response as { model?: unknown; id?: unknown };
-  const out: { providerReportedModelId?: string; providerRequestId?: string } = {};
-  if (typeof candidate.model === "string" && candidate.model.length > 0) {
-    out.providerReportedModelId = candidate.model;
-  }
-  if (typeof candidate.id === "string" && candidate.id.length > 0) out.providerRequestId = candidate.id;
-  return out;
-}
-
-function extractOutputText(response: unknown): string {
+function extractOutputText(response: unknown): string | undefined {
   const candidate = response as {
     output_text?: unknown;
     output?: { content?: { text?: unknown }[] }[];
@@ -288,5 +298,5 @@ function extractOutputText(response: unknown): string {
       if (typeof content.text === "string" && content.text.length > 0) return content.text;
     }
   }
-  throw new Error("OpenAI 응답에서 구조화 출력 텍스트를 찾을 수 없음");
+  return undefined;
 }

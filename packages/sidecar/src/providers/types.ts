@@ -212,4 +212,16 @@ export interface ProviderAdapter {
 export interface AdapterDeps {
   entry: ModelEntry;
   apiKey: string;
+  /**
+   * HTTP 전송 계층 주입 — **적합성 스위트가 실제 어댑터를 태우기 위한 것이다.**
+   *
+   * 왜 프로덕션 타입에 두는가: 이게 없으면 어댑터의 본체(요청 조립 → envelope 해석 →
+   * 정규화)는 **네트워크가 있어야만 검증된다.** 즉 유료 실행에서만 확인되고, 그 확인은
+   * 실패했을 때 이미 돈을 쓴 뒤다. 그런데 "어댑터는 서로 바꿔 끼울 수 있다"는 전제 위에
+   * 가설 게이트의 비교가 서 있으므로(multi-engine-routing.md 2절), 그 전제는 **공짜로 자주**
+   * 검증되어야 한다.
+   *
+   * 주입하지 않으면 SDK 기본 전송을 쓴다 — 프로덕션 경로는 달라지지 않는다.
+   */
+  fetch?: typeof globalThis.fetch;
 }

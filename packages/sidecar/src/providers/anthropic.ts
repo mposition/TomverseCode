@@ -11,6 +11,7 @@ import type {
 import { effectiveMaxOutputTokens } from "../budget/ledger.js";
 import { validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
 import { estimateTokensUpperBound } from "../context/budget.js";
+import { envelopeIdentity } from "./envelope.js";
 import { normalizeProviderError } from "./errors.js";
 import {
   buildDraftPrompt,
@@ -59,6 +60,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       baseURL: deps.entry.apiBaseUrl,
       // 재시도는 우리 정책이 관리한다 (openai.ts와 같은 이유).
       maxRetries: 0,
+      ...(deps.fetch ? { fetch: deps.fetch } : {}),
     });
   }
 
@@ -260,15 +262,6 @@ export class AnthropicAdapter implements ProviderAdapter {
  * 응답 envelope에서 모델 ID와 요청 ID를 뽑는다. **없으면 채우지 않는다** —
  * `this.modelId`로 폴백하면 exact-model 검증이 항상 통과해 무의미해진다.
  */
-function envelopeIdentity(message: unknown): { providerReportedModelId?: string; providerRequestId?: string } {
-  const candidate = message as { model?: unknown; id?: unknown };
-  const out: { providerReportedModelId?: string; providerRequestId?: string } = {};
-  if (typeof candidate.model === "string" && candidate.model.length > 0) {
-    out.providerReportedModelId = candidate.model;
-  }
-  if (typeof candidate.id === "string" && candidate.id.length > 0) out.providerRequestId = candidate.id;
-  return out;
-}
 
 /** 레지스트리 엔트리에 맞는 어댑터를 만든다. 모델 ID를 코드에 고정하지 않기 위한 팩토리. */
 export function createNativeAdapter(entry: ModelEntry, apiKey: string): ProviderAdapter {
