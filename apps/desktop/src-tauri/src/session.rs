@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 use tomverse_core::artifacts::ArtifactStore;
 use tomverse_core::host::{ApprovalGateway, ApprovalOutcome, EventSink, TaskHost};
-use tomverse_core::sidecar::{RespawnOutcome, SidecarClient, SidecarSupervisor, SpawnConfig, MAX_SIDECAR_RESPAWNS};
+use tomverse_core::sidecar::{RespawnOutcome, SidecarClient, SidecarSupervisor, MAX_SIDECAR_RESPAWNS};
 use tomverse_core::store::Store;
 use tomverse_core::store::TaskRow;
 use tomverse_core::types::{ApprovalRequest, ExecutionMode, TaskPolicy};
@@ -380,20 +380,31 @@ impl SessionState {
         // 자격증명은 이 클로저 안에서 매번 다시 읽는다 — 감독자가 키 사본을 들고 있지 않다.
         let allowed_for_spawn = allowed_providers.clone();
         let host_for_spawn = host.clone();
+        // **PATH가 인터프리터를 고르게 두지 않는다**(launcher.rs). 여기서 한 번 해석해
+        // 재spawn까지 같은 것을 쓴다 — 재spawn마다 다시 찾으면 그 사이 PATH가 바뀌었을 때
+        // 두 번째 sidecar가 첫 번째와 다른 런타임으로 뜬다.
+        let launcher = tomverse_core::launcher::detect()?;
+        if !launcher.is_bundled() {
+            // 배포판에서 이게 뜨면 번들이 깨진 것이다. 조용히 넘어가면 그 사실을 아무도 모른다.
+            eprintln!("[sidecar] 동봉 런타임이 아닙니다:\n{}", launcher.describe_failure());
+        }
+        let launcher_for_spawn = launcher.clone();
         let supervisor = SidecarSupervisor::new(Box::new(move || {
             SidecarClient::spawn(
-                SpawnConfig {
-                    program: "node".to_string(),
-                    args: vec![sidecar_entry().to_string_lossy().to_string()],
-                    working_dir: None,
-                    // **여기가 게이트다.** 허용되지 않은 공급자의 키를 주입하지 않으면 Node는
-                    // 그 공급자를 호출할 수단 자체가 없다 — 검사를 지워도 키가 없다.
-                    env: credential_env_for(allowed_for_spawn.as_deref()),
-                },
+                // **여기가 게이트다.** 허용되지 않은 공급자의 키를 주입하지 않으면 Node는
+                // 그 공급자를 호출할 수단 자체가 없다 — 검사를 지워도 키가 없다.
+                tomverse_core::launcher::config_from(
+                    &launcher_for_spawn,
+                    credential_env_for(allowed_for_spawn.as_deref()),
+                ),
                 host_for_spawn.clone(),
             )
         }))
-        .map_err(|e| format!("백엔드(sidecar)를 시작할 수 없습니다: {e}"))?;
+        .map_err(|e| {
+            // 무엇을 어디서 찾았는지 붙인다 — `No such file or directory`만 보여주면
+            // 사용자가 할 수 있는 일이 없다.
+            format!("백엔드(sidecar)를 시작할 수 없습니다: {e}\n{}", launcher.describe_failure())
+        })?;
         let supervisor = Arc::new(supervisor);
         let sidecar = supervisor.client();
 
@@ -689,23 +700,6 @@ impl SessionState {
             .map_err(|_| "승인 응답을 전달할 수 없습니다 (요청이 이미 종료되었습니다).".to_string())?;
         Ok(json!({ "ok": true }))
     }
-}
-
-/// 개발 모드 sidecar 진입점. 배포판에서는 번들된 바이너리를 쓴다
-/// (process-architecture.md 8절 미해결 항목).
-fn sidecar_entry() -> PathBuf {
-    if let Some(explicit) = std::env::var_os("TOMVERSE_SIDECAR_ENTRY") {
-        return PathBuf::from(explicit);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("packages")
-        .join("sidecar")
-        .join("dist")
-        .join("src")
-        .join("index.js")
 }
 
 /// `%APPDATA%/Tomverse Code/` (Windows) 또는 대응 위치.

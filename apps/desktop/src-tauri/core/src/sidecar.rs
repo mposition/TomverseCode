@@ -11,7 +11,6 @@ use crate::time::now_iso;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -130,17 +129,6 @@ pub struct SpawnConfig {
 }
 
 impl SidecarClient {
-    /// 개발 모드 sidecar 진입점 (`packages/sidecar/dist/src/index.js`).
-    /// 배포판에서는 단일 바이너리로 번들해야 한다(process-architecture.md 8절 미해결 항목).
-    pub fn dev_entry(repo_root: &Path) -> std::path::PathBuf {
-        repo_root
-            .join("packages")
-            .join("sidecar")
-            .join("dist")
-            .join("src")
-            .join("index.js")
-    }
-
     pub fn spawn(config: SpawnConfig, handler: Arc<dyn SidecarHandler>) -> std::io::Result<Arc<Self>> {
         let mut command = Command::new(&config.program);
         command

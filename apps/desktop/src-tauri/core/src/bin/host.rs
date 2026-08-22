@@ -32,7 +32,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tomverse_core::artifacts::ArtifactStore;
 use tomverse_core::host::{AlwaysDeny, ApprovalGateway, AutoApprove, EventSink, TaskHost};
-use tomverse_core::sidecar::{SidecarClient, SpawnConfig};
+use tomverse_core::sidecar::SidecarClient;
 use tomverse_core::store::{Store, TerminalOutcome};
 use tomverse_core::types::{ExecutionMode, TaskPolicy};
 use tomverse_core::CancellationRegistry;
@@ -583,16 +583,10 @@ fn run_task(
     session_id: &str,
     task_id: &str,
 ) -> Result<Value, String> {
-    let sidecar_entry = args
-        .sidecar
-        .clone()
-        .unwrap_or_else(|| SidecarClient::dev_entry(&repo_root()));
-    if !sidecar_entry.exists() {
-        return Err(format!(
-            "sidecar 진입점을 찾을 수 없습니다: {}\n먼저 `npm run build`를 실행하세요.",
-            sidecar_entry.display()
-        ));
-    }
+    // 진입점도 인터프리터도 **launcher가 정한다**(launcher.rs). 여기서 따로 찾으면
+    // 헤드리스 호스트와 데스크톱 앱이 서로 다른 규칙으로 sidecar를 띄우게 되고,
+    // e2e가 통과해도 그 통과가 앱 경로에 대해 말해주는 것이 줄어든다.
+    let launcher = tomverse_core::launcher::detect_with_entry(args.sidecar.clone())?;
 
     // 자격증명은 여기서 한 번 주입된다. Node는 이 값을 디스크에 쓰지 않는다.
     let mut env = credential_env();
@@ -610,16 +604,9 @@ fn run_task(
         }
     }
 
-    let client = SidecarClient::spawn(
-        SpawnConfig {
-            program: "node".to_string(),
-            args: vec![sidecar_entry.to_string_lossy().to_string()],
-            working_dir: None,
-            env,
-        },
-        host.clone(),
-    )
-    .map_err(|e| format!("sidecar를 spawn할 수 없습니다: {e}"))?;
+    let config = tomverse_core::launcher::config_from(&launcher, env);
+    let client = SidecarClient::spawn(config, host.clone())
+        .map_err(|e| format!("sidecar를 spawn할 수 없습니다: {e}\n{}", launcher.describe_failure()))?;
 
     // process-architecture.md 5절 — ready 대기 타임아웃 10초.
     let ready = client.wait_ready(Duration::from_secs(10))?;
@@ -790,14 +777,6 @@ fn run_task(
 
 /// 개발 모드 sidecar 경로 해석용 리포지토리 루트.
 /// 배포판에서는 `--sidecar`로 번들된 진입점을 넘긴다.
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("..")
-}
-
 fn workspace_name(root: &WorkspaceRoot) -> &str {
     root.path().file_name().and_then(|n| n.to_str()).unwrap_or("workspace")
 }

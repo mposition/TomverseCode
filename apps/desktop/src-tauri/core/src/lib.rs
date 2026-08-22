@@ -17,6 +17,7 @@ pub mod budget;
 pub mod cancel;
 pub mod export;
 pub mod host;
+pub mod launcher;
 pub mod metrics;
 pub mod paths;
 pub mod policy;
