@@ -249,6 +249,15 @@ export interface AvailableModel {
   inputPerMTok: number;
   outputPerMTok: number;
   maxContextTokens: number;
+  /**
+   * 이 모델 한 번 호출의 **최대 비용** — 예산 원장이 예약할 바로 그 수다.
+   *
+   * **화면이 계산하지 않는다.** 같은 공식이 두 벌이 되면 "예상"과 "실제로 예약되는 금액"이
+   * 조용히 갈라지고, 화면은 통과라고 말하는데 시작하면 거부되는 상태가 된다.
+   *
+   * 가격을 모르는 모델에는 **없다**(0이 아니다).
+   */
+  maxCallCostUsd?: number;
 }
 
 /**

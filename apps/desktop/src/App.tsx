@@ -39,6 +39,7 @@ import { DisagreementCard } from "./components/DisagreementCard";
 import { SecretShapeWarning, useSecretShapeScan } from "./components/SecretShapeWarning";
 import { TransmissionPanel } from "./components/TransmissionPanel";
 import { BudgetPanel } from "./components/BudgetPanel";
+import { precheckBudget } from "./lib/budgetCheck";
 import { AuditExportPanel } from "./components/AuditExportPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
@@ -210,6 +211,28 @@ export default function App() {
   // 실제로 쓰는 문턱. 측정값이 없으면 기본값이며, **그 사실은 개발자 모드에서만 노출한다** —
   // 일반 사용자에게 "이 숫자가 어디서 왔는가"는 필요 없는 정보다.
   const largeChangeFiles = largeChange?.files ?? DEFAULT_LARGE_CHANGE_FILES;
+  /**
+   * 시작 전 예산 점검 (multi-engine-routing.md 10.6·15절).
+   *
+   * 상한이 한 호출의 최대 비용보다 작으면 첫 호출부터 거부된다 — 종전에는 스냅샷과 라우팅을
+   * 마친 뒤에야 오류로 나왔다. 두 값을 같은 화면에서 받으므로 시작 전에 말할 수 있다.
+   */
+  const budgetLimit = useMemo(() => {
+    const args = budgetArgs(budgetText);
+    return args.budgetUnlimited ? null : args.budgetUsd;
+  }, [budgetText]);
+  const budgetPrecheck = useMemo(
+    () =>
+      precheckBudget({
+        // 화면의 입력을 태스크가 받게 될 값으로 바꾸는 곳은 `budgetArgs` 한 곳뿐이다 —
+        // 점검이 다른 규칙으로 읽으면 "경고는 없는데 시작하면 거부"가 생긴다.
+        budgetUsd: budgetLimit,
+        models,
+        pinExecutor,
+        pinReviewer,
+      }),
+    [budgetLimit, models, pinExecutor, pinReviewer]
+  );
   // 보내기 전 자격증명 경고(17.11절). 요청문과 답변은 **그대로 프롬프트에 실려 나가므로**,
   // 저장 시 마스킹으로는 막을 수 없다 — 막을 수 있는 것은 보내기 전의 사용자뿐이다.
   const messageSecrets: SecretShapeHit[] = useSecretShapeScan(message);
@@ -950,6 +973,15 @@ export default function App() {
                       (budgetSuggestion.source === "measured"
                         ? ` 제안값은 이 워크스페이스의 지난 작업 ${budgetSuggestion.sampleCount}건에서 유도했습니다(p90 × ${budgetSuggestion.headroomMultiplier}).`
                         : ` 제안값은 아직 관측이 부족해(${budgetSuggestion.sampleCount}/${budgetSuggestion.minSamples}건) 기본값입니다.`)}
+                  </p>
+                )}
+                {/* **확실할 때만 말한다.** "비쌀 수도 있습니다"는 하지 않는다 — 틀릴 수 있는
+                    경고는 몇 번 지나면 읽히지 않고, 그러면 맞는 경고도 함께 묻힌다. */}
+                {budgetPrecheck.certainRefusal && (
+                  <p className="warn small">
+                    <strong>이 상한으로는 첫 호출부터 거부됩니다.</strong> {budgetPrecheck.basisModelId} 한 번
+                    호출의 최대 비용이 ${budgetPrecheck.requiredUsd?.toFixed(4)}인데 상한이 그보다 작습니다 — 상한을
+                    올리거나 더 싼 모델을 고르세요.
                   </p>
                 )}
               </fieldset>

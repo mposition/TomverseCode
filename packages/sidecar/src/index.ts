@@ -3,6 +3,7 @@ import type { FinalResult, TaskPolicy, TaskStartParams, TaskUserInputParams } fr
 import { DEFAULT_TASK_POLICY } from "@tomverse/protocol";
 import { NdjsonTransport } from "./ipc/transport.js";
 import { Orchestrator, type OrchestratorDeps } from "./orchestrator/orchestrator.js";
+import { estimateCall } from "./orchestrator/budget.js";
 import { createAdapter } from "./providers/factory.js";
 import { ModelRegistry } from "./routing/registry.js";
 import { routerOptionsFromEnv } from "./routing/router.js";
@@ -117,13 +118,21 @@ export function createSidecar(
       allowOrgVerified: routerOptionsFromEnv().allowOrgVerified,
     });
     return {
-      models: entries.map((entry) => ({
-        modelId: entry.modelId,
-        providerId: entry.providerId,
-        inputPerMTok: entry.economics.inputPerMTok,
-        outputPerMTok: entry.economics.outputPerMTok,
-        maxContextTokens: entry.capabilities.maxContextTokens,
-      })),
+      models: entries.map((entry) => {
+        // **예약이 쓸 바로 그 수를 보낸다.** 화면이 같은 공식을 다시 구현하면 두 벌이 생기고,
+        // 그 순간 "예상 비용"과 "실제로 예약되는 금액"이 조용히 갈라진다 — 화면은 통과라고
+        // 말하는데 시작하면 거부되는 상태가 그것이다(envelopeIdentity가 두 벌이었던 것과 같은 모양).
+        const estimate = estimateCall(entry);
+        return {
+          modelId: entry.modelId,
+          providerId: entry.providerId,
+          inputPerMTok: entry.economics.inputPerMTok,
+          outputPerMTok: entry.economics.outputPerMTok,
+          maxContextTokens: entry.capabilities.maxContextTokens,
+          // 가격을 모르면 **키를 넣지 않는다.** 0을 넣으면 화면이 "공짜"로 읽는다.
+          ...(estimate ? { maxCallCostUsd: estimate.maxUsd } : {}),
+        };
+      }),
     };
   });
 
