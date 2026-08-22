@@ -17,6 +17,81 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Node → Rust 한 줄의 최대 바이트 (process-architecture.md 3.1절).
+///
+/// # 왜 상한이 필요한가 — 성능이 아니라 신뢰 경계다
+///
+/// 종전 구현은 `BufReader::lines()`였다. 그건 줄바꿈이 나올 때까지 **무한히** 버퍼를 키우므로,
+/// Node가 줄바꿈 없이 계속 쓰면 **신뢰 경계 프로세스가 메모리를 다 쓴다.** 원칙 2는 "Node가
+/// 완전히 장악당해도 Rust 게이트를 반드시 통과해야 한다"고 말하는데, 게이트에 도달하기 전에
+/// 게이트가 죽으면 그 문장은 성립하지 않는다. 문서가 이 항목을 "파싱을 느리게 만들 가능성"으로
+/// 적어둔 것은 문제의 성질을 잘못 짚은 것이다.
+///
+/// # 왜 32 MiB인가
+///
+/// 정당한 메시지가 크다. Node → Rust 방향에는 초안 patch가 실린 `db.appendEvent`가 있고,
+/// 다중 파일 patch는 수 MB가 될 수 있다. 상한을 작게 잡으면 **정상 작업이 프로토콜 위반으로
+/// 죽는다.** 반대로 이보다 큰 한 줄은 코딩 에이전트의 IPC 메시지로 설명되지 않는다.
+///
+/// **유도하지 못한 상수다.** 실사용 메시지 크기 분포를 재기 전까지는 관측이 아니라 판단이다.
+pub const MAX_IPC_LINE_BYTES: usize = 32 * 1024 * 1024;
+
+/// 한 줄을 읽은 결과.
+///
+/// `Oversized`와 `InvalidUtf8`을 **다른 값으로 두는 것이 이 타입의 요점이다.** 둘 다 "이 줄을
+/// 쓸 수 없다"이지만 그 다음이 다르다:
+///
+/// - `InvalidUtf8`은 줄이 **완결됐다** — 줄바꿈까지 읽었으므로 프레임 동기가 살아 있고, 그 줄만
+///   버리면 다음 줄부터 정상이다. 파싱 불가한 JSON을 무시하는 것과 같은 처리를 한다.
+/// - `Oversized`는 줄이 **완결되지 않았다** — 상한까지 읽고 멈췄으므로 그 줄의 나머지가 스트림에
+///   남아 있고, 다음에 읽는 "줄"은 앞 메시지의 꼬리다. **프레임 동기를 잃은 상태에서 계속
+///   파싱하는 것은 멈추는 것보다 나쁘다.**
+#[derive(Debug, PartialEq, Eq)]
+pub enum FramedLine {
+    Line(String),
+    /// 상한을 넘겨 줄을 완결하지 못했다. 읽은 바이트 수를 함께 준다 — 사유를 사람이 읽을 때
+    /// "얼마나 컸나"가 없으면 상한을 조정할 근거가 없다.
+    Oversized {
+        bytes: usize,
+    },
+    /// 줄은 완결됐지만 UTF-8이 아니다.
+    InvalidUtf8 {
+        bytes: usize,
+    },
+    Eof,
+    ReadError(String),
+}
+
+/// NDJSON 한 줄을 **상한 안에서** 읽는다.
+///
+/// `BufRead::read_until`은 상한이 없으므로 `take`로 감싸 이번 호출이 읽을 수 있는 바이트를
+/// 묶는다. `max_bytes + 1`을 허용하는 이유: 정확히 `max_bytes`인 줄은 정당하므로, 초과를
+/// **판정하려면** 한 바이트를 더 볼 수 있어야 한다.
+pub fn read_framed_line<R: BufRead>(reader: R, max_bytes: usize) -> FramedLine {
+    let mut buf: Vec<u8> = Vec::new();
+    // **리더를 값으로 받는다.** `take`가 값을 가져가므로, 호출자는 `&mut BufReader<...>`를
+    // 넘긴다 — 그러면 이 호출이 소비하는 것은 차용이고 리더 자체는 다음 줄을 위해 남는다.
+    let read = reader.take(max_bytes as u64 + 1).read_until(b'\n', &mut buf);
+    match read {
+        Err(e) => FramedLine::ReadError(e.to_string()),
+        Ok(0) => FramedLine::Eof,
+        Ok(n) => {
+            // 줄바꿈으로 끝나지 않았는데 상한을 넘겼다면 줄이 완결되지 않은 것이다.
+            // 줄바꿈 없이 끝난 **마지막** 줄(EOF)은 정당하므로 두 경우를 구별해야 한다.
+            if n > max_bytes && buf.last() != Some(&b'\n') {
+                return FramedLine::Oversized { bytes: n };
+            }
+            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            match String::from_utf8(buf) {
+                Ok(line) => FramedLine::Line(line),
+                Err(_) => FramedLine::InvalidUtf8 { bytes: n },
+            }
+        }
+    }
+}
+
 /// Node가 Rust에 보낸 요청을 처리하는 쪽. host가 구현한다.
 pub trait SidecarHandler: Send + Sync {
     /// `tool.execute`, `db.appendEvent`, `verify.run` 등
@@ -32,6 +107,8 @@ pub struct SidecarClient {
     child: Mutex<Option<Child>>,
     /// sidecar stdout이 EOF에 도달했는지 (프로세스 종료)
     closed: Arc<AtomicBool>,
+    /// 왜 닫혔는지. **정상 종료와 프로토콜 위반을 같은 문장으로 보고하지 않기 위해** 있다.
+    close_reason: Arc<Mutex<Option<String>>>,
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -80,6 +157,7 @@ impl SidecarClient {
         let pending: Arc<Mutex<HashMap<String, mpsc::Sender<Result<Value, String>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
+        let close_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let client = Arc::new(Self {
             stdin: Mutex::new(stdin),
@@ -87,13 +165,46 @@ impl SidecarClient {
             next_id: AtomicU64::new(1),
             child: Mutex::new(Some(child)),
             closed: closed.clone(),
+            close_reason: close_reason.clone(),
             reader: Mutex::new(None),
         });
 
         let reader_client = Arc::downgrade(&client);
+        let reason_slot = close_reason.clone();
         let reader = std::thread::spawn(move || {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Some(Ok(line)) = lines.next() {
+            let mut buffered = BufReader::new(stdout);
+            // **종료 사유를 갖고 나간다.** 종전에는 어떤 이유로 끝나든 대기 중인 요청이
+            // "sidecar가 응답 전에 종료됨"을 받았다. 프로토콜 위반과 정상 종료가 같은 문장으로
+            // 보고되면, 사용자는 고칠 수 있는 것(상한)과 고칠 수 없는 것(크래시)을 구별하지 못한다.
+            let mut exit_reason: Option<String> = None;
+            loop {
+                let line = match read_framed_line(&mut buffered, MAX_IPC_LINE_BYTES) {
+                    FramedLine::Line(line) => line,
+                    FramedLine::Eof => break,
+                    FramedLine::InvalidUtf8 { bytes } => {
+                        // 줄은 완결됐으므로 프레임 동기가 살아 있다 — 파싱 불가한 JSON과 같이
+                        // 그 줄만 버린다. 그 줄이 응답이었다면 해당 요청은 타임아웃으로 끝난다.
+                        eprintln!("[sidecar] UTF-8이 아닌 {bytes}바이트 줄을 버립니다");
+                        continue;
+                    }
+                    FramedLine::Oversized { bytes } => {
+                        // **여기서 멈춘다.** 줄이 완결되지 않았으므로 그 나머지가 스트림에 남아
+                        // 있고, 다음에 읽는 것은 앞 메시지의 꼬리다. 동기를 잃은 스트림을 계속
+                        // 파싱하면 우리가 해석하는 "메시지"는 아무것도 보장하지 않는다.
+                        //
+                        // 줄바꿈까지 버려 동기를 되찾는 방법도 있지만 그렇게 하지 않는다:
+                        // 32 MiB를 넘는 한 줄은 정상 상태가 아니고, 정상 아닌 것을 조용히
+                        // 회복하는 것이 그 상태를 오래 남기는 방식이다.
+                        exit_reason = Some(format!(
+                            "sidecar가 한 줄에 {bytes}바이트를 보냈습니다 (상한 {MAX_IPC_LINE_BYTES}).                              프로토콜 위반이므로 연결을 닫습니다."
+                        ));
+                        break;
+                    }
+                    FramedLine::ReadError(message) => {
+                        exit_reason = Some(format!("sidecar stdout 읽기 실패: {message}"));
+                        break;
+                    }
+                };
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -146,11 +257,16 @@ impl SidecarClient {
                     _ => {}
                 }
             }
-            // EOF — sidecar 종료. 대기 중인 요청을 전부 깨워야 호출자가 영원히 블록되지 않는다.
+            // 여기 오는 경로는 셋이다: EOF(정상 종료), 프로토콜 위반, 읽기 실패.
+            // 대기 중인 요청을 전부 깨워야 호출자가 영원히 블록되지 않는다.
+            let message = exit_reason.unwrap_or_else(|| "sidecar가 응답 전에 종료됨".to_string());
+            if let Ok(mut slot) = reason_slot.lock() {
+                *slot = Some(message.clone());
+            }
             closed.store(true, Ordering::SeqCst);
             let mut guard = pending.lock().unwrap();
             for (_, tx) in guard.drain() {
-                let _ = tx.send(Err("sidecar가 응답 전에 종료됨".to_string()));
+                let _ = tx.send(Err(message.clone()));
             }
         });
 
@@ -173,7 +289,13 @@ impl SidecarClient {
     /// Rust → Node 요청. `timeout`이 지나면 대기를 포기한다 (상한 없는 대기를 만들지 않는다).
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
         if self.closed.load(Ordering::SeqCst) {
-            return Err("sidecar가 실행 중이 아님".to_string());
+            // **왜 닫혔는지를 함께 말한다.** "실행 중이 아님"만 보고하면 프로토콜 위반으로
+            // 우리가 닫은 것과 sidecar가 죽은 것이 같은 문장이 되고, 사용자는 고칠 수 있는
+            // 것과 고칠 수 없는 것을 구별하지 못한다.
+            return Err(match self.close_reason() {
+                Some(reason) => format!("sidecar가 실행 중이 아님: {reason}"),
+                None => "sidecar가 실행 중이 아님".to_string(),
+            });
         }
         let id = format!("rust-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let (tx, rx) = mpsc::channel();
@@ -221,6 +343,11 @@ impl SidecarClient {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// 닫힌 사유. 아직 열려 있으면 `None`이다.
+    pub fn close_reason(&self) -> Option<String> {
+        self.close_reason.lock().ok().and_then(|g| g.clone())
+    }
+
     /// 정상 종료 (process-architecture.md 5절): shutdown 요청 → 응답 대기 → 강제 종료.
     pub fn shutdown(&self, grace: Duration) {
         let _ = self.request("shutdown", json!({ "at": now_iso() }), grace);
@@ -252,6 +379,96 @@ impl Drop for SidecarClient {
                 let _ = c.kill();
                 let _ = c.wait();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// 평범한 줄은 그대로 나오고, `\r\n`도 벗겨진다(Windows에서 온 줄을 그대로 파싱하면
+    /// JSON 뒤에 `\r`이 붙어 파싱이 실패한다).
+    #[test]
+    fn reads_lines_and_strips_terminators() {
+        let mut input = Cursor::new(b"{\"a\":1}\n{\"b\":2}\r\n".to_vec());
+        assert_eq!(
+            read_framed_line(&mut input, MAX_IPC_LINE_BYTES),
+            FramedLine::Line("{\"a\":1}".to_string())
+        );
+        assert_eq!(
+            read_framed_line(&mut input, MAX_IPC_LINE_BYTES),
+            FramedLine::Line("{\"b\":2}".to_string())
+        );
+        assert_eq!(read_framed_line(&mut input, MAX_IPC_LINE_BYTES), FramedLine::Eof);
+    }
+
+    /// **정확히 상한인 줄은 정당하다.** 경계를 초과로 판정하면 상한이 실제로는 하나 작은 값이 된다.
+    #[test]
+    fn a_line_exactly_at_the_limit_is_accepted() {
+        let mut data = vec![b'x'; 16];
+        data.push(b'\n');
+        let mut input = Cursor::new(data);
+        assert_eq!(read_framed_line(&mut input, 16), FramedLine::Line("x".repeat(16)));
+    }
+
+    /// 줄바꿈 없이 끝난 **마지막** 줄은 정당하다 — EOF는 프레임 위반이 아니다.
+    #[test]
+    fn a_final_line_without_a_newline_is_accepted() {
+        let mut input = Cursor::new(b"{\"a\":1}".to_vec());
+        assert_eq!(
+            read_framed_line(&mut input, MAX_IPC_LINE_BYTES),
+            FramedLine::Line("{\"a\":1}".to_string())
+        );
+    }
+
+    /// **상한을 넘기면 메모리를 계속 키우지 않는다.** 종전 `BufReader::lines()`는 줄바꿈이
+    /// 나올 때까지 무한히 버퍼를 키웠고, 그건 신뢰 경계 프로세스를 Node가 죽일 수 있다는 뜻이다.
+    ///
+    /// 입력을 실제로 크게 만들지 않고 확인한다 — 끝없는 바이트 스트림을 주고, 함수가
+    /// **돌아오는지**를 본다. 상한이 없으면 이 테스트는 끝나지 않는다.
+    #[test]
+    fn an_endless_line_is_bounded_instead_of_growing_forever() {
+        // `repeat`은 Read이지 BufRead가 아니므로 BufReader로 감싼다 — 감싸는 버퍼는 고정
+        // 크기이고, 무한히 커질 수 있는 것은 우리가 만드는 줄 버퍼뿐이다.
+        let mut endless = BufReader::new(std::io::repeat(b'x'));
+        match read_framed_line(&mut endless, 1_024) {
+            FramedLine::Oversized { bytes } => assert_eq!(bytes, 1_025, "상한+1까지만 읽어야 한다"),
+            other => panic!("초과를 감지하지 못했습니다: {other:?}"),
+        }
+    }
+
+    /// **초과와 완결 불가를 구별해야 다음 처리가 갈린다.** 완결된 줄(UTF-8 위반)은 프레임
+    /// 동기가 살아 있어 그 줄만 버리면 되지만, 초과는 나머지가 스트림에 남아 동기를 잃는다.
+    #[test]
+    fn invalid_utf8_is_distinguished_from_oversize() {
+        // 0xFF는 어떤 UTF-8 시퀀스에도 나타나지 않는다.
+        let mut input = Cursor::new(vec![0xFF, 0xFE, b'\n', b'o', b'k', b'\n']);
+        assert_eq!(
+            read_framed_line(&mut input, MAX_IPC_LINE_BYTES),
+            FramedLine::InvalidUtf8 { bytes: 3 }
+        );
+        // 그 줄만 버리면 다음 줄은 정상이다 — 이것이 초과와 다른 점이다.
+        assert_eq!(
+            read_framed_line(&mut input, MAX_IPC_LINE_BYTES),
+            FramedLine::Line("ok".to_string())
+        );
+    }
+
+    /// 초과 뒤의 스트림은 **앞 메시지의 꼬리**다. 그 사실을 이 테스트가 고정한다 —
+    /// 계속 읽으면 우리가 "메시지"라고 부르는 것이 아무것도 보장하지 않는다.
+    #[test]
+    fn after_an_oversized_line_the_stream_is_desynchronized() {
+        let mut input = Cursor::new(b"aaaaaaaaaa{\"tail\":1}\n{\"next\":2}\n".to_vec());
+        assert!(matches!(read_framed_line(&mut input, 4), FramedLine::Oversized { .. }));
+        // 다음에 읽히는 것은 온전한 메시지가 아니라 앞 줄의 나머지다.
+        match read_framed_line(&mut input, MAX_IPC_LINE_BYTES) {
+            FramedLine::Line(line) => {
+                assert_ne!(line, "{\"next\":2}", "동기가 유지된 것처럼 보입니다");
+                assert!(line.ends_with("{\"tail\":1}"), "실제로 읽힌 줄: {line}");
+            }
+            other => panic!("예상치 못한 결과: {other:?}"),
         }
     }
 }
