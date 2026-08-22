@@ -427,6 +427,13 @@ impl SessionState {
                 "백엔드 프로토콜 버전이 맞지 않습니다 (앱 {PROTOCOL_VERSION} / 백엔드 {sidecar_version}). 앱을 업데이트하세요."
             ));
         }
+        // 런타임 버전 확인 — 판정과 문장은 core에 있다(launcher.rs).
+        if let Err(message) =
+            tomverse_core::launcher::require_supported_node(ready.get("nodeVersion").and_then(Value::as_str), &launcher)
+        {
+            sidecar.shutdown(Duration::from_secs(2));
+            return Err(message);
+        }
 
         let info = json!({
             "rootPath": root.display(),

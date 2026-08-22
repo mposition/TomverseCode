@@ -51,7 +51,15 @@ export function createSidecar(
 
   const fake = options.fake ?? fakeOptionsFromEnv();
 
-  transport.onRequest("ping", async () => ({ pong: true, protocolVersion: PROTOCOL_VERSION }));
+  // **Node 버전을 함께 보고한다.** 동봉 런타임이 요구 버전보다 낮으면 증상이 "sidecar가
+  // 조용히 죽는다"이므로(최신 문법을 파싱하다 죽어 오류가 사용자에게 닿지 않는다),
+  // 준비 왕복에서 Rust가 확인하고 이해 가능한 실패로 바꾼다
+  // (process-architecture.md 10.4절 착지 기준 ④).
+  transport.onRequest("ping", async () => ({
+    pong: true,
+    protocolVersion: PROTOCOL_VERSION,
+    nodeVersion: process.versions.node,
+  }));
 
   /**
    * 이 자격증명으로 **실제로 쓸 수 있는 모델** 목록 (multi-engine-routing.md 15절).

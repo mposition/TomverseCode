@@ -120,6 +120,72 @@ pub struct Context<'a> {
     pub exists: &'a dyn Fn(&Path) -> bool,
 }
 
+/// sidecar가 요구하는 최소 Node 메이저 버전.
+///
+/// **루트 `package.json`의 `engines.node`와 같아야 한다.** 선언과 강제가 갈라지면 "요구한다고
+/// 적어둔 버전"과 "실제로 막는 버전"이 달라지고, 그 차이는 아무도 모르는 채로 남는다 —
+/// `packages/toolchain/test/nodeVersion.test.ts`가 둘을 대조한다.
+pub const MIN_NODE_MAJOR: u32 = 20;
+
+/// 동봉 런타임이 sidecar를 돌릴 수 있는가.
+///
+/// **세 값이다.** "모른다"를 "괜찮다"나 "너무 낮다" 어느 쪽에도 넣지 않는다 — 전자면 조용히
+/// 죽고, 후자면 우리가 필드 이름을 바꾼 것만으로 앱이 안 뜬다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum NodeVersionCheck {
+    Ok {
+        version: String,
+    },
+    TooOld {
+        found: String,
+        #[serde(rename = "requiredMajor")]
+        required_major: u32,
+    },
+    /// 확인할 수 없었다. **막지 않는다** — Node와 Rust는 같은 배포판 안에서 버전이 고정되므로
+    /// 이 값이 없다는 것은 대개 우리가 필드를 바꿨다는 뜻이고, 그때 앱이 안 뜨면 안 된다.
+    /// 프로토콜 버전 불일치는 이미 별도로 막는다.
+    Unknown {
+        reason: String,
+    },
+}
+
+/// sidecar가 보고한 `process.versions.node`를 본다.
+///
+/// # 왜 이 검사가 필요한가
+///
+/// 동봉 런타임의 버전이 sidecar가 요구하는 것보다 낮으면 **증상이 "sidecar가 조용히 죽는다"**다.
+/// 최신 문법·API를 파싱하다 죽으므로 오류가 사용자에게 닿지도 않는다. 번들을 만드는 쪽에서
+/// 실수하기 쉬운 자리이기도 하다(런타임을 따로 복사해 넣는다).
+///
+/// **막는 것은 Rust다.** Node가 자기 버전을 속일 수는 있지만, 그건 여기서 다루는 문제가 아니다 —
+/// 속인 Node는 어차피 실행 중에 죽는다. 이 검사의 목적은 보안이 아니라 **이해 가능한 실패**다.
+pub fn check_node_version(reported: Option<&str>) -> NodeVersionCheck {
+    let Some(raw) = reported.map(str::trim).filter(|v| !v.is_empty()) else {
+        return NodeVersionCheck::Unknown {
+            reason: "sidecar가 Node 버전을 보고하지 않았습니다".to_string(),
+        };
+    };
+    // `v22.1.0`처럼 접두사가 붙는 경우도 받는다 — `process.versions.node`는 붙이지 않지만
+    // `process.version`은 붙이고, 둘을 헷갈려 보내는 것은 막을 이유가 없는 실수다.
+    let trimmed = raw.strip_prefix('v').unwrap_or(raw);
+    let Some(major) = trimmed.split('.').next().and_then(|m| m.parse::<u32>().ok()) else {
+        return NodeVersionCheck::Unknown {
+            reason: format!("Node 버전을 해석할 수 없습니다: {raw}"),
+        };
+    };
+    if major < MIN_NODE_MAJOR {
+        NodeVersionCheck::TooOld {
+            found: raw.to_string(),
+            required_major: MIN_NODE_MAJOR,
+        }
+    } else {
+        NodeVersionCheck::Ok {
+            version: raw.to_string(),
+        }
+    }
+}
+
 /// 동봉 런타임의 파일 이름. **플랫폼별 규칙을 한 곳에 둔다** —
 /// `.exe`를 붙이는 자리가 둘이 되면 한쪽만 고쳐진다.
 pub fn runtime_file_name(windows: bool) -> &'static str {
@@ -263,6 +329,26 @@ pub fn detect_with_entry(entry_override: Option<PathBuf>) -> Result<Launcher, St
         var: &|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()),
         exists: &|path| path.exists(),
     })
+}
+
+/// 준비 왕복에서 런타임 버전을 강제한다. 통과하면 `Ok`, 막아야 하면 사용자에게 보일 문장.
+///
+/// **어디서 온 런타임인지 함께 말한다.** 고칠 방법이 다르기 때문이다 — 동봉 런타임이 낮으면
+/// 번들이 깨진 것이고(사용자가 할 일은 재설치), PATH에서 주워온 것이면 설치된 Node가 낮은 것이다.
+///
+/// `Unknown`은 막지 않는다(`check_node_version` 참조). 다만 조용히 넘기지도 않는다.
+pub fn require_supported_node(reported: Option<&str>, launcher: &Launcher) -> Result<(), String> {
+    match check_node_version(reported) {
+        NodeVersionCheck::Ok { .. } => Ok(()),
+        NodeVersionCheck::Unknown { reason } => {
+            eprintln!("[sidecar] Node 버전을 확인하지 못했습니다: {reason}");
+            Ok(())
+        }
+        NodeVersionCheck::TooOld { found, required_major } => Err(format!(
+            "백엔드 런타임의 Node 버전이 낮습니다 (발견: {found}, 필요: {required_major} 이상).\n{}",
+            launcher.describe_failure()
+        )),
+    }
 }
 
 /// 해석 + spawn 설정 조립을 **한 곳에서** 한다.
@@ -437,6 +523,60 @@ mod tests {
         assert!(err.contains("/app/sidecar/index.js"), "{err}");
         assert!(err.contains("/repo/packages/sidecar/dist/src/index.js"), "{err}");
         assert!(err.contains("npm run build"), "개발자가 할 일을 말하지 않습니다: {err}");
+    }
+
+    /// 최소 버전 이상이면 통과, 미만이면 막는다. 경계값(정확히 최소 버전)은 **통과**다 —
+    /// 초과로 판정하면 실제 요구 버전이 선언보다 하나 높아진다.
+    #[test]
+    fn the_minimum_node_major_is_inclusive() {
+        assert!(matches!(
+            check_node_version(Some(&format!("{MIN_NODE_MAJOR}.0.0"))),
+            NodeVersionCheck::Ok { .. }
+        ));
+        assert!(matches!(
+            check_node_version(Some(&format!("{}.99.9", MIN_NODE_MAJOR - 1))),
+            NodeVersionCheck::TooOld { .. }
+        ));
+        assert!(matches!(
+            check_node_version(Some(&format!("{}.0.0", MIN_NODE_MAJOR + 5))),
+            NodeVersionCheck::Ok { .. }
+        ));
+    }
+
+    /// `v` 접두사가 붙어 와도 받는다 — `process.version`과 `process.versions.node`를 헷갈리는
+    /// 것은 막을 이유가 없는 실수다.
+    #[test]
+    fn a_leading_v_is_accepted() {
+        assert!(matches!(
+            check_node_version(Some(&format!("v{MIN_NODE_MAJOR}.1.0"))),
+            NodeVersionCheck::Ok { .. }
+        ));
+    }
+
+    /// **"모른다"는 "너무 낮다"가 아니다.** 여기서 막으면 우리가 필드 이름을 바꾼 것만으로
+    /// 앱이 안 뜬다. 반대로 "괜찮다"로 세면 조용히 죽는 상태를 통과시킨다.
+    #[test]
+    fn an_unreported_version_is_neither_ok_nor_too_old() {
+        for reported in [None, Some(""), Some("   "), Some("nightly")] {
+            let verdict = check_node_version(reported);
+            assert!(
+                matches!(verdict, NodeVersionCheck::Unknown { .. }),
+                "{reported:?} → {verdict:?}"
+            );
+        }
+    }
+
+    /// 판정에 **찾은 값과 요구 값이 둘 다** 들어가야 한다 — 하나만 있으면 사용자가
+    /// 무엇을 어디까지 올려야 하는지 모른다.
+    #[test]
+    fn the_verdict_names_both_what_was_found_and_what_is_required() {
+        match check_node_version(Some("18.20.0")) {
+            NodeVersionCheck::TooOld { found, required_major } => {
+                assert_eq!(found, "18.20.0");
+                assert_eq!(required_major, MIN_NODE_MAJOR);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// spawn 설정은 **해석된 절대 경로를 그대로** 쓴다. 여기서 다시 "node"로 되돌리면

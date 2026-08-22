@@ -610,6 +610,12 @@ fn run_task(
 
     // process-architecture.md 5절 — ready 대기 타임아웃 10초.
     let ready = client.wait_ready(Duration::from_secs(10))?;
+    if let Err(message) =
+        tomverse_core::launcher::require_supported_node(ready.get("nodeVersion").and_then(Value::as_str), &launcher)
+    {
+        client.shutdown(Duration::from_secs(2));
+        return Err(message);
+    }
     let sidecar_version = ready.get("protocolVersion").and_then(Value::as_str).unwrap_or("");
     if sidecar_version != PROTOCOL_VERSION {
         client.shutdown(Duration::from_secs(2));
