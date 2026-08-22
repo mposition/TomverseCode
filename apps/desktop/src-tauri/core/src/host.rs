@@ -1179,13 +1179,25 @@ fn redact_approval_for_event(approval: &ApprovalRequest) -> Value {
     value
 }
 
+/// 큰 출력을 이벤트에 그대로 싣지 않기 위한 요약.
+///
+/// **요약은 크기를 줄이는 것이지 사실을 줄이는 것이 아니다.** 잘라낸 쪽에서 `exitCode`가
+/// 함께 사라지고 있었고, 그 결과 감사 기록이 **명령의 성공 여부를 말하지 못했다.**
+/// 출력이 16KB 이하면 artifact도 만들어지지 않으므로 그 사실을 되찾을 곳이 아예 없었다
+/// (4KB~16KB 구간). 재현 적용기가 "기록된 종료 코드와 같은가"를 물으면서 드러났다 —
+/// 기록에서 실패했던 단계를 그대로 재현했는데 비교할 값이 없어서 멈췄다.
 fn summarize_output(output: Option<&Value>) -> Value {
     let Some(value) = output else { return Value::Null };
     let serialized = value.to_string();
     if serialized.len() <= MAX_INLINE_OUTPUT_BYTES / 4 {
         return value.clone();
     }
-    json!({ "preview": truncate(&serialized, 1024), "sizeBytes": serialized.len() })
+    json!({
+        "preview": truncate(&serialized, 1024),
+        "sizeBytes": serialized.len(),
+        // 잘라도 이것만은 남긴다. 정수 하나이고, 이게 없으면 목록 전체가 "성공한 단계들"로 읽힌다.
+        "exitCode": value.get("exitCode").cloned().unwrap_or(Value::Null),
+    })
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1203,6 +1215,27 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// **요약은 크기를 줄이는 것이지 사실을 줄이는 것이 아니다.** 잘라낸 쪽에서 종료 코드가
+    /// 함께 사라지면 감사 기록이 명령의 성공 여부를 말하지 못한다 — 그리고 그 크기 구간에서는
+    /// artifact도 만들어지지 않으므로 되찾을 곳이 없다.
+    #[test]
+    fn a_truncated_output_summary_still_carries_the_exit_code() {
+        let big = "x".repeat(MAX_INLINE_OUTPUT_BYTES);
+        let out = summarize_output(Some(&json!({ "exitCode": 3, "stdout": big })));
+        assert!(
+            out.get("preview").is_some(),
+            "잘리지 않았습니다 — 이 테스트의 전제가 깨졌습니다"
+        );
+        assert_eq!(out["exitCode"], json!(3), "요약이 종료 코드를 버렸습니다: {out}");
+    }
+
+    /// 자르지 않는 크기에서는 원본이 그대로 나가야 한다 — 위 테스트가 두 경로를 다 덮도록.
+    #[test]
+    fn a_small_output_is_not_summarized() {
+        let value = json!({ "exitCode": 0, "stdout": "ok" });
+        assert_eq!(summarize_output(Some(&value)), value);
+    }
 
     fn host(
         policy: TaskPolicy,

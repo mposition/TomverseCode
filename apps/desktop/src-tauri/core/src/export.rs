@@ -40,7 +40,11 @@ use serde_json::{json, Value};
 
 /// export 형식 버전. **모양을 바꾸면 반드시 올린다** — 읽는 쪽이 옛 파일을 새 규칙으로 읽으면
 /// 조용히 틀린 해석을 한다.
-pub const EXPORT_FORMAT_VERSION: u32 = 1;
+/// | 버전 | 바뀐 것 |
+/// |---|---|
+/// | 1 | 최초 |
+/// | 2 | `fileMutations`에 내용 해시(`preSha256`/`postSha256`)와 존재 여부가 들어갔다. **재현기가 "기록과 같은 내용이 됐는가"를 판정할 수 있게 하려는 것**이다 — 그 전까지 재현기가 말할 수 있는 것은 "단계가 다 돌았다"뿐이었고, 그건 6.3절이 약속한 "최종 상태 복원"의 확인이 아니었다 |
+pub const EXPORT_FORMAT_VERSION: u32 = 2;
 
 /// 한 태스크의 감사 기록을 만든다. **아무것도 쓰지 않는다.**
 pub fn collect(store: &Store, task_id: &str) -> Result<Value, String> {
@@ -74,6 +78,7 @@ pub fn collect(store: &Store, task_id: &str) -> Result<Value, String> {
             "reRun": "같은 프롬프트로 모델을 다시 부르는 것은 이 파일이 보장하지 않는다 — LLM은 결정론적이지 않으므로 같은 결과가 나온다는 보장이 없다. 재현과 섞어 읽지 말 것.",
             "artifacts": "검증 출력 등 artifact 본문은 포함하지 않는다. 참조만 들어 있고 본문은 로컬에 남는다.",
             "startingState": "재현은 워크스페이스가 workspaceFingerprint와 같은 상태일 때만 의미가 있다. 지문이 없거나(available:false) 다르면 재현 결과가 기록과 달라질 수 있다.",
+            "expectedFinalState": "fileMutations의 postSha256/postExisted가 기록된 최종 내용이다. 재현이 실제로 복원됐는지는 단계가 다 돌았는지가 아니라 이 값과의 대조로 판정한다. 해시가 없는 항목(형식 v1로 만들어진 기록)은 '같다'가 아니라 '판정할 수 없다'이다.",
         },
 
         "task": task,
@@ -123,6 +128,7 @@ fn reproduce_steps(requests: &[Value], store: &Store, task_id: &str) -> Result<V
     let executions = store
         .tool_executions(task_id)
         .map_err(|e| format!("도구 조회 실패: {e}"))?;
+    let from_events = exit_codes_from_events(store, task_id);
 
     let mut steps = Vec::new();
     for req in requests {
@@ -144,7 +150,8 @@ fn reproduce_steps(requests: &[Value], store: &Store, task_id: &str) -> Result<V
                 "recordedOutcome".into(),
                 json!({
                     "status": exec.get("executionStatus").cloned().unwrap_or(Value::Null),
-                    "exitCode": recorded_exit_code(store, exec),
+                    "exitCode": recorded_exit_code(store, exec)
+                        .or_else(|| from_events.get(id).copied().flatten()),
                     "note": "status는 도구가 끝까지 돌았다는 뜻이고, 명령의 성공 여부는 exitCode가 말한다. exitCode가 null이면 종료 코드를 갖지 않는 도구이거나 출력 기록을 읽지 못한 것이다.",
                 }),
             );
@@ -152,6 +159,37 @@ fn reproduce_steps(requests: &[Value], store: &Store, task_id: &str) -> Result<V
         steps.push(step);
     }
     Ok(steps)
+}
+
+/// 이벤트 로그에서 요청별 종료 코드를 모은다.
+///
+/// artifact만 보면 **대부분의 명령에서 종료 코드를 잃는다.** 출력이 16KB 이하면 artifact가
+/// 아예 만들어지지 않기 때문이다 — 그런데 `task_events`는 진실의 원천이고(원칙 7)
+/// `TOOL_COMPLETED` 페이로드가 그 값을 이미 담고 있다. 없는 것을 새로 저장하는 대신
+/// 있는 곳에서 읽는다.
+///
+/// 값이 `Some(None)`인 항목은 "이벤트는 있었는데 종료 코드가 없었다"이다 — 종료 코드를 갖지
+/// 않는 도구가 그렇다. 키가 없는 것("그런 요청의 이벤트를 못 찾았다")과 다르므로 합치지 않는다.
+fn exit_codes_from_events(store: &Store, task_id: &str) -> std::collections::HashMap<String, Option<i64>> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(events) = store.events(task_id) else {
+        return out;
+    };
+    for event in events {
+        if event.event_type != "TOOL_COMPLETED" {
+            continue;
+        }
+        let Some(request_id) = event.payload.get("requestId").and_then(Value::as_str) else {
+            continue;
+        };
+        let code = event
+            .payload
+            .get("output")
+            .and_then(|o| o.get("exitCode"))
+            .and_then(Value::as_i64);
+        out.insert(request_id.to_string(), code);
+    }
+    out
 }
 
 /// 도구 출력 artifact에서 **종료 코드만** 꺼낸다.
@@ -292,6 +330,86 @@ mod tests {
 
         let out = collect(&store, "task-1").unwrap();
         assert_eq!(out["workspaceFingerprint"]["fingerprint"], json!("sha256:abc"));
+    }
+
+    /// **출력이 작으면 artifact가 아예 없다** — 그런데 종료 코드는 있어야 한다.
+    ///
+    /// 이게 실제로 뚫려 있던 구멍이다: `run_command` 출력이 16KB 이하면 artifact가 만들어지지
+    /// 않으므로 artifact만 보는 경로는 종료 코드를 잃었고, 그 결과 감사 기록이 **명령의 성공
+    /// 여부를 말하지 못했다.** `task_events`가 진실의 원천이므로(원칙 7) 거기서 읽는다.
+    #[test]
+    fn the_exit_code_survives_when_the_output_was_too_small_for_an_artifact() {
+        let (_d, mut store) = seeded();
+        // artifact 없이 실행된 명령 — output_ref가 없다.
+        executed(
+            &store,
+            "01",
+            ToolName::RunCommand,
+            json!({ "program": "npm" }),
+            ToolStatus::Ok,
+            None,
+        );
+        store
+            .append_event(
+                "task-1",
+                "TOOL_COMPLETED",
+                &json!({ "requestId": "01", "status": "ok", "output": { "exitCode": 1 } }),
+            )
+            .unwrap();
+
+        let out = collect(&store, "task-1").unwrap();
+        let step = &out["reproduce"]["steps"][0];
+        assert_eq!(step["requestId"], json!("01"));
+        assert_eq!(
+            step["recordedOutcome"]["exitCode"],
+            json!(1),
+            "출력이 작았다는 이유로 종료 코드가 사라졌습니다: {step}"
+        );
+    }
+
+    /// **재현의 판정 재료가 export에 있어야 한다.** 내용 해시가 빠지면 재현기가 말할 수 있는
+    /// 것은 "단계가 다 돌았다"뿐이고, 그건 6.3절이 약속한 "최종 상태 복원"의 확인이 아니다.
+    /// 본문은 여전히 넣지 않는다 — 해시는 판정에 충분하고, 본문은 밖으로 나가면 안 된다.
+    #[test]
+    fn file_mutations_carry_content_hashes_but_not_content() {
+        let (_d, store) = seeded();
+        request(
+            &store,
+            "01",
+            ToolName::ApplyPatch,
+            json!({ "path": "src/app.ts", "patch": "@@" }),
+        );
+        store
+            .record_file_mutation(&crate::types::FileMutationRecord {
+                request_id: "01".into(),
+                task_id: "task-1".into(),
+                path: "src/app.ts".into(),
+                pre_image: crate::types::ImageRef {
+                    existed: true,
+                    content_ref: Some("artifact://pre".into()),
+                    sha256: Some("sha-before".into()),
+                },
+                post_image: crate::types::ImageRef {
+                    existed: true,
+                    content_ref: Some("artifact://post".into()),
+                    sha256: Some("sha-after".into()),
+                },
+            })
+            .unwrap();
+
+        let out = collect(&store, "task-1").unwrap();
+        let m = &out["fileMutations"][0];
+        assert_eq!(m["postSha256"], json!("sha-after"), "{m}");
+        assert_eq!(m["preSha256"], json!("sha-before"), "{m}");
+        assert_eq!(m["postExisted"], json!(true), "{m}");
+        // 본문 참조는 나가지 않는다 — artifact를 빼기로 한 결정이 여기서도 유지된다.
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(
+            !text.contains("artifact://post"),
+            "artifact 참조가 export에 들어갔습니다"
+        );
+        // 그리고 보장 블록이 이 재료로 무엇을 하는지 말해야 한다.
+        assert!(out["guarantees"]["expectedFinalState"].is_string());
     }
 
     /// 지문이 아예 없는 실행도 export는 나와야 하되, **없다는 사실이 보여야 한다.**

@@ -55,7 +55,11 @@ use std::path::Path;
 /// 목록으로 두는 이유: 형식이 3까지 갔을 때 2도 읽을 수 있으면 여기에 2가 남는다.
 /// "최신만 읽는다"로 두면 옛 감사 기록이 조용히 읽히지 않게 된다 — 감사 기록은 **몇 년 뒤에
 /// 읽히는 것**이 용도이므로 그 조용함이 특히 나쁘다.
-pub const SUPPORTED_FORMAT_VERSIONS: &[u32] = &[crate::export::EXPORT_FORMAT_VERSION];
+/// v1도 읽는다. 계획(`reproduce.steps`)의 모양은 v1과 v2가 같고, v2가 더한 것은 **판정 재료**
+/// (내용 해시)다. v1을 거부하면 옛 감사 기록으로는 재현을 아예 못 돌리게 되는데, v1로도
+/// 단계를 적용하는 것까지는 정확히 할 수 있다 — 못 하는 것은 결과 판정뿐이고, 그건 거부가
+/// 아니라 `unknown`으로 말할 일이다.
+pub const SUPPORTED_FORMAT_VERSIONS: &[u32] = &[1, 2];
 
 // ---- 워크스페이스 지문 ----
 
@@ -552,14 +556,359 @@ pub fn check(export: &Value, workspace: &Path, acknowledged: Option<&str>) -> Re
         "note": "검사는 아무것도 쓰지 않는다. 전제가 무엇이든 거부하지 않는 이유가 이것이다.",
         "precondition": precondition,
         "currentFingerprint": current,
-        // **판정이지 동작이 아니다.** 적용기는 아직 없다.
-        "applyGate": {
-            "decision": decide_apply(&precondition, acknowledged),
-            "note": "적용해도 되는가에 대한 판정이다. 적용기는 아직 없으며, 만들 때 각 단계는 Policy Gate를 그대로 지나야 한다.",
-        },
+        // **판정이지 동작이 아니다.** 여기서는 적용하지 않는다.
+        //
+        // `--apply`의 보고와 **같은 모양으로** 낸다. 같은 뜻을 두 모양으로 내면 읽는 쪽이
+        // 두 벌의 해석을 들고 있어야 하고, 한쪽만 고칠 때 조용히 갈라진다.
+        "applyGate": decide_apply(&precondition, acknowledged),
+        "applyGateNote": "적용해도 되는가에 대한 판정이다. 실제 적용은 --apply이며, 그때 각 단계는 Policy Gate를 그대로 지난다.",
         "reproducibility": summarize(&checks),
         "steps": plan.steps,
         "checks": checks,
+    }))
+}
+
+// ---- 기대 최종 상태 (형식 v2부터) ----
+
+/// 기록이 말하는 **최종 파일 내용**. 경로별 마지막 변경의 post-image다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpectedFile {
+    pub path: String,
+    pub existed: bool,
+    /// `None`이면 **해시가 기록되지 않았다** — "내용이 없다"가 아니다.
+    pub sha256: Option<String>,
+}
+
+/// export의 `fileMutations`에서 경로별 최종 상태를 뽑는다.
+///
+/// 같은 파일을 여러 번 고쳤을 수 있으므로 **마지막** 기록을 쓴다. 롤백이 *최초* pre-image를
+/// 쓰는 것과 정확히 반대인데, 목적이 반대이기 때문이다: 롤백은 태스크를 없애고 재현은
+/// 태스크를 다시 만든다.
+pub fn expected_final_state(export: &Value) -> Vec<ExpectedFile> {
+    let mut by_path: Vec<ExpectedFile> = Vec::new();
+    let Some(rows) = export.get("fileMutations").and_then(Value::as_array) else {
+        return by_path;
+    };
+    for row in rows {
+        let Some(path) = field(row, "path") else { continue };
+        let entry = ExpectedFile {
+            path: path.to_string(),
+            // `postExisted`가 없는 옛 기록은 "있었다"로 보지 않는다 — 해시가 없으면 어차피
+            // 판정 불가로 떨어지므로, 여기서 없는 사실을 지어낼 이유가 없다.
+            existed: row.get("postExisted").and_then(Value::as_bool).unwrap_or(true),
+            sha256: field(row, "postSha256").map(str::to_string),
+        };
+        match by_path.iter_mut().find(|e| e.path == entry.path) {
+            Some(slot) => *slot = entry,
+            None => by_path.push(entry),
+        }
+    }
+    by_path
+}
+
+/// 한 파일이 기록과 같아졌는가.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum FileVerdict {
+    /// 내용 해시가 기록과 같다.
+    Matches,
+    /// 기록대로 없다(삭제가 재현됐다).
+    AbsentAsRecorded,
+    Differs {
+        expected: String,
+        actual: Option<String>,
+    },
+    /// 있어야 할 파일이 없다.
+    Missing,
+    /// 없어야 할 파일이 있다.
+    Unexpected,
+    /// **판정할 수 없다** — 기록에 해시가 없다(형식 v1). "같다"로 세지 않는다.
+    NotRecorded,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileCheck {
+    pub path: String,
+    pub verdict: FileVerdict,
+}
+
+/// 디스크의 실제 내용을 기대 상태와 견준다.
+pub fn verify_final_state(expected: &[ExpectedFile], workspace: &Path) -> Vec<FileCheck> {
+    expected
+        .iter()
+        .map(|e| {
+            let actual = std::fs::read(workspace.join(&e.path)).ok();
+            let verdict = match (&e.sha256, e.existed, actual) {
+                (None, _, _) => FileVerdict::NotRecorded,
+                (Some(_), true, None) => FileVerdict::Missing,
+                (Some(expected_hash), true, Some(bytes)) => {
+                    let got = crate::artifacts::sha256_hex(&bytes);
+                    if &got == expected_hash {
+                        FileVerdict::Matches
+                    } else {
+                        FileVerdict::Differs {
+                            expected: expected_hash.clone(),
+                            actual: Some(got),
+                        }
+                    }
+                }
+                (Some(_), false, None) => FileVerdict::AbsentAsRecorded,
+                (Some(_), false, Some(_)) => FileVerdict::Unexpected,
+            };
+            FileCheck {
+                path: e.path.clone(),
+                verdict,
+            }
+        })
+        .collect()
+}
+
+/// 재현 전체의 판정.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReproduceOutcome {
+    /// 기록된 모든 파일이 기록된 내용과 같다.
+    Reproduced,
+    /// 하나 이상이 다르다.
+    Diverged,
+    /// 판정할 수 없다 — 기록에 해시가 없거나, 대조할 파일 기록이 아예 없다.
+    Unknown,
+}
+
+/// **`Diverged`가 `Unknown`을 이긴다.** 하나라도 확실히 다르면 그 재현은 기록과 다른 상태를
+/// 만든 것이고, 나머지를 몰라도 그 사실은 이미 확정이다.
+///
+/// 대조할 것이 하나도 없으면 `Reproduced`가 아니라 `Unknown`이다 — **빈 집합에 대해 참인
+/// 명제를 성공으로 보고하면**, 기록이 비어 있을수록 재현이 잘된 것처럼 보인다.
+pub fn summarize_outcome(checks: &[FileCheck]) -> ReproduceOutcome {
+    if checks.iter().any(|c| {
+        matches!(
+            c.verdict,
+            FileVerdict::Differs { .. } | FileVerdict::Missing | FileVerdict::Unexpected
+        )
+    }) {
+        return ReproduceOutcome::Diverged;
+    }
+    if checks.is_empty() || checks.iter().any(|c| matches!(c.verdict, FileVerdict::NotRecorded)) {
+        return ReproduceOutcome::Unknown;
+    }
+    ReproduceOutcome::Reproduced
+}
+
+// ---- 적용기 ----
+
+/// 한 단계를 적용한 결과.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedStep {
+    pub index: usize,
+    /// 기록에서의 요청 id. 실행에는 새 id를 쓴다 — 같은 id를 재사용하면 이번 실행의 artifact가
+    /// 기록의 것과 같은 이름을 갖게 되어 둘을 구별할 수 없다.
+    pub recorded_request_id: String,
+    pub request_id: String,
+    pub tool: String,
+    pub policy_decision: String,
+    pub approved: bool,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub recorded_exit_code: Option<i64>,
+    /// 되돌리기 재료. 적용기는 스스로 되돌리지 않으므로(아래 이유) 이걸 남긴다.
+    pub pre_image_ref: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 왜 멈췄는가. **끝까지 갔는지와 왜 멈췄는지를 한 값으로 합치지 않는다.**
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum StopReason {
+    /// 전제가 적용을 허용하지 않았다. **한 단계도 실행하지 않았다.**
+    Precondition { decision: ApplyDecision },
+    /// Policy Gate가 막았다. 기록에 있다는 것은 승인 근거가 아니다.
+    PolicyDenied { index: usize, reason: String },
+    /// 승인을 받지 못했다.
+    NotApproved { index: usize },
+    /// 도구가 실패했다(실행 자체가 안 됐거나 오류).
+    ToolFailed {
+        index: usize,
+        status: String,
+        error: Option<String>,
+    },
+    /// 명령의 종료 코드가 기록과 다르다 — 여기서부터의 상태는 기록과 다른 상태다.
+    ExitCodeDiverged {
+        index: usize,
+        recorded: Option<i64>,
+        actual: Option<i64>,
+    },
+    /// 모르는 도구. **추측해서 실행하지 않는다.**
+    UnknownTool { index: usize, tool: String },
+}
+
+pub struct ApplyOptions<'a> {
+    pub root: crate::paths::WorkspaceRoot,
+    pub artifacts: crate::artifacts::ArtifactStore,
+    pub policy: crate::types::TaskPolicy,
+    /// 승인 게이트. **`Decision::RequireUserApproval`일 때만 불린다.**
+    pub approve: &'a dyn Fn(&crate::types::ToolRequest, &crate::types::PolicyDecision) -> bool,
+    /// 이번 재현 실행의 id. artifact 이름과 요청 id의 접두사가 된다.
+    pub run_id: String,
+}
+
+/// 기록을 이 워크스페이스에 **적용한다.**
+///
+/// # 첫 실패에서 멈춘다 — 그리고 되돌리지 않는다
+///
+/// 실패한 뒤에도 계속 적용하면 기록과도 다르고 시작 상태와도 다른 제3의 상태가 남는다.
+/// 그래서 멈춘다.
+///
+/// 자동 되돌리기는 **하지 않는다.** 되돌릴 대상이 분명하지 않기 때문이다 — 불일치를 확인으로
+/// 넘겨 시작한 경우 워크스페이스에는 이미 남의 변경이 있었고, "시작 상태"가 무엇이었는지
+/// 우리가 아는 것은 지문 하나뿐이다(내용이 아니다). 대신 어디까지 적용했는지와 각 단계의
+/// pre-image 참조를 보고에 남긴다 — 되돌리는 것은 사용자의 판단이고, 우리는 재료를 준다.
+///
+/// # 판정은 "단계가 다 돌았다"가 아니다
+///
+/// 끝까지 돌고도 파일 내용이 기록과 다를 수 있다. 그래서 마지막에 기록된 최종 내용과
+/// 대조하고, 그 대조가 불가능하면(형식 v1) `Unknown`이라고 말한다.
+pub fn apply(export: &Value, opts: &ApplyOptions, acknowledged: Option<&str>) -> Result<Value, String> {
+    use crate::types::{Decision, ToolName, ToolRequest, ToolStatus};
+
+    let plan = plan(export)?;
+    let workspace = opts.root.path().to_path_buf();
+    let current = fingerprint(|args| read_only_git(&workspace, args));
+    let precondition = judge(export.get("workspaceFingerprint"), &current);
+    let gate_decision = decide_apply(&precondition, acknowledged);
+
+    let mut applied: Vec<AppliedStep> = Vec::new();
+    let mut stopped: Option<StopReason> = None;
+
+    if gate_decision != ApplyDecision::Allowed {
+        stopped = Some(StopReason::Precondition {
+            decision: gate_decision.clone(),
+        });
+    } else {
+        let gate = crate::policy::PolicyGate::new(&opts.policy);
+        let runtime = crate::tools::ToolRuntime::new(
+            opts.root.clone(),
+            opts.artifacts.clone(),
+            std::time::Duration::from_millis(opts.policy.command_timeout_ms),
+        );
+        let cancel = crate::cancel::CancellationToken::new();
+
+        for step in &plan.steps {
+            // **모르는 도구는 추측해서 실행하지 않는다.** export는 밖에서 온 파일이고,
+            // 모르는 이름을 가장 비슷한 도구로 해석하면 그게 곧 우회 경로가 된다.
+            let Ok(tool) = serde_json::from_value::<ToolName>(Value::String(step.tool.clone())) else {
+                stopped = Some(StopReason::UnknownTool {
+                    index: step.index,
+                    tool: step.tool.clone(),
+                });
+                break;
+            };
+
+            let request = ToolRequest {
+                request_id: format!("{}-{}", opts.run_id, step.index),
+                task_id: opts.run_id.clone(),
+                tool,
+                // **기록된 인자를 그대로 쓴다.** 새로 조립하면 원칙 6의 보장("승인 화면에 보인
+                // argv가 실제 실행된 것")이 재현에서 깨진다.
+                args: step.args.clone(),
+                risk_tier: None,
+                // opaque하게 통과하는 값이다. **누가 요청했는지 기록에 남는다** —
+                // 재현으로 생긴 변경을 사람이 낸 것과 구별할 수 있어야 한다.
+                requested_by: serde_json::json!({ "role": "reproduce" }),
+                created_at: Some(crate::time::now_iso()),
+            };
+
+            let decision = gate.evaluate(&request, &opts.root, &opts.policy);
+            if matches!(decision.decision, Decision::Deny) {
+                stopped = Some(StopReason::PolicyDenied {
+                    index: step.index,
+                    reason: decision.reason.clone(),
+                });
+                break;
+            }
+            let approved = if decision.requires_user_approval {
+                (opts.approve)(&request, &decision)
+            } else {
+                true
+            };
+            if decision.requires_user_approval && !approved {
+                stopped = Some(StopReason::NotApproved { index: step.index });
+                break;
+            }
+
+            let outcome = runtime.execute(&request, &decision, approved, &cancel);
+            let exit_code = outcome
+                .result
+                .output
+                .as_ref()
+                .and_then(|o| o.get("exitCode"))
+                .and_then(Value::as_i64);
+
+            applied.push(AppliedStep {
+                index: step.index,
+                recorded_request_id: step.request_id.clone(),
+                request_id: request.request_id.clone(),
+                tool: step.tool.clone(),
+                policy_decision: format!("{:?}", decision.decision),
+                approved,
+                status: outcome.result.status.as_str().to_string(),
+                exit_code,
+                recorded_exit_code: step.recorded_exit_code,
+                pre_image_ref: outcome.mutation.as_ref().and_then(|m| m.pre_image.content_ref.clone()),
+                error: outcome.result.error.clone(),
+            });
+
+            if !matches!(outcome.result.status, ToolStatus::Ok) {
+                stopped = Some(StopReason::ToolFailed {
+                    index: step.index,
+                    status: outcome.result.status.as_str().to_string(),
+                    error: outcome.result.error.clone(),
+                });
+                break;
+            }
+
+            // `ToolStatus::Ok`은 "명령이 성공했다"가 아니다. 종료 코드가 기록과 다르면
+            // 여기서부터의 상태는 기록과 다른 상태다.
+            //
+            // 기록에 종료 코드가 **없으면** 비교할 수 없다. 그때는 0이 아닌 것만 보고 멈추고,
+            // 멈춘 이유에 "기록과 비교하지 못했다"가 드러나게 둘 다 싣는다.
+            let diverged = match (step.recorded_exit_code, exit_code) {
+                (Some(recorded), actual) => actual != Some(recorded),
+                (None, Some(actual)) => actual != 0,
+                (None, None) => false,
+            };
+            if diverged {
+                stopped = Some(StopReason::ExitCodeDiverged {
+                    index: step.index,
+                    recorded: step.recorded_exit_code,
+                    actual: exit_code,
+                });
+                break;
+            }
+        }
+    }
+
+    let expected = expected_final_state(export);
+    let file_checks = verify_final_state(&expected, &workspace);
+
+    Ok(serde_json::json!({
+        "formatVersion": plan.format_version,
+        "taskId": plan.task_id,
+        "runId": opts.run_id,
+        "precondition": precondition,
+        "applyGate": gate_decision,
+        "stepsPlanned": plan.steps.len(),
+        "applied": applied,
+        "stoppedAt": stopped,
+        "completed": stopped.is_none(),
+        // **판정은 여기다.** "단계가 다 돌았다"(completed)와 "기록과 같아졌다"(outcome)는
+        // 다른 사실이고, 둘을 한 값으로 합치면 돌기만 하고 결과가 다른 재현이 성공으로 읽힌다.
+        "outcome": summarize_outcome(&file_checks),
+        "files": file_checks,
+        "note": "적용기는 스스로 되돌리지 않는다. 각 단계의 preImageRef가 되돌리기 재료다.",
     }))
 }
 
@@ -859,5 +1208,300 @@ mod tests {
         let out = fingerprint(|args| read_only_git(ws.path(), args));
         assert_eq!(out["available"], json!(false));
         assert!(out.get("fingerprint").is_none(), "잴 수 없었는데 해시가 나왔습니다");
+    }
+
+    // ---- 적용기 ----
+
+    /// git 저장소인 워크스페이스. 지문이 나와야 전제가 `match`가 될 수 있다.
+    fn git_workspace(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = workspace_with(files);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "."]);
+        git(&["config", "user.email", "a@b.c"]);
+        git(&["config", "user.name", "t"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        dir
+    }
+
+    fn apply_options<'a>(
+        dir: &tempfile::TempDir,
+        artifacts: &tempfile::TempDir,
+        approve: &'a dyn Fn(&crate::types::ToolRequest, &crate::types::PolicyDecision) -> bool,
+    ) -> ApplyOptions<'a> {
+        ApplyOptions {
+            root: crate::paths::WorkspaceRoot::new(dir.path()).unwrap(),
+            artifacts: crate::artifacts::ArtifactStore::new(artifacts.path()).unwrap(),
+            policy: crate::types::TaskPolicy {
+                auto_approve_workspace_writes: true,
+                ..Default::default()
+            },
+            approve,
+            run_id: "repro-test".to_string(),
+        }
+    }
+
+    /// export의 지문을 지금 워크스페이스의 것으로 맞춘다 — 전제 `match`를 만든다.
+    fn with_current_fingerprint(mut export: Value, dir: &tempfile::TempDir) -> Value {
+        export["workspaceFingerprint"] = fingerprint(|a| read_only_git(dir.path(), a));
+        export
+    }
+
+    fn export_v2(steps: Value, mutations: Value) -> Value {
+        json!({
+            "formatVersion": 2,
+            "task": { "taskId": "task-1" },
+            "reproduce": { "steps": steps },
+            "fileMutations": mutations,
+        })
+    }
+
+    fn sha_of(text: &str) -> String {
+        crate::artifacts::sha256_hex(text.as_bytes())
+    }
+
+    /// 정상 경로 — 적용하면 파일이 **기록된 내용**이 되고, 판정이 그걸 말한다.
+    #[test]
+    fn applying_the_record_reproduces_the_recorded_content() {
+        let ws = git_workspace(&[("a.txt", "one\n")]);
+        let art = tempfile::tempdir().unwrap();
+        let export = with_current_fingerprint(
+            export_v2(
+                json!([patch_step(
+                    "a.txt",
+                    "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
+                )]),
+                json!([{ "path": "a.txt", "postExisted": true, "postSha256": sha_of("two\n") }]),
+            ),
+            &ws,
+        );
+
+        let yes = |_: &crate::types::ToolRequest, _: &crate::types::PolicyDecision| true;
+        let out = apply(&export, &apply_options(&ws, &art, &yes), None).unwrap();
+
+        assert_eq!(out["applyGate"]["decision"], json!("allowed"), "{out}");
+        assert_eq!(out["completed"], json!(true), "{out}");
+        assert_eq!(out["outcome"], json!("reproduced"), "{out}");
+        assert_eq!(std::fs::read_to_string(ws.path().join("a.txt")).unwrap(), "two\n");
+    }
+
+    /// **"단계가 다 돌았다"와 "기록과 같아졌다"는 다른 사실이다.** 단계가 전부 성공해도 최종
+    /// 내용이 기록과 다르면 재현이 아니다 — 둘을 한 값으로 합치면 그 경우가 성공으로 읽힌다.
+    #[test]
+    fn finishing_every_step_is_not_the_same_as_reproducing() {
+        let ws = git_workspace(&[("a.txt", "one\n")]);
+        let art = tempfile::tempdir().unwrap();
+        let export = with_current_fingerprint(
+            export_v2(
+                json!([patch_step(
+                    "a.txt",
+                    "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
+                )]),
+                // 기록은 "three"가 됐다고 말한다 — 단계는 "two"를 만든다.
+                json!([{ "path": "a.txt", "postExisted": true, "postSha256": sha_of("three\n") }]),
+            ),
+            &ws,
+        );
+
+        let yes = |_: &crate::types::ToolRequest, _: &crate::types::PolicyDecision| true;
+        let out = apply(&export, &apply_options(&ws, &art, &yes), None).unwrap();
+        assert_eq!(out["completed"], json!(true), "단계는 전부 돌았어야 합니다");
+        assert_eq!(out["outcome"], json!("diverged"), "{out}");
+    }
+
+    /// 해시가 없는 기록(v1)은 **`reproduced`가 아니라 `unknown`**이다.
+    #[test]
+    fn a_record_without_hashes_cannot_be_judged_reproduced() {
+        let ws = git_workspace(&[("a.txt", "one\n")]);
+        let art = tempfile::tempdir().unwrap();
+        let mut export = export_v2(
+            json!([patch_step(
+                "a.txt",
+                "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
+            )]),
+            json!([{ "path": "a.txt" }]),
+        );
+        export["formatVersion"] = json!(1);
+        let export = with_current_fingerprint(export, &ws);
+
+        let yes = |_: &crate::types::ToolRequest, _: &crate::types::PolicyDecision| true;
+        let out = apply(&export, &apply_options(&ws, &art, &yes), None).unwrap();
+        assert_eq!(out["completed"], json!(true));
+        assert_eq!(out["outcome"], json!("unknown"), "{out}");
+        // 그래도 적용은 됐다 — 판정을 못 하는 것과 아무것도 못 하는 것은 다르다.
+        assert_eq!(std::fs::read_to_string(ws.path().join("a.txt")).unwrap(), "two\n");
+    }
+
+    /// 대조할 것이 하나도 없으면 성공이 아니라 `unknown`이다. **빈 집합에 대해 참인 명제를
+    /// 성공으로 보고하면 기록이 비어 있을수록 재현이 잘된 것처럼 보인다.**
+    #[test]
+    fn nothing_to_compare_is_not_success() {
+        assert_eq!(summarize_outcome(&[]), ReproduceOutcome::Unknown);
+    }
+
+    /// **전제가 막으면 한 단계도 실행하지 않는다.** 지문이 다른데 확인 없이 시작하면
+    /// 그건 규칙 5를 어긴 것이고, 그 대가는 남의 워크스페이스에 남는다.
+    #[test]
+    fn a_mismatched_precondition_applies_nothing() {
+        let ws = git_workspace(&[("a.txt", "one\n")]);
+        let art = tempfile::tempdir().unwrap();
+        let export = export_v2(
+            json!([patch_step(
+                "a.txt",
+                "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
+            )]),
+            json!([{ "path": "a.txt", "postExisted": true, "postSha256": sha_of("two\n") }]),
+        );
+        // 지문을 맞추지 않았다 — export에 지문 키 자체가 없으므로 `unknown`이다.
+        let yes = |_: &crate::types::ToolRequest, _: &crate::types::PolicyDecision| true;
+        let out = apply(&export, &apply_options(&ws, &art, &yes), None).unwrap();
+
+        assert_eq!(out["applied"].as_array().unwrap().len(), 0, "{out}");
+        assert_eq!(out["stoppedAt"]["kind"], json!("precondition"));
+        assert_eq!(std::fs::read_to_string(ws.path().join("a.txt")).unwrap(), "one\n");
+    }
+
+    /// **기록에 있다는 것은 승인 근거가 아니다.** 조작된 export가 워크스페이스 밖 경로를
+    /// 담고 있으면 Policy Gate가 막는다 — 이 검사가 없으면 export 파일 하나로 임의 경로에
+    /// 쓰는 길이 열린다.
+    #[test]
+    fn a_doctored_export_cannot_write_outside_the_workspace() {
+        let ws = git_workspace(&[("a.txt", "one\n")]);
+        let art = tempfile::tempdir().unwrap();
+        let export = with_current_fingerprint(
+            export_v2(
+                json!([{
+                    "requestId": "r1",
+                    "tool": "create_file",
+                    "args": { "path": "../escaped.txt", "content": "pwned" },
+                }]),
+                json!([]),
+            ),
+            &ws,
+        );
+
+        let yes = |_: &crate::types::ToolRequest, _: &crate::types::PolicyDecision| true;
+        let out = apply(&export, &apply_options(&ws, &art, &yes), None).unwrap();
+        assert_eq!(out["stoppedAt"]["kind"], json!("policyDenied"), "{out}");
+        assert!(
+            !ws.path().parent().unwrap().join("escaped.txt").exists(),
+            "워크스페이스 밖에 파일이 쓰였습니다"
+        );
+    }
+
+    /// 모르는 도구는 **추측해서 실행하지 않는다.** 밖에서 온 파일의 이름을 가장 비슷한
+    /// 도구로 해석하기 시작하면 그게 곧 우회 경로가 된다.
+    #[test]
+    fn an_unknown_tool_stops_the_run_instead_of_being_guessed() {
+        let ws = git_workspace(&[("a.txt", "one\n")]);
+        let art = tempfile::tempdir().unwrap();
+        let export = with_current_fingerprint(
+            export_v2(
+                json!([{ "requestId": "r1", "tool": "write_anywhere", "args": { "path": "a.txt" } }]),
+                json!([]),
+            ),
+            &ws,
+        );
+        let yes = |_: &crate::types::ToolRequest, _: &crate::types::PolicyDecision| true;
+        let out = apply(&export, &apply_options(&ws, &art, &yes), None).unwrap();
+        assert_eq!(out["stoppedAt"]["kind"], json!("unknownTool"), "{out}");
+        assert_eq!(out["applied"].as_array().unwrap().len(), 0);
+    }
+
+    /// 첫 실패에서 멈춘다. 계속 적용하면 **기록과도 다르고 시작 상태와도 다른 제3의 상태**가
+    /// 남는다.
+    #[test]
+    fn the_run_stops_at_the_first_failure() {
+        let ws = git_workspace(&[("a.txt", "one\n"), ("b.txt", "keep\n")]);
+        let art = tempfile::tempdir().unwrap();
+        let export = with_current_fingerprint(
+            export_v2(
+                json!([
+                    // 붙지 않는 patch — 기존 내용과 맞지 않는다.
+                    patch_step("a.txt", "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-nope\n+two\n"),
+                    patch_step("b.txt", "--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-keep\n+changed\n"),
+                ]),
+                json!([]),
+            ),
+            &ws,
+        );
+        let yes = |_: &crate::types::ToolRequest, _: &crate::types::PolicyDecision| true;
+        let out = apply(&export, &apply_options(&ws, &art, &yes), None).unwrap();
+
+        assert_eq!(out["stoppedAt"]["kind"], json!("toolFailed"), "{out}");
+        assert_eq!(out["stoppedAt"]["index"], json!(0));
+        assert_eq!(out["completed"], json!(false));
+        // 두 번째 단계는 시작하지도 않았다.
+        assert_eq!(std::fs::read_to_string(ws.path().join("b.txt")).unwrap(), "keep\n");
+    }
+
+    /// 승인이 필요한 단계에서 승인을 받지 못하면 멈춘다 — **재현이라고 승인이 면제되지 않는다.**
+    #[test]
+    fn a_step_that_is_not_approved_stops_the_run() {
+        let ws = git_workspace(&[("a.txt", "one\n")]);
+        let art = tempfile::tempdir().unwrap();
+        let export = with_current_fingerprint(
+            export_v2(
+                json!([patch_step(
+                    "a.txt",
+                    "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
+                )]),
+                json!([]),
+            ),
+            &ws,
+        );
+        let no = |_: &crate::types::ToolRequest, _: &crate::types::PolicyDecision| false;
+        let mut options = apply_options(&ws, &art, &no);
+        // 자동 승인을 끄면 파일 쓰기는 사용자 승인을 요구한다.
+        options.policy.auto_approve_workspace_writes = false;
+
+        let out = apply(&export, &options, None).unwrap();
+        assert_eq!(out["stoppedAt"]["kind"], json!("notApproved"), "{out}");
+        assert_eq!(std::fs::read_to_string(ws.path().join("a.txt")).unwrap(), "one\n");
+    }
+
+    /// 확인(`--accept-fingerprint`)으로 불일치를 넘기면 실제로 적용된다 — 규칙 5가 말로만
+    /// 있는 것이 아님을 확인한다.
+    #[test]
+    fn an_acknowledged_mismatch_actually_applies() {
+        let ws = git_workspace(&[("a.txt", "one\n")]);
+        let art = tempfile::tempdir().unwrap();
+        let recorded = "sha256:aaa";
+        let mut export = export_v2(
+            json!([patch_step(
+                "a.txt",
+                "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"
+            )]),
+            json!([{ "path": "a.txt", "postExisted": true, "postSha256": sha_of("two\n") }]),
+        );
+        // 지금 지문과 재료는 같지만 값이 다른 기록.
+        export["workspaceFingerprint"] = json!({
+            "available": true,
+            "fingerprint": recorded,
+            "gitHead": "c0ffee",
+            "dirty": false,
+            "untrackedFiles": 0,
+            "inputs": FINGERPRINT_INPUTS,
+        });
+
+        let yes = |_: &crate::types::ToolRequest, _: &crate::types::PolicyDecision| true;
+        let without = apply(&export, &apply_options(&ws, &art, &yes), None).unwrap();
+        assert_eq!(without["stoppedAt"]["kind"], json!("precondition"), "{without}");
+
+        let with_ack = apply(&export, &apply_options(&ws, &art, &yes), Some(recorded)).unwrap();
+        assert_eq!(with_ack["outcome"], json!("reproduced"), "{with_ack}");
+        assert_eq!(std::fs::read_to_string(ws.path().join("a.txt")).unwrap(), "two\n");
     }
 }

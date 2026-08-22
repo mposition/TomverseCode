@@ -629,9 +629,10 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
       workspaceFingerprint: { fingerprint?: string } | null;
       reproduce: { steps: { tool: string; args: Record<string, unknown>; recordedOutcome: unknown }[] };
       toolRequests: { tool: string; args: Record<string, unknown> }[];
+      fileMutations: { path: string; postSha256?: string | null; postExisted?: boolean }[];
     };
 
-    assert.equal(exported.formatVersion, 1);
+    assert.equal(exported.formatVersion, 2);
     // 재현과 재실행이 둘 다 적혀야 한다 — 하나만 적으면 독자가 나머지를 같은 것으로 읽는다.
     assert.ok(exported.guarantees.reproduce && exported.guarantees.reRun, JSON.stringify(exported.guarantees));
     // 재현의 전제가 최상위에 있어야 한다.
@@ -683,7 +684,7 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
       formatVersion: number;
       taskId: string;
       precondition: { verdict: string; differs?: string[] };
-      applyGate: { decision: { decision: string } };
+      applyGate: { decision: string };
       reproducibility: string;
       steps: unknown[];
       checks: { check: { status: string } }[];
@@ -707,7 +708,7 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
       "불일치인데 무엇이 다른지 말하지 않았습니다 — 사용자가 맞출 대상을 알 수 없습니다"
     );
     // 불일치에서는 확인 없이 적용을 허용하지 않는다.
-    assert.equal(check.applyGate.decision.decision, "needsAcknowledgement", JSON.stringify(check.applyGate));
+    assert.equal(check.applyGate.decision, "needsAcknowledgement", JSON.stringify(check.applyGate));
 
     // **전제가 어긋나도 검사는 거부하지 않는다.** 각 단계가 판정을 받아야 한다.
     assert.ok(
@@ -720,6 +721,68 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
       encoding: "utf8",
     });
     assert.equal(treeAfter, treeBefore, "재현 **검사**가 워크스페이스를 바꿨습니다");
+
+    // ---- 적용: 시작 상태로 되돌린 뒤 기록을 다시 적용한다 ----
+    //
+    // 이것이 "재현"의 실제 정의다(product-strategy 6.3절). Rust 단위 테스트는 손으로 만든
+    // 계획을 적용하지만, 여기서는 **실제 실행이 낸 기록**을 실제 워크스페이스에 적용한다.
+
+    // 재현의 판정 재료가 export에 있어야 한다 — 없으면 아래 판정이 unknown으로 떨어지고,
+    // 그러면 이 테스트는 "돌기는 했다"만 확인하게 된다.
+    assert.ok(exported.fileMutations.length > 0, "변경 기록이 비었습니다");
+    assert.ok(
+      exported.fileMutations.some((m) => typeof m.postSha256 === "string"),
+      `기록에 내용 해시가 없습니다 — 재현을 판정할 수 없습니다: ${JSON.stringify(exported.fileMutations)}`
+    );
+
+    // 시작 상태로 되돌린다. 지문이 시작 상태의 것이므로 이래야 전제가 match가 된다.
+    execFileSync("git", ["-C", ctx.repo.root, "checkout", "--", "."], { encoding: "utf8" });
+    execFileSync("git", ["-C", ctx.repo.root, "clean", "-qfd"], { encoding: "utf8" });
+
+    const applied = hostExport(ctx, [
+      "reproduce",
+      "--workspace",
+      ctx.repo.root,
+      "--file",
+      exportPath,
+      "--apply",
+      "--auto-approve-writes",
+      "--artifacts",
+      ctx.artifacts,
+    ]) as {
+      precondition: { verdict: string };
+      applyGate: { decision: string };
+      completed: boolean;
+      outcome: string;
+      stoppedAt: { kind: string } | null;
+      applied: { tool: string; status: string }[];
+      files: { path: string; verdict: { status: string } }[];
+    };
+
+    // 되돌렸으므로 전제가 맞아야 한다. mismatch가 나오면 되돌리기가 덜 된 것이고,
+    // 그 상태에서 이어지는 판정은 아무것도 말하지 않는다.
+    assert.equal(
+      applied.precondition.verdict,
+      "match",
+      `시작 상태로 되돌리지 못했습니다: ${JSON.stringify(applied.precondition)}`
+    );
+    assert.equal(applied.applyGate.decision, "allowed", JSON.stringify(applied.applyGate));
+    assert.equal(
+      applied.completed,
+      true,
+      `적용이 중간에 멈췄습니다: ${JSON.stringify(applied.stoppedAt)}\n${JSON.stringify(applied.applied)}`
+    );
+
+    // **판정은 "단계가 다 돌았다"가 아니라 "기록과 같은 내용이 됐다"이다.**
+    assert.equal(
+      applied.outcome,
+      "reproduced",
+      `기록과 같은 상태가 아닙니다: ${JSON.stringify(applied.files)}`
+    );
+    assert.ok(
+      applied.files.every((f) => ["matches", "absentAsRecorded"].includes(f.verdict.status)),
+      `판정되지 않았거나 어긋난 파일이 있습니다: ${JSON.stringify(applied.files)}`
+    );
   });
 });
 

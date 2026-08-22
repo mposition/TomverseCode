@@ -76,8 +76,9 @@ apps/desktop/        Tauri 2 + React
                      **취소 소요 분포**(강제 포기 탈출구가 뜨는 시점의 근거). DB는 Rust의 것이므로
                      집계도 여기 둔다(Node가 SQLite를 직접 열지 않는다).
                      `reproduce`만 예외로 **DB를 열지 않는다** — 감사자에게는 DB가 없고(그래서
-                     export 파일이 있다), 열면 없던 state.db가 생겨 "아무것도 쓰지 않는다"가
-                     깨진다. 판정 규칙은 state-machine 21절
+                     export 파일이 있다), 열면 없던 state.db가 생긴다. 검사는 아무것도 쓰지 않고
+                     `--apply`는 파일을 쓰되 **각 단계가 Policy Gate를 그대로 지난다**(기록에
+                     있다는 것은 승인 근거가 아니다). 판정 규칙은 state-machine 21절
 spike/               Phase 0 가설 검증 하네스 (프로덕션 코드 아님, 실험 기록 — 보존하되 수정하지 않는다)
 evals/hypothesis-gate/  가설 게이트 G — 어려운 태스크에서 교차검증이 실제 이득인지 측정한다.
                      제품 코드가 아니라 **측정 도구**이며, production 실행 경로(tomverse-host)를

@@ -125,6 +125,9 @@ struct Args {
     file: Option<PathBuf>,
     /// 불일치를 넘기 위해 사용자가 명시하는 **기대 지문**. 플래그 하나로는 넘을 수 없다.
     accept_fingerprint: Option<String>,
+    /// 검사에 그치지 않고 **적용한다.** 기본값이 검사인 이유: 쓰는 쪽이 기본이면 실수의 대가가
+    /// 워크스페이스에 남는다.
+    apply: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -155,6 +158,7 @@ fn parse_args() -> Result<Args, String> {
         replay_draft: None,
         file: None,
         accept_fingerprint: None,
+        apply: false,
     };
 
     while let Some(flag) = raw.next() {
@@ -219,6 +223,7 @@ fn parse_args() -> Result<Args, String> {
             "--replay-draft" => args.replay_draft = Some(PathBuf::from(value()?)),
             "--file" => args.file = Some(PathBuf::from(value()?)),
             "--accept-fingerprint" => args.accept_fingerprint = Some(value()?),
+            "--apply" => args.apply = true,
             "--verbose" => args.verbose = true,
             "--all-workspaces" => args.all_workspaces = true,
             other => return Err(format!("알 수 없는 인자: {other}\n\n{}", usage())),
@@ -227,10 +232,11 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-/// `reproduce` — export 파일이 이 워크스페이스에 재현되는지 **검사**한다.
+/// `reproduce` — export 파일이 이 워크스페이스에 재현되는지 **검사**하고, `--apply`면 적용한다.
 ///
-/// 판정 규칙은 `tomverse_core::reproduce` 모듈 주석에 있다. 여기서 하는 일은 파일을 읽어
-/// 넘기고 결과를 찍는 것뿐이며, **아무것도 쓰지 않는다.**
+/// 판정 규칙은 `tomverse_core::reproduce` 모듈 주석에 있다. 검사는 아무것도 쓰지 않는다.
+/// 적용은 파일을 쓰지만 **DB는 열지 않는다** — 재현은 태스크가 아니고, 태스크 상태를 바꾸지도
+/// 않는다. 여는 순간 감사자의 머신에 없던 state.db가 생긴다.
 fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
     let path = args
         .file
@@ -242,11 +248,32 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
     let export: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("{path:?}가 JSON이 아닙니다: {e}"))?;
 
-    let out = tomverse_core::reproduce::check(
-        &export,
-        std::path::Path::new(&root.display()),
-        args.accept_fingerprint.as_deref(),
-    )?;
+    let out = if args.apply {
+        // pre-image가 여기 쌓인다 — 적용기가 스스로 되돌리지 않으므로 이게 되돌리기 재료다.
+        let artifacts_root = args.artifacts.clone().unwrap_or_else(ArtifactStore::default_root);
+        let artifacts = ArtifactStore::new(&artifacts_root).map_err(|e| format!("artifact 저장소 오류: {e}"))?;
+        let approve_all = args.approve == "auto";
+        let options = tomverse_core::reproduce::ApplyOptions {
+            root: root.clone(),
+            artifacts,
+            policy: TaskPolicy {
+                auto_approve_workspace_writes: args.auto_approve_writes,
+                allow_git_commit: args.allow_git_commit,
+                execution_mode: args.mode,
+                ..TaskPolicy::default()
+            },
+            // 재현이라고 해서 승인이 면제되지 않는다. **기록에 있다는 것은 승인 근거가 아니다.**
+            approve: &|_req, _decision| approve_all,
+            run_id: format!("repro-{}", uuid::Uuid::new_v4()),
+        };
+        tomverse_core::reproduce::apply(&export, &options, args.accept_fingerprint.as_deref())?
+    } else {
+        tomverse_core::reproduce::check(
+            &export,
+            std::path::Path::new(&root.display()),
+            args.accept_fingerprint.as_deref(),
+        )?
+    };
     // export와 같은 이유로 pretty다 — 사람이 읽고 무엇을 맞춰야 하는지 판단하는 것이 용도다.
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     Ok(0)
@@ -273,7 +300,11 @@ fn usage() -> String {
                  아무것도 쓰지 않으므로 전제가 무엇이든 거부하지 않는다. DB도 열지 않는다.\n\
                  판정은 종료 코드가 아니라 JSON에 있다 — 종료 코드에 실으면 '오류'와\n\
                  '재현 불가'가 같은 값이 된다. 적용기는 아직 없다.\n\
-                 [--accept-fingerprint <sha256:...>]로 불일치 확인의 판정만 미리 볼 수 있다"
+                 [--accept-fingerprint <sha256:...>]로 불일치를 확인해 넘긴다\n\
+                 [--apply]면 실제로 적용한다 — 각 단계는 Policy Gate를 그대로 지나고,\n\
+                 첫 실패에서 멈추며, 스스로 되돌리지는 않는다(보고의 preImageRef가 재료다).\n\
+                 판정은 '단계가 다 돌았다'(completed)가 아니라 기록된 최종 내용과의\n\
+                 대조(outcome)다"
         .to_string()
 }
 

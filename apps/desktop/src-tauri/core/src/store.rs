@@ -1215,9 +1215,19 @@ impl Store {
     }
 
     /// 파일 변경 내역 + 롤백 상태. 되돌릴 것이 남아 있는지 판단하는 근거다.
+    /// 이 태스크가 바꾼 파일들. **내용 해시를 함께 준다.**
+    ///
+    /// 해시를 넣는 이유는 진단이 아니라 **재현의 판정**이다. 감사 export가 이걸 담아야
+    /// 재현기가 "단계가 다 돌았다"가 아니라 **"기록과 같은 내용이 됐다"**를 말할 수 있다.
+    /// 그게 없으면 재현은 확인할 수 없는 약속이 되고, product-strategy 6.3절이 "재현은
+    /// 결정론적이고 보장 가능"이라고 적은 근거가 사라진다.
+    ///
+    /// 본문(`*_content_ref`)은 주지 않는다 — export는 밖으로 나가는 파일이고, 본문을 실으면
+    /// artifact를 빼기로 한 결정이 무의미해진다. 해시는 판정에 충분하다.
     pub fn mutation_records(&self, task_id: &str) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, pre_existed, post_existed, rollback_status, rolled_back_at, recorded_at
+            "SELECT path, pre_existed, post_existed, rollback_status, rolled_back_at, recorded_at,
+                    pre_sha256, post_sha256
              FROM file_mutations WHERE task_id = ?1 ORDER BY rowid",
         )?;
         let rows = stmt.query_map(params![task_id], |r| {
@@ -1234,6 +1244,12 @@ impl Store {
                 "rollbackStatus": r.get::<_, String>(3)?,
                 "rolledBackAt": r.get::<_, Option<String>>(4)?,
                 "recordedAt": r.get::<_, String>(5)?,
+                // **존재 여부와 해시를 둘 다 준다.** 삭제된 파일은 "해시가 없다"가 아니라
+                // "파일이 없다"이고, 둘을 해시 하나로 표현하면 구별되지 않는다.
+                "preExisted": pre != 0,
+                "postExisted": post != 0,
+                "preSha256": r.get::<_, Option<String>>(6)?,
+                "postSha256": r.get::<_, Option<String>>(7)?,
             }))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
