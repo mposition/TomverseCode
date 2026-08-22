@@ -377,7 +377,13 @@ export class Orchestrator {
 
     // ---- 라우팅 ----
     try {
-      this.routing = new Router(this.registry, this.deps.routerOptions).decide({
+      // **태스크 정책의 지정이 환경변수 선호보다 우선한다.** 선호는 기본값이고 지정은
+      // 이번 태스크에 대한 사용자의 선택이다 — 기본값이 선택을 덮으면 선택이 아니다.
+      const routerOptions: RouterOptions = {
+        ...this.deps.routerOptions,
+        ...(this.policy.modelPins ? { pinned: this.policy.modelPins } : {}),
+      };
+      this.routing = new Router(this.registry, routerOptions).decide({
         taskId: this.taskId,
         complexityTier: tier.tier,
         availableProviders: this.input.availableProviders,

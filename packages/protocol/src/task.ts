@@ -76,6 +76,25 @@ export interface TaskPolicy {
    * 뒤집는 것이므로(원칙 1), **선택지로 남기고 그 사실을 기록한다.**
    */
   budgetUsd: number | null;
+  /**
+   * 역할별 **모델 지정** (multi-engine-routing.md 15절).
+   *
+   * # 선호(preference)와 지정(pin)은 다르다
+   *
+   * 라우터에는 이미 환경변수로 오는 `preferred`가 있고, 그건 **쓸 수 없으면 조용히 다른 걸
+   * 쓴다**(사유는 `reason`에 남는다). 기본값에는 그게 맞다.
+   *
+   * 여기 있는 것은 **사용자가 이번 태스크에 대해 고른 값**이다. 쓸 수 없을 때 다른 모델로
+   * 대체하면, 사용자는 자기가 고르지 않은 모델에 자기 돈이 나간 것을 나중에 안다.
+   * 그래서 지정은 대체하지 않고 **멈춘다**(`RoutingError`).
+   *
+   * # co-executor는 지정할 수 없다
+   *
+   * 대조용 두 번째 실행자의 **유일한 일이 primary와 다른 것**이다(13.1절). 그걸 사용자가
+   * 고르게 하면 둘을 같게 만들 수 있고, 그 순간 "불일치 없음"은 정보가 아니라 착시가 된다.
+   * 그래서 지정 가능한 것은 primary executor와 reviewer뿐이다.
+   */
+  modelPins?: { executor?: string; reviewer?: string };
 }
 
 /**

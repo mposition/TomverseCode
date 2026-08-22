@@ -495,7 +495,18 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
     // `--budget-usd`를 여기서만 준다. **fake 공급자는 단가가 0이라 상한이 무엇도 막지 않으므로**
     // 이 시나리오가 확인하는 것은 강제 동작이 아니라 **배선**이다 — Rust가 받은 값이 정책 JSON을
     // 거쳐 Node의 원장까지 도달하는가. 강제 동작은 가격이 붙은 레지스트리로 단위 테스트가 본다.
-    const result = spawnSync(HOST_BIN, runArgs(ctx, ["--mode", "verified", "--timeout-secs", "180", "--budget-usd", "10"]), {
+    const result = spawnSync(HOST_BIN, runArgs(ctx, [
+        "--mode",
+        "verified",
+        "--timeout-secs",
+        "180",
+        "--budget-usd",
+        "10",
+        // 15절 모델 지정. **라우터가 어차피 고를 값을 지정한다** — 확인하려는 것은 배정 결과가
+        // 아니라 배선이다(Rust가 받은 값이 정책 JSON을 거쳐 라우터까지 가는가).
+        "--pin-executor",
+        "fake-executor",
+      ]), {
       encoding: "utf8",
       timeout: 210_000,
       env: hostEnv(),
@@ -551,6 +562,15 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
     ]) as { events: { type: string; payload: Record<string, unknown> }[] };
     // 상한이 Node까지 도달했는가. `enforced: false`면 배선 어딘가에서 값이 사라진 것이고,
     // 그때 사용자는 상한을 걸었다고 믿는 채로 상한 없이 돌게 된다.
+    // 지정이 라우터까지 갔는가. 배정된 모델이 같더라도 **사유가 "지정"이어야** 배선이 산 것이다.
+    const routing = detail.events.find((e) => e.type === "ROUTING_DECIDED");
+    assert.ok(routing, "라우팅 이벤트가 없습니다");
+    const primary = (routing!.payload.assignments as { role: string; modelId: string; reason: string }[]).find(
+      (a) => a.role === "executor"
+    )!;
+    assert.equal(primary.modelId, "fake-executor");
+    assert.ok(primary.reason.includes("지정"), primary.reason);
+
     const budgetPolicy = detail.events.find((e) => e.type === "BUDGET_POLICY");
     assert.ok(budgetPolicy, "BUDGET_POLICY 이벤트가 없습니다");
     assert.equal(budgetPolicy!.payload.enforced, true, JSON.stringify(budgetPolicy!.payload));

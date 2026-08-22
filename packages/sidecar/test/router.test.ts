@@ -162,3 +162,99 @@ test("환경변수에서 라우터 옵션을 읽는다", () => {
   assert.equal(options.preferred?.reviewer, "claude-sonnet-5");
   assert.equal(options.allowOrgVerified, true);
 });
+
+// ---- 15절: 역할별 모델 지정 ----
+
+/**
+ * **지정은 존중된다.** 정적 우선순위가 다른 것을 골랐을 값이라도 사용자가 고른 것을 쓴다.
+ */
+test("지정한 모델이 그 역할에 배정된다", () => {
+  const decision = new Router(registry, { pinned: { executor: "gpt-4.1" } }).decide({
+    taskId: "task-1",
+    complexityTier: "standard",
+    availableProviders: ["openai", "anthropic"],
+  });
+  const executor = decision.assignments.find((a) => a.role === "executor")!;
+  assert.equal(executor.modelId, "gpt-4.1");
+  assert.ok(executor.reason.includes("지정"), executor.reason);
+});
+
+/**
+ * **지정은 대체하지 않는다.** 선호(`preferred`)는 쓸 수 없으면 조용히 다른 걸 쓰지만,
+ * 지정은 사용자가 이번 태스크에 대해 고른 값이다 — 대체하면 고르지 않은 모델에 돈이 나간다.
+ */
+test("지정한 모델을 쓸 수 없으면 대체하지 않고 멈춘다", () => {
+  assert.throws(
+    () =>
+      new Router(registry, { pinned: { executor: "claude-sonnet-5" } }).decide({
+        taskId: "task-1",
+        complexityTier: "standard",
+        // anthropic 키가 없다 — 이건 "그 모델이 없다"가 아니라 "이 자격증명으로는 못 쓴다"이다.
+        availableProviders: ["openai"],
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof RoutingError, `${error}`);
+      assert.ok(error.message.includes("claude-sonnet-5"), error.message);
+      // 무엇을 고쳐야 하는지 말해야 한다 — 키인지, 조직 인증인지, 오타인지가 다른 행동이다.
+      assert.ok(error.message.includes("API 키"), error.message);
+      return true;
+    }
+  );
+});
+
+/** 선호는 종전대로 대체한다 — 기본값과 사용자의 선택은 다른 것이다. */
+test("선호는 쓸 수 없으면 대체하고 사유를 남긴다", () => {
+  const decision = new Router(registry, { preferred: { executor: "claude-sonnet-5" } }).decide({
+    taskId: "task-1",
+    complexityTier: "simple",
+    availableProviders: ["openai"],
+  });
+  const executor = decision.assignments.find((a) => a.role === "executor")!;
+  assert.notEqual(executor.modelId, "claude-sonnet-5");
+  assert.ok(executor.reason.includes("대체"), executor.reason);
+});
+
+/**
+ * **불변식이 지정을 이긴다.** 지정한 검수자가 실행자와 같은 공급자면 독립 검수가 성립하지
+ * 않는다. 다른 모델로 바꾸면 "지정은 대체하지 않는다"가 깨지고, 그대로 쓰면 원칙 4가 깨진다.
+ * 원칙 4를 지키고 **드롭 사실을 표시한다** — 사용자 권위는 "무엇을 만들 것인가"에 대한
+ * 것이고, "우리가 무엇을 검증이라 부를 것인가"는 우리가 파는 것이다.
+ */
+test("지정한 검수자가 독립적이지 않으면 바꾸지 않고 검수를 드롭한다", () => {
+  const decision = new Router(registry, {
+    pinned: { executor: "claude-sonnet-5", reviewer: "claude-opus-4-8" },
+  }).decide({
+    taskId: "task-1",
+    complexityTier: "standard",
+    // openai도 쓸 수 있다 — 즉 **독립 검수자를 뽑는 것이 가능했는데도** 바꾸지 않았다는 뜻이다.
+    // 대조는 켜지 않았으므로 실행자는 anthropic 하나이고, 지정된 검수자도 anthropic이다.
+    availableProviders: ["openai", "anthropic"],
+  });
+
+  assert.ok(!decision.activeRoles.includes("reviewer"), JSON.stringify(decision.assignments));
+  assert.equal(decision.reviewerIndependent, false);
+  const dropped = decision.appliedPolicies.find((p) => p.startsWith("reviewer_dropped:pinned_not_independent"));
+  assert.ok(dropped, JSON.stringify(decision.appliedPolicies));
+  // **다른 모델로 조용히 바뀌지 않았다.** anthropic이 후보에 있었으므로 대체는 가능했다.
+  assert.ok(!decision.assignments.some((a) => a.role === "reviewer"));
+  // 결정론적 검증은 그대로 돈다는 사실을 사유가 말해야 한다.
+  assert.ok(dropped!.includes("VERIFYING"), dropped);
+});
+
+/** 지정이 없으면 종전 동작 그대로다 — 이 기능이 기존 경로를 바꾸지 않는다. */
+test("지정이 없으면 정적 우선순위가 그대로 동작한다", () => {
+  const withPinField = new Router(registry, { pinned: {} }).decide({
+    taskId: "task-1",
+    complexityTier: "standard",
+    availableProviders: ["openai", "anthropic"],
+  });
+  const without = new Router(registry).decide({
+    taskId: "task-1",
+    complexityTier: "standard",
+    availableProviders: ["openai", "anthropic"],
+  });
+  assert.deepEqual(
+    withPinField.assignments.map((a) => a.modelId),
+    without.assignments.map((a) => a.modelId)
+  );
+});

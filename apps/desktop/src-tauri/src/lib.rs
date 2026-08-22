@@ -75,6 +75,9 @@ async fn start_task(
     /// **인자를 빠뜨린 화면이 상한을 조용히 끄지 못하게** 하는 것이 두 인자로 받는 이유다.
     budget_usd: Option<f64>,
     budget_unlimited: Option<bool>,
+    /// 역할별 모델 지정(`{ executor?, reviewer? }`). 없으면 라우터가 정한다.
+    /// **Rust는 해석하지 않고 그대로 넘긴다** — 모델 목록은 Node의 것이다.
+    model_pins: Option<Value>,
     timeout_secs: Option<u64>,
 ) -> Result<Value, String> {
     let execution_mode = match mode.as_str() {
@@ -89,7 +92,14 @@ async fn start_task(
     // `respond_approval` command가 처리될 수 있다 — 같은 스레드면 교착된다.
     tauri::async_runtime::spawn_blocking(move || {
         let session = app.state::<SessionState>();
-        session.start_task(&message, execution_mode, allow_git_commit.unwrap_or(false), budget, timeout)
+        session.start_task(
+            &message,
+            execution_mode,
+            allow_git_commit.unwrap_or(false),
+            budget,
+            model_pins.unwrap_or(Value::Null),
+            timeout,
+        )
     })
     .await
     .map_err(|e| format!("태스크 실행 스레드 오류: {e}"))?
@@ -212,6 +222,18 @@ fn task_export(state: tauri::State<'_, SessionState>, task_id: String) -> Result
     state.task_export(&task_id)
 }
 
+/// 이 자격증명으로 실제로 쓸 수 있는 모델 목록 (multi-engine-routing.md 15절).
+#[tauri::command]
+async fn list_models(app: tauri::AppHandle, timeout_secs: Option<u64>) -> Result<Value, String> {
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(10));
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = app.state::<SessionState>();
+        session.list_models(timeout)
+    })
+    .await
+    .map_err(|e| format!("모델 목록 스레드 오류: {e}"))?
+}
+
 /// 화면이 쓰는 문턱들과 그 근거 (16.3절 강제 포기 시점, 19.6절 "큰 변경" 안내).
 ///
 /// 값과 함께 `source`를 돌려주는 이유: 표본이 부족하면 그 값은 여전히 추정치인데, 숫자만
@@ -262,6 +284,7 @@ async fn restart_task(
     task_id: String,
     budget_usd: Option<f64>,
     budget_unlimited: Option<bool>,
+    model_pins: Option<Value>,
     timeout_secs: Option<u64>,
 ) -> Result<Value, String> {
     // 재실행은 **새 승인**이다. 이전 태스크의 상한을 이어받지 않는다 — 상한이 태스크당이라는
@@ -270,7 +293,7 @@ async fn restart_task(
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(900));
     tauri::async_runtime::spawn_blocking(move || {
         let session = app.state::<SessionState>();
-        session.restart_task(&task_id, budget, timeout)
+        session.restart_task(&task_id, budget, model_pins.unwrap_or(Value::Null), timeout)
     })
     .await
     .map_err(|e| format!("재실행 스레드 오류: {e}"))?
@@ -311,6 +334,7 @@ pub fn run() {
             derived_thresholds,
             task_transmission,
             task_export,
+            list_models,
             scan_input_for_secret_shapes,
             get_task,
             restart_task,

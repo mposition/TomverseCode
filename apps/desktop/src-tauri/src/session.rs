@@ -199,6 +199,19 @@ impl SessionState {
         serde_json::to_value(out).map_err(|e| format!("전송 내역을 직렬화할 수 없습니다: {e}"))
     }
 
+    /// 이 자격증명으로 실제로 쓸 수 있는 모델 목록 (multi-engine-routing.md 15절).
+    ///
+    /// **sidecar에 묻는다** — 레지스트리는 Node의 것이고, Rust가 별도 목록을 들고 있으면 두
+    /// 목록이 갈라져 "화면에서는 고를 수 있는데 시작하면 거부되는" 모델이 생긴다.
+    pub fn list_models(&self, timeout: Duration) -> Result<Value, String> {
+        let sidecar = self.with_active(|active| Ok(active.sidecar.clone()))?;
+        sidecar.request(
+            "models.list",
+            json!({ "availableProviders": available_providers() }),
+            timeout,
+        )
+    }
+
     /// 한 작업의 **감사 export**를 만든다 (product-strategy 6절).
     ///
     /// **값을 돌려줄 뿐 파일을 쓰지 않는다.** 임의 경로 쓰기를 UI가 시킬 수 있게 만들면
@@ -363,6 +376,7 @@ impl SessionState {
         mode: ExecutionMode,
         allow_git_commit: bool,
         budget_usd: Option<f64>,
+        model_pins: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
         let (sidecar, host, workspace_id, session_id) = self.with_active(|active| {
@@ -400,6 +414,9 @@ impl SessionState {
                 // null은 "기본값을 쓰라"가 아니라 **"상한 없음"**이다. sidecar의 mergePolicy가
                 // 키의 부재와 null을 구별하므로 여기서 항상 키를 넣는다.
                 "budgetUsd": budget_usd,
+                // 역할별 모델 지정. **Rust는 값을 해석하지 않고 그대로 넘긴다** — 모델 목록은
+                // Node의 것이고, 여기서 검증하면 두 곳이 서로 다른 규칙을 갖게 된다.
+                "modelPins": model_pins,
             },
             "workspaceName": self.info().and_then(|i| i.get("name").cloned()).unwrap_or(Value::Null),
             "availableProviders": available_providers(),
@@ -452,7 +469,13 @@ impl SessionState {
     ///
     /// 이전 명령을 자동 재개하지 않는 이유(state-machine-and-protocol.md 7절): 부분 실행된
     /// `ToolRequest`의 재개는 멱등성 보장이 없으면 위험하다. 같은 요청 문구로 처음부터 다시 돈다.
-    pub fn restart_task(&self, task_id: &str, budget_usd: Option<f64>, timeout: Duration) -> Result<Value, String> {
+    pub fn restart_task(
+        &self,
+        task_id: &str,
+        budget_usd: Option<f64>,
+        model_pins: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let task = self
             .get_task(task_id)?
             .ok_or_else(|| format!("작업을 찾을 수 없습니다: {task_id}"))?;
@@ -464,7 +487,7 @@ impl SessionState {
         // **기억나지 않는 설정으로 저장소 이력을 바꾸는 것**보다 제안하지 않는 편이 안전하다.
         // **다시 실행은 새 승인이다.** 이전 태스크의 상한을 이어받지 않고 화면이 준 값을 쓴다 —
         // 상한이 태스크당이라는 결정의 직접적 귀결이고, 그 사실은 화면이 말해야 한다.
-        self.start_task(&task.user_message, mode, false, budget_usd, timeout)
+        self.start_task(&task.user_message, mode, false, budget_usd, model_pins, timeout)
     }
 
     /// 취소 요청. **두 방향 모두 필요하다:**

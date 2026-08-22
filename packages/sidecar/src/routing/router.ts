@@ -10,10 +10,45 @@ import type { ModelRegistry } from "./registry.js";
  */
 
 export interface RouterOptions {
-  /** 역할별 선호 모델 override (환경변수/설정에서 온다). 모델 ID를 코드에 고정하지 않기 위한 축. */
+  /**
+   * 역할별 **선호** 모델 (환경변수/설정에서 온다). 모델 ID를 코드에 고정하지 않기 위한 축.
+   *
+   * 쓸 수 없으면 조용히 다른 걸 쓰고 사유를 `reason`에 남긴다 — 기본값에는 그게 맞다.
+   */
   preferred?: Partial<Record<EngineRole, string>>;
+  /**
+   * 역할별 **지정** 모델 (사용자가 이번 태스크에 대해 고른 값, 15절).
+   *
+   * `preferred`와 달리 **대체하지 않는다.** 쓸 수 없으면 `RoutingError`로 멈춘다 —
+   * 대체하면 사용자는 자기가 고르지 않은 모델에 자기 돈이 나간 것을 나중에 안다.
+   */
+  pinned?: { executor?: string; reviewer?: string };
   /** 조직 인증이 필요한 모델도 후보에 넣을지 (사용자가 인증됐다고 알린 경우) */
   allowOrgVerified?: boolean;
+}
+
+/**
+ * 지정한 모델을 쓸 수 없는 이유를 **구별해서** 말한다.
+ *
+ * "쓸 수 없습니다"만 말하면 사용자는 무엇을 고쳐야 하는지 모른다 — 키를 넣어야 하는지,
+ * 조직 인증을 받아야 하는지, 오타인지가 전부 다른 행동이다. gpt-5 사례가 정확히 이것이었다:
+ * 모델 가용성은 전역 사실이 아니라 **자격증명별 사실**이다.
+ */
+function pinFailureReason(registry: ModelRegistry, modelId: string, availableProviders: readonly string[]): string {
+  const known = registry.get(modelId);
+  if (!known) {
+    return `${modelId}는 모델 목록에 없습니다 (오타이거나 지원하지 않는 모델입니다)`;
+  }
+  if (!availableProviders.includes(known.providerId)) {
+    return `${modelId}를 쓰려면 ${known.providerId}의 API 키가 필요한데 설정되어 있지 않습니다`;
+  }
+  if (known.availability.requiresOrgVerification) {
+    return `${modelId}는 ${known.providerId} 조직 인증이 필요합니다 — 인증 전에는 호출이 실패합니다`;
+  }
+  if (known.availability.deprecatedAfter) {
+    return `${modelId}는 ${known.availability.deprecatedAfter} 이후 지원되지 않습니다`;
+  }
+  return `${modelId}를 후보에서 찾을 수 없습니다`;
 }
 
 /** 대조를 드롭한 사유 — `appliedPolicies`에 남고 UI가 그대로 보여준다. */
@@ -72,6 +107,11 @@ export class Router {
       );
     }
 
+    // **지정은 대체하지 않는다.** 쓸 수 없으면 여기서 멈추고 이유를 말한다 — 첫 유료 호출
+    // 전이며, 사용자가 고르지 않은 모델에 돈이 나가지 않는다.
+    this.assertPinAvailable("executor", candidates, input.availableProviders);
+    this.assertPinAvailable("reviewer", candidates, input.availableProviders);
+
     const executor = this.pick("executor", candidates);
     const assignments: RoleAssignment[] = [executor];
     const activeRoles: EngineRole[] = ["executor"];
@@ -115,7 +155,23 @@ export class Router {
       );
       const independent = candidates.filter((c) => !executorProviders.has(c.providerId));
 
-      if (independent.length > 0) {
+      // 사용자가 지정한 검수자가 **독립적이지 않은** 경우가 있다(실행자와 같은 공급자).
+      // 이때 다른 모델로 바꿔 배정하면 "지정은 대체하지 않는다"가 깨지고, 그대로 쓰면
+      // 원칙 4("같은 공급자로 검증한 척하지 않는다")가 깨진다. **원칙 4를 지킨다** —
+      // 사용자 권위는 "무엇을 만들 것인가"에 대한 것이고, "우리가 무엇을 검증이라 부를
+      // 것인가"는 우리가 파는 것이다(product-strategy 16절). 대신 드롭 사실을 표시한다.
+      const reviewerPin = this.options.pinned?.reviewer;
+      const pinnedReviewerIsIndependent = reviewerPin
+        ? independent.some((c) => c.modelId === reviewerPin)
+        : true;
+
+      if (reviewerPin && !pinnedReviewerIsIndependent) {
+        appliedPolicies.push(
+          `reviewer_dropped:pinned_not_independent(${reviewerPin}) — 지정한 검수자가 실행자와 같은 ` +
+            "공급자라 독립 검수가 성립하지 않습니다. 다른 모델로 바꾸지 않고 검수 역할을 드롭했습니다. " +
+            "결정론적 검증(VERIFYING)은 그대로 수행됩니다."
+        );
+      } else if (independent.length > 0) {
         const reviewer = this.pick("reviewer", independent);
         assignments.push(reviewer);
         activeRoles.push("reviewer");
@@ -168,8 +224,43 @@ export class Router {
     };
   }
 
+  /**
+   * 지정한 모델이 후보에 있는지 **배정을 시작하기 전에** 확인한다.
+   *
+   * 배정 도중에 확인하면 executor를 뽑은 뒤 reviewer 지정이 틀린 것을 알게 되고, 그때는
+   * 이미 "무엇이 잘못됐나"에 답하기 위해 두 개의 사실을 합쳐야 한다.
+   */
+  private assertPinAvailable(
+    role: "executor" | "reviewer",
+    candidates: ModelEntry[],
+    availableProviders: readonly string[]
+  ): void {
+    const pinned = this.options.pinned?.[role];
+    if (!pinned) return;
+    if (candidates.some((c) => c.modelId === pinned)) return;
+    throw new RoutingError(
+      `${role} 역할로 지정한 ${pinFailureReason(this.registry, pinned, availableProviders)}. ` +
+        "지정한 모델은 다른 모델로 대체하지 않습니다 — 고르지 않은 모델에 비용이 나가지 않도록 여기서 멈춥니다."
+    );
+  }
+
   private pick(role: EngineRole, candidates: ModelEntry[]): RoleAssignment {
     const pool = candidates;
+    const pinnedId = role === "executor" || role === "reviewer" ? this.options.pinned?.[role] : undefined;
+    if (pinnedId) {
+      const match = pool.find((c) => c.modelId === pinnedId);
+      if (match) {
+        return {
+          role,
+          modelId: match.modelId,
+          providerId: match.providerId,
+          reason: `사용자가 이 태스크의 ${role} 역할로 ${pinnedId}를 지정함`,
+        };
+      }
+      // 여기 오는 것은 **불변식이 후보를 좁힌 경우**다(예: 검수자 독립성 때문에 executor의
+      // 공급자가 빠진 뒤). 지정 자체는 `assertPinAvailable`이 이미 확인했으므로, 이 자리에서
+      // 대체하지 않고 호출자가 역할을 드롭하도록 둔다 — 아래 주석 참조.
+    }
     const preferredId = this.options.preferred?.[role];
     if (preferredId) {
       const match = pool.find((c) => c.modelId === preferredId);

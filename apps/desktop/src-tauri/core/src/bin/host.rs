@@ -12,7 +12,8 @@
 //! tomverse-host run --workspace <path> --message "..." [--mode fast|verified]
 //!                   [--approve auto|deny] [--db <path>] [--artifacts <path>]
 //!                   [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit]
-//!                   [--cancel-after-ms <n>] [--budget-usd <n>] [--verbose]
+//!                   [--cancel-after-ms <n>] [--budget-usd <n>]
+//!                   [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]
 //! tomverse-host rollback --workspace <path> --task <taskId> --db <path> [--artifacts <path>]
 //! tomverse-host recover  --workspace <path> --db <path>
 //! tomverse-host tasks    --workspace <path> --db <path>
@@ -87,6 +88,10 @@ struct Args {
     /// 기본 상한을 넣으면 그 통제 위에 우리가 모르는 두 번째 상한이 얹힌다.
     /// **UI 경로의 기본값은 이것과 다르다** — 거기서는 상한 없음이 명시적 선택이어야 한다.
     budget_usd: Option<f64>,
+    /// 역할별 모델 지정 (multi-engine-routing.md 15절). `executor`/`reviewer`만 지정할 수 있다 —
+    /// 대조용 두 번째 실행자는 **primary와 다른 것이 유일한 일**이므로 고르게 두지 않는다.
+    pin_executor: Option<String>,
+    pin_reviewer: Option<String>,
     timeout_secs: u64,
     verbose: bool,
     /// 시나리오 A용: 실행 시작 후 N ms 뒤에 스스로 취소를 요청한다.
@@ -132,6 +137,8 @@ fn parse_args() -> Result<Args, String> {
         auto_approve_writes: false,
         allow_git_commit: false,
         budget_usd: None,
+        pin_executor: None,
+        pin_reviewer: None,
         timeout_secs: 600,
         verbose: false,
         cancel_after_ms: None,
@@ -160,6 +167,8 @@ fn parse_args() -> Result<Args, String> {
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
             "--auto-approve-writes" => args.auto_approve_writes = true,
             "--allow-git-commit" => args.allow_git_commit = true,
+            "--pin-executor" => args.pin_executor = Some(value()?),
+            "--pin-reviewer" => args.pin_reviewer = Some(value()?),
             "--budget-usd" => {
                 let text = value()?;
                 let parsed: f64 = text
@@ -210,7 +219,8 @@ fn parse_args() -> Result<Args, String> {
 fn usage() -> String {
     "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
-     [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>] [--budget-usd <n>] [--verbose]\n\
+     [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>]\n\
+     [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
      \n\
      가설 게이트 전용: [--providers <csv>] [--review-mode blind|informed] [--replay-draft <file>]\n\
      \n\
@@ -603,6 +613,21 @@ fn run_task(
         experiment.insert("replayDraft".to_string(), draft);
     }
 
+    // 지정이 없으면 키 자체를 넣지 않는다 — 빈 객체를 넣으면 "지정했는데 비었다"와
+    // "지정하지 않았다"가 같은 모양이 된다.
+    let mut pins = serde_json::Map::new();
+    if let Some(m) = &args.pin_executor {
+        pins.insert("executor".to_string(), json!(m));
+    }
+    if let Some(m) = &args.pin_reviewer {
+        pins.insert("reviewer".to_string(), json!(m));
+    }
+    let model_pins = if pins.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(pins)
+    };
+
     let params = json!({
         "taskRequest": {
             "taskId": task_id,
@@ -617,6 +642,7 @@ fn run_task(
             // null은 "기본값을 쓰라"가 아니라 **"상한 없음"**이다. 키를 빼면 sidecar의
             // 기본 상한이 적용되어, 이 바이너리를 쓰는 하네스가 모르는 상한이 생긴다.
             "budgetUsd": args.budget_usd,
+            "modelPins": model_pins,
             "executionMode": match args.mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
         },
         "workspaceName": workspace_name(host.root()),

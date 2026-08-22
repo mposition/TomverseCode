@@ -576,6 +576,47 @@ test("공급자 사용량을 역할·모델과 함께 기록한다", async () =>
   }
 });
 
+/**
+ * **태스크 정책의 모델 지정이 라우터까지 도달한다** (multi-engine-routing.md 15절).
+ *
+ * 라우터 단위 테스트는 옵션을 직접 넣어 확인하지만, 그건 정책 → 라우터 배선에 대해서는
+ * 아무것도 말하지 않는다. 배선이 끊기면 사용자가 고른 모델이 조용히 무시된다.
+ */
+test("정책의 모델 지정이 라우팅 배정에 반영된다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    { defaultPatch: VALID_PATCH },
+    { policy: { modelPins: { executor: "fake-reviewer" } }, providers: ["fake-a", "fake-b", "fake-c"] }
+  );
+  await orchestrator.run();
+
+  const routing = host.events.find((e) => e.type === "ROUTING_DECIDED");
+  assert.ok(routing, `라우팅 이벤트가 없습니다: ${host.events.map((e) => e.type).join(", ")}`);
+  const assignments = (routing!.payload as { assignments: { role: string; modelId: string; reason: string }[] })
+    .assignments;
+  const primary = assignments.find((a) => a.role === "executor")!;
+  assert.equal(primary.modelId, "fake-reviewer", JSON.stringify(assignments));
+  assert.ok(primary.reason.includes("지정"), primary.reason);
+});
+
+/**
+ * **쓸 수 없는 모델을 지정하면 조용히 대체하지 않고 태스크가 멈춘다.** 대체하면 사용자는
+ * 자기가 고르지 않은 모델에 자기 돈이 나간 것을 나중에 안다.
+ */
+test("쓸 수 없는 모델을 지정하면 라우팅에서 멈춘다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }] },
+    {},
+    { policy: { modelPins: { executor: "claude-sonnet-5" } } }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "failed");
+  assert.ok(result.summary.includes("claude-sonnet-5"), result.summary);
+  // 호출이 나가지 않았다 — 멈추는 지점이 첫 유료 호출 **전**이어야 의미가 있다.
+  assert.equal(host.usage.length, 0, JSON.stringify(host.usage));
+});
+
 test("API 키가 없으면 라우팅 단계에서 명확히 실패한다", async () => {
   const { orchestrator } = build({ verifyResults: [{ overall: "pass" }] }, {}, { providers: [] });
   const result = await orchestrator.run();

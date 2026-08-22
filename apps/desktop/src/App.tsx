@@ -22,6 +22,7 @@ import {
   type StoredEvent,
   type TaskEvent,
   type TaskPhase,
+  type AvailableModel,
   type TaskBudgetThreshold,
   type TaskRow,
   type UserDecisionInput,
@@ -81,6 +82,19 @@ const DEFAULT_LARGE_CHANGE_FILES = 8;
  * 있다 — 인자를 빠뜨린 화면이 상한을 조용히 끄지 못하게 하기 위해서다. 그러려면 화면도
  * "없음"을 명시적으로 말해야 하고, 그 변환 지점이 한 곳뿐이어야 한다.
  */
+/**
+ * 화면의 선택을 `start_task`의 `modelPins`로 바꾼다.
+ *
+ * **비어 있으면 키를 넣지 않는다.** 빈 문자열을 그대로 보내면 "그런 모델 ID를 지정했다"가
+ * 되어 라우터가 멈춘다 — 사용자는 아무것도 고르지 않았는데.
+ */
+function modelPins(executor: string, reviewer: string): { executor?: string; reviewer?: string } | undefined {
+  const pins: { executor?: string; reviewer?: string } = {};
+  if (executor) pins.executor = executor;
+  if (reviewer) pins.reviewer = reviewer;
+  return Object.keys(pins).length > 0 ? pins : undefined;
+}
+
 function budgetArgs(text: string): { budgetUsd: number | null; budgetUnlimited: boolean } {
   const trimmed = text.trim();
   if (trimmed.length === 0) return { budgetUsd: null, budgetUnlimited: true };
@@ -118,6 +132,15 @@ export default function App() {
    */
   const [budgetText, setBudgetText] = useState<string>("");
   const [budgetSuggestion, setBudgetSuggestion] = useState<TaskBudgetThreshold | null>(null);
+  /**
+   * 역할별 모델 지정 (multi-engine-routing.md 15절). 빈 문자열은 **"라우터가 정한다"**이다.
+   *
+   * co-executor는 없다 — 대조 표본의 유일한 일이 primary와 다른 것이라, 고르게 하면 둘을
+   * 같게 만들 수 있고 그 순간 "불일치 없음"은 착시가 된다(13.1절).
+   */
+  const [models, setModels] = useState<AvailableModel[]>([]);
+  const [pinExecutor, setPinExecutor] = useState("");
+  const [pinReviewer, setPinReviewer] = useState("");
   /**
    * 이 작업이 만든 커밋. **되돌리기 화면의 선택지가 이 값에 달려 있다** —
    * 커밋이 없으면 파일 되돌리기 하나뿐이고, 있으면 사용자가 무엇을 되돌릴지 골라야 한다.
@@ -335,6 +358,14 @@ export default function App() {
         setBudgetSuggestion(null);
         setBudgetText("");
       }
+      // 모델 목록도 워크스페이스를 열 때 한 번 읽는다. **실패해도 작업을 막지 않는다** —
+      // 목록이 없으면 지정 없이(라우터가 정하는 대로) 실행되며, 그건 종전 동작이다.
+      try {
+        const listed = await invoke<{ models: AvailableModel[] }>("list_models", {});
+        setModels(listed.models ?? []);
+      } catch {
+        setModels([]);
+      }
     } catch (error) {
       setOpenError(String(error));
     } finally {
@@ -363,6 +394,7 @@ export default function App() {
         mode,
         allowGitCommit,
         ...budgetArgs(budgetText),
+        modelPins: modelPins(pinExecutor, pinReviewer),
       });
       setFinalResult(result);
       // 전송 내역은 **끝난 뒤에** 읽는다. 실패해도 결과 화면을 막지 않는다 — 이건 사후 조회이고,
@@ -608,7 +640,11 @@ export default function App() {
       setElapsedMs(0);
       try {
         // 다시 실행은 **새 승인**이다 — 지금 입력란에 있는 값이 이 실행의 상한이다.
-        const result = await invoke<FinalResult>("restart_task", { taskId: id, ...budgetArgs(budgetText) });
+        const result = await invoke<FinalResult>("restart_task", {
+          taskId: id,
+          ...budgetArgs(budgetText),
+          modelPins: modelPins(pinExecutor, pinReviewer),
+        });
         setFinalResult(result);
         setTaskId(result.taskId);
       } catch (error) {
@@ -738,6 +774,46 @@ export default function App() {
                   변경을 git에 커밋 (매번 승인을 묻습니다)
                 </label>
               </fieldset>
+              {/* 역할별 모델 지정 (multi-engine-routing.md 15절).
+                  **목록이 비면 이 블록 자체를 그리지 않는다** — 빈 select는 "고를 것이 없다"와
+                  "목록을 못 읽었다"를 구별하지 못하고, 어느 쪽이든 사용자가 할 일은 없다. */}
+              {models.length > 0 && (
+                <fieldset className="modes" disabled={running}>
+                  <legend>모델 지정 (비우면 자동)</legend>
+                  <label className="pin-row">
+                    실행자
+                    <select value={pinExecutor} onChange={(e) => setPinExecutor(e.target.value)}>
+                      <option value="">자동</option>
+                      {models.map((m) => (
+                        <option key={m.modelId} value={m.modelId}>
+                          {m.modelId} · ${m.inputPerMTok}/${m.outputPerMTok} per MTok
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="pin-row">
+                    검수자
+                    <select value={pinReviewer} onChange={(e) => setPinReviewer(e.target.value)}>
+                      <option value="">자동</option>
+                      {models.map((m) => (
+                        <option key={m.modelId} value={m.modelId}>
+                          {m.modelId} · ${m.inputPerMTok}/${m.outputPerMTok} per MTok
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <p className="muted small">
+                    지정한 모델은 <strong>다른 모델로 대체하지 않습니다</strong> — 쓸 수 없으면 시작하지 않고 이유를
+                    알려줍니다. 그리고 지정한 검수자가 실행자와 같은 공급자면{" "}
+                    <strong>검수를 드롭합니다</strong>: 같은 공급자로 "검증한 척"하지 않는 것이 이 도구가 파는 것입니다.
+                  </p>
+                  <p className="muted small">
+                    대조용 두 번째 실행자는 고를 수 없습니다 — 그 표본의 유일한 일이 첫 번째와 다른 것이라, 둘을 같게
+                    만들면 "불일치 없음"이 정보가 아니라 착시가 됩니다.
+                  </p>
+                </fieldset>
+              )}
+
               {/* 예산 상한 (multi-engine-routing.md 10.6절).
                   **비워 두면 상한 없음이고, 화면이 그렇게 말한다.** 0을 "무제한"으로 읽지
                   않는 이유는 budgetArgs 주석에 있다. */}

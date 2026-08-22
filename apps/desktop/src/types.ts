@@ -237,6 +237,20 @@ export interface FinalResult {
   budget?: TaskBudgetOutcome;
 }
 
+/**
+ * 이 자격증명으로 **실제로 쓸 수 있는** 모델 (multi-engine-routing.md 15절).
+ *
+ * 전체 카탈로그가 아니다 — 화면이 거르면 화면과 라우터가 서로 다른 규칙을 갖게 되어
+ * "고를 수 있게 보였는데 시작하면 거부되는" 모델이 생긴다.
+ */
+export interface AvailableModel {
+  modelId: string;
+  providerId: string;
+  inputPerMTok: number;
+  outputPerMTok: number;
+  maxContextTokens: number;
+}
+
 export interface WorkspaceInfo {
   rootPath: string;
   name: string;

@@ -891,3 +891,14 @@ button.tiny {
   font-size: 1.4rem;
   margin: 0.25rem 0 0.5rem;
 }
+
+/* 모델 지정 — 라벨과 select를 한 줄에 둔다. 두 줄이면 두 역할의 관계가 안 보인다. */
+.pin-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.pin-row select {
+  flex: 1;
+  min-width: 0;
+}

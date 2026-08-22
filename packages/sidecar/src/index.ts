@@ -3,6 +3,7 @@ import type { FinalResult, TaskPolicy, TaskStartParams, TaskUserInputParams } fr
 import { DEFAULT_TASK_POLICY } from "@tomverse/protocol";
 import { NdjsonTransport } from "./ipc/transport.js";
 import { Orchestrator, type OrchestratorDeps } from "./orchestrator/orchestrator.js";
+import { ModelRegistry } from "./routing/registry.js";
 import { routerOptionsFromEnv } from "./routing/router.js";
 import type { FakeProviderOptions } from "./providers/fake.js";
 
@@ -49,6 +50,35 @@ export function createSidecar(
   const fake = options.fake ?? fakeOptionsFromEnv();
 
   transport.onRequest("ping", async () => ({ pong: true, protocolVersion: PROTOCOL_VERSION }));
+
+  /**
+   * 이 자격증명으로 **실제로 쓸 수 있는 모델** 목록 (multi-engine-routing.md 15절).
+   *
+   * 화면이 역할별 모델을 고르려면 목록이 필요한데, 레지스트리는 Node에 있다.
+   *
+   * **`available()`을 그대로 쓴다.** 전체 카탈로그를 보내고 화면이 거르게 하면, 화면과
+   * 라우터가 서로 다른 규칙으로 거르게 되어 "고를 수 있게 보였는데 시작하면 거부되는" 모델이
+   * 생긴다. 가용성은 전역 사실이 아니라 자격증명별 사실이라는 것이 gpt-5 사례의 교훈이다.
+   *
+   * 단가를 함께 보낸다 — 모델 선택은 대부분 비용에 관한 결정이고, 숫자 없이 고르라고 하면
+   * 사용자는 이름으로 고른다.
+   */
+  transport.onRequest("models.list", async (params) => {
+    const { availableProviders } = (params ?? {}) as { availableProviders?: string[] };
+    const registry = new ModelRegistry();
+    const entries = registry.available(availableProviders ?? [], {
+      allowOrgVerified: routerOptionsFromEnv().allowOrgVerified,
+    });
+    return {
+      models: entries.map((entry) => ({
+        modelId: entry.modelId,
+        providerId: entry.providerId,
+        inputPerMTok: entry.economics.inputPerMTok,
+        outputPerMTok: entry.economics.outputPerMTok,
+        maxContextTokens: entry.capabilities.maxContextTokens,
+      })),
+    };
+  });
 
   transport.onRequest("task.start", async (params) => {
     const { taskRequest, policy, availableProviders, experiment } = params as TaskStartParams;
