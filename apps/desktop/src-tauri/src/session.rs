@@ -727,10 +727,16 @@ impl SessionState {
         } else {
             ApprovalOutcome::Denied { note }
         };
-        self.pending_approvals
-            .respond(approval_id, &active_root, outcome)
-            .map_err(|e| e.message())?;
-        Ok(json!({ "ok": true }))
+        // **실패도 `Ok` 봉투로 돌려준다.** Tauri의 `Err`는 문자열 하나뿐이라 구조가 들어갈
+        // 자리가 없고, 문자열에 구조를 실으면 화면이 문장을 파싱하게 된다 — 그건 6절이
+        // 없애려는 바로 그것이다.
+        match self.pending_approvals.respond(approval_id, &active_root, outcome) {
+            Ok(()) => Ok(json!({ "ok": true })),
+            Err(issue) => {
+                let ui = tomverse_core::uimsg::UserFacing::ui(&issue);
+                Ok(json!({ "ok": false, "code": ui.code, "params": ui.params, "message": ui.message }))
+            }
+        }
     }
 }
 

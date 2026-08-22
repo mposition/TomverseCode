@@ -11,17 +11,14 @@
  * # 문장도 값에서 만든다
  *
  * 같은 이유로 **문장 자체도 프로세스 경계를 넘지 않는다.** Rust는 `code`와 `params`를 주고
- * 문장은 여기서 만든다 — 문장을 넘기면 그 문장은 영원히 한국어이고, 다국어 카탈로그를
+ * 문장은 화면이 만든다 — 문장을 넘기면 그 문장은 영원히 한국어이고, 다국어 카탈로그를
  * 만들어도 **카탈로그 밖에 남는다**(ui-wireframes.md 6절: 반쪽 번역).
+ *
+ * 카탈로그는 이 파일이 아니라 `lib/messages.ts` 하나다 — 경계마다 렌더러를 두면 "이 코드가
+ * 카탈로그에 있는가"를 한 번에 확인할 수 없다.
  */
 
-/** 사용자에게 보이는 문자열의 카탈로그. 지금은 한국어 하나뿐이다 — 6절이 시점을 정한다. */
-const KO: Record<string, (params: Record<string, unknown>) => string> = {
-  respawnLimit: (p) => `백엔드가 ${p.attempts}번 다시 시작한 뒤에도 계속 종료됩니다.`,
-  protocolViolation: (p) =>
-    `백엔드와의 통신이 프로토콜 위반으로 끊겼습니다. 다시 시작하지 않습니다 — 같은 위반이 반복될 뿐입니다. (${p.reason})`,
-  spawnFailed: (p) => `백엔드를 다시 시작할 수 없습니다 (${p.attempt}/${p.max}): ${p.error}`,
-};
+import { render, type UiMessage } from "./messages.js";
 
 /** Rust `SupervisorStatus`의 미러. `noWorkspace`는 워크스페이스를 아직 안 연 상태다. */
 export type BackendStatus =
@@ -53,21 +50,6 @@ export interface BackendBanner {
 }
 
 /**
- * 코드로 문장을 만든다. 모르는 코드는 **원문으로 떨어진다** — 번역은 없지만 뜻은 전달된다.
- *
- * 이 대체 경로가 있어야 Rust가 새 코드를 추가할 때 화면이 빈칸을 그리지 않는다. 반쪽 번역은
- * 나쁘지만, **반쪽 번역과 빈 화면 중에서는 반쪽 번역이 낫다.**
- */
-export function renderCode(code: string, params: Record<string, unknown>, fallback: string): {
-  message: string;
-  untranslated: boolean;
-} {
-  const render = KO[code];
-  if (!render) return { message: fallback, untranslated: true };
-  return { message: render(params), untranslated: false };
-}
-
-/**
  * 배너를 그릴 필요가 있으면 그 내용을, 없으면 `null`.
  *
  * `willRespawn`에 배너를 띄우지 않는 이유: 다음 작업에서 자동으로 복구되므로 **사용자가 할
@@ -77,9 +59,9 @@ export function renderCode(code: string, params: Record<string, unknown>, fallba
 export function bannerFor(status: BackendStatus | null): BackendBanner | null {
   if (!status) return null;
   if (status.state !== "unavailable") return null;
-  const rendered = renderCode(status.code, status.params ?? {}, status.message);
+  const rendered = render(status as UiMessage)!;
   return {
-    message: rendered.message,
+    message: rendered.text,
     untranslated: rendered.untranslated,
     // **`none`이면 버튼을 주지 않는다.** 프로토콜 위반은 다시 열어도 같은 위반이 반복되므로,
     // 버튼을 주면 눌러도 같은 결과가 나온다 — 그건 안내가 아니라 거짓말이다.
@@ -99,7 +81,3 @@ export function reopenTarget(banner: BackendBanner | null, workspacePath: string
   return trimmed ? trimmed : null;
 }
 
-/** 카탈로그가 아는 코드들. 테스트가 Rust 쪽 코드 목록과 대조하는 데 쓴다. */
-export function knownCodes(): string[] {
-  return Object.keys(KO).sort();
-}

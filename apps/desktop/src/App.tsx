@@ -45,6 +45,7 @@ import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
 import { TaskHistory } from "./components/TaskHistory";
 import { bannerFor, reopenTarget, type BackendStatus } from "./lib/backendStatus";
+import { render, type UiMessage } from "./lib/messages";
 import {
   EMPTY_TASK_LIST,
   TASK_PAGE_SIZE,
@@ -560,12 +561,20 @@ export default function App() {
       const current = approval;
       setApproval(null);
       try {
-        await invoke("respond_approval", {
+        // **실패도 `Ok` 봉투로 온다**(ui-wireframes 6절). Tauri의 `Err`는 문자열 하나뿐이라
+        // 구조가 들어갈 자리가 없고, 문자열에 구조를 실으면 화면이 문장을 파싱하게 된다.
+        const response = await invoke<UiMessage & { ok: boolean }>("respond_approval", {
           approvalId: current.approvalId,
           granted,
           note: granted ? null : "사용자가 승인을 거부했습니다",
         });
+        if (!response.ok) {
+          const rendered = render(response);
+          if (rendered) setNotice(`승인 응답 실패: ${rendered.text}`);
+        }
       } catch (error) {
+        // 여기 걸리는 것은 명령 자체가 실패한 경우(워크스페이스 없음 등)다 — 아직 코드가
+        // 붙지 않은 경계이므로 원문을 그대로 보여준다.
         setNotice(`승인 응답 실패: ${String(error)}`);
       }
     },

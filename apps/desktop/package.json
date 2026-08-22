@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "//test": "화면(tsx)이 아니라 src/lib의 순수 로직만 돌린다 — DOM 없이 node --test로 검증한다.",
-    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/diffSummary.test.js dist-test/test/budgetCheck.test.js dist-test/test/taskPaging.test.js dist-test/test/backendStatus.test.js dist-test/test/diffList.test.js"
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/diffSummary.test.js dist-test/test/budgetCheck.test.js dist-test/test/taskPaging.test.js dist-test/test/backendStatus.test.js dist-test/test/diffList.test.js dist-test/test/messages.test.js"
   },
   "dependencies": {
     "react": "^19.1.0",

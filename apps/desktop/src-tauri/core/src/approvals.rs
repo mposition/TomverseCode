@@ -61,8 +61,30 @@ pub enum RespondError {
     Gone,
 }
 
-impl RespondError {
-    pub fn message(&self) -> String {
+/// **문장이 아니라 코드와 파라미터로 화면에 간다**(ui-wireframes.md 6절).
+///
+/// 종전에는 `message()`가 한국어 문장을 돌려주고 그 문장이 그대로 화면에 떴다. 그러면 그
+/// 문장은 카탈로그 밖에 남아 영원히 한국어다. `korean()`은 남지만 이제 **화면이 코드를 모를
+/// 때의 대체 표시**이고, 로그용이다.
+impl crate::uimsg::UserFacing for RespondError {
+    fn code(&self) -> &'static str {
+        match self {
+            RespondError::Unknown => "approvalUnknown",
+            RespondError::WrongWorkspace { .. } => "approvalWrongWorkspace",
+            RespondError::Gone => "approvalGone",
+        }
+    }
+
+    fn params(&self) -> serde_json::Value {
+        match self {
+            // 끼울 값이 없는 코드도 **빈 객체**를 준다 — `null`을 주면 화면이 `params.x`를
+            // 읽다 터지고, 그 실패는 "문장이 안 뜬다"로만 보인다.
+            RespondError::Unknown | RespondError::Gone => serde_json::json!({}),
+            RespondError::WrongWorkspace { belongs_to } => serde_json::json!({ "belongsTo": belongs_to }),
+        }
+    }
+
+    fn korean(&self) -> String {
         match self {
             RespondError::Unknown => {
                 "해당 승인 요청을 찾을 수 없습니다 (이미 처리되었거나 시간이 초과되었습니다).".to_string()
@@ -164,6 +186,7 @@ impl PendingApprovals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uimsg::UserFacing;
 
     const A: &str = "/work/alpha";
     const B: &str = "/work/beta";
@@ -192,7 +215,9 @@ mod tests {
                 belongs_to: A.to_string()
             }
         );
-        assert!(err.message().contains(A), "{}", err.message());
+        // 워크스페이스는 **파라미터로** 온다 — 문장에 이어 붙이면 번역할 수 없다.
+        assert_eq!(err.params()["belongsTo"], serde_json::json!(A));
+        assert!(err.korean().contains(A), "{}", err.korean());
 
         // **아무것도 전달되지 않았다.**
         assert!(rx.try_recv().is_err(), "다른 워크스페이스의 승인이 전달됐습니다");
@@ -272,6 +297,29 @@ mod tests {
         );
         // 전달에 실패했어도 항목은 정리된다 — 남겨두면 영원히 실패하는 id가 쌓인다.
         assert!(pending.is_empty());
+    }
+
+    /// **코드가 서로 달라야** 화면이 문장을 고를 수 있고, **파라미터가 객체여야** 화면이
+    /// 값을 읽다 터지지 않는다(끼울 값이 없으면 빈 객체다).
+    #[test]
+    fn every_respond_error_has_its_own_code_and_object_params() {
+        let errors = [
+            RespondError::Unknown,
+            RespondError::WrongWorkspace {
+                belongs_to: A.to_string(),
+            },
+            RespondError::Gone,
+        ];
+        let codes: std::collections::BTreeSet<&str> = errors.iter().map(|e| e.code()).collect();
+        assert_eq!(codes.len(), errors.len(), "코드가 겹칩니다: {codes:?}");
+        for error in &errors {
+            assert!(
+                error.params().is_object(),
+                "{}의 파라미터가 객체가 아닙니다",
+                error.code()
+            );
+            assert!(!error.korean().is_empty());
+        }
     }
 
     /// `forget`은 대기가 끝났을 때(타임아웃 포함) 부른다. 부르지 않으면 맵이 계속 자란다.

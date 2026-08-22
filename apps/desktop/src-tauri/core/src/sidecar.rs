@@ -460,9 +460,9 @@ pub enum BackendIssue {
     SpawnFailed { attempt: u64, max: u64, error: String },
 }
 
-impl BackendIssue {
+impl crate::uimsg::UserFacing for BackendIssue {
     /// 화면이 문장을 고르는 열쇠. **이 값이 바뀌면 화면의 카탈로그도 바뀌어야 한다.**
-    pub fn code(&self) -> &'static str {
+    fn code(&self) -> &'static str {
         match self {
             BackendIssue::RespawnLimit { .. } => "respawnLimit",
             BackendIssue::ProtocolViolation { .. } => "protocolViolation",
@@ -472,7 +472,7 @@ impl BackendIssue {
 
     /// 문장에 끼워 넣을 값들. **문자열로 이어 붙이지 않는다** — 언어마다 어순이 다르므로,
     /// 이미 이어 붙인 문장은 번역할 수 없다.
-    pub fn params(&self) -> Value {
+    fn params(&self) -> Value {
         match self {
             BackendIssue::RespawnLimit { attempts } => json!({ "attempts": attempts }),
             BackendIssue::ProtocolViolation { reason } => json!({ "reason": reason }),
@@ -483,7 +483,7 @@ impl BackendIssue {
     }
 
     /// 원문(한국어). 로그와 **화면이 모르는 코드의 대체 표시**에 쓴다.
-    pub fn korean(&self) -> String {
+    fn korean(&self) -> String {
         match self {
             BackendIssue::RespawnLimit { attempts } => {
                 format!("백엔드가 {attempts}번 다시 시작한 뒤에도 계속 종료됩니다.")
@@ -496,7 +496,9 @@ impl BackendIssue {
             }
         }
     }
+}
 
+impl BackendIssue {
     /// 사용자가 무엇을 할 수 있는가. **판정은 문제 종류가 정한다** — 화면이 고르지 않는다.
     pub fn recovery(&self) -> Recovery {
         match self {
@@ -534,10 +536,12 @@ pub enum SupervisorStatus {
 
 impl SupervisorStatus {
     fn unavailable(issue: BackendIssue) -> Self {
+        use crate::uimsg::UserFacing;
+        let ui = issue.ui();
         SupervisorStatus::Unavailable {
-            code: issue.code().to_string(),
-            params: issue.params(),
-            message: issue.korean(),
+            code: ui.code,
+            params: ui.params,
+            message: ui.message,
             recovery: issue.recovery(),
         }
     }
@@ -752,6 +756,7 @@ mod tests {
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+    use crate::uimsg::UserFacing;
     use std::sync::atomic::AtomicUsize;
 
     struct NoopHandler;

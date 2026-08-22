@@ -1,9 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { bannerFor, knownCodes, renderCode, reopenTarget, type BackendStatus } from "../src/lib/backendStatus.js";
+import { bannerFor, reopenTarget, type BackendStatus } from "../src/lib/backendStatus.js";
 
 /**
  * 백엔드 상태 배너 — process-architecture.md 5.1절 / 10절.
@@ -11,19 +8,6 @@ import { bannerFor, knownCodes, renderCode, reopenTarget, type BackendStatus } f
  * 여기서 검증하는 실패는 화면에서 **정상으로 보인다**: 없어도 되는 배너는 그냥 배너로 보이고,
  * 눌러도 아무 일이 없는 버튼은 그냥 버튼으로 보인다.
  */
-
-/** `name` 디렉터리를 가진 조상을 찾는다. 없으면 예외 — "없는 경로"와 "빈 결과"는 다른 사실이다. */
-function findUp(name: string, from: string): string {
-  let current = from;
-  for (let depth = 0; depth < 8; depth += 1) {
-    const candidate = path.join(current, name);
-    if (existsSync(candidate)) return candidate;
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  throw new Error(`${from}에서 ${name} 디렉터리를 찾지 못했습니다`);
-}
 
 test("살아 있으면 배너가 없다", () => {
   assert.equal(bannerFor({ state: "alive" }), null);
@@ -72,36 +56,6 @@ test("카탈로그가 모르는 코드는 원문으로 떨어지고 그 사실�
   });
   assert.equal(banner?.message, "Rust가 준 원문");
   assert.equal(banner?.untranslated, true, "번역되지 않았다는 사실을 감췄습니다");
-});
-
-test("빈 문장을 그리지 않는다", () => {
-  const rendered = renderCode("아직-없는-코드", {}, "대체 문장");
-  assert.ok(rendered.message.length > 0);
-});
-
-/**
- * **Rust가 내는 코드를 카탈로그가 전부 알아야 한다.**
- *
- * 모르면 원문으로 떨어지므로 앱이 깨지지는 않지만, 그 사실이 조용하면 새 코드는 영원히
- * 번역되지 않는다 — "빠진 것은 실패하지 않으므로 빠진 사실이 드러나지 않는다".
- * 판정 기준은 사람이 적은 또 다른 목록이 아니라 **Rust 소스에서 유도한 코드 목록**이다.
- */
-test("Rust가 내는 모든 백엔드 코드가 카탈로그에 있다", () => {
-  // 컴파일된 테스트는 `dist-test/test/`에서 돌고 원본은 `test/`에서 돌므로, **상대 경로를
-  // 고정하지 않고** `src-tauri`를 가진 디렉터리를 찾아 올라간다. 못 찾으면 실패한다 —
-  // 조용히 건너뛰면 이 검사는 언제나 통과하는 방식으로 고장 난다.
-  const sidecarRs = findUp("src-tauri", path.dirname(fileURLToPath(import.meta.url)));
-  const source = readFileSync(path.join(sidecarRs, "core", "src", "sidecar.rs"), "utf8");
-
-  // `code()`가 돌려주는 문자열 리터럴만 뽑는다. needle을 런타임에 조립해 이 파일 자신이
-  // 검색 대상이 될 때 개수가 어긋나지 않게 한다.
-  const block = source.slice(source.indexOf("fn " + "code(&self)"));
-  const arm = new RegExp('=> "([a-zA-Z]+)"', "g");
-  const codes = [...block.slice(0, block.indexOf("\n    }")).matchAll(arm)].map((m) => m[1]!).sort();
-
-  assert.ok(codes.length >= 3, `Rust에서 코드를 읽지 못했습니다: ${JSON.stringify(codes)}`);
-  const missing = codes.filter((code) => !knownCodes().includes(code));
-  assert.deepEqual(missing, [], `카탈로그에 없는 코드: ${missing.join(", ")}`);
 });
 
 /**
