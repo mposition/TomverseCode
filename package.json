@@ -14,7 +14,7 @@
     "//typecheck": "build와 같은 순서를 쓴다. 타입 검사도 상류 패키지의 산출물(.d.ts)을 읽기 때문이다. `--if-present`를 쓰지 않는다: 워크스페이스가 스크립트를 잃으면 조용히 통과하는 대신 실패해야 한다.",
     "typecheck": "npm run typecheck --workspace=@tomverse/protocol && npm run typecheck --workspace=@tomverse/toolchain && npm run typecheck --workspace=@tomverse/sidecar && npm run typecheck --workspace=desktop && npm run typecheck --workspace=@tomverse/hypothesis-gate",
     "//test": "테스트가 있는 워크스페이스를 명시한다 — `--if-present`로 뭉개지 않는다. **가설 게이트 통합 테스트는 실제 tomverse-host 바이너리를 요구하므로** verify에서 core:build 뒤에 온다. 새 워크스페이스에 테스트를 추가하면 여기에도 넣을 것.",
-    "test": "npm run test --workspace=@tomverse/toolchain && npm run test --workspace=@tomverse/sidecar && npm run test --workspace=@tomverse/hypothesis-gate",
+    "test": "npm run test --workspace=@tomverse/toolchain && npm run test --workspace=@tomverse/sidecar && npm run test --workspace=desktop && npm run test --workspace=@tomverse/hypothesis-gate",
     "//test:e2e": "실제 Rust 호스트 바이너리를 요구한다 — 아래 core:build를 먼저 실행할 것.",
     "test:e2e": "npm run test:e2e --workspace=@tomverse/sidecar",
     "//core:build": "cargo를 직접 부르지 않고 런처를 지난다. Windows에서 맨몸 cargo는 INCLUDE/LIB가 없어 컴파일 후 **링크에서** 죽는다(stdarg.h 없음 / LNK1104). 런처가 scripts/_env.bat 경로로 환경을 준비하므로 일반 PowerShell에서도 그대로 돈다. scripts\\cargo-build-core.bat도 같은 런처를 쓴다 — 두 진입점이 갈라지지 않는다.",

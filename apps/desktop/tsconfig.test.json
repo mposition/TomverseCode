@@ -1,0 +1,15 @@
+{
+  "//": "테스트용 빌드. 화면(tsx)이 아니라 src/lib의 순수 로직만 컴파일한다 — DOM 없이 node --test로 돌린다.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist-test",
+    "rootDir": ".",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": false,
+    "types": ["node"]
+  },
+  "include": ["src/lib", "test"],
+  "references": []
+}

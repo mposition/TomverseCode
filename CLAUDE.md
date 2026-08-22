@@ -134,6 +134,15 @@ npm run verify         # 전체: 위 + Rust 단위 테스트 + 실제 구성요�
 `packages/sidecar/package.json`에 직접 나열한다. 새 테스트 파일을 추가하면 그 목록도 갱신할 것.
 (`evals/hypothesis-gate/package.json`도 같은 방식이다.)
 
+**루트 `test`에 워크스페이스를 빠뜨리는 것은 이제 테스트가 잡는다** —
+`packages/toolchain/test/buildOrder.test.ts`가 "테스트가 있는 워크스페이스"와 루트 `test` 목록을
+대조한다. 사람이 지키는 규칙으로 두면 언젠가 빠지고, **빠진 테스트는 실패하지 않으므로 빠진
+사실이 드러나지 않는다.**
+
+`apps/desktop`도 테스트가 있다(`tsconfig.test.json` → `dist-test`). 화면(tsx)이 아니라
+`src/lib`의 순수 로직만 컴파일해 DOM 없이 `node --test`로 돌린다 — 계산이 화면 안에 있으면
+검증할 방법이 없다.
+
 ### 가설 게이트 G
 
 ```bash

@@ -190,6 +190,25 @@ test("build/typecheck가 --if-present로 실패를 감추지 않는다", () => {
   }
 });
 
+/**
+ * **테스트가 있는데 루트 `test`에 없으면 아무도 모른다.**
+ *
+ * 지금까지 이 규칙은 CLAUDE.md의 문장으로만 있었다("새 워크스페이스에 테스트를 추가하면 루트
+ * test에도 넣을 것"). 사람이 지키는 규칙은 언젠가 빠지고, **빠진 테스트는 실패하지 않으므로
+ * 빠진 사실이 드러나지 않는다** — 없는 테스트는 초록색과 구별되지 않는다.
+ *
+ * `build`/`typecheck`에 대해 이미 같은 검사를 하고 있었다. `test`만 빠져 있었다.
+ */
+test("테스트가 있는 워크스페이스가 전부 루트 test에 있다", () => {
+  const listed = workspaceOrderIn(rootScript("test"));
+  const testable = readWorkspaces().filter((m) => m.scripts.test !== undefined);
+  assert.deepEqual(
+    [...listed].sort(),
+    testable.map((m) => m.name).sort(),
+    "루트 test의 워크스페이스 목록이 실제와 다릅니다 — 테스트를 추가하고 루트에 넣지 않았거나, 없는 것을 적었습니다"
+  );
+});
+
 test("@tomverse/toolchain은 어떤 워크스페이스에도 의존하지 않는다", () => {
   // 의존하면 순환 위험이 생기고, 무엇보다 cargo 런처가 빌드 없이 쓸 수 없게 된다.
   const graph = dependencyGraph(readWorkspaces());

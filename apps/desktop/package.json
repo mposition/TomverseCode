@@ -8,7 +8,9 @@
     "build": "tsc && vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "//test": "화면(tsx)이 아니라 src/lib의 순수 로직만 돌린다 — DOM 없이 node --test로 검증한다.",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/diffSummary.test.js"
   },
   "dependencies": {
     "react": "^19.1.0",
@@ -22,6 +24,7 @@
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2",
+    "@types/node": "^24.9.0"
   }
 }

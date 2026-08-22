@@ -1206,7 +1206,7 @@ export default function App() {
                 />
               )}
               <VerificationPanel reports={reports} />
-              <DiffPanel diffs={diffs} />
+              <DiffPanel diffs={diffs} largeChangeFiles={largeChangeFiles} />
             </div>
           </section>
 

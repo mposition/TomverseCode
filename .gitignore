@@ -14,3 +14,5 @@ target/
 # 가설 게이트 실행 산출물 — 모델 응답과 명령 출력이 들어 있어 저장소에 남길 이유가 없다.
 # 저장소에는 fixture·하네스·사전 등록 기준·비밀값 없는 집계 리포트만 커밋한다.
 evals/hypothesis-gate/reports/
+# 데스크톱 테스트 빌드 산출물 (apps/desktop/tsconfig.test.json)
+dist-test/
