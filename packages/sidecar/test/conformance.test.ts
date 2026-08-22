@@ -5,6 +5,8 @@ import { AnthropicAdapter } from "../src/providers/anthropic.js";
 import { FakeProviderAdapter } from "../src/providers/fake.js";
 import { OpenAIAdapter } from "../src/providers/openai.js";
 import { ProviderCallFailure, type ProviderAdapter, type ProviderCallContext } from "../src/providers/types.js";
+import { createAdapter, MissingCredentialError } from "../src/providers/factory.js";
+import { BUILTIN_MODELS, providerKindOf } from "../src/routing/registry.js";
 import { makeSnapshot } from "./helpers/fixtures.js";
 
 /**
@@ -286,4 +288,96 @@ function assertTransportIndependentContract(adapter: ProviderAdapter, entry: Mod
 test("[적합성] 실제 공급자 어댑터가 둘 이상 검사된다", () => {
   assert.ok(ADAPTERS.length >= 2, `검사된 어댑터: ${ADAPTERS.length}개`);
   assert.equal(new Set(ADAPTERS.map((a) => a.providerId)).size, ADAPTERS.length, "공급자가 중복됩니다");
+});
+
+// ---- 표에 넣는 것을 강제하는 장치 (multi-engine-routing.md 12절) ----
+
+/**
+ * 표가 덮지 못한 실제 공급자.
+ *
+ * 위 스위트에는 **조용한 구멍**이 하나 있었다: 새 공급자를 추가할 때 `ADAPTERS`에 줄을
+ * 넣는 것을 강제하는 것이 없었다. 넣지 않으면 그 어댑터에 대해서는 아무 테스트도 돌지 않고,
+ * **없는 테스트는 실패하지 않으므로** 실행 결과는 조용히 초록색이다. 루트 `test`에서
+ * 워크스페이스가 빠지던 것과 같은 모양이고, 거기서와 같은 방식으로 막는다 —
+ * 사람이 지키는 규칙이 아니라 **다른 목록에서 유도한 대조**로.
+ *
+ * 유도의 출발점을 레지스트리로 잡은 이유: 제품이 실제로 호출하는 공급자의 정본이 거기다.
+ * 어댑터 파일이 있어도 레지스트리에 없으면 호출되지 않고, 레지스트리에 있으면 반드시
+ * 호출된다. `providerKindOf`를 쓰는 것도 같은 이유다 — `local://` 규칙을 여기 복사하면
+ * 그 규칙이 바뀔 때 둘이 갈라진다.
+ */
+function uncoveredProviders(entries: readonly ModelEntry[], covered: ReadonlySet<string>): string[] {
+  const real = entries.filter((e) => providerKindOf(e) === "real").map((e) => e.providerId);
+  return [...new Set(real)].filter((p) => !covered.has(p)).sort();
+}
+
+test("[적합성] 레지스트리의 실제 공급자가 전부 이 표에 있다", () => {
+  const real = BUILTIN_MODELS.filter((e) => providerKindOf(e) === "real");
+  // 빈 집합에 대해 통과하는 검사를 허용하지 않는다 — 레지스트리를 잘못 읽으면
+  // "빠진 공급자 없음"과 "공급자 없음"이 같은 초록색으로 보인다.
+  assert.ok(real.length > 0, "레지스트리에서 실제 공급자를 하나도 찾지 못했습니다");
+  const missing = uncoveredProviders(BUILTIN_MODELS, new Set(ADAPTERS.map((a) => a.providerId)));
+  assert.deepEqual(
+    missing,
+    [],
+    `적합성 표에 없는 공급자: ${missing.join(", ")} — conformance.test.ts의 ADAPTERS에 줄을 추가하세요`
+  );
+});
+
+/**
+ * **위 검사가 실제로 무언가를 잡는지 확인한다.** 대조 검사는 대조 대상이 비거나 비교가
+ * 어긋나면 언제나 통과하는 방식으로 고장 나고, 그 고장은 초록색으로 보인다.
+ */
+test("[적합성] 표에 없는 공급자가 생기면 위 검사가 잡는다", () => {
+  const newcomer = entryFor("google", "gemini-hypothetical");
+  const missing = uncoveredProviders(
+    [...BUILTIN_MODELS, newcomer],
+    new Set(ADAPTERS.map((a) => a.providerId))
+  );
+  assert.deepEqual(missing, ["google"]);
+  // fake 공급자는 실전 어댑터가 아니므로 요구하지 않는다 — 요구하면 표가
+  // 검사할 수 없는 것(로컬 스크립트)까지 떠안는다.
+  const fake = BUILTIN_MODELS.filter((e) => providerKindOf(e) === "fake");
+  assert.ok(fake.length > 0, "레지스트리에 fake 공급자가 없어 이 구별을 확인할 수 없습니다");
+  assert.deepEqual(uncoveredProviders(fake, new Set()), []);
+});
+
+/**
+ * 표에 있는 것만으로는 부족하다 — **팩토리가 그 공급자를 만들 수 있어야** 한다.
+ *
+ * 레지스트리에 엔트리를 넣고 `createAdapter`의 분기를 빠뜨리면 실행 시점에야
+ * "어댑터가 아직 없습니다"로 죽는다. 그 시점은 사용자가 그 모델을 고른 뒤이고,
+ * 라우터는 그 모델을 **고를 수 있는 것으로 이미 보여준 뒤**다.
+ */
+test("[적합성] 레지스트리의 실제 공급자는 팩토리가 어댑터를 만들 수 있다", () => {
+  const real = BUILTIN_MODELS.filter((e) => providerKindOf(e) === "real");
+  assert.ok(real.length > 0, "레지스트리에서 실제 공급자를 하나도 찾지 못했습니다");
+  for (const entry of real) {
+    const assignment = {
+      role: "executor" as const,
+      modelId: entry.modelId,
+      providerId: entry.providerId,
+      reason: "적합성 검사",
+    };
+    // 자격증명은 **주입한 환경변수에서만** 읽는다. process.env를 쓰면 개발 머신에 키가
+    // 있는지 여부에 따라 결과가 달라진다 — 그건 이 검사가 답해야 할 질문이 아니다.
+    const adapter = createAdapter(entry, assignment, { env: { [entry.apiKeyEnvName]: "conformance" } });
+    assert.equal(adapter.capabilities().providerId, entry.providerId, entry.modelId);
+    assert.equal(adapter.capabilities().modelId, entry.modelId, entry.modelId);
+  }
+});
+
+/** 자격증명이 없으면 **만들기 전에** 거부한다 — 키 없이 만들어진 어댑터는 호출 때 죽는다. */
+test("[적합성] 자격증명이 없으면 어댑터를 만들지 않는다", () => {
+  const entry = BUILTIN_MODELS.find((e) => providerKindOf(e) === "real");
+  assert.ok(entry, "실제 공급자 엔트리가 없습니다");
+  assert.throws(
+    () =>
+      createAdapter(
+        entry,
+        { role: "executor", modelId: entry.modelId, providerId: entry.providerId, reason: "적합성 검사" },
+        { env: {} }
+      ),
+    MissingCredentialError
+  );
 });
