@@ -150,7 +150,7 @@ type ComplexityTier = "fast" | "balanced" | "verified" | "critical";
 |---|---|
 | workspace hash (태스크 시작 시점 전체 상태 지문) | **완료** — `WORKSPACE_FINGERPRINT` 이벤트 (6.2절) |
 | 모델 정확한 버전 문자열 | **완료** — 스키마 v4에 `resolved_model_id`·`requested_model_id`·`provider_request_id` (6.1절) |
-| export / replay | **완료** — `tomverse-host export --task`, `task_export` (6.3절) |
+| export / replay | **완료** — `tomverse-host export --task`, `task_export` (6.3절). 재현 **검사**도 있다 — `tomverse-host reproduce --file`(state-machine 21절). 적용기는 없다 |
 | 나머지 (tool call, patch, 승인·거부, 테스트, 검수, 비용·토큰, 최종 커밋) | **이미 스키마에 존재** |
 
 ### 6.2 워크스페이스 지문 — HEAD만으로는 다른 상태를 같다고 말한다
@@ -267,10 +267,21 @@ git 저장소가 아니면 `available: false`를 낸다. **빈 해시를 만들�
 로그가 통째로 들어 있고 거기에는 환경변수 이름·경로·사내 호스트명이 섞인다. export는 **밖으로
 나가라고 만든 파일**이므로 기본이 보수적이어야 하고, 첨부는 사용자의 선택으로 남긴다.
 
-#### 재현 러너는 아직 없다
+#### 재현 러너 — 검사는 있고 적용은 없다
 
 이 파일은 **재현의 재료**를 담고, 재현을 수행하지는 않는다. 없는 것을 있는 것처럼 적으면 위에서
-정의한 구분 자체가 무의미해진다. 러너를 만들 때 정해야 할 것은 12절에 있다.
+정의한 구분 자체가 무의미해진다.
+
+러너 쪽에서는 **판정 규칙과 검사**가 생겼다([state-machine-and-protocol.md 21절](./state-machine-and-protocol.md),
+`tomverse-host reproduce --file <export.json>`). 규칙을 정하는 과정에서 원래 문항이
+**답할 수 없는 형태**였다는 것이 드러났다 — "지문이 다르면 거부할지 경고 후 진행할지"는
+재현을 한 동작으로 보고 있었고, 실제로는 **아무것도 쓰지 않는 검사**와 **파일을 쓰는 적용**이
+다른 동작이다. 나누면 답이 사람에 따라 갈리지 않는다: 검사는 어떤 전제에서도 거부하지 않고
+(쓰지 않으므로 거부할 것이 없다), 적용만 전제를 요구한다.
+
+그래서 이 export 파일 하나로 감사자는 **같은 상태를 만들 수 없는 머신에서도** 답을 얻는다 —
+지문이 다르다는 사실만이 아니라 **무엇이 다른지**(기반 커밋인지 워킹 트리인지)와 **기록된 patch가
+실제로 붙는지**까지. 적용기는 아직 없고, 만들 때의 조건은 21.2절 규칙 5·6이 정해두었다.
 
 #### UI는 값을 받고 파일은 쓰지 않는다
 

@@ -21,6 +21,7 @@ pub mod metrics;
 pub mod paths;
 pub mod policy;
 pub mod proctree;
+pub mod reproduce;
 pub mod sidecar;
 pub mod store;
 pub mod time;

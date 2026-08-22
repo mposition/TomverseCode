@@ -22,7 +22,6 @@ use crate::types::{
 };
 use crate::verify::{CommandExecutor, VerificationRunner};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -720,43 +719,14 @@ impl TaskHost {
         Ok(payload)
     }
 
+    /// 재료와 조립은 `reproduce::fingerprint`에 있고 여기서는 **git 호출만** 준다.
+    ///
+    /// 한 곳에 모은 이유: 재현 검사는 태스크 없이 지문을 내야 하는데(감사자에게는 DB가 없다),
+    /// 조립을 두 벌 두면 같은 워크스페이스가 경로에 따라 다른 지문을 낸다 — 그러면 비교
+    /// 자체가 무너진다. 여기서 넘기는 러너는 **Policy Gate를 지나는** 것이고, 그 사실이
+    /// 태스크가 있는 경로와 없는 경로의 유일한 차이다.
     fn workspace_fingerprint(&self, task_id: &str) -> Value {
-        let Ok(head) = self.git_output(task_id, &["rev-parse", "HEAD"]) else {
-            // git 저장소가 아니거나 커밋이 하나도 없다. 둘 다 "잴 수 없었다"이지 "비어 있었다"가 아니다.
-            return json!({ "available": false, "reason": "git 저장소가 아니거나 아직 커밋이 없습니다" });
-        };
-        let Ok(status) = self.git_output(task_id, &["status", "--porcelain", "-uall"]) else {
-            return json!({ "available": false, "reason": "git status를 읽지 못했습니다" });
-        };
-        let Ok(diff) = self.git_output(task_id, &["diff", "HEAD"]) else {
-            return json!({ "available": false, "reason": "git diff를 읽지 못했습니다" });
-        };
-
-        let untracked = status.lines().filter(|l| l.starts_with("?? ")).count() as u64;
-        let dirty = !status.trim().is_empty();
-
-        let mut hasher = Sha256::new();
-        // 구분자를 넣는 이유: 재료를 그냥 이으면 한 재료의 끝과 다음 재료의 시작이 붙어
-        // **서로 다른 조합이 같은 바이트열**이 될 수 있다.
-        hasher.update(b"head\n");
-        hasher.update(head.trim().as_bytes());
-        hasher.update(b"\nstatus\n");
-        hasher.update(status.as_bytes());
-        hasher.update(b"\ndiff\n");
-        hasher.update(diff.as_bytes());
-        let digest = hasher.finalize();
-
-        json!({
-            "available": true,
-            "fingerprint": format!("sha256:{digest:x}"),
-            "gitHead": head.trim(),
-            "dirty": dirty,
-            // 0이면 위 한계(추적되지 않는 파일의 내용 미반영)가 이번 실행에 적용되지 않는다.
-            "untrackedFiles": untracked,
-            // **무엇으로 만든 지문인지 남긴다.** 나중에 재료가 바뀌면 옛 지문과 비교할 수 없는데,
-            // 그 사실을 알 방법이 없으면 "상태가 달라졌다"로 잘못 읽는다.
-            "inputs": ["rev-parse HEAD", "status --porcelain -uall", "diff HEAD"],
-        })
+        crate::reproduce::fingerprint(|args| self.git_output(task_id, args))
     }
 
     /// 이벤트 로그에서 이 태스크가 만든 커밋 sha를 찾는다.

@@ -118,6 +118,13 @@ struct Args {
     /// 초안을 새로 생성하지 않고 이 파일의 `DraftProposal`을 쓴다.
     /// **파일을 읽는 것은 Rust다** — sidecar는 경로를 받지도 않는다.
     replay_draft: Option<PathBuf>,
+
+    // ---- reproduce 전용 ----
+    /// 검사할 export 파일. **태스크 id가 아니라 파일이다** — 재현을 돌리는 사람에게는
+    /// 대개 DB가 없고, 그래서 export가 있는 것이다.
+    file: Option<PathBuf>,
+    /// 불일치를 넘기 위해 사용자가 명시하는 **기대 지문**. 플래그 하나로는 넘을 수 없다.
+    accept_fingerprint: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -146,6 +153,8 @@ fn parse_args() -> Result<Args, String> {
         providers: None,
         review_mode: None,
         replay_draft: None,
+        file: None,
+        accept_fingerprint: None,
     };
 
     while let Some(flag) = raw.next() {
@@ -208,6 +217,8 @@ fn parse_args() -> Result<Args, String> {
                 args.review_mode = Some(mode);
             }
             "--replay-draft" => args.replay_draft = Some(PathBuf::from(value()?)),
+            "--file" => args.file = Some(PathBuf::from(value()?)),
+            "--accept-fingerprint" => args.accept_fingerprint = Some(value()?),
             "--verbose" => args.verbose = true,
             "--all-workspaces" => args.all_workspaces = true,
             other => return Err(format!("알 수 없는 인자: {other}\n\n{}", usage())),
@@ -216,8 +227,33 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
+/// `reproduce` — export 파일이 이 워크스페이스에 재현되는지 **검사**한다.
+///
+/// 판정 규칙은 `tomverse_core::reproduce` 모듈 주석에 있다. 여기서 하는 일은 파일을 읽어
+/// 넘기고 결과를 찍는 것뿐이며, **아무것도 쓰지 않는다.**
+fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
+    let path = args
+        .file
+        .clone()
+        .ok_or_else(|| "reproduce에는 --file <export.json>이 필요합니다".to_string())?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path:?}를 읽을 수 없습니다: {e}"))?;
+    // **파일은 밖에서 온다.** 파싱 실패를 빈 계획으로 넘기지 않는다 — 빈 계획은
+    // "재현할 것이 없다"로 읽히고, 그건 "읽지 못했다"와 다른 사실이다.
+    let export: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{path:?}가 JSON이 아닙니다: {e}"))?;
+
+    let out = tomverse_core::reproduce::check(
+        &export,
+        std::path::Path::new(&root.display()),
+        args.accept_fingerprint.as_deref(),
+    )?;
+    // export와 같은 이유로 pretty다 — 사람이 읽고 무엇을 맞춰야 하는지 판단하는 것이 용도다.
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    Ok(0)
+}
+
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export|reproduce> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>]\n\
      [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
@@ -232,7 +268,12 @@ fn usage() -> String {
                 show와 다르다 — 도구 argv·patch 원문과 보장 범위가 파일 안에 들어 있다\n\
      revert  — 이 작업이 만든 커밋을 git revert로 되돌린다 (0=되돌림, 1=되돌리지 않음·저장소 그대로, 2=revert 진행 중으로 남음)\n\
      metrics — 기준 계측(커버리지/충돌 결말)을 JSON으로 집계한다. 읽기 전용.\n\
-               [--all-workspaces]로 워크스페이스 필터를 끈다"
+               [--all-workspaces]로 워크스페이스 필터를 끈다\n\
+     reproduce — export 파일(--file)을 이 워크스페이스에 재현할 수 있는지 **검사한다**.\n\
+                 아무것도 쓰지 않으므로 전제가 무엇이든 거부하지 않는다. DB도 열지 않는다.\n\
+                 판정은 종료 코드가 아니라 JSON에 있다 — 종료 코드에 실으면 '오류'와\n\
+                 '재현 불가'가 같은 값이 된다. 적용기는 아직 없다.\n\
+                 [--accept-fingerprint <sha256:...>]로 불일치 확인의 판정만 미리 볼 수 있다"
         .to_string()
 }
 
@@ -251,6 +292,13 @@ fn real_main() -> Result<i32, String> {
 
     let root = WorkspaceRoot::new(&args.workspace)
         .map_err(|e| format!("워크스페이스 {:?}를 열 수 없습니다: {e}", args.workspace))?;
+
+    // **재현 검사는 DB를 열지 않는다.** 감사자에게는 DB가 없다 — 그래서 export 파일이 있는
+    // 것이고, 여기서 store를 열면 없던 state.db가 생긴다. "아무것도 쓰지 않는다"는 약속은
+    // 그 파일 하나로 깨진다. 그래서 store를 만들기 **전에** 갈라진다.
+    if args.command == "reproduce" {
+        return reproduce_check(&args, &root);
+    }
 
     let artifacts_root = args.artifacts.clone().unwrap_or_else(ArtifactStore::default_root);
     let artifacts = ArtifactStore::new(&artifacts_root).map_err(|e| format!("artifact 저장소 오류: {e}"))?;

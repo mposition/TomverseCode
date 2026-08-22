@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -659,6 +659,67 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
       exported.reproduce.steps.every((s) => s.recordedOutcome !== undefined),
       "재현 단계에 기록된 결과가 없습니다 — status만으로는 명령의 성공 여부를 말할 수 없습니다"
     );
+
+    // ---- 그 export를 그대로 재현 러너에 먹인다 (state-machine 12절 판정 규칙) ----
+    //
+    // Rust 단위 테스트는 손으로 만든 export를 읽는다. 여기서는 **방금 실제 실행이 낸 파일**을
+    // 읽으므로, export가 내는 모양과 러너가 기대하는 모양이 갈라지면 여기서 걸린다.
+    const exportPath = path.join(ctx.artifacts, "reproduce-input.json");
+    writeFileSync(exportPath, JSON.stringify(exported), "utf8");
+
+    // 검사가 정말 아무것도 쓰지 않는지 보려면 **검사 전후를 비교**해야 한다. git status는
+    // 내용 변경과 새 파일을 둘 다 잡는다.
+    const treeBefore = execFileSync("git", ["-C", ctx.repo.root, "status", "--porcelain", "-uall"], {
+      encoding: "utf8",
+    });
+
+    const check = hostExport(ctx, [
+      "reproduce",
+      "--workspace",
+      ctx.repo.root,
+      "--file",
+      exportPath,
+    ]) as {
+      formatVersion: number;
+      taskId: string;
+      precondition: { verdict: string; differs?: string[] };
+      applyGate: { decision: { decision: string } };
+      reproducibility: string;
+      steps: unknown[];
+      checks: { check: { status: string } }[];
+    };
+
+    assert.equal(check.formatVersion, exported.formatVersion);
+    assert.equal(check.taskId, run.taskId);
+    assert.equal(check.steps.length, exported.reproduce.steps.length, "계획이 export와 다릅니다");
+    assert.equal(check.checks.length, check.steps.length, "검사하지 않은 단계가 있습니다");
+
+    // export의 지문은 **시작 상태**다. 실행이 파일을 바꿨으므로 지금은 달라야 하고, 무엇보다
+    // `unknown`이면 안 된다 — `unknown`은 "지문을 비교할 수 없었다"는 뜻이고, 그건 실행이
+    // 지문을 제대로 남기지 못했다는 신호다. "다르다"와 "모른다"를 갈라 두는 이유가 이것이다.
+    assert.equal(
+      check.precondition.verdict,
+      "mismatch",
+      `시작 상태와 지금이 같거나 비교되지 않았습니다: ${JSON.stringify(check.precondition)}`
+    );
+    assert.ok(
+      (check.precondition.differs ?? []).length > 0,
+      "불일치인데 무엇이 다른지 말하지 않았습니다 — 사용자가 맞출 대상을 알 수 없습니다"
+    );
+    // 불일치에서는 확인 없이 적용을 허용하지 않는다.
+    assert.equal(check.applyGate.decision.decision, "needsAcknowledgement", JSON.stringify(check.applyGate));
+
+    // **전제가 어긋나도 검사는 거부하지 않는다.** 각 단계가 판정을 받아야 한다.
+    assert.ok(
+      check.checks.every((c) => ["applies", "wouldFail", "notDecidable"].includes(c.check.status)),
+      `판정되지 않은 단계가 있습니다: ${JSON.stringify(check.checks)}`
+    );
+    assert.ok(["yes", "no", "unknown"].includes(check.reproducibility), check.reproducibility);
+
+    const treeAfter = execFileSync("git", ["-C", ctx.repo.root, "status", "--porcelain", "-uall"], {
+      encoding: "utf8",
+    });
+    assert.equal(treeAfter, treeBefore, "재현 **검사**가 워크스페이스를 바꿨습니다");
   });
 });
 
