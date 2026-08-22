@@ -240,8 +240,11 @@ impl SessionState {
             }
             // **사유와 복구 방법은 core에서 온다.** 문장을 여기 두면 조회 경로(`backend_status`)와
             // 갈라지고, 이 크레이트는 개발 환경에서 컴파일되지 않으므로 그 갈라짐이 드러나지 않는다.
+            // 여기서는 **원문**을 쓴다. 이 경로의 오류는 태스크 결과 문자열로 흘러가므로
+            // 화면이 코드로 문장을 고를 자리가 없다 — 배너 경로(`backend_status`)가 코드를
+            // 쓰고, 이 경로는 그때까지의 대체 표시다.
             other => match other.failure() {
-                Some((message, _recovery)) => Err(message),
+                Some(issue) => Err(issue.korean()),
                 // `failure()`가 None인 것은 성공뿐이고 그건 위에서 처리했다.
                 None => Ok(()),
             },

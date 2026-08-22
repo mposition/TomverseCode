@@ -437,6 +437,76 @@ pub enum Recovery {
     None,
 }
 
+/// 사용자에게 알려야 하는 백엔드 문제.
+///
+/// # 왜 문장이 아니라 이 타입인가
+///
+/// **화면에 그대로 뜨는 문장은 프로세스 경계를 넘지 않는다** — 판정과 파라미터가 넘고 문장은
+/// 화면이 만든다(ui-wireframes.md 6절). 문장을 넘기면 그 문장은 영원히 한국어이고, 다국어
+/// 카탈로그를 만들어도 **카탈로그 밖에 남는다.** 그러면 언어를 바꿔도 절반만 바뀐다.
+///
+/// 같은 규칙을 이미 한 번 적용했다: "다시 열기" 버튼을 띄울지를 화면이 문장에서 읽어내지
+/// 않게 `recovery`를 값으로 줬다(5.2절). 문장 자체도 같은 이유로 값이 되어야 한다.
+///
+/// `korean()`을 남겨 두는 이유: 로그와 **화면이 모르는 코드의 대체 표시**다. 화면이 새 코드를
+/// 아직 모를 때 빈 문장을 그리는 것보다, 번역되지 않은 원문을 그리는 편이 낫다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendIssue {
+    /// 재spawn 상한에 도달했다.
+    RespawnLimit { attempts: u64 },
+    /// 프로토콜 위반으로 우리가 닫았다.
+    ProtocolViolation { reason: String },
+    /// 다시 띄우려 했으나 spawn이 실패했다.
+    SpawnFailed { attempt: u64, max: u64, error: String },
+}
+
+impl BackendIssue {
+    /// 화면이 문장을 고르는 열쇠. **이 값이 바뀌면 화면의 카탈로그도 바뀌어야 한다.**
+    pub fn code(&self) -> &'static str {
+        match self {
+            BackendIssue::RespawnLimit { .. } => "respawnLimit",
+            BackendIssue::ProtocolViolation { .. } => "protocolViolation",
+            BackendIssue::SpawnFailed { .. } => "spawnFailed",
+        }
+    }
+
+    /// 문장에 끼워 넣을 값들. **문자열로 이어 붙이지 않는다** — 언어마다 어순이 다르므로,
+    /// 이미 이어 붙인 문장은 번역할 수 없다.
+    pub fn params(&self) -> Value {
+        match self {
+            BackendIssue::RespawnLimit { attempts } => json!({ "attempts": attempts }),
+            BackendIssue::ProtocolViolation { reason } => json!({ "reason": reason }),
+            BackendIssue::SpawnFailed { attempt, max, error } => {
+                json!({ "attempt": attempt, "max": max, "error": error })
+            }
+        }
+    }
+
+    /// 원문(한국어). 로그와 **화면이 모르는 코드의 대체 표시**에 쓴다.
+    pub fn korean(&self) -> String {
+        match self {
+            BackendIssue::RespawnLimit { attempts } => {
+                format!("백엔드가 {attempts}번 다시 시작한 뒤에도 계속 종료됩니다.")
+            }
+            BackendIssue::ProtocolViolation { reason } => format!(
+                "백엔드와의 통신이 프로토콜 위반으로 끊겼습니다. 다시 시작하지 않습니다 — 같은 위반이 반복될 뿐입니다. ({reason})"
+            ),
+            BackendIssue::SpawnFailed { attempt, max, error } => {
+                format!("백엔드를 다시 시작할 수 없습니다 ({attempt}/{max}): {error}")
+            }
+        }
+    }
+
+    /// 사용자가 무엇을 할 수 있는가. **판정은 문제 종류가 정한다** — 화면이 고르지 않는다.
+    pub fn recovery(&self) -> Recovery {
+        match self {
+            BackendIssue::RespawnLimit { .. } | BackendIssue::SpawnFailed { .. } => Recovery::ReopenWorkspace,
+            // 다시 열어도 같은 위반이 반복된다.
+            BackendIssue::ProtocolViolation { .. } => Recovery::None,
+        }
+    }
+}
+
 /// 감독자의 **현재** 상태. `ensure_alive`와 달리 아무것도 바꾸지 않는다.
 ///
 /// 세 값인 이유: "죽어 있다"가 곧 "사용자가 개입해야 한다"는 아니다. 상한이 남아 있으면
@@ -451,35 +521,45 @@ pub enum SupervisorStatus {
         remaining: u64,
     },
     /// 사용자가 개입해야 한다.
+    ///
+    /// **문장 대신 코드와 파라미터를 준다.** `message`는 화면이 그 코드를 아직 모를 때의
+    /// 대체 표시이지 화면이 쓸 기본값이 아니다.
     Unavailable {
-        reason: String,
+        code: String,
+        params: Value,
+        message: String,
         recovery: Recovery,
     },
 }
 
+impl SupervisorStatus {
+    fn unavailable(issue: BackendIssue) -> Self {
+        SupervisorStatus::Unavailable {
+            code: issue.code().to_string(),
+            params: issue.params(),
+            message: issue.korean(),
+            recovery: issue.recovery(),
+        }
+    }
+}
+
 impl RespawnOutcome {
-    /// 실패했다면 (사용자에게 보일 문장, 복구 방법). 성공이면 `None`.
+    /// 실패했다면 그 문제. 성공이면 `None`.
     ///
-    /// 문장을 여기 두는 이유가 둘이다. **한 곳에서 나와야 조회 경로(`status`)와 실행 경로가
-    /// 갈라지지 않는다.** 그리고 Tauri 껍데기 크레이트는 이 개발 환경에서 컴파일되지 않으므로,
-    /// 거기 남는 문장은 검증되지 않는다.
-    pub fn failure(&self) -> Option<(String, Recovery)> {
+    /// **한 곳에서 나와야 조회 경로(`status`)와 실행 경로가 갈라지지 않는다.** 그리고 Tauri
+    /// 껍데기 크레이트는 이 개발 환경에서 컴파일되지 않으므로, 거기 남는 판정은 검증되지 않는다.
+    pub fn failure(&self) -> Option<BackendIssue> {
         match self {
             RespawnOutcome::Alive | RespawnOutcome::Respawned { .. } => None,
-            RespawnOutcome::LimitReached { attempts } => Some((
-                format!("백엔드가 {attempts}번 다시 시작한 뒤에도 계속 종료됩니다."),
-                Recovery::ReopenWorkspace,
-            )),
-            RespawnOutcome::ProtocolViolation { reason } => Some((
-                format!(
-                    "백엔드와의 통신이 프로토콜 위반으로 끊겼습니다. 다시 시작하지 않습니다 — 같은 위반이 반복될 뿐입니다. ({reason})"
-                ),
-                Recovery::None,
-            )),
-            RespawnOutcome::SpawnFailed { attempt, error } => Some((
-                format!("백엔드를 다시 시작할 수 없습니다 ({attempt}/{MAX_SIDECAR_RESPAWNS}): {error}"),
-                Recovery::ReopenWorkspace,
-            )),
+            RespawnOutcome::LimitReached { attempts } => Some(BackendIssue::RespawnLimit { attempts: *attempts }),
+            RespawnOutcome::ProtocolViolation { reason } => {
+                Some(BackendIssue::ProtocolViolation { reason: reason.clone() })
+            }
+            RespawnOutcome::SpawnFailed { attempt, error } => Some(BackendIssue::SpawnFailed {
+                attempt: *attempt,
+                max: MAX_SIDECAR_RESPAWNS,
+                error: error.clone(),
+            }),
         }
     }
 }
@@ -519,26 +599,22 @@ impl SidecarSupervisor {
         }
         if let Some(reason) = guard.close_reason() {
             if reason.starts_with(PROTOCOL_VIOLATION_PREFIX) {
-                let (message, recovery) = RespawnOutcome::ProtocolViolation { reason }
-                    .failure()
-                    .expect("프로토콜 위반은 실패다");
-                return SupervisorStatus::Unavailable {
-                    reason: message,
-                    recovery,
-                };
+                return SupervisorStatus::unavailable(
+                    RespawnOutcome::ProtocolViolation { reason }
+                        .failure()
+                        .expect("프로토콜 위반은 실패다"),
+                );
             }
         }
         let used = self.respawns.load(Ordering::SeqCst);
         if used >= self.max_respawns {
-            let (message, recovery) = RespawnOutcome::LimitReached {
-                attempts: self.max_respawns,
-            }
-            .failure()
-            .expect("상한 도달은 실패다");
-            return SupervisorStatus::Unavailable {
-                reason: message,
-                recovery,
-            };
+            return SupervisorStatus::unavailable(
+                RespawnOutcome::LimitReached {
+                    attempts: self.max_respawns,
+                }
+                .failure()
+                .expect("상한 도달은 실패다"),
+            );
         }
         SupervisorStatus::WillRespawn {
             remaining: self.max_respawns - used,
@@ -862,9 +938,18 @@ mod supervisor_tests {
         wait_closed(&supervisor.client());
 
         match supervisor.status() {
-            SupervisorStatus::Unavailable { recovery, reason } => {
+            SupervisorStatus::Unavailable {
+                recovery,
+                code,
+                params,
+                message,
+            } => {
                 assert_eq!(recovery, Recovery::ReopenWorkspace);
-                assert!(reason.contains("계속 종료"), "{reason}");
+                // **코드가 판정이다.** 화면은 이걸로 문장을 고른다.
+                assert_eq!(code, "respawnLimit");
+                assert_eq!(params["attempts"], json!(MAX_SIDECAR_RESPAWNS));
+                // 원문도 함께 온다 — 화면이 코드를 모를 때의 대체 표시다.
+                assert!(message.contains("계속 종료"), "{message}");
             }
             other => panic!("상한에 도달했는데 다른 상태입니다: {other:?}"),
         }
@@ -886,9 +971,16 @@ mod supervisor_tests {
         assert_eq!(supervisor.respawn_count(), 0, "상한이 남아 있는 상태여야 합니다");
 
         match supervisor.status() {
-            SupervisorStatus::Unavailable { recovery, reason } => {
+            SupervisorStatus::Unavailable {
+                recovery, code, params, ..
+            } => {
                 assert_eq!(recovery, Recovery::None);
-                assert!(reason.contains("프로토콜 위반"), "{reason}");
+                assert_eq!(code, "protocolViolation");
+                // 위반 사유는 **파라미터로** 온다 — 문장에 이어 붙이면 번역할 수 없다.
+                assert!(
+                    params["reason"].as_str().unwrap_or_default().contains("너무 깁니다"),
+                    "{params}"
+                );
             }
             other => panic!("위반인데 다른 상태입니다: {other:?}"),
         }
@@ -917,15 +1009,16 @@ mod supervisor_tests {
         assert_eq!(supervisor.status(), SupervisorStatus::Alive);
     }
 
-    /// 조회와 실행이 **같은 문장**을 쓴다. 두 벌이 되면 화면과 로그가 다른 말을 하고,
+    /// 조회와 실행이 **같은 판정**에서 나온다. 두 벌이 되면 화면과 로그가 다른 말을 하고,
     /// 한쪽만 고쳐질 때 그 사실이 드러나지 않는다.
     #[test]
-    fn the_message_comes_from_one_place() {
-        let outcome = RespawnOutcome::LimitReached {
+    fn the_verdict_comes_from_one_place() {
+        let issue = RespawnOutcome::LimitReached {
             attempts: MAX_SIDECAR_RESPAWNS,
-        };
-        let (message, recovery) = outcome.failure().unwrap();
-        assert_eq!(recovery, Recovery::ReopenWorkspace);
+        }
+        .failure()
+        .unwrap();
+        assert_eq!(issue.recovery(), Recovery::ReopenWorkspace);
 
         let spawns = Arc::new(AtomicUsize::new(0));
         let supervisor = SidecarSupervisor::new(dying_factory(spawns.clone())).unwrap();
@@ -935,9 +1028,55 @@ mod supervisor_tests {
         }
         wait_closed(&supervisor.client());
         match supervisor.status() {
-            SupervisorStatus::Unavailable { reason, .. } => assert_eq!(reason, message),
+            SupervisorStatus::Unavailable { code, message, .. } => {
+                assert_eq!(code, issue.code());
+                assert_eq!(message, issue.korean());
+            }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// **코드가 서로 달라야 한다.** 같으면 화면이 문장을 고를 수 없다.
+    #[test]
+    fn every_issue_has_its_own_code() {
+        let issues = [
+            BackendIssue::RespawnLimit { attempts: 2 },
+            BackendIssue::ProtocolViolation {
+                reason: "x".to_string(),
+            },
+            BackendIssue::SpawnFailed {
+                attempt: 1,
+                max: 2,
+                error: "y".to_string(),
+            },
+        ];
+        let codes: std::collections::BTreeSet<&str> = issues.iter().map(|i| i.code()).collect();
+        assert_eq!(codes.len(), issues.len(), "코드가 겹칩니다: {codes:?}");
+        // 그리고 파라미터가 비어 있으면 안 된다 — 문장에 끼울 값이 없으면 이어 붙이기로 되돌아간다.
+        for issue in &issues {
+            assert!(
+                issue.params().as_object().map(|o| !o.is_empty()).unwrap_or(false),
+                "{}의 파라미터가 비었습니다",
+                issue.code()
+            );
+            assert!(!issue.korean().is_empty());
+        }
+    }
+
+    /// **값이 문장에 이어 붙어 있지 않다.** 이어 붙인 문장은 어순이 다른 언어로 옮길 수 없다 —
+    /// 파라미터가 원문에 들어 있는지로 그걸 확인한다.
+    #[test]
+    fn the_values_travel_as_parameters_not_only_inside_the_sentence() {
+        let issue = BackendIssue::SpawnFailed {
+            attempt: 1,
+            max: 2,
+            error: "ENOENT".to_string(),
+        };
+        assert_eq!(issue.params()["attempt"], json!(1));
+        assert_eq!(issue.params()["max"], json!(2));
+        assert_eq!(issue.params()["error"], json!("ENOENT"));
+        // 원문에도 들어 있지만, 그건 대체 표시용이지 화면이 파싱할 것이 아니다.
+        assert!(issue.korean().contains("ENOENT"));
     }
 
     /// 성공한 결과는 실패 문장을 갖지 않는다 — 갖게 되면 화면이 정상 동작에도 배너를 띄운다.

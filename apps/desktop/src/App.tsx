@@ -1319,7 +1319,10 @@ export default function App() {
       {/* 백엔드가 사용자 개입을 요구하는 상태일 때만 뜬다. 자동으로 복구될 상태에서는 뜨지
           않는다 — 필요 없는 조치를 요구하면 사용자는 배너를 무시하는 법을 배운다. */}
       {banner && (
-        <p className="error">
+        // `data-untranslated`는 **개발자용 표시다.** 카탈로그가 모르는 코드가 원문으로 떨어진
+        // 상태이며, 눈에 보이는 처리는 두 번째 언어가 생길 때 정한다(ui-wireframes 6절).
+        // 지금은 언어가 하나뿐이라 원문과 번역이 같은 문장이다.
+        <p className="error" data-untranslated={banner.untranslated || undefined}>
           {banner.message}
           {reopenPath && (
             <button className="secondary tiny" onClick={() => void reopenBackend()} disabled={opening || running}>
