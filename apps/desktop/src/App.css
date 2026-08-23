@@ -838,6 +838,33 @@ button.tiny {
   cursor: pointer;
 }
 
+/* 선택지 값이 목록일 때 — 3.9절. 한 줄로 이어 붙이면 항목이 서넛만 되어도 라디오 옆에
+   문단이 붙고, 사용자는 두 문단을 눈으로 diff하게 된다. `<label>`은 phrasing content만
+   담으므로 `<ul>`이 아니라 span에 줄바꿈을 준다. */
+.disagreement-values {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.disagreement-value::before {
+  content: "· ";
+  color: var(--muted);
+}
+
+/* 공통 항목은 **고르는 대상이 아니다.** 선택지와 같은 무게로 그리면 그것도 고를 수 있는
+   것처럼 읽힌다. */
+.disagreement-shared {
+  margin: 2px 0 6px 20px;
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+}
+
+.disagreement-shared ul {
+  margin: 2px 0 0;
+  padding-left: 16px;
+}
+
 .disagreement-freeform {
   width: 100%;
   margin: 4px 0 0 20px;

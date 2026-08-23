@@ -241,3 +241,24 @@ test("simple tier에서는 requiredTests 차이가 blocking이 아니다", () =>
   );
   assert.equal(report.disagreements.find((d) => d.field === "requiredTests")?.blocking, false);
 });
+
+test("값을 정하지 않은 선택지의 라벨은 조사를 받침에 맞춰 고른다", () => {
+  // **조사를 상수로 박으면 절반이 틀린다** — 실제로 `를`이 박혀 있어 "완료 기준를 정하지
+  // 않음", "필요한 검증를 정하지 않음"이 사용자 화면으로 나가고 있었다. 앱은 멀쩡히 돌고
+  // 로그도 조용하므로 읽어보기 전에는 드러나지 않는다.
+  const report = run(
+    draft({ proposalId: "p1", doneCriteria: [], requiredTests: [], plan: [{ stepId: "s", description: "d", targetPaths: [] }] }),
+    draft({
+      proposalId: "p2",
+      doneCriteria: ["빈 문자열 거부"],
+      requiredTests: ["형식 검증"],
+      plan: [{ stepId: "s", description: "d", targetPaths: ["src/a.ts"] }],
+    })
+  );
+  const labels = report.disagreements.flatMap((d) => d.question.options.map((o) => o.label));
+  const empties = labels.filter((l) => l.includes("정하지 않음"));
+  assert.equal(empties.length, 3, JSON.stringify(labels));
+  assert.ok(empties.includes("완료 기준을 정하지 않음"), JSON.stringify(empties));
+  assert.ok(empties.includes("필요한 검증을 정하지 않음"), JSON.stringify(empties));
+  assert.ok(empties.includes("수정 위치를 정하지 않음"), JSON.stringify(empties));
+});

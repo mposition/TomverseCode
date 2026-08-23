@@ -187,7 +187,10 @@ function buildQuestion(
     // 모델 선호로 판단하게 되기 때문이다. `fromProposalId`는 추적용으로만 남는다.
     options: positions.map((p, index) => ({
       optionId: `${field}-${index + 1}`,
-      label: p.value.length > 0 ? p.value.join(" / ") : `${FIELD_LABEL[field]}를 정하지 않음`,
+      label:
+        p.value.length > 0
+          ? p.value.join(" / ")
+          : `${FIELD_LABEL[field]}${objectParticle(FIELD_LABEL[field])} 정하지 않음`,
       fromProposalId: p.proposalId,
     })),
     // 둘 다 아닐 수 있다. 강제 선택이 기본이되 자유 입력은 항상 열어둔다(16.2절 ②).
@@ -203,6 +206,21 @@ function buildQuestion(
  */
 export function fieldLabel(field: DisagreementField | NarrativeField): string {
   return FIELD_LABEL[field];
+}
+
+/**
+ * 한국어 목적격 조사. 받침 유무로 고른다.
+ *
+ * **조사를 상수로 박으면 절반이 틀린다** — 실제로 `를`이 박혀 있어 "완료 기준를 정하지 않음",
+ * "필요한 검증를 정하지 않음"이 나가고 있었다. 사용자에게 그대로 보이는 문장이라 조용히
+ * 틀린 채로 남는다. 화면 쪽에도 같은 함수가 있다(`apps/desktop/src/lib/optionChoice.ts`) —
+ * 프로세스가 다르고 표시 문자열은 표시하는 쪽이 갖는다는 규칙 때문이다(FIELD_LABEL과 같다).
+ */
+export function objectParticle(word: string): "을" | "를" {
+  const last = word.trimEnd().slice(-1);
+  const code = last.charCodeAt(0);
+  if (Number.isNaN(code) || code < 0xac00 || code > 0xd7a3) return "를";
+  return (code - 0xac00) % 28 === 0 ? "를" : "을";
 }
 
 /** 표기 차이를 갈림으로 세지 않기 위한 정규화. 순서는 의미가 없으므로 정렬한다. */

@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import type { Disagreement, DraftNarrative, NarrativeField, UserDecisionInput } from "../types";
 import { SecretShapeWarning, useSecretShapeScan } from "./SecretShapeWarning";
+import { layoutChoices, onlyLabel } from "../lib/optionChoice";
 
 /**
  * 불일치 판정 카드 — docs/design/ui-wireframes.md 3.9절.
@@ -21,6 +22,10 @@ import { SecretShapeWarning, useSecretShapeScan } from "./SecretShapeWarning";
  *   일치는 약한 증거다. 이 카드에서 초록색은 사용자가 직접 판정한 항목에만 쓴다.
  * - **비-blocking 쟁점은 목록에 섞지 않고** 접힌 영역에만 둔다. 필수와 참고를 같은 목록에
  *   섞으면 전부 참고 항목처럼 읽힌다.
+ * - **선택지가 목록일 때는 공통 항목을 밖으로 뺀다**(`lib/optionChoice.ts`). 두 목록이 대부분
+ *   같고 한 항목만 다를 때 라벨을 통째로 그리면 사용자가 두 문단을 눈으로 diff하게 된다 —
+ *   판정하라고 만든 카드가 판정을 어렵게 한다. **고르는 것은 여전히 목록 전체**이고 기록에도
+ *   전체가 남는다. 달라지는 것은 무엇을 보고 고르는가뿐이다.
  */
 
 type Choice = { optionId?: string; text: string };
@@ -86,19 +91,12 @@ export function DisagreementCard({
               </div>
               <p className="disagreement-question">{d.question.text}</p>
 
-              {d.question.options.map((option) => (
-                <label key={option.optionId} className="disagreement-option">
-                  <input
-                    type="radio"
-                    name={d.disagreementId}
-                    checked={chosen?.optionId === option.optionId}
-                    onChange={() => setChoice(d.disagreementId, { optionId: option.optionId, text: option.label })}
-                  />
-                  <span>{option.label}</span>
-                  {/* 출처는 개발자 모드에서만. 평소에 보이면 모델 선호로 판단하게 된다. */}
-                  {devMode && <code className="muted small">{option.fromProposalId}</code>}
-                </label>
-              ))}
+              <OptionList
+                disagreement={d}
+                chosenOptionId={chosen?.optionId}
+                devMode={devMode}
+                onPick={(optionId, text) => setChoice(d.disagreementId, { optionId, text })}
+              />
 
               <label className="disagreement-option">
                 <input
@@ -217,6 +215,89 @@ export function DisagreementCard({
  * 않는다 — `types.ts` 주석 참조) 문자열을 이벤트에 실어 보내면 UI 문구를 sidecar가 정하게 되므로,
  * 표시 문자열은 표시하는 쪽이 갖는다. 한쪽을 고칠 때 다른 쪽도 볼 것.
  */
+/**
+ * 한 쟁점의 선택지들.
+ *
+ * 값이 목록인 필드(`doneCriteria`·`requiredTests`·`targetPaths`)에서는 공통 항목을 위로 빼고
+ * 각 선택지에는 **그 선택지에만 있는 것**만 남긴다. 계산은 화면 밖에 있다 — 화면 안에 있으면
+ * 검증할 방법이 없다(CLAUDE.md).
+ */
+function OptionList({
+  disagreement,
+  chosenOptionId,
+  devMode,
+  onPick,
+}: {
+  disagreement: Disagreement;
+  chosenOptionId: string | undefined;
+  devMode: boolean;
+  onPick: (optionId: string, text: string) => void;
+}) {
+  const valuesOf = (fromProposalId: string) =>
+    disagreement.positions.find((p) => p.proposalId === fromProposalId)?.value ?? [];
+  const layout = layoutChoices(
+    disagreement.question.options.map((o) => ({ optionId: o.optionId, values: valuesOf(o.fromProposalId) }))
+  );
+  const split = layout.asList && layout.shared.length > 0;
+
+  return (
+    <>
+      {split && (
+        <div className="disagreement-shared">
+          <span className="muted small">양쪽 공통 — 고르는 대상이 아닙니다</span>
+          <ul>
+            {layout.shared.map((item) => (
+              <li key={item} className="muted">
+                {item}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {disagreement.question.options.map((option, index) => {
+        const only = layout.distinct[index]?.only ?? [];
+        return (
+          <label key={option.optionId} className="disagreement-option">
+            <input
+              type="radio"
+              name={disagreement.disagreementId}
+              checked={chosenOptionId === option.optionId}
+              // **기록되는 값은 라벨 그대로다.** 화면이 나눠 보여준다고 고른 것이 달라지지
+              // 않는다 — 사용자가 고른 것은 그 초안의 목록 전체다.
+              onChange={() => onPick(option.optionId, option.label)}
+            />
+            <OptionBody
+              items={split ? only : valuesOf(option.fromProposalId)}
+              fallback={split ? onlyLabel(only, layout.shared.length) : option.label}
+            />
+            {/* 출처는 개발자 모드에서만. 평소에 보이면 모델 선호로 판단하게 된다. */}
+            {devMode && <code className="muted small">{option.fromProposalId}</code>}
+          </label>
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * 선택지 본문. 항목이 둘 이상이면 줄을 나눈다 — 한 줄로 이어 붙이면 라디오 옆에 문단이 붙는다.
+ *
+ * `<label>`은 phrasing content만 담을 수 있어 `<ul>`을 넣으면 유효하지 않은 마크업이 된다.
+ * 줄바꿈은 CSS가 하고, 그러면 라벨 클릭으로 고르는 동작도 남는다.
+ */
+function OptionBody({ items, fallback }: { items: string[]; fallback: string }) {
+  if (items.length < 2) return <span>{fallback}</span>;
+  return (
+    <span className="disagreement-values">
+      {items.map((item) => (
+        <span key={item} className="disagreement-value">
+          {item}
+        </span>
+      ))}
+    </span>
+  );
+}
+
 function narrativeLabel(field: NarrativeField): string {
   return field === "interpretation" ? "원인 진단" : "위험";
 }
