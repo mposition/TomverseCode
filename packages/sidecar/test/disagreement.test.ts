@@ -162,6 +162,53 @@ test("독립 공급자가 없으면 대조를 드롭하고 그 사실이 로그�
   assert.equal(host.events.filter((e) => e.type === "DRAFT_RECEIVED").length, 1);
 });
 
+/**
+ * **비-blocking 쟁점이 카드에 실리고, 답하지 않아도 미해결이 되지 않는다** — 17.4절.
+ *
+ * 종전에는 카드에 실리지도 않았다. 그래서 (a) 사용자가 갈린 것을 보고도 고칠 방법이 없었고
+ * (b) blocking 판정 규칙을 검증할 데이터가 영영 생기지 않았다.
+ */
+test("비-blocking 쟁점이 카드에 함께 실리고, 답이 없어도 미해결이 아니다", async () => {
+  const { orchestrator, host } = build({
+    defaultPatch: VALID_PATCH,
+    scriptByModel: twoExecutorScripts(
+      [
+        draftStep({ doneCriteria: ["빈 문자열을 거부한다"], targetPaths: ["a.ts", "shared.ts"] }),
+        draftStep({ doneCriteria: ["빈 문자열을 거부한다"], targetPaths: ["a.ts", "shared.ts"] }),
+      ],
+      [
+        draftStep({ doneCriteria: ["빈 문자열을 통과시킨다"], targetPaths: ["b.ts", "shared.ts"] }),
+        draftStep({ doneCriteria: ["빈 문자열을 거부한다"], targetPaths: ["a.ts", "shared.ts"] }),
+      ]
+    ),
+  });
+
+  const promise = orchestrator.run();
+  await waitFor(() => disagreementCard(host) !== undefined);
+  const card = disagreementCard(host)!;
+
+  const blocking = card.disagreements.filter((d) => d.blocking);
+  const advisory = card.disagreements.filter((d) => !d.blocking);
+  assert.equal(blocking.length, 1, JSON.stringify(card.disagreements.map((d) => [d.field, d.blocking])));
+  // 겹치는 파일이 있으므로 targetPaths는 blocking이 아니다 — 그래도 카드에는 온다.
+  assert.ok(advisory.some((d) => d.field === "targetPaths"), JSON.stringify(advisory.map((d) => d.field)));
+
+  // 필수만 답한다. 선택 항목은 건드리지 않는다.
+  const target = blocking[0]!;
+  const option = target.question.options[0]!;
+  assert.ok(
+    orchestrator.provideUserInput(option.label, [
+      { disagreementId: target.disagreementId, optionId: option.optionId, text: option.label },
+    ])
+  );
+
+  const result = await promise;
+  assert.equal(result.status, "completed", result.summary);
+  // **답하지 않은 선택 항목이 "묻지 못한 쟁점"으로 기록되면 안 된다** — 물었고 사용자가
+  // 건너뛴 것이라, 그렇게 적으면 로그가 거짓말을 한다.
+  assert.deepEqual(result.unresolvedDisagreements ?? [], []);
+});
+
 test("blocking 불일치가 생기면 3.9절 카드로 묻고, 답이 기준으로 고정된다", async () => {
   const { orchestrator, host } = build({
     defaultPatch: VALID_PATCH,
@@ -212,6 +259,8 @@ test("blocking 불일치가 생기면 3.9절 카드로 묻고, 답이 기준으�
       optionRank: 1,
       // 어떤 필드였는지 — 랭킹(17.4절) 튜닝의 재료다(17.10절 ⑩).
       field: target.field,
+      // 규칙이 막을 만하다고 봤는지 — blocking 판정 규칙 자체를 물을 수 있게 하는 축이다.
+      blocking: true,
     },
   ]);
 });
@@ -304,6 +353,7 @@ test("자유 입력은 optionId 없이 freeform으로 기록된다", async () =>
       cardPosition: 1,
       optionRank: null,
       field: target.field,
+      blocking: true,
     },
   ]);
 });

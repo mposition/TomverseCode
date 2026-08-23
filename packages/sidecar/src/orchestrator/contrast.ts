@@ -287,7 +287,17 @@ function isPairwiseDisjoint(values: string[][]): boolean {
 export const MAX_QUESTIONS_PER_ROUND = 4;
 
 /**
- * 이번 라운드에 물을 것과 못 물을 것을 나눈다 (17.4절).
+ * 이번 라운드에 **물을 것 / 못 물을 것 / 함께 실을 것**을 나눈다 (17.4절).
+ *
+ * # 비-blocking 쟁점이 어디에도 가지 않고 있었다
+ *
+ * 17.4절은 비-blocking을 "표시만"이라고 정했고 카드 화면에도 접힌 영역이 준비되어 있는데,
+ * 이 함수가 blocking만 돌려주는 바람에 **그 영역은 한 번도 채워진 적이 없다.** 갈렸다고
+ * 판정해 놓고 사용자에게 보여주지도 않은 것이다.
+ *
+ * 그리고 그 결과로 **blocking 판정 규칙 자체를 검증할 데이터가 없다**(12절 미해결). 규칙이
+ * "묻지 않아도 된다"고 한 쟁점을 물어본 적이 없으니, 그 판정이 옳았는지 알 길이 없다.
+ * 함께 실으면 왕복 횟수를 늘리지 않고 그 데이터가 생긴다.
  *
  * **여러 불일치를 한 라운드에 묶는다.** 라운드는 왕복 횟수이지 질문 개수가 아니고,
  * 사용자를 세 번 깨우는 것이 최악이다. 한 화면에 강제 선택 3~4개가 낫다.
@@ -298,11 +308,26 @@ export const MAX_QUESTIONS_PER_ROUND = 4;
 export function planQuestionRound(
   report: DisagreementReport,
   maxQuestions = MAX_QUESTIONS_PER_ROUND
-): { asked: Disagreement[]; deferred: Disagreement[] } {
+): { asked: Disagreement[]; deferred: Disagreement[]; advisory: Disagreement[] } {
   // contrastDrafts가 이미 랭킹 순으로 만들지만 여기서 다시 정렬한다 — 이 함수가 다른 곳에서
   // 만들어진 리포트를 받아도 순서 보장이 깨지지 않아야 한다.
-  const blocking = report.disagreements
-    .filter((d) => d.blocking)
-    .sort((a, b) => DISAGREEMENT_FIELD_RANK.indexOf(a.field) - DISAGREEMENT_FIELD_RANK.indexOf(b.field));
-  return { asked: blocking.slice(0, maxQuestions), deferred: blocking.slice(maxQuestions) };
+  const byRank = (a: Disagreement, b: Disagreement): number =>
+    DISAGREEMENT_FIELD_RANK.indexOf(a.field) - DISAGREEMENT_FIELD_RANK.indexOf(b.field);
+  const blocking = report.disagreements.filter((d) => d.blocking).sort(byRank);
+  const asked = blocking.slice(0, maxQuestions);
+  const deferred = blocking.slice(maxQuestions);
+
+  // **함께 실을 수 있는 조건은 둘이다.**
+  //
+  //  - 카드가 이미 뜬다(`asked`가 있다). 비-blocking 하나 때문에 라운드를 열면 사용자를 한 번
+  //    더 깨우는 것이고, 그건 17.4절이 상한을 그대로 두기로 한 이유와 정면으로 어긋난다.
+  //  - 예산을 넘긴 blocking이 없다. 물어야 할 것이 밀려난 카드에 참고 항목을 올리면
+  //    예산이라는 개념이 무너진다.
+  const canRideAlong = asked.length > 0 && deferred.length === 0;
+
+  return {
+    asked,
+    deferred,
+    advisory: canRideAlong ? report.disagreements.filter((d) => !d.blocking).sort(byRank) : [],
+  };
 }

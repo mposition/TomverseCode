@@ -227,6 +227,83 @@ test("비-blocking 쟁점은 질문 목록에 들어가지 않는다", () => {
   assert.ok(report.narratives.some((n) => n.field === "interpretation"));
 });
 
+/**
+ * 비-blocking 쟁점이 **어디에도 가지 않던** 상태를 고정한다.
+ *
+ * 17.4절은 "표시만"이라고 정했고 카드 화면에는 접힌 영역이 준비되어 있었는데,
+ * `planQuestionRound`가 blocking만 돌려줘서 그 영역이 한 번도 채워진 적이 없었다.
+ * 갈렸다고 판정해 놓고 사용자에게 보여주지도 않은 것이다.
+ */
+test("비-blocking 쟁점은 카드에 함께 실린다 — 질문 목록과는 따로", () => {
+  const report = run(
+    draft({
+      proposalId: "p1",
+      doneCriteria: ["A"],
+      plan: [{ stepId: "s", description: "d", targetPaths: ["a.ts", "shared.ts"] }],
+    }),
+    draft({
+      proposalId: "p2",
+      doneCriteria: ["B"],
+      plan: [{ stepId: "s", description: "d", targetPaths: ["b.ts", "shared.ts"] }],
+    })
+  );
+  const { asked, advisory } = planQuestionRound(report);
+  // targetPaths는 겹치는 파일이 있으므로 blocking이 아니다(17.4절).
+  assert.ok(asked.every((d) => d.blocking));
+  assert.ok(advisory.length > 0, JSON.stringify(report.disagreements.map((d) => [d.field, d.blocking])));
+  assert.ok(advisory.every((d) => !d.blocking));
+});
+
+test("비-blocking만 있으면 라운드를 열지 않는다", () => {
+  // 비-blocking 하나 때문에 카드를 띄우면 사용자를 한 번 더 깨우는 것이고, 그건 17.4절이
+  // 질문 상한을 그대로 두기로 한 이유와 정면으로 어긋난다.
+  const report = run(
+    draft({
+      proposalId: "p1",
+      doneCriteria: ["같음"],
+      plan: [{ stepId: "s", description: "d", targetPaths: ["a.ts", "shared.ts"] }],
+    }),
+    draft({
+      proposalId: "p2",
+      doneCriteria: ["같음"],
+      plan: [{ stepId: "s", description: "d", targetPaths: ["b.ts", "shared.ts"] }],
+    })
+  );
+  const { asked, advisory } = planQuestionRound(report);
+  assert.equal(asked.length, 0, JSON.stringify(asked.map((d) => d.field)));
+  assert.deepEqual(advisory, []);
+});
+
+test("blocking이 카드를 가득 채우면 비-blocking은 실리지 않는다", () => {
+  // 예산을 넘긴 blocking이 있는데 참고 항목을 함께 실으면, 정작 물어야 할 것을 밀어낸 자리에
+  // 참고가 앉는다.
+  // targetPaths가 겹치므로 그 쟁점은 비-blocking이다 — **실을 것이 실제로 존재한다.**
+  // 이게 없으면 advisory가 빈 것이 규칙 때문인지 후보가 없어서인지 구별되지 않는다.
+  const report = run(
+    draft({
+      proposalId: "p1",
+      doneCriteria: ["A"],
+      requiredTests: ["t1"],
+      plan: [{ stepId: "s", description: "d", targetPaths: ["a.ts", "shared.ts"] }],
+    }),
+    draft({
+      proposalId: "p2",
+      doneCriteria: ["B"],
+      requiredTests: ["t2"],
+      plan: [{ stepId: "s", description: "d", targetPaths: ["b.ts", "shared.ts"] }],
+    })
+  );
+  assert.ok(
+    report.disagreements.some((d) => !d.blocking),
+    "비-blocking 후보가 없어 이 검사가 공허합니다"
+  );
+  const { asked, deferred, advisory } = planQuestionRound(report, 1);
+  assert.equal(asked.length, 1);
+  assert.ok(deferred.length > 0);
+  // 넘친 blocking이 있는데 참고를 실으면 예산 개념이 무너진다.
+  assert.deepEqual(advisory, []);
+});
+
 test("한 라운드 질문 상한은 한 화면에 들어가는 수다", () => {
   // 라운드는 왕복 횟수이지 질문 개수가 아니다(17.4절) — 세 번 깨우는 것이 최악이므로
   // 여러 쟁점을 한 카드에 묶는다. 다만 스크롤이 생길 만큼 묶지는 않는다.

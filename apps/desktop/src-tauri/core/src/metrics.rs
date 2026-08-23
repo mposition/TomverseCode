@@ -248,6 +248,22 @@ pub struct CardAnswers {
     /// 한 축으로 합치면 둘 중 어느 것이 비율을 움직였는지 알 수 없다.
     #[serde(rename = "byField")]
     pub by_field: BTreeMap<String, FieldAnswers>,
+    /// **규칙이 막을 만하다고 봤는가**별 답 분포 — 12절 "blocking 판정 규칙 자체".
+    ///
+    /// # 이 축이 없으면 규칙을 검증할 수 없다
+    ///
+    /// blocking 판정은 규칙이 내린다(17.4절). 그 규칙이 옳은지 물으려면 **규칙이 "묻지 않아도
+    /// 된다"고 한 쟁점에서 사용자가 무엇을 골랐는지**를 봐야 하는데, 종전에는 그런 쟁점을
+    /// 카드에 싣지도 않았으므로 답이 존재할 수 없었다.
+    ///
+    /// 읽는 법: `non_blocking`에서 `pickedOther`/`freeform` 비율이 `blocking`과 비슷하거나
+    /// 높으면, 규칙이 막지 않기로 한 쟁점도 실제로는 판정이 갈리는 쟁점이었다는 뜻이다.
+    /// **절대값이 아니라 두 칸의 비교를 본다** — 카드 자리·필드 편향은 양쪽에 똑같이 걸린다.
+    ///
+    /// 키는 `blocking` / `non_blocking` / `unknown`. 마지막은 이 축이 붙기 전 기록이며,
+    /// 어느 한쪽에 합치면 그 쪽 비율이 과거 데이터로 희석된다.
+    #[serde(rename = "byBlocking")]
+    pub by_blocking: BTreeMap<String, FieldAnswers>,
 }
 
 /// 이 워크스페이스의 커밋이 **몇 개 파일을 담아 왔는가** — 19.6절 "커밋 단위"의 남은 항목.
@@ -1084,6 +1100,18 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "verdict가 separated인 쌍이 생기면 그때 라우터를 데이터 기반으로 전환한다(8절). **verificationPassRate로는 전환하지 않는다** — 그 분포는 라우터가 만든 것이라 표본이 쌓여도 편향이 줄지 않는다. unattributed가 0이 아니면 먼저 그 배선부터 본다",
         ),
         open_question(
+            "blockingRule",
+            "규칙이 '묻지 않아도 된다'고 판정한 쟁점에서 사용자가 뒤집는가 (state-machine 12절)",
+            "카드에서 받은 답 중 blocking 여부가 기록된 것",
+            m.card_answers
+                .by_blocking
+                .iter()
+                .filter(|(k, _)| k.as_str() != "unknown")
+                .map(|(_, f)| f.picked_primary + f.picked_other + f.freeform + f.unknown)
+                .sum(),
+            "non_blocking 칸의 pickedOther+freeform 비율이 blocking 칸과 비슷하거나 높으면 17.4절의 blocking 규칙이 막아야 할 것을 막지 않은 것이다. **절대값이 아니라 두 칸의 비교를 볼 것** — 자리·필드 편향은 양쪽에 똑같이 걸린다",
+        ),
+        open_question(
             "reviewerFindings",
             "검수가 patch를 실제로 바꾸는가, 산문만 남기는가 (product-strategy 14절)",
             "검수가 판정을 낸 태스크 수",
@@ -1492,20 +1520,33 @@ fn collect_card_answers(events: &[crate::store::StoredEvent], out: &mut CardAnsw
                 }
             }
 
+            // 답 하나를 어느 칸에 더할지는 같은 규칙이다. 두 번 적으면 한쪽만 고쳐질 수 있다.
+            let tally = |slot: &mut FieldAnswers| {
+                if freeform {
+                    slot.freeform += 1;
+                } else {
+                    match rank {
+                        Some(1) => slot.picked_primary += 1,
+                        Some(_) => slot.picked_other += 1,
+                        None => slot.unknown += 1,
+                    }
+                }
+            };
+
             // 필드는 payload가 말한다. **id에서 파싱하지 않는다** — id 형식을 바꾸는 순간
             // 집계가 조용히 끊기고, 끊긴 것은 0으로 보인다.
             if let Some(field) = decision.get("field").and_then(Value::as_str) {
-                let by_field = out.by_field.entry(field.to_string()).or_default();
-                if freeform {
-                    by_field.freeform += 1;
-                } else {
-                    match rank {
-                        Some(1) => by_field.picked_primary += 1,
-                        Some(_) => by_field.picked_other += 1,
-                        None => by_field.unknown += 1,
-                    }
-                }
+                tally(out.by_field.entry(field.to_string()).or_default());
             }
+
+            // 규칙이 막을 만하다고 봤는가. **없으면 `unknown`이고 어느 쪽에도 합치지 않는다** —
+            // 이 축이 붙기 전 기록을 blocking으로 세면 그 칸이 과거 데이터로 희석된다.
+            let bucket = match decision.get("blocking").and_then(Value::as_bool) {
+                Some(true) => "blocking",
+                Some(false) => "non_blocking",
+                None => "unknown",
+            };
+            tally(out.by_blocking.entry(bucket.to_string()).or_default());
         }
     }
 }
@@ -2644,6 +2685,49 @@ mod tests {
     }
 
     // ---- 검수가 무엇을 했는가 (product-strategy.md 14절) ----
+
+    // ---- blocking 판정 규칙 (state-machine 12절) ----
+
+    #[test]
+    fn answers_are_split_by_whether_the_rule_called_it_blocking() {
+        // 이 축이 없으면 "규칙이 묻지 않아도 된다고 한 쟁점에서 사용자가 뒤집었는가"를 물을 수 없다.
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &json!({ "cardSize": 2, "decisions": [
+                    { "disagreementId": "d0", "cardPosition": 1, "optionRank": 1, "field": "doneCriteria", "freeform": false, "blocking": true },
+                    { "disagreementId": "d1", "cardPosition": 2, "optionRank": 2, "field": "targetPaths", "freeform": false, "blocking": false },
+                ]}),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        let by = &m.card_answers.by_blocking;
+        assert_eq!(by.get("blocking").map(|f| f.picked_primary), Some(1), "{by:?}");
+        // 규칙이 막지 않기로 한 쟁점에서 사용자가 다른 초안을 골랐다 — 그 판정이 틀렸던 경우다.
+        assert_eq!(by.get("non_blocking").map(|f| f.picked_other), Some(1), "{by:?}");
+    }
+
+    #[test]
+    fn records_without_the_axis_are_not_folded_into_either_side() {
+        // 어느 한쪽에 합치면 그 칸의 비율이 과거 데이터로 희석된다.
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &json!({ "cardSize": 1, "decisions": [
+                    { "disagreementId": "d0", "cardPosition": 1, "optionRank": 1, "field": "doneCriteria", "freeform": false },
+                ]}),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.card_answers.by_blocking.get("unknown").map(|f| f.picked_primary), Some(1));
+        assert!(m.card_answers.by_blocking.get("blocking").is_none());
+        // 그리고 분모에도 들어가지 않는다.
+        assert_eq!(question(&m, "blockingRule").samples, 0);
+    }
 
     fn seed_review(store: &mut Store, task_id: &str, verdict: &str, changed: Option<bool>) {
         store

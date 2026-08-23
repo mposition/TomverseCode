@@ -81,46 +81,21 @@ export function DisagreementCard({
       </p>
 
       <ol className="disagreements">
-        {blocking.map((d) => {
-          const chosen = choices[d.disagreementId];
-          return (
-            <li key={d.disagreementId} className="disagreement">
-              <div className="disagreement-head">
-                <span className="disagreement-field">{fieldLabel(d.field)}</span>
-                <span className="badge badge-required">필수</span>
-              </div>
-              <p className="disagreement-question">{d.question.text}</p>
-
-              <OptionList
-                disagreement={d}
-                chosenOptionId={chosen?.optionId}
-                devMode={devMode}
-                onPick={(optionId, text) => setChoice(d.disagreementId, { optionId, text })}
-              />
-
-              <label className="disagreement-option">
-                <input
-                  type="radio"
-                  name={d.disagreementId}
-                  checked={chosen !== undefined && chosen.optionId === undefined}
-                  onChange={() => setChoice(d.disagreementId, { text: "" })}
-                />
-                <span>직접 입력</span>
-              </label>
-              {chosen !== undefined && chosen.optionId === undefined && (
-                <input
-                  className="disagreement-freeform"
-                  value={chosen.text}
-                  autoFocus
-                  placeholder="둘 다 아니면 직접 적어주세요"
-                  onChange={(e) => setChoice(d.disagreementId, { text: e.target.value })}
-                />
-              )}
-
-              {devMode && <p className="muted small">blocking 판정 근거: {d.blockingReason}</p>}
-            </li>
-          );
-        })}
+        {blocking.map((d) => (
+          <li key={d.disagreementId} className="disagreement">
+            <div className="disagreement-head">
+              <span className="disagreement-field">{fieldLabel(d.field)}</span>
+              <span className="badge badge-required">필수</span>
+            </div>
+            <QuestionBody
+              disagreement={d}
+              chosen={choices[d.disagreementId]}
+              devMode={devMode}
+              autoFocusFreeform
+              onChoose={(choice) => setChoice(d.disagreementId, choice)}
+            />
+          </li>
+        ))}
       </ol>
 
       {/* **갈렸지만 막지 않은 쟁점**과 **두 초안의 서술**은 다른 것이라 따로 접는다.
@@ -130,24 +105,29 @@ export function DisagreementCard({
       {advisory.length > 0 && (
         <details className="disagreement-advisory">
           <summary>갈렸지만 묻지 않은 쟁점 ({advisory.length}건)</summary>
-          <ul>
+          {/* **답할 수 있게 열어둔다.** 규칙이 "묻지 않아도 된다"고 판정한 것이지 사용자가
+              그렇게 판정한 것이 아니다. 종전에는 값만 나열해서, 사용자가 여기서 잘못된 해석을
+              보고도 고칠 방법이 없었다 — 요구의 최종 권위가 사용자라는 규칙과 어긋난다.
+              그리고 이 답이 blocking 판정 규칙을 검증할 유일한 데이터다(17.4절). */}
+          <ol className="disagreements">
             {advisory.map((d) => (
-              <li key={d.disagreementId}>
-                <span className="disagreement-field">{fieldLabel(d.field)}</span>
-                <ul>
-                  {d.positions.map((p) => (
-                    <li key={p.proposalId} className="muted small">
-                      {p.value.join(" / ") || "(없음)"}
-                    </li>
-                  ))}
-                </ul>
-                {devMode && <p className="muted small">판정 근거: {d.blockingReason}</p>}
+              <li key={d.disagreementId} className="disagreement disagreement-optional">
+                <div className="disagreement-head">
+                  <span className="disagreement-field">{fieldLabel(d.field)}</span>
+                  <span className="badge badge-optional">선택</span>
+                </div>
+                <QuestionBody
+                  disagreement={d}
+                  chosen={choices[d.disagreementId]}
+                  devMode={devMode}
+                  onChoose={(choice) => setChoice(d.disagreementId, choice)}
+                />
               </li>
             ))}
-          </ul>
+          </ol>
           <p className="muted small">
-            규칙이 "묻지 않아도 된다"고 판정한 항목입니다 — 답하지 않아도 진행합니다. 필수 항목과
-            섞어 놓으면 필수가 참고처럼 읽히기 때문에 따로 두었습니다.
+            규칙이 "묻지 않아도 된다"고 판정한 항목입니다 — <strong>답하지 않아도 진행합니다.</strong>{" "}
+            필수 항목과 섞어 놓으면 필수가 참고처럼 읽히기 때문에 따로 두었습니다.
           </p>
         </details>
       )}
@@ -184,14 +164,18 @@ export function DisagreementCard({
         <button
           onClick={() =>
             onSubmit(
-              blocking.map((d) => {
-                const choice = choices[d.disagreementId]!;
-                return {
-                  disagreementId: d.disagreementId,
-                  ...(choice.optionId ? { optionId: choice.optionId } : {}),
-                  text: choice.text.trim(),
-                };
-              })
+              // 선택 항목은 **답한 것만** 싣는다. 빈 답을 실으면 "답하지 않았다"가
+              // "빈 문자열로 답했다"가 되어 집계가 그 둘을 구별하지 못한다.
+              [...blocking, ...advisory]
+                .filter((d) => (choices[d.disagreementId]?.text ?? "").trim().length > 0)
+                .map((d) => {
+                  const choice = choices[d.disagreementId]!;
+                  return {
+                    disagreementId: d.disagreementId,
+                    ...(choice.optionId ? { optionId: choice.optionId } : {}),
+                    text: choice.text.trim(),
+                  };
+                })
             )
           }
           disabled={!complete}
@@ -222,6 +206,60 @@ export function DisagreementCard({
  * 각 선택지에는 **그 선택지에만 있는 것**만 남긴다. 계산은 화면 밖에 있다 — 화면 안에 있으면
  * 검증할 방법이 없다(CLAUDE.md).
  */
+/**
+ * 질문 하나의 본문. **필수와 선택이 같은 컴포넌트를 쓴다.**
+ *
+ * 둘을 따로 그리면 한쪽에만 붙은 개선(공통 항목 분리 같은)이 다른 쪽에 없게 되고, 그 차이는
+ * 화면을 나란히 놓고 봐야만 드러난다. 다른 것은 감싸는 자리와 배지뿐이다.
+ */
+function QuestionBody({
+  disagreement,
+  chosen,
+  devMode,
+  autoFocusFreeform = false,
+  onChoose,
+}: {
+  disagreement: Disagreement;
+  chosen: Choice | undefined;
+  devMode: boolean;
+  autoFocusFreeform?: boolean;
+  onChoose: (choice: Choice) => void;
+}) {
+  return (
+    <>
+      <p className="disagreement-question">{disagreement.question.text}</p>
+
+      <OptionList
+        disagreement={disagreement}
+        chosenOptionId={chosen?.optionId}
+        devMode={devMode}
+        onPick={(optionId, text) => onChoose({ optionId, text })}
+      />
+
+      <label className="disagreement-option">
+        <input
+          type="radio"
+          name={disagreement.disagreementId}
+          checked={chosen !== undefined && chosen.optionId === undefined}
+          onChange={() => onChoose({ text: "" })}
+        />
+        <span>직접 입력</span>
+      </label>
+      {chosen !== undefined && chosen.optionId === undefined && (
+        <input
+          className="disagreement-freeform"
+          value={chosen.text}
+          autoFocus={autoFocusFreeform}
+          placeholder="둘 다 아니면 직접 적어주세요"
+          onChange={(e) => onChoose({ text: e.target.value })}
+        />
+      )}
+
+      {devMode && <p className="muted small">blocking 판정 근거: {disagreement.blockingReason}</p>}
+    </>
+  );
+}
+
 function OptionList({
   disagreement,
   chosenOptionId,

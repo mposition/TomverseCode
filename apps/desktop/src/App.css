@@ -404,6 +404,17 @@ fieldset.modes label {
   color: var(--error);
 }
 
+/* 선택 항목 배지. 필수(`badge-required`)와 **색이 달라야** 한 목록에 있을 때 구별된다.
+   접힌 영역 안이지만 열면 필수와 같은 모양의 질문이 나오므로, 배지가 유일한 구분이다. */
+.badge-optional {
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+.disagreement-optional {
+  border-left: 2px solid var(--border);
+}
+
 .badge-medium {
   border-color: var(--warn);
   color: var(--warn);

@@ -817,7 +817,7 @@ export class Orchestrator {
       complexityTier: this.state.complexityTier ?? "standard",
       round,
     });
-    const { asked, deferred } = planQuestionRound(report);
+    const { asked, deferred, advisory } = planQuestionRound(report);
     await this.emit("DISAGREEMENT_DETECTED", {
       ...report,
       // 대조를 돌렸는지 자체를 payload가 말해야 한다. proposalIds 길이로도 알 수 있지만,
@@ -826,6 +826,9 @@ export class Orchestrator {
       blockingCount: report.disagreements.filter((d) => d.blocking).length,
       askedCount: asked.length,
       deferredCount: deferred.length,
+      // 함께 실은 비-blocking 쟁점 수. 종전에는 이 값이 언제나 0이었고, 그 사실이 어디에도
+      // 남지 않아 "갈린 것이 없었다"와 구별되지 않았다.
+      advisoryCount: advisory.length,
     });
 
     // **예산을 넘긴 blocking 쟁점을 조용히 삼키지 않는다**(17.4절).
@@ -846,8 +849,11 @@ export class Orchestrator {
     }
 
     const clarified = await this.askUser(
+      // **질문 목록에는 blocking만 넣는다.** 이 배열이 프롬프트로 들어가므로, 답하지 않아도
+      // 되는 쟁점을 여기 넣으면 모델이 "물어본 것"으로 읽는다.
       asked.map((d) => d.question.text),
-      asked,
+      // 카드에는 함께 싣는다 — 화면이 blocking과 비-blocking을 따로 그린다(3.9절).
+      [...asked, ...advisory],
       // 자유 서술은 **질문이 아니라 참고 자료**로 카드에 실린다(17.12절). 물을 수 없는 것을
       // 질문 목록에 넣지 않으면서도, 두 초안이 문제를 어떻게 봤는지는 볼 수 있게 한다.
       report.narratives
@@ -1779,6 +1785,10 @@ export class Orchestrator {
     // 답을 받은 쟁점은 더 이상 미해결이 아니다.
     const answered = new Set(decisions.map((d) => d.disagreementId));
     for (const d of disagreements) {
+      // **비-blocking은 답이 없어도 미해결이 아니다.** 규칙이 "묻지 않아도 된다"고 판정한
+      // 것이고 화면도 그렇게 말한다. 여기 넣으면 `unresolvedDisagreements`가 "예산이 모자라
+      // 묻지 못한 blocking"이라는 뜻을 잃는다.
+      if (!d.blocking) continue;
       if (!answered.has(d.disagreementId) && decisions.length > 0) {
         // 카드에 띄웠는데 답이 오지 않은 항목 — 조용히 넘기지 않는다.
         this.recordUnresolved(d, "카드에 표시했으나 답변이 오지 않음");
@@ -1789,6 +1799,7 @@ export class Orchestrator {
     // (17.10절 ⑨). 지금은 화면 설계에서 나온 추정값이고, 실측 없이 늘리거나 줄일 수 없다.
     const positionOf = new Map(disagreements.map((d, index) => [d.disagreementId, index + 1]));
     const fieldOf = new Map(disagreements.map((d) => [d.disagreementId, d.field]));
+    const blockingOf = new Map(disagreements.map((d) => [d.disagreementId, d.blocking]));
     const optionRankOf = (decision: UserDecisionInput): number | null => {
       if (decision.optionId === undefined) return null;
       const options = disagreements.find((d) => d.disagreementId === decision.disagreementId)?.question.options;
@@ -1824,6 +1835,14 @@ export class Orchestrator {
         // 어떤 필드의 쟁점이었는가. **랭킹(17.4절)을 튜닝하려면 필드별로 세야 한다** —
         // id에서 파싱할 수도 있지만, 그러면 id 형식을 바꾸는 순간 집계가 조용히 끊긴다.
         field: fieldOf.get(d.disagreementId) ?? null,
+        /**
+         * 규칙이 이 쟁점을 **막을 만한 것으로 봤는가.**
+         *
+         * 12절이 남긴 "blocking 판정 규칙 자체"를 물을 수 있게 하는 유일한 축이다. 규칙이
+         * "묻지 않아도 된다"고 한 쟁점에서 사용자가 primary가 아닌 것을 골랐다면, 그 판정은
+         * 그 태스크에서 틀렸던 것이다. 답이 없으면 이 질문에는 영원히 답할 수 없다.
+         */
+        blocking: blockingOf.get(d.disagreementId) ?? null,
       })),
       acceptanceCriteria: criteria,
     });
