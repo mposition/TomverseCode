@@ -151,6 +151,7 @@ npm run verify         # 전체: 위 + Rust 단위 테스트 + 실제 구성요�
 
 ```bash
 npm run gate:g:validate   # fixture 24개 품질 검증 (모델 호출 없음)
+npm run gate:g:triage-calibration  # TRIAGE 임계값 표 — fixture 세트를 난이도 라벨로 쓴다 (모델 호출 없음)
 npm run gate:g:dry-run    # preflight + 실행 계획 (API 호출 없음)
 npm run gate:g:plan-pilot # 단계별(P0/P1) 승인 카드 (API 호출 없음)
 npm run gate:g:probe-models  # 역할당 최소 요청 1회로 모델 실제 확인. --max-cost-usd 필수
@@ -188,6 +189,12 @@ npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가
 **fake provider 결과로 가설을 판정하지 않는다** — 모든 기록에 `providerKind`가 남고, 집계가
 `fake` 기록만 있으면 무조건 `INCONCLUSIVE`를 낸다. 자세한 것은
 [evals/hypothesis-gate/README.md](./evals/hypothesis-gate/README.md).
+
+**단, 그 규칙이 지키는 것은 *모델 출력에 의존하는 판정*이다.** TRIAGE 임계값은 거기 해당하지
+않는다(규칙 기반이라 모델을 부르지 않는다) — 그래서 `triage-calibration`은 fake 공급자로 재고,
+**해당하지 않는다는 사실을 주석이 아니라 이벤트 순서로 증명한다**: `TRIAGE_COMPLETED`가 첫
+`PROVIDER_USAGE`보다 앞서야 하고, 공급자 호출이 아예 없으면 그 비교는 공허하므로 증명으로
+치지 않는다. 새로 "fake로 재도 되는" 측정을 만들면 같은 증명을 함께 만들 것.
 
 ### Rust 쪽 — **반드시 이 패턴을 쓸 것**
 

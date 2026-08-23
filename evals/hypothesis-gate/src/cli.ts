@@ -16,7 +16,7 @@ import {
 import { computeCallBudget, describeCallBudget } from "./callBudget.js";
 import { criteriaHash, CRITERIA, describeCriteria } from "./criteria.js";
 import { prepareMsvcEnv } from "@tomverse/toolchain";
-import { REPO_ROOT } from "./host.js";
+import { artifactsPresent, REPO_ROOT } from "./host.js";
 import { loadAllFixtures, listFixtureIds } from "./manifest.js";
 import { credentialPresent, preflight } from "./preflight.js";
 import { estimateRecordCost, lookupModel, maxCallsPerRecord, planModels, isModelPlan } from "./models.js";
@@ -59,6 +59,7 @@ import { ARMS } from "./arms.js";
 import { writeReports } from "./report.js";
 import { fillReviewerContributions, runExperiment } from "./runner.js";
 import { evaluateGate } from "./stats.js";
+import { loadEasyTasks, loadHardTasks, observeTriage, renderCalibration, summarize } from "./triageCalibration.js";
 import { validateAll } from "./validate.js";
 import type { ArmId } from "./types.js";
 
@@ -67,6 +68,7 @@ import type { ArmId } from "./types.js";
  *
  * 하위 명령:
  *   validate  — fixture 품질 검증 (모델 호출 없음)
+ *   triage-calibration — TRIAGE 규칙을 난이도 라벨이 붙은 태스크에 태워 임계값 표를 만든다 (모델 호출 없음)
  *   dry-run   — 실행 계획과 preflight만 출력 (API 호출 없음)
  *   plan-pilot   — 단계별(P0/P1) 승인 카드 (API 호출 없음)
  *   probe-models — 역할당 최소 요청 1회로 모델을 실제 확인한다 (비용 상한 필수)
@@ -78,6 +80,8 @@ import type { ArmId } from "./types.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(__dirname, "..", "..");
 const FIXTURES_ROOT = path.join(PACKAGE_ROOT, "fixtures");
+/** Phase 0 스파이크 fixture — **읽기만 한다.** 쉬운 라벨의 출처다. */
+const SPIKE_FIXTURES_ROOT = path.join(REPO_ROOT, "spike", "fixtures");
 const REPORTS_ROOT = path.join(PACKAGE_ROOT, "reports");
 
 function log(message: string): void {
@@ -91,7 +95,9 @@ async function main(): Promise<number> {
   requireCostLimitForPaidRun(options, usingFake);
 
   if (options.command === "help") {
-    log("usage: gate <validate|dry-run|plan-pilot|probe-models|budget-status|attest-p0|pilot|run|report> [옵션]");
+    log(
+      "usage: gate <validate|triage-calibration|dry-run|plan-pilot|probe-models|budget-status|attest-p0|pilot|run|report> [옵션]"
+    );
     log("");
     log("옵션: --fixtures a,b --arms A,B,C,D --repetitions N --seed N");
     log("      --max-cost-usd N --max-concurrency 1 --resume --output <run-dir>");
@@ -162,6 +168,39 @@ async function main(): Promise<number> {
     log("");
     log(`${results.length - failed}/${results.length} 통과`);
     return failed === 0 ? 0 : 1;
+  }
+
+  // ---- triage-calibration ----
+  // **유료 호출이 없다.** TRIAGE는 모델을 부르지 않으므로(13.2절), 규칙의 판정은 fake 공급자로도
+  // 그대로 관측된다 — 그 사실을 주장하지 않고 이벤트 순서로 증명한다(triageCalibration.ts).
+  if (options.command === "triage-calibration") {
+    const artifacts = artifactsPresent();
+    if (!artifacts.ok) {
+      log("실행 산출물이 없습니다 — TRIAGE 규칙을 production 경로로 태울 수 없습니다.");
+      log("");
+      log(artifacts.detail);
+      return 4;
+    }
+
+    const hard = loadHardTasks(FIXTURES_ROOT, options.fixtures);
+    const easy = loadEasyTasks(SPIKE_FIXTURES_ROOT);
+    const tasks = [...hard, ...easy];
+    log(`난이도 라벨이 붙은 태스크 ${tasks.length}개에 TRIAGE 규칙을 태웁니다 (어려움 ${hard.length} · 쉬움 ${easy.length}).`);
+    log("공급자는 레지스트리의 fake 항목입니다 — local:// 주소라 네트워크로 나가지 않습니다.");
+    log("");
+
+    const observations = tasks.map((task) => {
+      const observed = observeTriage(task);
+      log(
+        `  ${observed.tier ?? "관측 실패"}  ${task.label === "hard" ? "어려움" : "쉬움  "}  ${task.id}` +
+          (observed.evidence ? ` (작업 파일 ${observed.evidence.workFileCount}개)` : "")
+      );
+      return observed;
+    });
+    log("");
+    for (const line of renderCalibration(summarize(observations))) log(line);
+    // **판정하지 않는다.** 이건 사람이 교환비를 정하기 위한 표이지 게이트가 아니다.
+    return 0;
   }
 
   // ---- plan-pilot ----

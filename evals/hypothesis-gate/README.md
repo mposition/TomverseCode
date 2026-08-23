@@ -75,6 +75,7 @@ TypeScript fixture 20개는 MSVC 없이도 그대로 검증된다.
 ```bash
 npm run gate:g:test       # 하네스 자동 테스트 (실제 API 없음, npm test에도 포함된다)
 npm run gate:g:validate   # fixture 품질 검증 (모델 호출 없음)
+npm run gate:g:triage-calibration  # TRIAGE 임계값 표 (모델 호출 없음 — 아래 참조)
 npm run gate:g:dry-run    # preflight + 실행 계획만
 npm run gate:g:plan-pilot # **단계별(P0/P1) 유료 실행 승인 카드** (실제 API 호출 0건)
 npm run gate:g:probe-models  # 역할당 **최소 요청 1회**로 모델을 실제 확인 (--max-cost-usd 필수)
@@ -120,6 +121,49 @@ pilot --run-card ...  P1 실행
 | `READY_FOR_P0_APPROVAL` / `READY_FOR_P1_APPROVAL` | 유료 실행을 승인할 수 있다 |
 
 종료 코드: `0`=PASS, `1`=FAIL, `2`=INCONCLUSIVE, `3`=하네스 오류, `4`=툴체인 미준비.
+
+## fixture 세트의 두 번째 쓸모 — TRIAGE 임계값 캘리브레이션
+
+이 fixture 24개는 **난이도 라벨이 붙은 태스크 세트**이기도 하다. 그게 게이트 G 말고 다른 질문
+하나를 공짜로 닫는다.
+
+state-machine-and-protocol.md 12절은 TRIAGE 임계값 튜닝을 *"'어려운' 태스크 세트로 스파이크를
+재실행"* 이라고 적어두었고 그래서 **유료 API 대기**로 분류되어 있었다. 그런데 TRIAGE는 모델을
+부르지 않는다 — 재실행이 필요했던 이유는 판정이 아니라 **어려운 태스크 세트가 없어서**였다.
+지금은 여기 있다.
+
+```bash
+npm run gate:g:triage-calibration
+```
+
+- 어려움 24건(이 fixture) + 쉬움 5건(Phase 0 스파이크, **읽기만 한다**)에 규칙을 태운다
+- `tomverse-host`를 `--mode fast`로 띄운다 — **규칙이 실제로 판정하게 두는 유일한 모드**다
+  (게이트 arm이 쓰는 `verified`는 TRIAGE 결과와 무관하게 항상 교차검증 경로다)
+- 공급자는 레지스트리의 `local://` fake 항목이라 네트워크로 나가지 않는다
+- 임계값 후보를 스윕해 두 종류의 오분류를 표로 낸다. **합계로 순위를 매기지 않는다** —
+  두 오류의 대가가 다르고 그 교환비는 아직 아무도 정하지 않았다. 지배 관계만 표시한다
+
+### fake로 재도 되는 근거를 주석에 두지 않는다
+
+CLAUDE.md는 fake provider 결과로 가설을 판정하지 말라고 못박는다. 그 규칙이 지키는 것은
+*모델 출력에 의존하는 판정*이고 TRIAGE는 거기 해당하지 않는다 — 그러나 "해당하지 않는다"를
+주석으로 적으면 나중에 해당하게 되어도 주석은 그대로 남는다.
+
+그래서 관측마다 **이벤트 순서로 증명한다**: `TRIAGE_COMPLETED.seq` < 첫 `PROVIDER_USAGE.seq`.
+그리고 공급자 호출이 한 번도 없었다면 그 비교는 공허하게 참이므로 **증명으로 치지 않는다**
+(실측으로 빈 patch를 주면 스키마 위반이 호출보다 먼저 나서 그렇게 된다).
+
+`appliedPolicies`가 비어 있지 않은 실행은 규칙이 돌지 않은 것이므로 관측에서 뺀다 — 세면
+분모가 부풀어 오분류율이 실제보다 낮아 보인다.
+
+### 결과는 문항을 바꿨다
+
+기본값에서 어려움 24건 중 **20건이 `simple`** 로 갔다. 그런데 임계값을 바꿔도 나아지지 않는다 —
+지배당하지 않는 후보가 둘뿐이고 그중 하나(`maxRelevantFiles=0`)는 TRIAGE를 끄는 것과 같다.
+작업 파일 개수 분포를 보면 이유가 보인다: 두 라벨이 값 `1`에 겹쳐 **29건 중 26건**이 거기 있다.
+
+**임계값이 잘못 맞춰진 것이 아니라 축이 라벨을 가르지 못한다.** 자세한 것은
+state-machine-and-protocol.md 13.4절.
 
 ## 유료 실행 안전장치
 

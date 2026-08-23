@@ -407,7 +407,8 @@ function executeOne(options: ExecuteOneOptions): RecordWithDraft {
     const hostResult = runHost({
       workspaceRoot: workspace.root,
       taskPrompt: manifest.taskPrompt,
-      arm: spec,
+      providers: spec.providers,
+      ...(spec.reviewMode ? { reviewMode: spec.reviewMode } : {}),
       taskId,
       timeoutMs: manifest.timeoutMs,
       ...(options.replayDraft !== undefined ? { replayDraft: options.replayDraft } : {}),

@@ -30,6 +30,8 @@
     "gate:g:test": "npm run gate:g:build && npm run test --workspace=@tomverse/hypothesis-gate",
     "gate:g:validate": "npm run gate:g:build && node evals/hypothesis-gate/dist/src/cli.js validate",
     "gate:g:dry-run": "npm run gate:g:build && node evals/hypothesis-gate/dist/src/cli.js dry-run",
+    "//gate:g:triage-calibration": "TRIAGE 임계값을 난이도 라벨이 붙은 태스크 세트에 태워 오분류 표를 만든다. **모델 호출이 없다** — TRIAGE는 규칙이고, 그 사실을 이벤트 순서로 증명한다. 12절이 '유료 스파이크 재실행'이라고 적어둔 항목이지만 재실행이 필요했던 것은 어려운 태스크 세트가 없어서였다.",
+    "gate:g:triage-calibration": "npm run gate:g:build && node evals/hypothesis-gate/dist/src/cli.js triage-calibration",
     "//gate:g:plan-pilot": "유료 실행 전 승인 카드. **실제 API를 부르지 않는다.**",
     "gate:g:plan-pilot": "npm run gate:g:build && node evals/hypothesis-gate/dist/src/cli.js plan-pilot",
     "//gate:g:probe-models": "역할당 최소 요청 1회로 모델을 실제 확인한다. **실제 API를 부르므로 --max-cost-usd가 필수다.** 카드가 READY_FOR_MODEL_PROBE일 때 다음으로 도는 명령.",

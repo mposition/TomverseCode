@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_TRIAGE_POLICY, triage, triageTask } from "../src/triage.js";
+import { DEFAULT_TRIAGE_POLICY, tierAtThreshold, triage, triageTask } from "../src/triage.js";
 import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
 
 test("단일 파일 + 깨끗한 git + 위험 키워드 없음 → simple", () => {
@@ -115,4 +115,49 @@ test("triageTask는 triage와 같은 판정을 낸다", () => {
   for (const message of ["오타 수정", "보안 점검", "리팩터링"]) {
     assert.equal(triageTask(snapshot, message), triage(snapshot, message).tier, message);
   }
+});
+
+/**
+ * 기록된 근거만으로 다시 계산한 판정이 **살아 있는 규칙과 같은가.**
+ *
+ * 이 둘이 갈라지면 임계값 표(state-machine-and-protocol.md 13.4절)는 제품이 실제로 하는 것과
+ * 다른 규칙에 대한 표가 된다 — 그리고 표는 여전히 그럴듯하게 그려진다.
+ */
+test("기록된 근거로 다시 계산한 tier가 규칙의 판정과 같다", () => {
+  const cases: { paths: string[]; message: string; dirty: boolean }[] = [];
+  for (const paths of [
+    ["src/a.ts"],
+    ["src/a.ts", "src/b.ts"],
+    ["src/a.ts", "src/a.test.ts"],
+    ["src/a.ts", "src/b.ts", "tests/c.ts"],
+    [],
+  ]) {
+    for (const message of ["오타 수정", "인증 로직 리팩터링"]) {
+      for (const dirty of [false, true]) cases.push({ paths, message, dirty });
+    }
+  }
+
+  for (const c of cases) {
+    const snapshot = makeSnapshot({
+      relevantFiles: c.paths.map((path) => makeRelevantFile({ path, reason: "mentioned" })),
+      ...(c.dirty ? { gitDiffSummary: " M src/a.ts" } : {}),
+    });
+    const result = triage(snapshot, c.message);
+    const label = `${c.paths.join(",")} / ${c.message} / dirty=${c.dirty}`;
+    assert.equal(tierAtThreshold(result, DEFAULT_TRIAGE_POLICY.maxRelevantFiles), result.tier, label);
+    assert.equal(
+      tierAtThreshold(result, DEFAULT_TRIAGE_POLICY.maxRelevantFiles, true),
+      result.tierIfTestsCounted,
+      label
+    );
+  }
+});
+
+test("다른 임계값으로 다시 계산해도 다른 이유로 인한 standard는 유지된다", () => {
+  const snapshot = makeSnapshot({ relevantFiles: [makeRelevantFile({ path: "src/a.ts" })] });
+  const result = triage(snapshot, "결제 모듈 마이그레이션");
+  assert.equal(result.riskKeywordMatched, true);
+  // 임계값을 아무리 올려도 simple이 되지 않는다. 이걸 놓치면 표가 "3으로 올리면 전부 simple"이라고
+  // 말하는데 제품은 그러지 않는다.
+  for (const n of [1, 2, 10]) assert.equal(tierAtThreshold(result, n), "standard", `n=${n}`);
 });

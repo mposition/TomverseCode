@@ -9,7 +9,7 @@
     "build": "node ../../scripts/assertDepsFresh.mjs . && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "//test": "이 Node 버전은 `node --test <디렉터리>`가 동작하지 않는다 — 파일을 직접 나열한다(CLAUDE.md 함정 기록).",
-    "test": "npm run build && node --test dist/test/criteria.test.js dist/test/manifest.test.js dist/test/stats.test.js dist/test/records.test.js dist/test/harness.test.js dist/test/safety.test.js",
+    "test": "npm run build && node --test dist/test/criteria.test.js dist/test/manifest.test.js dist/test/stats.test.js dist/test/records.test.js dist/test/harness.test.js dist/test/triageCalibration.test.js dist/test/safety.test.js",
     "gate": "node dist/src/cli.js"
   },
   "dependencies": {

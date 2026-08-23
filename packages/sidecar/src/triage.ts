@@ -77,6 +77,19 @@ export interface TriageResult {
   excludedTestFiles: string[];
   /** 테스트 파일을 세었더라면 나왔을 tier. 같으면 이 규칙은 이 태스크에서 무의미했다. */
   tierIfTestsCounted: ComplexityTier;
+  /**
+   * 파일 개수 말고 **다른 이유로** 이미 standard였는가.
+   *
+   * 이 둘이 없으면 기록만 보고 **임계값이 판정에 관여했는지조차 알 수 없다.** `tier`가
+   * standard인 태스크가 파일 수 때문이었는지 위험 키워드 때문이었는지 구별되지 않으므로,
+   * "`maxRelevantFiles`를 2로 올리면 무엇이 달라지는가"를 되물을 수 없다 — 12절이
+   * 튜닝 대상이라고 적어둔 바로 그 상수인데도 그렇다.
+   *
+   * 값으로 남기면 **저장된 근거만으로 다른 임계값을 다시 계산할 수 있다.** 그게
+   * `sweepThreshold`가 유료 호출 없이 성립하는 이유다.
+   */
+  riskKeywordMatched: boolean;
+  uncommittedChanges: boolean;
 }
 
 /** 분류만 필요할 때. 근거가 필요하면 `triage`를 쓴다 — **판정 로직은 한 곳뿐이다.** */
@@ -104,16 +117,51 @@ export function triage(
   const lowerMessage = userMessage.toLowerCase();
   const matchesRiskKeyword = policy.riskKeywords.some((kw) => lowerMessage.includes(kw.toLowerCase()));
 
-  // 파일 수 말고 다른 이유로 이미 standard이면, 테스트 제외 규칙은 이 태스크에서 아무것도
-  // 하지 않은 것이다 — 반사실도 같은 값이 되어 집계에서 저절로 빠진다.
-  const otherReasons = hasUncommittedChanges || matchesRiskKeyword;
-  const verdict = (files: number): ComplexityTier =>
-    files > policy.maxRelevantFiles || otherReasons ? "standard" : "simple";
-
-  return {
-    tier: verdict(workFileCount),
+  // 근거를 먼저 모으고 판정은 `tierAtThreshold` 한 곳에서 한다. 여기에 판정식을 한 번 더
+  // 적으면 임계값을 바꿔 다시 계산할 때 **두 식이 갈라진 채로 통과**할 수 있다.
+  const evidence = {
     workFileCount,
     excludedTestFiles,
-    tierIfTestsCounted: verdict(notProjectMeta.length),
+    riskKeywordMatched: matchesRiskKeyword,
+    uncommittedChanges: hasUncommittedChanges,
   };
+
+  return {
+    ...evidence,
+    tier: tierAtThreshold(evidence, policy.maxRelevantFiles),
+    // 파일 수 말고 다른 이유로 이미 standard이면, 테스트 제외 규칙은 이 태스크에서 아무것도
+    // 하지 않은 것이다 — 반사실도 같은 값이 되어 집계에서 저절로 빠진다.
+    tierIfTestsCounted: tierAtThreshold(evidence, policy.maxRelevantFiles, true),
+  };
+}
+
+/**
+ * 기록된 근거만으로 **다른 임계값이었다면 어떤 tier였을지**를 다시 계산한다.
+ *
+ * # 왜 이게 가능한가 — 그리고 왜 중요한가
+ *
+ * 12절은 임계값 튜닝을 "어려운 태스크 세트로 스파이크를 재실행해야 한다"고 적었다. 그런데
+ * TRIAGE는 **모델을 부르지 않는다**(이 파일 첫 주석). 규칙의 입력은 스냅샷과 사용자 메시지뿐이고,
+ * 그 둘에서 나온 값이 위 `TriageResult`에 전부 남는다. 그러므로 임계값을 바꿔 다시 묻는 일은
+ * **이미 기록된 근거에 대한 순수 계산**이며 유료 호출이 필요 없다.
+ *
+ * 필요한 것은 태스크를 다시 돌리는 것이 아니라 **난이도 라벨**이다 — 그건
+ * `evals/hypothesis-gate`의 fixture 세트가 이미 사전 등록해 두었다.
+ *
+ * `countTestFiles`를 함께 받는 이유: 테스트 파일 제외 규칙도 튜닝 대상이고
+ * (context-engine.md 11.1절), 둘을 따로 스윕하면 상호작용이 보이지 않는다.
+ */
+export function tierAtThreshold(
+  evidence: Pick<
+    TriageResult,
+    "workFileCount" | "excludedTestFiles" | "riskKeywordMatched" | "uncommittedChanges"
+  >,
+  maxRelevantFiles: number,
+  countTestFiles = false
+): ComplexityTier {
+  const files = countTestFiles
+    ? evidence.workFileCount + evidence.excludedTestFiles.length
+    : evidence.workFileCount;
+  if (evidence.riskKeywordMatched || evidence.uncommittedChanges) return "standard";
+  return files > maxRelevantFiles ? "standard" : "simple";
 }

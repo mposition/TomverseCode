@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkArtifacts, hostBinaryPath, sidecarEntryPath } from "@tomverse/toolchain";
-import type { ArmSpec } from "./types.js";
 
 /**
  * production 실행 경로 호출부.
@@ -36,7 +35,20 @@ export function artifactsPresent(): { ok: boolean; detail: string } {
 export interface HostRunOptions {
   workspaceRoot: string;
   taskPrompt: string;
-  arm: ArmSpec;
+  /**
+   * 후보 공급자. **arm 자체가 아니라 arm의 축만 받는다** — 이 함수는 arm이라는 개념을 몰라도
+   * 되고, TRIAGE 캘리브레이션처럼 arm이 없는 측정도 같은 실행 경로를 쓸 수 있어야 한다.
+   */
+  providers: string[];
+  reviewMode?: "blind" | "informed";
+  /**
+   * 실행 모드. 기본은 `verified` — 가설 게이트의 모든 arm은 TRIAGE 결과와 무관하게
+   * 교차검증 경로를 타야 하기 때문이다.
+   *
+   * `fast`를 주면 **TRIAGE 규칙이 실제로 판정한다.** 그 판정을 관측하는 것이
+   * `triageCalibration`의 전부이며, 규칙은 모델을 부르지 않으므로 유료 호출이 없다.
+   */
+  executionMode?: "fast" | "verified";
   taskId: string;
   timeoutMs: number;
   /** Arm C/D가 재생할 초안. Rust가 이 파일을 읽어 sidecar에 내용만 넘긴다. */
@@ -76,10 +88,10 @@ export function runHost(options: HostRunOptions): HostRunResult {
     options.workspaceRoot,
     "--message",
     options.taskPrompt,
-    // verified 모드 = TRIAGE 결과와 무관하게 항상 standard(교차검증) 경로.
+    // 기본은 verified = TRIAGE 결과와 무관하게 항상 standard(교차검증) 경로.
     // arm A/B는 공급자가 하나뿐이라 라우터가 스스로 reviewer를 드롭한다 — 별도 분기가 아니다.
     "--mode",
-    "verified",
+    options.executionMode ?? "verified",
     "--approve",
     "auto",
     "--db",
@@ -89,7 +101,7 @@ export function runHost(options: HostRunOptions): HostRunResult {
     "--sidecar",
     SIDECAR_ENTRY,
     "--providers",
-    options.arm.providers.join(","),
+    options.providers.join(","),
     "--timeout-secs",
     String(Math.ceil(options.timeoutMs / 1000)),
     // 파일 변경을 자동 승인한다: 이 실험은 승인 UX가 아니라 수정 품질을 측정한다.
@@ -97,7 +109,7 @@ export function runHost(options: HostRunOptions): HostRunResult {
     "--auto-approve-writes",
     "--verbose",
   ];
-  if (options.arm.reviewMode) args.push("--review-mode", options.arm.reviewMode);
+  if (options.reviewMode) args.push("--review-mode", options.reviewMode);
 
   if (options.replayDraft !== undefined) {
     const draftPath = path.join(stateDir, "replay-draft.json");
