@@ -13,6 +13,14 @@
 //! 직접 접근하지 않는다). 집계는 읽기 전용이지만, Node가 SQLite 파일을 직접 열기 시작하면
 //! 그 경계가 흐려진다. 여기 두면 경계가 그대로 유지되고 `tomverse-host metrics`로 GUI 없이 돈다.
 //!
+//! # 언제 답할 수 있는가도 값으로 낸다
+//!
+//! 이 파일의 지표 대부분은 제품을 굴리는 값이 아니라 **설계 문서의 열린 항목에 답하려고**
+//! 있다. 그런데 집계는 표본이 3개여도 비율을 낸다 — 그 비율을 보고 조치하면 관측이 아니라
+//! 우연에 따라 설계를 바꾸는 것이다. 그래서 `openQuestions`가 질문마다 **분모·표본 수·
+//! 최소치·지금 들여다볼 때가 됐는지**를 함께 낸다. 유도 문턱들이 이미 하던 일
+//! (`MIN_LATENCY_SAMPLES` — 표본이 모자라면 유도값을 내지 않는다)을 열린 질문에도 준 것이다.
+//!
 //! # 이 집계가 답하지 못하는 것
 //!
 //! **"충돌이 진짜 잘못된 계획을 잡았는가"의 정답은 어디에도 없다.** 사용자가 매번 판정해주지
@@ -287,6 +295,37 @@ pub struct TestFileRule {
     pub tasks_where_excluded_test_was_mutated: u64,
 }
 
+/// 인덱스 캐시가 실제로 이득인가 (context-engine.md 2.1절, process-architecture.md 11.4절).
+///
+/// **문서는 "계측을 붙였으므로 실사용이 쌓이면 답할 수 있다"고 적었는데 집계가 없었다.**
+/// 이벤트만 있고 세는 사람이 없으면 답할 수 있는 것이 아니다 — 감사자가 손으로 이벤트를
+/// 세야 하고, 그건 "답할 수 있다"가 아니라 "원리적으로 가능하다"이다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct IndexCache {
+    /// 캐시를 못 써서 새로 구축한 횟수.
+    pub builds: u64,
+    /// 캐시가 맞아 구축을 건너뛴 횟수.
+    pub hits: u64,
+    /// 회피한 시간을 **모르는** 적중 수(옛 기록 등).
+    ///
+    /// 조용히 0으로 더하면 "이득이 작다"와 "배선이 끊겼다"를 구별할 수 없다 —
+    /// `callsWithoutEstimate`와 같은 이유로 따로 센다.
+    #[serde(rename = "hitsWithoutSavedMs")]
+    pub hits_without_saved_ms: u64,
+    /// 적중이 회피한 구축 시간의 합(ms). **이득의 크기**는 적중률이 아니라 이 값에 있다 —
+    /// 100번 적중해도 구축이 20ms였다면 캐시는 필요 없다.
+    #[serde(rename = "savedMsTotal")]
+    pub saved_ms_total: u64,
+    /// 구축 시간 분포. 회피한 시간이 큰지 작은지는 이것과 비교해야 안다.
+    #[serde(rename = "p50BuildMs")]
+    pub p50_build_ms: Option<u64>,
+    #[serde(rename = "p90BuildMs")]
+    pub p90_build_ms: Option<u64>,
+    /// 구축한 인덱스의 파일 수 분포 — 느린 것이 저장소가 커서인지 디스크가 느려서인지 가른다.
+    #[serde(rename = "p90FileCount")]
+    pub p90_file_count: Option<u64>,
+}
+
 /// 표본이 부족할 때 "이 계획은 크다"고 볼 파일 수.
 ///
 /// **이 값만은 유도하지 못했다.** 취소 소요와 달리 "정상 범위"를 관측에서 끌어낼 수 없는
@@ -499,9 +538,150 @@ pub struct Metrics {
     /// 관측에서 유도한 태스크당 예산 상한 제안. **집계 결과이지 설정이 아니다.**
     #[serde(rename = "taskBudgetThreshold")]
     pub task_budget_threshold: Option<TaskBudgetThreshold>,
+    /// 인덱스 캐시의 이득 (context-engine.md 2.1절).
+    #[serde(rename = "indexCache")]
+    pub index_cache: IndexCache,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
+    /// **아직 답하지 못한 질문들과 그 답이 나올 때가 됐는지.**
+    ///
+    /// 이 목록이 비면 "열린 질문이 없다"는 뜻이고, 그건 설계 문서의 미해결 목록과 어긋난
+    /// 상태다. 지표를 추가하면서 여기 넣는 것을 잊으면 그 지표는 **아무도 읽지 않는 숫자**가 된다.
+    #[serde(rename = "openQuestions")]
+    pub open_questions: Vec<OpenQuestion>,
+}
+
+/// 아직 답하지 못한 질문 하나와 **그 답이 나올 때가 됐는지**.
+///
+/// # 왜 필요한가
+///
+/// 이 파일의 지표 대부분은 제품을 굴리기 위한 값이 아니라 **설계 문서의 열린 항목에 답하려고**
+/// 있다. 그런데 집계는 표본이 3개여도 비율을 낸다. `no_test_reference 4/5`를 보고 "압도적이다"라고
+/// 읽는 순간, 문서가 경계하라고 적어둔 바로 그 성급한 조치로 간다.
+///
+/// 유도 문턱들에는 이미 이런 가드가 있다(`MIN_LATENCY_SAMPLES` 등 — 표본이 모자라면 유도값을
+/// 내지 않는다). **열린 질문들에는 없었다.** 같은 규율을 그쪽에도 준다.
+///
+/// # 왜 `ready`가 아니라 `EnoughToLook`인가
+///
+/// 표본이 최소치를 넘었다는 것은 "이제 답이 믿을 만하다"가 아니라 **"이제 들여다볼 값이 있다"**는
+/// 뜻이다. `ready`라고 부르면 그 숫자가 확정된 답처럼 읽히고, 그건 이 가드가 막으려던 것과 같은
+/// 종류의 착시다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Readiness {
+    /// 표본이 최소치에 못 미친다. **비율을 읽지 말 것.**
+    InsufficientSamples,
+    /// 들여다볼 값이 생겼다. 확정된 답이라는 뜻은 아니다.
+    EnoughToLook,
+}
+
+/// 열린 질문 하나.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpenQuestion {
+    /// 설계 문서의 항목과 잇는 열쇠.
+    pub id: &'static str,
+    /// 무엇을 묻는가.
+    pub question: &'static str,
+    /// **이 질문의 분모.** 지표마다 세는 대상이 다르므로 여기 적어둔다 — 잘못된 분모로 읽는
+    /// 것이 표본이 모자란 것보다 나쁘다(그쪽은 적어도 틀린 줄 안다).
+    pub denominator: &'static str,
+    /// 지금까지 쌓인 표본 수.
+    pub samples: u64,
+    /// 들여다보기 시작할 최소치.
+    #[serde(rename = "minSamples")]
+    pub min_samples: u64,
+    pub readiness: Readiness,
+    /// 답이 나왔을 때 **어디를 고치는가.** 이게 없으면 관측이 결정으로 이어지지 않는다.
+    #[serde(rename = "actOn")]
+    pub act_on: &'static str,
+}
+
+/// 열린 질문을 들여다보기 시작할 표본 수.
+///
+/// **유도하지 못한 상수다.** 유도 문턱들이 쓰는 10(`MIN_LATENCY_SAMPLES` 등)보다 크게 잡은
+/// 이유는 재는 것이 다르기 때문이다: 그쪽은 분포의 백분위이고 여기는 **비율**이라, 10건에서는
+/// 한 건이 10%를 움직인다. 30은 "한 건이 비율을 3%보다 크게 흔들지 않는" 수준으로 고른
+/// 관례적 선택이며 관측이 아니다 — 이 사실을 적어두는 이유는, 근거 없는 숫자가 근거 있는
+/// 숫자와 코드에서 구별되지 않기 때문이다.
+pub const MIN_OPEN_QUESTION_SAMPLES: u64 = 30;
+
+fn open_question(
+    id: &'static str,
+    question: &'static str,
+    denominator: &'static str,
+    samples: u64,
+    act_on: &'static str,
+) -> OpenQuestion {
+    OpenQuestion {
+        id,
+        question,
+        denominator,
+        samples,
+        min_samples: MIN_OPEN_QUESTION_SAMPLES,
+        readiness: if samples >= MIN_OPEN_QUESTION_SAMPLES {
+            Readiness::EnoughToLook
+        } else {
+            Readiness::InsufficientSamples
+        },
+        act_on,
+    }
+}
+
+/// 집계된 값에서 열린 질문들의 준비 상태를 만든다.
+///
+/// **표본 수를 여기서 다시 세지 않는다.** 위에서 이미 센 값을 읽는다 — 두 번 세면 두 수가
+/// 어긋날 수 있고, 그때 어느 쪽이 정본인지 알 방법이 없다.
+fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
+    vec![
+        open_question(
+            "criteriaCoverage",
+            "기준을 테스트에 이을 수 있는 경우가 실제로 얼마나 되는가 (state-machine 17.9절)",
+            "판정된 기준 개수",
+            m.coverage.criteria,
+            "no_test_reference가 압도적이면 (a) 기준을 적을 때 테스트를 함께 적게 하거나 (b) 잇는 규칙을 넓힌다. **(b)를 먼저 하고 싶은 유혹을 경계할 것** — 늘어난 확인이 근거 있는지는 같은 규칙으로 검사할 수 없다",
+        ),
+        open_question(
+            "conflictOutcomes",
+            "기준 충돌 게이트가 실제 문제를 잡는가, 프롬프트가 기준을 안 읽는 것인가 (17.10절 8)",
+            "결말이 기록된 충돌 건수",
+            m.conflicts.settled,
+            "plan_unchanged가 해석이 그대로인 쪽에 몰리면 프롬프트를, 해석이 달라진 쪽에 몰리면 게이트가 잡은 것이 실제 문제였는지를 본다",
+        ),
+        open_question(
+            "cardQuestions",
+            "한 카드 질문 상한 4개와 필드 랭킹이 맞는가 (17.10절 9·10)",
+            "카드에서 받은 답의 개수",
+            m.card_answers
+                .by_position
+                .values()
+                .map(|p| p.first_option + p.later_option + p.freeform + p.unknown)
+                .sum(),
+            "자리에 따라 비율이 달라지는 것만이 자리 때문이다. 필드는 절대값이 아니라 필드끼리 비교하고, 고칠 자리는 DISAGREEMENT_FIELD_RANK 한 줄이다",
+        ),
+        open_question(
+            "tokenEstimate",
+            "토큰 상한 계수가 실제로 상한인가 (context-engine 8.1절)",
+            "추정과 실제를 둘 다 아는 호출 수",
+            m.token_estimate.calls,
+            "callsWhereActualExceededEstimate가 0이 아니면 상한이 아니므로 계수를 올린다. p90 비율이 한참 낮으면 과대 추정이므로 내린다",
+        ),
+        open_question(
+            "testFileRule",
+            "TRIAGE의 테스트 파일 제외 규칙이 오분류를 얼마나 내는가 (context-engine 11.1절)",
+            "**규칙이 판정을 바꾼** 태스크 수 (simple 건수가 아니다)",
+            m.test_file_rule.tasks_where_rule_changed_tier,
+            "자주 틀리면 고칠 자리는 TEST_FILE_PATTERNS가 아니라 규칙 자체다 — 테스트 파일을 고치는 것이 작업인 태스크를 어떻게 알아볼 것인가가 진짜 질문이다",
+        ),
+        open_question(
+            "indexCache",
+            "인덱스 캐시가 이득인가 (context-engine 2.1절)",
+            "구축 + 적중 횟수",
+            m.index_cache.builds + m.index_cache.hits,
+            "적중률이 아니라 savedMsTotal을 본다. 구축이 원래 빨랐다면 캐시는 지우는 것이 맞다",
+        ),
+    ]
 }
 
 /// 두 경로가 같은 파일을 가리키는가.
@@ -528,6 +708,8 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     let mut task_cost_micros: Vec<u64> = Vec::new();
     // `실제 / 추정` × 100. 정수로 모으는 이유는 위와 같다.
     let mut token_ratios: Vec<u64> = Vec::new();
+    let mut build_ms: Vec<u64> = Vec::new();
+    let mut index_file_counts: Vec<u64> = Vec::new();
     for (task_id, terminal_status) in &tasks {
         metrics.tasks_scanned += 1;
 
@@ -622,6 +804,31 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
             }
         }
 
+        // ---- 인덱스 캐시 (context-engine.md 2.1절) ----
+        for event in &events {
+            match event.event_type.as_str() {
+                "WORKSPACE_INDEX_BUILT" => {
+                    metrics.index_cache.builds += 1;
+                    if let Some(ms) = event.payload.get("buildMs").and_then(Value::as_u64) {
+                        build_ms.push(ms);
+                    }
+                    if let Some(n) = event.payload.get("fileCount").and_then(Value::as_u64) {
+                        index_file_counts.push(n);
+                    }
+                }
+                "WORKSPACE_INDEX_CACHE_HIT" => {
+                    metrics.index_cache.hits += 1;
+                    // 회피한 시간을 **모르는 적중은 따로 센다.** 0으로 더하면 "이득이 작다"와
+                    // "배선이 끊겼다"가 같은 숫자가 된다.
+                    match event.payload.get("savedBuildMs").and_then(Value::as_u64) {
+                        Some(ms) => metrics.index_cache.saved_ms_total += ms,
+                        None => metrics.index_cache.hits_without_saved_ms += 1,
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // ---- 충돌: 감지와 결말을 각각 센다 ----
         let mut proceeded = false;
         for event in &events {
@@ -704,6 +911,10 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     metrics.large_change_threshold = Some(suggest_large_change_files(&metrics.commit_sizes));
 
     token_ratios.sort_unstable();
+    metrics.index_cache.p50_build_ms = percentile(&build_ms, 50);
+    metrics.index_cache.p90_build_ms = percentile(&build_ms, 90);
+    metrics.index_cache.p90_file_count = percentile(&index_file_counts, 90);
+
     metrics.token_estimate.p50_ratio_percent = percentile(&token_ratios, 50);
     metrics.token_estimate.p90_ratio_percent = percentile(&token_ratios, 90);
     metrics.token_estimate.max_ratio_percent = token_ratios.last().copied();
@@ -716,6 +927,9 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     metrics.task_budget_threshold = Some(suggest_task_budget_usd(&metrics.task_costs));
 
     metrics.force_abandon_threshold = Some(suggest_force_abandon_ms(&metrics.cancellation));
+
+    // **마지막에 만든다.** 위에서 센 값을 읽을 뿐이므로 순서가 뒤집히면 전부 0을 본다.
+    metrics.open_questions = open_questions(&metrics);
     Ok(metrics)
 }
 
@@ -1657,5 +1871,132 @@ mod tests {
         assert!(!same_path("src/a.test.ts", "src/b.test.ts"));
         // 꼬리 일치가 경로 경계를 무시하면 안 된다.
         assert!(!same_path("a.test.ts", "src/ba.test.ts"));
+    }
+    // ---- 인덱스 캐시 (context-engine.md 2.1절) ----
+
+    #[test]
+    fn index_cache_counts_builds_hits_and_the_time_they_saved() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "WORKSPACE_INDEX_BUILT",
+                &json!({ "buildMs": 400, "fileCount": 1200 }),
+            )
+            .unwrap();
+        store
+            .append_event("task-1", "WORKSPACE_INDEX_CACHE_HIT", &json!({ "savedBuildMs": 400 }))
+            .unwrap();
+        store
+            .append_event("task-1", "WORKSPACE_INDEX_CACHE_HIT", &json!({ "savedBuildMs": 380 }))
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.index_cache.builds, 1);
+        assert_eq!(m.index_cache.hits, 2);
+        // **이득의 크기는 적중률이 아니라 이 값에 있다.**
+        assert_eq!(m.index_cache.saved_ms_total, 780);
+        assert_eq!(m.index_cache.p50_build_ms, Some(400));
+        assert_eq!(m.index_cache.p90_file_count, Some(1200));
+    }
+
+    /// 회피한 시간을 모르는 적중을 **조용히 0으로 더하지 않는다.** 그러면 "이득이 작다"와
+    /// "배선이 끊겼다"가 같은 숫자가 되고, 그 결론은 "캐시를 지우자"로 간다.
+    #[test]
+    fn a_hit_without_a_recorded_build_time_is_counted_separately() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "WORKSPACE_INDEX_CACHE_HIT", &json!({ "savedBuildMs": 500 }))
+            .unwrap();
+        store
+            .append_event("task-1", "WORKSPACE_INDEX_CACHE_HIT", &json!({ "builtAt": "옛 기록" }))
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.index_cache.hits, 2);
+        assert_eq!(m.index_cache.saved_ms_total, 500);
+        assert_eq!(m.index_cache.hits_without_saved_ms, 1);
+    }
+
+    // ---- 열린 질문의 준비 상태 ----
+
+    fn question<'a>(m: &'a Metrics, id: &str) -> &'a OpenQuestion {
+        m.open_questions.iter().find(|q| q.id == id).expect(id)
+    }
+
+    #[test]
+    fn open_questions_start_out_unanswerable() {
+        let (_d, store) = seeded();
+        let m = collect(&store, None).unwrap();
+
+        // 빈 목록이면 "열린 질문이 없다"가 되어 이 가드 자체가 사라진다.
+        assert!(m.open_questions.len() >= 6, "{:?}", m.open_questions);
+        for q in &m.open_questions {
+            assert_eq!(q.samples, 0, "{}", q.id);
+            assert_eq!(q.readiness, Readiness::InsufficientSamples, "{}", q.id);
+        }
+    }
+
+    /// **각 질문이 자기 계수기에 연결돼 있는가.** 하나를 채웠을 때 그것만 바뀌어야 한다 —
+    /// 공유 계수기를 읽고 있으면 여러 개가 함께 넘어가고, 그러면 "이 질문의 표본"이라는 말이
+    /// 아무것도 뜻하지 않는다.
+    #[test]
+    fn filling_one_question_does_not_move_the_others() {
+        let (_d, mut store) = seeded();
+        let items: Vec<(&str, &str)> = (0..MIN_OPEN_QUESTION_SAMPLES)
+            .map(|_| ("UNVERIFIED", "no_test_reference"))
+            .collect();
+        store
+            .append_event("task-1", "CRITERIA_EVALUATED", &evaluated(items))
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        let coverage = question(&m, "criteriaCoverage");
+        assert_eq!(coverage.samples, MIN_OPEN_QUESTION_SAMPLES);
+        assert_eq!(coverage.readiness, Readiness::EnoughToLook);
+
+        for q in m.open_questions.iter().filter(|q| q.id != "criteriaCoverage") {
+            assert_eq!(
+                q.readiness,
+                Readiness::InsufficientSamples,
+                "{} 가 함께 움직였습니다",
+                q.id
+            );
+        }
+    }
+
+    /// 하나 모자라면 아직 아니다 — 경계에서 관대해지면 문턱이 있으나 마나다.
+    #[test]
+    fn one_short_of_the_minimum_is_still_insufficient() {
+        let (_d, mut store) = seeded();
+        let items: Vec<(&str, &str)> = (0..(MIN_OPEN_QUESTION_SAMPLES - 1))
+            .map(|_| ("UNVERIFIED", "no_test_reference"))
+            .collect();
+        store
+            .append_event("task-1", "CRITERIA_EVALUATED", &evaluated(items))
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(
+            question(&m, "criteriaCoverage").readiness,
+            Readiness::InsufficientSamples
+        );
+    }
+
+    /// 분모와 "어디를 고치는가"가 비어 있으면 이 목록은 숫자만 늘린다 — 관측이 결정으로
+    /// 이어지지 않는다.
+    #[test]
+    fn every_question_names_its_denominator_and_what_to_act_on() {
+        let (_d, store) = seeded();
+        let m = collect(&store, None).unwrap();
+
+        let mut ids = std::collections::BTreeSet::new();
+        for q in &m.open_questions {
+            assert!(!q.question.is_empty(), "{}", q.id);
+            assert!(!q.denominator.is_empty(), "{}", q.id);
+            assert!(!q.act_on.is_empty(), "{}", q.id);
+            assert!(q.min_samples > 0, "{}", q.id);
+            assert!(ids.insert(q.id), "id가 겹칩니다: {}", q.id);
+        }
     }
 }
