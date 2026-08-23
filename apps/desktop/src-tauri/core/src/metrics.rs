@@ -28,7 +28,7 @@
 //! 어떻게 끝났다"뿐이다. 그래서 필드 이름을 추론이 아니라 **일어난 일 그대로** 붙였다 —
 //! 지표 이름이 추론을 포함하면 읽는 사람이 그 추론을 사실로 읽는다.
 
-use crate::store::Store;
+use crate::store::{StoredEvent, Store};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -325,8 +325,26 @@ pub struct TestFileRule {
     #[serde(rename = "tasksWhereRuleChangedTier")]
     pub tasks_where_rule_changed_tier: u64,
     /// 그중 제외했던 테스트 파일이 실제로 변경된 태스크. 오분류율의 분자다.
+    ///
+    /// **이 분자는 모델의 선택에 의존한다.** 규칙이 테스트 파일을 복잡도에서 지운 탓에 모델이
+    /// 그 파일을 고쳐야 한다는 것을 못 봤다면 — 즉 규칙이 정확히 해를 끼친 경우 — 그 파일은
+    /// `FILE_MUTATED`에 없다. **규칙이 가장 나쁘게 작동한 경우가 가장 깨끗한 성적표로 나온다.**
+    /// 그래서 아래 분자를 하나 더 둔다.
     #[serde(rename = "tasksWhereExcludedTestWasMutated")]
     pub tasks_where_excluded_test_was_mutated: u64,
+    /// 그중 제외했던 테스트 파일이 **검증 실패에 나타난** 태스크. 두 번째 분자다.
+    ///
+    /// 검증은 모델이 아니라 Rust가 돌리고 실패한 테스트 파일 이름은 러너가 찍는다. 그러므로
+    /// 이 값은 모델이 무엇을 골랐는지와 **무관하다** — 위 분자가 구조적으로 놓치는 경우가
+    /// 정확히 여기 잡힌다.
+    #[serde(rename = "tasksWhereExcludedTestFailedVerification")]
+    pub tasks_where_excluded_test_failed_verification: u64,
+    /// 검증 출력이 이벤트 밖(artifact)에 있어 **대조할 수 없었던** 태스크.
+    ///
+    /// 0으로 더하지 않는 이유는 `hitsWithoutSavedMs`와 같다: 대조하지 못한 것을 "일치 없음"으로
+    /// 세면 두 번째 분자가 낮게 나오고, 그건 "규칙이 괜찮다"로 읽힌다.
+    #[serde(rename = "tasksWhereVerificationTextUnavailable")]
+    pub tasks_where_verification_text_unavailable: u64,
 }
 
 /// 인덱스 캐시가 실제로 이득인가 (context-engine.md 2.1절, process-architecture.md 11.4절).
@@ -1209,7 +1227,7 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
         open_question(
             "testFileRule",
             "testFileRule",
-            "TRIAGE의 테스트 파일 제외 규칙이 오분류를 얼마나 내는가 (context-engine 11.1절)",
+            "TRIAGE의 테스트 파일 제외 규칙이 오분류를 얼마나 내는가 (context-engine 11.1절). **분자를 둘 다 볼 것** — `WasMutated`는 모델이 그 파일을 고쳤을 때만 세므로, 규칙이 해를 끼쳐 모델이 그 파일을 못 본 경우를 구조적으로 놓친다. `FailedVerification`은 모델의 선택을 거치지 않는다. `VerificationTextUnavailable`이 크면 두 번째 분자가 낮은 것이 무죄의 증거가 아니다",
             "**규칙이 판정을 바꾼** 태스크 수 (simple 건수가 아니다)",
             m.test_file_rule.tasks_where_rule_changed_tier,
             "자주 틀리면 고칠 자리는 TEST_FILE_PATTERNS가 아니라 규칙 자체다 — 테스트 파일을 고치는 것이 작업인 태스크를 어떻게 알아볼 것인가가 진짜 질문이다",
@@ -1285,6 +1303,78 @@ fn same_path(a: &str, b: &str) -> bool {
     let norm = |p: &str| p.replace('\\', "/").trim_start_matches("./").to_lowercase();
     let (a, b) = (norm(a), norm(b));
     a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+/// 실패한 `test` 체크의 출력에 제외했던 테스트 파일이 나타났는가.
+///
+/// `None`은 "아니다"가 아니라 **"볼 수 없었다"**이다 — 출력이 커서 artifact로 빠지면
+/// (`detailRef`) 이벤트에는 본문이 없다. 둘을 뭉치면 대조 실패가 무죄 판정으로 둔갑한다.
+///
+/// 실패한 체크가 아예 없으면 `Some(false)`다. 그건 볼 것이 없는 것이 아니라 **볼 것을 다 보고
+/// 없었던 것**이므로 판정 불가가 아니다.
+fn excluded_test_in_failed_verification(events: &[StoredEvent], excluded: &[&str]) -> Option<bool> {
+    if excluded.is_empty() {
+        return Some(false);
+    }
+    let mut unavailable = false;
+    for event in events.iter().filter(|e| e.event_type == "VERIFICATION_COMPLETED") {
+        // baseline은 작업 전 상태라 이 태스크의 작업 대상을 말해주지 않는다.
+        if event.payload.get("phase").and_then(Value::as_str) != Some("post") {
+            continue;
+        }
+        let Some(checks) = event.payload.get("checks").and_then(Value::as_array) else {
+            continue;
+        };
+        for check in checks {
+            if check.get("kind").and_then(Value::as_str) != Some("test") {
+                continue;
+            }
+            let status = check.get("status").and_then(Value::as_str).unwrap_or("");
+            if status != "FAILED" && status != "TIMED_OUT" {
+                continue;
+            }
+            let summary = check.get("summary").and_then(Value::as_str).unwrap_or("");
+            let detail = check.get("detail").and_then(Value::as_str);
+            if detail.is_none() && check.get("detailRef").is_some() {
+                unavailable = true;
+            }
+            let text = format!("{summary}\n{}", detail.unwrap_or(""));
+            if excluded.iter().any(|t| text_mentions_path(&text, t)) {
+                return Some(true);
+            }
+        }
+    }
+    if unavailable {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// 러너 출력이 그 경로를 언급했는가. 출력은 상대 경로일 수도 파일명뿐일 수도 있다.
+///
+/// **경계를 지킨다.** 단순 포함으로 보면 `e.test.ts`가 `validate.test.ts`에 걸려 서로 다른
+/// 파일이 같은 것으로 세어진다 — 그러면 이 분자가 실제보다 커지고, 큰 분자는 "규칙이 나쁘다"로
+/// 읽힌다. 경로 전체든 파일명이든 앞이 이름의 일부가 아니어야 인정한다.
+fn text_mentions_path(text: &str, path: &str) -> bool {
+    let norm = |p: &str| p.replace('\\', "/").to_lowercase();
+    let (haystack, needle) = (norm(text), norm(path));
+    let base = needle.rsplit('/').next().unwrap_or("").to_string();
+    [needle.as_str(), base.as_str()]
+        .iter()
+        .filter(|n| !n.is_empty())
+        .any(|n| mentions_at_boundary(&haystack, n))
+}
+
+/// 이름 경계에서 시작하는 출현이 있는가. 앞 글자가 영숫자나 `.`/`-`/`_`면 더 긴 이름의
+/// 일부이므로 다른 파일이다.
+fn mentions_at_boundary(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(at, _)| {
+        at == 0 || {
+            let prev = haystack.as_bytes()[at - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'.' || prev == b'-' || prev == b'_')
+        }
+    })
 }
 
 /// 저장된 이벤트에서 두 지표를 집계한다. **아무것도 쓰지 않는다.**
@@ -1410,6 +1500,16 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
                     });
                     if mutated_an_excluded_test {
                         metrics.test_file_rule.tasks_where_excluded_test_was_mutated += 1;
+                    }
+
+                    // 두 번째 분자 — **모델의 선택을 거치지 않는 쪽.** 실패한 test 체크의
+                    // 출력에 제외했던 파일이 나타났다면, 그 파일은 이 태스크와 관련이 있었다.
+                    match excluded_test_in_failed_verification(&events, &excluded) {
+                        Some(true) => metrics.test_file_rule.tasks_where_excluded_test_failed_verification += 1,
+                        Some(false) => {}
+                        // 출력을 못 봤다. "일치 없음"과 뭉치면 분자가 낮아 보이고,
+                        // 낮은 분자는 "규칙이 괜찮다"로 읽힌다.
+                        None => metrics.test_file_rule.tasks_where_verification_text_unavailable += 1,
                     }
                 }
             }
@@ -2664,6 +2764,91 @@ mod tests {
         let m = collect(&store, None).unwrap();
         assert_eq!(m.test_file_rule.tasks_where_rule_changed_tier, 1);
         assert_eq!(m.test_file_rule.tasks_where_excluded_test_was_mutated, 0);
+    }
+
+    /// 검증 실패 이벤트를 심는다. `detail`이 `None`이면 출력이 artifact로 빠진 상태를 흉내 낸다.
+    fn seed_failed_test_check(store: &mut Store, task_id: &str, summary: &str, detail: Option<&str>) {
+        let mut check = json!({ "kind": "test", "status": "FAILED", "summary": summary });
+        match detail {
+            Some(d) => check["detail"] = json!(d),
+            None => check["detailRef"] = json!("artifacts/verify-1.txt"),
+        }
+        store
+            .append_event(
+                task_id,
+                "VERIFICATION_COMPLETED",
+                &json!({ "phase": "post", "attemptNumber": 0, "overall": "fail", "checks": [check] }),
+            )
+            .unwrap();
+    }
+
+    /// **모델이 그 파일을 고치지 않아도 오분류는 오분류다.**
+    ///
+    /// 규칙이 테스트 파일을 지운 탓에 모델이 그것을 못 본 경우 — 규칙이 정확히 해를 끼친
+    /// 경우 — `FILE_MUTATED` 분자는 0이다. 검증 실패는 모델의 선택을 거치지 않는다.
+    #[test]
+    fn an_excluded_test_that_fails_verification_counts_even_when_untouched() {
+        let (_d, mut store) = seeded();
+        seed_triage(
+            &mut store,
+            "task-1",
+            json!({
+                "complexityTier": "simple",
+                "tierIfTestsCounted": "standard",
+                "excludedTestFiles": ["src/paginate.test.ts"],
+            }),
+            &["src/paginate.ts"],
+        );
+        seed_failed_test_check(&mut store, "task-1", "1 failing", Some("not ok 3 - src/paginate.test.ts"));
+
+        let m = collect(&store, None).unwrap();
+        // 첫 번째 분자는 여전히 0이다 — 그게 이 분자를 만든 이유다.
+        assert_eq!(m.test_file_rule.tasks_where_excluded_test_was_mutated, 0);
+        assert_eq!(m.test_file_rule.tasks_where_excluded_test_failed_verification, 1);
+        assert_eq!(m.test_file_rule.tasks_where_verification_text_unavailable, 0);
+    }
+
+    /// 출력을 못 본 것은 "일치 없음"이 아니다. 뭉치면 대조 실패가 무죄 판정이 된다.
+    #[test]
+    fn verification_text_in_an_artifact_is_counted_as_unknown_not_as_clean() {
+        let (_d, mut store) = seeded();
+        seed_triage(
+            &mut store,
+            "task-1",
+            json!({
+                "complexityTier": "simple",
+                "tierIfTestsCounted": "standard",
+                "excludedTestFiles": ["src/paginate.test.ts"],
+            }),
+            &["src/paginate.ts"],
+        );
+        seed_failed_test_check(&mut store, "task-1", "1 failing", None);
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_file_rule.tasks_where_excluded_test_failed_verification, 0);
+        assert_eq!(m.test_file_rule.tasks_where_verification_text_unavailable, 1);
+    }
+
+    /// 이름이 **다른** 테스트가 실패한 것은 이 규칙과 무관하다. 그리고 접미사 대조가
+    /// 경계를 안 지키면 `e.test.ts`가 `validate.test.ts`에 걸린다.
+    #[test]
+    fn an_unrelated_failing_test_is_not_a_misclassification() {
+        let (_d, mut store) = seeded();
+        seed_triage(
+            &mut store,
+            "task-1",
+            json!({
+                "complexityTier": "simple",
+                "tierIfTestsCounted": "standard",
+                "excludedTestFiles": ["e.test.ts"],
+            }),
+            &["src/paginate.ts"],
+        );
+        seed_failed_test_check(&mut store, "task-1", "1 failing", Some("not ok 3 - src/validate.test.ts"));
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_file_rule.tasks_where_excluded_test_failed_verification, 0);
+        assert_eq!(m.test_file_rule.tasks_where_verification_text_unavailable, 0);
     }
 
     /// **분모를 부풀리지 않는다.** 다른 이유로 이미 standard였다면 규칙은 아무것도 하지 않았고,

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import {
   distributionOf,
   loadEasyTasks,
@@ -14,6 +15,7 @@ import {
   type TriageObservation,
 } from "../src/triageCalibration.js";
 import { artifactsPresent, REPO_ROOT, type StoredEvent } from "../src/host.js";
+import { listFixtureIds } from "../src/manifest.js";
 
 /**
  * TRIAGE 임계값 캘리브레이션 — state-machine-and-protocol.md 12절.
@@ -223,6 +225,41 @@ test("어려운 라벨과 쉬운 라벨이 실제 저장소에서 온다", () =>
 test("스파이크 디렉터리가 없으면 빈 배열이 아니라 예외다", () => {
   // 빈 배열이면 쉬운 라벨이 통째로 빠진 채 표가 조용히 나온다.
   assert.throws(() => loadEasyTasks(path.join(SPIKE_FIXTURES, "없는-경로")), /없습니다/);
+});
+
+/**
+ * 이 세트가 **답할 수 없는 질문**을 못 박아 둔다 — context-engine 11.1.1절.
+ *
+ * TRIAGE 임계값은 이 fixture 세트로 재진다(라벨이 있고 규칙이 모델을 부르지 않는다). 그래서
+ * "테스트 파일 제외 규칙의 오분류"도 같은 방식으로 앞당길 수 있는지 확인해봤고, **없다.**
+ * 오분류의 분자는 "제외한 테스트 파일이 실제 작업 대상이었는가"인데, 24개 fixture의 정답
+ * 패치가 **전부 소스 파일**을 고친다. 반례를 담을 수 없는 세트에서 분자 0을 보고하면 그건
+ * "규칙이 완벽하다"로 읽힌다 — 문서가 경고한 조용한 실패 그대로다.
+ *
+ * 그래서 이 사실을 산문이 아니라 검사로 둔다. fixture의 정답 대상이 테스트 파일이 되는 순간
+ * 이 세트는 그 질문에 답할 수 있게 되므로, 그때 실패해서 항목을 다시 열게 한다.
+ */
+test("정답 패치가 테스트 파일을 고치는 fixture는 없다 — 그래서 이 세트는 11.1의 오분류를 재지 못한다", () => {
+  const ids = listFixtureIds(FIXTURES);
+  assert.ok(ids.length >= 24, `fixture를 찾지 못했습니다 (${ids.length}개)`);
+
+  const looksLikeTest = (p: string): boolean => /\.(?:test|spec)\.[a-z]{1,4}$/i.test(p);
+  let targets = 0;
+  for (const id of ids) {
+    const patchPath = path.join(FIXTURES, id, "reference.patch");
+    const parsed = JSON.parse(readFileSync(patchPath, "utf8")) as { files?: { path: string }[] };
+    assert.ok(Array.isArray(parsed.files) && parsed.files.length > 0, `${id}: reference.patch에 files가 없습니다`);
+    for (const file of parsed.files) {
+      targets += 1;
+      assert.ok(
+        !looksLikeTest(file.path),
+        `${id}의 정답 패치가 테스트 파일(${file.path})을 고칩니다. ` +
+          "이제 이 세트로 context-engine 11.1의 오분류를 잴 수 있으므로 그 항목을 다시 열 것"
+      );
+    }
+  }
+  // 대상이 0개면 위 반복이 한 번도 돌지 않은 것이고, 그러면 이 검사는 아무것도 말하지 않는다.
+  assert.ok(targets >= 24, `정답 대상 경로를 ${targets}개밖에 못 읽었습니다`);
 });
 
 // ---- production 경로를 실제로 태운다 ----
