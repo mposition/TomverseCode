@@ -35,6 +35,7 @@ import {
 import { AcceptanceCriteriaPanel } from "./components/AcceptanceCriteriaPanel";
 import { resultBasis } from "./lib/resultBasis";
 import { summarizeContrast, type ContrastInput } from "./lib/contrastSummary";
+import { describeCallPlan } from "./lib/callPlan";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { DiffPanel } from "./components/DiffPanel";
 import { DisagreementCard } from "./components/DisagreementCard";
@@ -993,8 +994,18 @@ export default function App() {
                 </label>
                 <label>
                   <input type="radio" checked={mode === "verified"} onChange={() => setMode("verified")} />
-                  Verified — 항상 독립 검수
+                  Verified — 항상 독립 검수 <span className="muted">(실행자를 둘 부릅니다)</span>
                 </label>
+                {/* **모드가 바꾸는 것은 대부분 비용인데 이름이 그걸 말하지 않고 있었다.**
+                    경고가 아니라 사실 나열이다 — 계산은 화면 밖(lib/callPlan.ts)에 있고,
+                    "모자랄 수 있습니다" 같은 예측은 하지 않는다(budgetCheck.ts의 규율). */}
+                {describeCallPlan(mode, budgetLimit, models).map(
+                  (line) => (
+                    <p key={line} className="muted small">
+                      {line}
+                    </p>
+                  )
+                )}
               </fieldset>
               {/* 커밋은 **되돌리기가 파일만 복원하고 커밋은 남기는** 유일한 단계라 별도 스위치다.
                   켜도 승인 없이 커밋되지 않는다 — 승인 모달이 실제 argv를 그대로 보여준다. */}
