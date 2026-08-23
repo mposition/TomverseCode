@@ -21,8 +21,20 @@
 
 import { createHash } from "node:crypto";
 
-/** 기준을 바꾸면 이 값을 올려야 한다. 올리면 이전 실행 기록과 같은 실험이 아니다. */
-export const PROTOCOL_VERSION = 1;
+/**
+ * 기준을 바꾸면 이 값을 올려야 한다. 올리면 이전 실행 기록과 같은 실험이 아니다.
+ *
+ * **상수뿐 아니라 판정 절차가 바뀌어도 올린다.** 해시가 봉인하는 것은 아래 객체의 값들이지만,
+ * 같은 값으로 다른 결론을 내는 규칙을 넣으면 봉인은 아무것도 지키지 못한다. 그건 해시를 두는
+ * 이유(결과를 본 뒤 기준을 움직이지 못하게 한다)를 절차 쪽으로 우회하는 길이다.
+ *
+ * v2에서 바뀐 것: **천장 검사**를 추가했다(`stats.ts`). 가장 강한 단일 arm이 이미 높게
+ * 통과해 가능한 최대 개선이 요구 개선폭보다 작으면 FAIL이 아니라 INCONCLUSIVE다 —
+ * Phase 0이 겪은 "단일 모델 5/5" 상황이 정확히 그 경우이고, 종전 규칙은 그것을
+ * "교차검증이 이득이 없다"로 적었다. 문턱은 새 상수가 아니라 `minOraclePassRateGainPp`에서
+ * 유도된다. 실행 기록이 하나도 없는 시점에 바꿨으므로 이전 기록과 섞일 여지는 없다.
+ */
+export const PROTOCOL_VERSION = 2;
 
 export interface GateCriteria {
   protocolVersion: number;

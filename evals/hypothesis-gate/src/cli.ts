@@ -59,6 +59,7 @@ import { ARMS } from "./arms.js";
 import { writeReports } from "./report.js";
 import { fillReviewerContributions, runExperiment } from "./runner.js";
 import { evaluateGate } from "./stats.js";
+import { assessDifficulty, describeDifficulty, summarizeDifficulty } from "./difficulty.js";
 import { loadEasyTasks, loadHardTasks, observeTriage, renderCalibration, summarize } from "./triageCalibration.js";
 import { validateAll } from "./validate.js";
 import type { ArmId } from "./types.js";
@@ -68,6 +69,7 @@ import type { ArmId } from "./types.js";
  *
  * 하위 명령:
  *   validate  — fixture 품질 검증 (모델 호출 없음)
+ *   difficulty — fixture가 실제로 "어려운지" 구조로 판정한다 (모델 호출 없음)
  *   triage-calibration — TRIAGE 규칙을 난이도 라벨이 붙은 태스크에 태워 임계값 표를 만든다 (모델 호출 없음)
  *   dry-run   — 실행 계획과 preflight만 출력 (API 호출 없음)
  *   plan-pilot   — 단계별(P0/P1) 승인 카드 (API 호출 없음)
@@ -96,7 +98,7 @@ async function main(): Promise<number> {
 
   if (options.command === "help") {
     log(
-      "usage: gate <validate|triage-calibration|dry-run|plan-pilot|probe-models|budget-status|attest-p0|pilot|run|report> [옵션]"
+      "usage: gate <validate|difficulty|triage-calibration|dry-run|plan-pilot|probe-models|budget-status|attest-p0|pilot|run|report> [옵션]"
     );
     log("");
     log("옵션: --fixtures a,b --arms A,B,C,D --repetitions N --seed N");
@@ -168,6 +170,33 @@ async function main(): Promise<number> {
     log("");
     log(`${results.length - failed}/${results.length} 통과`);
     return failed === 0 ? 0 : 1;
+  }
+
+  // ---- difficulty ----
+  // **모델 호출이 없다.** "어렵다"를 outcome이 아니라 구조로 정의했기 때문이다 —
+  // 근거는 difficulty.ts 모듈 주석과 product-strategy.md 12절.
+  if (options.command === "difficulty") {
+    log(`fixture ${fixtures.length}개의 난이도를 판정합니다 (모델 호출 없음).`);
+    log("");
+    const results = fixtures.map((fixture) => {
+      const result = assessDifficulty(fixture);
+      const mark = !result.measured ? "?" : result.kind === "fully_visible" ? "✗" : "✓";
+      log(
+        `  ${mark} ${result.fixtureId} — ${result.measured ? describeDifficulty(result.kind) : result.notMeasuredReason}` +
+          (result.ablations.length > 0
+            ? ` [되돌린 조각 ${result.ablations.length}개 중 공개 검증이 놓친 것 ${result.ablations.filter((a) => a.invisible).length}개]`
+            : "")
+      );
+      return result;
+    });
+    const summary = summarizeDifficulty(results);
+    log("");
+    log(`어려움 ${summary.hard}개 · 보이는 신호가 정답을 결정함 ${summary.fullyVisible}개 · 판정 못 함 ${summary.notMeasured}개`);
+    if (summary.notMeasured > 0) {
+      log("판정하지 못한 fixture를 '쉽다'로 세지 않는다 — 못 잰 것과 쉬운 것은 다른 사실이다.");
+    }
+    // **판정을 종료 코드로 내지 않는다.** 이건 세트의 성질을 재는 도구이지 게이트가 아니다.
+    return 0;
   }
 
   // ---- triage-calibration ----

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { criteriaHash } from "../src/criteria.js";
+import { CRITERIA, criteriaHash } from "../src/criteria.js";
 import {
   classifyContribution,
   evaluateGate,
@@ -144,6 +144,46 @@ test("fake provider 기록만 있으면 INCONCLUSIVE이고 성공률을 주장�
   assert.ok(evaluation.reasons.some((r) => r.includes("fake")), evaluation.reasons.join(" / "));
   assert.equal(evaluation.realApiRuns, 0);
   assert.equal(evaluation.fakeRuns, 72);
+});
+
+/**
+ * **Phase 0이 겪은 상황이 FAIL로 보고되면 안 된다.**
+ *
+ * 단일 모델이 거의 다 통과하면 개선할 여지 자체가 없다. 그때 나오는 "개선 0%p"는
+ * "교차검증이 이득이 없다"가 아니라 **"이 세트로는 잴 수 없다"**이고, 그 둘을 뭉치면
+ * 근거 없는 판정을 근거로 M1 방향이 정해진다.
+ */
+test("단일 모델이 이미 천장에 닿으면 FAIL이 아니라 INCONCLUSIVE다", () => {
+  const records = [
+    ...armRecords("C", 24, 3, () => true),
+    // 최강 단일 arm이 24개 중 23개 통과 = 가능한 최대 개선 4.2%p < 기준 10%p.
+    ...armRecords("A", 24, 3, (i) => i > 0),
+    ...armRecords("B", 24, 3, () => false),
+  ];
+  const evaluation = evaluateGate(records, { seed: 1 });
+  assert.equal(evaluation.verdict, "INCONCLUSIVE", evaluation.reasons.join(" / "));
+  assert.ok(
+    evaluation.reasons.some((r) => r.includes("최대 개선")),
+    evaluation.reasons.join(" / ")
+  );
+});
+
+test("천장 문턱은 상수가 아니라 요구 개선폭에서 유도된다", () => {
+  // 최강 단일 arm 통과율 0.5 → 최대 개선 50%p. 요구 개선폭을 60%p로 올리면 잴 수 없어진다.
+  const records = [
+    ...armRecords("C", 24, 3, () => true),
+    ...armRecords("A", 24, 3, (i) => i % 2 === 0),
+    ...armRecords("B", 24, 3, () => false),
+  ];
+  const relaxed = evaluateGate(records, { seed: 1 });
+  assert.notEqual(relaxed.verdict, "INCONCLUSIVE", relaxed.reasons.join(" / "));
+
+  const strict = evaluateGate(records, {
+    seed: 1,
+    criteria: { ...CRITERIA, minOraclePassRateGainPp: 60 },
+  });
+  assert.equal(strict.verdict, "INCONCLUSIVE", strict.reasons.join(" / "));
+  assert.ok(strict.reasons.some((r) => r.includes("최대 개선")), strict.reasons.join(" / "));
 });
 
 test("fixture가 24개 미만이면 INCONCLUSIVE", () => {

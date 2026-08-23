@@ -306,6 +306,28 @@ export function evaluateGate(
       `인프라 실패율 ${(infrastructureFailureRate * 100).toFixed(1)}% ≥ 기준 ${criteria.maxInfrastructureFailureRate * 100}% — 표본을 신뢰할 수 없습니다`
     );
   }
+
+  // ---- 개선할 여지가 있었는가 (천장 검사) ----
+  //
+  // **이게 없으면 Phase 0이 겪은 상황이 FAIL로 보고된다.** 단일 모델이 5/5를 통과했을 때
+  // 사실은 "교차검증이 도움이 안 된다"가 아니라 **"이 세트로는 잴 수 없다"**였다. 그런데
+  // 아래 gainPp 검사는 그 둘을 구별하지 못하고 전자로 적는다 — 그리고 그 판정을 근거로
+  // M1 방향이 정해진다.
+  //
+  // 문턱은 새 상수가 아니라 **유도된다**: 가장 강한 단일 arm이 s를 통과했다면 가능한 최대
+  // 개선은 (1 − s)이고, 그것이 요구하는 개선폭보다 작으면 무엇을 관측하든 기준을 넘을 수 없다.
+  // 상수로 적어두면 `minOraclePassRateGainPp`를 바꿨을 때 따라오지 않는다.
+  if (strongest) {
+    const headroomPp = (1 - strongest.oraclePassRate) * 100;
+    if (headroomPp < criteria.minOraclePassRateGainPp) {
+      reasons.push(
+        `가장 강한 단일 Arm ${strongest.arm}이 이미 ${(strongest.oraclePassRate * 100).toFixed(1)}% 통과 — ` +
+          `가능한 최대 개선 ${headroomPp.toFixed(1)}%p가 기준 ${criteria.minOraclePassRateGainPp}%p보다 작습니다. ` +
+          `이 fixture 세트로는 가설을 판정할 수 없습니다 (교차검증이 이득이 없다는 뜻이 아닙니다).`
+      );
+    }
+  }
+
   if (reasons.length > 0) return inconclusive();
 
   // ---- 여기부터는 PASS/FAIL 판정 ----
