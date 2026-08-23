@@ -690,6 +690,79 @@ pub struct ModelEvaluation {
     pub unattributed: u64,
 }
 
+/// product-strategy.md 14절 **보조 지표** 표의 순수 집계들.
+///
+/// # 이벤트는 쌓이는데 읽는 곳이 없었다
+///
+/// 14절은 "집계는 `tomverse-host metrics`가 저장된 이벤트에서 계산한다"고 적어두었다. 그런데
+/// 표의 여러 행(첫 시도 통과율, 승인율·거부율, 되돌리기 비율, 위험 명령 차단률)은 **이벤트만
+/// 있고 집계가 없었다.** 기록은 M0부터 하고 있었으므로 데이터를 잃지는 않았지만, "실사용이
+/// 쌓이면 본다"고 적어둔 값을 정작 볼 방법이 없는 상태였다.
+///
+/// # 이건 열린 질문이 아니라 운영 지표다
+///
+/// 그래서 `openQuestions`에 넣지 않는다. 열린 질문은 **설계를 바꿀지 말지**를 묻고 최소 표본
+/// 가드가 필요하지만, 이쪽은 그냥 "지금 어떤가"를 보는 값이다. 대신 면제 목록에 그 사실을
+/// 적어 둔다 — 아무 말 없이 지나가는 길은 두지 않는다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct OperationalCounts {
+    /// 작업 후(post) 검증 리포트 수. 아래 첫 시도 비율의 분모다.
+    #[serde(rename = "postVerifications")]
+    pub post_verifications: u64,
+    /// 그중 **재시도 없이**(attemptNumber = 0) 통과한 수.
+    #[serde(rename = "firstAttemptPasses")]
+    pub first_attempt_passes: u64,
+    #[serde(rename = "approvalsGranted")]
+    pub approvals_granted: u64,
+    #[serde(rename = "approvalsDenied")]
+    pub approvals_denied: u64,
+    /// 되돌리기가 **완료된** 태스크 수. 시작만 하고 끝나지 않은 것은 세지 않는다.
+    #[serde(rename = "tasksRolledBack")]
+    pub tasks_rolled_back: u64,
+    /// Policy Gate가 내린 판정 수와 그중 거부. 차단률의 분자·분모다.
+    #[serde(rename = "policyDecisions")]
+    pub policy_decisions: u64,
+    #[serde(rename = "policyDenials")]
+    pub policy_denials: u64,
+}
+
+/// 예약이 실제 비용의 몇 배였는가 — multi-engine-routing.md 10.6절.
+///
+/// # 문서가 "측정할 수 있다"고 적어둔 것이 측정되지 않고 있었다
+///
+/// `TASK_BUDGET_HEADROOM`(×3)은 유도하지 못한 상수이고, 그 주석은 *"그 간극이 얼마인지는
+/// `BUDGET_RESERVATION_OPENED`의 `reservedUsd`가 쌓이면 측정할 수 있다"* 고 적어두었다.
+/// 그런데 **그 이벤트를 읽는 집계가 없었다.** 실사용이 아무리 쌓여도 아무도 읽지 못한다 —
+/// "데이터를 기다린다"와 "데이터를 읽을 수 없다"는 다른 상태이고, 후자는 기다려도 오지 않는다.
+///
+/// # 왜 배수가 필요한가
+///
+/// 예약은 그 호출의 **최대** 비용으로 열리고 확정은 **실제** 비용으로 된다. 상한을 과거 실제
+/// 지출에 맞추면 남은 예산이 다음 호출의 최대치를 못 덮어 **정상 태스크가 거부된다.** 그래서
+/// 배수가 필요하고, 그 크기가 여기서 나온다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct BudgetHeadroom {
+    /// 예약과 확정이 짝지어진 호출 수. **비율의 분모다.**
+    pub settled: u64,
+    /// 확정은 됐는데 실제 비용이 0이라 배수를 낼 수 없는 호출 수.
+    ///
+    /// fake 공급자나 단가를 모르는 모델이 여기 들어온다. **0을 배수 계산에 넣으면 무한대가
+    /// 되므로 빼되, 뺀 사실을 남긴다** — 조용히 빼면 분모가 왜 작은지 알 수 없다.
+    #[serde(rename = "settledWithoutCost")]
+    pub settled_without_cost: u64,
+    /// 열렸다가 **취소된** 예약 수(호출이 일어나지 않았다).
+    pub released: u64,
+    /// 열린 채로 끝난 예약 수. 0이 아니면 그 요청은 과금됐을 수 있다(10.7절).
+    pub unresolved: u64,
+    /// `예약 / 실제` × 100의 백분위. 300이면 지금 상수(×3)가 맞는다는 뜻이다.
+    #[serde(rename = "p50ReservedOverActualPercent")]
+    pub p50_reserved_over_actual_percent: Option<u64>,
+    #[serde(rename = "p90ReservedOverActualPercent")]
+    pub p90_reserved_over_actual_percent: Option<u64>,
+    #[serde(rename = "maxReservedOverActualPercent")]
+    pub max_reserved_over_actual_percent: Option<u64>,
+}
+
 /// 검수가 무엇을 했는가 — product-strategy.md 14절.
 ///
 /// # 이름에 추론을 넣지 않는다
@@ -921,6 +994,12 @@ pub struct Metrics {
     /// 검수가 무엇을 했는가 (product-strategy.md 14절).
     #[serde(rename = "reviewerFindings")]
     pub reviewer_findings: ReviewerFindings,
+    /// 예약이 실제 비용의 몇 배였는가 (multi-engine-routing.md 10.6절).
+    #[serde(rename = "budgetHeadroom")]
+    pub budget_headroom: BudgetHeadroom,
+    /// 14절 보조 지표의 순수 집계.
+    #[serde(rename = "operational")]
+    pub operational: OperationalCounts,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
@@ -988,6 +1067,17 @@ pub enum Readiness {
 pub struct OpenQuestion {
     /// 설계 문서의 항목과 잇는 열쇠.
     pub id: &'static str,
+    /**
+     * 이 질문이 **어느 집계를 읽는가** (`Metrics`의 JSON 키).
+     *
+     * 이 필드가 없을 때 이 파일의 모듈 주석은 "지표를 추가하면서 여기 넣는 것을 잊으면 그
+     * 지표는 아무도 읽지 않는 숫자가 된다"고 **경고만** 하고 있었다. 경고는 잊히고, 잊힌 것은
+     * 조용하다 — 실제로 `budgetHeadroom`이 그렇게 빠져 있었다(문서는 "측정할 수 있다"고
+     * 적어두었는데 집계가 없었다).
+     *
+     * 이제 테스트가 `Metrics`의 모든 키를 훑어 질문이 읽거나 면제 목록에 있는지 확인한다.
+     */
+    pub metric: &'static str,
     /// 무엇을 묻는가.
     pub question: &'static str,
     /// **이 질문의 분모.** 지표마다 세는 대상이 다르므로 여기 적어둔다 — 잘못된 분모로 읽는
@@ -1015,13 +1105,33 @@ pub const MIN_OPEN_QUESTION_SAMPLES: u64 = 30;
 
 fn open_question(
     id: &'static str,
+    metric: &'static str,
     question: &'static str,
     denominator: &'static str,
     samples: u64,
     act_on: &'static str,
 ) -> OpenQuestion {
-    open_question_with_min(id, question, denominator, samples, MIN_OPEN_QUESTION_SAMPLES, act_on)
+    open_question_with_min(id, metric, question, denominator, samples, MIN_OPEN_QUESTION_SAMPLES, act_on)
 }
+
+/// `Metrics`의 키 중 **질문이 읽지 않아도 되는 것**과 그 이유.
+///
+/// 면제를 목록으로 두는 이유: 새 지표를 넣을 때 "질문을 붙이거나, 여기 이유를 적거나" 둘 중
+/// 하나를 하게 만든다. 아무 말 없이 지나가는 길을 없앤다.
+pub const METRICS_WITHOUT_QUESTION: &[(&str, &str)] = &[
+    ("cancellation", "forceAbandonThreshold의 입력. 유도값 쪽에 자체 표본 가드가 있다"),
+    ("commitSizes", "largeChangeThreshold의 입력. 같은 이유"),
+    ("taskCosts", "taskBudgetThreshold의 입력. 같은 이유"),
+    ("largeChangeThreshold", "유도된 문턱 자체 — 표본이 모자라면 값을 내지 않는다"),
+    ("forceAbandonThreshold", "유도된 문턱 자체"),
+    ("taskBudgetThreshold", "유도된 문턱 자체"),
+    ("tasksScanned", "분모/부기 — 질문이 아니라 다른 수를 읽는 근거다"),
+    ("openQuestions", "질문 목록 자체"),
+    (
+        "operational",
+        "14절 보조 지표 — 설계를 바꿀지 묻는 열린 질문이 아니라 '지금 어떤가'를 보는 운영 값이다. 최소 표본 가드가 필요 없다",
+    ),
+];
 
 /// 최소치를 **유도할 수 있는** 질문용.
 ///
@@ -1031,6 +1141,7 @@ fn open_question(
 /// "표본 부족"이라고 부르게 된다.
 fn open_question_with_min(
     id: &'static str,
+    metric: &'static str,
     question: &'static str,
     denominator: &'static str,
     samples: u64,
@@ -1039,6 +1150,7 @@ fn open_question_with_min(
 ) -> OpenQuestion {
     OpenQuestion {
         id,
+        metric,
         question,
         denominator,
         samples,
@@ -1060,6 +1172,7 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
     vec![
         open_question(
             "criteriaCoverage",
+            "coverage",
             "기준을 테스트에 이을 수 있는 경우가 실제로 얼마나 되는가 (state-machine 17.9절)",
             "판정된 기준 개수",
             m.coverage.criteria,
@@ -1067,6 +1180,7 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
         ),
         open_question(
             "conflictOutcomes",
+            "conflicts",
             "기준 충돌 게이트가 실제 문제를 잡는가, 프롬프트가 기준을 안 읽는 것인가 (17.10절 8)",
             "결말이 기록된 충돌 건수",
             m.conflicts.settled,
@@ -1074,6 +1188,7 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
         ),
         open_question(
             "cardQuestions",
+            "cardAnswers",
             "한 카드 질문 상한 4개와 필드 랭킹이 맞는가 (17.10절 9·10)",
             "카드에서 받은 답의 개수",
             m.card_answers
@@ -1085,12 +1200,14 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
         ),
         open_question(
             "tokenEstimate",
+            "tokenEstimate",
             "토큰 상한 계수가 실제로 상한인가 (context-engine 8.1절)",
             "추정과 실제를 둘 다 아는 호출 수",
             m.token_estimate.calls,
             "callsWhereActualExceededEstimate가 0이 아니면 상한이 아니므로 계수를 올린다. p90 비율이 한참 낮으면 과대 추정이므로 내린다",
         ),
         open_question(
+            "testFileRule",
             "testFileRule",
             "TRIAGE의 테스트 파일 제외 규칙이 오분류를 얼마나 내는가 (context-engine 11.1절)",
             "**규칙이 판정을 바꾼** 태스크 수 (simple 건수가 아니다)",
@@ -1099,12 +1216,14 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
         ),
         open_question(
             "ipcLineSize",
+            "ipcLineSizes",
             "NDJSON 한 줄 상한 32 MiB가 맞는 값인가 (process-architecture 3.1절)",
             "줄 크기를 보고한 **태스크 수** (줄 수가 아니다 — 한 태스크가 수십 줄을 주고받는다)",
             m.ipc_line_sizes.tasks_observed,
             "maxPercentOfLimit이 한 자리 수에 머무르면 상한이 헐거운 것이다. 다만 **낮추는 것은 정당한 메시지를 프로토콜 위반으로 죽이는 쪽**이므로, 분포의 꼬리(가장 큰 구간의 줄 수)를 함께 보고 여유를 남긴다",
         ),
         open_question_with_min(
+            "modelEvaluation",
             "modelEvaluation",
             "모델 평가 데이터를 표본 몇 개부터 라우팅에 반영할 것인가 (multi-engine-routing 12절)",
             "대조 실행에서 **승패가 갈린 태스크 수** (쟁점 수가 아니다 — 한 태스크의 쟁점들은 같은 두 초안에서 나오므로 독립이 아니다)",
@@ -1119,6 +1238,7 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
         ),
         open_question(
             "blockingRule",
+            "cardAnswers",
             "규칙이 '묻지 않아도 된다'고 판정한 쟁점에서 사용자가 뒤집는가 (state-machine 12절)",
             "카드에서 받은 답 중 blocking 여부가 기록된 것",
             m.card_answers
@@ -1131,12 +1251,22 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
         ),
         open_question(
             "reviewerFindings",
+            "reviewerFindings",
             "검수가 patch를 실제로 바꾸는가, 산문만 남기는가 (product-strategy 14절)",
             "검수가 판정을 낸 태스크 수",
             m.reviewer_findings.tasks_reviewed,
             "revisionsThatChangedThePatch가 revisionsProposed에 비해 낮으면 검수 프롬프트가 수정본을 내놓게 하지 못하는 것이다. **이 값으로 '검수가 쓸모없다'를 판정하지 말 것** — 검수 없이 돌렸을 때의 결과가 없으므로 그 비교는 게이트 하네스에서만 성립한다",
         ),
         open_question(
+            "budgetHeadroom",
+            "budgetHeadroom",
+            "예약이 실제 비용의 몇 배인가 — 여유 배수 ×3의 근거 (multi-engine-routing 10.6절)",
+            "예약과 확정이 짝지어진 공급자 호출 수 (실제 비용이 0인 호출은 배수를 낼 수 없어 빠진다)",
+            m.budget_headroom.settled,
+            "p90이 300%보다 한참 낮으면 TASK_BUDGET_HEADROOM을 내린다. **올리는 쪽이 안전한 방향이 아니다** — 배수가 작으면 남은 예산이 다음 호출의 최대치를 못 덮어 정상 태스크가 거부된다. unresolved가 0이 아니면 그 요청은 과금됐을 수 있으므로(10.7절) 배수보다 그쪽을 먼저 본다",
+        ),
+        open_question(
+            "indexCache",
             "indexCache",
             "인덱스 캐시가 이득인가 (context-engine 2.1절)",
             "구축 + 적중 횟수",
@@ -1172,6 +1302,8 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     let mut token_ratios: Vec<u64> = Vec::new();
     let mut build_ms: Vec<u64> = Vec::new();
     let mut index_file_counts: Vec<u64> = Vec::new();
+    // `예약 / 실제` × 100. 정수로 모으는 이유는 다른 지표와 같은 백분위 함수를 쓰기 위해서다.
+    let mut headroom_ratios: Vec<u64> = Vec::new();
     for (task_id, terminal_status) in &tasks {
         metrics.tasks_scanned += 1;
 
@@ -1280,6 +1412,65 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
                         metrics.test_file_rule.tasks_where_excluded_test_was_mutated += 1;
                     }
                 }
+            }
+        }
+
+        // ---- 14절 보조 지표 ----
+        for event in &events {
+            match event.event_type.as_str() {
+                "APPROVAL_GRANTED" => metrics.operational.approvals_granted += 1,
+                "APPROVAL_DENIED" => metrics.operational.approvals_denied += 1,
+                "POLICY_DECIDED" => {
+                    metrics.operational.policy_decisions += 1;
+                    if event.payload.get("decision").and_then(Value::as_str) == Some("deny") {
+                        metrics.operational.policy_denials += 1;
+                    }
+                }
+                "VERIFICATION_COMPLETED" => {
+                    // baseline은 "작업 전"이라 첫 시도 통과율의 대상이 아니다. 넣으면 분모가
+                    // 두 배가 되고 비율이 절반으로 보인다.
+                    if event.payload.get("phase").and_then(Value::as_str) != Some("post") {
+                        continue;
+                    }
+                    metrics.operational.post_verifications += 1;
+                    let first = event.payload.get("attemptNumber").and_then(Value::as_u64) == Some(0);
+                    let passed = event.payload.get("overall").and_then(Value::as_str) == Some("pass");
+                    if first && passed {
+                        metrics.operational.first_attempt_passes += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 되돌리기는 **태스크 단위**다. 한 태스크에서 두 번 되돌려도 되돌린 태스크는 하나다.
+        if events.iter().any(|e| e.event_type == "ROLLBACK_COMPLETED") {
+            metrics.operational.tasks_rolled_back += 1;
+        }
+
+        // ---- 예약 대비 실제 (multi-engine-routing.md 10.6절) ----
+        for event in &events {
+            match event.event_type.as_str() {
+                "BUDGET_RESERVATION_RELEASED" => metrics.budget_headroom.released += 1,
+                "BUDGET_RESERVATION_UNRESOLVED" => metrics.budget_headroom.unresolved += 1,
+                "BUDGET_RESERVATION_SETTLED" => {
+                    let reserved = event.payload.get("reservedUsd").and_then(Value::as_f64);
+                    let actual = event.payload.get("actualUsd").and_then(Value::as_f64);
+                    let (Some(reserved), Some(actual)) = (reserved, actual) else {
+                        continue;
+                    };
+                    if !reserved.is_finite() || !actual.is_finite() || reserved < 0.0 || actual < 0.0 {
+                        continue;
+                    }
+                    // 실제가 0이면 배수를 낼 수 없다. **조용히 빼지 않는다** — 빼면 분모가 왜
+                    // 작은지 알 수 없고, fake 공급자로 돌린 기록이 섞였는지도 구별되지 않는다.
+                    if actual == 0.0 {
+                        metrics.budget_headroom.settled_without_cost += 1;
+                        continue;
+                    }
+                    metrics.budget_headroom.settled += 1;
+                    headroom_ratios.push(((reserved / actual) * 100.0).round() as u64);
+                }
+                _ => {}
             }
         }
 
@@ -1480,6 +1671,11 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     metrics.task_costs.p90_usd = percentile(&task_cost_micros, 90).map(micros_to_usd);
     metrics.task_costs.max_usd = task_cost_micros.last().copied().map(micros_to_usd);
     metrics.task_budget_threshold = Some(suggest_task_budget_usd(&metrics.task_costs));
+
+    headroom_ratios.sort_unstable();
+    metrics.budget_headroom.p50_reserved_over_actual_percent = percentile(&headroom_ratios, 50);
+    metrics.budget_headroom.p90_reserved_over_actual_percent = percentile(&headroom_ratios, 90);
+    metrics.budget_headroom.max_reserved_over_actual_percent = headroom_ratios.last().copied();
 
     metrics.force_abandon_threshold = Some(suggest_force_abandon_ms(&metrics.cancellation));
 
@@ -2749,6 +2945,153 @@ mod tests {
         assert_eq!(target.get(&2).map(|f| f.picked_other), Some(1), "{target:?}");
         // 주변 분포는 그대로 남는다 — 결합이 그것을 대체하지는 않는다.
         assert_eq!(m.card_answers.by_field.get("targetPaths").map(|f| f.picked_primary), Some(1));
+    }
+
+    // ---- 지표가 읽히는가 ----
+
+    /// **모든 집계에 읽는 법이 붙어 있는가.**
+    ///
+    /// 이 파일의 모듈 주석은 오래전부터 "지표를 추가하면서 여기 넣는 것을 잊으면 그 지표는
+    /// 아무도 읽지 않는 숫자가 된다"고 경고하고 있었다. 경고는 잊혔고 — `budgetHeadroom`이
+    /// 정확히 그렇게 빠져 있었다(문서는 "측정할 수 있다"고 적었는데 집계가 없었다).
+    /// 이제 새 지표를 넣으면 질문을 붙이거나 면제 이유를 적어야 한다.
+    #[test]
+    fn every_metric_is_read_by_a_question_or_is_explicitly_exempt() {
+        let (_d, store) = seeded();
+        let m = collect(&store, None).unwrap();
+        let json = serde_json::to_value(&m).unwrap();
+        let keys: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+        assert!(keys.len() >= 10, "직렬화가 깨졌습니다: {keys:?}");
+
+        let read: Vec<&str> = m.open_questions.iter().map(|q| q.metric).collect();
+        let exempt: Vec<&str> = METRICS_WITHOUT_QUESTION.iter().map(|(k, _)| *k).collect();
+
+        let orphans: Vec<&String> = keys
+            .iter()
+            .filter(|k| !read.contains(&k.as_str()) && !exempt.contains(&k.as_str()))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "읽는 법이 없는 지표: {orphans:?} — openQuestion을 붙이거나 METRICS_WITHOUT_QUESTION에 이유를 적을 것"
+        );
+    }
+
+    #[test]
+    fn a_question_cannot_point_at_a_metric_that_does_not_exist() {
+        // 오타 하나면 질문이 없는 칸을 가리키고, 그 질문은 영원히 0을 읽는다.
+        let (_d, store) = seeded();
+        let m = collect(&store, None).unwrap();
+        let json = serde_json::to_value(&m).unwrap();
+        let object = json.as_object().unwrap();
+        for question in &m.open_questions {
+            assert!(
+                object.contains_key(question.metric),
+                "질문 {}가 없는 지표 {}를 가리킵니다",
+                question.id,
+                question.metric
+            );
+        }
+    }
+
+    #[test]
+    fn exemptions_carry_a_reason() {
+        // 이유 없는 면제는 다음 사람이 판단할 수 없다.
+        for (key, reason) in METRICS_WITHOUT_QUESTION {
+            assert!(!reason.trim().is_empty(), "{key}의 면제 이유가 비어 있습니다");
+        }
+    }
+
+    // ---- 14절 보조 지표 ----
+
+    #[test]
+    fn baseline_reports_are_not_in_the_first_attempt_denominator() {
+        // baseline은 "작업 전"이라 첫 시도 통과율의 대상이 아니다. 넣으면 분모가 두 배가 되고
+        // 비율이 절반으로 보인다.
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "VERIFICATION_COMPLETED", &json!({ "phase": "baseline", "attemptNumber": 0, "overall": "pass" }))
+            .unwrap();
+        store
+            .append_event("task-1", "VERIFICATION_COMPLETED", &json!({ "phase": "post", "attemptNumber": 0, "overall": "pass" }))
+            .unwrap();
+        store
+            .append_event("task-1", "VERIFICATION_COMPLETED", &json!({ "phase": "post", "attemptNumber": 1, "overall": "pass" }))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.operational.post_verifications, 2);
+        // 재시도 끝에 통과한 것은 "첫 시도"가 아니다.
+        assert_eq!(m.operational.first_attempt_passes, 1);
+    }
+
+    #[test]
+    fn rollback_is_counted_per_task_not_per_event() {
+        let (_d, mut store) = seeded();
+        store.append_event("task-1", "ROLLBACK_COMPLETED", &json!({})).unwrap();
+        store.append_event("task-1", "ROLLBACK_COMPLETED", &json!({})).unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.operational.tasks_rolled_back, 1);
+    }
+
+    #[test]
+    fn policy_denials_have_a_denominator() {
+        // 거부 건수만 세면 "차단률"을 낼 수 없다 — 100건 중 1건과 2건 중 1건은 다른 사실이다.
+        let (_d, mut store) = seeded();
+        store.append_event("task-1", "POLICY_DECIDED", &json!({ "decision": "allow" })).unwrap();
+        store.append_event("task-1", "POLICY_DECIDED", &json!({ "decision": "deny" })).unwrap();
+        store.append_event("task-1", "APPROVAL_GRANTED", &json!({})).unwrap();
+        store.append_event("task-1", "APPROVAL_DENIED", &json!({})).unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.operational.policy_decisions, 2);
+        assert_eq!(m.operational.policy_denials, 1);
+        assert_eq!(m.operational.approvals_granted, 1);
+        assert_eq!(m.operational.approvals_denied, 1);
+    }
+
+    // ---- 예약 대비 실제 (multi-engine-routing 10.6절) ----
+
+    #[test]
+    fn reservation_settlements_yield_the_headroom_multiple() {
+        let (_d, mut store) = seeded();
+        for (reserved, actual) in [(0.30, 0.10), (0.60, 0.10), (0.20, 0.10)] {
+            store
+                .append_event(
+                    "task-1",
+                    "BUDGET_RESERVATION_SETTLED",
+                    &json!({ "reservedUsd": reserved, "actualUsd": actual }),
+                )
+                .unwrap();
+        }
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.budget_headroom.settled, 3);
+        // 300%, 600%, 200% → p50은 300%. 지금 상수(×3)가 맞는지는 이 수가 말한다.
+        assert_eq!(m.budget_headroom.p50_reserved_over_actual_percent, Some(300));
+        assert_eq!(m.budget_headroom.max_reserved_over_actual_percent, Some(600));
+    }
+
+    #[test]
+    fn a_settlement_without_cost_is_counted_not_dropped() {
+        // 0으로 나누면 무한대다. 조용히 빼면 분모가 왜 작은지 알 수 없고, fake 공급자로 돌린
+        // 기록이 섞였는지도 구별되지 않는다.
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "BUDGET_RESERVATION_SETTLED", &json!({ "reservedUsd": 0.3, "actualUsd": 0.0 }))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.budget_headroom.settled, 0);
+        assert_eq!(m.budget_headroom.settled_without_cost, 1);
+        assert_eq!(m.budget_headroom.p50_reserved_over_actual_percent, None);
+    }
+
+    #[test]
+    fn open_and_unresolved_reservations_are_different_facts() {
+        // 열린 채 끝난 예약은 **과금됐을 수 있다**(10.7절). 취소된 예약과 같은 칸에 넣으면
+        // 그 위험이 사라진다.
+        let (_d, mut store) = seeded();
+        store.append_event("task-1", "BUDGET_RESERVATION_RELEASED", &json!({})).unwrap();
+        store.append_event("task-1", "BUDGET_RESERVATION_UNRESOLVED", &json!({})).unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.budget_headroom.released, 1);
+        assert_eq!(m.budget_headroom.unresolved, 1);
     }
 
     // ---- blocking 판정 규칙 (state-machine 12절) ----
