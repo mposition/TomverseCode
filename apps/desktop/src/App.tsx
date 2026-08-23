@@ -287,9 +287,8 @@ export default function App() {
       // 저장 계층이 아직 안 열렸거나 열지 못한 상태. 새 작업 실행은 가능해야 하므로
       // 화면을 막지 않고 사유만 보여준다.
       if (!result.ok) return setStoreError(result.problem.text);
-      // 새로고침은 **이미 읽은 페이지를 버린다.** 목록이 updated_at 내림차순이라 그 사이
-      // 갱신된 작업이 있으면 순서가 통째로 바뀌고, 옛 페이지를 남기면 어느 시점에도
-      // 존재한 적 없는 목록이 만들어진다.
+      // 새로고침은 **이미 읽은 페이지를 버린다.** 1페이지만 갈아 끼우면 위쪽은 새 상태,
+      // 아래쪽은 옛 상태가 되어 어느 시점에도 존재한 적 없는 목록이 만들어진다.
       setTaskList(firstPage(result.value));
       setStoreError(null);
     } catch (error) {

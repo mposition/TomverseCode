@@ -1051,7 +1051,6 @@ impl Store {
 
     // ---- 조회 (UI가 Tauri command를 통해서만 접근한다) ----
 
-    /// 최근 작업 목록. `cursor`는 `updated_at` 값이며 그보다 오래된 것만 반환한다.
     /// 집계용 전체 태스크 목록 (task_id, terminal_status).
     ///
     /// `list_tasks`를 쓰지 않는 이유: 그쪽은 **UI 목록용**이라 상한 200으로 잘린다(의도된
@@ -1070,23 +1069,33 @@ impl Store {
 
     /// 목록 페이지 하나 (ui-wireframes.md 3.8절).
     ///
-    /// # 커서는 `(updated_at, task_id)` 쌍이다
+    /// # 커서는 `(created_at, task_id)` 쌍이다
     ///
-    /// `updated_at` 하나로 자르면 **같은 시각의 행이 통째로 사라진다.** 마지막 행의 시각으로
+    /// 시각 하나로 자르면 **같은 시각의 행이 통째로 사라진다.** 마지막 행의 시각으로
     /// `< cursor`를 하면 그 시각을 공유하는 다른 행도 함께 잘리기 때문이다. 목록에서 사라진
     /// 작업은 사용자에게 "없는 작업"이고, 그건 목록의 목적을 정면으로 어긴다.
     ///
-    /// 그래서 정렬과 비교를 둘 다 `(updated_at, task_id)`로 한다 — `task_id`가 유일하므로
-    /// 쌍은 전순서가 되고, 어떤 행도 건너뛰거나 두 번 나오지 않는다.
+    /// 그래서 정렬과 비교를 둘 다 같은 쌍으로 한다 — `task_id`가 유일하므로 쌍은 전순서가
+    /// 되고, 어떤 행도 건너뛰거나 두 번 나오지 않는다.
+    ///
+    /// # 그 쌍이 `updated_at`이 아니라 `created_at`인 이유 (3.8.1절)
+    ///
+    /// **커서 페이징은 정렬 키가 움직이지 않을 때만 성립한다.** `updated_at`으로 정렬하면,
+    /// 페이지 사이에 갱신된 작업이 커서 **위로** 올라가 아직 안 읽은 페이지에서 빠진다.
+    /// 그 행은 어떤 페이지에도 나오지 않으므로 사용자에게는 존재하지 않는 작업이 된다.
+    /// `created_at`은 생성 시각이라 production 경로 어디서도 UPDATE되지 않는다 — 키가
+    /// 움직이지 않으면 스냅샷 없이도 페이징이 안정하다.
+    ///
+    /// 곁들여 **화면과도 맞는다.** 목록 행이 찍는 시각은 `createdAt`이었으므로, 정렬이
+    /// `updated_at`이던 동안 화면은 13:40이 14:02 위에 오는 목록을 그릴 수 있었다.
     ///
     /// **커서 형식은 호출자에게 불투명하다.** 화면이 커서를 만들면 정렬 기준이 바뀔 때
-    /// 화면과 질의가 조용히 갈라진다 — 실제로 그렇게 갈라져 있었다(커서는 `created_at`인데
-    /// 질의는 `updated_at`으로 잘랐다).
+    /// 화면과 질의가 조용히 갈라진다 — 실제로 그렇게 갈라져 있었다.
     pub fn list_tasks(&self, workspace_path: Option<&str>, limit: i64, cursor: Option<&str>) -> Result<Vec<TaskRow>> {
         let limit = limit.clamp(1, 200);
-        let (cursor_updated, cursor_id) = match cursor {
+        let (cursor_created, cursor_id) = match cursor {
             Some(raw) => match raw.split_once('|') {
-                Some((updated, id)) => (Some(updated.to_string()), Some(id.to_string())),
+                Some((created, id)) => (Some(created.to_string()), Some(id.to_string())),
                 // 형식이 틀린 커서를 "처음부터"로 읽지 않는다 — 그러면 "더 보기"가 첫 페이지를
                 // 다시 붙여 목록이 반복되고, 사용자는 그걸 데이터가 늘어난 것으로 읽는다.
                 None => return Err(StoreError::InvalidCursor(raw.to_string())),
@@ -1100,17 +1109,17 @@ impl Store {
                     t.created_at, t.updated_at
              FROM tasks t
              WHERE (?1 IS NULL OR t.workspace_path = ?1)
-               AND (?2 IS NULL OR (t.updated_at, t.task_id) < (?2, ?3))
-             ORDER BY t.updated_at DESC, t.task_id DESC
+               AND (?2 IS NULL OR (t.created_at, t.task_id) < (?2, ?3))
+             ORDER BY t.created_at DESC, t.task_id DESC
              LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![workspace_path, cursor_updated, cursor_id, limit], map_task_row)?;
+        let rows = stmt.query_map(params![workspace_path, cursor_created, cursor_id, limit], map_task_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// 이 행 다음 페이지를 가리키는 커서. **질의가 정렬에 쓰는 것과 같은 필드로 만든다.**
     pub fn cursor_for(row: &TaskRow) -> String {
-        format!("{}|{}", row.updated_at, row.task_id)
+        format!("{}|{}", row.created_at, row.task_id)
     }
 
     pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>> {
@@ -2868,12 +2877,12 @@ mod tests {
         panic!("커서가 전진하지 않아 페이지가 끝나지 않았습니다");
     }
 
-    /// `updated_at`이 같은 행이 여럿일 때 **어느 것도 사라지지 않아야** 한다.
+    /// 시각이 같은 행이 여럿일 때 **어느 것도 사라지지 않아야** 한다.
     ///
     /// 시각 하나로만 자르면 마지막 행과 시각을 공유하는 행이 통째로 잘린다. 사용자에게
     /// 목록에서 사라진 작업은 없는 작업이므로, 이건 표시 문제가 아니라 데이터 손실로 읽힌다.
     #[test]
-    fn list_tasks_paging_keeps_rows_that_share_updated_at() {
+    fn list_tasks_paging_keeps_rows_that_share_a_timestamp() {
         let (_d, mut store) = seeded();
         // seeded()가 만든 task-1까지 포함해 7건이 **전부 같은 시각**을 갖게 한다.
         store
@@ -2900,10 +2909,11 @@ mod tests {
         assert_eq!(sorted.len(), 7, "페이지 경계에서 행이 사라졌습니다: {seen:?}");
     }
 
-    /// `created_at`과 `updated_at`이 갈라져도 페이지가 어긋나지 않아야 한다.
+    /// 커서와 질의가 **같은 필드**를 봐야 한다.
     ///
-    /// 이 테스트가 잡는 실제 결함: 커서를 `created_at`으로 만들면서 질의는 `updated_at`으로
+    /// 이 테스트가 잡는 실제 결함: 한때 커서는 `created_at`으로 만들면서 질의는 `updated_at`으로
     /// 잘랐다. 두 값이 같은 동안에는 통과하므로 **일부러 반대 순서로** 만들어야만 드러난다.
+    /// 정렬 키가 `created_at`으로 바뀐 지금도 같은 함정이 반대 방향으로 존재하므로 그대로 둔다.
     #[test]
     fn list_tasks_cursor_uses_the_same_field_the_query_orders_by() {
         let (_d, mut store) = seeded();
@@ -2911,7 +2921,7 @@ mod tests {
         store
             .conn
             .execute(
-                "UPDATE tasks SET created_at = '2029-01-01T00:00:00Z', updated_at = '2030-01-01T00:00:00Z'
+                "UPDATE tasks SET created_at = '2029-01-01T00:00:00Z', updated_at = '2029-01-01T00:00:00Z'
                  WHERE task_id = 'task-1'",
                 [],
             )
@@ -2929,8 +2939,88 @@ mod tests {
         let seen = page_through(&store, 2);
         assert_eq!(
             seen,
-            vec!["p-0", "p-1", "p-2", "p-3", "p-4", "p-5", "task-1"],
-            "페이지를 이어 붙인 순서가 updated_at 내림차순과 다릅니다"
+            vec!["p-5", "p-4", "p-3", "p-2", "p-1", "p-0", "task-1"],
+            "페이지를 이어 붙인 순서가 created_at 내림차순과 다릅니다"
+        );
+    }
+
+    /// **페이지 사이에 갱신된 작업이 목록에서 사라지지 않아야 한다** (3.8.1절).
+    ///
+    /// 이것이 종전에 "고치지 않은 것"으로 적혀 있던 결함이다. `updated_at`으로 정렬하면
+    /// 아직 안 읽은 페이지에 있던 행이 커서 **위로** 올라가 어떤 페이지에도 나오지 않는다.
+    /// 사용자에게 목록에서 사라진 작업은 없는 작업이다.
+    ///
+    /// 스냅샷 조회가 필요하다고 적어두었지만 필요한 것은 스냅샷이 아니라 **움직이지 않는
+    /// 정렬 키**였다.
+    #[test]
+    fn list_tasks_does_not_drop_rows_updated_between_pages() {
+        let (_d, mut store) = seeded();
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET created_at = '2030-01-09T00:00:00Z', updated_at = '2030-01-09T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        for i in 0..6 {
+            let at = format!("2030-01-0{}T00:00:00Z", i + 1);
+            seed_task(&mut store, &format!("p-{i}"), &at, &at);
+        }
+
+        // 1페이지를 읽는다.
+        let first = store.list_tasks(Some("/tmp/ws"), 3, None).unwrap();
+        assert_eq!(first.len(), 3);
+        let cursor = Store::cursor_for(first.last().unwrap());
+
+        // 그 사이 **아직 안 읽은** 작업 하나가 갱신된다 (phase 전이가 하는 일 그대로).
+        store
+            .conn
+            .execute(
+                "UPDATE tasks SET updated_at = '2031-12-31T00:00:00Z' WHERE task_id = 'p-0'",
+                [],
+            )
+            .unwrap();
+
+        let mut seen: Vec<String> = first.into_iter().map(|r| r.task_id).collect();
+        let mut next = Some(cursor);
+        while let Some(c) = next {
+            let rows = store.list_tasks(Some("/tmp/ws"), 3, Some(&c)).unwrap();
+            let full = rows.len() == 3;
+            next = if full { Some(Store::cursor_for(rows.last().unwrap())) } else { None };
+            seen.extend(rows.into_iter().map(|r| r.task_id));
+        }
+
+        assert!(seen.contains(&"p-0".to_string()), "갱신된 작업이 목록에서 사라졌습니다: {seen:?}");
+        assert_eq!(seen.len(), 7, "행이 빠지거나 겹쳤습니다: {seen:?}");
+    }
+
+    /// 정렬 키가 **움직이지 않는다**는 것이 위 테스트의 전제다. 그 전제를 코드에서 확인한다 —
+    /// production 경로가 `created_at`을 UPDATE하기 시작하면 페이징은 다시 조용히 깨진다.
+    /// (테스트 fixture는 시각을 직접 심어야 하므로 `mod tests` 아래는 검사 대상이 아니다.)
+    #[test]
+    fn production_code_never_updates_the_sort_key() {
+        let source = include_str!("store.rs");
+        let production = source.split("mod tests").next().expect("mod tests 앞부분");
+        // needle을 런타임에 조립한다 — 리터럴로 적으면 이 assertion 자체가 검사에 걸린다.
+        let sort_key = format!("created_at{}", " =");
+        let touched = format!("updated_at{}", " =");
+        // UPDATE 문의 **대입부만** 본다. 컬럼 이름은 INSERT 목록과 SELECT에도 나오므로
+        // 파일 전체에서 찾으면 언제나 걸린다.
+        let assignments: Vec<&str> = production
+            .split("UPDATE ")
+            .skip(1)
+            .map(|chunk| chunk.split("WHERE").next().unwrap_or(chunk))
+            .collect();
+        for stmt in &assignments {
+            assert!(
+                !stmt.contains(&sort_key),
+                "production 경로가 created_at을 UPDATE합니다 — 정렬 키가 움직이면 3.8.1절이 무효가 됩니다: {stmt}"
+            );
+        }
+        // 이 검사가 공허하지 않다는 것: 같은 방식으로 찾으면 updated_at 대입은 실제로 잡힌다.
+        assert!(
+            assignments.iter().any(|stmt| stmt.contains(&touched)),
+            "UPDATE 문을 하나도 찾지 못했습니다 — 검사 방식이 아무것도 보지 않고 있습니다"
         );
     }
 
