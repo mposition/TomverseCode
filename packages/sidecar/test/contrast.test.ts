@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { DraftProposal } from "@tomverse/protocol";
 import { contrastDrafts, planQuestionRound, MAX_QUESTIONS_PER_ROUND } from "../src/orchestrator/contrast.js";
+import { DISAGREEMENT_FIELD_RANK } from "@tomverse/protocol";
 
 /**
  * 구조적 대조 — docs/design/state-machine-and-protocol.md 17절.
@@ -308,6 +309,52 @@ test("한 라운드 질문 상한은 한 화면에 들어가는 수다", () => {
   // 라운드는 왕복 횟수이지 질문 개수가 아니다(17.4절) — 세 번 깨우는 것이 최악이므로
   // 여러 쟁점을 한 카드에 묶는다. 다만 스크롤이 생길 만큼 묶지는 않는다.
   assert.ok(MAX_QUESTIONS_PER_ROUND >= 3 && MAX_QUESTIONS_PER_ROUND <= 4);
+});
+
+/**
+ * **상한이 지금은 구속하지 않는다 — 그리고 그 사실이 두 미해결 항목의 전제다.**
+ *
+ * 대조는 필드당 쟁점을 하나만 만들고(`contrastDrafts`), 판정 가능한 필드는 3개다. 그러므로
+ * 한 카드의 쟁점은 최대 3개이고 상한 4를 넘을 수 없다. 결과로 두 가지가 따라온다.
+ *
+ *  - `deferred`는 production에서 언제나 빈 배열이다. "예산을 넘겨 묻지 못한 쟁점"이라는
+ *    상태는 지금 도달할 수 없다(코드는 남겨둔다 — 필드가 늘면 바로 필요해진다).
+ *  - **랭킹의 "예산 초과 시 무엇을 먼저 묻는가"도 발생하지 않는다.** 랭킹이 실제로 하는 일은
+ *    카드 안의 **자리 순서**뿐이고, 12절이 남긴 두 항목(상한 4의 근거, 랭킹 임계)은 그
+ *    사실 위에서 다시 읽어야 한다.
+ *
+ * 이 검사는 **필드가 늘어나는 순간 실패한다.** 그러면 위 두 항목이 자동으로 다시 열린다 —
+ * 사람이 기억하고 있어야 하는 규칙으로 두면 언젠가 잊는다.
+ */
+test("판정 가능한 필드가 상한을 넘지 않는다 — 넘으면 예산 항목이 다시 열린다", () => {
+  assert.ok(
+    MAX_QUESTIONS_PER_ROUND >= DISAGREEMENT_FIELD_RANK.length,
+    `필드가 ${DISAGREEMENT_FIELD_RANK.length}개로 늘어 상한 ${MAX_QUESTIONS_PER_ROUND}을 넘습니다. ` +
+      `이제 deferred가 실제로 생기므로 랭킹 순서와 상한의 근거를 다시 정해야 합니다(12절).`
+  );
+});
+
+test("모든 필드가 갈려도 한 카드에 다 들어간다", () => {
+  // 위 검사는 상수 비교다. 실제로 만들어지는 쟁점 개수가 그 상수와 이어져 있는지는
+  // 여기서 본다 — 대조가 필드당 둘 이상 만들기 시작하면 상수 비교는 통과한 채로 넘친다.
+  const report = run(
+    draft({
+      proposalId: "p1",
+      doneCriteria: ["A"],
+      requiredTests: ["t1"],
+      plan: [{ stepId: "s", description: "d", targetPaths: ["a.ts"] }],
+    }),
+    draft({
+      proposalId: "p2",
+      doneCriteria: ["B"],
+      requiredTests: ["t2"],
+      plan: [{ stepId: "s", description: "d", targetPaths: ["b.ts"] }],
+    })
+  );
+  assert.equal(report.disagreements.length, DISAGREEMENT_FIELD_RANK.length);
+  const { asked, deferred } = planQuestionRound(report);
+  assert.equal(deferred.length, 0);
+  assert.equal(asked.length, report.disagreements.length);
 });
 
 test("simple tier에서는 requiredTests 차이가 blocking이 아니다", () => {

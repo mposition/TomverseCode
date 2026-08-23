@@ -248,6 +248,24 @@ pub struct CardAnswers {
     /// 한 축으로 합치면 둘 중 어느 것이 비율을 움직였는지 알 수 없다.
     #[serde(rename = "byField")]
     pub by_field: BTreeMap<String, FieldAnswers>,
+    /// 필드 → 자리 → 답 분포. **필드와 자리의 교락을 푸는 유일한 표다.**
+    ///
+    /// # 따로 세면 답할 수 없는 질문이었다
+    ///
+    /// 17.10절 ⑨는 "자리에 따라 비율이 달라지는 것만이 자리 때문이다"라고 읽는 법을 적어두었다.
+    /// 그런데 `byPosition`과 `byField`가 **따로** 있으면 그 비교가 불가능하다: 랭킹이 고정이라
+    /// `doneCriteria`는 언제나 앞자리에 오므로, 두 표에서 보이는 차이가 필드 때문인지 자리
+    /// 때문인지 가를 수 없다. **교락된 두 축을 각각 주변화해 놓고 "비교하라"고 적어둔 셈이다.**
+    ///
+    /// 다행히 무작위화가 필요하지는 않다. 카드에는 **갈린 필드만** 실리므로 같은 필드가
+    /// 카드마다 다른 자리에 온다 — `targetPaths`는 `doneCriteria`가 갈리지 않은 카드에서
+    /// 1번, 갈린 카드에서 2번이다. 그 변이가 자리 효과를 필드와 분리해 준다.
+    ///
+    /// 읽는 법: **한 필드 안에서 자리별로 비교한다.** 필드를 가로질러 비교하면 원래 문제로
+    /// 돌아간다. 남은 교란: 비-blocking 항목은 언제나 blocking 뒤에 실리므로(17.4.1절) 자리에
+    /// blocking 여부도 섞인다 — `doneCriteria`처럼 언제나 blocking인 필드가 가장 깨끗한 읽기다.
+    #[serde(rename = "byFieldAndPosition")]
+    pub by_field_and_position: BTreeMap<String, BTreeMap<u64, FieldAnswers>>,
     /// **규칙이 막을 만하다고 봤는가**별 답 분포 — 12절 "blocking 판정 규칙 자체".
     ///
     /// # 이 축이 없으면 규칙을 검증할 수 없다
@@ -1063,7 +1081,7 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
                 .values()
                 .map(|p| p.first_option + p.later_option + p.freeform + p.unknown)
                 .sum(),
-            "자리에 따라 비율이 달라지는 것만이 자리 때문이다. 필드는 절대값이 아니라 필드끼리 비교하고, 고칠 자리는 DISAGREEMENT_FIELD_RANK 한 줄이다",
+            "**byFieldAndPosition을 본다** — byPosition과 byField는 교락된 두 축의 주변 분포라 따로 보면 자리 때문인지 필드 때문인지 가를 수 없다. 한 필드 안에서 자리별로 비교하고, 고칠 자리는 DISAGREEMENT_FIELD_RANK 한 줄이다. **다만 랭킹의 '예산 초과 시 무엇을 버릴지'는 지금 발생할 수 없다** — 필드가 3개라 상한 4를 넘을 수 없으므로 랭킹의 실제 효과는 자리 하나뿐이다",
         ),
         open_question(
             "tokenEstimate",
@@ -1537,6 +1555,14 @@ fn collect_card_answers(events: &[crate::store::StoredEvent], out: &mut CardAnsw
             // 집계가 조용히 끊기고, 끊긴 것은 0으로 보인다.
             if let Some(field) = decision.get("field").and_then(Value::as_str) {
                 tally(out.by_field.entry(field.to_string()).or_default());
+                // 결합 분포. 주변 분포 둘로는 교락을 풀 수 없다.
+                tally(
+                    out.by_field_and_position
+                        .entry(field.to_string())
+                        .or_default()
+                        .entry(position)
+                        .or_default(),
+                );
             }
 
             // 규칙이 막을 만하다고 봤는가. **없으면 `unknown`이고 어느 쪽에도 합치지 않는다** —
@@ -2685,6 +2711,45 @@ mod tests {
     }
 
     // ---- 검수가 무엇을 했는가 (product-strategy.md 14절) ----
+
+    #[test]
+    fn field_and_position_are_tallied_jointly() {
+        // 주변 분포 둘로는 교락을 풀 수 없다. 같은 필드가 다른 자리에 온 카드가 실제로
+        // 존재하므로, 결합 분포에서만 "자리 때문인가"를 물을 수 있다.
+        let (_d, mut store) = seeded();
+        // 카드 1: doneCriteria가 갈려서 targetPaths는 2번 자리.
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &json!({ "cardSize": 2, "decisions": [
+                    { "disagreementId": "a", "cardPosition": 1, "optionRank": 1, "field": "doneCriteria", "freeform": false, "blocking": true },
+                    { "disagreementId": "b", "cardPosition": 2, "optionRank": 2, "field": "targetPaths", "freeform": false, "blocking": true },
+                ]}),
+            )
+            .unwrap();
+        // 카드 2: doneCriteria가 갈리지 않아 targetPaths가 1번 자리.
+        store
+            .create_task("task-2", "sess-1", "ws-1", "/tmp/ws", "verified", "fix")
+            .unwrap();
+        store
+            .append_event(
+                "task-2",
+                "USER_DECISION_RECORDED",
+                &json!({ "cardSize": 1, "decisions": [
+                    { "disagreementId": "c", "cardPosition": 1, "optionRank": 1, "field": "targetPaths", "freeform": false, "blocking": true },
+                ]}),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        let target = m.card_answers.by_field_and_position.get("targetPaths").expect("필드가 없습니다");
+        // **같은 필드가 두 자리에 나타난다** — 이게 없으면 자리 효과를 물을 수 없다.
+        assert_eq!(target.get(&1).map(|f| f.picked_primary), Some(1), "{target:?}");
+        assert_eq!(target.get(&2).map(|f| f.picked_other), Some(1), "{target:?}");
+        // 주변 분포는 그대로 남는다 — 결합이 그것을 대체하지는 않는다.
+        assert_eq!(m.card_answers.by_field.get("targetPaths").map(|f| f.picked_primary), Some(1));
+    }
 
     // ---- blocking 판정 규칙 (state-machine 12절) ----
 
