@@ -89,9 +89,11 @@ pub enum StoreError {
 ///
 /// # 여기 있는 것이 전부가 아니다
 ///
-/// **전환한 것만 코드를 갖는다.** 나머지 저장 계층 실패는 아직 껍데기에서 문장으로 나가고,
-/// 그것들에 코드를 미리 만들어 두지 않는다 — 카탈로그에 있지만 실제로는 코드가 도착하지 않는
-/// 항목이 생기면, "카탈로그가 코드를 안다"는 검사가 **번역됐다는 뜻이 아니게** 된다.
+/// **화면에 봉투로 나가는 것만 코드를 갖는다.** 아직 산문으로 나가는 저장 계층 실패
+/// (허용 목록 저장, 실행 경로의 태스크 생성 등)에는 코드를 만들지 않는다 — 카탈로그에 있지만
+/// 실제로는 도착하지 않는 항목이 생기면, "카탈로그가 코드를 안다"는 검사가 **번역됐다는 뜻이
+/// 아니게** 된다. 그 자리들은 `SessionState::with_store_prose`를 쓴다: **고르는 것이 눈에
+/// 보이는 자리**여야 빠뜨린 것과 구별된다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreOp {
     /// artifact 저장소를 만들 수 없었다.
@@ -106,6 +108,12 @@ pub enum StoreOp {
     ReadTask,
     /// 작업의 이벤트 타임라인을 읽지 못했다.
     ReadTaskEvents,
+    /// 화면이 쓰는 문턱(강제 포기 시점 등)을 집계하지 못했다.
+    ReadThresholds,
+    /// 전송 내역을 모으지 못했다.
+    ReadTransmission,
+    /// 감사 export를 만들지 못했다.
+    ReadExport,
 }
 
 impl StoreOp {
@@ -121,6 +129,9 @@ impl StoreOp {
         StoreOp::ReadTasks,
         StoreOp::ReadTask,
         StoreOp::ReadTaskEvents,
+        StoreOp::ReadThresholds,
+        StoreOp::ReadTransmission,
+        StoreOp::ReadExport,
     ];
 }
 
@@ -150,6 +161,9 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::ReadTasks => "storeReadTasks",
             StoreOp::ReadTask => "storeReadTask",
             StoreOp::ReadTaskEvents => "storeReadTaskEvents",
+            StoreOp::ReadThresholds => "storeReadThresholds",
+            StoreOp::ReadTransmission => "storeReadTransmission",
+            StoreOp::ReadExport => "storeReadExport",
         }
     }
 
@@ -165,6 +179,9 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::ReadTasks => "작업 목록을 읽을 수 없습니다",
             StoreOp::ReadTask => "작업을 읽을 수 없습니다",
             StoreOp::ReadTaskEvents => "작업의 이벤트를 읽을 수 없습니다",
+            StoreOp::ReadThresholds => "화면이 쓰는 문턱을 집계할 수 없습니다",
+            StoreOp::ReadTransmission => "전송 내역을 읽을 수 없습니다",
+            StoreOp::ReadExport => "감사 기록을 만들 수 없습니다",
         };
         format!("{what}: {}", self.detail)
     }

@@ -52,6 +52,9 @@ const KO: Record<string, Render> = {
   storeReadTasks: (p) => `작업 목록을 읽을 수 없습니다: ${p.detail}`,
   storeReadTask: (p) => `작업을 읽을 수 없습니다: ${p.detail}`,
   storeReadTaskEvents: (p) => `작업의 이벤트를 읽을 수 없습니다: ${p.detail}`,
+  storeReadThresholds: (p) => `화면이 쓰는 문턱을 집계할 수 없습니다: ${p.detail}`,
+  storeReadTransmission: (p) => `전송 내역을 읽을 수 없습니다: ${p.detail}`,
+  storeReadExport: (p) => `감사 기록을 만들 수 없습니다: ${p.detail}`,
 };
 
 export interface Rendered {

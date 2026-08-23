@@ -437,7 +437,13 @@ export default function App() {
       // **실패해도 작업을 막지 않는다.** 이건 편의 값이고, 없으면 기본값으로 돌아가면 된다 —
       // 계측을 읽지 못했다고 워크스페이스를 못 열게 하는 것은 꼬리가 몸통을 흔드는 것이다.
       try {
-        const measured = await invoke<DerivedThresholds>("derived_thresholds", { workspacePath: info.rootPath });
+        const result = unwrap(
+          await invoke<Envelope<DerivedThresholds>>("derived_thresholds", { workspacePath: info.rootPath })
+        );
+        // 실패는 조용히 기본값으로 돌아간다(아래 catch와 같은 처리). 이 값은 편의이고,
+        // 못 읽었다고 화면에 경고를 띄우면 사용자가 할 수 있는 일이 없다.
+        if (!result.ok) throw new Error(result.problem.text);
+        const measured = result.value;
         setForceAbandonAfter(measured.forceAbandon ?? null);
         setLargeChange(measured.largeChange ?? null);
         // **제안은 승인이 아니다.** 입력란을 채우기만 하고, 강제되는 것은 사용자가 확인한 값이다.
@@ -546,7 +552,8 @@ export default function App() {
       // 전송 내역은 **끝난 뒤에** 읽는다. 실패해도 결과 화면을 막지 않는다 — 이건 사후 조회이고,
       // 읽지 못했다는 사실은 패널이 스스로 말한다(패널이 없으면 그냥 없는 것이다).
       try {
-        setTransmission(await invoke<Transmission>("task_transmission", { taskId: result.taskId }));
+        const sent = unwrap(await invoke<Envelope<Transmission>>("task_transmission", { taskId: result.taskId }));
+        setTransmission(sent.ok ? sent.value : null);
       } catch {
         setTransmission(null);
       }

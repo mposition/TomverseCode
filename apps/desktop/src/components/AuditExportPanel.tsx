@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { unwrap, type Envelope } from "../lib/envelope";
 
 /**
  * 감사 export — 한 작업의 기록을 형식 버전이 붙은 JSON으로 꺼낸다
@@ -31,8 +32,16 @@ export function AuditExportPanel({ taskId }: { taskId: string }) {
     setError(null);
     setCopied(false);
     try {
-      const value = await invoke<unknown>("task_export", { taskId });
-      setText(JSON.stringify(value, null, 2));
+      // 봉투로 온 실패는 **카탈로그가 문장을 만든다.** 예외는 전송 자체가 실패한 경우다.
+      const result = unwrap(await invoke<Envelope<{ export: unknown }>>("task_export", { taskId }));
+      if (!result.ok) {
+        setText(null);
+        setError(result.problem.text);
+        return;
+      }
+      // **봉투를 벗긴 본문만 보여준다.** 감사자가 복사해 가는 것은 우리가 만든 기록이지
+      // 이 앱의 응답 형식이 아니다.
+      setText(JSON.stringify(result.value.export, null, 2));
     } catch (e) {
       setText(null);
       setError(String(e));

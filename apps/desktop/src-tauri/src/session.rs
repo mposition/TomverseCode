@@ -161,10 +161,46 @@ impl SessionState {
             .ok_or_else(|| "artifact 저장소가 아직 초기화되지 않았습니다".to_string())
     }
 
-    pub fn with_store<T>(&self, f: impl FnOnce(&mut Store) -> T) -> Result<T, String> {
-        let store = self.store()?;
+    /// 저장 계층 접근. **`op`를 반드시 받는다.**
+    ///
+    /// 종전에는 `Result<T, String>`이라 호출부마다 산문을 지어 붙였고, 새 화면 명령을 만들면서
+    /// 그걸 잊으면 아무도 알아채지 못했다 — 실패가 실제로 일어나야만 보이기 때문이다.
+    /// 이제 **이름 없는 저장 계층 실패는 타입이 막는다**(ui-wireframes.md 6.5절): 무엇을
+    /// 하려던 것인지 말하지 않고는 저장 계층에 닿을 수 없다.
+    ///
+    /// 실행 경로처럼 화면에 봉투로 나가지 않는 자리는 `.map_err(|ui| ui.message)`로 되돌린다 —
+    /// **되돌리는 것은 눈에 보이지만, 빠뜨리는 것은 보이지 않는다.**
+    pub fn with_store<T>(&self, op: StoreOp, f: impl FnOnce(&mut Store) -> T) -> Result<T, UiMessage> {
+        let store = self
+            .store()
+            .map_err(|e| StoreIssue::new(op.clone(), e).ui())?;
         let mut guard = store.lock().unwrap();
         Ok(f(&mut guard))
+    }
+
+    /// 화면에 봉투로 나가지 **않는** 저장 계층 접근.
+    ///
+    /// 실행 경로처럼 결과가 사용자 문장이 되지 않는 자리다. **`op`를 받지 않는 대신 이름을
+    /// 고르게 한다** — 코드를 만들어 두면 카탈로그에 도착하지 않는 항목이 생기고, 그러면
+    /// "카탈로그가 코드를 안다"는 검사가 번역된다는 뜻을 잃는다(ui-wireframes.md 6.5절).
+    ///
+    /// 이 함수를 고르는 것은 **눈에 보이는 선택**이다. 그게 요점이다: 봉투를 빠뜨리는 것은
+    /// 보이지 않지만, 이걸 쓰는 것은 보인다.
+    fn with_store_prose<T>(&self, what: &str, f: impl FnOnce(&mut Store) -> T) -> Result<T, String> {
+        let store = self.store().map_err(|e| format!("{what}: {e}"))?;
+        let mut guard = store.lock().unwrap();
+        Ok(f(&mut guard))
+    }
+
+    /// 안쪽도 `Result`인 흔한 형태 — 두 겹을 한 번에 편다. **같은 `op`가 양쪽에 붙는다**:
+    /// 저장 계층이 안 열린 것도, 질의가 실패한 것도 화면에는 같은 실패다.
+    fn read_store<T, E: std::fmt::Display>(
+        &self,
+        op: StoreOp,
+        f: impl FnOnce(&mut Store) -> Result<T, E>,
+    ) -> Result<T, UiMessage> {
+        self.with_store(op.clone(), f)?
+            .map_err(|e| StoreIssue::new(op, e).ui())
     }
 
     // ---- 조회 (UI는 DB에 직접 접근하지 않는다 — 전부 이 경로를 지난다) ----
@@ -175,11 +211,7 @@ impl SessionState {
         limit: i64,
         cursor: Option<&str>,
     ) -> Result<Vec<TaskRow>, UiMessage> {
-        // 저장 계층이 아직 안 열린 것도 "목록을 읽지 못했다"이다 — 화면이 보는 결과는 같고,
-        // 원인은 `detail`에 남는다.
-        self.with_store(|s| s.list_tasks(workspace_path, limit, cursor))
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTasks, e).ui())?
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTasks, e).ui())
+        self.read_store(StoreOp::ReadTasks, |s| s.list_tasks(workspace_path, limit, cursor))
     }
 
     /// 화면이 쓰는 문턱들. **저장된 이벤트에서 유도한다** — 추정값이던 상수들의 자리다
@@ -191,8 +223,10 @@ impl SessionState {
     ///
     /// 둘을 한 명령으로 묶는 이유: 같은 집계 한 번에서 나오므로 따로 부르면 같은 훑기를 두 번
     /// 한다. 그리고 문턱이 늘어날 때마다 명령이 늘어나면 UI가 부를 것을 빠뜨리기 쉽다.
-    pub fn derived_thresholds(&self, workspace_path: Option<&str>) -> Result<Value, String> {
-        let metrics = self.with_store(|s| tomverse_core::metrics::collect(s, workspace_path))??;
+    pub fn derived_thresholds(&self, workspace_path: Option<&str>) -> Result<Value, UiMessage> {
+        let metrics = self.read_store(StoreOp::ReadThresholds, |s| {
+            tomverse_core::metrics::collect(s, workspace_path)
+        })?;
         Ok(json!({
             "forceAbandon": metrics.force_abandon_threshold,
             "largeChange": metrics.large_change_threshold,
@@ -210,9 +244,12 @@ impl SessionState {
     ///
     /// 태스크가 끝난 뒤에도 답할 수 있어야 하므로 이벤트와 `provider_usage`에서 만든다 —
     /// 진행 중 상태를 들고 있다가 보여주면 앱을 다시 켠 뒤에는 답하지 못한다.
-    pub fn task_transmission(&self, task_id: &str) -> Result<Value, String> {
-        let out = self.with_store(|s| tomverse_core::transmission::collect(s, task_id))??;
-        serde_json::to_value(out).map_err(|e| format!("전송 내역을 직렬화할 수 없습니다: {e}"))
+    pub fn task_transmission(&self, task_id: &str) -> Result<Value, UiMessage> {
+        let out = self.read_store(StoreOp::ReadTransmission, |s| {
+            tomverse_core::transmission::collect(s, task_id)
+        })?;
+        serde_json::to_value(out)
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTransmission, format!("직렬화: {e}")).ui())
     }
 
     /// 이 워크스페이스에서 쓸 공급자를 정한다 (multi-engine-routing.md 16절).
@@ -222,8 +259,12 @@ impl SessionState {
     /// 호출자에게 알린다 — 여기서 몰래 sidecar를 재시작하면 진행 중인 태스크가 죽는다.
     pub fn set_allowed_providers(&self, allowed: Option<Vec<String>>) -> Result<Value, String> {
         let workspace_id = self.with_active(|active| Ok(active.workspace_id.clone()))?;
-        self.with_store(|s| s.set_allowed_providers(&workspace_id, allowed.as_deref()))?
-            .map_err(|e| format!("허용 목록을 저장할 수 없습니다: {e}"))?;
+        // **쓰기이고, 아직 봉투로 전환하지 않은 경계다.** 그래서 코드를 만들지 않는 쪽을
+        // 고른다 — 그 선택이 여기 눈에 보인다(6.5절).
+        self.with_store_prose("허용 목록을 저장할 수 없습니다", |s| {
+            s.set_allowed_providers(&workspace_id, allowed.as_deref())
+        })?
+        .map_err(|e| format!("허용 목록을 저장할 수 없습니다: {e}"))?;
         Ok(json!({
             "saved": allowed,
             "appliesAfterReopen": true,
@@ -307,23 +348,23 @@ impl SessionState {
     /// 모델 요청이 Policy Gate를 지나야 한다는 규칙과 나란히, 게이트를 지나지 않는 두 번째
     /// 쓰기 경로가 생긴다. 파일로 떨구는 것은 `tomverse-host export`가 한다.
     pub fn task_export(&self, task_id: &str) -> Result<Value, String> {
-        self.with_store(|s| tomverse_core::export::collect(s, task_id))?
+        // **export 본문에 봉투 키를 섞지 않는다.** 이건 감사자가 그대로 복사해 가는 문서이고
+        // `reproduce`가 읽는 입력이다 — 여기에 `ok`가 끼면 우리가 만든 기록이 아니게 된다.
+        // 그래서 봉투가 감쌀 자리를 따로 만든다.
+        let export = self.read_store(StoreOp::ReadExport, |s| tomverse_core::export::collect(s, task_id))?;
+        Ok(json!({ "export": export }))
     }
 
     /// 작업 상세를 이루는 세 읽기는 **하나의 사용자 동작**이다("이 작업을 연다").
     /// 그래서 셋 다 같은 코드를 낸다 — 무엇을 하려다 실패했는가가 코드이고, 어느 읽기였는지는
     /// `detail`에 남는다(ui-wireframes.md 6.5절).
     pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>, UiMessage> {
-        self.with_store(|s| s.get_task(task_id))
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, e).ui())?
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, e).ui())
+        self.read_store(StoreOp::ReadTask, |s| s.get_task(task_id))
     }
 
     pub fn get_task_events(&self, task_id: &str, after_event_id: Option<i64>) -> Result<Value, UiMessage> {
         let events = self
-            .with_store(|s| s.events_after(task_id, after_event_id))
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTaskEvents, e).ui())?
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTaskEvents, e).ui())?;
+            .read_store(StoreOp::ReadTaskEvents, |s| s.events_after(task_id, after_event_id))?;
         // **배열이 아니라 객체로 돌려준다.** 봉투가 `ok`를 얹을 자리가 있어야 하고,
         // 배열에는 키를 얹을 수 없다.
         Ok(json!({ "events": events
@@ -341,18 +382,16 @@ impl SessionState {
 
     /// 저장된 mutation 목록 — INTERRUPTED 작업의 "되돌리기" 버튼이 이걸 보고 판단한다.
     pub fn task_mutations(&self, task_id: &str) -> Result<Vec<String>, UiMessage> {
-        self.with_store(|s| s.mutated_paths(task_id))
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, format!("변경 목록: {e}")).ui())?
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, format!("변경 목록: {e}")).ui())
+        self.read_store(StoreOp::ReadTask, |s| s.mutated_paths(task_id))
+            .map_err(|ui| StoreIssue::new(StoreOp::ReadTask, format!("변경 목록 — {}", ui.message)).ui())
     }
 
     /// 저장된 작업의 확정 기준. 히스토리에서 지난 작업을 열었을 때도 "무엇을 결정했는가"가
     /// 보여야 한다 — 그 화면에는 FinalResult가 없고 DB뿐이다.
     pub fn task_acceptance_criteria(&self, task_id: &str) -> Result<Value, UiMessage> {
         let rows = self
-            .with_store(|s| s.acceptance_criteria(task_id))
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, format!("기준 목록: {e}")).ui())?
-            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, format!("기준 목록: {e}")).ui())?;
+            .read_store(StoreOp::ReadTask, |s| s.acceptance_criteria(task_id))
+            .map_err(|ui| StoreIssue::new(StoreOp::ReadTask, format!("기준 목록 — {}", ui.message)).ui())?;
         Ok(serde_json::to_value(rows).unwrap_or(Value::Null))
     }
 
@@ -551,7 +590,9 @@ impl SessionState {
             ExecutionMode::Fast => "fast",
             ExecutionMode::Verified => "verified",
         };
-        host.with_store(|s| s.create_task(&task_id, &session_id, &workspace_id, &workspace_path, mode_str, message))
+        host.with_store_prose("태스크를 만들 수 없습니다", |s| {
+            s.create_task(&task_id, &session_id, &workspace_id, &workspace_path, mode_str, message)
+        })
             .map_err(|e| format!("태스크를 만들 수 없습니다: {e}"))?;
 
         let params = json!({
@@ -600,7 +641,9 @@ impl SessionState {
                 );
 
                 if let Some(obj) = value.as_object_mut() {
-                    let mutated = host.with_store(|s| s.mutated_paths(&task_id)).unwrap_or_default();
+                    let mutated = host
+                        .with_store(StoreOp::ReadTask, |s| s.mutated_paths(&task_id))
+                        .unwrap_or_default();
                     obj.insert("mutatedPaths".to_string(), json!(mutated));
                     obj.insert("taskId".to_string(), json!(task_id));
                     obj.insert("diffs".to_string(), json!(host.collected_diffs()));

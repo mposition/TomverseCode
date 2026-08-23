@@ -213,7 +213,7 @@ fn scan_input_for_secret_shapes(text: String) -> Result<Value, String> {
 /// 진행 중 상태가 아니라 저장된 이벤트에서 만든다.
 #[tauri::command]
 fn task_transmission(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
-    state.task_transmission(&task_id)
+    Ok(envelope(state.task_transmission(&task_id)))
 }
 
 /// 한 작업의 감사 export (product-strategy 6절).
@@ -222,7 +222,7 @@ fn task_transmission(state: tauri::State<'_, SessionState>, task_id: String) -> 
 /// 적어두었다.
 #[tauri::command]
 fn task_export(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
-    state.task_export(&task_id)
+    Ok(envelope(state.task_export(&task_id)))
 }
 
 /// 백엔드(sidecar) 상태. **읽기 전용이다** — 물었다고 다시 띄우지 않는다.
@@ -279,7 +279,7 @@ fn derived_thresholds(
     state: tauri::State<'_, SessionState>,
     workspace_path: Option<String>,
 ) -> Result<Value, String> {
-    state.derived_thresholds(workspace_path.as_deref())
+    Ok(envelope(state.derived_thresholds(workspace_path.as_deref())))
 }
 
 /// 최근 작업 목록. `workspace_path`가 없으면 전체.
