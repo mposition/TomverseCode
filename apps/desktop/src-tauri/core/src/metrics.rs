@@ -656,6 +656,53 @@ pub struct ModelEvaluation {
     pub unattributed: u64,
 }
 
+/// 검수가 무엇을 했는가 — product-strategy.md 14절.
+///
+/// # 이름에 추론을 넣지 않는다
+///
+/// 14절 표에는 **"검수 모델이 실제 결함을 발견한 비율"** 과 **"잘못된 검수 경고 비율"** 이
+/// 있었고, 12절에는 그 판정 기준을 정하라는 항목이 남아 있었다. 정하려고 보니 **production에서는
+/// 정할 수 없다.**
+///
+/// - 표가 적어둔 출처("검수 지적 항목 중 테스트로 확인된 것")는 기준↔테스트 연결과 같은
+///   문제이고(state-machine 17.9절), 그쪽 결론은 이미 **"대부분 이을 수 없다"** 였다.
+///   같은 규칙을 지적에 적용하면 값은 거의 언제나 0이고, 0을 피하려면 모델에게 판정을 맡겨야
+///   하는데 그건 CLAUDE.md 원칙 1이 막는 바로 그 일이다.
+/// - 결정론적으로 답하려면 **반사실**이 필요하다: 그 지적을 반영하지 않은 초안이 검증을
+///   통과했는가. production은 한 태스크에 한 경로만 태우므로 그 반사실이 없다.
+///
+/// 반사실이 있는 곳은 게이트 하네스다(같은 초안을 Arm A는 검수 없이, Arm C는 검수와 함께
+/// 태운다). 그래서 그 두 지표는 **실험 지표**로 옮겼고, 여기 남는 것은 production에서 실제로
+/// 관측되는 사실뿐이다 — 14절 자신이 "오탐률이라는 이름의 지표는 두지 않았다"고 적어둔 규율의
+/// 연장이다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ReviewerFindings {
+    /// 검수가 실제로 돌아 판정을 낸 태스크 수. 아래 모든 수의 분모다.
+    #[serde(rename = "tasksReviewed")]
+    pub tasks_reviewed: u64,
+    /// verdict별 태스크 수 (마지막 판정 기준).
+    #[serde(rename = "byVerdict")]
+    pub by_verdict: BTreeMap<String, u64>,
+    /// REVISE 판정 수.
+    #[serde(rename = "revisionsProposed")]
+    pub revisions_proposed: u64,
+    /// 그중 수정본이 초안과 **실제로 달랐던** 수.
+    ///
+    /// 같으면 그 지적은 산문만 남기고 아무것도 바꾸지 못한 것이다. 이건 "틀린 지적"이라는
+    /// 뜻이 아니다 — 관측된 것은 patch가 같다는 사실뿐이다.
+    #[serde(rename = "revisionsThatChangedThePatch")]
+    pub revisions_that_changed_the_patch: u64,
+    /// REVISE인데 수정본이 아예 없던 수. 이 경로는 태스크를 실패로 끝낸다.
+    #[serde(rename = "revisionsWithoutPatch")]
+    pub revisions_without_patch: u64,
+    /// **수정본을 실행한 태스크**의 최종 상태 분포.
+    ///
+    /// "검수가 도움이 됐는가"에 답하지 않는다 — 검수 없이 돌렸을 때의 결과가 없기 때문이다.
+    /// 답하는 것은 "수정본을 태운 태스크들이 어떻게 끝났는가"뿐이다.
+    #[serde(rename = "outcomeAfterRevision")]
+    pub outcome_after_revision: BTreeMap<String, u64>,
+}
+
 /// 쌍의 기록을 찾거나 만든다. 키는 정렬된 두 모델 ID이므로 순서가 뒤집혀도 같은 칸에 쌓인다.
 fn head_to_head_entry<'a>(
     map: &'a mut BTreeMap<String, HeadToHead>,
@@ -837,6 +884,9 @@ pub struct Metrics {
     /// 모델 정면 비교 (multi-engine-routing.md 12절).
     #[serde(rename = "modelEvaluation")]
     pub model_evaluation: ModelEvaluation,
+    /// 검수가 무엇을 했는가 (product-strategy.md 14절).
+    #[serde(rename = "reviewerFindings")]
+    pub reviewer_findings: ReviewerFindings,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
@@ -1034,6 +1084,13 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "verdict가 separated인 쌍이 생기면 그때 라우터를 데이터 기반으로 전환한다(8절). **verificationPassRate로는 전환하지 않는다** — 그 분포는 라우터가 만든 것이라 표본이 쌓여도 편향이 줄지 않는다. unattributed가 0이 아니면 먼저 그 배선부터 본다",
         ),
         open_question(
+            "reviewerFindings",
+            "검수가 patch를 실제로 바꾸는가, 산문만 남기는가 (product-strategy 14절)",
+            "검수가 판정을 낸 태스크 수",
+            m.reviewer_findings.tasks_reviewed,
+            "revisionsThatChangedThePatch가 revisionsProposed에 비해 낮으면 검수 프롬프트가 수정본을 내놓게 하지 못하는 것이다. **이 값으로 '검수가 쓸모없다'를 판정하지 말 것** — 검수 없이 돌렸을 때의 결과가 없으므로 그 비교는 게이트 하네스에서만 성립한다",
+        ),
+        open_question(
             "indexCache",
             "인덱스 캐시가 이득인가 (context-engine 2.1절)",
             "구축 + 적중 횟수",
@@ -1176,6 +1233,50 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
                     if mutated_an_excluded_test {
                         metrics.test_file_rule.tasks_where_excluded_test_was_mutated += 1;
                     }
+                }
+            }
+        }
+
+        // ---- 검수가 무엇을 했는가 (product-strategy.md 14절) ----
+        //
+        // **마지막 REVIEW_RECEIVED를 쓴다.** REVISE 루프를 돌면 여러 번 나오는데, 질문은
+        // "이 태스크에서 검수가 어떻게 끝났는가"이므로 마지막이 정본이다.
+        if let Some(payload) = events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == "REVIEW_RECEIVED")
+            .map(|e| &e.payload)
+        {
+            metrics.reviewer_findings.tasks_reviewed += 1;
+            let verdict = payload
+                .get("verdict")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            *metrics.reviewer_findings.by_verdict.entry(verdict.clone()).or_insert(0) += 1;
+
+            if verdict == "REVISE" {
+                metrics.reviewer_findings.revisions_proposed += 1;
+                match payload.get("revisionChangedThePatch").and_then(Value::as_bool) {
+                    Some(true) => {
+                        metrics.reviewer_findings.revisions_that_changed_the_patch += 1;
+                        *metrics
+                            .reviewer_findings
+                            .outcome_after_revision
+                            .entry(terminal_status.clone().unwrap_or_else(|| "running".to_string()))
+                            .or_insert(0) += 1;
+                    }
+                    Some(false) => {
+                        // 수정본은 왔는데 초안과 같다 — 실행은 됐으므로 결말은 센다.
+                        *metrics
+                            .reviewer_findings
+                            .outcome_after_revision
+                            .entry(terminal_status.clone().unwrap_or_else(|| "running".to_string()))
+                            .or_insert(0) += 1;
+                    }
+                    // `null`은 "수정본이 없었다"이다. false로 뭉개면 "바꾸지 않았다"와
+                    // "바꿀 기회가 없었다"가 같은 값이 된다.
+                    None => metrics.reviewer_findings.revisions_without_patch += 1,
                 }
             }
         }
@@ -2540,6 +2641,69 @@ mod tests {
         let m = collect(&store, None).unwrap();
         assert_eq!(m.ipc_line_sizes.max_percent_of_limit, None);
         assert_eq!(question(&m, "ipcLineSize").readiness, Readiness::InsufficientSamples);
+    }
+
+    // ---- 검수가 무엇을 했는가 (product-strategy.md 14절) ----
+
+    fn seed_review(store: &mut Store, task_id: &str, verdict: &str, changed: Option<bool>) {
+        store
+            .create_task(task_id, "sess-1", "ws-1", "/tmp/ws", "verified", "fix")
+            .unwrap();
+        let mut payload = json!({ "verdict": verdict });
+        if let Some(changed) = changed {
+            payload["revisionChangedThePatch"] = json!(changed);
+        }
+        store.append_event(task_id, "REVIEW_RECEIVED", &payload).unwrap();
+    }
+
+    #[test]
+    fn a_revision_that_changed_nothing_is_counted_separately() {
+        // 산문만 남긴 지적과 실제로 patch를 바꾼 지적은 다른 사실이다. 뭉개면 "검수가 기여했다"가
+        // 언제나 참이 된다.
+        let (_d, mut store) = seeded();
+        seed_review(&mut store, "t-changed", "REVISE", Some(true));
+        seed_review(&mut store, "t-same", "REVISE", Some(false));
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.reviewer_findings.revisions_proposed, 2);
+        assert_eq!(m.reviewer_findings.revisions_that_changed_the_patch, 1);
+    }
+
+    #[test]
+    fn a_revise_without_a_patch_is_not_a_revision_that_changed_nothing() {
+        // `null`을 false로 뭉개면 "바꾸지 않았다"와 "바꿀 기회가 없었다"가 같은 값이 된다.
+        let (_d, mut store) = seeded();
+        seed_review(&mut store, "t-none", "REVISE", None);
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.reviewer_findings.revisions_without_patch, 1);
+        assert_eq!(m.reviewer_findings.revisions_that_changed_the_patch, 0);
+        // 실행된 적이 없으므로 결말 분포에도 들어가지 않는다.
+        assert!(m.reviewer_findings.outcome_after_revision.is_empty(), "{:?}", m.reviewer_findings);
+    }
+
+    #[test]
+    fn verdicts_are_counted_by_the_last_review() {
+        // REVISE 루프를 돌면 여러 번 나온다. 전부 세면 루프가 많은 태스크가 분포를 좌우한다.
+        let (_d, mut store) = seeded();
+        store
+            .create_task("t-loop", "sess-1", "ws-1", "/tmp/ws", "verified", "fix")
+            .unwrap();
+        store
+            .append_event("t-loop", "REVIEW_RECEIVED", &json!({ "verdict": "REVISE", "revisionChangedThePatch": true }))
+            .unwrap();
+        store
+            .append_event("t-loop", "REVIEW_RECEIVED", &json!({ "verdict": "ACCEPT" }))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.reviewer_findings.tasks_reviewed, 1);
+        assert_eq!(m.reviewer_findings.by_verdict.get("ACCEPT"), Some(&1));
+        assert_eq!(m.reviewer_findings.by_verdict.get("REVISE"), None);
+    }
+
+    #[test]
+    fn tasks_without_a_review_are_not_in_the_denominator() {
+        let (_d, store) = seeded();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.reviewer_findings.tasks_reviewed, 0);
     }
 
     // ---- 모델 정면 비교 (multi-engine-routing.md 12절) ----

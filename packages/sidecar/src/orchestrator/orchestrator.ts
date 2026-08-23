@@ -648,6 +648,28 @@ export class Orchestrator {
         // 배정만 남기면 로그가 실제로 누가 검수했는지에 답하지 못한다.
         assignedReviewerModel: adapters.reviewerModelId ?? null,
         actualReviewerModel: reviewer.modelId,
+        /**
+         * **검수자가 내놓은 수정본.** REVISE에서 이 patch가 초안을 그대로 갈아치우고 실행된다.
+         *
+         * 이걸 남기지 않으면 **실제로 적용된 변경의 출처가 로그에 없다** — `DRAFT_RECEIVED`의
+         * patch는 버려졌는데 어디에도 그 사실이 없고, "왜 이 patch가 적용됐나"에 답할 수 없다.
+         * `DRAFT_RECEIVED`가 `hasPatch`만 남기던 때와 같은 종류의 구멍이다.
+         */
+        revisedPatch: decision.revisedPatch ?? null,
+        /**
+         * 수정본이 초안과 **실제로 다른가.**
+         *
+         * 여기서 계산하는 이유: 8KB를 넘는 patch는 Rust가 artifact로 밀어내므로 집계 쪽에서
+         * 두 payload를 비교하면 **큰 patch에서만 조용히 비교가 실패**한다. 두 문자열을 손에
+         * 들고 있는 자리에서 판정해 boolean으로 남긴다.
+         *
+         * REVISE가 아니거나 수정본이 없으면 `null`이다 — false로 뭉개면 "바꾸지 않았다"와
+         * "바꿀 기회가 없었다"가 같은 값이 된다.
+         */
+        revisionChangedThePatch:
+          decision.verdict === "REVISE" && decision.revisedPatch
+            ? decision.revisedPatch.trim() !== (proposal.patch ?? "").trim()
+            : null,
       });
 
       switch (decision.verdict) {

@@ -161,6 +161,67 @@ test("REVISE는 검수자의 수정본을 적용한다", async () => {
   assert.ok(String(applied.args.patch).includes("+export const a = 3;"));
 });
 
+/**
+ * **적용된 변경의 출처가 로그에 남는가** — product-strategy.md 14절.
+ *
+ * REVISE에서는 검수자의 수정본이 초안을 그대로 갈아치우고 실행된다. 그 patch가 이벤트에
+ * 없으면 "왜 이 patch가 적용됐나"에 로그가 답하지 못한다 — `DRAFT_RECEIVED`가 `hasPatch`만
+ * 남기던 때와 같은 구멍이다.
+ */
+test("검수자의 수정본과 그것이 초안을 바꿨는지가 이벤트에 남는다", async () => {
+  const revised = VALID_PATCH.replace("export const a = 2;", "export const a = 3;");
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [{ kind: "review", payload: { verdict: "REVISE", rationale: "값이 틀렸다", revisedPatch: revised } }],
+    }
+  );
+  await orchestrator.run();
+  const review = host.events.find((e) => e.type === "REVIEW_RECEIVED")!.payload as Record<string, unknown>;
+  assert.equal(String(review.revisedPatch).includes("+export const a = 3;"), true);
+  assert.equal(review.revisionChangedThePatch, true);
+});
+
+test("수정본이 초안과 같으면 바꾸지 않았다고 남는다", async () => {
+  // 산문만 남긴 지적이다. "검수가 기여했다"를 REVISE 개수로 세면 이 경우가 기여로 잡힌다.
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [{ kind: "review", payload: { verdict: "REVISE", rationale: "이렇게 해라", revisedPatch: VALID_PATCH } }],
+    }
+  );
+  await orchestrator.run();
+  const review = host.events.find((e) => e.type === "REVIEW_RECEIVED")!.payload as Record<string, unknown>;
+  assert.equal(review.revisionChangedThePatch, false);
+});
+
+test("수정본이 없으면 false가 아니라 null이다", async () => {
+  // false로 뭉개면 "바꾸지 않았다"와 "바꿀 기회가 없었다"가 같은 값이 된다.
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }] },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [{ kind: "review", payload: { verdict: "REVISE", rationale: "고쳐줘" } }],
+    }
+  );
+  await orchestrator.run();
+  const review = host.events.find((e) => e.type === "REVIEW_RECEIVED")!.payload as Record<string, unknown>;
+  assert.equal(review.revisionChangedThePatch, null);
+  assert.equal(review.revisedPatch, null);
+});
+
+test("ACCEPT에는 바꿈 여부가 없다 — 바꿀 기회가 없었다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    { defaultPatch: VALID_PATCH, script: [{ kind: "review", payload: { verdict: "ACCEPT", rationale: "좋다" } }] }
+  );
+  await orchestrator.run();
+  const review = host.events.find((e) => e.type === "REVIEW_RECEIVED")!.payload as Record<string, unknown>;
+  assert.equal(review.revisionChangedThePatch, null);
+});
+
 test("REVISE인데 수정본이 없으면 상한을 태우지 않고 실패한다", async () => {
   const { orchestrator } = build(
     { verifyResults: [{ overall: "pass" }] },
