@@ -523,6 +523,12 @@ async function main(): Promise<number> {
       log("");
       log("→ 실제 API 실험: NOT_RUN / 게이트 판정: INCONCLUSIVE");
     }
+    // **막는 요인이 없어도 이 목록은 낸다.** blocker가 비면 "이제 된다"로 읽히는데,
+    // 이 점검은 자격증명 존재만 보므로 그 문장을 보증할 수 없다.
+    log("");
+    log("이 점검이 확인하지 않은 것 (실제 호출이 필요하다 — `probe-models`가 한다):");
+    for (const line of pre.notChecked) log(`  - ${line}`);
+    log("  → 유료 pilot은 probe evidence 없이 Run Card로 승인되지 않는다.");
     // dry-run은 계획을 보여주는 것이 목적이므로 blocker가 있어도 성공으로 끝난다.
     return 0;
   }

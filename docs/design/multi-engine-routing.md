@@ -542,9 +542,15 @@ Insight는 `ai` + `@ai-sdk/{openai,anthropic,google}`를 쓰고, Code는 공급�
   절반은 이미 닫혀 있다**: 라우터가 실제로 두 환경에서 다르게 배정하는지(2개면
   `reviewer_shares_provider_with_contrast_participant`가 붙고 3개면 붙지 않는지)는 결정론적이며
   `packages/sidecar/test/disagreement.test.ts`가 양방향으로 확인한다. 그러므로 이 항목을 다시 열 때
-  **배정을 다시 검사하지 말 것** — 남은 것은 품질 차이 하나이고, 그건 세 번째 공급자 자격증명과
-  유료 실행이 있어야 한다. 게이트 G의 arm에 얹을 수 없다: arm을 늘리면 `PROTOCOL_VERSION`이 올라가
-  **다른 실험**이 되므로 별도 사전 등록이 필요하다
+  **배정을 다시 검사하지 말 것** — 남은 것은 품질 차이 하나다. 게이트 G의 arm에 얹을 수 없다:
+  arm을 늘리면 `PROTOCOL_VERSION`이 올라가 **다른 실험**이 되므로 별도 사전 등록이 필요하다.
+  **그리고 이 항목은 자격증명을 기다리는 것이 아니다** — 종전에 "세 번째 공급자 자격증명과 유료
+  실행이 있어야 한다"고 적어둔 것은 틀렸다. `ModelRegistry`의 실제 공급자는 `openai`와 `anthropic`
+  둘뿐이고(`fake-a/b/c`는 `local://`다), 세 번째 어댑터는 아직 **존재하지 않는다**(Gemini는 M2).
+  키를 세 개 넣어도 3공급자 환경을 구성할 수 없으므로, 선행 조건은 유료 API가 아니라 **어댑터
+  추가**다. 이 선후 관계는 `packages/sidecar/test/budget.test.ts`가 지킨다 — 실제 공급자가 셋이
+  되는 순간 실패해서 이 항목을 다시 연다. 사람이 기억하기로 두면, 조건이 갖춰진 사실 자체가
+  아무 데도 나타나지 않는다
 - ~~**제품 유료 호출 경로에 `BudgetLedger` 적용**~~ — 10.6절에서 해결. 선행 조건 세 가지가
   각각 정해졌고(태스크당 상한 / `budget_exceeded` 종료 / `task_events` 영속), 그중 셋째는
   종전 계획(`budget_events` 테이블)을 **뒤집었다** — 원칙 7이 이미 정본을 정해두었고, 별도

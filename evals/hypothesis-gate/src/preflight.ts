@@ -16,6 +16,16 @@ import type { ArmId } from "./types.js";
  * # 자격증명을 어떻게 확인하는가
  *
  * 값을 읽지 않고 **존재 여부만** 본다. 이 하네스는 키를 로그·리포트·기록 어디에도 남기지 않는다.
+ *
+ * # 그리고 확인하지 **않은** 것을 함께 말한다
+ *
+ * 종전에는 "막는 요인" 목록만 냈고, 그 목록이 완전한 것처럼 읽혔다. 실제로는 존재 여부만
+ * 보므로 **키가 있는데도 실행이 안 되는 경우가 셋** 남는다: 그 호스트에 닿지 않거나(프록시·
+ * 방화벽·오프라인), 조직 인증이 없어 그 모델을 못 부르거나(gpt-5 사례), 키가 만료됐거나.
+ *
+ * 이 세 가지는 **실제 호출을 해야만** 알 수 있고 그게 `probe-models`의 일이다. 여기서 할 일은
+ * 그 사실을 말해서 "키만 넣으면 된다"로 읽히지 않게 하는 것이다 — 실측 사례가 있다: 이
+ * 저장소의 개발 환경은 `OPENAI_API_KEY`가 있는데도 egress 프록시가 `api.openai.com`을 막는다.
  */
 
 export interface PreflightInput {
@@ -34,10 +44,20 @@ export interface PreflightInput {
 
 export interface PreflightReport {
   ok: boolean;
-  /** 실제 API 실험을 돌릴 수 있는가. false면 결과는 NOT_RUN이고 게이트는 INCONCLUSIVE다. */
+  /**
+   * 실제 API 실험을 돌릴 수 있는가.
+   *
+   * **"막는 것이 없다"이지 "된다"가 아니다.** 아래 `notChecked`가 남은 거리를 말한다.
+   */
   canRunRealExperiment: boolean;
   lines: string[];
   blockers: string[];
+  /**
+   * 이 점검이 **보지 않은 것**. 비어 있으면 안 된다 — 이 점검은 원리적으로 전부 볼 수 없다.
+   *
+   * 목록으로 내는 이유: 산문에 섞어 두면 blockers만 읽고 "이제 되겠구나"로 넘어간다.
+   */
+  notChecked: string[];
 }
 
 const PROVIDER_ENV: { providerId: string; envNames: string[] }[] = [
@@ -130,7 +150,16 @@ export function preflight(input: PreflightInput): PreflightReport {
     if (!anthropic) blockers.push("ANTHROPIC_API_KEY가 없습니다 — Arm B/C/D를 실행할 수 없습니다");
   }
 
-  return { ok: blockers.length === 0, canRunRealExperiment, lines, blockers };
+  // **확인하지 않은 것.** 자격증명 존재만 봤으므로 여기부터는 실제 호출이 필요하다.
+  const notChecked = [
+    "그 키로 공급자 호스트에 **닿는가** — 프록시·방화벽·오프라인은 여기서 보이지 않는다 (이 저장소의 개발 환경이 실제로 그렇다: 키가 있는데 egress가 막는다)",
+    "그 키가 그 **모델을 부를 수 있는가** — 조직 인증이 필요한 모델은 조회는 되고 추론에서 죽는다(multi-engine 17절, gpt-5 사례)",
+    "그 키가 **유효한가** — 만료·오타·다른 프로젝트의 키는 존재 여부로 구별되지 않는다",
+  ];
+  // **`lines`에 넣지 않는다.** 출력 자리는 호출부가 정한다 — 여기 넣으면 dry-run과
+  // pilot이 각각 한 번씩, 합쳐서 두 번 찍힌다.
+
+  return { ok: blockers.length === 0, canRunRealExperiment, lines, blockers, notChecked };
 }
 
 function describeMsvc(result: MsvcResult): string {

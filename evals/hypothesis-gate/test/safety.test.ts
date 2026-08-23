@@ -216,6 +216,44 @@ test("3b. ledger도 같은 값을 거부한다", () => {
   }
 });
 
+/**
+ * **"막는 요인"이 비었다고 되는 것이 아니다** — preflight는 자격증명 **존재**만 본다.
+ *
+ * 실측 사례가 이 저장소 개발 환경에 있다: `OPENAI_API_KEY`가 설정되어 있는데 egress 프록시가
+ * OpenAI 호스트를 막는다. blocker 목록만 보면 "키 하나만 더 넣으면 된다"로 읽힌다.
+ *
+ * (호스트 이름을 여기 그대로 적지 않는다 — 아래 19번이 이 파일 소스에서 실제 엔드포인트를
+ * 찾으므로, 주석에 적으면 그 테스트가 **내 주석을 잡는다**.)
+ */
+test("preflight는 확인하지 않은 것을 반드시 함께 낸다", () => {
+  const report = preflight({
+    fixtureCount: 24,
+    arms: ["A", "B", "C"],
+    repetitions: 3,
+    usingFakeProvider: false,
+    msvc: { kind: "not_needed" },
+  });
+  assert.ok(report.notChecked.length >= 3, JSON.stringify(report.notChecked));
+  const joined = report.notChecked.join(" ");
+  // 셋은 성질이 다르고 다음에 할 일도 다르다 — 뭉치면 무엇을 고쳐야 하는지 알 수 없다.
+  assert.ok(joined.includes("닿는가"), joined);
+  assert.ok(joined.includes("모델을 부를 수 있는가"), joined);
+  assert.ok(joined.includes("유효한가"), joined);
+});
+
+test("확인하지 않은 것 목록은 막는 요인이 없어도 나온다", () => {
+  // blocker가 비면 "이제 된다"로 읽히는데, 이 점검은 그 문장을 보증할 수 없다.
+  const report = preflight({
+    fixtureCount: 24,
+    arms: ["A"],
+    repetitions: 1,
+    usingFakeProvider: true,
+    msvc: { kind: "not_needed" },
+  });
+  assert.equal(report.blockers.length, 0, report.blockers.join(" | "));
+  assert.ok(report.notChecked.length >= 3);
+});
+
 // ---- 4. 가격 없는 모델은 preflight 차단 ----
 
 test("4. 가격 정보가 없는 모델은 preflight blocker다", () => {

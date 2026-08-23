@@ -116,7 +116,7 @@ npm run gate:g:test       # 하네스 자동 테스트 (실제 API 없음, npm t
 npm run gate:g:validate   # fixture 품질 검증 (모델 호출 없음)
 npm run gate:g:difficulty # fixture가 실제로 "어려운지" 구조로 판정 (모델 호출 없음)
 npm run gate:g:triage-calibration  # TRIAGE 임계값 표 (모델 호출 없음 — 아래 참조)
-npm run gate:g:dry-run    # preflight + 실행 계획만
+npm run gate:g:dry-run    # preflight + 실행 계획만 ("확인하지 않은 것"을 함께 낸다 — 아래)
 npm run gate:g:plan-pilot # **단계별(P0/P1) 유료 실행 승인 카드** (실제 API 호출 0건)
 npm run gate:g:probe-models  # 역할당 **최소 요청 1회**로 모델을 실제 확인 (--max-cost-usd 필수)
 npm run gate:g:budget-status # 예산 상태 **읽기 전용** 조회 (열린 예약 확인. 고치지 않는다)
@@ -131,6 +131,23 @@ npm run gate:g:report     # 기존 기록으로 리포트만 재생성
 `--stage smoke|pilot|confirmatory` `--executor-model <id>` `--reviewer-model <id>`
 `plan-pilot` 전용: `--p0-max-cost-usd N` `--p1-max-cost-usd N`
 유료 실행 필수: `--run-card <path>` (선택: `--probe-evidence <path>`)
+
+### preflight의 "막는 요인 없음"은 "실행할 수 있다"가 아니다
+
+`dry-run`의 preflight가 보는 것은 **자격증명이 존재하는가** 하나뿐이다. 그래서 blocker 목록이
+비어도 실행이 되리라고 말할 수 없고, blocker가 하나면 "그것 하나만 넣으면 된다"고도 말할 수 없다.
+실측 사례가 이 저장소 개발 환경에 있다 — `OPENAI_API_KEY`가 설정되어 있는데 egress 프록시가
+공급자 호스트를 막는다. 존재만 본 점검은 그 사실을 볼 방법이 없다.
+
+그래서 preflight는 **확인하지 않은 것**을 함께 낸다(`PreflightReport.notChecked`), 그리고
+**막는 요인이 없어도 낸다**:
+
+- 그 키로 공급자 호스트에 **닿는가** (프록시·방화벽·오프라인)
+- 그 키가 그 **모델을 부를 수 있는가** (조직 인증 — `gpt-5` 사례)
+- 그 키가 **유효한가** (만료·오타·다른 프로젝트의 키)
+
+셋 다 실제 호출로만 답이 나오고, 그 호출을 하는 것이 `probe-models`다. 유료 pilot이 probe
+evidence 없이 승인되지 않는 이유가 이것이다.
 
 **진행 순서** — 각 단계가 다음 단계의 **입력**이다:
 
