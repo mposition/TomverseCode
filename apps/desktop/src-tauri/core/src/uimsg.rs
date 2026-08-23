@@ -55,6 +55,45 @@ pub trait UserFacing {
     }
 }
 
+/// 성공/실패를 **하나의 `Ok` 봉투**로 만든다 — ui-wireframes.md 6.4·6.5절.
+///
+/// # 왜 실패가 `Err`가 아닌가
+///
+/// Tauri의 `Err`는 문자열 하나뿐이라 구조가 들어갈 자리가 없다. 문자열에 구조를 실으면
+/// **화면이 문장을 파싱하게 되고**, 그건 위 규칙이 없애려는 바로 그것이다.
+///
+/// # 왜 core에 있나
+///
+/// 이 함수는 `UiMessage`를 JSON 모양으로 바꿀 뿐 tauri를 모른다. 껍데기 크레이트에 두면
+/// **이 개발 환경에서 컴파일되지 않아 검증되지 않는다**(process-architecture.md 10.3절) —
+/// 화면과의 계약을 정하는 코드를 검증할 수 없는 자리에 둘 이유가 없다.
+///
+/// # 성공에도 `ok`를 얹는 이유
+///
+/// 화면이 `code`의 유무로 갈래를 정하면, 코드가 없는 성공과 **코드를 빠뜨린 실패**가 같은
+/// 모양이 된다. 갈래를 정하는 값은 따로 있어야 한다.
+pub fn envelope<T: serde::Serialize>(result: Result<T, UiMessage>) -> Value {
+    match result {
+        Ok(value) => {
+            let mut body = serde_json::to_value(value).unwrap_or(Value::Null);
+            match body.as_object_mut() {
+                Some(map) => {
+                    map.insert("ok".into(), Value::Bool(true));
+                    body
+                }
+                // 객체가 아닌 성공값은 감싸서 돌려준다 — 배열이나 스칼라에는 키를 얹을 수 없다.
+                None => serde_json::json!({ "ok": true, "value": body }),
+            }
+        }
+        Err(ui) => serde_json::json!({
+            "ok": false,
+            "code": ui.code,
+            "params": ui.params,
+            "message": ui.message,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +128,45 @@ mod tests {
         for key in ["code", "params", "message"] {
             assert!(value.get(key).is_some(), "{key}가 빠졌습니다: {value}");
         }
+    }
+
+    // ---- 봉투 ----
+
+    /// 성공은 값 위에 `ok`만 얹는다. 값을 한 겹 더 감싸면 화면이 그 겹을 벗기는 코드를
+    /// 경계마다 갖게 된다.
+    #[test]
+    fn success_gets_ok_alongside_the_value() {
+        let value = envelope(Ok::<Value, UiMessage>(json!({ "tasks": [1], "nextCursor": null })));
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["tasks"], json!([1]));
+        assert!(value.get("code").is_none(), "성공에 code가 있으면 안 됩니다: {value}");
+    }
+
+    /// **객체가 아닌 성공값에도 `ok`가 붙어야 한다.** 배열에는 키를 얹을 수 없으므로 감싼다 —
+    /// 감싸지 않고 그대로 내보내면 화면의 `ok` 검사가 실패를 만난 것처럼 읽는다.
+    #[test]
+    fn a_non_object_success_is_wrapped_so_it_still_carries_ok() {
+        let value = envelope(Ok::<Value, UiMessage>(json!([1, 2])));
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["value"], json!([1, 2]));
+    }
+
+    /// 실패는 셋을 전부 싣는다. `message`가 빠지면 화면이 코드를 모를 때 그릴 것이 없다.
+    #[test]
+    fn failure_carries_the_whole_message() {
+        let value = envelope(Err::<Value, UiMessage>(Sample.ui()));
+        assert_eq!(value["ok"], json!(false));
+        assert_eq!(value["code"], json!("sample"));
+        assert_eq!(value["params"]["n"], json!(3));
+        assert_eq!(value["message"], json!("값은 3입니다"));
+    }
+
+    /// 성공과 실패가 **같은 키로 갈리는가.** 화면은 `ok` 하나만 보고 갈래를 정한다.
+    #[test]
+    fn both_branches_are_told_apart_by_the_same_key() {
+        let ok = envelope(Ok::<Value, UiMessage>(json!({})));
+        let err = envelope(Err::<Value, UiMessage>(Sample.ui()));
+        assert_eq!(ok["ok"], json!(true));
+        assert_eq!(err["ok"], json!(false));
     }
 }

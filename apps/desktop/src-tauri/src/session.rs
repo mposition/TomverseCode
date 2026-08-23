@@ -310,16 +310,23 @@ impl SessionState {
         self.with_store(|s| tomverse_core::export::collect(s, task_id))?
     }
 
-    pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>, String> {
-        self.with_store(|s| s.get_task(task_id))?
-            .map_err(|e| format!("작업을 읽을 수 없습니다: {e}"))
+    /// 작업 상세를 이루는 세 읽기는 **하나의 사용자 동작**이다("이 작업을 연다").
+    /// 그래서 셋 다 같은 코드를 낸다 — 무엇을 하려다 실패했는가가 코드이고, 어느 읽기였는지는
+    /// `detail`에 남는다(ui-wireframes.md 6.5절).
+    pub fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>, UiMessage> {
+        self.with_store(|s| s.get_task(task_id))
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, e).ui())?
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, e).ui())
     }
 
-    pub fn get_task_events(&self, task_id: &str, after_event_id: Option<i64>) -> Result<Value, String> {
+    pub fn get_task_events(&self, task_id: &str, after_event_id: Option<i64>) -> Result<Value, UiMessage> {
         let events = self
-            .with_store(|s| s.events_after(task_id, after_event_id))?
-            .map_err(|e| format!("이벤트를 읽을 수 없습니다: {e}"))?;
-        Ok(json!(events
+            .with_store(|s| s.events_after(task_id, after_event_id))
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTaskEvents, e).ui())?
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTaskEvents, e).ui())?;
+        // **배열이 아니라 객체로 돌려준다.** 봉투가 `ok`를 얹을 자리가 있어야 하고,
+        // 배열에는 키를 얹을 수 없다.
+        Ok(json!({ "events": events
             .into_iter()
             .map(|e| json!({
                 "eventId": e.event_id,
@@ -329,21 +336,23 @@ impl SessionState {
                 "payload": e.payload,
                 "createdAt": e.created_at,
             }))
-            .collect::<Vec<_>>()))
+            .collect::<Vec<_>>() }))
     }
 
     /// 저장된 mutation 목록 — INTERRUPTED 작업의 "되돌리기" 버튼이 이걸 보고 판단한다.
-    pub fn task_mutations(&self, task_id: &str) -> Result<Vec<String>, String> {
-        self.with_store(|s| s.mutated_paths(task_id))?
-            .map_err(|e| format!("변경 목록을 읽을 수 없습니다: {e}"))
+    pub fn task_mutations(&self, task_id: &str) -> Result<Vec<String>, UiMessage> {
+        self.with_store(|s| s.mutated_paths(task_id))
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, format!("변경 목록: {e}")).ui())?
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, format!("변경 목록: {e}")).ui())
     }
 
     /// 저장된 작업의 확정 기준. 히스토리에서 지난 작업을 열었을 때도 "무엇을 결정했는가"가
     /// 보여야 한다 — 그 화면에는 FinalResult가 없고 DB뿐이다.
-    pub fn task_acceptance_criteria(&self, task_id: &str) -> Result<Value, String> {
+    pub fn task_acceptance_criteria(&self, task_id: &str) -> Result<Value, UiMessage> {
         let rows = self
-            .with_store(|s| s.acceptance_criteria(task_id))?
-            .map_err(|e| format!("기준 목록을 읽을 수 없습니다: {e}"))?;
+            .with_store(|s| s.acceptance_criteria(task_id))
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, format!("기준 목록: {e}")).ui())?
+            .map_err(|e| StoreIssue::new(StoreOp::ReadTask, format!("기준 목록: {e}")).ui())?;
         Ok(serde_json::to_value(rows).unwrap_or(Value::Null))
     }
 
@@ -623,8 +632,11 @@ impl SessionState {
         model_pins: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
+        // 여기는 화면이 그리는 실패 경로가 아니라 재실행 중의 내부 조회다 — 봉투를 산문으로
+        // 되돌려 기존 흐름에 넘긴다. 봉투가 필요한 것은 **화면이 문장을 만드는 자리**뿐이다.
         let task = self
-            .get_task(task_id)?
+            .get_task(task_id)
+            .map_err(|ui| ui.message)?
             .ok_or_else(|| format!("작업을 찾을 수 없습니다: {task_id}"))?;
         let mode = match task.mode.as_deref() {
             Some("fast") => ExecutionMode::Fast,
@@ -735,13 +747,16 @@ impl SessionState {
         // **실패도 `Ok` 봉투로 돌려준다.** Tauri의 `Err`는 문자열 하나뿐이라 구조가 들어갈
         // 자리가 없고, 문자열에 구조를 실으면 화면이 문장을 파싱하게 된다 — 그건 6절이
         // 없애려는 바로 그것이다.
-        match self.pending_approvals.respond(approval_id, &active_root, outcome) {
-            Ok(()) => Ok(json!({ "ok": true })),
-            Err(issue) => {
-                let ui = tomverse_core::uimsg::UserFacing::ui(&issue);
-                Ok(json!({ "ok": false, "code": ui.code, "params": ui.params, "message": ui.message }))
-            }
-        }
+        //
+        // 봉투를 만드는 자리는 **한 곳**이다(`tomverse_core::uimsg::envelope`). 경계마다 직접 조립하면
+        // 키 이름이 갈라지고, 화면은 그 갈래마다 다른 읽기를 갖게 된다 — 실제로 `store-ready`가
+        // `message` 대신 `error`를 쓰고 있었다.
+        Ok(tomverse_core::uimsg::envelope(
+            self.pending_approvals
+                .respond(approval_id, &active_root, outcome)
+                .map(|()| json!({}))
+                .map_err(|issue| tomverse_core::uimsg::UserFacing::ui(&issue)),
+        ))
     }
 }
 

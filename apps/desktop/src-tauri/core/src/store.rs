@@ -102,6 +102,26 @@ pub enum StoreOp {
     RecoverInterrupted,
     /// 작업 목록을 읽지 못했다.
     ReadTasks,
+    /// 작업 하나를 읽지 못했다.
+    ReadTask,
+    /// 작업의 이벤트 타임라인을 읽지 못했다.
+    ReadTaskEvents,
+}
+
+impl StoreOp {
+    /// 테스트가 훑는 목록.
+    ///
+    /// **모든 variant가 코드를 갖는다는 보장은 이 목록이 아니라 컴파일러가 준다** —
+    /// `code()`/`korean()`의 `match`가 exhaustive라 variant를 추가하면 컴파일이 깨진다.
+    /// 이 목록은 "코드가 서로 다른가"를 확인하기 위해 훑을 대상일 뿐이다.
+    pub const ALL: &'static [StoreOp] = &[
+        StoreOp::OpenArtifacts,
+        StoreOp::OpenDatabase,
+        StoreOp::RecoverInterrupted,
+        StoreOp::ReadTasks,
+        StoreOp::ReadTask,
+        StoreOp::ReadTaskEvents,
+    ];
 }
 
 /// 어떤 조작이 어떤 이유로 실패했는가.
@@ -128,6 +148,8 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::OpenDatabase => "storeOpenDatabase",
             StoreOp::RecoverInterrupted => "storeRecoverInterrupted",
             StoreOp::ReadTasks => "storeReadTasks",
+            StoreOp::ReadTask => "storeReadTask",
+            StoreOp::ReadTaskEvents => "storeReadTaskEvents",
         }
     }
 
@@ -141,6 +163,8 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::OpenDatabase => "로컬 DB를 열 수 없습니다",
             StoreOp::RecoverInterrupted => "중단된 작업을 정리할 수 없습니다",
             StoreOp::ReadTasks => "작업 목록을 읽을 수 없습니다",
+            StoreOp::ReadTask => "작업을 읽을 수 없습니다",
+            StoreOp::ReadTaskEvents => "작업의 이벤트를 읽을 수 없습니다",
         };
         format!("{what}: {}", self.detail)
     }
@@ -3024,19 +3048,13 @@ mod tests {
     #[test]
     fn every_store_op_has_its_own_code_and_carries_the_cause_as_a_parameter() {
         use crate::uimsg::UserFacing;
-        let ops = [
-            StoreOp::OpenArtifacts,
-            StoreOp::OpenDatabase,
-            StoreOp::RecoverInterrupted,
-            StoreOp::ReadTasks,
-        ];
-        let issues: Vec<StoreIssue> = ops
+        let issues: Vec<StoreIssue> = StoreOp::ALL
             .iter()
             .map(|op| StoreIssue::new(op.clone(), "database is locked"))
             .collect();
 
         let codes: std::collections::BTreeSet<&str> = issues.iter().map(|i| i.code()).collect();
-        assert_eq!(codes.len(), ops.len(), "코드가 겹칩니다: {codes:?}");
+        assert_eq!(codes.len(), StoreOp::ALL.len(), "코드가 겹칩니다: {codes:?}");
 
         for issue in &issues {
             assert_eq!(issue.params()["detail"], serde_json::json!("database is locked"));

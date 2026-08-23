@@ -50,6 +50,8 @@ const KO: Record<string, Render> = {
   storeOpenDatabase: (p) => `로컬 DB를 열 수 없습니다: ${p.detail}`,
   storeRecoverInterrupted: (p) => `중단된 작업을 정리할 수 없습니다: ${p.detail}`,
   storeReadTasks: (p) => `작업 목록을 읽을 수 없습니다: ${p.detail}`,
+  storeReadTask: (p) => `작업을 읽을 수 없습니다: ${p.detail}`,
+  storeReadTaskEvents: (p) => `작업의 이벤트를 읽을 수 없습니다: ${p.detail}`,
 };
 
 export interface Rendered {

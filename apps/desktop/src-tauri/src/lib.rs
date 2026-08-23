@@ -16,6 +16,9 @@ use serde_json::{json, Value};
 use session::SessionState;
 use tauri::{Emitter, Manager};
 use tomverse_core::types::{ExecutionMode, TaskPolicy};
+// 봉투를 만드는 자리는 **한 곳**이고 그 자리는 core다 — 껍데기 크레이트는 이 개발
+// 환경에서 컴파일되지 않으므로 화면과의 계약을 정하는 코드를 여기 두지 않는다.
+use tomverse_core::uimsg::{envelope, UiMessage};
 use tomverse_core::{PROTOCOL_VERSION, PROVIDER_ENV_VARS};
 
 /// 워크스페이스 열기.
@@ -184,7 +187,7 @@ fn get_task_events(
     task_id: String,
     after_event_id: Option<i64>,
 ) -> Result<Value, String> {
-    state.get_task_events(&task_id, after_event_id)
+    Ok(envelope(state.get_task_events(&task_id, after_event_id)))
 }
 
 /// 보내기 **전에** 자격증명처럼 보이는 값이 있는지 본다 (17.11절).
@@ -291,36 +294,37 @@ fn list_tasks(
     let limit = limit.unwrap_or(50).clamp(1, 200);
     // 실패를 `Err`가 아니라 봉투로 돌려준다. Tauri의 `Err`는 문자열 하나뿐이라 구조가 들어갈
     // 자리가 없고, 문자열에 구조를 실으면 화면이 문장을 파싱하게 된다(ui-wireframes.md 6.4절).
-    let rows = match state.list_tasks(workspace_path.as_deref(), limit, cursor.as_deref()) {
-        Ok(rows) => rows,
-        Err(ui) => {
-            return Ok(json!({
-                "ok": false,
-                "code": ui.code,
-                "params": ui.params,
-                "message": ui.message,
-            }))
-        }
-    };
-    // 커서는 **Store가 만든다.** 여기서 직접 조립하면 정렬 기준이 바뀔 때 화면과 질의가
-    // 조용히 갈라진다 — 실제로 갈라져 있었다(커서는 created_at인데 질의는 updated_at으로 잘랐다).
-    // 그러면 페이지 경계에서 행이 빠지거나 두 번 나오는데, 목록만 봐서는 알아챌 수 없다.
-    //
-    // 커서를 limit을 채웠을 때만 주는 이유: 덜 채운 페이지는 마지막 페이지이므로
-    // 커서를 주면 화면이 "더 보기"를 계속 띄우고, 누르면 늘 빈 결과가 돌아온다.
-    let next_cursor = if rows.len() as i64 == limit {
-        rows.last().map(tomverse_core::store::Store::cursor_for)
-    } else {
-        None
-    };
-    Ok(json!({ "ok": true, "tasks": rows, "nextCursor": next_cursor }))
+    // **성공 쪽도 같은 함수를 지난다** — `ok`를 손으로 얹기 시작하면 곧 한 군데가 빠진다.
+    Ok(envelope(
+        state
+            .list_tasks(workspace_path.as_deref(), limit, cursor.as_deref())
+            .map(|rows| {
+                // 커서는 **Store가 만든다.** 여기서 직접 조립하면 정렬 기준이 바뀔 때 화면과
+                // 질의가 조용히 갈라진다 — 실제로 갈라져 있었다(커서는 created_at인데 질의는
+                // updated_at으로 잘랐다). 그러면 페이지 경계에서 행이 빠지거나 두 번 나오는데,
+                // 목록만 봐서는 알아챌 수 없다.
+                //
+                // 커서를 limit을 채웠을 때만 주는 이유: 덜 채운 페이지는 마지막 페이지이므로
+                // 커서를 주면 화면이 "더 보기"를 계속 띄우고, 누르면 늘 빈 결과가 돌아온다.
+                let next_cursor = if rows.len() as i64 == limit {
+                    rows.last().map(tomverse_core::store::Store::cursor_for)
+                } else {
+                    None
+                };
+                json!({ "tasks": rows, "nextCursor": next_cursor })
+            }),
+    ))
 }
 
 #[tauri::command]
 fn get_task(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
-    let task = state.get_task(&task_id)?;
+    Ok(envelope(load_task_detail(&state, &task_id)))
+}
+
+fn load_task_detail(state: &SessionState, task_id: &str) -> Result<Value, UiMessage> {
+    let task = state.get_task(task_id)?;
     let (mutated, criteria) = if task.is_some() {
-        (state.task_mutations(&task_id)?, state.task_acceptance_criteria(&task_id)?)
+        (state.task_mutations(task_id)?, state.task_acceptance_criteria(task_id)?)
     } else {
         (Vec::new(), Value::Null)
     };
@@ -363,15 +367,7 @@ pub fn run() {
             let state = app.state::<SessionState>();
             // 실패는 **봉투**로 나간다 — 화면이 코드로 문장을 만든다(ui-wireframes.md 6절).
             // `error`는 그 봉투의 원문이며 화면이 코드를 모를 때의 대체 표시다.
-            let payload = match state.initialize() {
-                Ok(info) => json!({ "ok": true, "recovery": info }),
-                Err(ui) => json!({
-                    "ok": false,
-                    "code": ui.code,
-                    "params": ui.params,
-                    "error": ui.message,
-                }),
-            };
+            let payload = envelope(state.initialize().map(|info| json!({ "recovery": info })));
             let _ = app.emit("store-ready", payload);
             Ok(())
         })
