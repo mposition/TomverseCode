@@ -2,7 +2,7 @@ import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, wri
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ComplexityTier } from "@tomverse/protocol";
-import { DEFAULT_TRIAGE_POLICY, tierAtThreshold } from "@tomverse/sidecar/triage";
+import { DEFAULT_TRIAGE_POLICY, DEFAULT_USE_RISK_PATHS, tierAtThreshold } from "@tomverse/sidecar/triage";
 import { readEvents, runHost, type StoredEvent } from "./host.js";
 import { listFixtureIds, loadFixture } from "./manifest.js";
 
@@ -136,6 +136,8 @@ export interface TriageEvidence {
   workFileCount: number;
   excludedTestFiles: string[];
   riskKeywordMatched: boolean;
+  /** 경로가 위험 구역을 가리켰는가 — 사용자의 표현이 아니라 코드의 위치에서 오는 신호. */
+  riskPathMatched: boolean;
   uncommittedChanges: boolean;
 }
 
@@ -209,6 +211,7 @@ export function observationFromEvents(
     workFileCount?: number;
     excludedTestFiles?: string[];
     riskKeywordMatched?: boolean;
+    riskPathMatched?: boolean;
     uncommittedChanges?: boolean;
     tierIfTestsCounted?: string;
   };
@@ -231,15 +234,26 @@ export function observationFromEvents(
     typeof payload.workFileCount !== "number" ||
     !Array.isArray(payload.excludedTestFiles) ||
     typeof payload.riskKeywordMatched !== "boolean" ||
+    typeof payload.riskPathMatched !== "boolean" ||
     typeof payload.uncommittedChanges !== "boolean"
   ) {
+    // **어느 필드가 없는지 말한다.** 신호가 늘면 옛 기록은 새 필드를 갖지 않으므로 여기로
+    // 떨어지는데, "근거가 없습니다"만 나오면 기록이 낡은 것인지 배선이 끊긴 것인지 구별되지
+    // 않는다. (검사 자체는 위 조건이 한다 — 목록으로 하면 타입이 좁혀지지 않는다.)
+    const missing = [
+      typeof payload.workFileCount !== "number" ? "workFileCount" : null,
+      !Array.isArray(payload.excludedTestFiles) ? "excludedTestFiles" : null,
+      typeof payload.riskKeywordMatched !== "boolean" ? "riskKeywordMatched" : null,
+      typeof payload.riskPathMatched !== "boolean" ? "riskPathMatched" : null,
+      typeof payload.uncommittedChanges !== "boolean" ? "uncommittedChanges" : null,
+    ].filter((f): f is string => f !== null);
     return {
       ...base,
       tier: null,
       evidence: null,
       tierIfTestsCounted: null,
       decidedBeforeAnyProviderCall,
-      notObservedReason: "TRIAGE_COMPLETED에 임계값을 다시 계산할 근거가 없습니다",
+      notObservedReason: `TRIAGE_COMPLETED에 임계값을 다시 계산할 근거가 없습니다 (없는 필드: ${missing.join(", ")})`,
     };
   }
 
@@ -250,6 +264,7 @@ export function observationFromEvents(
       workFileCount: payload.workFileCount,
       excludedTestFiles: payload.excludedTestFiles,
       riskKeywordMatched: payload.riskKeywordMatched,
+      riskPathMatched: payload.riskPathMatched,
       uncommittedChanges: payload.uncommittedChanges,
     },
     tierIfTestsCounted: payload.tierIfTestsCounted === "standard" ? "standard" : "simple",
@@ -308,6 +323,8 @@ export function observeTriage(task: LabeledTask, options: ObserveOptions = {}): 
 export interface ThresholdRow {
   maxRelevantFiles: number;
   countTestFiles: boolean;
+  /** 경로 위험 신호를 판정에 썼는가. 이 축을 스윕하지 않으면 신호를 켠 대가를 알 수 없다. */
+  useRiskPaths: boolean;
   /** 어려운 태스크를 단일 모델 경로로 보낸 횟수. 대가는 잘못된 완료 위험이다. */
   hardRoutedSimple: number;
   /** 쉬운 태스크를 교차검증 경로로 보낸 횟수. 대가는 Phase 0 실측(비용 1.63배, 지연 1.70배)이다. */
@@ -361,16 +378,25 @@ export function sweepThresholds(
 ): ThresholdRow[] {
   const usable = observations.filter((o) => o.evidence !== null);
   const rows: ThresholdRow[] = [];
-  for (const countTestFiles of [false, true]) {
-    for (const maxRelevantFiles of candidates) {
-      let hardRoutedSimple = 0;
-      let easyRoutedStandard = 0;
-      for (const o of usable) {
-        const tier = tierAtThreshold(o.evidence!, maxRelevantFiles, countTestFiles);
-        if (o.label === "hard" && tier === "simple") hardRoutedSimple += 1;
-        if (o.label === "easy" && tier === "standard") easyRoutedStandard += 1;
+  for (const useRiskPaths of [false, true]) {
+    for (const countTestFiles of [false, true]) {
+      for (const maxRelevantFiles of candidates) {
+        let hardRoutedSimple = 0;
+        let easyRoutedStandard = 0;
+        for (const o of usable) {
+          const tier = tierAtThreshold(o.evidence!, maxRelevantFiles, countTestFiles, useRiskPaths);
+          if (o.label === "hard" && tier === "simple") hardRoutedSimple += 1;
+          if (o.label === "easy" && tier === "standard") easyRoutedStandard += 1;
+        }
+        rows.push({
+          maxRelevantFiles,
+          countTestFiles,
+          useRiskPaths,
+          hardRoutedSimple,
+          easyRoutedStandard,
+          dominated: false,
+        });
       }
-      rows.push({ maxRelevantFiles, countTestFiles, hardRoutedSimple, easyRoutedStandard, dominated: false });
     }
   }
   for (const row of rows) {
@@ -433,7 +459,12 @@ export function summarize(observations: readonly TriageObservation[]): Calibrati
 
   const rows = sweepThresholds(observations, thresholdCandidates(observations));
   const current =
-    rows.find((r) => r.maxRelevantFiles === DEFAULT_TRIAGE_POLICY.maxRelevantFiles && !r.countTestFiles) ?? null;
+    rows.find(
+      (r) =>
+        r.maxRelevantFiles === DEFAULT_TRIAGE_POLICY.maxRelevantFiles &&
+        !r.countTestFiles &&
+        r.useRiskPaths === DEFAULT_USE_RISK_PATHS
+    ) ?? null;
 
   return {
     observations: [...observations],
@@ -482,10 +513,11 @@ export function renderCalibration(summary: CalibrationSummary): string[] {
   }
 
   lines.push("임계값 후보 (지배당한 줄은 어떤 교환비에서도 답이 아니다):");
-  lines.push("  테스트파일  maxFiles  어려움→simple  쉬움→standard  지배당함");
+  lines.push("  경로신호  테스트파일  maxFiles  어려움→simple  쉬움→standard  지배당함");
   for (const row of summary.rows) {
     lines.push(
-      `  ${row.countTestFiles ? "센다  " : "제외  "}    ${String(row.maxRelevantFiles).padStart(6)}  ` +
+      `  ${row.useRiskPaths ? "쓴다  " : "안씀  "}  ${row.countTestFiles ? "센다  " : "제외  "}    ` +
+        `${String(row.maxRelevantFiles).padStart(6)}  ` +
         `${String(row.hardRoutedSimple).padStart(11)}  ${String(row.easyRoutedStandard).padStart(12)}  ` +
         `${row.dominated ? "예" : "-"}`
     );

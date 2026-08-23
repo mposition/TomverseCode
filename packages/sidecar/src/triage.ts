@@ -11,6 +11,17 @@ import type { ComplexityTier, WorkspaceSnapshot } from "@tomverse/protocol";
 export interface TriagePolicy {
   maxRelevantFiles: number;
   riskKeywords: string[];
+  /**
+   * **경로**에서 읽는 위험 신호 — product-strategy 5절의 세 항목 중 둘.
+   *
+   * `riskKeywords`가 보는 것은 사용자가 **뭐라고 썼는가**다. 그래서 같은 작업이라도 "결제 로직
+   * 고쳐줘"는 `standard`가 되고 "이 함수 좀 봐줘"는 `simple`이 된다 — 위험은 표현이 아니라
+   * 코드에 있는데 판정은 표현에 달려 있었다. 경로는 사용자가 고르는 값이 아니므로 그 의존이 없다.
+   *
+   * 경로 **구분자 사이의 조각**과 파일명 앞부분에만 맞춘다. 단순 포함으로 보면 `auth`가
+   * `author.ts`에 걸리고, 그러면 이 신호는 잡음이 된다.
+   */
+  riskPathSegments: string[];
 }
 
 /**
@@ -51,7 +62,48 @@ export const DEFAULT_TRIAGE_POLICY: TriagePolicy = {
     "payment",
     "delete",
   ],
+  // 인증·결제·암호화 경로와 DB migration. **"public API 변경"은 넣지 않았다** — 그건 심볼
+  // 분석이 있어야 판정할 수 있고(Tree-sitter는 아직 없다, context-engine 9절), 경로 이름으로
+  // 흉내 내면 맞을 때보다 틀릴 때가 많다. 없는 신호를 있는 척하지 않는다.
+  riskPathSegments: [
+    "auth",
+    "login",
+    "session",
+    "credential",
+    "credentials",
+    "token",
+    "password",
+    "payment",
+    "payments",
+    "billing",
+    "checkout",
+    "invoice",
+    "crypto",
+    "cipher",
+    "signature",
+    "migration",
+    "migrations",
+    "migrate",
+  ],
 };
+
+/**
+ * 이 경로가 위험 구역인가.
+ *
+ * **경계를 지킨다.** 디렉터리 조각이 정확히 같거나, 파일명이 그 조각으로 시작하고 뒤에
+ * 이름 문자가 아닌 것이 오는 경우만 인정한다 — 단순 포함이면 `auth`가 `author.ts`에,
+ * `token`이 `tokenizer.ts`에 걸린다. 잡음이 섞이면 이 신호는 "전부 standard"로 수렴하고,
+ * 그건 TRIAGE를 죽이는 것과 같다.
+ */
+function riskSegmentsIn(path: string, segments: readonly string[]): string[] {
+  const normalized = path.replace(/\\/g, "/").toLowerCase();
+  const parts = normalized.split("/").filter((p) => p.length > 0);
+  const dirs = new Set(parts.slice(0, -1));
+  const base = parts[parts.length - 1] ?? "";
+  // 파일명은 `.`/`-`/`_`로 잘라 조각으로 본다: `auth.ts`, `auth-helper.ts`, `reset_password.py`.
+  const baseTokens = new Set(base.split(/[.\-_]/).filter((p) => p.length > 0));
+  return segments.filter((seg) => dirs.has(seg.toLowerCase()) || baseTokens.has(seg.toLowerCase()));
+}
 
 /**
  * 분류와 **그 근거**. 테스트 파일 제외 규칙이 실제로 판정을 바꿨는지까지 담는다.
@@ -89,6 +141,16 @@ export interface TriageResult {
    * `sweepThreshold`가 유료 호출 없이 성립하는 이유다.
    */
   riskKeywordMatched: boolean;
+  /**
+   * 관련 파일의 **경로**가 위험 구역을 가리켰는가.
+   *
+   * `riskKeywordMatched`와 뭉치지 않는 이유: 둘은 서로 다른 것에 의존한다. 하나는 사용자의
+   * 표현, 다른 하나는 코드의 위치다. 한 값으로 합치면 "이 태스크가 왜 standard였나"에
+   * 답할 수 없고, 무엇보다 **어느 신호가 실제로 일하는지 잴 수 없다.**
+   */
+  riskPathMatched: boolean;
+  /** 어떤 경로의 어떤 조각이 걸렸는가. 개수가 아니라 값이어야 판정을 사후에 검증할 수 있다. */
+  riskPaths: { path: string; segments: string[] }[];
   uncommittedChanges: boolean;
 }
 
@@ -117,12 +179,21 @@ export function triage(
   const lowerMessage = userMessage.toLowerCase();
   const matchesRiskKeyword = policy.riskKeywords.some((kw) => lowerMessage.includes(kw.toLowerCase()));
 
+  // **테스트 파일도 본다.** 복잡도 **개수**에서는 빼지만 위험 구역 판정에서는 빼지 않는다 —
+  // `auth/login.test.ts`가 있다는 것은 그 태스크가 인증 근처라는 뜻이고, 그 사실은 그 파일을
+  // 세는지와 무관하다. 두 규칙이 같은 목록을 본다고 해서 같은 것을 묻는 것은 아니다.
+  const riskPaths = notProjectMeta
+    .map((f) => ({ path: f.path, segments: riskSegmentsIn(f.path, policy.riskPathSegments) }))
+    .filter((hit) => hit.segments.length > 0);
+
   // 근거를 먼저 모으고 판정은 `tierAtThreshold` 한 곳에서 한다. 여기에 판정식을 한 번 더
   // 적으면 임계값을 바꿔 다시 계산할 때 **두 식이 갈라진 채로 통과**할 수 있다.
   const evidence = {
     workFileCount,
     excludedTestFiles,
     riskKeywordMatched: matchesRiskKeyword,
+    riskPathMatched: riskPaths.length > 0,
+    riskPaths,
     uncommittedChanges: hasUncommittedChanges,
   };
 
@@ -134,6 +205,20 @@ export function triage(
     tierIfTestsCounted: tierAtThreshold(evidence, policy.maxRelevantFiles, true),
   };
 }
+
+/**
+ * 경로 위험 신호를 **판정에 쓸 것인가**의 기본값.
+ *
+ * `true`인 근거는 라벨 붙은 29개 세트의 실측이다(state-machine 13.4.1절). 같은 임계값에서
+ * 어려운 태스크를 `simple`로 보낸 것이 **20/24 → 19/24**로 줄었고, 쉬운 태스크를 `standard`로
+ * 보낸 것은 **1/5로 그대로**다. 한쪽을 개선하고 다른 쪽을 악화시키지 않으므로 **교환비를
+ * 정하지 않고도** 답이 된다 — 스윕 표가 쓰는 지배 관계 그대로다.
+ *
+ * **이득이 크다는 뜻은 아니다.** 24건 중 1건이고, 대가가 0인 것은 이 세트의 쉬운 태스크에
+ * 위험 경로가 없기 때문이기도 하다. 실사용에서 `auth/` 아래의 쉬운 태스크는 `standard`로 갈
+ * 것이고 그 대가는 여기서 관측되지 않는다.
+ */
+export const DEFAULT_USE_RISK_PATHS = true;
 
 /**
  * 기록된 근거만으로 **다른 임계값이었다면 어떤 tier였을지**를 다시 계산한다.
@@ -154,14 +239,16 @@ export function triage(
 export function tierAtThreshold(
   evidence: Pick<
     TriageResult,
-    "workFileCount" | "excludedTestFiles" | "riskKeywordMatched" | "uncommittedChanges"
+    "workFileCount" | "excludedTestFiles" | "riskKeywordMatched" | "riskPathMatched" | "uncommittedChanges"
   >,
   maxRelevantFiles: number,
-  countTestFiles = false
+  countTestFiles = false,
+  useRiskPaths = DEFAULT_USE_RISK_PATHS
 ): ComplexityTier {
   const files = countTestFiles
     ? evidence.workFileCount + evidence.excludedTestFiles.length
     : evidence.workFileCount;
   if (evidence.riskKeywordMatched || evidence.uncommittedChanges) return "standard";
+  if (useRiskPaths && evidence.riskPathMatched) return "standard";
   return files > maxRelevantFiles ? "standard" : "simple";
 }

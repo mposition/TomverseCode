@@ -35,6 +35,56 @@ test("위험 키워드 매칭 → 파일이 하나여도 standard", () => {
   }
 });
 
+/**
+ * product-strategy 5절의 세 신호 중 둘 — state-machine 13.4.1절.
+ *
+ * `riskKeywords`는 사용자가 **뭐라고 썼는가**를 본다. 같은 작업이라도 "결제 로직 고쳐줘"는
+ * standard가 되고 "이 함수 좀 봐줘"는 simple이 됐다. 위험은 표현이 아니라 코드에 있다.
+ */
+test("경로가 위험 구역을 가리키면 사용자가 아무 말 안 해도 standard다", () => {
+  for (const path of ["src/auth/session.ts", "app/payment.ts", "db/migrations/003_add.sql", "lib/crypto.rs"]) {
+    const snapshot = makeSnapshot({ relevantFiles: [makeRelevantFile({ path })] });
+    assert.equal(triageTask(snapshot, "이 함수 좀 봐줘"), "standard", `${path}는 standard여야 합니다`);
+  }
+});
+
+test("경로 신호는 이름 경계를 지킨다 — author.ts는 auth가 아니다", () => {
+  // 단순 포함으로 보면 이 신호는 잡음이 되고, 잡음이 섞이면 전부 standard로 수렴해
+  // TRIAGE를 죽이는 것과 같아진다.
+  for (const path of ["src/author.ts", "src/tokenizer.ts", "lib/authors/list.ts", "src/migrationless.ts"]) {
+    const snapshot = makeSnapshot({ relevantFiles: [makeRelevantFile({ path })] });
+    assert.equal(triageTask(snapshot, "이 함수 좀 봐줘"), "simple", `${path}는 simple이어야 합니다`);
+  }
+});
+
+test("경로 신호의 근거는 개수가 아니라 값으로 남는다", () => {
+  const snapshot = makeSnapshot({
+    relevantFiles: [makeRelevantFile({ path: "src/auth/login.ts" }), makeRelevantFile({ path: "src/util.ts" })],
+  });
+  const result = triage(snapshot, "고쳐줘");
+  assert.equal(result.riskPathMatched, true);
+  // 디렉터리와 파일명 양쪽에서 걸린다 — 어느 조각이 걸렸는지가 남아야 판정을 사후에 검증한다.
+  assert.deepEqual(result.riskPaths, [{ path: "src/auth/login.ts", segments: ["auth", "login"] }]);
+  // **두 신호를 뭉치지 않는다.** 사용자는 위험 단어를 쓰지 않았다.
+  assert.equal(result.riskKeywordMatched, false);
+});
+
+test("테스트 파일은 개수에서 빠지지만 위험 구역 판정에서는 빠지지 않는다", () => {
+  // 두 규칙이 같은 목록을 본다고 해서 같은 것을 묻는 것은 아니다.
+  const snapshot = makeSnapshot({ relevantFiles: [makeRelevantFile({ path: "src/auth/login.test.ts" })] });
+  const result = triage(snapshot, "고쳐줘");
+  assert.equal(result.workFileCount, 0);
+  assert.deepEqual(result.excludedTestFiles, ["src/auth/login.test.ts"]);
+  assert.equal(result.riskPathMatched, true);
+});
+
+test("경로 신호를 끄고 다시 계산할 수 있다 — 켠 대가를 재려면 필요하다", () => {
+  const snapshot = makeSnapshot({ relevantFiles: [makeRelevantFile({ path: "src/auth/login.ts" })] });
+  const result = triage(snapshot, "고쳐줘");
+  assert.equal(tierAtThreshold(result, DEFAULT_TRIAGE_POLICY.maxRelevantFiles, false, true), "standard");
+  assert.equal(tierAtThreshold(result, DEFAULT_TRIAGE_POLICY.maxRelevantFiles, false, false), "simple");
+});
+
 test("project-meta 파일은 복잡도 신호로 세지 않는다", () => {
   // README/package.json/CLAUDE.md는 4절 규칙에 따라 항상 포함되므로, 이걸 세면
   // 모든 태스크가 standard가 되어 TRIAGE 자체가 무의미해진다.

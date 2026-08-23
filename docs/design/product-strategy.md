@@ -52,7 +52,7 @@ status: accepted (2026-07-25) — 단, 2절의 **가설 게이트**를 통과하
 | 전략 문서 요구 | 현재 상태 |
 |---|---|
 | §4 테스트가 최종 판정 | **구현 완료** — `VERIFYING`은 `complexityTier`와 무관하게 항상 실행된다(CLAUDE.md 원칙 1). <!-- present: packages/sidecar/src/orchestrator/machine.ts --> |
-| §5 위험도 기반 적응형 검증 | **구현 완료(2단계)** — `TRIAGE` + `complexityTier`. 4단계로 확장 필요(5절). <!-- present: packages/sidecar/src/triage.ts --> |
+| §5 위험도 기반 적응형 검증 | **구현 완료(2단계)** — `TRIAGE` + `complexityTier`, 판정 신호에 경로 기반 위험 축 추가(13.4.1절). **4단계 확장은 보류**이며 이유는 로드맵이 아니라 측정에 있다(13.4.2절) — 지금 축이 두 라벨을 가르지 못하므로 넷으로 늘리면 이름만 넷이 된다. <!-- present: packages/sidecar/src/triage.ts --> |
 | §6 실제 성과 학습 라우터 | **부분** — 무엇이 표본인지를 정하고(multi-engine 8.1절) **집계까지 만들었다**(`tomverse-host metrics`의 `modelEvaluation`). 라우터를 그 값으로 바꾸는 일은 아직 하지 않았다 — `verdict`가 `separated`인 쌍이 실제로 생겼을 때가 그 시점이다. <!-- present: apps/desktop/src-tauri/core/src/metrics.rs, packages/sidecar/src/routing --> |
 | §7 검수 독립성 | **구현 완료** — 공급자 독립성은 불변식으로 강제(multi-engine 5절), narrative 독립성은 `blind` 모드로 구현했다. **기본값은 `informed`다** — 4.1절 실측이 blind의 이득을 지지하지 않았고, 그 철회 자체가 결과다. <!-- present: packages/sidecar/src/providers/prompts.ts --> |
 | §9 데이터 전송 투명성 | **구현 완료** — 하드 제외(context-engine 7절)에 더해 **화면과 CLI 양쪽에 표시가 있다**(`TransmissionPanel`, `tomverse-host transmission`, 감사 export). <!-- present: apps/desktop/src/components/TransmissionPanel.tsx, apps/desktop/src/components/AuditExportPanel.tsx --> |
@@ -167,8 +167,10 @@ type ComplexityTier = "fast" | "balanced" | "verified" | "critical";
 
 - 기존 `simple` → `fast`/`balanced`, `standard` → `verified`로 매핑. `critical`은 Arena(M4)가 준비될 때까지 `verified`와 동일하게 동작하되 승인 요구만 강화.
 - **사용자가 태스크별로 tier를 올릴 수 있어야 한다**(내리는 것도). 라우터의 자동 분류는 기본값 제안이지 강제가 아니다.
-- TRIAGE 판정 신호에 전략 문서 §5의 항목을 추가: 인증·결제·암호화 코드 경로 여부, DB migration 여부, public API 변경 여부. 단 **임계값 튜닝은 여전히 미해결**(어려운 픽스처 세트 필요).
+- ~~TRIAGE 판정 신호에 §5의 항목을 추가: 인증·결제·암호화 코드 경로 여부, DB migration 여부, public API 변경 여부~~ → **셋 중 둘을 구현했다**([state-machine 13.4.1절](./state-machine-and-protocol.md)). 이 항목은 tier 개수와 독립이라 4단계 확장을 기다릴 이유가 없었다. 구현하면서 드러난 것: **기존 위험 신호가 사용자의 표현에 의존하고 있었다** — `riskKeywords`는 `userMessage`를 보므로 같은 코드를 고치는 같은 작업이라도 "결제 로직 고쳐줘"는 `standard`, "이 함수 좀 봐줘"는 `simple`이었다. 경로는 사용자가 고르는 값이 아니다. 라벨 붙은 29개 세트 실측에서 어려움→simple이 20/24 → 19/24로 줄고 쉬움→standard는 1/5로 그대로여서, **교환비를 정하지 않고도** 켤 근거가 된다. `public API 변경`은 넣지 않았다 — 심볼 분석이 있어야 하는데 Tree-sitter가 아직 없고, 경로 이름으로 흉내 내면 틀릴 때가 더 많다
 - 워크스페이스 정책의 `forceComplexityTier`는 하한선으로 동작(예: 결제 저장소는 최소 `verified`).
+
+> **4단계 확장 자체는 지금 하지 않는다** — [13.4.2절](./state-machine-and-protocol.md). 이유가 둘이고 각각 독립적으로 충분하다: **①** 위 표의 이름(`fast`/`verified`)이 state-machine 17.5절이 갈라놓은 두 축(규칙이 정하는 tier / 사용자가 고르는 실행 모드)을 다시 합친다 — 그 혼동이 만든 비용 2배 결함을 방금 고쳤는데 이름 층위에서 되살아난다. **②** 13.4절 실측대로 지금 쓰는 축이 두 라벨을 가르지 못하므로, 넷으로 늘리면 **이름만 넷이고 규칙은 두 답만 낸다.** 그래서 이 항목의 선행 조건은 구현이 아니라 (a) 축을 합치지 않는 명명과 (b) 네 단계를 실제로 가르는 축이다.
 
 ## 6. 채택: Agent Trace 완성 (기존 자산의 작은 델타)
 
@@ -880,7 +882,7 @@ Tomverse Code를 개발하면서 이 환경에서 실제로 발생한 것:
 |---|---|---|
 | **M0 — 코어 루프** | Tool Runtime, Policy Gate, Context Engine, VERIFYING, 이벤트 로그. 공급자 2개. Model Registry + Role 추상화(multi-engine 0단계) | 실제 저장소에서 버그 수정 1건이 승인→실행→검증→커밋까지 완주 |
 | **G — 가설 게이트** ⚡ | 어려운 픽스처 세트로 스파이크 재실행. **M0 완료 직후, 다른 작업과 병렬로 즉시 수행** | 교차검증이 유의미한 이득을 보이는가에 대한 데이터 기반 답 |
-| **M1 — 차별화 (깊게)** | Blind Review(4절), 4단계 tier(5절), 모델 불일치 화면, Verified 리포트(11절), 전송 투명성(7절), Agent Trace 완성(6절) | 불일치 화면이 실제 태스크에서 의미 있는 정보를 보여줌 |
+| **M1 — 차별화 (깊게)** | Blind Review(4절), ~~4단계 tier(5절)~~ **→ TRIAGE 신호 확충으로 대체, 4단계는 선행 조건 미충족(13.4.2절)**, 모델 불일치 화면, Verified 리포트(11절), 전송 투명성(7절), Agent Trace 완성(6절) | 불일치 화면이 실제 태스크에서 의미 있는 정보를 보여줌 |
 | **M2 — 커버리지 A (싼 것)** | MCP, 프로젝트 규칙, worktree·브랜치 격리, 세션 중지·재개·취소, Git 도구, Gemini 어댑터 | 8.2 표의 해당 행 기준 충족 |
 | **M3 — 커버리지 B (실작업)** | Autopilot(검증 게이트 포함), Hooks, Skills·커스텀 에이전트(얕은 버전), PR 연동, 세션 메모리, 부분 승인 | 8.2 표의 해당 행 기준 충족 → **여기서 v1 출시 가능** |
 | **M4 — Arena** | 복수 구현 경쟁, Fleet 병렬, 9절 완화책 전체 | `critical` tier에서 기존 테스트 기준 최적 구현 선택 |

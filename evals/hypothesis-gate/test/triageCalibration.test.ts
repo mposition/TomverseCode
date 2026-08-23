@@ -45,6 +45,7 @@ const FULL_EVIDENCE = {
   workFileCount: 1,
   excludedTestFiles: [],
   riskKeywordMatched: false,
+  riskPathMatched: false,
   uncommittedChanges: false,
   tierIfTestsCounted: "simple",
 };
@@ -127,6 +128,7 @@ test("공급자 호출이 한 번도 없으면 순서 증명으로 치지 않는
 function obs(id: string, label: "hard" | "easy", workFileCount: number, extra: Partial<{
   excludedTestFiles: string[];
   riskKeywordMatched: boolean;
+  riskPathMatched: boolean;
   uncommittedChanges: boolean;
 }> = {}): TriageObservation {
   return {
@@ -139,6 +141,7 @@ function obs(id: string, label: "hard" | "easy", workFileCount: number, extra: P
       workFileCount,
       excludedTestFiles: extra.excludedTestFiles ?? [],
       riskKeywordMatched: extra.riskKeywordMatched ?? false,
+      riskPathMatched: extra.riskPathMatched ?? false,
       uncommittedChanges: extra.uncommittedChanges ?? false,
     },
     decidedBeforeAnyProviderCall: true,
