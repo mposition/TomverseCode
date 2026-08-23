@@ -2090,6 +2090,10 @@ Windows에서 실제로 파일·네트워크를 제한하는 수단과, 그것�
 **아래가 전부 참으로 확인되기 전까지 이 경로는 "구현됨"이지 "검증됨"이 아니다.**
 taskkill 경로는 어느 경우에도 남겨둔다(20.5절).
 
+**판정은 이제 명령이 한다** — `tomverse-host windows-landing`(process-architecture.md 12절).
+사람이 이 목록을 읽고 머릿속에서 판정하면 하나를 빠뜨려도 아무 일도 일어나지 않는다.
+그리고 4번은 **Windows를 기다리지 않는다**: 플랫폼과 무관한 소스 불변식이라 테스트가 지킨다.
+
 1. `npm run core:build`가 Windows에서 통과한다.
 2. e2e 시나리오 A(**손자 프로세스가 실제로 죽는가**)가 Windows에서 통과한다.
 3. `TreeKillOutcome.tree_guaranteed`가 Windows에서 `true`가 되고, 그 값이 UI 문구를 실제로

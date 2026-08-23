@@ -101,6 +101,8 @@ struct Args {
     cancel_after_ms: Option<u64>,
     /// `metrics` 전용: 워크스페이스 필터를 끄고 DB 전체를 집계한다.
     all_workspaces: bool,
+    /// `windows-landing` 전용 — tauri 번들 디렉터리.
+    bundle: Option<PathBuf>,
 
     // ---- 가설 게이트(evals/hypothesis-gate) 전용 ----
     //
@@ -153,6 +155,7 @@ fn parse_args() -> Result<Args, String> {
         verbose: false,
         cancel_after_ms: None,
         all_workspaces: false,
+        bundle: None,
         providers: None,
         review_mode: None,
         replay_draft: None,
@@ -226,6 +229,7 @@ fn parse_args() -> Result<Args, String> {
             "--apply" => args.apply = true,
             "--verbose" => args.verbose = true,
             "--all-workspaces" => args.all_workspaces = true,
+            "--bundle" => args.bundle = Some(PathBuf::from(value()?)),
             other => return Err(format!("알 수 없는 인자: {other}\n\n{}", usage())),
         }
     }
@@ -280,7 +284,7 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export|reproduce> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export|reproduce|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>]\n\
      [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
@@ -304,7 +308,11 @@ fn usage() -> String {
                  [--apply]면 실제로 적용한다 — 각 단계는 Policy Gate를 그대로 지나고,\n\
                  첫 실패에서 멈추며, 스스로 되돌리지는 않는다(보고의 preImageRef가 재료다).\n\
                  판정은 '단계가 다 돌았다'(completed)가 아니라 기록된 최종 내용과의\n\
-                 대조(outcome)다"
+                 대조(outcome)다\n\
+     windows-landing — Windows에서만 확인되는 착지 기준(Job Object·번들·Credential Store)을\n\
+                 판정한다. 읽기 전용이고 DB도 열지 않는다. **확인하지 못한 것을 통과로 세지\n\
+                 않는다** — 사람이 해야 하는 단계는 remaining에 남는다.\n\
+                 [--bundle <경로>]로 tauri-build 산출물을 가리키면 번들 기준까지 본다"
         .to_string()
 }
 
@@ -327,6 +335,16 @@ fn real_main() -> Result<i32, String> {
     // **재현 검사는 DB를 열지 않는다.** 감사자에게는 DB가 없다 — 그래서 export 파일이 있는
     // 것이고, 여기서 store를 열면 없던 state.db가 생긴다. "아무것도 쓰지 않는다"는 약속은
     // 그 파일 하나로 깨진다. 그래서 store를 만들기 **전에** 갈라진다.
+    // **착지 검사도 DB를 열지 않는다.** 관측만 하고 아무것도 쓰지 않으므로, 여기서 store를
+    // 열면 없던 state.db가 생긴다 — reproduce와 같은 이유로 store를 만들기 전에 갈라진다.
+    if args.command == "windows-landing" {
+        let report = tomverse_core::landing::assess(&tomverse_core::landing::Observations::here(args.bundle.clone()));
+        println!("{}", serde_json::to_string(&report).unwrap_or_default());
+        // **판정을 종료 코드에 싣지 않는다.** 실으면 "도구가 실패했다"와 "아직 착지하지
+        // 않았다"가 같은 값이 된다 — reproduce가 같은 이유로 그렇게 한다.
+        return Ok(0);
+    }
+
     if args.command == "reproduce" {
         return reproduce_check(&args, &root);
     }

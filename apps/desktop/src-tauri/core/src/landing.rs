@@ -1,0 +1,540 @@
+//! Windows에서만 확인되는 착지 기준을 **명령이 판정한다.**
+//!
+//! # 왜 필요한가
+//!
+//! 세 항목이 "Windows에서 실행해야만 검증된다"로 유보되어 있다 — Job Object
+//! (state-machine-and-protocol.md 20.6절), sidecar 동봉(process-architecture.md 10.4절),
+//! Credential Store(multi-engine-routing.md 12절). 그 기준들은 **문서의 산문**이었다.
+//! 사람이 세 문서에서 아홉 개 남짓한 항목을 읽고, 손으로 해보고, 머릿속에서 판정한다.
+//!
+//! 그 방식의 실패는 조용하다: 한 항목을 빠뜨려도 아무 일도 일어나지 않고, 나중에
+//! "확인했다"는 기억만 남는다. 유도 문턱과 열린 질문에 이미 적용한 규율(표본이 모자라면
+//! 답을 내지 않는다)을 여기에도 준다 — **확인하지 못한 것을 통과로 세지 않는다.**
+//!
+//! # 이 모듈이 판정하지 않는 것
+//!
+//! 여기가 하는 일은 관측을 기준에 대보는 것뿐이다. 사람이 해야 하는 단계(실제 취소 실행,
+//! node 없는 머신에서 설치본 실행)는 **`NeedsHuman`으로 남고 그 사실이 판정에 반영된다.**
+//! 자동으로 못 본 것을 통과로 바꾸는 순간 이 도구는 착시를 만드는 쪽이 된다.
+
+use std::path::{Path, PathBuf};
+
+/// 기준 하나의 상태.
+///
+/// **다섯 값인 것이 요점이다.** 넷으로 줄이면 "확인할 수 없었다"와 "아직 만들지 않았다"가
+/// 뭉개지는데, 그 둘은 다음에 할 일이 전혀 다르다 — 앞은 Windows를 구하는 것이고 뒤는
+/// 코드를 쓰는 것이다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Passed,
+    Failed,
+    /// 이 플랫폼/입력에서는 볼 수 없다 (Windows 전용이거나 번들 경로를 안 줬다).
+    NotCheckableHere,
+    /// 자동으로 볼 수 없다 — 사람이 해야 한다.
+    NeedsHuman,
+    /// 기능 자체가 아직 없다.
+    NotImplemented,
+}
+
+impl CheckStatus {
+    fn is_pass(&self) -> bool {
+        matches!(self, CheckStatus::Passed)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Check {
+    pub id: &'static str,
+    /// **문서에 적힌 기준 문장.** 여기서 바꿔 쓰지 않는다 — 두 곳이 다른 말을 하면
+    /// 어느 쪽이 기준인지 알 수 없다.
+    pub criterion: &'static str,
+    pub status: CheckStatus,
+    /// 무엇을 보고 그렇게 판정했는가, 또는 사람이 무엇을 해야 하는가.
+    pub detail: String,
+}
+
+/// 한 항목(= 문서 한 절)의 결말.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// 기준이 **전부** 통과했다.
+    Landed,
+    /// 하나라도 실패했다. 통과하지 못한 것이 있는 것과 다르다 — 이건 고칠 것이 있다는 뜻이다.
+    NotLanded,
+    /// 실패는 없지만 확인하지 못한 것이 남았다. **`Landed`가 아니다.**
+    Incomplete,
+}
+
+fn verdict_of(checks: &[Check]) -> Verdict {
+    if checks.iter().any(|c| c.status == CheckStatus::Failed) {
+        return Verdict::NotLanded;
+    }
+    if checks.iter().all(|c| c.status.is_pass()) {
+        return Verdict::Landed;
+    }
+    Verdict::Incomplete
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Group {
+    pub id: &'static str,
+    /// 기준이 적힌 곳. 판정을 의심할 때 볼 자리를 알려준다.
+    #[serde(rename = "documentedAt")]
+    pub documented_at: &'static str,
+    pub checks: Vec<Check>,
+    pub verdict: Verdict,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LandingReport {
+    /// 이 판정이 어느 OS에서 나왔는가. **Windows가 아니면 대부분 볼 수 없다**는 사실이
+    /// 보고서 안에 남아야 한다.
+    pub platform: String,
+    pub groups: Vec<Group>,
+    /// 전체 결말 — 항목 중 하나라도 `Landed`가 아니면 `Landed`가 아니다.
+    pub verdict: Verdict,
+    /// 사람이 아직 해야 하는 일. 비어 있지 않으면 그게 다음 할 일 목록이다.
+    pub remaining: Vec<String>,
+}
+
+/// 판정에 쓰는 관측. **판정 로직을 순수하게 두기 위해** 입력으로 받는다 —
+/// 그래야 Windows 없이도 규칙 자체를 테스트할 수 있다.
+#[derive(Debug, Clone)]
+pub struct Observations {
+    pub os: String,
+    /// `tauri-build`이 만든 번들 디렉터리. 없으면 번들 기준을 볼 수 없다.
+    pub bundle_dir: Option<PathBuf>,
+}
+
+impl Observations {
+    pub fn here(bundle_dir: Option<PathBuf>) -> Self {
+        Self {
+            os: std::env::consts::OS.to_string(),
+            bundle_dir,
+        }
+    }
+
+    fn on_windows(&self) -> bool {
+        self.os == "windows"
+    }
+}
+
+fn check(id: &'static str, criterion: &'static str, status: CheckStatus, detail: impl Into<String>) -> Check {
+    Check {
+        id,
+        criterion,
+        status,
+        detail: detail.into(),
+    }
+}
+
+/// 디렉터리 아래 파일 크기 합계(바이트). 얕게 훑는다 — 번들 구조는 깊지 않다.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+fn job_object_checks(obs: &Observations) -> Vec<Check> {
+    let windows = obs.on_windows();
+    vec![
+        check(
+            "coreBuild",
+            "`npm run core:build`가 Windows에서 통과한다.",
+            if windows {
+                CheckStatus::Passed
+            } else {
+                CheckStatus::NotCheckableHere
+            },
+            if windows {
+                "이 바이너리가 Windows에서 돌고 있다 — 빌드가 통과했다는 증거다.".to_string()
+            } else {
+                format!("여기는 {}다. Windows에서 다시 돌릴 것.", obs.os)
+            },
+        ),
+        check(
+            "e2eScenarioA",
+            "e2e 시나리오 A(손자 프로세스가 실제로 죽는가)가 Windows에서 통과한다.",
+            CheckStatus::NeedsHuman,
+            "Windows에서 `npm run test:e2e`를 돌리고 시나리오 A가 통과하는지 볼 것. \
+             종료 코드만으로는 이 기준을 알 수 없다 — 다른 시나리오가 실패해도 같은 코드다.",
+        ),
+        check(
+            "treeGuaranteedTrue",
+            "`TreeKillOutcome.tree_guaranteed`가 Windows에서 true가 되고, 그 값이 UI 문구를 실제로 바꾼다.",
+            CheckStatus::NeedsHuman,
+            "**절반은 여기서 이미 지킨다** — 값에 따라 문구가 갈리는 것은 플랫폼과 무관한 \
+             순수 분기이고 `tools/mod.rs`의 단위 테스트가 그 분기를 태운다. Windows에서 확인할 \
+             나머지 절반은 '실제 취소에서 그 값이 true가 되는가'다.",
+        ),
+        check(
+            "appNotInJob",
+            "앱 자신이 job에 들어가지 않는다 — `AssignProcessToJobObject`는 자식 핸들에만 부른다.",
+            CheckStatus::Passed,
+            "플랫폼과 무관한 **소스 불변식**이므로 Windows를 기다리지 않는다. \
+             `win_job.rs`를 훑는 테스트가 `verify`에서 지킨다.",
+        ),
+        check(
+            "jobHandleLifetime",
+            "job 핸들의 수명이 태스크와 같다 — 끝나면 닫히고, 닫히면 남은 프로세스가 죽는다.",
+            CheckStatus::NeedsHuman,
+            "핸들 수명은 **실행해야만 드러나는 종류**다(CLAUDE.md: 타입 검증은 동작 검증이 \
+             아니다). Windows에서 취소·강제 포기를 각각 한 번씩 돌리고 남은 프로세스를 확인할 것.",
+        ),
+    ]
+}
+
+fn bundle_checks(obs: &Observations) -> Vec<Check> {
+    let Some(dir) = obs.bundle_dir.as_ref() else {
+        return vec![
+            check(
+                "bundleContents",
+                "번들 안에 `sidecar/node.exe`와 `sidecar/index.js`가 있다.",
+                CheckStatus::NotCheckableHere,
+                "`--bundle <경로>`로 `tauri-build` 산출물을 가리키면 확인한다.",
+            ),
+            check(
+                "runsWithoutNodeOnPath",
+                "설치된 앱을 PATH에 node가 없는 머신에서 실행해 sidecar가 뜬다.",
+                CheckStatus::NeedsHuman,
+                "설치본을 node 없는 Windows에서 실행할 것.",
+            ),
+            check(
+                "sourcesAreBundled",
+                "그 실행에서 `ProgramSource`/`EntrySource`가 둘 다 `Bundled`다.",
+                CheckStatus::NeedsHuman,
+                "앱이 번들이 아닐 때 stderr로 알린다(session.rs) — 그 줄이 없어야 한다.",
+            ),
+            check(
+                "bundleSizeRecorded",
+                "번들 크기가 기록된다 — \"크기는 고려하지 않았다\"가 아니라 \"얼마인지 알고 받아들였다\"여야 한다.",
+                CheckStatus::NotCheckableHere,
+                "`--bundle <경로>`를 주면 재서 적는다.",
+            ),
+        ];
+    };
+
+    let node_exe = dir.join("sidecar").join("node.exe");
+    let entry = dir.join("sidecar").join("index.js");
+    let has_both = node_exe.is_file() && entry.is_file();
+    let size = dir_size(dir);
+
+    vec![
+        check(
+            "bundleContents",
+            "번들 안에 `sidecar/node.exe`와 `sidecar/index.js`가 있다.",
+            if has_both {
+                CheckStatus::Passed
+            } else {
+                CheckStatus::Failed
+            },
+            format!(
+                "node.exe={} index.js={} ({})",
+                node_exe.is_file(),
+                entry.is_file(),
+                dir.display()
+            ),
+        ),
+        check(
+            "runsWithoutNodeOnPath",
+            "설치된 앱을 PATH에 node가 없는 머신에서 실행해 sidecar가 뜬다.",
+            CheckStatus::NeedsHuman,
+            "번들에 파일이 있다는 것과 그것으로 뜬다는 것은 다른 사실이다.",
+        ),
+        check(
+            "sourcesAreBundled",
+            "그 실행에서 `ProgramSource`/`EntrySource`가 둘 다 `Bundled`다.",
+            CheckStatus::NeedsHuman,
+            "앱이 번들이 아닐 때 stderr로 알린다(session.rs) — 그 줄이 없어야 한다.",
+        ),
+        check(
+            "bundleSizeRecorded",
+            "번들 크기가 기록된다 — \"크기는 고려하지 않았다\"가 아니라 \"얼마인지 알고 받아들였다\"여야 한다.",
+            if size > 0 {
+                CheckStatus::Passed
+            } else {
+                CheckStatus::Failed
+            },
+            format!("{size} 바이트 ({:.1} MiB)", size as f64 / (1024.0 * 1024.0)),
+        ),
+    ]
+}
+
+fn credential_checks() -> Vec<Check> {
+    // **기준은 있는데 기능이 없다.** 그 사실을 `Failed`로 적으면 "만들었는데 깨졌다"로 읽힌다.
+    let why = "아직 환경변수에서 읽는다 — Credential Store는 구현되지 않았다.";
+    vec![
+        check(
+            "storedThroughDpapi",
+            "키를 앱 안에서 넣고 지울 수 있고, 저장이 Windows Credential Manager(DPAPI)를 지난다.",
+            CheckStatus::NotImplemented,
+            why,
+        ),
+        check(
+            "noPlaintextAtRest",
+            "저장 후 앱 디렉터리와 설정 어디에도 키 문자열이 평문으로 남지 않는다.",
+            CheckStatus::NotImplemented,
+            why,
+        ),
+        check(
+            "uiNeverHoldsTheKey",
+            "UI 프로세스는 키를 갖지 않는다 — 입력 즉시 Rust로 넘기고 이후 조회는 \"있다/없다\"만 돌려준다(원칙 3).",
+            CheckStatus::NotImplemented,
+            why,
+        ),
+        check(
+            "injectionStaysOnce",
+            "sidecar에는 여전히 spawn 시 1회 주입이고 허용 목록으로 걸러진다 — 저장소가 생겨도 `credential.get`이 되살아나지 않는다.",
+            CheckStatus::NotImplemented,
+            "8.2절이 지운 메서드다. 저장소를 만들면서 되살리고 싶어지는 자리이므로 기준으로 못박아 둔다.",
+        ),
+    ]
+}
+
+/// 관측을 기준에 대본다. **아무것도 실행하지 않고 아무것도 쓰지 않는다.**
+pub fn assess(obs: &Observations) -> LandingReport {
+    let groups = vec![
+        {
+            let checks = job_object_checks(obs);
+            Group {
+                id: "jobObject",
+                documented_at: "state-machine-and-protocol.md 20.6절",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+        {
+            let checks = bundle_checks(obs);
+            Group {
+                id: "sidecarBundle",
+                documented_at: "process-architecture.md 10.4절",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+        {
+            let checks = credential_checks();
+            Group {
+                id: "credentialStore",
+                documented_at: "multi-engine-routing.md 12절",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+    ];
+
+    let all: Vec<&Check> = groups.iter().flat_map(|g| g.checks.iter()).collect();
+    let verdict = if all.iter().any(|c| c.status == CheckStatus::Failed) {
+        Verdict::NotLanded
+    } else if all.iter().all(|c| c.status.is_pass()) {
+        Verdict::Landed
+    } else {
+        Verdict::Incomplete
+    };
+
+    let remaining = all
+        .iter()
+        .filter(|c| !c.status.is_pass())
+        .map(|c| format!("[{}] {} — {}", c.id, c.criterion, c.detail))
+        .collect();
+
+    LandingReport {
+        platform: obs.os.clone(),
+        groups,
+        verdict,
+        remaining,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn linux() -> Observations {
+        Observations {
+            os: "linux".to_string(),
+            bundle_dir: None,
+        }
+    }
+
+    /// **확인하지 못한 것은 통과가 아니다.** 이 규칙이 이 모듈의 존재 이유다.
+    #[test]
+    fn unchecked_criteria_never_add_up_to_landed() {
+        let report = assess(&linux());
+        assert_eq!(report.verdict, Verdict::Incomplete);
+        assert!(!report.remaining.is_empty());
+    }
+
+    /// 실패가 하나라도 있으면 "확인 못 함"과 섞이지 않는다 — 고칠 것이 있다는 사실이 이긴다.
+    #[test]
+    fn a_failure_outranks_the_unchecked_ones() {
+        let checks = vec![
+            check("a", "c", CheckStatus::Passed, ""),
+            check("b", "c", CheckStatus::NeedsHuman, ""),
+            check("c", "c", CheckStatus::Failed, ""),
+        ];
+        assert_eq!(verdict_of(&checks), Verdict::NotLanded);
+    }
+
+    #[test]
+    fn all_passed_is_the_only_way_to_land() {
+        let checks = vec![
+            check("a", "c", CheckStatus::Passed, ""),
+            check("b", "c", CheckStatus::Passed, ""),
+        ];
+        assert_eq!(verdict_of(&checks), Verdict::Landed);
+
+        for blocked in [
+            CheckStatus::NotCheckableHere,
+            CheckStatus::NeedsHuman,
+            CheckStatus::NotImplemented,
+        ] {
+            let mixed = vec![
+                check("a", "c", CheckStatus::Passed, ""),
+                check("b", "c", blocked.clone(), ""),
+            ];
+            assert_eq!(verdict_of(&mixed), Verdict::Incomplete, "{blocked:?}");
+        }
+    }
+
+    /// Linux에서 Windows 전용 기준을 통과로 세면 안 된다. **여기서 통과한 verify가 그 코드에
+    /// 대해 아무것도 말하지 않는다**는 사실이 보고서에도 그대로 남아야 한다.
+    #[test]
+    fn windows_only_criteria_are_not_checkable_on_linux() {
+        let report = assess(&linux());
+        let job = report.groups.iter().find(|g| g.id == "jobObject").unwrap();
+        let build = job.checks.iter().find(|c| c.id == "coreBuild").unwrap();
+        assert_eq!(build.status, CheckStatus::NotCheckableHere);
+        assert!(build.detail.contains("linux"), "{}", build.detail);
+    }
+
+    /// 번들 경로를 주면 볼 수 있는 것이 늘어난다 — 그리고 없는 파일은 **실패**다
+    /// ("확인 못 함"이 아니다: 봤는데 없었다).
+    #[test]
+    fn a_bundle_without_the_runtime_is_a_failure_not_an_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let obs = Observations {
+            os: "windows".to_string(),
+            bundle_dir: Some(dir.path().to_path_buf()),
+        };
+        let report = assess(&obs);
+        let bundle = report.groups.iter().find(|g| g.id == "sidecarBundle").unwrap();
+        let contents = bundle.checks.iter().find(|c| c.id == "bundleContents").unwrap();
+        assert_eq!(contents.status, CheckStatus::Failed);
+        assert_eq!(bundle.verdict, Verdict::NotLanded);
+    }
+
+    #[test]
+    fn a_bundle_with_the_runtime_passes_and_records_its_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("sidecar");
+        std::fs::create_dir_all(&sidecar).unwrap();
+        std::fs::write(sidecar.join("node.exe"), vec![0u8; 2048]).unwrap();
+        std::fs::write(sidecar.join("index.js"), "console.log(1);").unwrap();
+
+        let obs = Observations {
+            os: "windows".to_string(),
+            bundle_dir: Some(dir.path().to_path_buf()),
+        };
+        let report = assess(&obs);
+        let bundle = report.groups.iter().find(|g| g.id == "sidecarBundle").unwrap();
+        assert_eq!(
+            bundle.checks.iter().find(|c| c.id == "bundleContents").unwrap().status,
+            CheckStatus::Passed
+        );
+        let size = bundle.checks.iter().find(|c| c.id == "bundleSizeRecorded").unwrap();
+        assert_eq!(size.status, CheckStatus::Passed);
+        // 크기를 **적는다**. "기록된다"가 기준이므로 숫자가 없으면 통과가 아니다.
+        assert!(size.detail.contains("2"), "{}", size.detail);
+    }
+
+    /// 만들지 않은 것은 실패가 아니다 — 다음에 할 일이 다르다.
+    #[test]
+    fn an_unbuilt_feature_is_not_a_failure() {
+        let report = assess(&linux());
+        let cred = report.groups.iter().find(|g| g.id == "credentialStore").unwrap();
+        assert!(cred.checks.iter().all(|c| c.status == CheckStatus::NotImplemented));
+        assert_eq!(cred.verdict, Verdict::Incomplete);
+    }
+
+    /// 기준 문장이 비어 있으면 이 보고서는 id 목록일 뿐이다.
+    #[test]
+    fn every_check_carries_the_documented_sentence() {
+        let report = assess(&linux());
+        let mut ids = std::collections::BTreeSet::new();
+        for group in &report.groups {
+            assert!(!group.documented_at.is_empty(), "{}", group.id);
+            for c in &group.checks {
+                assert!(!c.criterion.is_empty(), "{}", c.id);
+                assert!(!c.detail.is_empty(), "{}", c.id);
+                assert!(ids.insert(c.id), "id가 겹칩니다: {}", c.id);
+            }
+        }
+    }
+    // ---- 소스 불변식: 앱 자신이 job에 들어가지 않는다 (20.6절 4번) ----
+    //
+    // `win_job.rs`는 이 규칙을 주석에 적어두고 **"리뷰에서 멈춰야 한다"**고 말한다. 사람이
+    // 지키는 규칙은 언젠가 빠지고, 이 규칙이 빠지면 증상은 **앱이 스스로 죽는 것**이다
+    // (KILL_ON_JOB_CLOSE job에 우리 프로세스가 들어가면 Drop이 앱을 죽인다).
+    //
+    // 이 파일은 Linux에서 컴파일되지 않지만 **텍스트로는 읽힌다.** 그래서 Windows를 기다리지
+    // 않고 여기서 지킨다 — 착지 보고서가 이 항목을 `Passed`로 적는 근거가 이 테스트다.
+
+    /// **주석을 뺀 코드만** 돌려준다.
+    ///
+    /// `win_job.rs`는 금지된 심볼의 이름을 주석에 적어 "쓰지 말 것"이라고 말한다. 주석까지
+    /// 훑으면 그 금지 문장 자체가 위반으로 잡힌다 — 규칙을 적어두는 것이 규칙을 어기는 것이
+    /// 되는 셈이다. CLAUDE.md의 "소스를 검사하는 테스트는 자기 자신을 센다"와 같은 함정이고,
+    /// 실제로 이 테스트가 처음에 거기 걸렸다. **규칙은 코드에 대한 것이므로 검사도 코드만 본다.**
+    fn win_job_code() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("win_job.rs");
+        let source =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}를 읽지 못했습니다: {e}", path.display()));
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_app_never_puts_itself_into_the_job() {
+        let source = win_job_code();
+        // 빈 문자열에 대해 통과하는 검사를 허용하지 않는다 — 주석을 지우고도 코드가 남아야 한다.
+        assert!(source.len() > 500, "win_job.rs 코드를 못 읽었습니다");
+
+        // needle을 런타임에 조립한다 — 이 파일 자신이 검색 대상이 될 때 개수가 어긋난다.
+        let forbidden = "GetCurrent".to_string() + "Process";
+        assert!(
+            !source.contains(&forbidden),
+            "{forbidden}가 win_job.rs에 있습니다 — 앱이 자기 job에 들어가면 Drop이 앱을 죽입니다"
+        );
+
+        let assign = "AssignProcessTo".to_string() + "JobObject(";
+        let calls = source.matches(&assign).count();
+        // import 한 번, 호출 한 번. 호출이 늘면 "부르는 곳이 하나뿐"이라는 근거가 사라진다.
+        assert_eq!(calls, 1, "job 배정 호출이 {calls}개입니다 — 하나여야 합니다");
+
+        // 그 하나의 인자가 자식 핸들에서 온다.
+        //
+        // 닫는 괄호로 자르지 않는다 — 인자 안에 `as_raw_handle()`의 괄호가 있어서 첫 `)`는
+        // 호출의 끝이 아니다. 줄 끝까지 보는 편이 단순하고 틀리지 않는다.
+        let call = source.split(&assign).nth(1).unwrap_or_default();
+        let args = call.lines().next().unwrap_or_default();
+        assert!(
+            args.contains("child.as_raw_handle"),
+            "job 배정 인자가 자식 핸들이 아닙니다: {args}"
+        );
+    }
+}
