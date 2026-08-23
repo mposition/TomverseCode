@@ -1049,7 +1049,7 @@ process-architecture.md 2절의 신뢰 모델("Node가 완전히 장악당해도
 - **OpenAI (초안/DRAFTING, SINGLE_MODEL_FIX 아님):** Responses API, `text.format = { type: "json_schema", strict: true, schema: {...} }`로 구조화된 JSON 출력을 강제. `response.output_text`에서 파싱(`spike/src/providers/openai.ts`).
 - **Anthropic (검수/REVIEWING, SINGLE_MODEL_FIX):** Messages API, `tool_choice: { type: "tool", name: "..." }`로 특정 도구 호출을 강제해 구조화된 판정(`verdict`/`rationale`/`finalFile`)을 받음(`spike/src/providers/anthropic.ts`). REJECT일 때 `finalFile`을 생략할 수 있도록 스키마의 `required`에서 제외.
 - **모델 선택 관련 실전 이슈:** `gpt-5`/`gpt-5.5` 같은 reasoning 모델은 OpenAI Organization Verification이 필요해 계정에 따라 즉시 사용이 막힐 수 있다(스파이크 실행 중 실제로 발생). 프로덕션에서는 조직 인증 여부를 사전에 확인하거나, 인증이 안 된 조직을 위한 폴백 모델(`gpt-4.1` 등)을 Provider Adapter 레벨에서 자동 선택하는 로직이 필요 — 단순 설정값이 아니라 "인증 상태에 따른 모델 가용성"이라는 새로운 축으로 다뤄야 한다.
-- **아직 스파이크가 다루지 않은 것:** `apply_patch`(unified diff) 방식은 검증 안 됨 — 스파이크는 파일 전체 교체만 사용. `ToolRequest`/`ToolResult` 루프, REVISE 다회차, FIX_LOOP는 실제 구현 전이라 여전히 설계 단계.
+- ~~**아직 스파이크가 다루지 않은 것:** `apply_patch`(unified diff), `ToolRequest`/`ToolResult` 루프, REVISE 다회차, FIX_LOOP는 실제 구현 전이라 여전히 설계 단계~~ → **넷 다 구현·검증됐다.** `apply_patch`는 Rust `tools/patch.rs`가 unified diff를 적용하고 e2e가 실제 파일 변경까지 확인한다(문서 21.4절의 순차 적용 흉내가 그 위에 서 있다). `ToolRequest`/`ToolResult` 루프는 Policy Gate를 지나는 제품의 주 경로이고, REVISE 다회차는 `reviseRounds ≤ 2`로, FIX_LOOP는 `fixLoopRounds ≤ 3`으로 각각 상한과 테스트가 있다. **이 문장을 그대로 두면 문서가 거짓을 말한다** — 열린 항목보다 틀린 항목이 나쁘다.
 
 ### 13.4 TRIAGE 임계값 캘리브레이션 — 유료 실행을 기다리고 있지 않았다
 

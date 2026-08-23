@@ -404,6 +404,22 @@ fieldset.modes label {
   color: var(--error);
 }
 
+/* 대조 요약. **초록색이 없다** — 일치는 검증이 아니므로 성공 톤을 쓸 자리가 아니다(3.9절).
+   갈린 경우만 눈에 띄게 하고, 나머지는 조용하되 **글자로는 반드시 말한다.** */
+.contrast-note {
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  margin-top: 8px;
+}
+
+.contrast-note p {
+  margin: 2px 0;
+}
+
+.contrast-disagreed {
+  border-left-color: var(--warn);
+}
+
 /* 선택 항목 배지. 필수(`badge-required`)와 **색이 달라야** 한 목록에 있을 때 구별된다.
    접힌 영역 안이지만 열면 필수와 같은 모양의 질문이 나오므로, 배지가 유일한 구분이다. */
 .badge-optional {

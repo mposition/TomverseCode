@@ -34,6 +34,7 @@ import {
 } from "./types";
 import { AcceptanceCriteriaPanel } from "./components/AcceptanceCriteriaPanel";
 import { resultBasis } from "./lib/resultBasis";
+import { summarizeContrast, type ContrastInput } from "./lib/contrastSummary";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { DiffPanel } from "./components/DiffPanel";
 import { DisagreementCard } from "./components/DisagreementCard";
@@ -1197,6 +1198,7 @@ export default function App() {
                         ))}
                       </ul>
                     )}
+                    <ContrastNote events={events} appliedPolicies={routing.appliedPolicies} />
                   </>
                 ) : (
                   <p className="muted">아직 라우팅되지 않았습니다.</p>
@@ -1453,6 +1455,43 @@ function statusLabel(status: FinalResult["status"]): string {
 function currentTaskId(events: TaskEvent[], fallback: string | null): string | null {
   const last = events[events.length - 1];
   return last?.taskId ?? fallback;
+}
+
+/**
+ * 대조가 무엇을 말했는가 — **조용한 것도 주장이다**(state-machine 17절).
+ *
+ * 갈린 것이 있을 때만 카드가 뜨므로, "대조했는데 같았다"와 "대조하지 않았다"가 사용자에게는
+ * 똑같이 빈 화면이었다. 그 침묵이 하필 가장 위험한 쪽으로 읽힌다 — 두 모델이 같은 방식으로
+ * 틀리면 불일치가 생기지 않기 때문이다(product-strategy 9.2-B).
+ *
+ * **초록색을 쓰지 않는다.** 판정은 `lib/contrastSummary.ts`가 하고 여기서는 그리기만 한다.
+ */
+function ContrastNote({ events, appliedPolicies }: { events: TaskEvent[]; appliedPolicies: string[] }) {
+  const summary = summarizeContrast({ detected: findContrast(events), appliedPolicies });
+  if (!summary) return null;
+  return (
+    <div className={`contrast-note contrast-${summary.kind}`}>
+      <p className="small">{summary.note}</p>
+      {summary.kind === "disagreed" && (
+        <p className="muted small">
+          답을 요구한 항목 {summary.askedCount}건 · 함께 실은 참고 항목 {summary.advisoryCount}건
+        </p>
+      )}
+      {summary.agreedFields.length > 0 && (
+        <p className="muted small">같았던 항목: {summary.agreedFields.join(", ")}</p>
+      )}
+    </div>
+  );
+}
+
+/** 마지막 `DISAGREEMENT_DETECTED` — 대조를 돌렸는지와 그 결과. */
+function findContrast(events: TaskEvent[]): ContrastInput["detected"] {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (events[i]!.type === "DISAGREEMENT_DETECTED") {
+      return events[i]!.payload as unknown as ContrastInput["detected"];
+    }
+  }
+  return undefined;
 }
 
 function findRouting(events: TaskEvent[]): RoutingInfo | null {
