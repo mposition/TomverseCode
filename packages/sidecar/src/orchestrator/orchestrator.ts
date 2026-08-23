@@ -1275,8 +1275,23 @@ export class Orchestrator {
   }
 
   /** 기준 대조의 근거가 되는 워크스페이스 사실. 실재하지 않는 경로는 근거가 될 수 없다. */
+  /**
+   * 기준 판정이 "이 경로가 실재하는가"를 물을 때 보는 목록 — 17.9.1절.
+   *
+   * **종전에는 `snapshot.relevantFiles`뿐이었다.** 그건 워크스페이스가 아니라 토큰 예산이 고른
+   * 부분집합이므로, 예산에 밀린 테스트도 이번 변경이 새로 만든 테스트도 전부 "그런 파일이
+   * 없습니다"가 됐다. 네 곳을 합친다 — 인덱스가 본 것, 인덱스가 제외한 것, 스냅샷이 뺀 것,
+   * 이번 변경이 건드린 것. 뒤의 셋은 **제외/변경 자체가 존재의 증거**다.
+   */
   private criteriaContext(): CriteriaContext {
-    return { workspaceFiles: this.snapshot?.relevantFiles.map((f) => f.path) ?? [] };
+    return {
+      knownFiles: [
+        ...this.contextEngine.knownFilePaths(),
+        ...(this.snapshot?.relevantFiles.map((f) => f.path) ?? []),
+        ...(this.snapshot?.excludedNotes?.map((n) => n.path) ?? []),
+        ...this.mutatedPaths,
+      ],
+    };
   }
 
   /** 계획의 ToolRequest를 순차 실행한다. 재시도 상한은 `toolRetries`. */
@@ -1865,7 +1880,8 @@ export class Orchestrator {
   }
 
   /**
-   * `DraftProposal.doneCriteria`를 기준 목록에 흡수한다(17.3절 구멍 1).
+   * `DraftProposal`의 `doneCriteria`와 `requiredTests`를 기준 목록에 흡수한다(17.3절 구멍 1,
+   * 17.9.1절).
    *
    * `DRAFT_SCHEMA`가 required로 강제해서 받아놓고 소비처가 타입 정의뿐이었다 —
    * 요구 분석의 결론이 수집만 되고 버려지고 있었다.
@@ -1875,15 +1891,37 @@ export class Orchestrator {
    */
   private absorbDraftCriteria(proposal: DraftProposal): AcceptanceCriterion[] {
     const decidedAt = new Date().toISOString();
-    const absorbed: AcceptanceCriterion[] = proposal.doneCriteria
-      .map((text) => text.trim())
-      .filter((text) => text.length > 0)
-      .map((text, index) => ({
-        criterionId: `${proposal.proposalId}-done-${index}`,
-        text,
-        source: "draft_proposal" as const,
-        decidedAt,
-      }));
+    const absorbed: AcceptanceCriterion[] = [
+      ...proposal.doneCriteria
+        .map((text) => text.trim())
+        .filter((text) => text.length > 0)
+        .map((text, index) => ({
+          criterionId: `${proposal.proposalId}-done-${index}`,
+          text,
+          source: "draft_proposal" as const,
+          decidedAt,
+        })),
+      /**
+       * `requiredTests`도 함께 흡수한다 — 17.9.1절.
+       *
+       * **합의하면 사라지는 구조였다.** 이 필드는 대조 가능 필드라서 두 초안이 갈리면
+       * 쟁점이 되고 사용자의 답이 기준이 된다. 그런데 둘이 **합의하면** 아무 데도 실리지
+       * 않고 사라졌다 — 합의가 검증이 아닌데(17.6절), 합의한 요구만 없어지는 것은 거꾸로다.
+       *
+       * 그리고 이 필드는 기준↔테스트 연결의 재료 그 자체다. 모델이 "무엇이 확인되어야
+       * 하는가"에 답한 유일한 자리이고, 그 답은 대개 **테스트 파일 이름**이라 판정 규칙이
+       * 바로 이을 수 있다. 이건 잇는 규칙을 넓히는 것이 아니라, 이을 것을 버리지 않는 것이다.
+       */
+      ...proposal.requiredTests
+        .map((text) => text.trim())
+        .filter((text) => text.length > 0)
+        .map((text, index) => ({
+          criterionId: `${proposal.proposalId}-test-${index}`,
+          text,
+          source: "draft_proposal" as const,
+          decidedAt,
+        })),
+    ];
     this.acceptanceCriteria = [
       ...this.acceptanceCriteria.filter((c) => c.source !== "draft_proposal"),
       ...absorbed,

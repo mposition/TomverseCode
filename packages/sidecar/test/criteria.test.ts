@@ -11,7 +11,7 @@ import { evaluateCriteria, findCriteriaConflicts, describeEvaluations } from "..
  */
 
 const FILES = ["src/validate.ts", "src/api/login.ts", "test/validate.test.ts", "package.json"];
-const CONTEXT = { workspaceFiles: FILES };
+const CONTEXT = { knownFiles: FILES };
 
 function criterion(overrides: Partial<AcceptanceCriterion> & { text: string }): AcceptanceCriterion {
   return {
@@ -109,23 +109,98 @@ test("test가 통과해도 그 파일이 실행된 근거가 없으면 미확인
   assert.match(evaluations[0]!.reason, /실행된 근거를 찾지 못했습니다/);
 });
 
-test("존재하지 않는 테스트 파일을 적어도 확인이 되지 않는다", () => {
+test("아는 목록에도 검증 출력에도 없는 테스트 파일은 근거가 되지 못한다", () => {
   // 모델도 사용자도 없는 파일 이름을 적을 수 있다. 그걸 근거로 쓰면 근거 자체가 허구다.
+  //
+  // **종전 fixture는 자기모순이었다**: 파일이 없다고 주장하면서 러너 출력에는
+  // `ok 1 - imaginary.test.ts`를 넣어두고 있었다. 러너가 실행했다면 그 파일은 실재한다 —
+  // 그래서 그 fixture가 재던 것은 "지어낸 이름을 거부한다"가 아니라 "실행 증거를 무시한다"였다.
   const evaluations = evaluateCriteria({
     criteria: [criterion({ text: "확인은 imaginary.test.ts 로 한다" })],
-    report: report({ status: "PASSED", detail: "ok 1 - imaginary.test.ts" }),
+    report: report({ status: "PASSED", detail: "ok 1 - test/validate.test.ts" }),
     changedPaths: ["src/validate.ts"],
     context: CONTEXT,
   });
   assert.equal(evaluations[0]!.status, "UNVERIFIED");
   // **"이름이 없었다"와 구별된다.** 고쳐야 할 곳이 다르므로 집계에서 뭉치면 안 된다.
-  assert.equal(evaluations[0]!.code, "test_reference_not_found");
+  assert.equal(evaluations[0]!.code, "test_reference_unresolved");
+  // 그리고 **없다고 단언하지 않는다** — 우리가 아는 목록은 워크스페이스 전부가 아니다.
+  assert.ok(!evaluations[0]!.reason.includes("워크스페이스에 없"), evaluations[0]!.reason);
+});
+
+/**
+ * 17.9.1절 — 잇지 못한 이유의 상당수는 "이을 수 없어서"가 아니라 **실재 판정이 틀려서**였다.
+ *
+ * 아래 셋은 종전 규칙에서 전부 미확인이었다. 셋 다 파일이 실재하고 테스트가 통과했는데도.
+ */
+test("스냅샷이 예산에 밀려 뺀 테스트도 실재 근거가 된다", () => {
+  const evaluations = evaluateCriteria({
+    criteria: [criterion({ text: "test/dropped.test.ts 로 확인한다" })],
+    report: report({ status: "PASSED", detail: "ok 1 - test/dropped.test.ts" }),
+    changedPaths: ["src/validate.ts"],
+    // 스냅샷의 relevantFiles에는 없지만 인덱스가 본 파일. 종전에는 이것이 "없는 파일"이었다.
+    context: { knownFiles: [...FILES, "test/dropped.test.ts"] },
+  });
+  assert.equal(evaluations[0]!.status, "VERIFIED_BY_TEST");
+});
+
+test("이번 변경이 새로 만든 테스트도 실재 근거가 된다", () => {
+  // 스냅샷은 패치 이전에 찍히므로 새 테스트는 거기 없다. **가장 확인되기 쉬운 경우가
+  // 구조적으로 확인 불가**였다 — 새 테스트를 쓰고 그것이 통과한 경우.
+  const evaluations = evaluateCriteria({
+    criteria: [criterion({ text: "test/new.test.ts 가 통과한다" })],
+    report: report({ status: "PASSED", detail: "ok 1 - test/new.test.ts" }),
+    changedPaths: ["src/validate.ts", "test/new.test.ts"],
+    context: { knownFiles: [...FILES, "test/new.test.ts"] },
+  });
+  assert.equal(evaluations[0]!.status, "VERIFIED_BY_TEST");
+});
+
+test("러너가 실행한 파일은 아는 목록에 없어도 실재 근거가 된다", () => {
+  // 러너의 argv/출력에 나타났다면 그 파일은 실재하고 실행됐다. 이건 스냅샷 목록보다
+  // **강한** 근거이므로, 목록에 없다는 이유로 떨어뜨리면 근거를 들고 와서 버리는 것이다.
+  const evaluations = evaluateCriteria({
+    criteria: [criterion({ text: "test/unlisted.test.ts 로 확인" })],
+    report: report({ status: "PASSED", detail: "ok 1 - test/unlisted.test.ts" }),
+    changedPaths: ["src/validate.ts"],
+    context: CONTEXT, // 목록에 없다
+  });
+  assert.equal(evaluations[0]!.status, "VERIFIED_BY_TEST");
+  assert.deepEqual(evaluations[0]!.evidence, ["test/unlisted.test.ts"]);
+});
+
+test("접미사 대조는 경계를 지킨다 — e.test.ts가 validate.test.ts로 세어지지 않는다", () => {
+  // 단순 endsWith를 쓰면 `validate.test.ts`가 `e.test.ts`로 끝나므로 서로 다른 파일이
+  // 같은 것으로 세어진다. 그러면 러너가 실제로 돌린 `e.test.ts`가 근거에서 빠진다.
+  const evaluations = evaluateCriteria({
+    criteria: [criterion({ text: "e.test.ts 로 확인" })],
+    report: report({ status: "PASSED", detail: "ok 1 - e.test.ts" }),
+    changedPaths: ["src/validate.ts"],
+    context: { knownFiles: ["test/validate.test.ts"] },
+  });
+  assert.equal(evaluations[0]!.status, "VERIFIED_BY_TEST");
+  assert.deepEqual(evaluations[0]!.evidence, ["e.test.ts"]);
+});
+
+test("러너가 언급하지 않으면 넓히지 않는다 — 이름만으로는 확인이 되지 않는다", () => {
+  // 위 세 테스트가 규칙을 넓힌 것으로 읽히지 않도록 반대편을 고정한다. 실행 근거가 없으면
+  // 파일이 실재해도 미확인이다(fail-closed).
+  const evaluations = evaluateCriteria({
+    criteria: [criterion({ text: "test/validate.test.ts 로 확인" })],
+    report: report({ status: "PASSED", detail: "ok 1 - something-else" }),
+    changedPaths: ["src/validate.ts"],
+    context: CONTEXT,
+  });
+  assert.equal(evaluations[0]!.status, "UNVERIFIED");
+  assert.equal(evaluations[0]!.code, "no_run_evidence");
 });
 
 test("미확인 사유는 코드로 구별된다 (집계가 한국어 문장을 파싱하지 않도록)", () => {
   const cases: { text: string; report: VerificationReport | null; code: string }[] = [
     { text: "오류 메시지를 한국어로 표시한다", report: report({}), code: "no_test_reference" },
-    { text: "확인은 imaginary.test.ts 로", report: report({}), code: "test_reference_not_found" },
+    { text: "확인은 imaginary.test.ts 로", report: report({}), code: "test_reference_unresolved" },
+    // 리포트가 없으면 러너 근거도 없다 — 없는 것을 근거로 채택하지 않는다.
+    { text: "확인은 imaginary.test.ts 로", report: null, code: "test_reference_unresolved" },
     {
       text: "test/validate.test.ts 로 확인",
       report: report({ status: "PASSED", detail: "ok 1 - unrelated" }),

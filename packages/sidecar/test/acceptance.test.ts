@@ -148,6 +148,42 @@ test("DraftProposal.doneCriteria가 draft_proposal 기준으로 흡수된다", a
   assert.equal(payload.acceptanceCriteriaReplaces, "draft_proposal");
 });
 
+/**
+ * 17.9.1절 — `requiredTests`는 대조 쟁점이 됐을 때만 기준이 되고, **두 초안이 합의하면
+ * 사라졌다.** 합의는 검증이 아닌데(17.6절) 합의한 요구만 없어지는 것은 거꾸로다. 그리고
+ * 이 필드는 기준↔테스트 연결의 재료 그 자체다 — 답이 대개 테스트 파일 이름이다.
+ */
+test("DraftProposal.requiredTests도 기준으로 흡수된다", async () => {
+  const { orchestrator } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [
+        {
+          kind: "draft",
+          payload: {
+            interpretation: "이메일 검증 누락",
+            patch: VALID_PATCH,
+            plan: [{ stepId: "s1", description: "고친다", targetPaths: [] }],
+            risks: [],
+            requiredTests: ["test/validate.test.ts", "  "],
+            uncertainties: [],
+            doneCriteria: ["빈 문자열을 거부한다"],
+          },
+        },
+      ],
+    }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  const texts = (result.acceptanceCriteria ?? [])
+    .filter((c) => c.source === "draft_proposal")
+    .map((c) => c.text);
+  // 빈 항목은 버린다 — 빈 기준은 체크리스트에서 판정 불가능한 행이 된다.
+  assert.deepEqual(texts, ["빈 문자열을 거부한다", "test/validate.test.ts"]);
+});
+
 test("재질문 뒤 새 초안이 오면 이전 초안의 기준은 대체되고 사용자 판정은 살아남는다", async () => {
   const { orchestrator, host } = build(
     { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },

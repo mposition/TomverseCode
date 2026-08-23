@@ -39,8 +39,20 @@ const TEST_REFERENCE = /[\w./\\-]+\.(?:test|spec)\.[a-z]{1,4}(?::\d+)?/gi;
 const PATH_REFERENCE = /[\w.\\/-]+\.[a-z]{1,5}(?::\d+)?/gi;
 
 export interface CriteriaContext {
-  /** 스냅샷이 본 워크스페이스 파일 목록. **실재하는 경로만** 근거로 쓴다. */
-  workspaceFiles: readonly string[];
+  /**
+   * **실재가 확인된 경로.** 이름이 `workspaceFiles`였을 때 담기던 것은 스냅샷의
+   * `relevantFiles`, 즉 **토큰 예산이 고른 부분집합**이었다. 그래서 이 목록에 없다는 것은
+   * 파일이 없다는 뜻이 아니라 이번 태스크의 컨텍스트에 안 실렸다는 뜻인데, 판정은 그것을
+   * "워크스페이스에 없습니다"라고 말하고 있었다(17.9.1절).
+   *
+   * 지금은 **본 적 있는 경로 전부**가 들어온다: 인덱스의 파일 목록, 인덱스가 하드 필터로
+   * 제외한 목록, 스냅샷이 예산에 밀려 뺀 목록, 이번 변경이 건드린 경로. 제외 목록은
+   * "없다"의 증거가 아니라 **"있다"의 증거다** — 없는 파일은 제외할 일도 없다.
+   *
+   * 그래도 이 목록은 워크스페이스 전부가 아니다(인덱스에 상한이 있다). 그래서 여기 없는
+   * 경로에 대해 우리는 **"없다"가 아니라 "모른다"**고 말한다.
+   */
+  knownFiles: readonly string[];
 }
 
 /**
@@ -51,7 +63,7 @@ export interface CriteriaContext {
  */
 function extractExistingPaths(text: string, pattern: RegExp, context: CriteriaContext): string[] {
   const index = new Map<string, string>();
-  for (const file of context.workspaceFiles) index.set(canonical(file), file);
+  for (const file of context.knownFiles) index.set(canonical(file), file);
 
   const found = new Set<string>();
   for (const raw of text.match(pattern) ?? []) {
@@ -66,7 +78,7 @@ function extractExistingPaths(text: string, pattern: RegExp, context: CriteriaCo
     // 여럿이면 어느 것을 가리키는지 모르므로 근거가 되지 못한다.
     const base = canonical(withoutLine).split("/").pop() ?? "";
     if (base.length === 0) continue;
-    const matches = context.workspaceFiles.filter((f) => canonical(f).split("/").pop() === base);
+    const matches = context.knownFiles.filter((f) => canonical(f).split("/").pop() === base);
     if (matches.length === 1) found.add(matches[0] as string);
   }
   return [...found];
@@ -177,20 +189,37 @@ export function evaluateCriteria(input: EvaluateInput): CriterionEvaluation[] {
       };
     }
 
-    const named = extractExistingPaths(criterion.text, TEST_REFERENCE, context);
-    if (named.length === 0) {
-      // **"이름이 없었다"와 "이름은 있는데 그런 파일이 없다"를 나눈다.** 고쳐야 할 곳이 다르다 —
-      // 전자는 기준을 적는 방식의 문제이고, 후자는 지어낸 이름을 근거로 쓰지 않는 규칙이
-      // 제대로 작동한 것이다. 한 덩어리로 세면 커버리지가 왜 낮은지 알 수 없다.
-      const mentioned = (criterion.text.match(TEST_REFERENCE) ?? []).length > 0;
+    const mentioned = testTokens(criterion.text);
+    if (mentioned.length === 0) {
       return {
         criterionId: criterion.criterionId,
         status: "UNVERIFIED" as const,
-        code: mentioned ? ("test_reference_not_found" as const) : ("no_test_reference" as const),
+        code: "no_test_reference" as const,
         // 이유를 적어두지 않으면 화면의 물음표가 결함처럼 보인다.
-        reason: mentioned
-          ? "기준이 지목한 테스트 파일이 워크스페이스에 없어 근거로 쓸 수 없습니다."
-          : "이 기준이 어떤 테스트로 확인되는지 자동으로 이을 수 없습니다 (기준 문장에 테스트 파일이 언급되지 않음).",
+        reason:
+          "이 기준이 어떤 테스트로 확인되는지 자동으로 이을 수 없습니다 (기준 문장에 테스트 파일이 언급되지 않음).",
+      };
+    }
+
+    const known = extractExistingPaths(criterion.text, TEST_REFERENCE, context);
+    // **러너가 실제로 실행한 파일은 그 자체로 실재의 증거다.** 아는 목록에 없다는 이유로
+    // 여기서 떨어뜨리면, 가장 강한 근거를 들고 와서 미확인으로 적는 셈이 된다(17.9.1절).
+    const fromRunner = mentioned.filter(
+      (token) => !known.some((k) => sameFile(k, token)) && runnerRan(testCheck, token)
+    );
+    const named = [...known, ...fromRunner];
+
+    if (named.length === 0) {
+      // **"이름이 없었다"와 "이름은 있는데 찾지 못했다"를 나눈다.** 고쳐야 할 곳이 다르다 —
+      // 전자는 기준을 적는 방식의 문제이고, 후자는 잇는 쪽의 문제다.
+      // 한 덩어리로 세면 커버리지가 왜 낮은지 알 수 없다.
+      return {
+        criterionId: criterion.criterionId,
+        status: "UNVERIFIED" as const,
+        code: "test_reference_unresolved" as const,
+        reason:
+          `기준이 지목한 ${mentioned.join(", ")}를 아는 파일 목록에서도 검증 출력에서도 찾지 못했습니다 ` +
+          "(그런 파일이 없다는 뜻은 아닙니다 — 인덱스에 없을 수도 있습니다).",
       };
     }
 
@@ -248,11 +277,9 @@ function evaluateNamedTest(
     };
   }
 
-  // 실행 근거는 세 곳에서 찾는다. **실행된 argv가 가장 강한 근거다** — 러너가 그 파일을 인자로
-  // 받았다면 그 파일은 실행됐다. 출력은 러너 형식에 따라 파일명을 안 찍을 수도 있어 보조다.
-  const commandLine = testCheck.command ? [testCheck.command.program, ...testCheck.command.args].join(" ") : "";
-  const output = `${commandLine}\n${testCheck.detail ?? ""}\n${testCheck.summary}`;
-  const ran = named.filter((path) => outputMentions(output, path));
+  // 실행 근거는 `runnerRan`과 **같은 텍스트**에서 찾는다. 두 곳이 다른 문자열을 보면
+  // "러너가 실행했다고 봐서 근거로 채택한 파일"이 "실행 근거 없음"으로 떨어질 수 있다.
+  const ran = named.filter((path) => outputMentions(runnerText(testCheck), path));
   if (ran.length === 0) {
     return {
       ...base,
@@ -270,6 +297,46 @@ function evaluateNamedTest(
     reason: `${ran.join(", ")}가 실행됐고 test 체크가 통과했습니다. 이 기준을 그 테스트가 확인했다는 뜻이 아니라, 그 테스트가 실행되어 통과했다는 뜻입니다.`,
     evidence: ran,
   };
+}
+
+/**
+ * 기준 문장이 **언급한** 테스트 토큰. 실재 여부는 보지 않는다.
+ *
+ * 실재 판정과 언급 판정을 나눈 이유: 종전에는 둘이 한 함수에 묶여 있어서, 아는 목록에 없으면
+ * 토큰 자체가 사라졌다. 그러면 "언급이 없었다"와 "언급은 있는데 못 찾았다"를 구별하려고
+ * 정규식을 **한 번 더** 돌려야 했고, 두 곳이 갈라질 수 있는 상태였다.
+ */
+function testTokens(text: string): string[] {
+  const seen = new Set<string>();
+  for (const raw of text.match(TEST_REFERENCE) ?? []) seen.add(raw.replace(/:\d+$/, ""));
+  return [...seen];
+}
+
+/**
+ * 검증 러너가 이 파일을 **실행했는가.**
+ *
+ * 근거는 두 곳이다. 실행된 argv가 가장 강하다 — 러너가 그 파일을 인자로 받았다면 그 파일은
+ * 실재하고 실행됐다. 출력은 러너 형식에 따라 파일명을 안 찍을 수도 있어 보조다.
+ */
+function runnerRan(testCheck: VerificationCheck | undefined, path: string): boolean {
+  if (!testCheck) return false;
+  return outputMentions(runnerText(testCheck), path);
+}
+
+function runnerText(testCheck: VerificationCheck): string {
+  const commandLine = testCheck.command ? [testCheck.command.program, ...testCheck.command.args].join(" ") : "";
+  return `${commandLine}\n${testCheck.detail ?? ""}\n${testCheck.summary}`;
+}
+
+/**
+ * 두 경로 표기가 같은 파일을 가리키는가. 토큰이 파일명만 적은 경우(`validate.test.ts`)를
+ * 위해 접미사도 인정하되 **경계를 지킨다** — 단순 `endsWith`를 쓰면 `e.test.ts`가
+ * `validate.test.ts`에 걸려 서로 다른 파일이 같은 것으로 세어진다.
+ */
+function sameFile(known: string, token: string): boolean {
+  const a = canonical(known);
+  const b = canonical(token);
+  return a === b || a.endsWith(`/${b}`);
 }
 
 /** 출력에 그 파일이 언급됐는가. 경로 구분자와 대소문자 차이는 무시한다. */

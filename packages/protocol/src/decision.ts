@@ -209,8 +209,15 @@ export type CriterionCheckCode =
   | "changed_paths_disjoint"
   /** 기준 문장에 테스트 파일처럼 생긴 것이 아예 없다. **커버리지의 주 병목**이다. */
   | "no_test_reference"
-  /** 테스트 파일을 적었으나 워크스페이스에 그런 파일이 없다 (모델/사용자가 지어낸 이름). */
-  | "test_reference_not_found"
+  /**
+   * 테스트 파일을 적었는데 **우리가 아는 어떤 목록에서도 찾지 못했다.**
+   *
+   * 종전 이름은 `test_reference_not_found`였다. 그 이름은 "그런 파일이 없다"고 단언하는데,
+   * 우리는 그걸 알 수 없다 — 인덱스에는 상한(`maxIndexedFiles`)이 있고, 스냅샷은 예산에 맞춰
+   * 자른 부분집합이다. 집계 이름이 단언을 포함하면 읽는 사람이 "모델이 이름을 지어낸다"로
+   * 읽고 고칠 자리를 잘못 찾는다.
+   */
+  | "test_reference_unresolved"
   /** 실재하는 테스트를 지목했고 통과했지만, 그것이 실제로 실행됐다는 근거가 없다. */
   | "no_run_evidence"
   /** 프로젝트에 테스트 명령이 없다. */

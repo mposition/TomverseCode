@@ -202,6 +202,51 @@ test("스냅샷은 secret 파일을 relevantFiles에 넣지 않는다", async ()
   assert.ok(snapshot.excludedNotes?.some((n) => n.path === ".env"));
 });
 
+/**
+ * 17.9.1절 — 기준 판정의 "이 파일이 실재하는가"가 스냅샷을 보고 있었다. 스냅샷은 토큰 예산이
+ * 고른 부분집합이므로 그 질문에 답할 수 없다. 인덱스가 답한다.
+ */
+test("knownFilePaths는 스냅샷이 아니라 인덱스를 보고, 제외 목록도 존재의 증거로 센다", async () => {
+  const host = new FakeHost({
+    files: [
+      { path: "src/app.ts", isDir: false, sizeBytes: 50 },
+      { path: "test/far-away.test.ts", isDir: false, sizeBytes: 50 },
+      { path: ".env", isDir: false, sizeBytes: 30 },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: {
+      "src/app.ts": "export const a = 1;\n",
+      "test/far-away.test.ts": "test('x', () => {});\n",
+      ".env": "OPENAI_API_KEY=sk-super-secret\n",
+      "package.json": '{"scripts":{"test":"node --test"}}',
+    },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const engine = new ContextEngine();
+
+  // 인덱스가 만들어지기 전에는 **빈 배열**이다. 그건 "워크스페이스가 비었다"가 아니라
+  // "아직 모른다"이며, 읽는 쪽이 그걸 "없다"로 말하지 않는 것이 사용 조건이다.
+  assert.deepEqual(engine.knownFilePaths(), []);
+
+  const snapshot = await engine.createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "app.ts 를 고쳐줘",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 50_000 }],
+  });
+
+  const known = engine.knownFilePaths();
+  assert.ok(known.includes("src/app.ts"));
+  // 요청과 무관해서 스냅샷에 안 실린 테스트도 **실재한다.** 여기가 종전에 틀리던 자리다.
+  assert.ok(known.includes("test/far-away.test.ts"), known.join(", "));
+  // 하드 필터로 제외된 secret도 존재 자체는 확인됐다 — 제외는 "없다"가 아니라 "있는데 뺐다"다.
+  assert.ok(known.includes(".env"), known.join(", "));
+
+  // 그리고 이 비교가 공허하지 않다는 것: 스냅샷은 실제로 그 테스트를 싣지 않았다.
+  const inSnapshot = snapshot.relevantFiles.map((f) => f.path);
+  assert.ok(!inSnapshot.includes("test/far-away.test.ts"), inSnapshot.join(", "));
+});
+
 test("스냅샷은 프로젝트 규칙 파일을 항상 포함한다", async () => {
   const host = new FakeHost({
     files: [

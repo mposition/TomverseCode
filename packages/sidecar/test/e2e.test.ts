@@ -509,6 +509,9 @@ test("확정된 기준이 있으면 검증 뒤에 기준별 판정이 계산된�
     // 교차검증 경로의 초안이 doneCriteria를 내므로 기준이 생긴다. 하나는 픽스처의 실제 테스트
     // 파일을 지목하고, 다른 하나는 아무것도 지목하지 않는다 — 확인과 미확인이 **둘 다** 나와야
     // "전부 확인" 또는 "전부 미확인"으로 뭉개지지 않았음이 증명된다.
+    //
+    // `requiredTests`도 기준이 된다(17.9.1절 ④). 그래서 기준은 셋이고 확인은 둘이다 —
+    // 이 테스트가 그 흡수를 **production 실행 경로 전체**로 확인하는 자리이기도 하다.
     const draft = {
       kind: "draft" as const,
       payload: {
@@ -528,10 +531,13 @@ test("확정된 기준이 있으면 검증 뒤에 기준별 판정이 계산된�
     const evaluations = run.final.criterionEvaluations ?? [];
     assert.equal(evaluations.length, (run.final.acceptanceCriteria ?? []).length, "기준마다 판정이 하나씩");
 
+    // doneCriteria 2 + requiredTests 1.
+    assert.equal(evaluations.length, 3, JSON.stringify(run.final.acceptanceCriteria));
+
     const verified = evaluations.filter((e) => e.status === "VERIFIED_BY_TEST");
     const unverified = evaluations.filter((e) => e.status === "UNVERIFIED");
-    assert.equal(verified.length, 1, `실제 테스트를 지목한 기준이 확인되지 않았습니다: ${JSON.stringify(evaluations)}`);
-    assert.deepEqual(verified[0]!.evidence, ["paginate.test.js"]);
+    assert.equal(verified.length, 2, `실제 테스트를 지목한 기준이 확인되지 않았습니다: ${JSON.stringify(evaluations)}`);
+    for (const e of verified) assert.deepEqual(e.evidence, ["paginate.test.js"]);
     // 지목하지 않은 기준은 **끝까지 미확인이다.** 이걸 확인으로 만드는 유일한 방법이 모델에게
     // 묻는 것이고, 그 순간 product-strategy 9절의 순환 의존이 재현된다.
     assert.equal(unverified.length, 1, JSON.stringify(evaluations));
