@@ -71,7 +71,10 @@ apps/desktop/        Tauri 2 + React
                      않으므로 여기서 통과한 verify가 이 파일에 대해 말해주는 것이 없다.**
                      별도 크레이트에서 실제 파일을 #[path]로 가리켜 타입 검증만 했다(문서 20.5절)
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
-                     `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`.
+                     `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`/`windows-landing`.
+                     `windows-landing`은 **Windows에서만 검증되는 동작의 착지 판정을 사람 머릿속에서 꺼낸 것**이다 —
+                     Job Object·sidecar 번들·Credential Store·명령 해석(npm shim)·프로세스 그룹·경로 정규화 여섯 묶음이고,
+                     `cfg(windows)`/`Platform::Windows`를 쓰는 파일이 그 목록에 없으면 테스트가 실패한다.
                      `metrics`는 저장된 이벤트에서 계측을 집계한다 — 기준 커버리지·충돌 결말과
                      **취소 소요 분포**(강제 포기 탈출구가 뜨는 시점의 근거), 그리고 **모델 정면
                      비교**(`modelEvaluation` — 대조 실행에서 사용자가 어느 모델의 안을 골랐는가.

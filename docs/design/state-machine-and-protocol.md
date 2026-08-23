@@ -2218,6 +2218,30 @@ taskkill 경로는 어느 경우에도 남겨둔다(20.5절).
 5. job 핸들의 수명이 태스크와 같다 — 태스크가 끝나면 닫히고, 닫히면 남은 프로세스가 죽는다.
    강제 포기도 이 경로를 그대로 탄다(20.4).
 
+#### 20.6.1 Job Object만 Windows를 기다리는 것이 아니었다
+
+착지 목록을 만들 때는 이 절(Job Object)과 sidecar 번들·Credential Store 셋만 들어 있었다.
+훑어보니 **Windows에서만 진짜로 검증되는 동작이 셋 더 있었고 아무 목록에도 없었다.**
+
+- **명령 해석**(`tools/program.rs`) — `npm`이 `npm.cmd`라 생기는 그 함정이다. CLAUDE.md가 가장
+  길게 적어둔 항목인데도 빠져 있었고, **빠진 이유가 시사적이다**: 이 파일은 `cfg!(windows)`를
+  직접 읽지 않고 `Platform`을 인자로 받으므로(그래야 Linux에서 경로 조작을 검증할 수 있다)
+  `cfg(windows)`를 찾는 눈에는 보이지 않았다. 증상도 조용하다 — 해석이 실패하면 검증이
+  `SKIPPED_WITH_REASON`이 되어 **정상 수정 작업이 검증 없이 완료로 보고**된다. 다행히 이제
+  볼 수 있는 값이 하나 있다: 종합 판정이 `could_not_run`인지 여부다(product-strategy 11.1절).
+- **프로세스 그룹**(`proctree.rs`) — `CREATE_NEW_PROCESS_GROUP`과, Job Object가 확인될 때까지
+  남겨두는 `taskkill` 경로. Job Object와 **다른 항목**이다.
+- **경로 정규화**(`paths.rs`) — `\\?\` verbatim 프리픽스 제거. **Policy Gate가 이 결과로
+  경계를 판정하므로**, 남으면 정상 경로가 경계 밖으로 판정될 수 있다. UNC는 건드리지 않아야
+  한다.
+
+셋 다 `windows-landing`에 들어갔다(`commandResolution`/`processGroup`/`pathNormalization`).
+
+그리고 **같은 누락을 막는 그물을 함께 두었다**: `core/src`에서 `cfg(windows)` 또는
+`Platform::Windows`를 쓰는 파일이 `landing.rs`에 언급되지 않으면 테스트가 실패한다. 면제하려면
+`WINDOWS_FILES_WITHOUT_LANDING`에 **이유를 적어야** 한다. 두 표식 없이 들어오는 Windows 전용
+동작은 이 그물도 놓친다 — 타입 검사의 대체물이 아니라 그물이라는 것을 그대로 적어둔다.
+
 
 ## 21. 재현 러너의 판정 규칙 (M1)
 

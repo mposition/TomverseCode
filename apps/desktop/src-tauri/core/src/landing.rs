@@ -300,6 +300,141 @@ fn credential_checks() -> Vec<Check> {
     ]
 }
 
+/// 명령 해석 — `tools/program.rs`. **Windows에서만 진짜로 검증된다.**
+///
+/// # 왜 이 항목이 빠져 있었는가
+///
+/// `program.rs`는 `cfg!(windows)`를 직접 읽지 않고 `Platform`을 인자로 받는다(그래야 Linux에서
+/// 경로 조작을 검증할 수 있다). 그 덕분에 **`cfg(windows)`를 찾는 눈에는 안 보였고**, 착지
+/// 목록에서도 빠져 있었다. 정작 CLAUDE.md가 가장 길게 적어둔 Windows 함정이 이것이다.
+///
+/// # 이 결함의 증상은 조용하다
+///
+/// `npm`이 `npm.cmd`라 실행에 실패하면 검증이 `SKIPPED_WITH_REASON`이 되고, 그러면 **정상 수정
+/// 작업이 검증 없이 완료로 보고된다.** 그 상태는 화면에서 성공과 거의 같아 보인다 — 그래서
+/// "돌려보고 괜찮더라"로는 확인되지 않고, **무엇을 봐야 하는지**를 여기 적어둔다.
+///
+/// 다행히 이제 관측 가능한 값이 하나 있다: 종합 판정이 `could_not_run`인지 여부다
+/// (product-strategy 11.1절에서 `not_verified`를 둘로 가르면서 생겼다).
+fn command_resolution_checks(obs: &Observations) -> Vec<Check> {
+    let on_windows = obs.os == "windows";
+    let unavailable = || {
+        if on_windows {
+            (CheckStatus::NeedsHuman, "Windows에서 사람이 확인해야 한다.".to_string())
+        } else {
+            (
+                CheckStatus::NotCheckableHere,
+                format!("여기는 {} — Windows 셸 해석은 이 플랫폼에서 볼 수 없다.", obs.os),
+            )
+        }
+    };
+
+    let (npm_status, npm_detail) = unavailable();
+    let (skip_status, skip_detail) = unavailable();
+    let (unknown_status, unknown_detail) = unavailable();
+
+    vec![
+        check(
+            "npmResolvesToNodeCli",
+            "Node 프로젝트에서 `npm test`가 `node.exe <...>\\npm-cli.js test`로 해석되어 실제로 돈다.",
+            npm_status,
+            format!(
+                "{npm_detail} 실행 결과의 `resolvedCommand`에 node.exe와 npm-cli.js가 보여야 한다. \
+                 nvm/volta/fnm/Scoop 설치는 구조가 다를 수 있고, 다르면 **추측하지 않고 실패하는** 것이 맞다."
+            ),
+        ),
+        check(
+            "verificationIsNotSilentlySkipped",
+            "그 태스크의 종합 판정이 `could_not_run`이 아니다.",
+            skip_status,
+            format!(
+                "{skip_detail} 이게 이 함정의 **유일하게 눈에 보이는 증상**이다 — \
+                 해석이 실패하면 검증이 SKIPPED_WITH_REASON이 되고 작업이 검증 없이 완료로 보고된다."
+            ),
+        ),
+        check(
+            "unknownShimIsRefusedNotGuessed",
+            "알려지지 않은 `.cmd`/`.bat`는 셸로 감싸지 않고 실패한다.",
+            unknown_status,
+            format!(
+                "{unknown_detail} `cmd.exe /c`로 감싸면 인자의 `&`/`|`/`%`가 재해석되어 \
+                 원칙 6(승인 화면의 argv = 실제 실행)이 무너진다."
+            ),
+        ),
+    ]
+}
+
+/// 프로세스 트리 종료의 Windows 쪽 — `proctree.rs`. Job Object와 **다른 항목이다.**
+///
+/// Job Object는 트리 종료를 보장하고, 여기는 그 앞단(그룹 생성)과 뒤로 남겨둔 taskkill
+/// 경로다(16.3절 — Job Object가 Windows에서 확인될 때까지 지우지 않는다).
+fn process_group_checks(obs: &Observations) -> Vec<Check> {
+    let (status, detail) = if obs.os == "windows" {
+        (CheckStatus::NeedsHuman, "Windows에서 사람이 확인해야 한다.".to_string())
+    } else {
+        (
+            CheckStatus::NotCheckableHere,
+            format!("여기는 {} — `CREATE_NEW_PROCESS_GROUP`은 이 플랫폼에 없다.", obs.os),
+        )
+    };
+    vec![
+        check(
+            "childGetsItsOwnProcessGroup",
+            "자식이 `CREATE_NEW_PROCESS_GROUP`으로 뜨고, 앱에 Ctrl+C가 전파되지 않는다.",
+            status.clone(),
+            format!("{detail} 전파되면 사용자의 Ctrl+C가 앱 자체를 죽인다."),
+        ),
+        check(
+            "taskkillFallbackStillWorks",
+            "Job Object가 없는 경로에서도 `taskkill /T /F`가 트리를 거둔다.",
+            status,
+            format!(
+                "{detail} taskkill은 **스냅샷 기반**이라 이미 고아가 된 손자를 놓칠 수 있다 — \
+                 그 한계를 확인하는 것이지 완전함을 확인하는 것이 아니다."
+            ),
+        ),
+    ]
+}
+
+/// 경로 정규화의 Windows 쪽 — `paths.rs`. **Policy Gate가 이 결과로 경계를 판정한다.**
+fn path_normalization_checks(obs: &Observations) -> Vec<Check> {
+    let (status, detail) = if obs.os == "windows" {
+        (CheckStatus::NeedsHuman, "Windows에서 사람이 확인해야 한다.".to_string())
+    } else {
+        (
+            CheckStatus::NotCheckableHere,
+            format!("여기는 {} — `\\\\?\\` verbatim 프리픽스는 이 플랫폼에 없다.", obs.os),
+        )
+    };
+    vec![
+        check(
+            "verbatimPrefixStripped",
+            "워크스페이스 루트를 정규화한 결과에 `\\\\?\\`가 남지 않는다.",
+            status.clone(),
+            format!(
+                "{detail} 남으면 게이트가 비교하는 두 문자열의 모양이 달라지고, \
+                 **정상 경로가 경계 밖으로 판정될 수 있다.**"
+            ),
+        ),
+        check(
+            "uncPathsUntouched",
+            "UNC 경로(`\\\\?\\UNC\\server\\share`)는 건드리지 않는다.",
+            status,
+            format!("{detail} 잘못 벗기면 경로가 깨져 접근 자체가 실패한다. 네트워크 드라이브에서 확인할 것."),
+        ),
+    ]
+}
+
+/// Windows 전용 동작이 있는데 **착지 목록에 없어도 되는** 파일과 그 이유.
+///
+/// 목록으로 두는 이유는 `METRICS_WITHOUT_QUESTION`과 같다: 새로 Windows 분기를 넣을 때
+/// "착지 검사를 붙이거나, 여기 이유를 적거나" 둘 중 하나를 하게 만든다. 아무 말 없이
+/// 지나가는 길을 없앤다.
+pub const WINDOWS_FILES_WITHOUT_LANDING: &[(&str, &str)] = &[(
+    "lib.rs",
+    "모듈 선언뿐이다 — 동작은 win_job.rs에 있고 그쪽이 착지 목록에 있다",
+)];
+
 /// 관측을 기준에 대본다. **아무것도 실행하지 않고 아무것도 쓰지 않는다.**
 pub fn assess(obs: &Observations) -> LandingReport {
     let groups = vec![
@@ -326,6 +461,33 @@ pub fn assess(obs: &Observations) -> LandingReport {
             Group {
                 id: "credentialStore",
                 documented_at: "multi-engine-routing.md 12절",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+        {
+            let checks = command_resolution_checks(obs);
+            Group {
+                id: "commandResolution",
+                documented_at: "state-machine-and-protocol.md 19절 (`tools/program.rs`)",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+        {
+            let checks = process_group_checks(obs);
+            Group {
+                id: "processGroup",
+                documented_at: "state-machine-and-protocol.md 16.3절 (`proctree.rs`)",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+        {
+            let checks = path_normalization_checks(obs);
+            Group {
+                id: "pathNormalization",
+                documented_at: "process-architecture.md 4절 (`paths.rs`)",
                 verdict: verdict_of(&checks),
                 checks,
             }
@@ -537,4 +699,77 @@ mod tests {
             "job 배정 인자가 자식 핸들이 아닙니다: {args}"
         );
     }
+
+    /// **Windows 전용 동작에는 착지 검사가 있는가.**
+    ///
+    /// 이 검사가 없을 때 `tools/program.rs`가 목록에서 빠져 있었다 — 하필 CLAUDE.md가 가장 길게
+    /// 적어둔 Windows 함정인데도. 빠진 이유가 시사적이다: 그 파일은 `cfg!(windows)`를 직접 읽지
+    /// 않고 `Platform`을 인자로 받으므로(그래야 Linux에서 경로 조작을 검증할 수 있다)
+    /// **`cfg(windows)`만 찾는 눈에는 보이지 않았다.** 그래서 두 표식을 함께 본다.
+    ///
+    /// 이건 타입 검사의 대체물이 아니라 **그물**이다. Windows 전용 동작이 두 표식 없이
+    /// 들어오면 이 검사도 놓친다 — 그때는 사람이 알아채는 수밖에 없고, 그 사실을 여기 적어둔다.
+    #[test]
+    fn windows_only_code_has_a_landing_check_or_a_reason() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let landing = fs::read_to_string(src.join("landing.rs")).expect("landing.rs를 읽지 못했습니다");
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).expect("소스 디렉터리를 읽지 못했습니다") {
+                let path = entry.expect("항목을 읽지 못했습니다").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+
+        // needle을 런타임에 조립한다 — 소스에 그대로 적으면 이 파일이 자기 자신에 걸린다.
+        let cfg_needle = format!("cfg({})", "windows");
+        let platform_needle = format!("Platform::{}", "Windows");
+
+        let mut windows_files: Vec<String> = Vec::new();
+        for file in &files {
+            let name = file.file_name().unwrap().to_string_lossy().to_string();
+            if name == "landing.rs" {
+                continue;
+            }
+            let text = fs::read_to_string(file).expect("소스를 읽지 못했습니다");
+            if text.contains(&cfg_needle) || text.contains(&platform_needle) {
+                windows_files.push(name);
+            }
+        }
+
+        // 빈 집합에 대해 통과하는 검사를 허용하지 않는다 — 스캔이 깨지면 "위반 없음"과
+        // "파일 없음"이 같은 초록색으로 보인다.
+        assert!(
+            windows_files.len() >= 3,
+            "Windows 분기가 있는 파일을 읽지 못했습니다: {windows_files:?}"
+        );
+
+        let exempt: Vec<&str> = WINDOWS_FILES_WITHOUT_LANDING.iter().map(|(f, _)| *f).collect();
+        let orphans: Vec<&String> = windows_files
+            .iter()
+            .filter(|f| !landing.contains(f.as_str()) && !exempt.contains(&f.as_str()))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "Windows 전용 동작인데 착지 검사가 없습니다: {orphans:?} — \
+             기준을 landing.rs에 적거나 WINDOWS_FILES_WITHOUT_LANDING에 이유를 적을 것"
+        );
+    }
+
+    #[test]
+    fn windows_landing_exemptions_carry_a_reason() {
+        for (file, reason) in WINDOWS_FILES_WITHOUT_LANDING {
+            assert!(!reason.trim().is_empty(), "{file}의 면제 이유가 비어 있습니다");
+        }
+    }
+
 }
