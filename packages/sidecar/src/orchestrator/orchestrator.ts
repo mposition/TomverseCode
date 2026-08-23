@@ -21,6 +21,7 @@ import type {
   ToolRequester,
   VerificationReport,
   WorkspaceSnapshot,
+  TaskEventType,
 } from "@tomverse/protocol";
 import { ValidationError } from "@tomverse/protocol";
 import { ContextEngine } from "../context/engine.js";
@@ -49,8 +50,33 @@ import {
 } from "./criteria.js";
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
 import { buildCommitMessage, buildCommitPlan, buildExecutionPlan, PlanningError } from "./planner.js";
-import { triageTask, type TriagePolicy } from "../triage.js";
+import { triage, type TriagePolicy, type TriageResult } from "../triage.js";
 import { BudgetRefused, TaskBudget } from "./budget.js";
+import type { BudgetEventType } from "../budget/ledger.js";
+
+/**
+ * 예산 원장의 사실 → `task_events`의 이름.
+ *
+ * **조립하지 않고 적어 둔다.** 종전에는 `BUDGET_${event.type.toUpperCase()}`였는데, 그러면
+ * 이름이 소스에 존재하지 않아 grep으로 찾을 수 없고 `TaskEventType`이 막지도 못한다.
+ * 더 나쁜 것은 `BudgetEventType`을 이름만 바꿔도 **이미 저장된 로그가 조회되지 않는 상태**가
+ * 조용히 만들어진다는 점이다 — 이름은 append-only 로그에 영구히 남는 값이다(원칙 7).
+ *
+ * 이 표는 양쪽으로 컴파일러가 지킨다: `Record`가 원장 타입 전부를 요구하고, 값은
+ * `TaskEventType`이어야 한다.
+ */
+const BUDGET_EVENT_NAMES: Record<BudgetEventType, TaskEventType> = {
+  approval_created: "BUDGET_APPROVAL_CREATED",
+  approval_raised: "BUDGET_APPROVAL_RAISED",
+  reservation_opened: "BUDGET_RESERVATION_OPENED",
+  reservation_released: "BUDGET_RESERVATION_RELEASED",
+  reservation_settled: "BUDGET_RESERVATION_SETTLED",
+  reservation_unresolved: "BUDGET_RESERVATION_UNRESOLVED",
+  provider_usage_recorded: "BUDGET_PROVIDER_USAGE_RECORDED",
+  budget_estimate_breached: "BUDGET_ESTIMATE_BREACHED",
+  run_blocked: "BUDGET_RUN_BLOCKED",
+  budget_ledger_invalid: "BUDGET_LEDGER_INVALID",
+};
 
 /**
  * Orchestrator — 태스크 하나의 상태 머신을 소유한다.
@@ -320,7 +346,7 @@ export class Orchestrator {
     const budget = TaskBudget.create(this.policy.budgetUsd, {
       taskId: this.taskId,
       onEvent: (event) => {
-        void this.emit(`BUDGET_${event.type.toUpperCase()}`, event);
+        void this.emit(BUDGET_EVENT_NAMES[event.type], event);
       },
     });
     if (!budget.ok) {
@@ -390,7 +416,17 @@ export class Orchestrator {
 
     const tier = this.decideTier();
     this.state.complexityTier = tier.tier;
-    await this.emit("TRIAGE_COMPLETED", { complexityTier: tier.tier, appliedPolicies: tier.appliedPolicies });
+    // `tier`는 빼고 싣는다. 같은 사실을 `complexityTier`와 두 이름으로 두면 나중에 둘이
+    // 어긋났을 때 어느 쪽이 정본인지 알 수 없다.
+    const { tier: _sameAsComplexityTier, ...evidence } = tier.evidence ?? ({} as Partial<TriageResult>);
+    await this.emit("TRIAGE_COMPLETED", {
+      complexityTier: tier.tier,
+      appliedPolicies: tier.appliedPolicies,
+      // **규칙이 판정을 바꿨는지까지 남긴다.** 이게 없으면 "테스트 파일 제외 규칙이 얼마나
+      // 오분류를 내는가"(context-engine.md 11.1절)를 사후에 물어볼 수 없다 —
+      // 규칙이 작동하기라도 한 태스크가 어느 것인지 구별되지 않기 때문이다.
+      ...evidence,
+    });
 
     // ---- 라우팅 ----
     try {
@@ -1395,7 +1431,14 @@ export class Orchestrator {
     return experiment.contrast === true;
   }
 
-  private decideTier(): { tier: ComplexityTier; appliedPolicies: string[] } {
+  /**
+   * 이 태스크의 tier와 그 근거.
+   *
+   * **규칙이 돌지 않은 경로에는 `evidence`가 없다** — 사용자가 Verified를 고르거나 tier를
+   * 강제한 태스크는 TRIAGE의 규칙에 대해 아무것도 말해주지 않으므로, 근거를 만들어 붙이면
+   * 집계의 분모가 부풀어 오분류율이 실제보다 낮아 보인다.
+   */
+  private decideTier(): { tier: ComplexityTier; appliedPolicies: string[]; evidence?: TriageResult } {
     const appliedPolicies: string[] = [];
 
     // 사용자가 UI에서 Verified를 고르면 TRIAGE 결과와 무관하게 standard다.
@@ -1407,8 +1450,8 @@ export class Orchestrator {
       appliedPolicies.push(`forceComplexityTier=${this.policy.forceComplexityTier}`);
       return { tier: this.policy.forceComplexityTier, appliedPolicies };
     }
-    const tier = triageTask(this.requireSnapshot(), this.input.taskRequest.userMessage, this.deps.triagePolicy);
-    return { tier, appliedPolicies };
+    const evidence = triage(this.requireSnapshot(), this.input.taskRequest.userMessage, this.deps.triagePolicy);
+    return { tier: evidence.tier, appliedPolicies, evidence };
   }
 
   /**
@@ -1816,7 +1859,15 @@ export class Orchestrator {
     await this.emit("PHASE_CHANGED", { from, to, counters: this.state.counters });
   }
 
-  private async emit(type: string, payload: unknown): Promise<void> {
+  /**
+   * `task_events`에 한 줄 남긴다.
+   *
+   * **타입이 `TaskEventType`인 것이 요점이다.** 종전에는 `string`이라, 이벤트 이름을 정본으로
+   * 선언해 둔 union이 정작 아무것도 막지 못했다 — 실제로 다섯 개가 선언 밖에서 발행되고
+   * 있었다. 이름은 **저장된 로그에 영구히 남는 값**이라 나중에 바꾸는 비용이 크고
+   * (원칙 7), 집계는 이름으로 이벤트를 찾는다.
+   */
+  private async emit(type: TaskEventType, payload: unknown): Promise<void> {
     try {
       const result = await this.deps.transport.request<{ eventId: number; seq: number }>("db.appendEvent", {
         taskId: this.taskId,

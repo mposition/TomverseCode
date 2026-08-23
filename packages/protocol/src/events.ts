@@ -90,6 +90,44 @@ export type TaskEventType =
   | "WORKSPACE_INDEX_BUILT"
   | "WORKSPACE_INDEX_CACHE_HIT"
   /**
+   * TRIAGE 판정과 **그 근거** (context-engine.md 11.1절).
+   *
+   * `complexityTier` 외에 `workFileCount`·`excludedTestFiles`·`tierIfTestsCounted`가 실린다.
+   * 마지막이 반사실이다 — **테스트 파일을 세었더라면 어떤 tier였는가.** 그게 없으면
+   * "테스트 파일 제외 규칙이 오분류를 얼마나 내는가"를 사후에 물어볼 수 없다:
+   * 규칙이 작동하기라도 한 태스크가 어느 것인지 구별되지 않기 때문이다.
+   *
+   * **사용자가 tier를 고르거나 강제한 태스크에는 근거가 없다.** 그 태스크는 규칙에 대해
+   * 아무것도 말해주지 않으므로 집계의 분모에 들어가면 안 된다.
+   */
+  | "TRIAGE_COMPLETED"
+  /** 3.4절 확인 필요 카드 / 3.9절 불일치 카드를 띄우라는 신호. */
+  | "APPROVAL_REQUESTED_NOTE"
+  /** 이 태스크에 적용된 예산 정책(상한 유무와 그 근거). */
+  | "BUDGET_POLICY"
+  /**
+   * 예산 원장이 낸 사실들 (multi-engine-routing.md 10.6절).
+   *
+   * **종전에는 이 이름들이 런타임에 조립되고 있었다**(`BUDGET_${type.toUpperCase()}`).
+   * 그러면 여기 선언이 있어도 아무것도 막지 못하고, `BudgetEventType`을 이름만 바꿔도
+   * **이미 저장된 로그가 조회되지 않는 상태**가 조용히 만들어진다. 이름은 append-only
+   * 로그에 영구히 남는 값이다(원칙 7). 지금은 명시적인 표가 둘을 잇는다.
+   */
+  | "BUDGET_APPROVAL_CREATED"
+  | "BUDGET_APPROVAL_RAISED"
+  | "BUDGET_RESERVATION_OPENED"
+  | "BUDGET_RESERVATION_RELEASED"
+  | "BUDGET_RESERVATION_SETTLED"
+  | "BUDGET_RESERVATION_UNRESOLVED"
+  | "BUDGET_PROVIDER_USAGE_RECORDED"
+  | "BUDGET_ESTIMATE_BREACHED"
+  | "BUDGET_RUN_BLOCKED"
+  | "BUDGET_LEDGER_INVALID"
+  /** 예산 상한이 호출을 막았다. */
+  | "BUDGET_REFUSED"
+  /** phase는 그대로인데 남겨야 하는 사실이 있을 때 (예: 재요청 예산 소진 후 그대로 진행). */
+  | "PHASE_CHANGED_NOTE"
+  /**
    * 도구가 파일을 바꾼 뒤 스냅샷을 다시 읽지 못했다 (context-engine.md 6.1절).
    *
    * **`ERROR`로 묻으면 안 되는 사실이다.** 이 이벤트가 있다는 것은 그 뒤의 모델 호출이

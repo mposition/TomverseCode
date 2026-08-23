@@ -258,6 +258,35 @@ pub struct CommitSizes {
     pub max_files: Option<u64>,
 }
 
+/// TRIAGE의 **테스트 파일 제외 규칙**이 실제로 얼마나 오분류를 내는가
+/// (context-engine.md 11.1절 미해결 항목).
+///
+/// # 무엇이 분모인가
+///
+/// "`simple`이 몇 건인가"는 이 질문에 답하지 못한다. 규칙이 **작동하기라도 한** 태스크만
+/// 세야 하는데, 테스트 파일이 제외됐어도 위험 키워드나 미커밋 변경 때문에 이미 `standard`였다면
+/// 그 태스크는 이 규칙에 대해 아무것도 말해주지 않기 때문이다.
+///
+/// 그래서 분모는 **규칙이 판정을 바꾼 태스크**(`tier != tierIfTestsCounted`)이고, 분자는
+/// 그중 **제외했던 테스트 파일을 실제로 고친** 태스크다. 후자가 오분류다: 그 파일은 작업
+/// 대상이었는데 복잡도에서 빠졌다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct TestFileRule {
+    /// 근거가 실린 TRIAGE 이벤트를 가진 태스크. **사용자가 tier를 고른 태스크는 여기 없다** —
+    /// 그 태스크에서는 규칙이 돌지 않았다.
+    #[serde(rename = "tasksJudgedByRules")]
+    pub tasks_judged_by_rules: u64,
+    /// 테스트 파일을 하나라도 제외한 태스크.
+    #[serde(rename = "tasksWithExcludedTests")]
+    pub tasks_with_excluded_tests: u64,
+    /// **제외가 판정을 바꾼** 태스크. 오분류율의 분모다.
+    #[serde(rename = "tasksWhereRuleChangedTier")]
+    pub tasks_where_rule_changed_tier: u64,
+    /// 그중 제외했던 테스트 파일이 실제로 변경된 태스크. 오분류율의 분자다.
+    #[serde(rename = "tasksWhereExcludedTestWasMutated")]
+    pub tasks_where_excluded_test_was_mutated: u64,
+}
+
 /// 표본이 부족할 때 "이 계획은 크다"고 볼 파일 수.
 ///
 /// **이 값만은 유도하지 못했다.** 취소 소요와 달리 "정상 범위"를 관측에서 끌어낼 수 없는
@@ -464,12 +493,26 @@ pub struct Metrics {
     pub task_costs: TaskCosts,
     #[serde(rename = "tokenEstimate")]
     pub token_estimate: TokenEstimateAccuracy,
+    /// TRIAGE 테스트 파일 제외 규칙의 오분류 빈도 (context-engine.md 11.1절).
+    #[serde(rename = "testFileRule")]
+    pub test_file_rule: TestFileRule,
     /// 관측에서 유도한 태스크당 예산 상한 제안. **집계 결과이지 설정이 아니다.**
     #[serde(rename = "taskBudgetThreshold")]
     pub task_budget_threshold: Option<TaskBudgetThreshold>,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
+}
+
+/// 두 경로가 같은 파일을 가리키는가.
+///
+/// 스냅샷의 경로는 워크스페이스 상대이고 `FILE_MUTATED`의 경로는 Rust가 정규화한 것이라
+/// 표기가 다를 수 있다. **구분자를 맞추고 뒤에서부터 본다** — 한쪽이 절대 경로여도
+/// 꼬리가 같으면 같은 파일이다. Windows에서는 대소문자를 구별하지 않는다.
+fn same_path(a: &str, b: &str) -> bool {
+    let norm = |p: &str| p.replace('\\', "/").trim_start_matches("./").to_lowercase();
+    let (a, b) = (norm(a), norm(b));
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
 }
 
 /// 저장된 이벤트에서 두 지표를 집계한다. **아무것도 쓰지 않는다.**
@@ -534,6 +577,47 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
                     metrics.coverage.criteria += 1;
                     bump(&mut metrics.coverage.by_status, item.get("status"));
                     bump(&mut metrics.coverage.by_code, item.get("code"));
+                }
+            }
+        }
+
+        // ---- TRIAGE 테스트 파일 제외 규칙 (context-engine.md 11.1절) ----
+        //
+        // **마지막 TRIAGE_COMPLETED를 쓴다.** 재질문 왕복으로 다시 분류될 수 있고, 질문은
+        // "이 태스크가 어떤 tier로 실행됐는가"이므로 마지막이 정본이다.
+        if let Some(payload) = events
+            .iter()
+            .rev()
+            .find(|e| e.event_type == "TRIAGE_COMPLETED")
+            .map(|e| &e.payload)
+        {
+            // 근거가 없으면 규칙이 돌지 않은 태스크다(사용자가 tier를 고르거나 강제함).
+            // **분모에 넣지 않는다** — 넣으면 오분류율이 실제보다 낮아 보인다.
+            if let Some(counterfactual) = payload.get("tierIfTestsCounted").and_then(Value::as_str) {
+                metrics.test_file_rule.tasks_judged_by_rules += 1;
+                let excluded: Vec<&str> = payload
+                    .get("excludedTestFiles")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if !excluded.is_empty() {
+                    metrics.test_file_rule.tasks_with_excluded_tests += 1;
+                }
+                let tier = payload.get("complexityTier").and_then(Value::as_str).unwrap_or("");
+                if tier != counterfactual {
+                    metrics.test_file_rule.tasks_where_rule_changed_tier += 1;
+                    // 제외했던 테스트 파일이 실제로 고쳐졌는가 — 그랬다면 그 파일은 작업
+                    // 대상이었고, 복잡도에서 빠진 것이 오분류다.
+                    let mutated_an_excluded_test = events.iter().any(|e| {
+                        e.event_type == "FILE_MUTATED"
+                            && e.payload
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .is_some_and(|p| excluded.iter().any(|t| same_path(t, p)))
+                    });
+                    if mutated_an_excluded_test {
+                        metrics.test_file_rule.tasks_where_excluded_test_was_mutated += 1;
+                    }
                 }
             }
         }
@@ -1466,5 +1550,112 @@ mod tests {
         assert_eq!(metrics.tasks_scanned, 1);
         assert_eq!(metrics.coverage.criteria, 0);
         assert_eq!(metrics.conflicts.detected, 0);
+    }
+    // ---- TRIAGE 테스트 파일 제외 규칙 (context-engine.md 11.1절) ----
+
+    fn seed_triage(store: &mut Store, task_id: &str, payload: Value, mutated: &[&str]) {
+        if task_id != "task-1" {
+            store
+                .create_task(task_id, "sess-1", "ws-1", "/tmp/ws", "fast", "fix")
+                .unwrap();
+        }
+        store.append_event(task_id, "TRIAGE_COMPLETED", &payload).unwrap();
+        for path in mutated {
+            store
+                .append_event(task_id, "FILE_MUTATED", &json!({ "path": path }))
+                .unwrap();
+        }
+    }
+
+    /// 규칙이 판정을 바꾸고, 제외했던 테스트 파일이 실제로 고쳐졌다 = **오분류**다.
+    #[test]
+    fn a_mutated_excluded_test_counts_as_a_misclassification() {
+        let (_d, mut store) = seeded();
+        seed_triage(
+            &mut store,
+            "task-1",
+            json!({
+                "complexityTier": "simple",
+                "tierIfTestsCounted": "standard",
+                "excludedTestFiles": ["src/paginate.test.ts"],
+            }),
+            &["src/paginate.test.ts"],
+        );
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_file_rule.tasks_judged_by_rules, 1);
+        assert_eq!(m.test_file_rule.tasks_with_excluded_tests, 1);
+        assert_eq!(m.test_file_rule.tasks_where_rule_changed_tier, 1);
+        assert_eq!(m.test_file_rule.tasks_where_excluded_test_was_mutated, 1);
+    }
+
+    /// 규칙이 판정을 바꿨지만 그 테스트 파일은 건드리지 않았다 = 규칙이 **맞았다.**
+    #[test]
+    fn an_untouched_excluded_test_is_not_a_misclassification() {
+        let (_d, mut store) = seeded();
+        seed_triage(
+            &mut store,
+            "task-1",
+            json!({
+                "complexityTier": "simple",
+                "tierIfTestsCounted": "standard",
+                "excludedTestFiles": ["src/paginate.test.ts"],
+            }),
+            &["src/paginate.ts"],
+        );
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_file_rule.tasks_where_rule_changed_tier, 1);
+        assert_eq!(m.test_file_rule.tasks_where_excluded_test_was_mutated, 0);
+    }
+
+    /// **분모를 부풀리지 않는다.** 다른 이유로 이미 standard였다면 규칙은 아무것도 하지 않았고,
+    /// 그 태스크를 분모에 넣으면 오분류율이 실제보다 낮아 보인다.
+    #[test]
+    fn a_task_the_rule_did_not_change_stays_out_of_the_denominator() {
+        let (_d, mut store) = seeded();
+        seed_triage(
+            &mut store,
+            "task-1",
+            json!({
+                "complexityTier": "standard",
+                "tierIfTestsCounted": "standard",
+                "excludedTestFiles": ["src/auth.test.ts"],
+            }),
+            &["src/auth.test.ts"],
+        );
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_file_rule.tasks_with_excluded_tests, 1);
+        assert_eq!(m.test_file_rule.tasks_where_rule_changed_tier, 0);
+        assert_eq!(m.test_file_rule.tasks_where_excluded_test_was_mutated, 0);
+    }
+
+    /// 사용자가 tier를 고른 태스크에는 근거가 없다 — **규칙이 돌지 않았으므로** 세지 않는다.
+    #[test]
+    fn a_task_without_evidence_is_not_judged_by_the_rule() {
+        let (_d, mut store) = seeded();
+        seed_triage(
+            &mut store,
+            "task-1",
+            json!({ "complexityTier": "standard", "appliedPolicies": ["executionMode=verified"] }),
+            &["src/a.test.ts"],
+        );
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_file_rule.tasks_judged_by_rules, 0);
+        assert_eq!(m.test_file_rule.tasks_where_rule_changed_tier, 0);
+    }
+
+    /// 스냅샷의 경로와 `FILE_MUTATED`의 경로는 표기가 다를 수 있다. 꼬리가 같으면 같은 파일이다 —
+    /// 여기서 못 맞추면 오분류가 **0으로 보고되고**, 그건 "규칙이 완벽하다"로 읽힌다.
+    #[test]
+    fn paths_match_across_notations() {
+        assert!(same_path("src/a.test.ts", "./src/a.test.ts"));
+        assert!(same_path("src\\a.test.ts", "src/a.test.ts"));
+        assert!(same_path("src/a.test.ts", "/tmp/ws/src/a.test.ts"));
+        assert!(!same_path("src/a.test.ts", "src/b.test.ts"));
+        // 꼬리 일치가 경로 경계를 무시하면 안 된다.
+        assert!(!same_path("a.test.ts", "src/ba.test.ts"));
     }
 }
