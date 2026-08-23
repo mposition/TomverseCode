@@ -45,18 +45,46 @@ status: accepted (2026-07-25) — 단, 2절의 **가설 게이트**를 통과하
 
 전략 문서가 요구하는 것 중 상당 부분이 이미 설계·구현되어 있다. 새로 만들 것과 이미 있는 것을 구분해야 낭비가 없다.
 
+**각 행은 상태를 주장할 때 그 주장을 반증할 파일을 함께 적는다**(3.1절). 손으로 적은 상태표는
+반드시 낡고, 낡은 표는 "있는 것을 없다"고 말해 같은 것을 두 번 만들게 한다 — 실제로 그렇게
+낡아 있었다.
+
 | 전략 문서 요구 | 현재 상태 |
 |---|---|
-| §4 테스트가 최종 판정 | **설계 완료** — 최초 아키텍처 원칙부터 `VERIFYING`이 tier와 무관하게 항상 실행 |
-| §5 위험도 기반 적응형 검증 | **구현 완료(2단계)** — `TRIAGE` + `complexityTier`, `packages/sidecar/src/triage.ts`. 4단계로 확장 필요(5절) |
-| §6 실제 성과 학습 라우터 | **설계 완료** — multi-engine-routing.md 8절이 동일 결론에 독립적으로 도달(부트스트랩 순환 포함) |
-| §7 검수 독립성 | **부분** — 공급자 독립성은 불변식으로 강제(multi-engine 5절). **narrative 독립성은 없음 → 4절에서 추가** |
-| §9 데이터 전송 투명성 | **부분** — context-engine.md 7절에 secret/바이너리/대용량 하드 제외. 감사·표시 UI 없음 |
-| §10 재현 가능한 Agent Trace | **기록은 완료** — `task_events` append-only, `tool_requests`/`tool_results`/`file_mutations`/`verification_reports`/`snapshots(git_head)`에 workspace hash·응답 모델·형식 버전이 붙은 export까지(6절). **남은 것은 재현을 수행하는 러너다** — 재료는 있고 실행기는 없다 |
-| §2 모델 불일치 화면 | **미착수** — ui-wireframes.md에 검증 결과 패널은 있으나 불일치 표는 없음 |
-| §3 Candidate Arena | **미착수** — worktree 격리 자체가 없음 |
+| §4 테스트가 최종 판정 | **구현 완료** — `VERIFYING`은 `complexityTier`와 무관하게 항상 실행된다(CLAUDE.md 원칙 1). <!-- present: packages/sidecar/src/orchestrator/machine.ts --> |
+| §5 위험도 기반 적응형 검증 | **구현 완료(2단계)** — `TRIAGE` + `complexityTier`. 4단계로 확장 필요(5절). <!-- present: packages/sidecar/src/triage.ts --> |
+| §6 실제 성과 학습 라우터 | **부분** — 무엇이 표본인지를 정하고(multi-engine 8.1절) **집계까지 만들었다**(`tomverse-host metrics`의 `modelEvaluation`). 라우터를 그 값으로 바꾸는 일은 아직 하지 않았다 — `verdict`가 `separated`인 쌍이 실제로 생겼을 때가 그 시점이다. <!-- present: apps/desktop/src-tauri/core/src/metrics.rs, packages/sidecar/src/routing --> |
+| §7 검수 독립성 | **구현 완료** — 공급자 독립성은 불변식으로 강제(multi-engine 5절), narrative 독립성은 `blind` 모드로 구현했다. **기본값은 `informed`다** — 4.1절 실측이 blind의 이득을 지지하지 않았고, 그 철회 자체가 결과다. <!-- present: packages/sidecar/src/providers/prompts.ts --> |
+| §9 데이터 전송 투명성 | **구현 완료** — 하드 제외(context-engine 7절)에 더해 **화면과 CLI 양쪽에 표시가 있다**(`TransmissionPanel`, `tomverse-host transmission`, 감사 export). <!-- present: apps/desktop/src/components/TransmissionPanel.tsx, apps/desktop/src/components/AuditExportPanel.tsx --> |
+| §10 재현 가능한 Agent Trace | **구현 완료** — 기록(`task_events` append-only + export)에 더해 **러너가 있다**: `tomverse-host reproduce`가 DB 없이 검사하고 `--apply`가 각 단계를 Policy Gate에 그대로 태운다(state-machine 21절). <!-- present: apps/desktop/src-tauri/core/src/reproduce.rs --> |
+| §2 모델 불일치 화면 | **구현 완료** — 3.9절 불일치 판정 카드. 표가 아니라 **강제 선택 카드**가 된 이유는 16절에 있다. <!-- present: apps/desktop/src/components/DisagreementCard.tsx --> |
+| §3 Candidate Arena | **미착수** — worktree 격리 자체가 없다. <!-- absent: apps/desktop/src-tauri/core/src/arena.rs --> |
 
 **놓치기 쉬운 사실: Agent Trace는 거의 다 됐다.** 원 제안서는 이걸 후순위(P2)로 뒀지만, 우리에겐 append-only 이벤트 로그가 이미 진실의 원천이므로 남은 건 작은 델타다. Copilot이 이걸 사후 추가하려면 아키텍처를 고쳐야 하지만 우리는 이미 그렇게 설계돼 있다 — 저비용 고가치 항목이므로 우선순위를 올린다.
+
+### 3.1 상태표가 낡는 것을 검사로 막는다
+
+이 표는 **"새로 만들 것과 이미 있는 것을 구분해야 낭비가 없다"**는 목적으로 있다. 그런데 손으로
+적은 상태는 코드가 앞서가면 조용히 낡고, **낡은 상태표는 자기 목적을 정면으로 배신한다** —
+"미착수"라고 적힌 것을 읽고 이미 있는 것을 다시 만들게 된다.
+
+실제로 그랬다. 위 표는 네 행이 틀려 있었고 **전부 같은 방향으로** 틀렸다: 불일치 화면(3.9절
+카드로 구현됨), narrative 독립성(`blind` 모드로 구현됨), 전송 투명성 표시(`TransmissionPanel`과
+`tomverse-host transmission`), 재현 러너(`reproduce --apply`). 넷 다 **있는 것을 없다고** 말하고
+있었다.
+
+그래서 각 행에 **그 주장을 반증할 파일**을 마커로 적는다.
+
+- `<!-- present: 경로, 경로 -->` — 있다고 주장했으므로 그 경로가 **있어야** 한다.
+- `<!-- absent: 경로 -->` — 없다고 주장했으므로 그 경로가 **없어야** 한다.
+
+`packages/toolchain/test/docStatus.test.ts`가 대조한다. 마커가 없는 행도 실패다 — 근거 없이
+상태만 적는 행이 다시 생기면 그 행은 처음부터 검사 밖에 있게 된다.
+
+**이 검사가 잡는 것과 못 잡는 것을 구별해 둔다.** 파일이 생기거나 사라진 것은 잡지만, 파일이
+남아 있는데 그 안의 기능이 무의미해진 것은 못 잡는다. 그건 원리적으로 문장을 읽어야 아는
+일이다 — 검사의 목적은 판정을 대신하는 것이 아니라, **가장 자주 일어나는 낡는 방식**(만들어
+놓고 표를 안 고침)을 자동으로 막는 것이다.
 
 ## 4. 채택: Blind Review — 그리고 현재 코드의 실제 결함
 
