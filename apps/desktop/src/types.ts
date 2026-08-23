@@ -120,7 +120,7 @@ export interface VerificationReport {
   checks: VerificationCheck[];
   newlyFailing?: string[];
   preexistingFailures?: string[];
-  overall: "pass" | "fail" | "not_verified";
+  overall: "pass" | "fail" | "not_configured" | "could_not_run";
 }
 
 /** `list_tasks` / `get_task`가 돌려주는 저장된 작업 한 줄. Rust `TaskRow`의 미러. */

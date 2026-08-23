@@ -50,10 +50,25 @@ export interface VerificationReport {
   /** baseline에서도 실패하던 체크 — 이번 변경의 책임이 아니다. */
   preexistingFailures?: VerificationKind[];
   /**
-   * 종합 판정. NOT_CONFIGURED만 있는 경우는 pass가 아니라 not_verified다 —
-   * 실행할 검증이 없었다는 사실을 통과로 위장하지 않는다.
+   * 종합 판정. 실행할 검증이 없었다는 사실을 통과로 위장하지 않는다.
+   *
+   * # `not_verified`를 둘로 갈랐다
+   *
+   * 종전 3값에서 `not_verified` 하나가 **성질이 다른 두 상황**을 담고 있었다:
+   *
+   * - 프로젝트에 돌릴 명령이 아예 없다 → `not_configured`
+   * - 돌리려 했는데 돌지 못했다(`SKIPPED_WITH_REASON`) → `could_not_run`
+   *
+   * 둘째는 실제로 일어난 결함에서 나왔다. Windows에서 `npm`이 `npm.cmd`라 실행에 실패하면
+   * 테스트가 `SKIPPED_WITH_REASON`이 되는데(CLAUDE.md 함정 기록), 뭉쳐 있는 동안 제품은
+   * 사용자에게 **"이 프로젝트에는 검증 명령이 없습니다. 스크립트를 추가하세요"** 라고 말했다.
+   * 그 프로젝트에는 스크립트가 있었다 — 우리가 못 돌린 것이다. 원인을 잘못 짚은 안내는
+   * 침묵보다 나쁘다: 사용자가 없는 문제를 고치러 간다.
+   *
+   * `VerificationStatus`를 3값에서 5값으로 가른 것과 같은 이유이며, 그때 **종합 판정 쪽에는
+   * 같은 규율을 주지 않았던 것**을 지금 맞춘다.
    */
-  overall: "pass" | "fail" | "not_verified";
+  overall: "pass" | "fail" | "not_configured" | "could_not_run";
   createdAt: ISODateTime;
 }
 

@@ -45,7 +45,7 @@ export interface FakeHostOptions {
 }
 
 export interface VerifyStub {
-  overall: "pass" | "fail" | "not_verified";
+  overall: "pass" | "fail" | "not_configured" | "could_not_run";
   checks?: { kind: VerificationKind; status: VerificationStatus; summary?: string; detail?: string }[];
   newlyFailing?: VerificationKind[];
   preexistingFailures?: VerificationKind[];

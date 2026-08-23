@@ -281,7 +281,7 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 - **`record_*_with_event` 계열은 `append_event`를 거치지 않는다.** 레코드와 이벤트를 한 트랜잭션에 쓰기 위한 설계인데, 그 대가로 **sink(UI) 릴레이가 빠진다.** DB에는 남는데 화면에는 안 보이는, 찾기 어려운 종류의 누락이다. 새로 이런 메서드를 만들면 커밋 후 `TaskHost::relay`를 반드시 부를 것.
 - **Windows의 `npm`은 `npm.exe`가 아니라 `npm.cmd`다.** `Command::new("npm")`/`spawnSync("npm")`은
   `program not found`로 실패한다. 증상이 고약한 이유는 그 다음이다 — Verification Runner가
-  테스트를 못 돌려 `SKIPPED_WITH_REASON` → `not_verified`가 되고, **정상 수정 작업이 검증 없이
+  테스트를 못 돌려 `SKIPPED_WITH_REASON` → `could_not_run`이 되고, **정상 수정 작업이 검증 없이
   완료로 보고**된다. `tools/program.rs`(제품)와 `@tomverse/toolchain`의 `resolveNodeCli`(테스트
   하네스)가 각각 이걸 처리한다. 둘을 섞지 말 것 — e2e 본체는 반드시 논리 명령 `npm test`를
   Rust에 요청해야 해석 계층이 실제로 검증된다.

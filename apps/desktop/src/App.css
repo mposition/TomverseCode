@@ -419,9 +419,27 @@ fieldset.modes label {
   color: var(--error);
 }
 
-.badge-overall-not_verified {
+/* 검증되지 않은 두 경우는 원인이 다르지만 **경고 수준은 같다** — 어느 쪽이든 결과를
+   뒷받침하는 결정론적 근거가 없다. 색으로 등급을 나누면 한쪽이 덜 심각해 보인다. */
+.badge-overall-not_configured,
+.badge-overall-could_not_run {
   border-color: var(--warn);
   color: var(--warn);
+}
+
+/* 결과의 근거 배지. 초록(통과 톤)은 **결정론적 근거가 실제로 있을 때만** 쓴다. */
+.badge-basis-deterministic {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.badge-basis-weak {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.basis {
+  margin: 0.25rem 0 0.5rem;
 }
 
 .command {

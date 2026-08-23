@@ -93,8 +93,27 @@ function statusMark(status: VerificationStatus): string {
   }
 }
 
+/**
+ * 종합 판정 4값. **"검증되지 않음"의 원인을 단정하지 않는다.**
+ *
+ * 종전에는 `not_verified` 하나에 "명령이 없음"과 "돌리지 못함"이 뭉쳐 있었고, 라벨은 언제나
+ * 전자를 단정했다 — 스크립트가 있는데 실행에 실패한 사용자에게 "명령이 없습니다"라고 말한 것이다.
+ * 원인이 다르면 **사용자가 할 일이 다르므로** 라벨도 달라야 한다.
+ */
 function OverallBadge({ overall }: { overall: VerificationReport["overall"] }) {
-  const label =
-    overall === "pass" ? "통과" : overall === "fail" ? "실패" : "검증되지 않음 (실행할 검증 명령이 없음)";
+  const label = overallLabel(overall);
   return <span className={`badge badge-overall-${overall}`}>{label}</span>;
+}
+
+function overallLabel(overall: VerificationReport["overall"]): string {
+  switch (overall) {
+    case "pass":
+      return "통과";
+    case "fail":
+      return "실패";
+    case "not_configured":
+      return "검증되지 않음 (실행할 검증 명령이 없음)";
+    case "could_not_run":
+      return "검증되지 않음 (명령을 실행하지 못함)";
+  }
 }

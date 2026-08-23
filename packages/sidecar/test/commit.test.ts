@@ -253,10 +253,10 @@ test("검증이 실패하면 커밋하지 않는다", async () => {
   assert.ok(!host.eventTypes().includes("GIT_COMMIT_CREATED"));
 });
 
-test("검증할 명령이 없으면(not_verified) 커밋하지 않는다", async () => {
+test("검증할 명령이 없으면(not_configured) 커밋하지 않는다", async () => {
   // "검증되지 않았다"를 "통과했다"처럼 다루면 커밋이 검증 없는 변경을 이력에 박아 넣는다.
   const { orchestrator, host } = build(
-    { verifyResults: [{ overall: "not_verified" }, { overall: "not_verified" }] },
+    { verifyResults: [{ overall: "not_configured" }, { overall: "not_configured" }] },
     { defaultPatch: VALID_PATCH },
     { allowGitCommit: true } as never
   );

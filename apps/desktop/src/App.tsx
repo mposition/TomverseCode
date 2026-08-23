@@ -33,6 +33,7 @@ import {
   type WorkspaceInfo,
 } from "./types";
 import { AcceptanceCriteriaPanel } from "./components/AcceptanceCriteriaPanel";
+import { resultBasis } from "./lib/resultBasis";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { DiffPanel } from "./components/DiffPanel";
 import { DisagreementCard } from "./components/DisagreementCard";
@@ -1253,6 +1254,24 @@ export default function App() {
               {finalResult && (
                 <div className={`panel result result-${finalResult.status}`}>
                   <h2>{statusLabel(finalResult.status)}</h2>
+                  {/* **무엇이 이 결과를 뒷받침하는가** — product-strategy.md 11절·16.5절.
+                      완료 표시 옆에 이게 없으면, 검증이 침묵한 작업이 통과한 작업과 같은
+                      신뢰 수준으로 읽힌다. 계산은 화면 밖(src/lib)에 있다. */}
+                  {(() => {
+                    const basis = resultBasis({
+                      overall: [...reports].reverse().find((r) => r.phase === "post")?.overall,
+                      criteria: finalResult.acceptanceCriteria,
+                      evaluations: finalResult.criterionEvaluations,
+                    });
+                    return (
+                      <p className={`basis basis-${basis.kind}`}>
+                        <span className={`badge badge-basis-${basis.deterministic ? "deterministic" : "weak"}`}>
+                          {basis.label}
+                        </span>{" "}
+                        <span className="muted small">{basis.detail}</span>
+                      </p>
+                    );
+                  })()}
                   <p>{finalResult.summary}</p>
                   {finalResult.failureReason && <p className="muted small">사유 코드: {finalResult.failureReason}</p>}
                   {(finalResult.mutatedPaths?.length ?? 0) > 0 && (

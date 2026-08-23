@@ -353,7 +353,7 @@ impl<'a> VerificationRunner<'a> {
 ///   2. FIX_LOOP 다이제스트가 pre-existing 실패를 별도로 표시해 모델이 맥락을 안다.
 /// "거짓 성공"과 "설명이 붙은 실패" 중에서는 후자가 이 제품의 명제에 맞다.
 ///
-/// 실행된 검증이 하나도 없으면 pass가 아니라 `not_verified`다.
+/// 실행된 검증이 하나도 없으면 pass가 아니라 `not_configured`다.
 ///
 /// **돌려고 했는데 돌지 못한 체크가 하나라도 있으면 `pass`를 낼 수 없다.**
 /// `SkippedWithReason`은 정책 거부·취소·실행 오류를 담는데, 그중 실행 오류에는
@@ -375,7 +375,16 @@ fn compute_overall(checks: &[VerificationCheck], _newly_failing: Option<&[Verifi
         })
         .count();
     if executed == 0 {
-        return Overall::NotVerified;
+        // **여기서 두 경우가 갈린다.** 돌린 것이 하나도 없더라도, 돌리려다 못 돌린 체크가
+        // 있으면 그건 "명령이 없다"가 아니다. 뭉쳐 두면 아래 `any_unrunnable` 분기가
+        // 영원히 닿지 않는 죽은 코드가 되고, 사용자는 틀린 안내를 받는다.
+        if checks
+            .iter()
+            .any(|c| matches!(c.status, VerificationStatus::SkippedWithReason))
+        {
+            return Overall::CouldNotRun;
+        }
+        return Overall::NotConfigured;
     }
 
     let any_failure = checks
@@ -389,7 +398,7 @@ fn compute_overall(checks: &[VerificationCheck], _newly_failing: Option<&[Verifi
         .iter()
         .any(|c| matches!(c.status, VerificationStatus::SkippedWithReason));
     if any_unrunnable {
-        return Overall::NotVerified;
+        return Overall::CouldNotRun;
     }
 
     Overall::Pass
@@ -510,7 +519,8 @@ mod tests {
             .iter()
             .all(|c| c.status == VerificationStatus::NotConfigured));
         // 여기가 핵심: 실행할 게 없었다는 사실이 pass로 위장되지 않는다.
-        assert_eq!(report.overall, Overall::NotVerified);
+        // 그리고 **왜** 검증되지 않았는지까지 남는다 — 이 경우는 정말로 명령이 없었다.
+        assert_eq!(report.overall, Overall::NotConfigured);
     }
 
     #[test]
@@ -658,8 +668,9 @@ mod tests {
         let test_check = report.checks.iter().find(|c| c.kind == VerificationKind::Test).unwrap();
         assert_eq!(test_check.status, VerificationStatus::SkippedWithReason);
         assert!(test_check.summary.contains("policy denied"));
-        // 실행된 검증이 없으므로 pass가 아니다.
-        assert_eq!(report.overall, Overall::NotVerified);
+        // 실행된 검증이 없으므로 pass가 아니다. 그리고 명령은 있었으므로 `NotConfigured`도
+        // 아니다 — 정책이 막아서 못 돌린 것이고, 사용자가 할 일이 다르다.
+        assert_eq!(report.overall, Overall::CouldNotRun);
     }
 
     /// Windows 결함이 만든 상황 그대로: build는 돌아서 통과했는데 test는 프로그램 해석 실패로
@@ -711,8 +722,47 @@ mod tests {
         assert_eq!(test.status, VerificationStatus::SkippedWithReason);
         assert_eq!(
             report.overall,
-            Overall::NotVerified,
+            Overall::CouldNotRun,
             "돌지 못한 검증이 있는데 통과로 보고했습니다"
+        );
+    }
+
+    /// 네 값이 **서로 다른 사실**을 말하는지 한 자리에서 고정한다.
+    ///
+    /// 종전에는 `executed == 0`이 무조건 `not_verified`였고, 그 아래의 "돌지 못한 체크가 있다"
+    /// 분기는 통과한 체크가 함께 있을 때만 닿았다. 즉 **정책이 모든 검증을 막은 경우**가
+    /// "이 프로젝트에는 명령이 없습니다"로 보고됐다.
+    #[test]
+    fn the_four_verdicts_say_four_different_things() {
+        let check = |kind, status| VerificationCheck {
+            kind,
+            command: None,
+            status,
+            summary: String::new(),
+            detail: None,
+            detail_ref: None,
+            exit_code: None,
+            duration_ms: None,
+        };
+        use VerificationKind::{Build, Test};
+        use VerificationStatus as S;
+
+        assert_eq!(
+            compute_overall(&[check(Test, S::NotConfigured), check(Build, S::NotConfigured)], None),
+            Overall::NotConfigured
+        );
+        // 돌린 것은 없지만 **돌리려다 못 돌린** 체크가 있다 — 명령이 없는 것이 아니다.
+        assert_eq!(
+            compute_overall(&[check(Test, S::SkippedWithReason), check(Build, S::NotConfigured)], None),
+            Overall::CouldNotRun
+        );
+        assert_eq!(
+            compute_overall(&[check(Test, S::Passed), check(Build, S::NotConfigured)], None),
+            Overall::Pass
+        );
+        assert_eq!(
+            compute_overall(&[check(Test, S::Failed), check(Build, S::SkippedWithReason)], None),
+            Overall::Fail
         );
     }
 

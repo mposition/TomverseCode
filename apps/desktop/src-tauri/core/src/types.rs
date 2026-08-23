@@ -364,7 +364,11 @@ pub enum VerificationPhase {
 pub enum Overall {
     Pass,
     Fail,
-    NotVerified,
+    /// 프로젝트에 돌릴 검증 명령이 아예 없었다.
+    NotConfigured,
+    /// **돌리려 했는데 돌지 못했다.** 사용자가 할 일이 `NotConfigured`와 다르다 —
+    /// 여기서 "스크립트를 추가하세요"라고 말하면 없는 문제를 고치러 보내는 것이다.
+    CouldNotRun,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

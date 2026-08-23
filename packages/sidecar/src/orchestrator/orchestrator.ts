@@ -1007,21 +1007,31 @@ export class Orchestrator {
         };
       }
 
-      // not_verified: 검증 명령이 없어서 판정할 수 없었던 경우.
-      // 통과로 위장하지 않고, 실패로도 몰지 않는다 — 고칠 근거(실패 로그)가 없으므로
-      // fix loop를 태우는 것은 의미가 없다. 완료로 처리하되 그 사실을 명시한다.
-      if (report.overall === "not_verified") {
-        // 확정 기준도 함께 말한다. 검증 명령이 없는 프로젝트야말로 "무엇을 요구했는지"만
-        // 남는 자리이므로, 여기서 기준을 감추면 보고에 아무 내용이 없게 된다.
+      // 판정할 수 없었던 경우. 통과로 위장하지 않고, 실패로도 몰지 않는다 — 고칠 근거(실패
+      // 로그)가 없으므로 fix loop를 태우는 것은 의미가 없다. 완료로 처리하되 그 사실을 명시한다.
+      //
+      // **두 경우를 다르게 말한다.** 종전에는 하나로 뭉쳐 언제나 "검증 명령이 없습니다,
+      // 스크립트를 추가하세요"라고 안내했는데, 돌리려다 못 돌린 경우(Windows에서 `npm`을
+      // 찾지 못하는 결함 등)에는 **그 프로젝트에 스크립트가 있다.** 원인을 잘못 짚은 안내는
+      // 침묵보다 나쁘다 — 사용자가 없는 문제를 고치러 간다.
+      if (report.overall === "not_configured" || report.overall === "could_not_run") {
+        // 확정 기준도 함께 말한다. 검증이 침묵한 자리야말로 "무엇을 요구했는지"만 남는
+        // 자리이므로, 여기서 기준을 감추면 보고에 아무 내용이 없게 된다.
         const criteria = this.describeCriteria();
+        const blocked = report.checks
+          .filter((c) => c.status === "SKIPPED_WITH_REASON")
+          .map((c) => `${c.kind}(${c.summary})`)
+          .join(", ");
+        const explanation =
+          report.overall === "not_configured"
+            ? "이 프로젝트에서 실행할 수 있는 검증 명령이 없어 **검증되지 않았습니다**. " +
+              "build/test/lint 스크립트를 추가하면 다음부터 자동으로 검증됩니다."
+            : "검증 명령을 **실행하지 못해** 검증되지 않았습니다" +
+              (blocked ? `: ${blocked}` : "") +
+              ". 스크립트가 없는 것이 아니라 이번 실행에서 돌리지 못한 것입니다.";
         return {
           kind: "final",
-          result: await this.finish(
-            "completed",
-            "변경을 적용했으나 이 프로젝트에서 실행할 수 있는 검증 명령이 없어 **검증되지 않았습니다**. " +
-              "build/test/lint 스크립트를 추가하면 다음부터 자동으로 검증됩니다." +
-              (criteria ? ` · ${criteria}` : "")
-          ),
+          result: await this.finish("completed", `변경을 적용했으나 ${explanation}${criteria ? ` · ${criteria}` : ""}`),
         };
       }
 

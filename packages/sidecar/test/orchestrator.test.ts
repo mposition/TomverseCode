@@ -327,12 +327,38 @@ test("baseline에서 실패했던 체크가 통과로 바뀌면 성공이다", a
 
 test("검증 명령이 없으면 통과로 위장하지 않고 그 사실을 알린다", async () => {
   const { orchestrator } = build(
-    { verifyResults: [{ overall: "not_verified" }, { overall: "not_verified" }] },
+    { verifyResults: [{ overall: "not_configured" }, { overall: "not_configured" }] },
     { defaultPatch: VALID_PATCH }
   );
   const result = await orchestrator.run();
   assert.equal(result.status, "completed");
   assert.ok(result.summary.includes("검증되지 않았습니다"), result.summary);
+});
+
+/**
+ * **"돌릴 것이 없었다"와 "돌리지 못했다"에 같은 안내를 하지 않는다.**
+ *
+ * 종전에는 두 경우가 `not_verified` 하나로 뭉쳐 있어 언제나 "스크립트를 추가하세요"라고
+ * 말했다. Windows에서 `npm`을 찾지 못해 테스트가 실행되지 못한 사용자에게는 **그 프로젝트에
+ * 스크립트가 있는데도** 그렇게 말한 것이고, 원인을 잘못 짚은 안내는 침묵보다 나쁘다.
+ */
+test("검증을 실행하지 못한 경우에 '스크립트를 추가하라'고 말하지 않는다", async () => {
+  const { orchestrator } = build(
+    {
+      verifyResults: [
+        { overall: "could_not_run", checks: [{ kind: "test", status: "SKIPPED_WITH_REASON", summary: "program not found: npm" }] },
+        { overall: "could_not_run", checks: [{ kind: "test", status: "SKIPPED_WITH_REASON", summary: "program not found: npm" }] },
+      ],
+    },
+    { defaultPatch: VALID_PATCH }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed");
+  assert.ok(result.summary.includes("실행하지 못해"), result.summary);
+  // 없는 문제를 고치러 보내지 않는다.
+  assert.ok(!result.summary.includes("스크립트를 추가"), result.summary);
+  // 무엇을 못 돌렸는지가 남는다 — 이게 없으면 사용자가 무엇을 볼지 알 수 없다.
+  assert.ok(result.summary.includes("program not found: npm"), result.summary);
 });
 
 test("Policy Gate 거부는 policy_denied로 실패한다", async () => {
