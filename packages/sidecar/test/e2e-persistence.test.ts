@@ -866,6 +866,14 @@ test("[시나리오 D] 저장된 이벤트에서 기준 계측을 집계할 수 
       coverage: { criteria: number; byStatus: Record<string, number>; byCode: Record<string, number> };
       conflicts: { detected: number; settled: number };
       tokenEstimate: { calls: number; callsWithoutEstimate: number; callsWhereActualExceededEstimate: number };
+      ipcLineSizes: {
+        tasksObserved: number;
+        lines: number;
+        maxBytes: number;
+        maxPercentOfLimit: number | null;
+        byUpToBytes: Record<string, number>;
+      };
+      openQuestions: { id: string; samples: number; readiness: string; denominator: string; actOn: string }[];
     };
 
     assert.equal(metrics.tasksScanned, 1);
@@ -891,5 +899,27 @@ test("[시나리오 D] 저장된 이벤트에서 기준 계측을 집계할 수 
     // **감지보다 결말이 적으면** 결말이 새고 있다는 뜻이므로 그 불변식을 여기서 고정한다.
     assert.equal(metrics.conflicts.detected, 0);
     assert.ok(metrics.conflicts.settled <= metrics.conflicts.detected);
+
+    // process-architecture 3.1절: **IPC 줄 크기가 실제로 기록되는가.** 계측기는 spawn 시점에
+    // handler로 건네지고 태스크가 끝날 때 이벤트가 된다 — 그 사슬 중 하나라도 끊기면 여기서
+    // 걸린다. Rust 단위 테스트는 계수기만 보므로 배선은 실제 실행에서만 확인된다.
+    assert.ok(metrics.ipcLineSizes.lines > 0, JSON.stringify(metrics.ipcLineSizes));
+    assert.ok(metrics.ipcLineSizes.maxBytes > 0, JSON.stringify(metrics.ipcLineSizes));
+    // 구간 합계가 줄 수와 같아야 한다 — 어긋나면 어떤 줄이 어느 구간에도 안 들어간 것이다.
+    const bucketed = Object.values(metrics.ipcLineSizes.byUpToBytes).reduce((a, b) => a + b, 0);
+    assert.equal(bucketed, metrics.ipcLineSizes.lines, JSON.stringify(metrics.ipcLineSizes));
+
+    // **열린 질문 목록이 실제 실행에서도 채워지는가.** 표본이 적으므로 전부
+    // insufficient_samples여야 한다 — 한 번 돌린 것으로 답이 나오면 그게 이 가드의 실패다.
+    const ipc = metrics.openQuestions.find((q) => q.id === "ipcLineSize");
+    assert.ok(ipc, JSON.stringify(metrics.openQuestions.map((q) => q.id)));
+    // **표본은 줄이 아니라 태스크다.** 줄로 세면 한 번 돌린 것만으로 최소치를 넘어버린다 —
+    // 실제로 이 실행 하나가 43줄을 냈고, 그게 이 단언에 걸려 드러났다.
+    assert.equal(metrics.ipcLineSizes.tasksObserved, 1);
+    assert.equal(ipc.samples, 1);
+    assert.ok(
+      metrics.openQuestions.every((q) => q.readiness === "insufficient_samples"),
+      JSON.stringify(metrics.openQuestions)
+    );
   });
 });

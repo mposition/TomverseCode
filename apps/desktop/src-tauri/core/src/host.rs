@@ -12,7 +12,7 @@ use crate::artifacts::ArtifactStore;
 use crate::cancel::{CancelOutcome, CancellationRegistry, CancellationToken};
 use crate::paths::WorkspaceRoot;
 use crate::policy::{parse_run_command, secrets, PolicyGate};
-use crate::sidecar::SidecarHandler;
+use crate::sidecar::{IpcLineMeter, SidecarHandler};
 use crate::store::{AppendedEvent, Store, StoreError, TerminalOutcome};
 use crate::time::now_iso;
 use crate::tools::{ToolRuntime, MAX_INLINE_OUTPUT_BYTES};
@@ -86,6 +86,12 @@ pub struct TaskHost {
     baseline: Mutex<Option<VerificationReport>>,
     /// 이번 태스크에서 마지막으로 만들어진 diff 모음 (UI 표시용)
     diffs: Mutex<Vec<(String, String)>>,
+    /// IPC 한 줄 크기를 재는 쪽 (process-architecture.md 3.1절 — 32 MiB가 맞는지).
+    ///
+    /// **생성자 인자가 아니라 나중에 붙인다.** 호스트가 먼저 만들어지고 그 호스트를 handler로
+    /// 삼아 sidecar를 띄우므로, 만들 때는 잴 대상이 아직 없다. 없으면 그냥 재지 않는다 —
+    /// 계측이 없다고 태스크를 세우지 않는다.
+    ipc_meter: Mutex<Option<std::sync::Weak<dyn IpcLineMeter>>>,
 }
 
 impl TaskHost {
@@ -117,6 +123,7 @@ impl TaskHost {
             cancels,
             baseline: Mutex::new(None),
             diffs: Mutex::new(Vec::new()),
+            ipc_meter: Mutex::new(None),
         }
     }
 
@@ -261,7 +268,31 @@ impl TaskHost {
             // 터미널에 도달했으므로 취소 토큰을 정리한다.
             self.release_task(task_id);
         }
+        // **`Recorded`만 보면 안 된다.** 정상 경로에서 터미널을 먼저 잡는 것은 Node가 보낸
+        // 터미널 `PHASE_CHANGED`이고(store의 원자적 자리 잡기), 그러면 호스트의 확정은
+        // `AlreadyTerminal`로 돌아온다 — 거기서 계측을 건너뛰면 **정상 실행에서만 기록이
+        // 사라진다.** 실제로 그랬고 e2e가 잡았다.
+        //
+        // 두 번 불려도 안전하다: `take_line_sizes`가 비우므로 두 번째는 0을 보고 남기지 않는다.
+        self.record_ipc_line_sizes(task_id);
         Ok(outcome)
+    }
+
+    /// 이 태스크 구간에 관측한 IPC 줄 크기를 남긴다 (process-architecture.md 3.1절).
+    ///
+    /// **한 줄도 못 봤으면 남기지 않는다.** 0짜리 이벤트가 쌓이면 "트래픽이 없었다"가
+    /// "계측이 안 붙었다"와 같은 모양이 되고, 그러면 분포의 분모를 믿을 수 없다.
+    fn record_ipc_line_sizes(&self, task_id: &str) {
+        // 클라이언트가 이미 사라졌으면 잴 것이 없다. **약한 참조라서** 여기서 upgrade한다.
+        let Some(meter) = self.ipc_meter.lock().unwrap().as_ref().and_then(|m| m.upgrade()) else {
+            return;
+        };
+        let sizes = meter.take_line_sizes();
+        if sizes.lines == 0 {
+            return;
+        }
+        let payload = serde_json::to_value(&sizes).unwrap_or(Value::Null);
+        let _ = self.append_event(task_id, "IPC_LINE_SIZES", payload);
     }
 
     /// **이미 DB에 커밋된** 이벤트를 UI로 릴레이한다.
@@ -983,6 +1014,10 @@ impl CommandExecutor for HostExecutor<'_> {
 
 /// Node → Rust 요청 디스패치.
 impl SidecarHandler for TaskHost {
+    fn attach_ipc_meter(&self, meter: std::sync::Weak<dyn IpcLineMeter>) {
+        *self.ipc_meter.lock().unwrap() = Some(meter);
+    }
+
     fn handle_request(&self, method: &str, params: &Value) -> Result<Value, String> {
         match method {
             "tool.execute" => {
@@ -2229,5 +2264,120 @@ mod tests {
         assert_eq!(host.with_store(|s| s.verification_report_count("task-1")).unwrap(), 1);
         let types = host.with_store(|s| s.event_types("task-1")).unwrap();
         assert!(types.contains(&"VERIFICATION_COMPLETED".to_string()));
+    }
+    // ---- IPC 줄 크기 계측 (process-architecture.md 3.1절) ----
+
+    /// **꺼내면 비워지는 계약을 그대로 흉내낸다.** 매번 같은 값을 주는 fake를 쓰면
+    /// "두 번 불러도 중복되지 않는다"를 검증할 수 없다 — 진짜는 비우기 때문에 중복되지
+    /// 않는데, 흉내가 그 성질을 빼면 테스트는 존재하지 않는 동작을 재는 것이 된다.
+    struct FakeMeter {
+        taken: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::sidecar::IpcLineMeter for FakeMeter {
+        fn take_line_sizes(&self) -> crate::sidecar::IpcLineSizes {
+            let first = self.taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            crate::sidecar::IpcLineSizes {
+                lines: if first { 2 } else { 0 },
+                max_bytes: if first { 4096 } else { 0 },
+                buckets: vec![crate::sidecar::IpcLineBucket {
+                    up_to_bytes: 65536,
+                    lines: if first { 2 } else { 0 },
+                }],
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_task_records_the_lines_it_exchanged() {
+        let (_ws, _art, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
+        let meter = Arc::new(FakeMeter {
+            taken: std::sync::atomic::AtomicU64::new(0),
+        });
+        host.attach_ipc_meter(Arc::downgrade(&meter) as std::sync::Weak<dyn crate::sidecar::IpcLineMeter>);
+
+        host.finish_task("task-1", "COMPLETED", "TASK_COMPLETED", None, json!({}))
+            .unwrap();
+
+        let events = host.with_store(|s| s.events("task-1")).unwrap();
+        let recorded = events
+            .iter()
+            .find(|e| e.event_type == "IPC_LINE_SIZES")
+            .expect("IPC_LINE_SIZES가 없습니다");
+        assert_eq!(recorded.payload["lines"], json!(2));
+        assert_eq!(recorded.payload["maxBytes"], json!(4096));
+    }
+
+    /// **계측기를 강하게 잡으면 순환 참조가 된다.** 클라이언트가 handler를 `Arc`로 들고 있고
+    /// handler가 클라이언트를 되잡으면 둘 다 영원히 해제되지 않는다 — 워크스페이스를 전환할
+    /// 때마다 sidecar 클라이언트가 하나씩 쌓인다. 이 테스트는 그 되잡기가 약한지를 본다.
+    #[test]
+    fn attaching_the_meter_does_not_keep_it_alive() {
+        let (_ws, _art, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
+        let meter = Arc::new(FakeMeter {
+            taken: std::sync::atomic::AtomicU64::new(0),
+        });
+        let weak = Arc::downgrade(&meter);
+        host.attach_ipc_meter(weak.clone() as std::sync::Weak<dyn crate::sidecar::IpcLineMeter>);
+
+        drop(meter);
+        assert!(weak.upgrade().is_none(), "호스트가 계측기를 붙잡고 있습니다");
+
+        // 계측기가 사라져도 터미널 확정은 그대로 된다 — 계측은 태스크의 결과가 아니다.
+        host.finish_task("task-1", "COMPLETED", "TASK_COMPLETED", None, json!({}))
+            .unwrap();
+        let events = host.with_store(|s| s.events("task-1")).unwrap();
+        assert!(events.iter().any(|e| e.event_type == "TASK_COMPLETED"));
+        assert!(!events.iter().any(|e| e.event_type == "IPC_LINE_SIZES"));
+    }
+    /// **정상 경로가 `AlreadyTerminal`이다.** Node가 보낸 터미널 `PHASE_CHANGED`가 먼저
+    /// 자리를 잡으므로, `Recorded`에서만 계측하면 정상 실행에서만 기록이 사라진다.
+    #[test]
+    fn the_lines_are_recorded_even_when_the_terminal_was_already_claimed() {
+        let (_ws, _art, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
+        let meter = Arc::new(FakeMeter {
+            taken: std::sync::atomic::AtomicU64::new(0),
+        });
+        host.attach_ipc_meter(Arc::downgrade(&meter) as std::sync::Weak<dyn crate::sidecar::IpcLineMeter>);
+
+        // Node가 터미널을 먼저 잡는다.
+        host.append_event(
+            "task-1",
+            "PHASE_CHANGED",
+            json!({ "from": "EXECUTING", "to": "COMPLETED" }),
+        )
+        .unwrap();
+        let outcome = host
+            .finish_task("task-1", "COMPLETED", "TASK_COMPLETED", None, json!({}))
+            .unwrap();
+        assert!(
+            matches!(outcome, TerminalOutcome::AlreadyTerminal { .. }),
+            "{outcome:?}"
+        );
+
+        let events = host.with_store(|s| s.events("task-1")).unwrap();
+        assert!(
+            events.iter().any(|e| e.event_type == "IPC_LINE_SIZES"),
+            "정상 경로에서 계측이 빠졌습니다"
+        );
+    }
+
+    /// 두 번 불려도 이벤트가 둘이 되지 않는다 — 꺼내면 비워지므로 두 번째는 남길 것이 없다.
+    #[test]
+    fn recording_twice_does_not_duplicate_the_event() {
+        let (_ws, _art, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
+        let meter = Arc::new(FakeMeter {
+            taken: std::sync::atomic::AtomicU64::new(0),
+        });
+        host.attach_ipc_meter(Arc::downgrade(&meter) as std::sync::Weak<dyn crate::sidecar::IpcLineMeter>);
+
+        host.finish_task("task-1", "COMPLETED", "TASK_COMPLETED", None, json!({}))
+            .unwrap();
+        host.finish_task("task-1", "COMPLETED", "TASK_COMPLETED", None, json!({}))
+            .unwrap();
+
+        let events = host.with_store(|s| s.events("task-1")).unwrap();
+        let recorded = events.iter().filter(|e| e.event_type == "IPC_LINE_SIZES").count();
+        assert_eq!(recorded, 1);
     }
 }

@@ -541,6 +541,9 @@ pub struct Metrics {
     /// 인덱스 캐시의 이득 (context-engine.md 2.1절).
     #[serde(rename = "indexCache")]
     pub index_cache: IndexCache,
+    /// IPC 한 줄 크기 분포 (process-architecture.md 3.1절).
+    #[serde(rename = "ipcLineSizes")]
+    pub ipc_line_sizes: IpcLineSizes,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
@@ -550,6 +553,32 @@ pub struct Metrics {
     /// 상태다. 지표를 추가하면서 여기 넣는 것을 잊으면 그 지표는 **아무도 읽지 않는 숫자**가 된다.
     #[serde(rename = "openQuestions")]
     pub open_questions: Vec<OpenQuestion>,
+}
+
+/// IPC 한 줄 크기의 분포 (process-architecture.md 3.1절 — 32 MiB가 맞는 값인가).
+///
+/// **최댓값 하나로는 답이 안 나온다.** "3 MiB짜리가 한 번 있었다"와 "3 MiB짜리가 늘 온다"는
+/// 상한을 낮출 수 있는지에 대해 정반대를 말하는데, 최댓값은 둘을 구별하지 못한다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct IpcLineSizes {
+    /// 줄 크기를 보고한 **태스크 수.**
+    ///
+    /// **표본은 줄이 아니라 태스크다.** 한 태스크가 줄을 수십 개 주고받으므로 줄로 세면
+    /// 한 번 돌린 것만으로 "표본이 충분하다"가 되어 버린다 — 실제로 e2e 한 번에 43줄이
+    /// 나왔다. 질문은 "여러 태스크에 걸쳐 어떤 크기가 오가는가"이므로 분모도 태스크다.
+    #[serde(rename = "tasksObserved")]
+    pub tasks_observed: u64,
+    /// 관측한 줄 수. 0이면 아래 값들은 아무것도 말하지 않는다.
+    pub lines: u64,
+    /// 관측한 가장 큰 줄(바이트). **상한을 판단하는 값이다.**
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: u64,
+    /// 상한(`MAX_IPC_LINE_BYTES`) 대비 최댓값의 비율(%). 상한이 얼마나 헐거운지가 여기 보인다.
+    #[serde(rename = "maxPercentOfLimit")]
+    pub max_percent_of_limit: Option<u64>,
+    /// 구간별 줄 수. 키는 구간의 상한(바이트).
+    #[serde(rename = "byUpToBytes")]
+    pub by_up_to_bytes: BTreeMap<u64, u64>,
 }
 
 /// 아직 답하지 못한 질문 하나와 **그 답이 나올 때가 됐는지**.
@@ -675,6 +704,13 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "자주 틀리면 고칠 자리는 TEST_FILE_PATTERNS가 아니라 규칙 자체다 — 테스트 파일을 고치는 것이 작업인 태스크를 어떻게 알아볼 것인가가 진짜 질문이다",
         ),
         open_question(
+            "ipcLineSize",
+            "NDJSON 한 줄 상한 32 MiB가 맞는 값인가 (process-architecture 3.1절)",
+            "줄 크기를 보고한 **태스크 수** (줄 수가 아니다 — 한 태스크가 수십 줄을 주고받는다)",
+            m.ipc_line_sizes.tasks_observed,
+            "maxPercentOfLimit이 한 자리 수에 머무르면 상한이 헐거운 것이다. 다만 **낮추는 것은 정당한 메시지를 프로토콜 위반으로 죽이는 쪽**이므로, 분포의 꼬리(가장 큰 구간의 줄 수)를 함께 보고 여유를 남긴다",
+        ),
+        open_question(
             "indexCache",
             "인덱스 캐시가 이득인가 (context-engine 2.1절)",
             "구축 + 적중 횟수",
@@ -759,6 +795,23 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
                     metrics.coverage.criteria += 1;
                     bump(&mut metrics.coverage.by_status, item.get("status"));
                     bump(&mut metrics.coverage.by_code, item.get("code"));
+                }
+            }
+        }
+
+        // ---- IPC 한 줄 크기 (process-architecture.md 3.1절) ----
+        for event in events.iter().filter(|e| e.event_type == "IPC_LINE_SIZES") {
+            metrics.ipc_line_sizes.tasks_observed += 1;
+            metrics.ipc_line_sizes.lines += event.payload.get("lines").and_then(Value::as_u64).unwrap_or(0);
+            let max = event.payload.get("maxBytes").and_then(Value::as_u64).unwrap_or(0);
+            metrics.ipc_line_sizes.max_bytes = metrics.ipc_line_sizes.max_bytes.max(max);
+            if let Some(buckets) = event.payload.get("buckets").and_then(Value::as_array) {
+                for bucket in buckets {
+                    let Some(limit) = bucket.get("upToBytes").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    *metrics.ipc_line_sizes.by_up_to_bytes.entry(limit).or_insert(0) +=
+                        bucket.get("lines").and_then(Value::as_u64).unwrap_or(0);
                 }
             }
         }
@@ -911,6 +964,13 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     metrics.large_change_threshold = Some(suggest_large_change_files(&metrics.commit_sizes));
 
     token_ratios.sort_unstable();
+    // 상한 대비 비율은 **집계가 끝난 뒤** 낸다 — 최댓값이 확정돼야 계산할 수 있다.
+    if metrics.ipc_line_sizes.lines > 0 {
+        let limit = crate::sidecar::MAX_IPC_LINE_BYTES as u64;
+        metrics.ipc_line_sizes.max_percent_of_limit =
+            Some((metrics.ipc_line_sizes.max_bytes * 100).div_ceil(limit.max(1)));
+    }
+
     metrics.index_cache.p50_build_ms = percentile(&build_ms, 50);
     metrics.index_cache.p90_build_ms = percentile(&build_ms, 90);
     metrics.index_cache.p90_file_count = percentile(&index_file_counts, 90);
@@ -1998,5 +2058,68 @@ mod tests {
             assert!(q.min_samples > 0, "{}", q.id);
             assert!(ids.insert(q.id), "id가 겹칩니다: {}", q.id);
         }
+    }
+    // ---- IPC 줄 크기 (process-architecture.md 3.1절) ----
+
+    #[test]
+    fn ipc_line_sizes_merge_across_tasks_and_keep_the_largest() {
+        let (_d, mut store) = seeded();
+        store
+            .create_task("task-2", "sess-1", "ws-1", "/tmp/ws", "fast", "fix")
+            .unwrap();
+        store
+            .append_event(
+                "task-1",
+                "IPC_LINE_SIZES",
+                &json!({
+                    "lines": 3,
+                    "maxBytes": 2048,
+                    "buckets": [{ "upToBytes": 1024, "lines": 2 }, { "upToBytes": 65536, "lines": 1 }],
+                }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "task-2",
+                "IPC_LINE_SIZES",
+                &json!({
+                    "lines": 1,
+                    "maxBytes": 900,
+                    "buckets": [{ "upToBytes": 1024, "lines": 1 }],
+                }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        // 표본은 태스크 수다 — 줄로 세면 한 태스크가 최소치를 넘겨버린다.
+        assert_eq!(m.ipc_line_sizes.tasks_observed, 2);
+        assert_eq!(question(&m, "ipcLineSize").samples, 2);
+        assert_eq!(m.ipc_line_sizes.lines, 4);
+        // **합치지 않고 최댓값을 고른다.** 더하면 상한 판단이 무의미해진다.
+        assert_eq!(m.ipc_line_sizes.max_bytes, 2048);
+        assert_eq!(m.ipc_line_sizes.by_up_to_bytes.get(&1024), Some(&3));
+        assert_eq!(m.ipc_line_sizes.by_up_to_bytes.get(&65536), Some(&1));
+    }
+
+    /// **상한 대비 비율이 답의 형태다.** 2 KiB가 32 MiB의 몇 %인지가 "상한이 헐거운가"에
+    /// 직접 답한다 — 0으로 반올림해 버리면 "재봤더니 0%"가 되어 아무 말도 하지 않는다.
+    #[test]
+    fn the_max_is_reported_as_a_share_of_the_limit_without_rounding_to_zero() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "IPC_LINE_SIZES", &json!({ "lines": 1, "maxBytes": 2048 }))
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.ipc_line_sizes.max_percent_of_limit, Some(1));
+    }
+
+    /// 관측이 없으면 비율을 말하지 않는다 — 0%는 "작다"로 읽히지만 사실은 "모른다"다.
+    #[test]
+    fn no_observation_means_no_share_at_all() {
+        let (_d, store) = seeded();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.ipc_line_sizes.max_percent_of_limit, None);
+        assert_eq!(question(&m, "ipcLineSize").readiness, Readiness::InsufficientSamples);
     }
 }

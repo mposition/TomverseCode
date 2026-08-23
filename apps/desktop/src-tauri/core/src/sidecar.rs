@@ -35,6 +35,61 @@ use std::time::{Duration, Instant};
 /// **유도하지 못한 상수다.** 실사용 메시지 크기 분포를 재기 전까지는 관측이 아니라 판단이다.
 pub const MAX_IPC_LINE_BYTES: usize = 32 * 1024 * 1024;
 
+/// 관측 구간의 경계(바이트, 상한 포함). **32 MiB까지 펼친다** — 답해야 하는 질문이
+/// "실제 트래픽이 상한에서 얼마나 먼가"이므로, 상한 근처가 비어 있다는 사실 자체가 답이다.
+pub const IPC_LINE_BUCKET_LIMITS: [u64; 5] = [
+    1024,            // 1 KiB — 대부분의 제어 메시지
+    64 * 1024,       // 64 KiB
+    1024 * 1024,     // 1 MiB
+    8 * 1024 * 1024, // 8 MiB
+    MAX_IPC_LINE_BYTES as u64,
+];
+
+/// 한 구간의 관측 수.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IpcLineBucket {
+    /// 이 구간의 상한(바이트, 포함).
+    #[serde(rename = "upToBytes")]
+    pub up_to_bytes: u64,
+    pub lines: u64,
+}
+
+/// 관측 구간 동안 **Node → Rust**로 들어온 한 줄들의 크기 분포.
+///
+/// # 왜 이 방향만 재는가
+///
+/// 상한(`MAX_IPC_LINE_BYTES`)이 이 방향에만 있다. 그 상한이 신뢰 경계를 지키는 장치이기
+/// 때문이다(원칙 2) — 반대 방향은 우리가 보내는 것이라 같은 위협이 없다. **답해야 하는
+/// 질문은 "그 상한이 맞는가"이므로 상한이 있는 방향을 잰다.**
+///
+/// # 왜 최댓값만이 아니라 분포인가
+///
+/// 최댓값 하나로는 "3 MiB짜리가 한 번 있었다"와 "3 MiB짜리가 늘 온다"를 구별할 수 없는데,
+/// 상한을 낮출 수 있는지는 그 구별에 달려 있다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IpcLineSizes {
+    /// 관측한 줄 수. 0이면 아래 값들은 아무것도 말하지 않는다.
+    pub lines: u64,
+    /// 가장 큰 줄(바이트). **상한을 판단하는 값이다.**
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: u64,
+    pub buckets: Vec<IpcLineBucket>,
+}
+
+/// 관측한 줄 크기를 꺼내오는 쪽.
+///
+/// 트레이트로 두는 이유: `TaskHost`가 `SidecarClient`를 알지 않아야 한다. 호스트는 sidecar가
+/// 보내는 요청을 **받는** 쪽이고 클라이언트를 소유하지 않는다.
+pub trait IpcLineMeter: Send + Sync {
+    /// 직전 호출 이후 관측한 것을 돌려주고 **비운다.**
+    ///
+    /// 누적이 아니라 구간인 이유: 태스크마다 남기려면 그 태스크의 몫이어야 하는데, 누적값을
+    /// 남기면 뒤 태스크일수록 커지기만 해서 분포가 아니라 순번을 재게 된다. **구간의 경계는
+    /// 태스크 경계와 정확히 같지 않다** — v1은 워크스페이스당 한 번에 한 태스크만 돌리므로
+    /// 실제로는 일치하지만, 그 전제가 깨지면 이 값은 "직전 take 이후"일 뿐이다.
+    fn take_line_sizes(&self) -> IpcLineSizes;
+}
+
 /// 한 줄을 읽은 결과.
 ///
 /// `Oversized`와 `InvalidUtf8`을 **다른 값으로 두는 것이 이 타입의 요점이다.** 둘 다 "이 줄을
@@ -103,6 +158,20 @@ pub trait SidecarHandler: Send + Sync {
     fn handle_request(&self, method: &str, params: &Value) -> Result<Value, String>;
     /// Node가 발행한 이벤트 (응답 없음) — UI 릴레이 + 이벤트 로그
     fn handle_event(&self, task_id: &str, event: &Value);
+    /// spawn 직후 클라이언트가 **자기 계측기를 건넨다.** 기본은 무시한다.
+    ///
+    /// # 왜 여기서 건네는가
+    ///
+    /// 진입점이 둘이다(Tauri 껍데기, 헤드리스 호스트). 각자 배선하면 반드시 갈라지고,
+    /// 이 저장소는 그 갈라짐을 이미 한 번 겪었다(CLAUDE.md의 `_env.bat` 기록).
+    /// 둘 다 handler를 넘기므로 **넘기는 그 자리에서** 붙이면 한 곳이 된다.
+    ///
+    /// # 왜 `Weak`인가
+    ///
+    /// 클라이언트는 handler를 `Arc`로 들고 있다. handler가 클라이언트를 `Arc`로 되잡으면
+    /// **순환 참조가 되어 둘 다 영원히 해제되지 않는다.** 리더 스레드가 `Arc::downgrade`를
+    /// 쓰는 것과 같은 이유다.
+    fn attach_ipc_meter(&self, _meter: std::sync::Weak<dyn IpcLineMeter>) {}
 }
 
 pub struct SidecarClient {
@@ -115,6 +184,53 @@ pub struct SidecarClient {
     /// 왜 닫혔는지. **정상 종료와 프로토콜 위반을 같은 문장으로 보고하지 않기 위해** 있다.
     close_reason: Arc<Mutex<Option<String>>>,
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 관측한 줄 크기(process-architecture.md 3.1절 — 32 MiB가 맞는 값인지 재는 자리).
+    ///
+    /// 리더 스레드가 쓰고 태스크가 끝날 때 읽어 비운다. **락이 아니라 atomic인 이유**:
+    /// 모든 줄마다 지나는 자리라 여기서 락을 잡으면 계측이 측정 대상을 바꾼다.
+    line_sizes: Arc<LineSizeCounters>,
+}
+
+/// 리더 스레드가 줄마다 올리는 계수기.
+#[derive(Default)]
+struct LineSizeCounters {
+    lines: AtomicU64,
+    max_bytes: AtomicU64,
+    buckets: [AtomicU64; IPC_LINE_BUCKET_LIMITS.len()],
+}
+
+impl LineSizeCounters {
+    fn observe(&self, bytes: u64) {
+        self.lines.fetch_add(1, Ordering::Relaxed);
+        self.max_bytes.fetch_max(bytes, Ordering::Relaxed);
+        // 상한을 넘는 줄은 `Line`이 되지 못하므로 마지막 구간이 언제나 받아준다.
+        let index = IPC_LINE_BUCKET_LIMITS
+            .iter()
+            .position(|limit| bytes <= *limit)
+            .unwrap_or(IPC_LINE_BUCKET_LIMITS.len() - 1);
+        self.buckets[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn take(&self) -> IpcLineSizes {
+        IpcLineSizes {
+            lines: self.lines.swap(0, Ordering::Relaxed),
+            max_bytes: self.max_bytes.swap(0, Ordering::Relaxed),
+            buckets: IPC_LINE_BUCKET_LIMITS
+                .iter()
+                .zip(self.buckets.iter())
+                .map(|(limit, count)| IpcLineBucket {
+                    up_to_bytes: *limit,
+                    lines: count.swap(0, Ordering::Relaxed),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl IpcLineMeter for SidecarClient {
+    fn take_line_sizes(&self) -> IpcLineSizes {
+        self.line_sizes.take()
+    }
 }
 
 pub struct SpawnConfig {
@@ -152,6 +268,7 @@ impl SidecarClient {
             Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         let close_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let line_sizes = Arc::new(LineSizeCounters::default());
 
         let client = Arc::new(Self {
             stdin: Mutex::new(stdin),
@@ -161,10 +278,15 @@ impl SidecarClient {
             closed: closed.clone(),
             close_reason: close_reason.clone(),
             reader: Mutex::new(None),
+            line_sizes: line_sizes.clone(),
         });
+
+        // 계측기를 handler에 건넨다. **약한 참조다** — 위 트레이트 주석 참조.
+        handler.attach_ipc_meter(Arc::downgrade(&client) as std::sync::Weak<dyn IpcLineMeter>);
 
         let reader_client = Arc::downgrade(&client);
         let reason_slot = close_reason.clone();
+        let reader_sizes = line_sizes.clone();
         let reader = std::thread::spawn(move || {
             let mut buffered = BufReader::new(stdout);
             // **종료 사유를 갖고 나간다.** 종전에는 어떤 이유로 끝나든 대기 중인 요청이
@@ -202,6 +324,10 @@ impl SidecarClient {
                 if line.trim().is_empty() {
                     continue;
                 }
+                // **파싱 전에 잰다.** 파싱 불가한 줄도 상한을 지나온 줄이고, 상한이 맞는지를
+                // 묻는 질문에는 그것도 관측이다.
+                reader_sizes.observe(line.len() as u64);
+
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else {
                     // 파싱 불가한 줄은 무시한다 (packages/sidecar transport.ts와 동일 원칙).
                     continue;
@@ -1089,5 +1215,45 @@ mod supervisor_tests {
     fn success_has_no_failure_message() {
         assert!(RespawnOutcome::Alive.failure().is_none());
         assert!(RespawnOutcome::Respawned { attempt: 1 }.failure().is_none());
+    }
+    // ---- IPC 줄 크기 계측 (process-architecture.md 3.1절) ----
+
+    #[test]
+    fn every_line_lands_in_the_bucket_that_bounds_it() {
+        let counters = LineSizeCounters::default();
+        counters.observe(10);
+        counters.observe(1024);
+        counters.observe(1025);
+        counters.observe(MAX_IPC_LINE_BYTES as u64);
+
+        let sizes = counters.take();
+        assert_eq!(sizes.lines, 4);
+        assert_eq!(sizes.max_bytes, MAX_IPC_LINE_BYTES as u64);
+        // 경계값은 **그 구간에 들어간다**(상한 포함). 경계에서 한 칸 밀리면 분포가 통째로 밀린다.
+        assert_eq!(sizes.buckets[0].lines, 2, "{:?}", sizes.buckets);
+        assert_eq!(sizes.buckets[1].lines, 1, "{:?}", sizes.buckets);
+        assert_eq!(sizes.buckets[4].lines, 1, "{:?}", sizes.buckets);
+    }
+
+    /// **꺼내면 비워진다.** 누적을 남기면 뒤 태스크일수록 커지기만 해서 분포가 아니라 순번을
+    /// 재게 된다.
+    #[test]
+    fn taking_the_sizes_clears_them() {
+        let counters = LineSizeCounters::default();
+        counters.observe(500);
+        assert_eq!(counters.take().lines, 1);
+
+        let second = counters.take();
+        assert_eq!(second.lines, 0);
+        assert_eq!(second.max_bytes, 0);
+        assert!(second.buckets.iter().all(|b| b.lines == 0), "{:?}", second.buckets);
+    }
+
+    /// 구간 상한이 실제 상한까지 덮는가. 마지막 구간이 `MAX_IPC_LINE_BYTES`보다 작으면
+    /// **상한 근처의 줄이 어디에도 안 세어진다** — 그러면 "상한이 헐거운가"에 답할 수 없다.
+    #[test]
+    fn the_buckets_reach_the_limit() {
+        assert_eq!(*IPC_LINE_BUCKET_LIMITS.last().unwrap(), MAX_IPC_LINE_BYTES as u64);
+        assert!(IPC_LINE_BUCKET_LIMITS.windows(2).all(|w| w[0] < w[1]));
     }
 }

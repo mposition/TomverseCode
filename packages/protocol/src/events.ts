@@ -90,6 +90,14 @@ export type TaskEventType =
   | "WORKSPACE_INDEX_BUILT"
   | "WORKSPACE_INDEX_CACHE_HIT"
   /**
+   * 이 태스크 구간에 관측한 IPC 한 줄 크기 분포 (process-architecture.md 3.2절).
+   *
+   * **Rust가 append한다** — Node는 자기 메시지 크기를 보고할 자리에 있지 않다(보고하게 두면
+   * 장악당한 Node가 상한 판단의 근거를 정하게 된다). 값은 32 MiB 상한이 맞는지를 묻는
+   * 열린 항목의 재료다.
+   */
+  | "IPC_LINE_SIZES"
+  /**
    * TRIAGE 판정과 **그 근거** (context-engine.md 11.1절).
    *
    * `complexityTier` 외에 `workFileCount`·`excludedTestFiles`·`tierIfTestsCounted`가 실린다.
