@@ -1304,7 +1304,16 @@ blocking"이라는 뜻을 잃는다.
 
 ### 17.5 tier 게이팅
 
-executor를 2회 부르는 것은 비용이 2배다. `complexityTier`가 4단계로 확장되면(product-strategy 5절) `verified` 이상에서만 켠다. 현재의 2단계에서는 `standard`가 그 자리다. `simple`/`fast`에서 켜지면 13.1절이 측정한 비용 절감이 사라진다.
+executor를 2회 부르는 것은 비용이 2배다. `simple`/`fast`에서 켜지면 13.1절이 측정한 비용 절감이 사라진다.
+
+**게이트는 축이 둘이다 — 한동안 하나로 보고 있었다.** 종전 문장은 *"`complexityTier`가 4단계로 확장되면 `verified` 이상에서만 켠다. 현재의 2단계에서는 `standard`가 그 자리다"* 였고 구현도 tier만 봤다. 그런데 `standard`는 **두 경로에서 나온다**:
+
+- 사용자가 `executionMode: "verified"`를 골랐다 → TRIAGE와 무관하게 언제나 `standard`
+- 사용자가 `fast`인데 **TRIAGE 규칙이** `standard`로 분류했다
+
+둘째 경우에도 대조가 켜져 executor 호출이 2배가 되고 있었다 — 이 절이 금지한 바로 그 상황이다. `fast`는 사용자가 **싸게 가겠다고 고른 것**이고, 규칙이 "이 태스크는 어렵다"고 본 것은 교차검증(executor 1 + reviewer 1)을 켜는 근거이지 executor를 하나 더 부르는 근거가 아니다.
+
+그래서 **둘 다 요구한다**: tier가 `standard`이고 **동시에** `executionMode`가 `verified`일 때만 대조를 켠다. 규칙이 켜는 것과 사용자가 켜는 것을 갈라둔 것이며, tier가 4단계로 확장되어도 이 분리는 그대로다.
 
 라우터가 독립적인 두 executor를 배정하지 못하면 — 5절 불변식과 같은 처리다 — **같은 공급자로 두 번 부르지 않는다.** 대조 자체를 드롭하고 사유를 `RoutingDecision.appliedPolicies`에 남긴다([multi-engine-routing.md 13절](./multi-engine-routing.md)). 같은 모델을 두 번 부른 "불일치 없음"은 정보가 아니라 착시다.
 

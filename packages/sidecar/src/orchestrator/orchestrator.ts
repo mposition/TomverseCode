@@ -1453,17 +1453,33 @@ export class Orchestrator {
   // ---- 보조 ----
 
   /**
-   * 대조(executor ×2)를 요청할 것인가 — 17.5절 tier 게이팅.
+   * 대조(executor ×2)를 요청할 것인가 — 17.5절 게이팅.
    *
-   * `verified` 이상에서만 켠다는 것이 규칙이고, tier가 2단계인 현재는 `standard`가 그 자리다.
-   * `simple`에서 켜면 13.1절 스파이크가 측정한 비용 절감이 통째로 사라진다.
+   * # 축이 둘인데 하나로 보고 있었다
+   *
+   * 종전 규칙은 `tier === "standard"` 하나였고, 주석은 *"`verified` 이상에서만 켠다는 것이
+   * 규칙이고, tier가 2단계인 현재는 `standard`가 그 자리다"* 라고 적혀 있었다. **그 등치가
+   * 틀렸다.** `standard`는 두 경로에서 나온다:
+   *
+   *  - 사용자가 `verified`를 골랐다 → 언제나 `standard`
+   *  - 사용자가 `fast`인데 **TRIAGE 규칙이** `standard`로 분류했다
+   *
+   * 둘째 경우에도 대조가 켜져 executor 호출이 2배가 되고 있었다 — 17.5절이
+   * *"`simple`/`fast`에서 켜지면 13.1절이 측정한 비용 절감이 사라진다"* 고 못박은 바로 그 상황이다.
+   * `fast`는 사용자가 **싸게 가겠다고 고른 것**이고, 규칙이 "이 태스크는 어렵다"고 본 것은
+   * 교차검증(executor 1 + reviewer 1)을 켜는 근거이지 executor를 하나 더 부르는 근거가 아니다.
+   *
+   * 그래서 두 축을 갈라 둘 다 요구한다. tier는 **교차검증**을, 실행 모드는 **대조**를 켠다.
    *
    * **실험 하네스에서는 명시적으로 켜지 않는 한 끈다.** 하네스는 arm을 고정해 비교하는데,
    * 호출이 하나 더 생기면 그게 arm 차이인지 대조 때문인지 구별되지 않는다 — 측정 도구가
-   * production 경로를 그대로 타되 축은 하네스가 정한다는 원칙(README)의 연장이다.
+   * production 경로를 그대로 타되 축은 하네스가 정한다는 원칙(README)의 연장이다. 다만
+   * 하네스 플래그는 **좁히기만 한다**: production이 끄는 자리를 켜지는 못한다.
    */
   private contrastRequested(tier: ComplexityTier): boolean {
     if (tier !== "standard") return false;
+    // 비용 2배는 사용자가 고르는 것이지 규칙이 고르는 것이 아니다.
+    if (this.policy.executionMode !== "verified") return false;
     const experiment = this.input.experiment;
     if (!experiment) return true;
     return experiment.contrast === true;

@@ -39,6 +39,11 @@ export const DEFAULT_LOOP_LIMITS: TaskLoopLimits = {
  * - verified: TRIAGE 결과와 무관하게 항상 standard(교차검증) 경로 — forceComplexityTier와 같다.
  *
  * 둘 중 어느 쪽이든 VERIFYING은 생략되지 않는다(CLAUDE.md 원칙 1).
+ *
+ * **대조(executor ×2)는 이 축이 정한다.** `complexityTier`가 아니다 — `standard`는 사용자가
+ * `verified`를 고른 경우와 `fast`인데 TRIAGE가 그렇게 분류한 경우 **둘 다**에서 나오고,
+ * 후자에서 executor를 하나 더 부르면 `fast`를 고른 뜻이 사라진다
+ * (state-machine-and-protocol.md 17.5절). tier는 교차검증을, 이 축은 대조를 켠다.
  */
 export type ExecutionMode = "fast" | "verified";
 

@@ -163,6 +163,37 @@ test("독립 공급자가 없으면 대조를 드롭하고 그 사실이 로그�
 });
 
 /**
+ * **비용 2배는 사용자가 고르는 것이지 규칙이 고르는 것이 아니다** — 17.5절.
+ *
+ * `standard` tier는 두 경로에서 나온다: 사용자가 `verified`를 골랐거나, `fast`인데 TRIAGE
+ * 규칙이 그렇게 분류했거나. 종전 게이트는 tier만 봐서 **둘째 경우에도 executor를 두 번**
+ * 불렀다 — 17.5절이 "`simple`/`fast`에서 켜지면 비용 절감이 사라진다"고 못박은 상황이다.
+ */
+test("fast 모드에서는 tier가 standard여도 대조를 켜지 않는다", async () => {
+  const { orchestrator, host } = build(
+    { defaultPatch: VALID_PATCH },
+    { policy: { executionMode: "fast", forceComplexityTier: "standard" } }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+  assert.equal(
+    host.events.filter((e) => e.type === "DRAFT_RECEIVED").length,
+    1,
+    "fast 모드인데 초안이 둘 만들어졌습니다 — executor 호출이 2배입니다"
+  );
+});
+
+test("verified 모드에서는 대조를 켠다 — 게이트가 아무것도 막지 않는 상태가 아니다", async () => {
+  // 위 테스트만 있으면 "대조가 아예 안 켜진다"로도 통과한다. 켜지는 쪽을 함께 고정한다.
+  const { orchestrator, host } = build(
+    { defaultPatch: VALID_PATCH },
+    { policy: { executionMode: "verified" } }
+  );
+  await orchestrator.run();
+  assert.equal(host.events.filter((e) => e.type === "DRAFT_RECEIVED").length, 2);
+});
+
+/**
  * **비-blocking 쟁점이 카드에 실리고, 답하지 않아도 미해결이 되지 않는다** — 17.4절.
  *
  * 종전에는 카드에 실리지도 않았다. 그래서 (a) 사용자가 갈린 것을 보고도 고칠 방법이 없었고
