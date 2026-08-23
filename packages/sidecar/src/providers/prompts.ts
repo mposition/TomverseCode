@@ -255,7 +255,7 @@ export function buildSingleModelFixPrompt(input: {
 export function buildFixPrompt(input: {
   userMessage: string;
   snapshot: WorkspaceSnapshot;
-  appliedDiff: string;
+  appliedChanges: string;
   digest: VerificationDigest;
 }): string {
   const failing = input.digest.failingChecks
@@ -282,7 +282,12 @@ export function buildFixPrompt(input: {
     "",
     `## Task\n${input.userMessage}`,
     `## Attempt number\n${input.digest.attemptNumber}`,
-    `## Changes that were applied\n\`\`\`diff\n${input.appliedDiff || "(no diff recorded)"}\n\`\`\``,
+    // **```diff 블록이 아니다.** 우리는 diff를 갖고 있지 않다 — 여기 실리는 것은 경로와
+    // 크기뿐이고, 변경 내용 자체는 위 스냅샷이 이미 적용된 상태로 보여준다(6.1절).
+    // 제목과 fence가 diff라고 말하면 모델은 없는 diff를 찾다가 크기 한 줄을 diff로 읽는다.
+    `## Files your previous attempt changed\n${input.appliedChanges || "(none recorded)"}\n\n` +
+      "Their current contents are already shown in the workspace snapshot above — that snapshot " +
+      "reflects your change. This section is an index, not a diff.",
     `## Failing checks\n${failing || "(no failing check detail available)"}`,
     `## Checks that passed\n${input.digest.passingChecksSummary || "(none)"}`,
   ];

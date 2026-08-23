@@ -76,7 +76,8 @@ export interface FixInput {
   snapshot: WorkspaceSnapshot;
   userMessage: string;
   /** 직전에 적용된 변경 (전체 스냅샷 재전송 대신 delta만 — 문서 6절) */
-  appliedDiff: string;
+  /** 적용된 변경의 **목차**(경로·크기). 내용이 아니다 — 내용은 스냅샷이 나른다. */
+  appliedChanges: string;
   digest: VerificationDigest;
   attemptNumber: number;
 }

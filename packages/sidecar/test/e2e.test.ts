@@ -250,6 +250,17 @@ test("M0: 버그 수정 1건이 요청→분석→승인→파일 변경→검�
     assert.deepEqual(run.mutatedPaths, ["paginate.js"]);
     assert.ok(repo.read("paginate.js").includes("(page - 1) * perPage"));
 
+    // 1-b) **적용된 변경의 정본은 Rust다** (3.2절).
+    //
+    // sidecar는 diff를 갖고 있지 않다 — Rust가 돌려주는 것은 경로와 크기뿐이다. 그런데 한때
+    // 그 값이 `extractDiff`라는 이름으로 모여 `FinalResult.finalDiff`가 되고 FIX_LOOP
+    // 프롬프트에 ```diff 블록으로 실렸다. 최종 결과에 diff처럼 생긴 것이 다시 생기면 여기서
+    // 잡는다. needle은 런타임에 조립한다 — 리터럴로 적으면 이 파일이 검사에 걸린다.
+    const finalJson = JSON.stringify(run.final);
+    for (const needle of ["@@ " + "-", "+++ " + "b/", "--- " + "a/"]) {
+      assert.ok(!finalJson.includes(needle), `최종 결과에 diff 본문이 실렸습니다: ${needle}`);
+    }
+
     // 2) 검증이 실제로 돌아 통과했다 — 통과로 위장한 것이 아니라 npm test가 실제로 성공했다.
     assert.equal(run.final.verificationReport?.overall, "pass");
     const testCheck = run.final.verificationReport?.checks.find((c) => c.kind === "test");

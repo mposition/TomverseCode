@@ -63,6 +63,17 @@ test("규칙이 판정한 태스크만 관측으로 센다", () => {
   assert.equal(observed.providerCallObserved, true);
 });
 
+test("근거가 빠진 이유는 어느 필드인지까지 말한다", () => {
+  // 신호가 늘면 옛 기록은 새 필드를 갖지 않아 여기로 떨어진다. "근거가 없습니다"만 나오면
+  // 기록이 낡은 것인지 배선이 끊긴 것인지 구별되지 않는다.
+  const { riskPathMatched: _drop, ...withoutNewField } = FULL_EVIDENCE;
+  const observed = observationFromEvents(TASK, [ev(1, "TRIAGE_COMPLETED", withoutNewField)], 10);
+  assert.equal(observed.tier, null);
+  assert.match(observed.notObservedReason ?? "", /riskPathMatched/);
+  // 그리고 **없는 것만** 말한다 — 전부 나열하면 어느 것이 문제인지 다시 알 수 없다.
+  assert.doesNotMatch(observed.notObservedReason ?? "", /workFileCount/);
+});
+
 test("모드가 강제한 판정은 관측이 아니다 — 세면 분모가 부푼다", () => {
   const observed = observationFromEvents(
     TASK,

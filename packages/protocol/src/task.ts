@@ -253,7 +253,15 @@ export interface FinalResult {
   status: "completed" | "failed" | "cancelled" | "rejected";
   failureReason?: FailureReason;
   summary: string;
-  finalDiff?: string;
+  /**
+   * ~~`finalDiff`~~ — 제거했다(state-machine 3.2절).
+   *
+   * **소비자가 없었고, 있는 편이 오히려 나빴다.** 적용된 diff를 만든 것은 Rust의 Tool
+   * Runtime이고 Rust가 이미 경로별로 들고 있다(`collected_diffs` — 화면이 실제로 그리는 것도
+   * 그쪽이다). 여기 담긴 것은 그 사실을 **Node가 한 바퀴 돌려 만든 사본**이었다: 감사 기록에
+   * 같은 사실의 사본이 둘 생기고 그중 하나가 신뢰 경계 밖에서 온다(원칙 2). 값도 크다 —
+   * 모든 patch를 이어 붙인 문자열이 NDJSON 한 줄에 실린다.
+   */
   verificationReport?: VerificationReport;
   auditTrailEventIds: string[];
   /** 이 태스크가 변경한 파일 목록 (롤백 UX가 쓴다 — state-machine-and-protocol.md 10절) */

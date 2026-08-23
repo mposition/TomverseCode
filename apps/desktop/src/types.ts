@@ -229,7 +229,6 @@ export interface FinalResult {
   status: "completed" | "failed" | "cancelled" | "rejected";
   failureReason?: string;
   summary: string;
-  finalDiff?: string;
   verificationReport?: VerificationReport;
   mutatedPaths?: string[];
   diffs?: [string, string][];

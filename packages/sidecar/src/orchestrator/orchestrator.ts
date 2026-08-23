@@ -147,7 +147,13 @@ export class Orchestrator {
   private bridge: ToolBridge | null = null;
   private baselineReport: VerificationReport | null = null;
   private lastReport: VerificationReport | null = null;
-  private appliedDiffs: string[] = [];
+  /**
+   * 적용된 변경에 대해 **우리가 실제로 아는 것** — 경로와 크기. diff가 아니다.
+   *
+   * FIX_LOOP가 이걸 프롬프트에 싣는데, 변경 **내용**은 여기가 아니라 다시 읽은 스냅샷이
+   * 나른다(context-engine 6.1절). 그래서 이 목록은 "무엇이 바뀌었나"의 목차 역할만 한다.
+   */
+  private appliedChangeNotes: string[] = [];
   /**
    * fix loop를 돌게 만든 체크 종류들. **커밋 메시지가 "몇 번 만에 통과했는지"를 말하기 위한
    * 재료**다(19.6절). 중간 시도는 검증에 실패한 상태라 커밋으로 남지 않으므로, 이 흔적이
@@ -1308,8 +1314,8 @@ export class Orchestrator {
         const { result, policy } = await bridge.executeRequest(request);
 
         if (result.status === "ok") {
-          const diff = extractDiff(result.output);
-          if (diff) this.appliedDiffs.push(diff);
+          const applied = describeApplied(result.output);
+          if (applied) this.appliedChangeNotes.push(applied);
           const path = (request.args as { path?: unknown }).path;
           if (typeof path === "string" && path.length > 0) {
             if (!this.mutatedPaths.includes(path)) this.mutatedPaths.push(path);
@@ -1385,7 +1391,7 @@ export class Orchestrator {
           {
             snapshot: fixLoopSnapshot,
             userMessage: this.input.taskRequest.userMessage,
-            appliedDiff: this.appliedDiffs.join("\n"),
+            appliedChanges: this.appliedChangeNotes.join("\n"),
             digest,
             attemptNumber: this.state.counters.fixLoopRounds,
           },
@@ -2063,7 +2069,6 @@ export class Orchestrator {
       status,
       failureReason,
       summary,
-      finalDiff: this.appliedDiffs.length > 0 ? this.appliedDiffs.join("\n") : undefined,
       verificationReport: this.lastReport ?? undefined,
       auditTrailEventIds: this.eventIds,
       // 성공/실패/취소를 가리지 않고 담는다 — 사용자가 무엇을 결정했는지는 결과와 무관한 사실이고,
@@ -2343,9 +2348,12 @@ function readStdout(output: unknown): string {
   return typeof stdout === "string" ? stdout : "";
 }
 
-function extractDiff(output: unknown): string | null {
-  // Rust는 diff를 별도로 돌려주지 않고 이벤트에만 담는다. patch 적용 결과에서
-  // 경로 정보만 얻어 delta 요약에 쓴다 — 전체 diff는 git_diff로 다시 얻을 수 있다.
+function describeApplied(output: unknown): string | null {
+  // **이 함수는 diff를 만들지 않는다.** Rust는 diff를 돌려주지 않고 이벤트에만 담으므로,
+  // 여기서 얻을 수 있는 것은 경로와 크기뿐이다. 한때 이름이 `extractDiff`였고 결과가
+  // `appliedDiffs`에 쌓여 FIX_LOOP 프롬프트에 ```diff 블록으로 실렸다 — 모델은 "당신이 적용한
+  // 변경"이라는 제목 아래 바이트 수 한 줄을 받았다(3.2절). 이름이 거짓말을 하면 소비자가
+  // 없는 것을 있다고 믿는다.
   if (typeof output !== "object" || output === null) return null;
   const record = output as { path?: unknown; bytesBefore?: unknown; bytesAfter?: unknown };
   if (typeof record.path !== "string") return null;

@@ -300,7 +300,7 @@ interface FinalResult {
   status: "completed" | "failed" | "cancelled" | "rejected";
   failureReason?: FailureReason; // status = "failed"일 때만
   summary: string;
-  finalDiff?: string;
+  // finalDiff는 제거했다 — 3.2절.
   verificationReport?: VerificationReport;
   auditTrailEventIds: string[];
   // 이 태스크가 공급자 호출에 실제로 쓴 돈. **성공·실패를 가리지 않고 담는다** —
@@ -310,6 +310,65 @@ interface FinalResult {
   completedAt: ISODateTime;
 }
 ```
+
+### 3.2 `FinalResult.finalDiff`를 제거했다 (M1)
+
+**소비자가 없었고, 있는 편이 오히려 나빴다.**
+
+이 필드는 sidecar가 적용된 patch들을 이어 붙여 만들었고(`appliedDiffs.join`), 저장소 전체에서
+읽는 곳이 **한 군데도 없었다** — 화면도, Rust도, export도, 재현도, 테스트도. 화면이 실제로
+그리는 diff는 Rust가 경로별로 들고 있는 `collected_diffs`이며, Tauri 계층이 최종 결과 객체에
+`diffs`로 얹어 준다.
+
+없애는 이유가 "안 쓰니까"만은 아니다. **같은 사실의 사본이 둘이고 그중 하나가 신뢰 경계 밖에서
+왔다.** 적용된 diff를 만든 것은 Rust의 Tool Runtime인데, 감사 기록에 실리는 사본 하나는 Node를
+한 바퀴 돌아 온 것이다. Node가 장악당하면 그 사본은 실제 적용된 것과 다를 수 있고, 그러면
+기록을 읽는 사람은 어느 쪽이 정본인지 알 수 없다(원칙 2). `command`/`resolvedCommand`를 **둘 다**
+남기는 것과는 다른 경우다 — 그 둘은 서로 다른 사실이고, 이건 같은 사실이다.
+
+크기도 공짜가 아니었다. 모든 patch를 이어 붙인 문자열이 NDJSON **한 줄**에 실려 신뢰 경계를
+건너고(3.1절의 32 MiB 상한이 지키는 그 줄이다) 최종 결과 payload에 들어간다.
+
+**되살아나지 않게 검사를 둔다.** 최종 결과 JSON에 diff처럼 생긴 것(`--- a/`, `+++ b/`, `@@ -`)이
+나타나면 e2e가 실패한다 — 필드 이름을 검사하면 다른 이름으로 같은 것이 다시 들어올 때 통과하므로,
+이름이 아니라 **모양**을 본다.
+
+#### 3.2.1 지우려고 열어보니 그것은 diff가 아니었다
+
+`finalDiff`를 만들던 `extractDiff()`는 **diff를 만든 적이 없다.** Rust는 diff를 돌려주지 않고
+이벤트에만 담으므로, 그 함수가 `apply_patch` 결과에서 얻을 수 있는 것은 경로와 크기뿐이었다.
+실제 값은 이렇다:
+
+```
+# applied to paginate.js (173 → 179 bytes)
+```
+
+함수 안의 주석은 그 사실을 정확히 적어두었는데(**"경로 정보만 얻어"**) 이름이 반대로 말하고
+있었고, 이름을 믿은 소비자가 둘 있었다.
+
+**그리고 둘째가 진짜 결함이다.** FIX_LOOP 프롬프트가 이 값을 이렇게 렌더링하고 있었다:
+
+````
+## Changes that were applied
+```diff
+# applied to paginate.js (173 → 179 bytes)
+```
+````
+
+제목도 fence도 diff라고 말하는데 내용은 **바이트 수 한 줄**이다. 모델은 "당신이 적용한 변경"을
+보라는 지시를 받고 크기 보고서를 읽는다. context-engine 6.1절이 이미 같은 자리의 절반을 고쳤다 —
+*"FIX_LOOP가 패치 이전의 파일 내용을 실어 보내면서 프롬프트로는 '당신의 변경이 이미 반영되어
+있다'고 말하고 있었다."* 스냅샷 절반은 그때 고쳤고, **프롬프트 절반이 남아 있었다.**
+
+고친 방식은 없는 diff를 만들어 채우는 것이 아니라 **부르는 이름을 사실에 맞추는 것**이다
+(`extractDiff` → `describeApplied`, `appliedDiff` → `appliedChanges`). 변경 **내용**은 6.1절이
+정한 대로 다시 읽은 스냅샷이 나르므로 프롬프트에 diff가 따로 필요하지 않다. 대신 그 절이
+목차라는 것을 문장으로 말한다 — "이 섹션은 색인이지 diff가 아니고, 현재 내용은 위 스냅샷에
+이미 반영되어 있다."
+
+diff를 진짜로 싣고 싶다면 `git_diff`를 한 번 더 부르면 된다. 하지만 그건 도구 호출 한 번을
+더 쓰는 결정이고, 스냅샷이 이미 적용 후 내용을 나르는 지금은 **같은 사실의 두 번째 사본**이다 —
+3.2절이 `finalDiff`를 지운 것과 같은 이유로 하지 않는다.
 
 ## 4. Policy Gate 기본 매핑 (초안)
 
