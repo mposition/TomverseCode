@@ -73,8 +73,10 @@ apps/desktop/        Tauri 2 + React
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
                      `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`.
                      `metrics`는 저장된 이벤트에서 계측을 집계한다 — 기준 커버리지·충돌 결말과
-                     **취소 소요 분포**(강제 포기 탈출구가 뜨는 시점의 근거). DB는 Rust의 것이므로
-                     집계도 여기 둔다(Node가 SQLite를 직접 열지 않는다).
+                     **취소 소요 분포**(강제 포기 탈출구가 뜨는 시점의 근거), 그리고 **모델 정면
+                     비교**(`modelEvaluation` — 대조 실행에서 사용자가 어느 모델의 안을 골랐는가.
+                     라우팅에 반영해도 되는 유일한 신호다. multi-engine 8.1절).
+                     DB는 Rust의 것이므로 집계도 여기 둔다(Node가 SQLite를 직접 열지 않는다).
                      `reproduce`만 예외로 **DB를 열지 않는다** — 감사자에게는 DB가 없고(그래서
                      export 파일이 있다), 열면 없던 state.db가 생긴다. 검사는 아무것도 쓰지 않고
                      `--apply`는 파일을 쓰되 **각 단계가 Policy Gate를 그대로 지난다**(기록에

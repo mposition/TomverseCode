@@ -512,6 +512,296 @@ pub struct TokenEstimateAccuracy {
     pub max_ratio_percent: Option<u64>,
 }
 
+/// 두 모델의 정면 비교 하나 — multi-engine-routing.md 8절/12절.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HeadToHead {
+    /// 비교된 두 모델. 정렬되어 있으므로 `wins[0]`은 `models[0]`의 것이다.
+    pub models: [String; 2],
+    /// 각 모델이 이긴 **태스크** 수. 쟁점 수가 아니다 — 아래 `ModelEvaluation` 주석 참조.
+    pub wins: [u64; 2],
+    /// 두 모델이 같은 수의 쟁점에서 선택된 태스크. 승자가 없다.
+    pub ties: u64,
+    /// 부호 검정(단측)의 p-value — **승패가 동전 던지기라는 가설 아래** 이만큼 치우칠 확률.
+    #[serde(rename = "pValue")]
+    pub p_value: f64,
+    pub verdict: EvaluationVerdict,
+}
+
+/// 이 비교를 **라우팅에 반영해도 되는가.**
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationVerdict {
+    /// **완승이어도** 유의할 수 없는 표본 수. 여기서 최소 표본이 유도된다 — 상수가 아니다.
+    TooFewToSeparate,
+    /// 표본은 갈릴 수 있는 크기인데 갈리지 않았다. **"차이가 없다"가 아니라 "못 갈랐다"이다.**
+    NoDifference,
+    /// 한쪽이 유의하게 더 자주 선택됐다.
+    Separated { better: String },
+}
+
+/// 부호 검정의 유의수준. **관례적 상수다** — 0.05에 자연법칙이 있는 것은 아니다.
+///
+/// 여기 적어두는 이유는 이 값이 아래 최소 표본 수를 **결정**하기 때문이다. 바꾸면 최소치가
+/// 따라 움직이므로, 두 값을 각각 손으로 적어두면 언젠가 어긋난다.
+pub const SIGN_TEST_ALPHA: f64 = 0.05;
+
+/// **완승했을 때조차** 유의할 수 없는 표본 크기의 경계.
+///
+/// 유도한다: 한쪽이 n번 모두 이길 확률은 동전 던지기 아래 `0.5^n`이므로, 그 값이 α보다 크면
+/// 그 표본으로는 무엇을 관측하든 갈릴 수 없다. α=0.05에서 n=5다.
+///
+/// **이 숫자를 상수로 박지 않는 이유**: 박아두면 α를 바꿨을 때 최소치가 따라오지 않고, 그러면
+/// "유의하다"고 말하면서 실제로는 유의할 수 없는 표본을 통과시킨다. 그 종류의 오류는 값이
+/// 그럴듯해서 눈으로 잡히지 않는다.
+pub fn min_separable_comparisons() -> u64 {
+    let mut n: u64 = 1;
+    // 0.5^n은 n=1074 부근에서 f64 하한에 닿는다. α가 0보다 크면 그 훨씬 전에 멈춘다.
+    while 0.5_f64.powi(n as i32) > SIGN_TEST_ALPHA && n < 1_074 {
+        n += 1;
+    }
+    n
+}
+
+/// 부호 검정(단측) p-value. `wins` 쪽이 우연만으로 이만큼 이상 이길 확률.
+///
+/// 로그 공간에서 더한다. `0.5^n`을 직접 곱하면 n이 커질 때 0으로 내려앉는데, 그러면
+/// **50:50인 큰 표본도 p=0**이 되어 "유의하다"로 읽힌다 — 값이 그럴듯해서 잡히지 않는 종류의
+/// 고장이다.
+pub fn sign_test_p_value(wins: u64, losses: u64) -> f64 {
+    let n = wins + losses;
+    if n == 0 {
+        return 1.0;
+    }
+    let k = wins.max(losses);
+    // 누적 로그 팩토리얼. n이 커도 O(n)이고 정밀도가 유지된다.
+    let mut log_fact = vec![0.0_f64; (n + 1) as usize];
+    for i in 1..=n {
+        log_fact[i as usize] = log_fact[(i - 1) as usize] + (i as f64).ln();
+    }
+    let ln_half = 0.5_f64.ln();
+    let mut sum = 0.0_f64;
+    for i in k..=n {
+        let ln_c = log_fact[n as usize] - log_fact[i as usize] - log_fact[(n - i) as usize];
+        sum += (ln_c + (n as f64) * ln_half).exp();
+    }
+    // `min`을 쓰면 NaN이 1.0으로 **세탁된다** — 계산이 깨진 상태가 "유의하지 않음"과
+    // 똑같이 보인다. `clamp`는 NaN을 그대로 통과시키므로 고장이 값에 남는다.
+    sum.clamp(0.0, 1.0)
+}
+
+/// 승패에서 판정을 만든다. **판정 로직은 여기 한 곳뿐이다.**
+pub fn evaluation_verdict(models: &[String; 2], wins: [u64; 2]) -> EvaluationVerdict {
+    let n = wins[0] + wins[1];
+    if n < min_separable_comparisons() {
+        return EvaluationVerdict::TooFewToSeparate;
+    }
+    if sign_test_p_value(wins[0], wins[1]) > SIGN_TEST_ALPHA {
+        return EvaluationVerdict::NoDifference;
+    }
+    let better = if wins[0] > wins[1] { 0 } else { 1 };
+    EvaluationVerdict::Separated {
+        better: models[better].clone(),
+    }
+}
+
+/// 모델 평가 — multi-engine-routing.md 12절 "표본 몇 개부터 라우팅에 반영할 것인가".
+///
+/// # 문항보다 먼저 답해야 하는 것이 있었다
+///
+/// 12절은 **표본 수의 임계**를 물었다. 그런데 임계를 정하기 전에 물어야 하는 것은
+/// **어떤 관측이 애초에 모델 간 비교가 되는가**이고, 대부분의 관측은 되지 않는다.
+///
+/// `verificationPassRate`가 그렇다. 어떤 모델이 어떤 태스크를 받았는지는 **라우터가 정한다.**
+/// 즉 그 비율은 라우터가 만든 분포 위에서 재는 값이고, 모델이 아니라 **그 모델에게 배정된
+/// 태스크가 쉬웠는지**를 함께 담고 있다. 표본이 아무리 쌓여도 이 편향은 줄지 않는다 —
+/// 오히려 좁은 신뢰구간이 붙어 더 그럴듯해진다. 8절의 부트스트랩 순환이 남긴 잔여물이다.
+///
+/// **태스크 난이도가 상쇄되는 관측은 하나뿐이다**: 대조 실행(13절 co-executor)에서 두 모델이
+/// **같은 태스크·같은 스냅샷**에 대해 낸 안을 사용자가 고른 결과. 여기서만 두 모델이 같은
+/// 문제를 풀었고, 그래서 승패가 모델의 차이를 말한다.
+///
+/// # 왜 쟁점이 아니라 태스크로 세는가
+///
+/// 한 태스크의 쟁점들은 **같은 두 초안**에서 나온다. 쟁점으로 세면 쟁점 4개짜리 태스크 하나가
+/// 표본 4가 되어 유의성이 부풀려진다 — 독립이 아닌 것을 독립으로 센 것이다. 그래서 태스크마다
+/// 다수결로 승자를 하나 정하고, 동수면 무승부로 둔다.
+///
+/// # 사용자가 판정자인 것이 문제가 아니라 이유다
+///
+/// 여기서 이기고 진다는 것은 "사용자가 그 모델의 해석을 골랐다"이다. 요구에 대한 최종 권위는
+/// 사용자이므로(product-strategy.md 16절), 이건 대리 지표가 아니라 **재려던 것 그 자체**다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ModelEvaluation {
+    /// 모델 쌍(정렬된 두 ID를 ` vs `로 이은 키) → 정면 비교.
+    #[serde(rename = "headToHead")]
+    pub head_to_head: BTreeMap<String, HeadToHead>,
+    /// 대조를 돌린 태스크 수. 아래 모든 수의 상위 분모다.
+    #[serde(rename = "contrastTasks")]
+    pub contrast_tasks: u64,
+    /// 사용자가 두 안을 **모두 버리고** 직접 적어 승자가 없는 태스크.
+    ///
+    /// 어느 모델의 패배도 아니지만 버리지 않는다 — 이 수가 크면 갈라야 할 것은 모델이 아니라
+    /// 초안 프롬프트다.
+    #[serde(rename = "bothRejected")]
+    pub both_rejected: u64,
+    /// 사용자 판정이 없어 비교가 성립하지 않은 태스크(쟁점 0건, 카드가 뜨지 않음).
+    #[serde(rename = "noVerdict")]
+    pub no_verdict: u64,
+    /// 선택을 모델에 **귀속시키지 못한** 태스크.
+    ///
+    /// 귀속은 `USER_DECISION_RECORDED.optionId` → `DISAGREEMENT_DETECTED`의
+    /// `fromProposalId` → `DRAFT_RECEIVED.model`로 세 번 잇는다. 한 곳이라도 끊기면 그 태스크는
+    /// **조용히 사라지는 대신** 여기 남는다 — 조용히 버리면 배선이 끊긴 상태가
+    /// "아직 대조를 안 돌렸다"와 똑같이 보인다.
+    pub unattributed: u64,
+}
+
+/// 쌍의 기록을 찾거나 만든다. 키는 정렬된 두 모델 ID이므로 순서가 뒤집혀도 같은 칸에 쌓인다.
+fn head_to_head_entry<'a>(
+    map: &'a mut BTreeMap<String, HeadToHead>,
+    models: [String; 2],
+) -> &'a mut HeadToHead {
+    let key = format!("{} vs {}", models[0], models[1]);
+    map.entry(key).or_insert(HeadToHead {
+        models,
+        wins: [0, 0],
+        ties: 0,
+        // 판정은 집계가 끝난 뒤 한 번에 채운다 — 중간값으로 채우면 그 값이 최종처럼 보인다.
+        p_value: 1.0,
+        verdict: EvaluationVerdict::TooFewToSeparate,
+    })
+}
+
+/// 한 대조 태스크가 모델 비교에 무엇을 기여하는가.
+///
+/// **모든 결말에 이름이 있다.** "기여하지 않음"을 하나로 뭉치면, 배선이 끊긴 것과 사용자가
+/// 판정하지 않은 것과 두 안이 모두 버려진 것이 같은 값이 된다 — 셋은 서로 다른 조치를 부른다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContrastOutcome {
+    /// 대조를 돌리지 않은 태스크. 비교의 모집단이 아니다.
+    NotContrasted,
+    /// 대조는 돌렸지만 사용자 판정이 없었다(쟁점 0건이거나 카드가 뜨지 않았다).
+    NoVerdict,
+    /// 사용자가 두 안을 모두 버리고 직접 적었다.
+    BothRejected,
+    /// 선택을 모델에 이을 수 없었다.
+    Unattributed,
+    /// 두 모델이 같은 수의 쟁점에서 선택됐다.
+    Tied { models: [String; 2] },
+    /// 한쪽이 더 많이 선택됐다. `winner`는 `models`의 인덱스다.
+    Won { models: [String; 2], winner: usize },
+}
+
+/// 대조 태스크 하나에서 승자를 가린다.
+///
+/// 잇는 순서: `USER_DECISION_RECORDED.decisions[].optionId`
+/// → `DISAGREEMENT_DETECTED`의 `question.options[].fromProposalId`
+/// → `DRAFT_RECEIVED.model`.
+///
+/// **새 계측을 붙이지 않았다.** 세 이벤트가 이미 각자 필요한 것을 남기고 있었고, 없던 것은
+/// 그 셋을 잇는 일뿐이었다. 그래서 이 집계는 오늘 이전에 쌓인 로그에도 그대로 적용된다.
+pub fn contrast_outcome(events: &[crate::store::StoredEvent]) -> ContrastOutcome {
+    let contrasted = events.iter().any(|e| {
+        e.event_type == "DISAGREEMENT_DETECTED"
+            && e.payload.get("contrasted").and_then(Value::as_bool) == Some(true)
+    });
+    if !contrasted {
+        return ContrastOutcome::NotContrasted;
+    }
+
+    // proposalId → model
+    let mut proposal_model: BTreeMap<String, String> = BTreeMap::new();
+    for event in events.iter().filter(|e| e.event_type == "DRAFT_RECEIVED") {
+        let (Some(id), Some(model)) = (
+            event.payload.get("proposalId").and_then(Value::as_str),
+            event.payload.get("model").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        proposal_model.insert(id.to_string(), model.to_string());
+    }
+
+    // optionId → proposalId
+    let mut option_proposal: BTreeMap<String, String> = BTreeMap::new();
+    for event in events.iter().filter(|e| e.event_type == "DISAGREEMENT_DETECTED") {
+        let Some(items) = event.payload.get("disagreements").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(options) = item
+                .get("question")
+                .and_then(|q| q.get("options"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for option in options {
+                let (Some(option_id), Some(from)) = (
+                    option.get("optionId").and_then(Value::as_str),
+                    option.get("fromProposalId").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                option_proposal.insert(option_id.to_string(), from.to_string());
+            }
+        }
+    }
+
+    // 모델이 정확히 둘일 때만 정면 비교가 성립한다. 하나면 대조가 실제로 돌지 않은 것이고,
+    // 셋 이상이면 이 집계가 다루는 모양이 아니다 — 어느 쪽이든 승패로 세지 않는다.
+    let mut models: Vec<String> = proposal_model.values().cloned().collect();
+    models.sort();
+    models.dedup();
+    if models.len() != 2 {
+        return ContrastOutcome::Unattributed;
+    }
+    let pair: [String; 2] = [models[0].clone(), models[1].clone()];
+
+    let mut picks = [0_u64, 0_u64];
+    let mut freeform = 0_u64;
+    let mut answered = 0_u64;
+    for event in events.iter().filter(|e| e.event_type == "USER_DECISION_RECORDED") {
+        let Some(decisions) = event.payload.get("decisions").and_then(Value::as_array) else {
+            continue;
+        };
+        for decision in decisions {
+            answered += 1;
+            if decision.get("freeform").and_then(Value::as_bool) == Some(true) {
+                freeform += 1;
+                continue;
+            }
+            let model = decision
+                .get("optionId")
+                .and_then(Value::as_str)
+                .and_then(|o| option_proposal.get(o))
+                .and_then(|p| proposal_model.get(p));
+            let Some(model) = model else {
+                // 한 선택이라도 이을 수 없으면 이 태스크의 승패를 믿을 수 없다.
+                return ContrastOutcome::Unattributed;
+            };
+            if *model == pair[0] {
+                picks[0] += 1;
+            } else if *model == pair[1] {
+                picks[1] += 1;
+            } else {
+                return ContrastOutcome::Unattributed;
+            }
+        }
+    }
+
+    if answered == 0 {
+        return ContrastOutcome::NoVerdict;
+    }
+    if picks[0] == 0 && picks[1] == 0 && freeform > 0 {
+        return ContrastOutcome::BothRejected;
+    }
+    if picks[0] == picks[1] {
+        return ContrastOutcome::Tied { models: pair };
+    }
+    let winner = if picks[0] > picks[1] { 0 } else { 1 };
+    ContrastOutcome::Won { models: pair, winner }
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Metrics {
     pub coverage: CriteriaCoverage,
@@ -544,6 +834,9 @@ pub struct Metrics {
     /// IPC 한 줄 크기 분포 (process-architecture.md 3.1절).
     #[serde(rename = "ipcLineSizes")]
     pub ipc_line_sizes: IpcLineSizes,
+    /// 모델 정면 비교 (multi-engine-routing.md 12절).
+    #[serde(rename = "modelEvaluation")]
+    pub model_evaluation: ModelEvaluation,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
@@ -643,13 +936,30 @@ fn open_question(
     samples: u64,
     act_on: &'static str,
 ) -> OpenQuestion {
+    open_question_with_min(id, question, denominator, samples, MIN_OPEN_QUESTION_SAMPLES, act_on)
+}
+
+/// 최소치를 **유도할 수 있는** 질문용.
+///
+/// 대부분의 열린 질문은 비율을 재므로 최소치가 관례적 상수일 수밖에 없다
+/// (`MIN_OPEN_QUESTION_SAMPLES`). 그러나 검정으로 판정하는 질문은 **완승해도 유의할 수 없는
+/// 표본 크기**가 검정 자체에서 나온다. 그런 질문에까지 관례적 상수를 씌우면, 이미 갈린 결과를
+/// "표본 부족"이라고 부르게 된다.
+fn open_question_with_min(
+    id: &'static str,
+    question: &'static str,
+    denominator: &'static str,
+    samples: u64,
+    min_samples: u64,
+    act_on: &'static str,
+) -> OpenQuestion {
     OpenQuestion {
         id,
         question,
         denominator,
         samples,
-        min_samples: MIN_OPEN_QUESTION_SAMPLES,
-        readiness: if samples >= MIN_OPEN_QUESTION_SAMPLES {
+        min_samples,
+        readiness: if samples >= min_samples {
             Readiness::EnoughToLook
         } else {
             Readiness::InsufficientSamples
@@ -709,6 +1019,19 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "줄 크기를 보고한 **태스크 수** (줄 수가 아니다 — 한 태스크가 수십 줄을 주고받는다)",
             m.ipc_line_sizes.tasks_observed,
             "maxPercentOfLimit이 한 자리 수에 머무르면 상한이 헐거운 것이다. 다만 **낮추는 것은 정당한 메시지를 프로토콜 위반으로 죽이는 쪽**이므로, 분포의 꼬리(가장 큰 구간의 줄 수)를 함께 보고 여유를 남긴다",
+        ),
+        open_question_with_min(
+            "modelEvaluation",
+            "모델 평가 데이터를 표본 몇 개부터 라우팅에 반영할 것인가 (multi-engine-routing 12절)",
+            "대조 실행에서 **승패가 갈린 태스크 수** (쟁점 수가 아니다 — 한 태스크의 쟁점들은 같은 두 초안에서 나오므로 독립이 아니다)",
+            m.model_evaluation
+                .head_to_head
+                .values()
+                .map(|h| h.wins[0] + h.wins[1])
+                .sum(),
+            // 이 질문의 최소치만 관례적 상수가 아니다 — 검정에서 유도된다.
+            min_separable_comparisons(),
+            "verdict가 separated인 쌍이 생기면 그때 라우터를 데이터 기반으로 전환한다(8절). **verificationPassRate로는 전환하지 않는다** — 그 분포는 라우터가 만든 것이라 표본이 쌓여도 편향이 줄지 않는다. unattributed가 0이 아니면 먼저 그 배선부터 본다",
         ),
         open_question(
             "indexCache",
@@ -857,6 +1180,31 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
             }
         }
 
+        // ---- 모델 정면 비교 (multi-engine-routing.md 12절) ----
+        match contrast_outcome(&events) {
+            ContrastOutcome::NotContrasted => {}
+            ContrastOutcome::NoVerdict => {
+                metrics.model_evaluation.contrast_tasks += 1;
+                metrics.model_evaluation.no_verdict += 1;
+            }
+            ContrastOutcome::BothRejected => {
+                metrics.model_evaluation.contrast_tasks += 1;
+                metrics.model_evaluation.both_rejected += 1;
+            }
+            ContrastOutcome::Unattributed => {
+                metrics.model_evaluation.contrast_tasks += 1;
+                metrics.model_evaluation.unattributed += 1;
+            }
+            ContrastOutcome::Tied { models } => {
+                metrics.model_evaluation.contrast_tasks += 1;
+                head_to_head_entry(&mut metrics.model_evaluation.head_to_head, models).ties += 1;
+            }
+            ContrastOutcome::Won { models, winner } => {
+                metrics.model_evaluation.contrast_tasks += 1;
+                head_to_head_entry(&mut metrics.model_evaluation.head_to_head, models).wins[winner] += 1;
+            }
+        }
+
         // ---- 인덱스 캐시 (context-engine.md 2.1절) ----
         for event in &events {
             match event.event_type.as_str() {
@@ -987,6 +1335,13 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     metrics.task_budget_threshold = Some(suggest_task_budget_usd(&metrics.task_costs));
 
     metrics.force_abandon_threshold = Some(suggest_force_abandon_ms(&metrics.cancellation));
+
+    // 정면 비교의 판정은 **집계가 끝난 뒤** 한 번에 낸다. 태스크마다 갱신하면 중간 상태의
+    // 판정이 로그에 남고, 그 값은 최종 판정과 구별되지 않는다.
+    for entry in metrics.model_evaluation.head_to_head.values_mut() {
+        entry.p_value = sign_test_p_value(entry.wins[0], entry.wins[1]);
+        entry.verdict = evaluation_verdict(&entry.models, entry.wins);
+    }
 
     // **마지막에 만든다.** 위에서 센 값을 읽을 뿐이므로 순서가 뒤집히면 전부 0을 본다.
     metrics.open_questions = open_questions(&metrics);
@@ -1183,6 +1538,70 @@ mod tests {
                 }))
                 .unwrap();
         }
+    }
+
+    /// 대조 태스크 하나를 심는다. `picks`는 (쟁점 번호, 고른 초안 번호 또는 None=자유 입력).
+    ///
+    /// **이벤트를 직접 쓴다.** 세 이벤트를 잇는 것이 이 집계의 전부이므로, 그 세 이벤트가
+    /// 실제로 저장된 모양대로 있어야 검사가 의미를 갖는다.
+    fn seed_contrast_task(
+        store: &mut Store,
+        task_id: &str,
+        models: (&str, &str),
+        picks: &[Option<usize>],
+    ) {
+        store
+            .create_task(task_id, "sess-1", "ws-1", "/tmp/ws", "verified", "fix")
+            .unwrap();
+        for (i, model) in [models.0, models.1].iter().enumerate() {
+            store
+                .append_event(
+                    task_id,
+                    "DRAFT_RECEIVED",
+                    &json!({ "proposalId": format!("p{i}"), "model": model }),
+                )
+                .unwrap();
+        }
+        let disagreements: Vec<Value> = picks
+            .iter()
+            .enumerate()
+            .map(|(q, _)| {
+                json!({
+                    "disagreementId": format!("d{q}"),
+                    "field": "doneCriteria",
+                    "question": { "options": [
+                        { "optionId": format!("d{q}-o0"), "fromProposalId": "p0" },
+                        { "optionId": format!("d{q}-o1"), "fromProposalId": "p1" },
+                    ]},
+                })
+            })
+            .collect();
+        store
+            .append_event(
+                task_id,
+                "DISAGREEMENT_DETECTED",
+                &json!({ "contrasted": true, "disagreements": disagreements }),
+            )
+            .unwrap();
+        let decisions: Vec<Value> = picks
+            .iter()
+            .enumerate()
+            .map(|(q, pick)| match pick {
+                Some(which) => json!({
+                    "disagreementId": format!("d{q}"),
+                    "optionId": format!("d{q}-o{which}"),
+                    "freeform": false,
+                }),
+                None => json!({
+                    "disagreementId": format!("d{q}"),
+                    "optionId": Value::Null,
+                    "freeform": true,
+                }),
+            })
+            .collect();
+        store
+            .append_event(task_id, "USER_DECISION_RECORDED", &json!({ "decisions": decisions }))
+            .unwrap();
     }
 
     fn seed_token_estimate(store: &Store, task_id: &str, call: &str, estimated: Option<i64>, actual: i64) {
@@ -2122,4 +2541,168 @@ mod tests {
         assert_eq!(m.ipc_line_sizes.max_percent_of_limit, None);
         assert_eq!(question(&m, "ipcLineSize").readiness, Readiness::InsufficientSamples);
     }
+
+    // ---- 모델 정면 비교 (multi-engine-routing.md 12절) ----
+
+    #[test]
+    fn contrast_picks_are_attributed_to_the_model_that_wrote_the_option() {
+        let (_d, mut store) = seeded();
+        // 쟁점 3개 중 2개에서 두 번째 초안(model-b)을 골랐다 → 그 태스크는 b의 승리다.
+        seed_contrast_task(&mut store, "t-a", ("model-a", "model-b"), &[Some(1), Some(1), Some(0)]);
+        let m = collect(&store, None).unwrap();
+        let h = m.model_evaluation.head_to_head.get("model-a vs model-b").expect("쌍이 없습니다");
+        assert_eq!(h.wins, [0, 1], "{h:?}");
+        assert_eq!(m.model_evaluation.contrast_tasks, 1);
+        assert_eq!(m.model_evaluation.unattributed, 0);
+    }
+
+    #[test]
+    fn a_task_is_one_sample_however_many_disagreements_it_had() {
+        // 쟁점으로 세면 이 태스크 하나가 표본 5가 되어 완승으로 유의해진다. 태스크로 세면 1이다.
+        let (_d, mut store) = seeded();
+        seed_contrast_task(
+            &mut store,
+            "t-a",
+            ("model-a", "model-b"),
+            &[Some(0), Some(0), Some(0), Some(0), Some(0)],
+        );
+        let m = collect(&store, None).unwrap();
+        let h = m.model_evaluation.head_to_head.get("model-a vs model-b").unwrap();
+        assert_eq!(h.wins, [1, 0]);
+        assert_eq!(h.verdict, EvaluationVerdict::TooFewToSeparate, "{h:?}");
+    }
+
+    #[test]
+    fn ties_and_rejections_and_broken_wiring_are_different_facts() {
+        let (_d, mut store) = seeded();
+        // 동수 — 승자가 없다.
+        seed_contrast_task(&mut store, "t-tie", ("model-a", "model-b"), &[Some(0), Some(1)]);
+        // 둘 다 버리고 직접 적었다.
+        seed_contrast_task(&mut store, "t-free", ("model-a", "model-b"), &[None, None]);
+        // 판정이 없었다.
+        seed_contrast_task(&mut store, "t-none", ("model-a", "model-b"), &[]);
+        let m = collect(&store, None).unwrap();
+        let h = m.model_evaluation.head_to_head.get("model-a vs model-b").unwrap();
+        assert_eq!(h.ties, 1);
+        assert_eq!(h.wins, [0, 0]);
+        assert_eq!(m.model_evaluation.both_rejected, 1);
+        assert_eq!(m.model_evaluation.no_verdict, 1);
+        assert_eq!(m.model_evaluation.contrast_tasks, 3);
+    }
+
+    #[test]
+    fn an_unlinkable_pick_is_counted_not_dropped() {
+        // 조용히 버리면 배선이 끊긴 상태가 "아직 대조를 안 돌렸다"와 똑같이 보인다.
+        let (_d, mut store) = seeded();
+        store
+            .create_task("t-broken", "sess-1", "ws-1", "/tmp/ws", "verified", "fix")
+            .unwrap();
+        for (i, model) in ["model-a", "model-b"].iter().enumerate() {
+            store
+                .append_event("t-broken", "DRAFT_RECEIVED", &json!({ "proposalId": format!("p{i}"), "model": model }))
+                .unwrap();
+        }
+        store
+            .append_event(
+                "t-broken",
+                "DISAGREEMENT_DETECTED",
+                &json!({ "contrasted": true, "disagreements": [
+                    { "disagreementId": "d0", "question": { "options": [
+                        { "optionId": "d0-o0", "fromProposalId": "p0" }
+                    ]}}
+                ]}),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "t-broken",
+                "USER_DECISION_RECORDED",
+                // 이 optionId는 어느 선택지 목록에도 없다 — 이을 수 없다.
+                &json!({ "decisions": [{ "disagreementId": "d0", "optionId": "없는-선택지", "freeform": false }] }),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.model_evaluation.unattributed, 1);
+        assert!(m.model_evaluation.head_to_head.is_empty(), "{:?}", m.model_evaluation);
+    }
+
+    #[test]
+    fn tasks_without_contrast_are_not_in_the_population() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "DRAFT_RECEIVED", &json!({ "proposalId": "p0", "model": "model-a" }))
+            .unwrap();
+        store
+            .append_event("task-1", "DISAGREEMENT_DETECTED", &json!({ "contrasted": false, "disagreements": [] }))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.model_evaluation.contrast_tasks, 0);
+    }
+
+    // ---- 부호 검정 ----
+
+    #[test]
+    fn the_minimum_sample_is_derived_from_the_test_not_written_down() {
+        let n = min_separable_comparisons();
+        // 완승해도 유의하지 않은 크기에서는 판정이 나오면 안 된다.
+        let models = ["a".to_string(), "b".to_string()];
+        assert_eq!(
+            evaluation_verdict(&models, [n - 1, 0]),
+            EvaluationVerdict::TooFewToSeparate,
+            "n={n}"
+        );
+        // 하나만 더 있으면 완승이 갈린다.
+        assert_eq!(
+            evaluation_verdict(&models, [n, 0]),
+            EvaluationVerdict::Separated { better: "a".to_string() }
+        );
+        // 그리고 그 경계가 α와 실제로 이어져 있다.
+        assert!(0.5_f64.powi((n - 1) as i32) > SIGN_TEST_ALPHA);
+        assert!(0.5_f64.powi(n as i32) <= SIGN_TEST_ALPHA);
+    }
+
+    #[test]
+    fn a_big_but_balanced_sample_is_not_significant() {
+        // 로그 공간으로 더하지 않으면 0.5^n이 0으로 내려앉아 **50:50도 p=0**이 된다.
+        // 값이 그럴듯해서 눈으로 잡히지 않는 종류의 고장이다.
+        let p = sign_test_p_value(600, 600);
+        // 참값은 0.5보다 아주 조금 크다. 구간을 넓게 잡으면 **0으로 내려앉은 것도 1.0으로
+        // 세탁된 것도** 통과한다 — 둘 다 실제로 나온 고장이다.
+        assert!(p > 0.4 && p < 0.6, "p={p}");
+        let models = ["a".to_string(), "b".to_string()];
+        assert_eq!(evaluation_verdict(&models, [600, 600]), EvaluationVerdict::NoDifference);
+    }
+
+    #[test]
+    fn a_lopsided_large_sample_separates() {
+        let p = sign_test_p_value(40, 10);
+        assert!(p < 0.001, "p={p}");
+        let models = ["a".to_string(), "b".to_string()];
+        assert_eq!(
+            evaluation_verdict(&models, [40, 10]),
+            EvaluationVerdict::Separated { better: "a".to_string() }
+        );
+    }
+
+    #[test]
+    fn sign_test_matches_hand_computed_values() {
+        // 5전 5승: 0.5^5 = 0.03125.
+        assert!((sign_test_p_value(5, 0) - 0.03125).abs() < 1e-12);
+        // 4전 3승: (4 + 1)/16 = 0.3125.
+        assert!((sign_test_p_value(3, 1) - 0.3125).abs() < 1e-12);
+        // 표본이 없으면 아무것도 말하지 않는다.
+        assert_eq!(sign_test_p_value(0, 0), 1.0);
+    }
+
+    #[test]
+    fn model_evaluation_minimum_is_not_the_conventional_one() {
+        // 이 질문만 최소치가 유도된다. 관례적 상수를 씌우면 이미 갈린 결과를 "표본 부족"이라
+        // 부르게 된다.
+        let (_d, store) = seeded();
+        let m = collect(&store, None).unwrap();
+        let q = question(&m, "modelEvaluation");
+        assert_eq!(q.min_samples, min_separable_comparisons());
+        assert!(q.min_samples < MIN_OPEN_QUESTION_SAMPLES);
+    }
+
 }

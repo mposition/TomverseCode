@@ -35,12 +35,69 @@ export interface ModelAvailability {
   deprecatedAfter?: ISODateTime;
 }
 
+/**
+ * 이 모델에 대해 관측된 것 — multi-engine-routing.md 8절/12절.
+ *
+ * # 모든 관측이 모델 비교인 것은 아니다
+ *
+ * 12절은 "표본 몇 개부터 라우팅에 반영할 것인가"를 물었다. 그런데 임계를 정하기 전에 물어야
+ * 하는 것이 있다: **어떤 관측이 애초에 모델 간 비교가 되는가.** 대부분은 되지 않는다.
+ *
+ * 종전 정의는 `verificationPassRate` 하나를 최상위에 두고 있었다. 그런데 **어떤 모델이 어떤
+ * 태스크를 받았는지는 라우터가 정한다.** 그 비율은 라우터가 만든 분포 위에서 재는 값이고,
+ * 모델의 능력과 "그 모델에게 배정된 태스크가 쉬웠는지"를 함께 담는다. 표본이 쌓여도 이
+ * 편향은 줄지 않고, 신뢰구간만 좁아져 더 그럴듯해진다 — 8절 부트스트랩 순환의 잔여물이다.
+ *
+ * 그래서 타입을 둘로 가른다. **가르지 않으면 언젠가 누군가 `verificationPassRate`로 라우팅을
+ * 바꾸고, 그 결정이 왜 틀렸는지는 코드 어디에도 남아 있지 않다.**
+ */
 export interface ModelEvaluation {
-  sampleCount: number;
-  verificationPassRate: number; // VERIFYING을 통과한 비율 — 결정론적 정답
+  /** **라우팅에 반영해도 되는 신호.** 대조 실행의 정면 비교뿐이다. */
+  paired: PairedEvaluation;
+  /** 관측되지만 모델 **간** 비교에 쓰면 안 되는 값들. */
+  unpaired: UnpairedObservations;
+  lastUpdatedAt: ISODateTime;
+}
+
+/**
+ * 대조 실행(13절 co-executor)에서의 정면 비교.
+ *
+ * 두 모델이 **같은 태스크·같은 스냅샷**에 대해 안을 냈고 사용자가 골랐다. 태스크 난이도가
+ * 양쪽에 똑같이 걸리므로 승패가 모델의 차이를 말한다.
+ *
+ * **태스크가 표본 단위다.** 한 태스크의 쟁점들은 같은 두 초안에서 나오므로 독립이 아니고,
+ * 쟁점으로 세면 쟁점 4개짜리 태스크 하나가 표본 4가 되어 유의성이 부풀려진다.
+ *
+ * 판정자가 사용자인 것은 대리 지표라서가 아니다 — 요구에 대한 최종 권위가 사용자이므로
+ * (product-strategy.md 16절) 이건 **재려던 것 그 자체**다.
+ */
+export interface PairedEvaluation {
+  /** 상대 모델 ID → 그 모델과의 전적. 승/무 모두 **태스크 수**다. */
+  headToHead: Record<ModelId, { wins: number; losses: number; ties: number }>;
+  /**
+   * 이 데이터로 라우팅을 바꿔도 되는가.
+   *
+   * 최소 표본은 상수가 아니라 **검정에서 유도된다**: 한쪽이 n번 모두 이길 확률이 유의수준보다
+   * 크면 그 표본으로는 무엇을 관측하든 갈릴 수 없다. 집계는 `tomverse-host metrics`의
+   * `modelEvaluation`이 한다.
+   */
+  verdict: "too_few_to_separate" | "no_difference" | "separated";
+}
+
+/**
+ * 절대 지표. **모델끼리 비교하지 않는다.**
+ *
+ * 쓸모가 없다는 뜻이 아니다: 같은 모델의 시간에 따른 변화, 공급자 장애, 비용 예측에 쓴다.
+ * 쓸 수 없는 것은 "A가 B보다 낫다"는 문장 하나뿐이고, 그게 정확히 라우팅이 필요로 하는
+ * 문장이라 따로 이름을 붙여 둔다.
+ */
+export interface UnpairedObservations {
+  /** 이 모델이 executor였던 태스크 수. */
+  taskCount: number;
+  /** VERIFYING을 통과한 비율. 결정론적이지만 **분포는 라우터가 만든 것**이다. */
+  verificationPassRate: number;
   medianLatencyMs: number;
   medianCostUsd: number;
-  lastUpdatedAt: ISODateTime;
 }
 
 export interface ModelEntry {
