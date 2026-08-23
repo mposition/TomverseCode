@@ -89,6 +89,14 @@ export type TaskEventType =
    */
   | "WORKSPACE_INDEX_BUILT"
   | "WORKSPACE_INDEX_CACHE_HIT"
+  /**
+   * 도구가 파일을 바꾼 뒤 스냅샷을 다시 읽지 못했다 (context-engine.md 6.1절).
+   *
+   * **`ERROR`로 묻으면 안 되는 사실이다.** 이 이벤트가 있다는 것은 그 뒤의 모델 호출이
+   * **낡은 파일 내용**을 받았다는 뜻이고, 그 호출이 낸 패치가 왜 어긋났는지는 나중에
+   * 이것 없이는 설명되지 않는다. 성공은 새 `SNAPSHOT_CREATED`가 말하므로 따로 남기지 않는다.
+   */
+  | "SNAPSHOT_REFRESH_FAILED"
   | "GIT_COMMIT_CREATED"
   | "ERROR"
   | "TASK_COMPLETED"

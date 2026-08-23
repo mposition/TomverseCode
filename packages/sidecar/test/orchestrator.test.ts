@@ -649,3 +649,75 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<voi
   }
   throw new Error("waitFor 조건이 시간 내에 충족되지 않았습니다");
 }
+
+// ---- FIX_LOOP가 보는 파일 내용 (context-engine.md 6.1절) ----
+
+test("FIX_LOOP는 패치가 적용된 뒤의 파일 내용을 본다", async () => {
+  // 이 결함은 **아무 증상도 내지 않았다**: 루프는 정상적으로 돌고 라운드도 세어졌으며,
+  // 다만 모델이 자기가 고친 적 없는 코드를 보면서 "당신의 변경이 이미 반영되어 있다"는
+  // 말을 듣고 있었다. 그러면 만든 패치는 문맥이 어긋나거나 직전 변경을 되돌린다.
+  const prompts: { kind: string; text: string }[] = [];
+  const { orchestrator, host } = build(
+    {
+      contents: { "package.json": '{"scripts":{"test":"node --test"}}', "src/app.ts": "PATCH_이전_내용\n" },
+      mutationEffects: { "src/app.ts": "PATCH_이후_내용\n" },
+      verifyResults: [{ overall: "pass" }, { overall: "fail", newlyFailing: ["test"] }, { overall: "pass" }],
+    },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [{ kind: "fix", payload: { verdict: "ACCEPT", rationale: "고쳤다", patch: VALID_PATCH } }],
+      onPrompt: (kind, text) => prompts.push({ kind, text }),
+    }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  // 픽스처가 실제로 달라졌는지 먼저 확인한다 — 안 달라졌으면 아래 단언은 아무것도
+  // 검증하지 않으면서 통과한다.
+  const draft = prompts.find((p) => p.kind === "draft");
+  assert.ok(draft, "초안 프롬프트가 없습니다");
+  assert.ok(draft.text.includes("PATCH_이전_내용"), "초안은 변경 전 내용을 봐야 합니다");
+
+  const fix = prompts.find((p) => p.kind === "fix");
+  assert.ok(fix, "fix 프롬프트가 없습니다");
+  assert.ok(fix.text.includes("PATCH_이후_내용"), "FIX_LOOP가 변경 이후 내용을 보지 못했습니다");
+  assert.ok(!fix.text.includes("PATCH_이전_내용"), "FIX_LOOP가 아직 변경 이전 내용을 싣고 있습니다");
+
+  // 다시 읽었다는 사실은 감사 기록에도 남는다 — 같은 태스크에 SNAPSHOT_CREATED가 둘
+  // 남는 이유가 로그만 보고 설명되어야 한다.
+  const snapshots = host.events.filter((e) => e.type === "SNAPSHOT_CREATED");
+  assert.equal(snapshots.length, 2);
+  const refreshed = (snapshots[1]!.payload as { refreshedAfterMutation?: { changed?: string[] } })
+    .refreshedAfterMutation;
+  assert.deepEqual(refreshed?.changed, ["src/app.ts"]);
+});
+
+test("fix loop 라운드마다 다시 읽는다", async () => {
+  // 한 번만 다시 읽고 마는 구현도 첫 라운드 테스트는 통과한다 — 두 번째 라운드가 다시
+  // 낡은 내용을 보게 되는지는 라운드를 더 돌려봐야 물어볼 수 있다.
+  const { orchestrator, host } = build(
+    {
+      contents: { "package.json": '{"scripts":{"test":"node --test"}}', "src/app.ts": "이전\n" },
+      mutationEffects: { "src/app.ts": "이후\n" },
+      verifyResults: [
+        { overall: "pass" },
+        { overall: "fail", newlyFailing: ["test"] },
+        { overall: "fail", newlyFailing: ["test"] },
+        { overall: "pass" },
+      ],
+    },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [
+        { kind: "fix", payload: { verdict: "ACCEPT", rationale: "1차", patch: VALID_PATCH } },
+        { kind: "fix", payload: { verdict: "ACCEPT", rationale: "2차", patch: VALID_PATCH } },
+      ],
+    }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+  assert.equal(orchestrator.counters.fixLoopRounds, 2);
+
+  // 최초 1회 + 라운드마다 1회.
+  assert.equal(host.events.filter((e) => e.type === "SNAPSHOT_CREATED").length, 3);
+});

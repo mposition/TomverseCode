@@ -5,7 +5,7 @@ import { classifyFile, MAX_INDEXED_FILE_BYTES } from "../src/context/exclude.js"
 import { estimateTokensUpperBound, packageFiles, truncateToTokens } from "../src/context/budget.js";
 import { FakeHost } from "./helpers/fakeHost.js";
 import { ToolBridge } from "../src/tools/bridge.js";
-import { makeRelevantFile } from "./helpers/fixtures.js";
+import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
 
 // ---- 제외 규칙 (secret / binary / 대용량) ----
 
@@ -402,4 +402,104 @@ test("M0 인덱스는 심볼 그래프를 비워두고 그 사실을 감추지 �
   const index = await new ContextEngine().ensureIndex(bridge, "ws-1");
   assert.deepEqual(index.symbols, []);
   assert.deepEqual(index.dependencyEdges, []);
+});
+
+// ---- 변경 이후 스냅샷 다시 읽기 (6.1절) ----
+//
+// 여기서 검증하는 결함은 **화면에 아무 증상도 내지 않았다**: FIX_LOOP는 정상적으로 돌고
+// 라운드도 세어졌으며, 다만 모델이 패치 **이전**의 파일을 보면서 "당신의 변경이 이미
+// 반영되어 있다"는 말을 듣고 있었다.
+
+function snapshotWith(files: Parameters<typeof makeRelevantFile>[0][]): ReturnType<typeof makeSnapshot> {
+  return makeSnapshot({ relevantFiles: files.map((f) => makeRelevantFile(f)) });
+}
+
+test("변경 이후 다시 읽으면 파일 내용이 지금의 것으로 바뀐다", async () => {
+  const host = new FakeHost({ contents: { "src/app.ts": "export const a = 2;\n" } });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const before = snapshotWith([{ path: "src/app.ts", content: "export const a = 1;\n" }]);
+
+  const refreshed = await new ContextEngine().refreshSnapshot(bridge, before, ["src/app.ts"]);
+
+  assert.equal(refreshed.snapshot.relevantFiles[0]!.content, "export const a = 2;\n");
+  assert.deepEqual(refreshed.changed, ["src/app.ts"]);
+  // 새 스냅샷은 새 id를 갖는다 — 전송 기록이 마지막 SNAPSHOT_CREATED를 읽으므로
+  // id를 물려주면 "지금 무엇이 나가 있는가"에 옛 답이 남는다.
+  assert.notEqual(refreshed.snapshot.snapshotId, before.snapshotId);
+});
+
+test("내용이 그대로면 바뀐 파일로 세지 않는다", async () => {
+  const host = new FakeHost({ contents: { "src/app.ts": "export const a = 1;\n" } });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const before = snapshotWith([{ path: "src/app.ts", content: "export const a = 1;\n" }]);
+
+  const refreshed = await new ContextEngine().refreshSnapshot(bridge, before, []);
+  assert.deepEqual(refreshed.changed, []);
+});
+
+test("변경이 건드린 파일이 앞으로 오고 프로젝트 규칙 파일은 자리를 지킨다", async () => {
+  const host = new FakeHost({
+    contents: { "README.md": "# p\n", "src/other.ts": "b\n", "src/target.ts": "c\n" },
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const before = snapshotWith([
+    { path: "README.md", reason: "project-meta", content: "# p\n" },
+    { path: "src/other.ts", content: "b\n" },
+    { path: "src/target.ts", content: "c\n" },
+  ]);
+
+  const refreshed = await new ContextEngine().refreshSnapshot(bridge, before, ["src/target.ts"]);
+
+  // 예산이 모자라면 뒤에서부터 잘린다 — FIX_LOOP에서 답이 있는 파일이 잘리면 그 라운드는
+  // 처음부터 가망이 없다.
+  assert.deepEqual(
+    refreshed.snapshot.relevantFiles.map((f) => f.path),
+    ["README.md", "src/target.ts", "src/other.ts"]
+  );
+});
+
+test("변경이 만든 파일은 스냅샷에 새로 들어온다", async () => {
+  const host = new FakeHost({ contents: { "src/app.ts": "a\n", "src/new.ts": "새 파일\n" } });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const before = snapshotWith([{ path: "src/app.ts", content: "a\n" }]);
+
+  const refreshed = await new ContextEngine().refreshSnapshot(bridge, before, ["src/new.ts"]);
+
+  assert.deepEqual(refreshed.added, ["src/new.ts"]);
+  assert.ok(refreshed.snapshot.relevantFiles.some((f) => f.path === "src/new.ts" && f.content === "새 파일\n"));
+});
+
+test("변경이 건드렸다는 이유로 secret 파일이 컨텍스트에 들어오지는 않는다", async () => {
+  // 새 진입 지점을 내면서 7절의 자물쇠를 빼놓지 않는다.
+  const host = new FakeHost({ contents: { "src/app.ts": "a\n", ".env": "OPENAI_API_KEY=sk-real\n" } });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const before = snapshotWith([{ path: "src/app.ts", content: "a\n" }]);
+
+  const refreshed = await new ContextEngine().refreshSnapshot(bridge, before, [".env"]);
+
+  assert.deepEqual(refreshed.added, []);
+  assert.ok(!refreshed.snapshot.relevantFiles.some((f) => f.path === ".env"));
+  assert.ok(!JSON.stringify(refreshed.snapshot.relevantFiles).includes("sk-real"));
+  assert.ok(refreshed.snapshot.excludedNotes?.some((n) => n.path === ".env"));
+});
+
+test("변경이 지운 파일은 빠지고, 건드린 적 없는데 못 읽는 파일은 옛 내용을 지킨다", async () => {
+  // "사라졌다"와 "모른다"는 다른 사실이다. 후자까지 빼면 읽기 경로가 잠깐 깨졌을 때
+  // 모델이 빈 컨텍스트를 받는다.
+  const host = new FakeHost({ contents: {} });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const before = snapshotWith([
+    { path: "src/deleted.ts", content: "지워질 것\n" },
+    { path: "src/untouched.ts", content: "그대로일 것\n" },
+  ]);
+
+  const refreshed = await new ContextEngine().refreshSnapshot(bridge, before, ["src/deleted.ts"]);
+
+  assert.deepEqual(refreshed.removed, ["src/deleted.ts"]);
+  assert.deepEqual(refreshed.unreadable, ["src/untouched.ts"]);
+  assert.deepEqual(
+    refreshed.snapshot.relevantFiles.map((f) => f.path),
+    ["src/untouched.ts"]
+  );
+  assert.equal(refreshed.snapshot.relevantFiles[0]!.content, "그대로일 것\n");
 });

@@ -51,6 +51,24 @@ const PROJECT_RULE_FILES = ["CLAUDE.md", "AGENTS.md", ".cursorrules", "CONTRIBUT
 
 const MANIFEST_FILES = ["package.json", "Cargo.toml", "pyproject.toml", "go.mod", "pom.xml", "build.gradle"];
 
+/** 도구 실행 뒤 스냅샷을 다시 읽은 결과. **무엇이 달라졌는지도 값으로 남긴다.** */
+export interface SnapshotRefresh {
+  snapshot: WorkspaceSnapshot;
+  /** 내용이 실제로 달라진 파일 */
+  changed: string[];
+  /** 변경이 만들어 새로 들어온 파일 */
+  added: string[];
+  /** 이번 변경이 삭제해 빠진 파일 */
+  removed: string[];
+  /**
+   * 읽지 못해 **옛 내용을 그대로 둔** 파일.
+   *
+   * 비어 있지 않으면 스냅샷의 그 부분은 낡았을 수 있다. 빈 컨텍스트보다는 낫지만
+   * 조용히 넘기면 안 되는 사실이라 값으로 남긴다.
+   */
+  unreadable: string[];
+}
+
 export interface ContextEngineOptions {
   /** 인덱싱할 최대 파일 수. 아주 큰 저장소에서 첫 태스크가 무한정 느려지지 않게 한다. */
   maxIndexedFiles?: number;
@@ -237,6 +255,156 @@ export class ContextEngine {
       tokenBudget: input.tokenBudgets.map((b) => ({ modelId: b.modelId as ModelId, maxTokens: b.maxTokens })),
       excludedNotes: excludedNotes.length > 0 ? excludedNotes : undefined,
       createdAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * 도구가 파일을 바꾼 뒤의 스냅샷 — context-engine.md 6.1절.
+   *
+   * # 왜 필요한가
+   *
+   * 스냅샷은 `SNAPSHOTTING`에서 **한 번** 만들어지고, 그 뒤 `apply_patch`가 파일을 고친다.
+   * 그런데 FIX_LOOP는 같은 스냅샷을 다시 실어 보내면서 프롬프트로 이렇게 말한다:
+   * *"The patch must apply to the CURRENT state of the files shown above (your previous
+   * change is already in them)."* — **거짓이었다.** 보여준 내용은 패치 이전이다.
+   * 모델은 자기가 고친 적 없는 코드를 보며 "이미 고쳐진 코드"라고 들었고, 그래서 만든 패치는
+   * 문맥이 어긋나 적용에 실패하거나(→ fixLoopRounds 소진) **직전 변경을 되돌린다.**
+   *
+   * # 다시 고르지 않고 다시 읽는다
+   *
+   * **선정과 내용은 다른 것이다.** 어떤 파일이 관련 있는가는 태스크 수준의 판단이고 라운드가
+   * 바뀐다고 달라질 이유가 없다 — 오히려 라운드마다 달라지면 두 모델의 대조도, 라운드 간
+   * 비교도 근거를 잃는다(1절). 내용은 **지금 디스크에 있는 것**이라는 사실이고, 낡으면 안 된다.
+   * 그래서 전체 재선정이 아니라 고른 파일의 내용만 다시 읽는다.
+   *
+   * # 변경이 건드린 파일은 앞으로 온다
+   *
+   * 예산이 모자라면 `packageFiles`가 뒤에서부터 자른다. FIX_LOOP에서 답이 있는 곳은 변경이
+   * 건드린 파일이므로, 그게 잘리면 그 라운드는 처음부터 가망이 없다. 이건 임의의 재정렬이
+   * 아니라 **새 정보(무엇이 바뀌었는가)에 따른 것**이며, 프로젝트 규칙 파일은 자리를 지킨다
+   * (4절 "우선순위와 별개로 항상 포함").
+   *
+   * # 제외 규칙은 그대로 걸린다
+   *
+   * 변경이 건드렸다는 이유로 `.env`가 컨텍스트에 들어오지 않는다. 7절의 하드 필터는 진입
+   * 자체를 막는 것이고, 여기는 새로운 진입 지점이다 — 새 문을 내면서 자물쇠를 빼놓지 않는다.
+   *
+   * # 깨진 중간 상태를 감추지 않는다
+   *
+   * 다시 읽은 내용이 문법적으로 깨져 있을 수 있다. 그래도 그대로 싣는다 — 스냅샷은 "이 코드가
+   * 올바르다"는 주장이 아니라 **"지금 디스크에 이것이 있다"는 사실**이다. 깨진 상태를 감추고
+   * 옛 내용을 보여주는 것이 바로 지금 고치는 결함이다.
+   */
+  async refreshSnapshot(
+    bridge: ToolBridge,
+    snapshot: WorkspaceSnapshot,
+    mutatedPaths: readonly string[]
+  ): Promise<SnapshotRefresh> {
+    const mutated = new Set(mutatedPaths);
+    const previous = new Map(snapshot.relevantFiles.map((f) => [f.path, f.content]));
+    const excludedNotes = [...(snapshot.excludedNotes ?? [])];
+
+    const kept: RelevantFile[] = [];
+    const removed: string[] = [];
+    const unreadable: string[] = [];
+    const changed: string[] = [];
+
+    for (const file of snapshot.relevantFiles) {
+      const read = await bridge.readFile(file.path).catch(() => null);
+      if (!read || read.binary || read.content === null) {
+        // **"사라졌다"와 "모른다"를 가른다.** 이번 변경이 건드린 파일이 안 읽히면 그건 삭제다 —
+        // 없는 파일의 내용을 계속 보여주면 모델이 그 파일을 고치려 든다. 반대로 우리가 건드린
+        // 적 없는 파일이 갑자기 안 읽히는 것은 삭제의 증거가 아니라 **읽기 경로가 깨졌다는
+        // 신호**에 가깝고, 그때 전부 빼면 모델은 빈 컨텍스트를 받는다. 그 경우는 옛 내용을
+        // 남기되 낡았을 수 있다는 사실을 값으로 남긴다.
+        if (mutated.has(file.path)) {
+          removed.push(file.path);
+          excludedNotes.push({ path: file.path, reason: "이번 변경이 삭제함" });
+        } else {
+          unreadable.push(file.path);
+          kept.push(file);
+        }
+        continue;
+      }
+      if (read.content !== file.content) changed.push(file.path);
+      kept.push({
+        ...file,
+        content: read.content,
+        truncated: read.truncated,
+        sizeBytes: read.sizeBytes,
+        includedBytes: read.content.length,
+      });
+    }
+
+    // 변경이 만든 파일 — 스냅샷에 없던 것만.
+    const added: string[] = [];
+    for (const path of mutated) {
+      if (previous.has(path) || removed.includes(path)) continue;
+      // **읽기 전에 경로로 먼저 판정한다.** 크기는 읽어야 알지만 secret 패턴은 이름으로
+      // 알 수 있고, 읽고 나서 버리면 그 내용은 이미 이 프로세스 안에 들어와 있다 —
+      // 7절이 "진입 자체를 막는다"고 쓴 이유가 그것이다.
+      const byPath = classifyFile(path, 0);
+      if (byPath.excluded) {
+        excludedNotes.push({ path, reason: byPath.reason ?? "제외됨" });
+        continue;
+      }
+      const read = await bridge.readFile(path).catch(() => null);
+      if (!read || read.binary || read.content === null) continue;
+      // 크기 규칙은 읽은 뒤에야 판정할 수 있다.
+      const bySize = classifyFile(path, read.sizeBytes);
+      if (bySize.excluded) {
+        excludedNotes.push({ path, reason: bySize.reason ?? "제외됨" });
+        continue;
+      }
+      added.push(path);
+      kept.push({
+        path,
+        reason: "recently-changed",
+        reasonDetail: "이번 태스크의 변경이 만든 파일",
+        content: read.content,
+        truncated: read.truncated,
+        sizeBytes: read.sizeBytes,
+        includedBytes: read.content.length,
+      });
+    }
+
+    const ordered = [
+      ...kept.filter((f) => f.reason === "project-meta"),
+      ...kept.filter((f) => f.reason !== "project-meta" && mutated.has(f.path)),
+      ...kept.filter((f) => f.reason !== "project-meta" && !mutated.has(f.path)),
+    ];
+
+    const budget = snapshot.tokenBudget[0]?.maxTokens ?? DEFAULT_CONTEXT_TOKEN_BUDGET;
+    const packaged = packageFiles(ordered, budget);
+    for (const dropped of packaged.dropped) excludedNotes.push({ path: dropped.path, reason: dropped.reason });
+
+    // git 상태도 지금의 사실로 바꾼다 — 패치가 적용됐으므로 dirty 여부와 diff 요약이 달라진다.
+    const gitStatus = await bridge.gitStatus().catch(() => ({ stdout: "", exitCode: null }));
+    const diffSummary = await bridge.gitDiff({ statOnly: true }).catch(() => "");
+
+    // 라운드마다 같은 사유가 다시 붙으면 목록이 길이만 늘어난다 — 그 목록은 프롬프트에도
+    // 화면에도 그대로 나가므로 경로당 하나만 남긴다(먼저 붙은 사유를 지킨다).
+    const byPathNote = new Map<string, { path: string; reason: string }>();
+    for (const note of excludedNotes) if (!byPathNote.has(note.path)) byPathNote.set(note.path, note);
+    const notes = [...byPathNote.values()];
+
+    return {
+      // **새 스냅샷은 새 id를 갖는다.** 전송 기록은 마지막 `SNAPSHOT_CREATED`를 읽으므로
+      // (transmission.rs), id를 물려주면 "지금 무엇이 나가 있는가"에 옛 답이 남는다.
+      snapshot: {
+        ...snapshot,
+        snapshotId: `snap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        gitBranch: parseBranch(gitStatus.stdout),
+        gitDirty: hasUncommittedChanges(gitStatus.stdout),
+        gitDiffSummary: diffSummary.trim() === "" ? undefined : diffSummary.trim(),
+        relevantFiles: packaged.files,
+        excludedNotes: notes.length > 0 ? notes : undefined,
+        createdAt: new Date().toISOString(),
+      },
+      changed,
+      added,
+      removed,
+      unreadable,
     };
   }
 

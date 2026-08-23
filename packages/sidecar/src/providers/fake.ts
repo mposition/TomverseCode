@@ -77,6 +77,13 @@ export interface FakeScriptStep {
 
 export interface FakeProviderOptions {
   /**
+   * 조립된 프롬프트를 그대로 흘려준다 (테스트 전용).
+   *
+   * 프로덕션 경로에는 없는 훅이지만 fake에는 있어야 한다 — 모델이 **무엇을 봤는가**는
+   * 산출물이 아니라 입력의 성질이라, 산출물만 보는 테스트로는 물어볼 수 없다.
+   */
+  onPrompt?: (kind: FakeScriptStep["kind"], prompt: string) => void;
+  /**
    * 스크립트가 지정하지 않을 때 쓸 envelope 모델 ID. 기본은 요청 모델 ID와 같다.
    * `null`이면 envelope에 model이 없는 공급자를 흉내낸다.
    */
@@ -180,6 +187,17 @@ export class FakeProviderAdapter implements ProviderAdapter {
    * 말하지 않는다. 그리고 `renderSnapshot`을 실제로 태우므로 **스냅샷이 프롬프트에서
    * 차지하는 크기**가 테스트에서 눈에 보인다.
    */
+  /**
+   * 실제로 조립된 프롬프트를 테스트에 흘려준다.
+   *
+   * **프롬프트를 볼 수 없으면 검증할 수 없는 것이 있다**: "모델이 무엇을 봤는가"는 산출물이
+   * 아니라 입력의 성질이고, 산출물만 보는 테스트는 낡은 컨텍스트를 보낸 실행도 통과시킨다.
+   */
+  private record(kind: FakeScriptStep["kind"], prompt: string): string {
+    this.options.onPrompt?.(kind, prompt);
+    return prompt;
+  }
+
   private metaFor(step: FakeScriptStep | undefined, prompt?: string): ProviderCallMetadata {
     const scripted = step?.providerReportedModelId !== undefined ? step.providerReportedModelId : this.options.providerReportedModelId;
     const reported = scripted === undefined ? this.modelId : scripted;
@@ -217,7 +235,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
-      meta: this.metaFor(step, buildDraftPrompt(input)),
+      meta: this.metaFor(step, this.record("draft", buildDraftPrompt(input))),
     };
   }
 
@@ -238,7 +256,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
-      meta: this.metaFor(step, buildReviewPrompt(input)),
+      meta: this.metaFor(step, this.record("review", buildReviewPrompt(input))),
     };
   }
 
@@ -257,7 +275,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
-      meta: this.metaFor(step, buildSingleModelFixPrompt(input)),
+      meta: this.metaFor(step, this.record("singleFix", buildSingleModelFixPrompt(input))),
     };
   }
 
@@ -276,7 +294,7 @@ export class FakeProviderAdapter implements ProviderAdapter {
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
-      meta: this.metaFor(step, buildFixPrompt(input)),
+      meta: this.metaFor(step, this.record("fix", buildFixPrompt(input))),
     };
   }
 

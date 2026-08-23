@@ -29,6 +29,13 @@ export interface FakeHostOptions {
    * 캐시를 신경 쓰지 않고 "인덱스를 재사용한다"만 확인한다.
    */
   indexFingerprint?: string | null;
+  /**
+   * 변경 도구가 성공했을 때 파일 내용을 이렇게 바꾼다 (path → 새 내용, `null`이면 삭제).
+   *
+   * **fake가 이걸 하지 않으면 검증할 수 없는 것이 있다**: 스냅샷이 변경 이후 내용을 싣는지는
+   * 파일이 실제로 달라져야만 물어볼 수 있고, 달라지지 않으면 옛 내용을 실어도 테스트가 통과한다.
+   */
+  mutationEffects?: Record<string, string | null>;
   /** tool.execute 응답 override (requestId 순서대로) */
   toolResults?: {
     status: "ok" | "error" | "denied" | "timeout" | "cancelled";
@@ -196,6 +203,7 @@ export class FakeHost {
         const stub = this.options.toolResults?.[this.toolCursor];
         this.toolCursor += 1;
         if (!stub || stub.status === "ok") {
+          this.applyMutationEffect(String(request.args.path ?? ""));
           return ok({ path: request.args.path, bytesBefore: 10, bytesAfter: 12 });
         }
         return {
@@ -216,6 +224,15 @@ export class FakeHost {
         };
       }
     }
+  }
+
+  /** 성공한 변경 도구가 디스크에 남긴 결과를 흉내낸다. */
+  private applyMutationEffect(path: string): void {
+    const effect = this.options.mutationEffects?.[path];
+    if (effect === undefined) return;
+    this.options.contents ??= {};
+    if (effect === null) delete this.options.contents[path];
+    else this.options.contents[path] = effect;
   }
 
   private buildReport(

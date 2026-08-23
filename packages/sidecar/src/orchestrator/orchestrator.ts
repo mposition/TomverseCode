@@ -136,6 +136,23 @@ export class Orchestrator {
    * (Rust의 `file_mutations`가 정본이고, 이건 판정에 쓰는 Node 쪽 사본이다.)
    */
   private readonly mutatedPaths: string[] = [];
+  /**
+   * 마지막으로 확정된 도구 결과가 스냅샷보다 새로운가.
+   *
+   * 도구가 파일을 바꾸면 스냅샷의 내용은 그 순간 낡는다. 즉시 다시 읽지 않고 표시만 해두는
+   * 이유는 **검증을 통과하면 다시 보낼 일이 없기 때문**이다 — 통과 경로에서 파일 12개를
+   * 다시 읽는 것은 아무도 보지 않는 일을 하는 것이다.
+   */
+  private snapshotStale = false;
+  /**
+   * 진행 중인 다시 읽기.
+   *
+   * **두 실행자는 `Promise.all`로 동시에 부른다**(13.1절). 각자 새로 만들게 두면 두 모델이
+   * **서로 다른 스냅샷**을 받고, 그러면 대조에서 나온 불일치가 모델 차이인지 입력 차이인지
+   * 구별되지 않는다(context-engine.md 1절). 검사와 대입 사이에 `await`를 두지 않는 것도
+   * 같은 이유다(CLAUDE.md 함정 기록 — `await`가 곧 양보 지점이다).
+   */
+  private refreshingSnapshot: Promise<WorkspaceSnapshot> | null = null;
   private answers: { question: string; answer: string }[] = [];
   /**
    * 확정된 기준 목록 — 사용자 판정이 프롬프트 문자열로 끝나지 않게 하는 자리(17.3절).
@@ -565,10 +582,11 @@ export class Orchestrator {
       const reviewCall = `review:${this.state.counters.reviseRounds + 1}`;
       // Blind Review는 M1 항목이라 production 기본은 informed다. 실험 하네스만 이 축을 고정한다.
       const blind = this.input.experiment?.reviewMode === "blind";
+      const reviewSnapshot = await this.snapshotForPrompt();
       const review = await this.callProvider(reviewer, "reviewer", reviewCall, (ctx) =>
         reviewer.reviewProposal(
           {
-            snapshot: this.requireSnapshot(),
+            snapshot: reviewSnapshot,
             userMessage: this.input.taskRequest.userMessage,
             draft: proposal,
             blind,
@@ -664,6 +682,9 @@ export class Orchestrator {
     callId: string,
     options: { optionalSample?: boolean } = {}
   ): Promise<DraftOutcome> {
+    // **두 실행자가 같은 스냅샷을 받아야 한다**(1절). `snapshotForPrompt`는 동시 호출을
+    // 하나의 다시 읽기로 합치므로, `Promise.all`로 불러도 두 초안의 입력이 갈리지 않는다.
+    const draftSnapshot = await this.snapshotForPrompt();
     const draft = await this.callProviderMaybeOptional(
       adapter,
       "executor",
@@ -671,7 +692,7 @@ export class Orchestrator {
       (ctx) =>
       adapter.generateDraft(
         {
-          snapshot: this.requireSnapshot(),
+          snapshot: draftSnapshot,
           userMessage: this.input.taskRequest.userMessage,
           userAnswers: this.answers.length > 0 ? this.answers : undefined,
           // 17.3절 규칙 1: 확정된 기준을 프롬프트에 넣는다. 프롬프트가 강제력을 주지는
@@ -814,10 +835,11 @@ export class Orchestrator {
     await this.transition("SINGLE_MODEL_FIX");
 
     const callId = `fix:${this.state.counters.clarificationRounds + 1}`;
+    const fixSnapshot = await this.snapshotForPrompt();
     const response = await this.callProvider(adapters.executor, "executor", callId, (ctx) =>
       adapters.executor.singleModelFix(
         {
-          snapshot: this.requireSnapshot(),
+          snapshot: fixSnapshot,
           userMessage: this.input.taskRequest.userMessage,
           userAnswers: this.answers.length > 0 ? this.answers : undefined,
           acceptanceCriteria: this.criteriaForPrompt(),
@@ -1041,7 +1063,14 @@ export class Orchestrator {
 
     const message = conflicts.map((c) => c.message).join(" ");
 
-    // 실행 이후(fix loop 안)라면 초안으로 되돌리지 않는다 — 스냅샷이 낡았다.
+    // 실행 이후(fix loop 안)라면 초안으로 되돌리지 않는다.
+    //
+    // **이유가 바뀌었다.** 종전 주석은 "스냅샷이 낡았다"였고 그건 사실이었지만, 이제
+    // `snapshotForPrompt`가 변경 이후 내용을 다시 읽으므로 더 이상 이유가 되지 못한다
+    // (context-engine.md 6.1절). 남는 진짜 이유는 **루프 상한**이다: 여기서 초안으로
+    // 돌아가면 한 루프를 `reviseRounds`와 `fixLoopRounds` 둘이 함께 다스리게 되고,
+    // 그러면 "모든 루프에는 상한이 있다"(원칙 5)의 종료 논증이 두 counter에 걸쳐 흩어진다.
+    // 실행이 시작된 뒤로는 fix loop의 예산 하나가 다스린다.
     if (this.state.counters.fixLoopRounds > 0) {
       // 이쪽도 결말을 남겨야 한다. fix loop는 PLANNING으로 되돌아오므로 다음 라운드가 판정한다 —
       // 여기서 기억하지 않으면 감지만 세고 결말이 새어 집계의 두 수가 어긋난다.
@@ -1193,8 +1222,10 @@ export class Orchestrator {
           const diff = extractDiff(result.output);
           if (diff) this.appliedDiffs.push(diff);
           const path = (request.args as { path?: unknown }).path;
-          if (typeof path === "string" && path.length > 0 && !this.mutatedPaths.includes(path)) {
-            this.mutatedPaths.push(path);
+          if (typeof path === "string" && path.length > 0) {
+            if (!this.mutatedPaths.includes(path)) this.mutatedPaths.push(path);
+            // 이 순간부터 스냅샷의 파일 내용은 디스크와 다르다.
+            this.snapshotStale = true;
           }
           break;
         }
@@ -1253,6 +1284,9 @@ export class Orchestrator {
     const adapters = this.requireAdapters();
     const digest = buildDigest(report);
 
+    // 여기가 결함이 실제로 나타나던 자리다 — 프롬프트가 "당신의 변경이 이미 반영되어 있다"고
+    // 말하는 그 스냅샷이 패치 이전이었다.
+    const fixLoopSnapshot = await this.snapshotForPrompt();
     const response = await this.callProvider(
       adapters.executor,
       "executor",
@@ -1260,7 +1294,7 @@ export class Orchestrator {
       (ctx) =>
         adapters.executor.continueWithToolResult(
           {
-            snapshot: this.requireSnapshot(),
+            snapshot: fixLoopSnapshot,
             userMessage: this.input.taskRequest.userMessage,
             appliedDiff: this.appliedDiffs.join("\n"),
             digest,
@@ -2029,6 +2063,70 @@ export class Orchestrator {
   private requireSnapshot(): WorkspaceSnapshot {
     if (!this.snapshot) throw new Error("snapshot이 아직 만들어지지 않았습니다");
     return this.snapshot;
+  }
+
+  /**
+   * **모델에게 보낼 스냅샷은 반드시 이걸 지난다.** 도구가 파일을 바꿨으면 내용을 다시 읽는다.
+   *
+   * 이 접근자가 없던 동안 FIX_LOOP는 패치 **이전**의 파일을 실어 보내면서 프롬프트로는
+   * "당신의 변경이 이미 반영되어 있다"고 말하고 있었다. 모델은 자기가 고친 적 없는 코드를 보고
+   * 고쳤고, 그 결과 패치는 문맥이 어긋나 적용에 실패하거나 직전 변경을 되돌렸다.
+   *
+   * 다시 읽기에 실패하면 **옛 스냅샷을 그대로 쓴다.** 낡은 컨텍스트는 나쁘지만, 컨텍스트 없이
+   * 부르는 것보다는 낫고 태스크를 여기서 세울 이유는 없다 — 다만 그 사실을 이벤트로 남긴다.
+   */
+  private async snapshotForPrompt(): Promise<WorkspaceSnapshot> {
+    if (!this.snapshotStale) return this.requireSnapshot();
+    // 검사와 대입 사이에 `await`가 없다 — 동시 호출 둘이 각자 다시 읽으면 두 모델이 다른
+    // 스냅샷을 받는다.
+    this.refreshingSnapshot ??= this.doRefreshSnapshot();
+    return this.refreshingSnapshot;
+  }
+
+  private async doRefreshSnapshot(): Promise<WorkspaceSnapshot> {
+    const before = this.requireSnapshot();
+    try {
+      const refreshed = await this.contextEngine.refreshSnapshot(
+        this.requireBridge(),
+        before,
+        this.mutatedPaths
+      );
+      this.snapshot = refreshed.snapshot;
+      this.snapshotStale = false;
+      // 새 스냅샷은 새 전송이다. 전송 기록이 마지막 `SNAPSHOT_CREATED`를 읽으므로
+      // (core/src/transmission.rs), 이 이벤트를 빠뜨리면 화면은 옛 목록을 계속 보여준다.
+      await this.emit("SNAPSHOT_CREATED", {
+        snapshotId: refreshed.snapshot.snapshotId,
+        gitBranch: refreshed.snapshot.gitBranch,
+        gitDirty: refreshed.snapshot.gitDirty,
+        relevantFiles: refreshed.snapshot.relevantFiles.map((f) => ({
+          path: f.path,
+          reason: f.reason,
+          reasonDetail: f.reasonDetail,
+          truncated: f.truncated,
+        })),
+        excludedNotes: refreshed.snapshot.excludedNotes ?? [],
+        projectMeta: refreshed.snapshot.projectMeta,
+        // 무엇이 달라져서 다시 만들었는지. 이게 없으면 같은 태스크에 SNAPSHOT_CREATED가
+        // 여러 개 남은 이유를 로그만 보고는 알 수 없다.
+        refreshedAfterMutation: {
+          changed: refreshed.changed,
+          added: refreshed.added,
+          removed: refreshed.removed,
+          // 비어 있지 않으면 이 스냅샷의 그 파일들은 **낡은 내용**이다.
+          unreadable: refreshed.unreadable,
+        },
+      });
+      return refreshed.snapshot;
+    } catch (error) {
+      await this.emit("SNAPSHOT_REFRESH_FAILED", {
+        error: error instanceof Error ? error.message : String(error),
+        mutatedPaths: [...this.mutatedPaths],
+      });
+      return before;
+    } finally {
+      this.refreshingSnapshot = null;
+    }
   }
 
   private requireAdapters(): RoleAdapters {

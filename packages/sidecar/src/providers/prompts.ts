@@ -298,7 +298,8 @@ export function buildFixPrompt(input: {
   parts.push(
     [
       "## Output rules",
-      "The patch must apply to the CURRENT state of the files shown above (your previous change is already in them).",
+      "The files shown above were re-read from disk AFTER your previous change was applied — they are the current state.",
+      "Your patch must apply to them as shown. Do not re-apply changes that are already there.",
       "ACCEPT with a `patch` if you can fix it. REJECT with `rejectionReason` if the failure is not caused by your change.",
       "",
       PATCH_RULES,

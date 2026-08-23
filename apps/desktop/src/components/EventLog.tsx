@@ -25,6 +25,8 @@ const IMPORTANT: string[] = [
   "FILE_MUTATED",
   "VERIFICATION_COMPLETED",
   "FIX_LOOP_STARTED",
+  // 모델이 낡은 파일 내용을 받았다는 뜻이다 — 그 뒤 패치가 어긋난 이유가 여기 있다.
+  "SNAPSHOT_REFRESH_FAILED",
   "PROVIDER_RETRY",
   "TOOL_RETRY",
   "ROLLBACK_STARTED",
@@ -97,10 +99,22 @@ function summarize(event: DisplayEvent): string {
     case "SNAPSHOT_CREATED": {
       const files = (p.relevantFiles as { path: string }[] | undefined) ?? [];
       const excluded = (p.excludedNotes as unknown[] | undefined) ?? [];
-      return `모델에 전달된 파일 ${files.length}개${excluded.length > 0 ? `, 제외 ${excluded.length}개` : ""}: ${files
+      // 같은 태스크에 이 이벤트가 여러 개 남는 이유를 한 줄로 말해준다 — 없으면 왜 두 번
+      // 찍혔는지 알 수 없고, 두 번째가 첫 번째를 대체한다는 사실도 보이지 않는다.
+      const refreshed = p.refreshedAfterMutation as
+        | { changed?: string[]; added?: string[]; removed?: string[] }
+        | undefined;
+      const mark = refreshed
+        ? `(변경 이후 다시 읽음 — 바뀜 ${refreshed.changed?.length ?? 0} · 추가 ${
+            refreshed.added?.length ?? 0
+          } · 빠짐 ${refreshed.removed?.length ?? 0}) `
+        : "";
+      return `${mark}모델에 전달된 파일 ${files.length}개${excluded.length > 0 ? `, 제외 ${excluded.length}개` : ""}: ${files
         .map((f) => f.path)
         .join(", ")}`;
     }
+    case "SNAPSHOT_REFRESH_FAILED":
+      return `변경 이후 파일을 다시 읽지 못해 이전 내용으로 진행합니다: ${String(p.error)}`;
     case "TRIAGE_COMPLETED":
       return `복잡도 ${String(p.complexityTier)}`;
     case "ROUTING_DECIDED": {
