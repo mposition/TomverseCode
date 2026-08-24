@@ -125,6 +125,18 @@ pub struct TaskProfile {
     /// 않는 이유는 24.5절에 있다 — `detect_commands`는 매니페스트에서 유도하므로 모델이 명령을
     /// **지어낼** 수는 없지만, 모델은 매니페스트를 **고칠** 수 있다.
     verification_pin: Vec<(String, Vec<String>)>,
+    /// 같은 시점의 **매니페스트 내용** 지문.
+    ///
+    /// # argv를 고정해도 본문은 고정되지 않는다
+    ///
+    /// 24.5절의 고정은 명령의 **이름**을 지킨다: 모델이 `scripts.lint`를 새로 추가해도 그
+    /// 명령은 자동 승인 집합에 없다. 그런데 `npm test`의 argv는 그대로 두고 `scripts.test`의
+    /// **본문**을 바꾸면, 고정된 argv가 다른 프로그램을 돌린다. 훅도 같다 — 등록된
+    /// `npm run fmt`의 본문이 바뀌면 등록이 승인한 것과 실제로 도는 것이 달라진다(25.3절).
+    ///
+    /// 그래서 사전 승인은 **매니페스트가 그대로일 때만** 유효하다. 바뀌었으면 자동 승인을
+    /// 취소하고 평소대로 묻는다(무인이면 멈춘다) — 막는 것이 아니라 **사람에게 되돌린다.**
+    manifest_fingerprint: String,
 }
 
 impl TaskProfile {
@@ -141,8 +153,32 @@ impl TaskProfile {
             policy,
             gate,
             verification_pin,
+            manifest_fingerprint: manifest_fingerprint(root),
         }
     }
+}
+
+/// 검증 명령의 **본문이 사는 파일들**의 지문.
+///
+/// 이름이 아니라 내용을 센다. 없는 파일과 빈 파일을 구별하기 위해 존재 여부도 함께 넣는다 —
+/// 뭉개면 파일이 새로 생긴 것을 못 본다.
+fn manifest_fingerprint(root: &WorkspaceRoot) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    // **목록을 손으로 적는다.** `detect_commands`가 읽는 것과 같아야 하는데, 거기서 유도하려면
+    // 그 함수가 경로를 돌려줘야 하고 그건 지금 하는 일이 아니다. 대신 새 매니페스트를 지원할 때
+    // 이 목록도 함께 늘려야 한다는 것을 `manifest_fingerprint_covers_what_detect_reads`가 지킨다.
+    for name in ["package.json", "Cargo.toml"] {
+        hasher.update(name.as_bytes());
+        match std::fs::read(root.path().join(name)) {
+            Ok(bytes) => {
+                hasher.update([1u8]);
+                hasher.update(&bytes);
+            }
+            Err(_) => hasher.update([0u8]),
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 pub struct TaskHost {
@@ -649,13 +685,31 @@ impl TaskHost {
     /// 구조적으로 확인할 수 있다. 그러나 **하나의 스위치로 뭉개지 않는다** — 검증 명령을
     /// 자동 승인하기로 한 것과 훅을 등록한 것은 다른 결정이고, 기록도 달라야 한다.
     fn pre_approval(&self, request: &ToolRequest, profile: &TaskProfile) -> Option<PreApproval> {
-        if profile.policy.auto_approve_verification && self.is_pinned_verification(request, profile) {
-            return Some(PreApproval::DeclaredVerification);
+        let candidate = if profile.policy.auto_approve_verification && self.is_pinned_verification(request, profile) {
+            Some(PreApproval::DeclaredVerification)
+        } else if self.is_registered_hook(request) {
+            Some(PreApproval::RegisteredHook)
+        } else {
+            None
+        };
+        let kind = candidate?;
+
+        // **매니페스트가 바뀌었으면 사전 승인이 성립하지 않는다**(29.3절). argv는 그대로인데
+        // 그 argv가 돌리는 본문이 달라졌을 수 있고, 그러면 사용자가 승인한 것과 실제로 도는
+        // 것이 다르다. 막는 것이 아니라 **사람에게 되돌린다** — 평소대로 묻고, 무인이면 멈춘다.
+        if manifest_fingerprint(&self.root) != profile.manifest_fingerprint {
+            let _ = self.append_event(
+                &request.task_id,
+                "PRE_APPROVAL_WITHDRAWN",
+                json!({
+                    "requestId": request.request_id,
+                    "wouldHaveBeen": kind.event_type(),
+                    "reason": "태스크 시작 이후 매니페스트가 바뀌어 사전 승인이 성립하지 않습니다 —                                같은 명령이라도 그 본문이 달라졌을 수 있습니다",
+                }),
+            );
+            return None;
         }
-        if self.is_registered_hook(request) {
-            return Some(PreApproval::RegisteredHook);
-        }
-        None
+        Some(kind)
     }
 
     /// 이 요청이 **사용자가 등록한 훅과 바이트 단위로 같은** 명령인가.
@@ -2467,6 +2521,99 @@ mod tests {
             "{:?}",
             profile.verification_pin
         );
+    }
+
+    /// **argv를 고정해도 본문은 고정되지 않는다** (29.3절).
+    ///
+    /// 24.5절의 고정은 명령의 *이름*을 지킨다. 그런데 `npm test`의 argv를 그대로 두고
+    /// `scripts.test`의 **본문**을 바꾸면, 고정된 argv가 다른 프로그램을 돌린다. 훅도 같다.
+    /// 그 구멍은 이 저장소가 이미 스킬·검증에서 세운 규칙("모델은 매니페스트를 고칠 수 있다")의
+    /// 두 번째 얼굴이었고, 등록 화면을 만들면서 드러났다.
+    #[test]
+    fn a_changed_manifest_withdraws_the_pre_approval() {
+        let (ws, _a, host) = host_with_manifest(
+            TaskPolicy {
+                auto_approve_verification: true,
+                ..TaskPolicy::default()
+            },
+            Arc::new(AlwaysDeny),
+            Some(r#"{"scripts":{"test":"node -e 0"}}"#),
+        );
+        host.begin_task(
+            "task-1",
+            TaskPolicy {
+                auto_approve_verification: true,
+                ..TaskPolicy::default()
+            },
+        )
+        .unwrap();
+        let profile = host.profile("task-1");
+        let request = req(
+            ToolName::RunTests,
+            json!({ "program": "npm", "args": ["test"], "cwd": "." }),
+        );
+
+        // 바뀌기 전에는 사전 승인이 성립한다 — 아래 단언이 공허하지 않다는 증거다.
+        assert!(host.pre_approval(&request, &profile).is_some());
+
+        // **argv는 그대로이고 본문만 바뀐다.**
+        fs::write(
+            ws.path().join("package.json"),
+            r#"{"scripts":{"test":"node evil.js"}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            host.pre_approval(&request, &profile).is_none(),
+            "본문이 바뀌었는데 사전 승인이 그대로입니다"
+        );
+        // 막는 것이 아니라 사람에게 되돌린다 — 그 사실이 기록에 남는다.
+        let types = host.with_store(|s| s.event_types("task-1")).unwrap();
+        assert!(types.contains(&"PRE_APPROVAL_WITHDRAWN".to_string()), "{types:?}");
+    }
+
+    /// 등록된 훅도 같은 규칙을 받는다 — `npm run fmt`의 본문이 바뀌면 등록이 승인한 것과
+    /// 실제로 도는 것이 다르다.
+    #[test]
+    fn a_changed_manifest_also_withdraws_a_registered_hooks_pre_approval() {
+        let (ws, _a, host) = host_with_manifest(
+            TaskPolicy::default(),
+            Arc::new(AlwaysDeny),
+            Some(r#"{"scripts":{"fmt":"node -e 0"}}"#),
+        );
+        let host = host.with_hooks(crate::hooks::HookRegistry::new(vec![crate::hooks::HookConfig {
+            phase: "COMPLETED".to_string(),
+            program: "npm".to_string(),
+            args: vec!["run".to_string(), "fmt".to_string()],
+        }]));
+        host.begin_task("task-1", TaskPolicy::default()).unwrap();
+        let profile = host.profile("task-1");
+        let request = req(
+            ToolName::RunCommand,
+            json!({ "program": "npm", "args": ["run", "fmt"], "cwd": "." }),
+        );
+        assert!(host.pre_approval(&request, &profile).is_some());
+
+        fs::write(ws.path().join("package.json"), r#"{"scripts":{"fmt":"node evil.js"}}"#).unwrap();
+        assert!(host.pre_approval(&request, &profile).is_none());
+    }
+
+    /// 지문이 **읽는 파일 목록**은 손으로 적혀 있다. `detect_commands`가 새 매니페스트를
+    /// 지원하면 여기도 함께 늘어야 하고, 늘지 않으면 그 매니페스트의 본문 변경이 보이지 않는다.
+    #[test]
+    fn manifest_fingerprint_covers_what_detect_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let empty = manifest_fingerprint(&root);
+
+        // `detect_commands`가 읽는 매니페스트마다 지문이 달라져야 한다.
+        for name in ["package.json", "Cargo.toml"] {
+            fs::write(dir.path().join(name), "x").unwrap();
+            assert_ne!(manifest_fingerprint(&root), empty, "{name}의 변화가 지문에 없습니다");
+            fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        // 지웠으면 원래대로 — 존재 여부도 지문에 들어간다.
+        assert_eq!(manifest_fingerprint(&root), empty);
     }
 
     /// 고정 집합은 매니페스트가 **선언한 것만** 담는다. 없는 스크립트를 담으면 자동 승인이

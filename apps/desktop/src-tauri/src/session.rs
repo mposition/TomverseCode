@@ -282,6 +282,29 @@ impl SessionState {
             .map_err(|e| StoreIssue::new(StoreOp::ReadTransmission, format!("직렬화: {e}")).ui())
     }
 
+    /// 이 워크스페이스의 훅·MCP 등록 (state-machine 29절).
+    pub fn workspace_settings(&self) -> Result<Value, String> {
+        let workspace_id = self.with_active(|active| Ok(active.workspace_id.clone()))?;
+        let settings = tomverse_core::settings::load(&app_state_dir(), &workspace_id)
+            .map_err(|e| format!("워크스페이스 설정: {e}"))?;
+        serde_json::to_value(settings).map_err(|e| format!("직렬화: {e}"))
+    }
+
+    /// 등록을 저장한다.
+    ///
+    /// **즉시 반영되지 않는다.** 훅 레지스트리와 MCP 풀은 `TaskHost`를 만들 때 붙으므로,
+    /// 바뀐 등록은 워크스페이스를 다시 열어야 적용된다. 공급자 허용 목록이 sidecar 재spawn을
+    /// 기다리는 것과 같은 성질이고(16절), **그 사실을 화면이 말해야 한다** — 저장했는데
+    /// 아무 일도 일어나지 않으면 사용자는 저장이 실패했다고 읽는다.
+    pub fn set_workspace_settings(&self, settings: Value) -> Result<Value, String> {
+        let workspace_id = self.with_active(|active| Ok(active.workspace_id.clone()))?;
+        let parsed: tomverse_core::settings::WorkspaceSettings =
+            serde_json::from_value(settings).map_err(|e| format!("설정 형식이 올바르지 않습니다: {e}"))?;
+        tomverse_core::settings::save(&app_state_dir(), &workspace_id, &parsed)
+            .map_err(|e| format!("워크스페이스 설정: {e}"))?;
+        Ok(json!({ "note": "저장했습니다. 등록은 워크스페이스를 다시 열 때 적용됩니다." }))
+    }
+
     /// 무인 정지의 처방 (state-machine 24.8절). **읽기 전용이다.**
     pub fn task_blocked(&self, task_id: &str) -> Result<Value, UiMessage> {
         let out = self.read_store(StoreOp::ReadBlocked, |s| tomverse_core::blocked::collect(s, task_id))?;
@@ -475,9 +498,15 @@ impl SessionState {
                 .map_err(|e| format!("공급자 허용 목록을 읽을 수 없습니다: {e}"))?
         };
 
+        // 등록된 훅과 MCP 서버 (state-machine 29절). **저장된 파일도 다시 검증한다** —
+        // 사용자가 손으로 고칠 수 있고, 그때 조용히 잘못된 등록으로 도는 것보다 워크스페이스가
+        // 열리지 않는 편이 낫다.
+        let (hooks, servers) = tomverse_core::settings::load_validated(&app_state_dir(), &workspace_id)
+            .map_err(|e| format!("워크스페이스 설정: {e}"))?;
+
         let approvals = Arc::new(UiApprovalGateway::new(app.clone(), self.pending_approvals.clone()));
         let sink = Arc::new(TauriSink { app: app.clone() });
-        let host = Arc::new(TaskHost::new(
+        let mut task_host = TaskHost::new(
             root.clone(),
             policy,
             store,
@@ -485,7 +514,24 @@ impl SessionState {
             approvals,
             sink,
             self.cancels.clone(),
-        ));
+        );
+        let mcp = if servers.is_empty() {
+            None
+        } else {
+            Some(Arc::new(
+                tomverse_core::mcp::McpPool::new(servers).map_err(|e| e.to_string())?,
+            ))
+        };
+        if let Some(pool) = mcp.clone() {
+            task_host = task_host.with_mcp(pool);
+        }
+        if !hooks.is_empty() {
+            // **등록 시점에 게이트를 태워 본다**(25.5절). 확실히 거부될 훅은 여기서 알린다 —
+            // 등록만 되고 매 phase마다 조용히 거부되는 것보다 낫다.
+            task_host.preflight_hooks(&hooks)?;
+            task_host = task_host.with_hooks(tomverse_core::hooks::HookRegistry::new(hooks));
+        }
+        let host = Arc::new(task_host);
 
         // sidecar spawn: 여기서 API 키가 자식 환경으로 1회 주입된다.
         // 값은 UI로도 로그로도 나가지 않는다.

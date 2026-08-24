@@ -235,6 +235,18 @@ fn task_export(state: tauri::State<'_, SessionState>, task_id: String) -> Result
     Ok(envelope(state.task_export(&task_id)))
 }
 
+/// 이 워크스페이스의 훅·MCP 등록을 읽는다 (state-machine 29절).
+#[tauri::command]
+fn workspace_settings(state: tauri::State<'_, SessionState>) -> Result<Value, String> {
+    state.workspace_settings()
+}
+
+/// 등록을 저장한다. **즉시 반영되지 않는다** — 이유는 `SessionState`에 적어두었다.
+#[tauri::command]
+fn set_workspace_settings(state: tauri::State<'_, SessionState>, settings: Value) -> Result<Value, String> {
+    state.set_workspace_settings(settings)
+}
+
 /// 무인 정지의 처방 (state-machine 24.8절). **읽기 전용이다.**
 #[tauri::command]
 fn task_blocked(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
@@ -426,6 +438,8 @@ pub fn run() {
             derived_thresholds,
             task_transmission,
             task_blocked,
+            workspace_settings,
+            set_workspace_settings,
             open_pull_request,
             task_export,
             list_models,

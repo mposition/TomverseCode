@@ -45,6 +45,7 @@ import { BudgetPanel } from "./components/BudgetPanel";
 import { precheckBudget } from "./lib/budgetCheck";
 import { AuditExportPanel } from "./components/AuditExportPanel";
 import { BlockedPanel } from "./components/BlockedPanel";
+import { WorkspaceSettingsPanel } from "./components/WorkspaceSettingsPanel";
 import { PullRequestPanel } from "./components/PullRequestPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
@@ -1036,6 +1037,9 @@ export default function App() {
                   변경을 git에 커밋 (매번 승인을 묻습니다)
                 </label>
               </fieldset>
+              {/* 훅·MCP 등록 (29절). **워크스페이스 수명의 설정**이라 태스크 옵션과 나란히
+                  두지 않는다 — 여기 두면 "이번 작업에만 적용되는가"로 읽힌다. */}
+              {workspace && <WorkspaceSettingsPanel />}
               {/* 무인 실행 (state-machine 24절). **켜도 승인 정책은 그대로다** — 달라지는 것은
                   승인이 필요한 지점에서 묻는 대신 멈춘다는 것뿐이고, 그 정지는 사용자 거부로
                   기록되지 않는다(24.2절). */}

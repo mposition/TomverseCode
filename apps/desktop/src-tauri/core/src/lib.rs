@@ -30,6 +30,7 @@ pub mod pr;
 pub mod proctree;
 pub mod reproduce;
 pub mod session_memory;
+pub mod settings;
 pub mod sidecar;
 pub mod skills;
 pub mod store;
