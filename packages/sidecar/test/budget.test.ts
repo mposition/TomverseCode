@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { ModelEntry, TaskRequest } from "@tomverse/protocol";
 import { Orchestrator } from "../src/orchestrator/orchestrator.js";
 import { ModelRegistry, providerKindOf } from "../src/routing/registry.js";
+import { Router } from "../src/routing/router.js";
 import { FakeHost, VALID_PATCH, type FakeHostOptions } from "./helpers/fakeHost.js";
 import { makePolicy } from "./helpers/fixtures.js";
 import { DEFAULT_RETRY_POLICY } from "../src/providers/retry.js";
@@ -228,31 +229,44 @@ test("공급자 종류를 주소로 판정한다", () => {
 });
 
 /**
- * **13.3절 절충의 실제 비용을 재려면 실제 공급자가 셋 있어야 한다** —
- * multi-engine-routing.md 12절.
+ * ~~실제 공급자가 둘뿐이다 — 셋이 되면 13.3절 실험이 구성 가능해진다~~ → **셋이 됐다.**
  *
- * 그 항목은 "유료 API 대기"로 분류되어 있지만, 자격증명만으로는 구성되지 않는다: 레지스트리에
- * **실제 공급자 엔트리가 둘뿐**이라 라우터가 세 역할을 독립 공급자로 배정할 수 없다. 즉 이
- * 항목은 자격증명이 아니라 **M2(Gemini 어댑터)** 를 기다린다.
+ * 그 가드는 "13.3절 절충의 실제 비용" 항목이 자격증명이 아니라 **M2(Gemini 어댑터)** 를
+ * 기다린다는 것을 못 박아두고, 셋째가 들어오는 순간 실패해 항목을 다시 열게 하는 것이었다.
+ * 실제로 Gemini 어댑터를 넣자 이 검사가 발동했고, multi-engine-routing.md 12절의 그 항목을
+ * 다시 열었다(이제 남은 선행 조건은 세 자격증명과 별도 사전 등록이다).
  *
- * 이 검사는 셋째가 들어오는 순간 실패하며 그 항목이 다시 열린다. 사람이 기억하는 규칙으로
- * 두면 세 번째 공급자를 추가하고도 실험을 떠올리지 못한다.
+ * **그 자리를 빈 채로 두지 않는다.** 공급자를 하나 늘리는 변경에서 정작 위험한 것은 따로
+ * 있다: 레지스트리에 엔트리가 늘었다고 **자격증명이 둘뿐인 사용자의 경로가 달라지는 것.**
+ * 배정은 `availableProviders`가 정하므로 달라지지 않아야 하는데, 그건 규칙이지 사실이 아니다.
  */
-test("실제 공급자가 둘뿐이다 — 셋이 되면 13.3절 실험이 구성 가능해진다", () => {
-  const realProviders = new Set(
-    new ModelRegistry()
-      .all()
-      .filter((e) => providerKindOf(e) === "real")
-      .map((e) => e.providerId)
-  );
-  // 빈 집합에 대해 통과하지 않는다.
-  assert.ok(realProviders.size >= 2, `실제 공급자를 읽지 못했습니다: ${[...realProviders].join(", ")}`);
-  assert.ok(
-    realProviders.size < 3,
-    `실제 공급자가 ${realProviders.size}개가 됐습니다(${[...realProviders].join(", ")}). ` +
-      `이제 3공급자 환경을 구성할 수 있으므로 multi-engine-routing 12절의 "13.3절 절충의 실제 비용"을 다시 열 것 — ` +
-      `그 실험은 사전 등록이 따로 필요하다(게이트 G의 arm에 얹을 수 없다).`
-  );
+test("공급자를 레지스트리에 추가해도 자격증명이 둘뿐인 사용자의 배정은 그대로다", () => {
+  const registry = new ModelRegistry();
+  const real = [...new Set(registry.all().filter((e) => providerKindOf(e) === "real").map((e) => e.providerId))];
+  // 셋 이상이어야 이 질문이 성립한다 — 둘이면 "추가해도"라는 전제가 없다.
+  assert.ok(real.length >= 3, `실제 공급자가 ${real.length}개뿐이라 이 검사가 공허합니다: ${real.join(", ")}`);
+
+  const decide = (providers: string[]) =>
+    new Router(registry).decide({
+      taskId: "task-1",
+      complexityTier: "standard",
+      availableProviders: providers,
+    });
+
+  const twoCredentials = decide(["openai", "anthropic"]);
+  // 배정된 공급자가 **가진 자격증명 안에만** 있어야 한다. 하나라도 벗어나면 사용자는
+  // "키가 없는 공급자를 부르려다 실패"를 보게 된다.
+  for (const assignment of twoCredentials.assignments) {
+    assert.ok(
+      ["openai", "anthropic"].includes(assignment.providerId),
+      `자격증명이 없는 공급자가 배정됐습니다: ${assignment.providerId}`
+    );
+  }
+  // 그리고 검수자 독립성은 그대로 유지된다(원칙 4).
+  const executor = twoCredentials.assignments.find((a) => a.role === "executor");
+  const reviewer = twoCredentials.assignments.find((a) => a.role === "reviewer");
+  assert.ok(executor, "executor가 배정되지 않았습니다");
+  if (reviewer) assert.notEqual(reviewer.providerId, executor.providerId);
 });
 
 /**

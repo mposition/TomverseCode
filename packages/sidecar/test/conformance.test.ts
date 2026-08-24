@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { ModelEntry } from "@tomverse/protocol";
 import { AnthropicAdapter } from "../src/providers/anthropic.js";
 import { FakeProviderAdapter } from "../src/providers/fake.js";
+import { GeminiAdapter } from "../src/providers/gemini.js";
 import { OpenAIAdapter } from "../src/providers/openai.js";
 import { ProviderCallFailure, type ProviderAdapter, type ProviderCallContext } from "../src/providers/types.js";
 import { createAdapter, MissingCredentialError } from "../src/providers/factory.js";
@@ -108,6 +109,22 @@ const ADAPTERS: AdapterUnderTest[] = [
         ? [{ type: "text", text: "no tool call" }]
         : [{ type: "tool_use", id: "tu_1", name: "submit_draft", input: DRAFT_PAYLOAD }],
       usage: { input_tokens: 1_234, output_tokens: 56 },
+    }),
+  },
+  {
+    providerId: "google",
+    modelId: "gemini-conformance",
+    create: (entry, fetchImpl) => new GeminiAdapter({ entry, apiKey: "k", fetch: fetchImpl }),
+    // Gemini는 세 가지를 **다른 이름으로** 준다: 본문은 candidates/parts/text,
+    // 모델은 `modelVersion`(다른 둘은 `model`), 사용량은 `usageMetadata`.
+    // 정규화가 한 군데라도 빠지면 이 표의 다른 검사들이 잡는다.
+    body: (script, requestedModel) => ({
+      responseId: "resp_gemini_123",
+      ...(script.reportedModel === null ? {} : { modelVersion: script.reportedModel ?? requestedModel }),
+      candidates: script.omitPayload
+        ? [{ content: { parts: [] } }]
+        : [{ content: { parts: [{ text: JSON.stringify(DRAFT_PAYLOAD) }] } }],
+      usageMetadata: { promptTokenCount: 1_234, candidatesTokenCount: 56 },
     }),
   },
 ];
@@ -329,12 +346,15 @@ test("[적합성] 레지스트리의 실제 공급자가 전부 이 표에 있�
  * 어긋나면 언제나 통과하는 방식으로 고장 나고, 그 고장은 초록색으로 보인다.
  */
 test("[적합성] 표에 없는 공급자가 생기면 위 검사가 잡는다", () => {
-  const newcomer = entryFor("google", "gemini-hypothetical");
-  const missing = uncoveredProviders(
-    [...BUILTIN_MODELS, newcomer],
-    new Set(ADAPTERS.map((a) => a.providerId))
-  );
-  assert.deepEqual(missing, ["google"]);
+  // **표에 이미 있는 공급자를 쓰면 안 된다.** 예전에는 `google`을 썼는데 실제로 google
+  // 어댑터가 생기면서 이 검사가 "빠진 것 없음"으로 조용히 통과하게 됐다 — 공허성 검사가
+  // 공허해지는 정확한 방식이다. 표에 없는 이름을 고르고, 그 사실을 먼저 확인한다.
+  const covered = new Set(ADAPTERS.map((a) => a.providerId));
+  const hypothetical = "not-a-real-provider";
+  assert.ok(!covered.has(hypothetical), `${hypothetical}가 이미 표에 있어 이 검사가 공허합니다`);
+  const newcomer = entryFor(hypothetical, "hypothetical-model");
+  const missing = uncoveredProviders([...BUILTIN_MODELS, newcomer], covered);
+  assert.deepEqual(missing, [hypothetical]);
   // fake 공급자는 실전 어댑터가 아니므로 요구하지 않는다 — 요구하면 표가
   // 검사할 수 없는 것(로컬 스크립트)까지 떠안는다.
   const fake = BUILTIN_MODELS.filter((e) => providerKindOf(e) === "fake");

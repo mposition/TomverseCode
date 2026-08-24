@@ -88,6 +88,48 @@ export const BUILTIN_MODELS: ModelEntry[] = [
     availability: { requiresOrgVerification: false },
   },
   /**
+   * Google Gemini — M2 커버리지("멀티프로바이더 3사", product-strategy 8.2절).
+   *
+   * `structuredOutput`이 셋째 값 `response_schema`인 첫 항목이다. 그 축은 처음부터 있었고
+   * (Insight 카탈로그에서 온 구분) 쓰는 어댑터가 없었을 뿐이다.
+   *
+   * **이 엔트리는 실측으로 확인되지 않았다** — 이 저장소의 개발 환경에는 Google 자격증명이
+   * 없고 egress도 막혀 있다. 가격·컨텍스트 한도는 공개 문서 기준이며 `pricingAsOf`가 그
+   * 시점을 말한다. 착지 기준은 multi-engine-routing.md 19절에 있다.
+   */
+  {
+    modelId: "gemini-3-pro",
+    providerId: "google",
+    protocol: "native",
+    apiBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    apiKeyEnvName: "GEMINI_API_KEY",
+    capabilities: {
+      toolCalling: "parallel",
+      structuredOutput: "response_schema",
+      imageInput: true,
+      maxContextTokens: 1_000_000,
+      maxOutputTokens: 64_000,
+    },
+    economics: { inputPerMTok: 1.25, outputPerMTok: 10.0, pricingAsOf: PRICING_AS_OF },
+    availability: { requiresOrgVerification: false },
+  },
+  {
+    modelId: "gemini-3-flash",
+    providerId: "google",
+    protocol: "native",
+    apiBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    apiKeyEnvName: "GEMINI_API_KEY",
+    capabilities: {
+      toolCalling: "parallel",
+      structuredOutput: "response_schema",
+      imageInput: true,
+      maxContextTokens: 1_000_000,
+      maxOutputTokens: 64_000,
+    },
+    economics: { inputPerMTok: 0.3, outputPerMTok: 2.5, pricingAsOf: PRICING_AS_OF },
+    availability: { requiresOrgVerification: false },
+  },
+  /**
    * API 키 없이 전체 루프를 돌리기 위한 결정론적 가짜 공급자 (작업 지침 4.6절 마지막 항목).
    *
    * 레지스트리에 넣은 이유: 라우터가 특별 취급하는 경로를 만들지 않기 위해서다. fake도

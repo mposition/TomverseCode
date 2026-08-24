@@ -414,6 +414,7 @@ excluded from context"). 모델이 그 파일이 없다고 보고 내용을 추�
 | **테스트·빌드 실행 및 파싱** | 주요 러너(npm/pytest/cargo/dotnet) 결과 파싱, 신규 실패 분리 | flaky 감지, 성능 회귀 비교 |
 | **diff·부분 승인·되돌리기·체크포인트** | 파일 단위 diff, 전체/파일 단위 승인, 태스크 단위 롤백 | hunk 단위 부분 승인, 임의 시점 체크포인트 |
 | **멀티프로바이더 + BYOK + 모델 선택** | OpenAI·Anthropic·Google 3사, 키 등록, 역할별 수동 지정 | 공급자 추가, 학습 라우터(M4) |
+| ↳ 위 행의 현재 상태 | 3사 어댑터 **구현 완료**. 단 Google은 **실측 미확인**이며 착지 기준이 따로 있다([multi-engine 19.4절](./multi-engine-routing.md)) — "구현됨"과 "검증됨"을 뭉개면 출시 기준이 거짓이 된다 | — |
 | **저장소 인덱싱 · 토큰 사용량** | Tree-sitter 3개 언어(JS/TS·Python·Rust) + ripgrep 폴백, 태스크별 토큰 표시 | 언어 추가, 증분 인덱싱 최적화 |
 | **Chat · Plan 모드** | 계획 제시 → 사용자 확인 → 실행 | — |
 | **Interactive · Autopilot 모드** | Autopilot = 무인 실행하되 **검사 실패 시 정지**. 승인 정책은 그대로 적용 | 장시간 루프 안정성, 예산 기반 자동 중단 |

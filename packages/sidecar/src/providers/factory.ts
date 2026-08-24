@@ -1,6 +1,7 @@
 import type { ModelEntry, RoleAssignment } from "@tomverse/protocol";
 import { AnthropicAdapter } from "./anthropic.js";
 import { FakeProviderAdapter, type FakeProviderOptions } from "./fake.js";
+import { GeminiAdapter } from "./gemini.js";
 import { OpenAIAdapter } from "./openai.js";
 import type { ProviderAdapter } from "./types.js";
 
@@ -53,12 +54,16 @@ export function createAdapter(
       return new OpenAIAdapter({ entry, apiKey });
     case "anthropic":
       return new AnthropicAdapter({ entry, apiKey });
+    case "google":
+      return new GeminiAdapter({ entry, apiKey });
     default:
       // openai-compatible 공급자는 공용 어댑터 + baseUrl 교체로 처리할 수 있으나,
-      // M0에서는 검증된 공급자만 다룬다 (multi-engine-routing.md 9절: 엔진은 나중에).
+      // **검증된 공급자만 다룬다** (multi-engine-routing.md 9절: 엔진은 나중에).
+      // 여기 도달했다는 것은 레지스트리에 엔트리가 있는데 분기가 없다는 뜻이고,
+      // 적합성 스위트가 그 상태를 실행 전에 잡는다("팩토리가 어댑터를 만들 수 있다").
       throw new Error(
         `${entry.providerId} 공급자용 어댑터가 아직 없습니다. ` +
-          `M0 범위는 openai/anthropic + fake입니다 (docs/design/multi-engine-routing.md 9절).`
+          `현재 범위는 openai/anthropic/google + fake입니다 (docs/design/multi-engine-routing.md 9절).`
       );
   }
 }
