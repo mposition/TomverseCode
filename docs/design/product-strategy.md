@@ -58,7 +58,7 @@ status: accepted (2026-07-25) — 단, 2절의 **가설 게이트**를 통과하
 | §9 데이터 전송 투명성 | **구현 완료** — 하드 제외(context-engine 7절)에 더해 **화면과 CLI 양쪽에 표시가 있다**(`TransmissionPanel`, `tomverse-host transmission`, 감사 export). 이 집계가 서 있던 전제("모든 프롬프트 빌더가 같은 스냅샷을 싣는다")는 Rust 주석의 주장일 뿐이었고 이제 검사가 지킨다(7.1절). <!-- present: apps/desktop/src/components/TransmissionPanel.tsx, apps/desktop/src/components/AuditExportPanel.tsx, packages/sidecar/test/transmissionClaim.test.ts --> |
 | §10 재현 가능한 Agent Trace | **구현 완료** — 기록(`task_events` append-only + export)에 더해 **러너가 있다**: `tomverse-host reproduce`가 DB 없이 검사하고 `--apply`가 각 단계를 Policy Gate에 그대로 태운다(state-machine 21절). <!-- present: apps/desktop/src-tauri/core/src/reproduce.rs --> |
 | §2 모델 불일치 화면 | **구현 완료** — 3.9절 불일치 판정 카드. 표가 아니라 **강제 선택 카드**가 된 이유는 16절에 있다. <!-- present: apps/desktop/src/components/DisagreementCard.tsx --> |
-| §3 Candidate Arena | **미착수** — worktree 격리 자체가 없다. <!-- absent: apps/desktop/src-tauri/core/src/arena.rs --> |
+| §3 Candidate Arena | **미착수** — 복수 구현 경쟁·선택 로직이 없다. ~~worktree 격리 자체가 없다~~ → **그 선행 조건은 M2에서 갖춰졌다**(state-machine 22절). <!-- absent: apps/desktop/src-tauri/core/src/arena.rs --> |
 
 **놓치기 쉬운 사실: Agent Trace는 거의 다 됐다.** 원 제안서는 이걸 후순위(P2)로 뒀지만, 우리에겐 append-only 이벤트 로그가 이미 진실의 원천이므로 남은 건 작은 델타다. Copilot이 이걸 사후 추가하려면 아키텍처를 고쳐야 하지만 우리는 이미 그렇게 설계돼 있다 — 저비용 고가치 항목이므로 우선순위를 올린다.
 
@@ -421,6 +421,7 @@ excluded from context"). 모델이 그 파일이 없다고 보고 내용을 추�
 | **세션 중지·재개·취소** | 진행 중 취소, 앱 재시작 후 상태 복원(자동 재개는 안 함) | 다중 태스크 동시 실행 |
 | **Git status·diff·commit·branch** | 도구로 노출 + Policy Gate 적용 | — |
 | **Git worktree · 브랜치별 격리** | worktree 생성·격리 실행·정리 | Arena(M3)가 이 위에 올라감 |
+| ↳ 위 행의 현재 상태 | **구현 완료**(M2) — `tomverse-host run --worktree <branch>` / `tomverse-host worktree [--worktree <branch>] [--force]`. 격리는 **루트를 바꾸는 것이 전부**이고 Policy Gate에 분기를 만들지 않았다([state-machine 22절](./state-machine-and-protocol.md)) <!-- present: apps/desktop/src-tauri/core/src/worktree.rs --> | — |
 | **PR 연동** | GitHub PR 생성 | 리뷰 코멘트 반영, 타 호스팅 |
 | **MCP** | MCP 서버 등록, 그 도구가 `ToolRequest`로 변환되어 Policy Gate 통과 | 스펙 전 범위, 원격 서버 |
 | **프로젝트 규칙** | `CLAUDE.md`/`AGENTS.md` 자동 로드 (이미 `agentsMdContent`로 설계됨) | 디렉터리별 규칙 |

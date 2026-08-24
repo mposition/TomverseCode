@@ -64,6 +64,8 @@ interface RunOptions {
   defaultPatch?: string;
   timeoutSecs?: number;
   allowGitCommit?: boolean;
+  /** 격리 실행 — 이 브랜치의 worktree를 만들고 그 경로를 워크스페이스 루트로 쓴다. */
+  worktree?: string;
 }
 
 function hostAvailable(): boolean {
@@ -101,6 +103,7 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
     "--timeout-secs",
     String(options.timeoutSecs ?? 180),
   ];
+  if (options.worktree) args.push("--worktree", options.worktree);
   if (options.autoApproveWrites) args.push("--auto-approve-writes");
   if (options.allowGitCommit) args.push("--allow-git-commit");
 
@@ -137,8 +140,11 @@ function gitLogSubjects(root: string): string[] {
   return out.split("\n").filter((line) => line.trim().length > 0);
 }
 
-function withRepo(fn: (repo: FixtureRepo, stateDir: string) => void): void {
-  const repo = createFixtureRepo();
+function withRepo(
+  fn: (repo: FixtureRepo, stateDir: string) => void,
+  options: { gitRepo?: boolean } = {}
+): void {
+  const repo = createFixtureRepo(options);
   const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
   try {
     fn(repo, stateDir);
@@ -553,6 +559,33 @@ test("확정된 기준이 있으면 검증 뒤에 기준별 판정이 계산된�
     // 묻는 것이고, 그 순간 product-strategy 9절의 순환 의존이 재현된다.
     assert.equal(unverified.length, 1, JSON.stringify(evaluations));
   });
+});
+
+/**
+ * **격리 실행** — product-strategy 8.2절 "Git worktree · 브랜치별 격리", M2.
+ *
+ * 이 기능이 약속하는 것은 하나다: **태스크가 사용자의 작업 트리를 건드리지 않는다.** 그래서
+ * 검사도 하나다 — 태스크가 파일을 실제로 바꿨고, 그 변경이 본체에 없다.
+ *
+ * 한쪽만 보면 공허해진다: 본체가 안 바뀐 것만 보면 "아무 일도 안 일어났다"와 구별되지 않고,
+ * 격리 트리가 바뀐 것만 보면 본체도 함께 바뀌었을 수 있다.
+ */
+test("격리 실행은 본체 작업 트리를 건드리지 않는다", () => {
+  // **git 저장소여야 한다.** worktree는 git의 기능이므로 이 픽스처는 비-git일 수 없다 —
+  // 그리고 비-git에서는 호스트가 "git 저장소가 아닙니다"로 정확히 거부한다(그렇게 확인했다).
+  withRepo((repo, stateDir) => {
+    const before = repo.read("paginate.js");
+    const run = runHost(repo, stateDir, { worktree: "iso-e2e" });
+
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+    // ① 태스크는 실제로 파일을 바꿨다 — 아니면 아래 ②가 아무것도 말하지 않는다.
+    assert.deepEqual(run.mutatedPaths, ["paginate.js"]);
+    // ② 그런데 본체는 그대로다.
+    assert.equal(repo.read("paginate.js"), before, "격리 실행이 본체 작업 트리를 바꿨습니다");
+
+    // ③ 그리고 사용자에게 격리 트리가 어디인지 말한다 — 결과 diff를 어디서 볼지 알아야 한다.
+    assert.match(run.stderr, /격리 실행/, run.stderr);
+  }, { gitRepo: true });
 });
 
 test("fast 모드 + 단일 파일은 단일 모델 경로를 타지만 검증은 그대로 돈다", () => {

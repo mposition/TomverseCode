@@ -32,6 +32,7 @@ pub mod tools;
 pub mod transmission;
 pub mod types;
 pub mod uimsg;
+pub mod worktree;
 pub mod verify;
 #[cfg(windows)]
 pub(crate) mod win_job;

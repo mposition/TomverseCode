@@ -25,7 +25,7 @@
 //! 같은 프로세스 안에서 확인하면 "메모리에 남아 있었다"와 구별되지 않는다.
 //! 이 세 명령은 Tauri 앱이 부르는 것과 **같은 Store 메서드**를 호출한다 — 테스트 전용 경로가 아니다.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -99,6 +99,16 @@ struct Args {
     /// 테스트 편의 기능이지만, **실행되는 취소 경로는 실제 경로와 동일하다** —
     /// 같은 registry, 같은 토큰, 같은 프로세스 트리 종료 코드를 탄다. 별도 mock이 아니다.
     cancel_after_ms: Option<u64>,
+    /// 격리 실행: 이 브랜치의 worktree를 만들고 **그 경로를 워크스페이스 루트로 쓴다**
+    /// (multi-engine 없음 — product-strategy 8.2절, worktree.rs).
+    ///
+    /// 별도의 우회 규칙을 두지 않는 것이 요점이다. 루트가 바뀌면 Policy Gate는 자기가
+    /// worktree 안에 있는지조차 알 필요가 없다.
+    worktree: Option<String>,
+    /// 격리 실행에서 브랜치를 새로 만들 때의 출발점. 브랜치가 이미 있으면 무시된다.
+    worktree_base: Option<String>,
+    /// `worktree` 하위 명령에서 커밋되지 않은 변경을 **버리고** 지운다.
+    force: bool,
     /// `metrics` 전용: 워크스페이스 필터를 끄고 DB 전체를 집계한다.
     all_workspaces: bool,
     /// `windows-landing` 전용 — tauri 번들 디렉터리.
@@ -154,6 +164,9 @@ fn parse_args() -> Result<Args, String> {
         timeout_secs: 600,
         verbose: false,
         cancel_after_ms: None,
+        worktree: None,
+        worktree_base: None,
+        force: false,
         all_workspaces: false,
         bundle: None,
         providers: None,
@@ -178,6 +191,9 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--approve" => args.approve = value()?,
+            "--worktree" => args.worktree = Some(value()?),
+            "--worktree-base" => args.worktree_base = Some(value()?),
+            "--force" => args.force = true,
             "--db" => args.db = Some(PathBuf::from(value()?)),
             "--artifacts" => args.artifacts = Some(PathBuf::from(value()?)),
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
@@ -284,13 +300,18 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export|reproduce|windows-landing> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>]\n\
      [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
      \n\
      가설 게이트 전용: [--providers <csv>] [--review-mode blind|informed] [--replay-draft <file>]\n\
      \n\
+     run --worktree <branch> — 격리 실행. 그 브랜치의 worktree를 만들고 **그 경로를 워크스페이스\n\
+                 루트로 쓴다**. 브랜치가 없으면 만들고, 출발점은 [--worktree-base <ref>].\n\
+                 본체의 커밋되지 않은 변경은 따라오지 않으며 그 사실을 stderr로 알린다\n\
+     worktree — 격리 트리 목록(JSON). [--worktree <branch>]를 주면 그 트리를 정리한다.\n\
+                 커밋되지 않은 변경이 있으면 지우지 않고 사유를 낸다 — 버리려면 [--force]\n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
      tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
      show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다\n\
@@ -326,11 +347,62 @@ fn main() {
     }
 }
 
+/// 격리 트리를 어디에 만드는가.
+///
+/// **저장소 안에 만들지 않는다** — 안에 만들면 부모 워크스페이스의 게이트 루트가 그것을
+/// 포함해서, 본체에서 도는 태스크가 격리된 트리를 고칠 수 있다(worktree.rs 모듈 주석).
+/// 상태 디렉터리(`--db`가 사는 곳) 아래에 둔다: 태스크 기록과 같은 수명이라 정리 시점도 같다.
+fn worktree_parent_dir(args: &Args) -> PathBuf {
+    let state_dir = args
+        .db
+        .as_ref()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| args.workspace.join(".tomverse"));
+    state_dir.join("worktrees")
+}
+
 fn real_main() -> Result<i32, String> {
     let args = parse_args()?;
 
-    let root = WorkspaceRoot::new(&args.workspace)
-        .map_err(|e| format!("워크스페이스 {:?}를 열 수 없습니다: {e}", args.workspace))?;
+    // **격리 실행은 루트를 바꾸는 것이 전부다.** worktree를 만들고 그 경로를 루트로 준다 —
+    // Policy Gate에 "worktree 모드"라는 분기를 만들지 않는다. 분기를 만들면 그 분기가 곧
+    // 우회 지점이 되고, 게이트가 두 가지 규칙을 갖게 된다.
+    // **`run`에서만 격리 트리를 만든다.** `worktree` 하위 명령에서 `--worktree <branch>`는
+    // "이걸 정리하라"는 뜻이므로, 여기서 만들면 지우려던 사람이 트리를 새로 만들게 된다
+    // (실제로 그랬다 — 정리 명령이 "새로 만듦"을 찍었다).
+    let isolated = match args.worktree.as_ref().filter(|_| args.command == "run") {
+        Some(branch) => {
+            let repo = WorkspaceRoot::new(&args.workspace)
+                .map_err(|e| format!("워크스페이스 {:?}를 열 수 없습니다: {e}", args.workspace))?;
+            let parent = worktree_parent_dir(&args);
+            let wt = tomverse_core::worktree::ensure(repo.path(), &parent, branch, args.worktree_base.as_deref())
+                .map_err(|e| e.to_string())?;
+            // **본체의 커밋되지 않은 변경은 따라오지 않는다.** 말하지 않으면 사용자는 자기가
+            // 방금 고친 코드에 대해 태스크가 돈다고 믿고, 결과 diff를 "모델이 내 수정을
+            // 되돌렸다"로 읽는다.
+            if let Some(notice) = tomverse_core::worktree::isolation_notice(
+                tomverse_core::worktree::is_dirty(repo.path()),
+                &wt,
+            ) {
+                eprintln!("{notice}");
+            }
+            eprintln!(
+                "격리 실행: {} ({}) — {}",
+                wt.path.display(),
+                wt.branch,
+                if wt.created { "새로 만듦" } else { "기존 트리 재사용" }
+            );
+            Some(wt)
+        }
+        None => None,
+    };
+
+    let workspace_path = isolated
+        .as_ref()
+        .map(|w| w.path.clone())
+        .unwrap_or_else(|| args.workspace.clone());
+    let root = WorkspaceRoot::new(&workspace_path)
+        .map_err(|e| format!("워크스페이스 {workspace_path:?}를 열 수 없습니다: {e}"))?;
 
     // **재현 검사는 DB를 열지 않는다.** 감사자에게는 DB가 없다 — 그래서 export 파일이 있는
     // 것이고, 여기서 store를 열면 없던 state.db가 생긴다. "아무것도 쓰지 않는다"는 약속은
@@ -475,6 +547,58 @@ fn real_main() -> Result<i32, String> {
                 json!({ "interruptedTasks": marked, "dbPath": db_path.to_string_lossy() })
             );
             Ok(0)
+        }
+
+        // 격리 트리 조회·정리. **DB를 열지 않는다** — git 상태만 보고 아무것도 기록하지 않으므로
+        // reproduce/windows-landing과 같은 이유로 store 앞에서 갈라지는 것이 맞지만, 여기서는
+        // `--db`가 트리 위치를 정하므로 args만 쓴다.
+        "worktree" => {
+            let repo = WorkspaceRoot::new(&args.workspace)
+                .map_err(|e| format!("워크스페이스 {:?}를 열 수 없습니다: {e}", args.workspace))?;
+            let all = tomverse_core::worktree::list(repo.path()).map_err(|e| e.to_string())?;
+            let ours: Vec<_> = tomverse_core::worktree::ours(&all).into_iter().cloned().collect();
+
+            if args.worktree.is_none() {
+                // 목록만 낸다. **남의 트리도 함께 보여주되 우리 것과 구별한다** — 정리 대상
+                // 판정이 여기 달려 있고, 뭉치면 사용자가 자기 트리를 우리 것으로 읽는다.
+                let described: Vec<_> = all
+                    .iter()
+                    .map(|w| {
+                        serde_json::json!({
+                            "path": w.path.to_string_lossy(),
+                            "branch": w.branch,
+                            "ours": ours.iter().any(|o| o.path == w.path),
+                            "dirty": tomverse_core::worktree::is_dirty(&w.path),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::json!({ "worktrees": described }));
+                return Ok(0);
+            }
+
+            // `--worktree <branch>`가 있으면 그 트리를 정리한다.
+            let branch = args.worktree.clone().unwrap_or_default();
+            tomverse_core::worktree::validate_branch(&branch).map_err(|e| e.to_string())?;
+            let target = ours
+                .iter()
+                .find(|w| w.branch == branch)
+                .ok_or_else(|| format!("{branch}에 해당하는 격리 트리가 없습니다"))?;
+            match tomverse_core::worktree::remove(repo.path(), &target.path, args.force) {
+                Ok(()) => {
+                    println!("{}", serde_json::json!({ "removed": target.path.to_string_lossy() }));
+                    Ok(0)
+                }
+                // **더러운 트리를 지우지 않은 것은 도구의 실패가 아니다.** 종료 코드에 실으면
+                // "git이 깨졌다"와 "사용자가 정할 일이 남았다"가 같은 값이 된다.
+                Err(e @ tomverse_core::worktree::WorktreeError::Dirty { .. }) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "refused": target.path.to_string_lossy(), "reason": e.to_string() })
+                    );
+                    Ok(0)
+                }
+                Err(e) => Err(e.to_string()),
+            }
         }
 
         "tasks" => {
