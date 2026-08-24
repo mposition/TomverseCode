@@ -27,6 +27,11 @@ export type TaskEventType =
   // `APPROVAL_UNATTENDED`를 `APPROVAL_DENIED`와 나눈 것과 같다 — 사람이 이 요청을 보고
   // 답한 것이 아니다.
   | "APPROVAL_AUTO_VERIFICATION"
+  // 사용자가 **등록해 둔 훅**이라 통과했다. `APPROVAL_AUTO_VERIFICATION`과 나누는 이유는
+  // 잘못 걸렸을 때 고칠 자리가 다르기 때문이다 — 저쪽은 정책 스위치, 이쪽은 훅 등록이다.
+  | "APPROVAL_REGISTERED_HOOK"
+  // phase 훅이 실행됐다. `affectsVerdict: false`가 함께 남는다 — 훅은 관찰자다(25.4절).
+  | "HOOK_EXECUTED"
   | "TOOL_REQUESTED"
   | "TOOL_COMPLETED"
   | "POLICY_DECIDED"

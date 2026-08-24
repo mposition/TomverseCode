@@ -68,6 +68,8 @@ interface RunOptions {
   allowGitCommit?: boolean;
   /** 격리 실행 — 이 브랜치의 worktree를 만들고 그 경로를 워크스페이스 루트로 쓴다. */
   worktree?: string;
+  /** phase 전환 훅. `phase=프로그램[,인자...]` (state-machine 25절). */
+  hooks?: string[];
 }
 
 function hostAvailable(): boolean {
@@ -106,6 +108,7 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
     String(options.timeoutSecs ?? 180),
   ];
   if (options.worktree) args.push("--worktree", options.worktree);
+  for (const hook of options.hooks ?? []) args.push("--hook", hook);
   if (options.autoApproveWrites) args.push("--auto-approve-writes");
   if (options.autoApproveVerification) args.push("--auto-approve-verification");
   if (options.allowGitCommit) args.push("--allow-git-commit");
@@ -770,6 +773,134 @@ test("Autopilot은 프로젝트가 선언한 검증 명령까지 돌고서야 �
     assert.ok(run.eventTypes.includes("APPROVAL_AUTO_VERIFICATION"), run.eventTypes.join(", "));
     assert.ok(!run.eventTypes.includes("APPROVAL_GRANTED"), "무인인데 사용자 승인이 기록됐습니다");
     assert.ok(!run.eventTypes.includes("APPROVAL_DENIED"), "사용자가 거부한 것으로 기록됐습니다");
+  });
+});
+
+/**
+ * **훅은 실제로 돌고, 실패해도 판정을 바꾸지 않는다** (state-machine 25절).
+ *
+ * 두 훅을 건다. 하나는 성공하고 파일을 남겨 **정말 실행됐다는 증거**를 만들고, 하나는 0이
+ * 아닌 종료 코드로 끝난다.
+ *
+ * 성공하는 훅만 걸면 이 테스트는 훅이 도는지만 본다. 그런데 이 기능에서 가장 조용히 틀릴 수
+ * 있는 것은 **실패한 훅이 태스크를 실패로 만드는 것**이다 — 원칙 1이 정한 판정자는 결정론적
+ * 검증이고 사용자 훅은 검증이 아니다.
+ *
+ * **실패하는 훅을 먼저 건다.** 그래야 뒤따르는 훅이 실행됐다는 사실(`hook-ran.txt`)이
+ * "실패한 훅이 나머지를 중단시키지 않는다"를 증명한다 — 실패에서 루프를 빠져나가는 구현이면
+ * 이 파일이 생기지 않는다. 순서를 반대로 두면 그 파일은 아무것도 증명하지 않는다.
+ *
+ * `status === "completed"`에 대해서는 **이 테스트가 무엇을 못 하는지** 적어 둔다. 훅 결과가
+ * 판정에 닿는 경로는 지금 아예 없으므로(Rust가 결과를 버리고 Node는 훅의 존재를 모른다),
+ * 이 단언을 깨려면 그 경로를 새로 만들어야 한다. 실제로 훅 실패 시 태스크를 실패시키는 코드와
+ * phase 전환을 막는 코드를 각각 심어 봤지만 **둘 다 이 테스트를 통과했다.** 남겨 두는 이유는
+ * 나중에 그 경로가 생겼을 때 걸리게 하기 위해서이지, 지금 무언가를 증명하기 때문이 아니다.
+ */
+test("phase 훅은 실행되고 기록되지만, 실패해도 태스크의 판정을 바꾸지 않는다", () => {
+  withRepo((repo, stateDir) => {
+    // 훅이 정말 돌았는지는 **부작용**으로 본다. 이벤트만 보면 "우리가 이벤트를 적었다"까지만
+    // 확인되고 프로그램이 실제로 떴는지는 알 수 없다.
+    //
+    // 훅을 `npm run <스크립트>`로 거는 것은 우연이 아니라 **이 기능이 지나는 유일한 길**이다:
+    // allowlist에 없는 프로그램은 게이트가 기본 거부한다(25.5절). `node hook.js`로 걸었을 때
+    // 등록이 거절되는 것은 아래 테스트가 확인한다.
+    repo.write("hook-ok.js", "require('fs').writeFileSync('hook-ran.txt', 'yes');\n");
+    repo.write("hook-bad.js", "process.exit(3);\n");
+    const manifest = JSON.parse(repo.read("package.json")) as { scripts: Record<string, string> };
+    manifest.scripts["hook:ok"] = "node hook-ok.js";
+    manifest.scripts["hook:bad"] = "node hook-bad.js";
+    repo.write("package.json", JSON.stringify(manifest, null, 2) + "\n");
+
+    const run = runHost(repo, stateDir, {
+      mode: "fast",
+      // **실패하는 쪽이 먼저다** — 위 주석 참조.
+      hooks: ["VERIFYING=npm,run,hook:bad", "VERIFYING=npm,run,hook:ok"],
+    });
+
+    // ① 태스크는 완료다 — 훅 하나가 exit 3으로 끝났는데도.
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+    assert.equal(run.final.verificationReport?.overall, "pass", run.final.summary);
+
+    // ② 훅이 실제로 떴고, **실패한 훅이 뒤따르는 훅을 중단시키지 않았다.** 이벤트만 보면
+    //    "우리가 이벤트를 적었다"까지만 확인되고 프로그램이 실제로 떴는지는 알 수 없다.
+    assert.ok(
+      repo.exists("hook-ran.txt"),
+      `실패한 훅 뒤의 훅이 실행되지 않았습니다\n${run.stderr}`
+    );
+
+    // ③ 둘 다 기록됐다.
+    const hookEvents = run.eventTypes.filter((t) => t === "HOOK_EXECUTED");
+    assert.equal(hookEvents.length, 2, run.eventTypes.join(", "));
+
+    // ④ 승인은 **등록이** 했다. 사람이 답한 것으로 기록되면 감사 로그가 거짓말한다.
+    assert.ok(run.eventTypes.includes("APPROVAL_REGISTERED_HOOK"), run.eventTypes.join(", "));
+  });
+});
+
+/**
+ * **등록되지 않은 phase는 등록 시점에 거부된다.**
+ *
+ * 통과시키면 그 훅은 영원히 안 돌고, 사용자에게는 "훅이 동작하지 않는다"로만 보인다 —
+ * 원인이 자기 오타라는 것을 알 방법이 없다.
+ */
+/**
+ * **게이트가 거부할 훅은 등록에서 거절된다** (state-machine 25.5절).
+ *
+ * 이걸 통과시키면 훅은 등록되고 매 phase 전환마다 조용히 거부만 기록한다. 사용자에게는
+ * "훅이 동작하지 않는다"로 보이고, 원인(allowlist 기본 거부)은 로그 깊은 곳에 있다.
+ * **실제로 그 상태를 먼저 만들었고, 이 기능의 첫 e2e가 그렇게 실패했다.**
+ */
+test("allowlist에 없는 프로그램의 훅은 등록에서 거절되고, 지나는 길을 알려준다", () => {
+  withRepo((repo, stateDir) => {
+    const result = spawnSync(
+      HOST_BIN,
+      [
+        "run",
+        "--workspace",
+        repo.root,
+        "--message",
+        "아무거나",
+        "--hook",
+        "COMPLETED=node,build.js",
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+        "--sidecar",
+        SIDECAR_ENTRY,
+      ],
+      { encoding: "utf8" }
+    );
+    assert.notEqual(result.status, 0, "게이트가 거부할 훅이 등록됐습니다");
+    // 거절만 하면 사용자가 할 수 있는 일이 없다 — 지나는 길을 함께 말한다.
+    assert.match(result.stderr, /npm run/, result.stderr);
+  });
+});
+
+test("오타 난 phase의 훅은 조용히 무시되지 않고 등록에서 거부된다", () => {
+  withRepo((repo, stateDir) => {
+    const result = spawnSync(
+      HOST_BIN,
+      [
+        "run",
+        "--workspace",
+        repo.root,
+        "--message",
+        "아무거나",
+        "--hook",
+        "VERIFYNG=node,x.js",
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+        "--sidecar",
+        SIDECAR_ENTRY,
+      ],
+      { encoding: "utf8" }
+    );
+    assert.notEqual(result.status, 0, "오타 난 phase가 통과했습니다");
+    // 거부만 하면 사용자가 추측하게 된다 — 쓸 수 있는 이름을 함께 말한다.
+    assert.match(result.stderr, /VERIFYING/, result.stderr);
   });
 });
 

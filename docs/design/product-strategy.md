@@ -428,6 +428,7 @@ excluded from context"). 모델이 그 파일이 없다고 보고 내용을 추�
 | ↳ 위 행의 현재 상태 | **구현 완료**(M2) — stdio 서버 등록·`mcp_call`·게이트 통과. 언제나 승인이며 정책으로 낮출 수 없다([state-machine 23절](./state-machine-and-protocol.md)). 남은 것은 UI 등록 화면과 도구 목록 노출(23.10절) <!-- present: apps/desktop/src-tauri/core/src/mcp.rs --> | — |
 | **프로젝트 규칙** | `CLAUDE.md`/`AGENTS.md` 자동 로드 (이미 `agentsMdContent`로 설계됨) | 디렉터리별 규칙 |
 | **Hooks** | 주요 phase 전환에 사용자 스크립트 실행. **스크립트 실행도 Policy Gate 적용** | 이벤트 종류 확대 |
+| ↳ 위 행의 현재 상태 | **코어 구현 완료, UI 미배선**(M3) — `tomverse-host run --hook <phase>=<프로그램>[,인자...]`. 트리거는 Rust가 잡으므로 Node가 훅을 건너뛸 수 없고, 등록된 argv 그대로 게이트를 지난다. **게이트를 그대로 적용했더니 allowlist 밖 프로그램은 돌지 않았고, 레버를 만드는 대신 그대로 두었다** — 지나는 길은 `npm run <스크립트>`이며 등록 시점에 그 사실을 알린다. 훅은 **관찰자다**: 실패해도 판정을 바꾸지 않으며 차단형 훅은 하지 않는다([state-machine 25절](./state-machine-and-protocol.md)) <!-- present: apps/desktop/src-tauri/core/src/hooks.rs --> | — |
 | **Skills · 커스텀 에이전트** | 얕은 버전 — 이름 붙인 프롬프트 프리셋 + 도구 허용목록 + 역할별 모델 지정 | 완전한 에이전트 프레임워크 |
 | **병렬 서브에이전트(Fleet)** | worktree 격리 기반 N개 병렬 실행 + 비용 상한 | 자동 위임, 작업 분해 |
 | **명령별 승인 · workspace 경계 · secret 탐지** | 이미 설계 완료(Policy Gate, allowlist, context-engine 7절) | 정책 문법 확장 |

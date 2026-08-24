@@ -117,6 +117,14 @@ pub struct TaskHost {
     /// 유도하므로 모델이 명령을 **지어낼** 수는 없지만, 모델은 매니페스트를 **고칠** 수 있다.
     /// `scripts.test`를 바꿔 놓고 검증을 부르면 모델이 고른 명령이 자동 승인을 받는다.
     verification_pin: Vec<(String, Vec<String>)>,
+    /// 사용자가 등록한 phase 훅 (hooks.rs, state-machine 25절). 비어 있으면 아무것도 하지 않는다.
+    hooks: crate::hooks::HookRegistry,
+    /// 훅 실행 중인가 — 훅이 훅을 부르는 것을 **구조적으로** 막는다.
+    ///
+    /// 지금은 훅 실행이 `PHASE_CHANGED`를 만들지 않으므로 재귀가 나지 않지만, 그건 지금의
+    /// 사실이지 규칙이 아니다. 규칙으로 두지 않으면 나중에 누군가 훅 안에서 phase를 옮기는
+    /// 경로를 만들고 **상한 없는 루프**가 생긴다(원칙 5).
+    in_hook: std::sync::atomic::AtomicBool,
     /// 이번 태스크에서 마지막으로 만들어진 diff 모음 (UI 표시용)
     diffs: Mutex<Vec<(String, String)>>,
     /// IPC 한 줄 크기를 재는 쪽 (process-architecture.md 3.1절 — 32 MiB가 맞는지).
@@ -163,6 +171,8 @@ impl TaskHost {
             cancels,
             baseline: Mutex::new(None),
             verification_pin,
+            hooks: crate::hooks::HookRegistry::default(),
+            in_hook: std::sync::atomic::AtomicBool::new(false),
             diffs: Mutex::new(Vec::new()),
             ipc_meter: Mutex::new(None),
         }
@@ -182,6 +192,51 @@ impl TaskHost {
             ),
         )
         .with_mcp(pool);
+        self
+    }
+
+    /// 등록하려는 훅을 **게이트에 미리 태워 본다.**
+    ///
+    /// 게이트는 allowlist에 없는 프로그램을 기본 거부한다(정책 5절). 그래서 `node build.js`
+    /// 같은 훅은 등록은 되는데 매 phase마다 거부만 기록하고 아무 일도 하지 않는다 —
+    /// 사용자에게는 "훅이 동작하지 않는다"로 보이고 원인은 로그 깊은 곳에 있다.
+    ///
+    /// **이건 미리보기이지 판정이 아니다.** 실제 결정은 실행 시점에 다시 내려진다(그게 신뢰
+    /// 경계의 규칙이다). 여기서 하는 일은 확실히 거부될 것을 **지금** 알려주는 것뿐이고,
+    /// 통과한다고 해서 나중에 반드시 실행된다는 뜻은 아니다.
+    pub fn preflight_hooks(&self, hooks: &[crate::hooks::HookConfig]) -> Result<(), String> {
+        for hook in hooks {
+            let command = hook.command();
+            let request = ToolRequest {
+                request_id: "hook-preflight".to_string(),
+                task_id: String::new(),
+                tool: ToolName::RunCommand,
+                args: json!({ "program": command.program, "args": command.args, "cwd": command.cwd }),
+                risk_tier: None,
+                requested_by: json!({ "role": "hook-preflight" }),
+                created_at: None,
+            };
+            let decision = self.gate.evaluate(&request, &self.root, &self.policy);
+            if !decision.allowed() {
+                return Err(format!(
+                    "훅 {}의 명령을 Policy Gate가 거부합니다: {} ({})\n\
+                     allowlist에 없는 프로그램은 기본 거부입니다 — 스크립트를 package.json에 넣고 \
+                     `npm run <스크립트>`로 거는 것이 이 게이트를 지나는 길입니다",
+                    hook.phase,
+                    hook.describe(),
+                    decision.reason
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 등록된 phase 훅을 붙인다 (hooks.rs, state-machine 25절).
+    ///
+    /// **`with_mcp`와 같은 이유로 생성자 인자가 아니다**: 붙이지 않으면 훅은 존재하지 않으며,
+    /// 훅을 쓰지 않는 실행 경로가 훅 코드를 지나지 않는다.
+    pub fn with_hooks(mut self, hooks: crate::hooks::HookRegistry) -> Self {
+        self.hooks = hooks;
         self
     }
 
@@ -392,7 +447,79 @@ impl TaskHost {
                 "createdAt": now_iso(),
             }),
         );
+        // **훅은 이벤트가 기록된 뒤에 돈다.** 먼저 돌리면 훅이 실패했을 때 phase 전환 자체가
+        // 기록되지 않을 수 있고, 그러면 `task_events`가 진실의 원천이라는 성질이 깨진다
+        // (원칙 7). 훅은 관찰자이지 판정자가 아니다(25.4절).
+        if event_type == "PHASE_CHANGED" {
+            if let Some(to) = payload.get("to").and_then(Value::as_str) {
+                self.run_phase_hooks(task_id, to);
+            }
+        }
         Ok(json!({ "eventId": appended.event_id, "seq": appended.seq }))
+    }
+
+    /// 이 phase에 걸린 훅을 순서대로 실행한다.
+    ///
+    /// **결과를 돌려주지 않는다.** 훅이 실패해도 태스크의 판정은 바뀌지 않는다 —
+    /// 결정론적 검증이 판정자라는 원칙 1이 훅마다 달라지면 안 된다. 실패는 기록될 뿐이다.
+    fn run_phase_hooks(&self, task_id: &str, phase: &str) {
+        use std::sync::atomic::Ordering;
+        if self.hooks.is_empty() {
+            return;
+        }
+        // 재귀 차단. `swap`으로 검사와 표시를 한 번에 한다 — 검사한 뒤 표시하면 그 사이가
+        // 열린다(취소 가드에서 이미 한 번 겪었다).
+        if self.in_hook.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        for hook in self.hooks.for_phase(phase) {
+            let command = hook.command();
+            let request = ToolRequest {
+                request_id: format!("hook-{}", uuid::Uuid::new_v4()),
+                task_id: task_id.to_string(),
+                tool: ToolName::RunCommand,
+                args: json!({ "program": command.program, "args": command.args, "cwd": command.cwd }),
+                risk_tier: None,
+                // **모델이 아니라 사용자 설정이 요청자다.** 이 값은 기록용이며 승인 근거가
+                // 아니다 — 승인 근거는 argv가 등록된 것과 같은지다(25.3절).
+                requested_by: json!({ "role": "hook", "phase": phase }),
+                created_at: Some(now_iso()),
+            };
+            let outcome = self.execute_tool(&request);
+            // `ToolStatus::Ok`은 "명령이 성공했다"가 아니다(CLAUDE.md 함정 기록) — 종료 코드를
+            // 본다. 여기서 뭉개면 실패한 훅이 성공으로 기록된다.
+            let (status, exit_code) = match &outcome {
+                Ok(value) => {
+                    let result = value.get("result");
+                    let status = result
+                        .and_then(|r| r.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let exit = result
+                        .and_then(|r| r.get("output"))
+                        .and_then(|o| o.get("exitCode"))
+                        .and_then(Value::as_i64);
+                    (status, exit)
+                }
+                Err(message) => (format!("error: {message}"), None),
+            };
+            let _ = self.append_event(
+                task_id,
+                "HOOK_EXECUTED",
+                json!({
+                    "phase": phase,
+                    "requestId": request.request_id,
+                    "command": hook.describe(),
+                    "status": status,
+                    "exitCode": exit_code,
+                    // 실패했다는 것과 **그것이 판정을 바꾸지 않는다**는 것을 함께 남긴다.
+                    // 나중에 이 기록을 읽는 사람이 "왜 실패했는데 완료인가"를 묻지 않도록.
+                    "affectsVerdict": false,
+                }),
+            );
+        }
+        self.in_hook.store(false, Ordering::SeqCst);
     }
 
     /// ToolRequest 하나를 끝까지 처리한다. 이 함수가 신뢰 경계의 핵심 경로다.
@@ -436,6 +563,38 @@ impl TaskHost {
             return PolicyLever::AutoApproveVerification;
         }
         decision.unblocked_by
+    }
+
+    /// 사용자가 **미리 적어 둔 것**이 이 요청을 승인하는가.
+    ///
+    /// 둘 다 근거가 같다: 명령의 출처가 모델이 아니라 사용자이고, 그 사실을 이 프로세스가
+    /// 구조적으로 확인할 수 있다. 그러나 **하나의 스위치로 뭉개지 않는다** — 검증 명령을
+    /// 자동 승인하기로 한 것과 훅을 등록한 것은 다른 결정이고, 기록도 달라야 한다.
+    fn pre_approval(&self, request: &ToolRequest) -> Option<PreApproval> {
+        if self.policy.auto_approve_verification && self.is_pinned_verification(request) {
+            return Some(PreApproval::DeclaredVerification);
+        }
+        if self.is_registered_hook(request) {
+            return Some(PreApproval::RegisteredHook);
+        }
+        None
+    }
+
+    /// 이 요청이 **사용자가 등록한 훅과 바이트 단위로 같은** 명령인가.
+    ///
+    /// `requested_by`를 보지 않는다 — 그건 IPC로 들어오는 값이라 Node가 지어낼 수 있다.
+    /// 판정 근거는 argv뿐이고, 그래서 모델이 같은 argv를 요청하면 이것도 통과한다.
+    /// **그 사실을 숨기지 않는다**: 사용자가 "이 명령을 매 phase 전환마다 자동으로 돌려라"라고
+    /// 등록한 이상, 같은 명령이 한 번 더 도는 것은 그 승인의 범위 안이다(25.3절).
+    fn is_registered_hook(&self, request: &ToolRequest) -> bool {
+        if request.tool != ToolName::RunCommand {
+            return false;
+        }
+        let Ok(cmd) = parse_run_command(&request.args) else {
+            return false;
+        };
+        // 훅은 언제나 루트에서 돈다(hooks.rs `command()`). cwd가 다르면 등록된 것이 아니다.
+        cmd.cwd == "." && self.hooks.matches_registered(&cmd.program, &cmd.args)
     }
 
     pub fn execute_tool(&self, request: &ToolRequest) -> Result<Value, String> {
@@ -502,19 +661,23 @@ impl TaskHost {
         // **기본값이 `NotRequired`다.** 게이트가 승인을 요구하지 않은 요청은 "승인되지 않음"이
         // 아니라 "물을 일이 아니었음"이고, 둘을 같은 값으로 두면 결과 기록이 그 사실을 잃는다.
         let mut approval_state = crate::tools::ApprovalState::NotRequired;
-        if decision.requires_user_approval && self.policy.auto_approve_verification && self.is_pinned_verification(request)
-        {
-            // 사용자가 미리 켜 둔 규칙이 답한다 (state-machine 24.5절). **게이트 분류는
-            // 그대로다** — 바뀐 것은 "누가 답하는가"뿐이고, 그 대상은 프로젝트가 태스크
-            // 시작 전에 선언해 둔 명령으로 한정된다.
+        let pre_approval = if decision.requires_user_approval {
+            self.pre_approval(request)
+        } else {
+            None
+        };
+        if let Some(kind) = pre_approval {
+            // 사용자가 **미리** 정해 둔 것이 답한다. **게이트 분류는 그대로다** — 바뀐 것은
+            // "누가 답하는가"뿐이고, 그 대상은 사용자가 먼저 적어 둔 것으로 한정된다
+            // (24.5절 검증 명령 / 25.3절 등록된 훅).
             approval_state = crate::tools::ApprovalState::GrantedByPolicy;
             let _ = self.append_event(
                 &request.task_id,
-                "APPROVAL_AUTO_VERIFICATION",
+                kind.event_type(),
                 json!({
                     "requestId": request.request_id,
                     "normalizedTarget": decision.normalized_target,
-                    // 게이트가 무엇을 요구했는지 지운 채로 남기면, 나중에 이 레버가 무엇을
+                    // 게이트가 무엇을 요구했는지 지운 채로 남기면, 나중에 이것이 무엇을
                     // 통과시켰는지 되짚을 수 없다.
                     "wouldHaveAsked": decision.matched_rule,
                     "riskLevel": decision.risk_level,
@@ -1131,6 +1294,24 @@ impl TaskHost {
         let payload = json!({ "restored": restored, "failed": failed });
         let _ = self.append_event(task_id, "ROLLBACK_COMPLETED", payload.clone());
         Ok(payload)
+    }
+}
+
+/// 사용자가 미리 적어 둔 것이 승인을 대신한 경로. **둘을 하나로 뭉개지 않는다** —
+/// 감사 로그를 읽는 사람에게 "검증 명령이라 통과했다"와 "등록된 훅이라 통과했다"는
+/// 다른 사실이고, 잘못 걸렸을 때 고칠 자리도 다르다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreApproval {
+    DeclaredVerification,
+    RegisteredHook,
+}
+
+impl PreApproval {
+    fn event_type(self) -> &'static str {
+        match self {
+            Self::DeclaredVerification => "APPROVAL_AUTO_VERIFICATION",
+            Self::RegisteredHook => "APPROVAL_REGISTERED_HOOK",
+        }
     }
 }
 

@@ -18,6 +18,7 @@ pub mod blocked;
 pub mod budget;
 pub mod cancel;
 pub mod export;
+pub mod hooks;
 pub mod host;
 pub mod landing;
 pub mod launcher;

@@ -11,6 +11,7 @@
 //! ```text
 //! tomverse-host run --workspace <path> --message "..." [--mode fast|verified]
 //!                   [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>]
+//!                   [--hook <phase=프로그램[,인자...]>]
 //!                   [--sidecar <index.js>] [--auto-approve-writes] [--auto-approve-verification]
 //!                   [--allow-git-commit]
 //!                   [--cancel-after-ms <n>] [--budget-usd <n>]
@@ -116,6 +117,7 @@ struct Args {
     /// **셸 문자열이 아니라 쉼표로 나눈 argv다**(원칙 6). 등록은 사용자만 할 수 있다 —
     /// 모델이 서버를 추가하는 경로는 없으며, 그것이 이 기능의 안전 모델 전부다.
     mcp_servers: Vec<tomverse_core::mcp::McpServerConfig>,
+    hooks: Vec<tomverse_core::hooks::HookConfig>,
     /// `metrics` 전용: 워크스페이스 필터를 끄고 DB 전체를 집계한다.
     all_workspaces: bool,
     /// `windows-landing` 전용 — tauri 번들 디렉터리.
@@ -173,6 +175,7 @@ fn parse_args() -> Result<Args, String> {
         verbose: false,
         cancel_after_ms: None,
         mcp_servers: Vec::new(),
+        hooks: Vec::new(),
         worktree: None,
         worktree_base: None,
         force: false,
@@ -204,6 +207,7 @@ fn parse_args() -> Result<Args, String> {
             "--worktree-base" => args.worktree_base = Some(value()?),
             "--force" => args.force = true,
             "--mcp-server" => args.mcp_servers.push(parse_mcp_server(&value()?)?),
+            "--hook" => args.hooks.push(parse_hook(&value()?)?),
             "--db" => args.db = Some(PathBuf::from(value()?)),
             "--artifacts" => args.artifacts = Some(PathBuf::from(value()?)),
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
@@ -322,6 +326,10 @@ fn usage() -> String {
      run --worktree <branch> — 격리 실행. 그 브랜치의 worktree를 만들고 **그 경로를 워크스페이스\n\
                  루트로 쓴다**. 브랜치가 없으면 만들고, 출발점은 [--worktree-base <ref>].\n\
                  본체의 커밋되지 않은 변경은 따라오지 않으며 그 사실을 stderr로 알린다\n\
+     run --hook <phase=프로그램[,인자...]> — phase 전환 훅 등록(반복 가능). **셸 문자열이 아니라\n\
+                 쉼표로 나눈 argv다.** 등록한 argv 그대로 Policy Gate를 지나 실행되며,\n\
+                 **실패해도 태스크의 판정을 바꾸지 않는다**(훅은 관찰자다). 걸 수 있는 phase는\n\
+                 PLANNING/EXECUTING/VERIFYING/COMPLETED/FAILED/CANCELLED\n\
      run --mcp-server <이름=프로그램[,인자...]> — MCP 서버 등록(반복 가능). **셸 문자열이 아니라\n\
                  쉼표로 나눈 argv다.** 그 도구는 `mcp_call`로 변환되어 Policy Gate를 지나며,\n\
                  **언제나 사용자 승인을 요구한다**(정책으로 낮출 수 없다)\n\
@@ -376,6 +384,27 @@ fn main() {
 /// 쉼표로 argv를 나누는 이유: 셸 문자열을 받으면 승인 화면에 보인 것과 실제 실행되는 것이
 /// 갈라진다(원칙 6). 쉼표가 인자에 들어가야 하는 서버는 이 CLI로 등록할 수 없다 —
 /// **못 하는 것을 조용히 추측해서 하지 않는다**(설정 파일이 생기면 그때 넓힌다).
+/// `--hook <phase>=<프로그램>[,인자...]`.
+///
+/// **셸 문자열이 아니라 쉼표로 나눈 argv다**(원칙 6). `--mcp-server`와 같은 모양으로 둔 이유는
+/// 사용자가 두 가지 등록 문법을 외우지 않게 하기 위해서다 — 그리고 같은 한계도 공유한다:
+/// 쉼표가 든 인자는 등록할 수 없다(설정 파일이 생기면 그때 넓힌다).
+fn parse_hook(spec: &str) -> Result<tomverse_core::hooks::HookConfig, String> {
+    let (phase, rest) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--hook 형식은 phase=프로그램[,인자...] 입니다: {spec}"))?;
+    let mut parts = rest.split(',');
+    let program = parts
+        .next()
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| format!("--hook에 프로그램이 없습니다: {spec}"))?;
+    Ok(tomverse_core::hooks::HookConfig {
+        phase: phase.trim().to_string(),
+        program: program.to_string(),
+        args: parts.map(str::to_string).collect(),
+    })
+}
+
 fn parse_mcp_server(spec: &str) -> Result<tomverse_core::mcp::McpServerConfig, String> {
     let (name, rest) = spec
         .split_once('=')
@@ -557,6 +586,18 @@ fn real_main() -> Result<i32, String> {
             if let Some(pool) = mcp.clone() {
                 eprintln!("MCP 서버 등록: {}", pool.names().join(", "));
                 task_host = task_host.with_mcp(pool);
+            }
+            if !args.hooks.is_empty() {
+                // **등록 시점에 검증한다.** 오타 난 phase를 통과시키면 영원히 안 도는 훅이
+                // 되고, 사용자에게는 "훅이 동작하지 않는다"로만 보인다.
+                tomverse_core::hooks::validate_hooks(&args.hooks).map_err(|e| e.to_string())?;
+                // 게이트가 확실히 거부할 훅은 **지금** 알린다. 등록만 되고 매 phase마다 조용히
+                // 거부되는 것보다, 사용자가 명령을 적은 이 자리에서 거절당하는 편이 낫다.
+                task_host.preflight_hooks(&args.hooks)?;
+                for hook in &args.hooks {
+                    eprintln!("훅 등록: {} → {}", hook.phase, hook.describe());
+                }
+                task_host = task_host.with_hooks(tomverse_core::hooks::HookRegistry::new(args.hooks.clone()));
             }
             let host = Arc::new(task_host);
             let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id);
