@@ -109,6 +109,10 @@ export function WorkspaceSettingsPanel() {
       </button>
 
       <h3>MCP 서버</h3>
+      <p className="muted small">
+        도구를 적으면 <strong>그 목록 밖의 도구는 승인을 묻지도 않고 거부됩니다.</strong> 비워 두면 서버가
+        내놓는 전부를 부를 수 있습니다 — 어느 쪽이든 호출마다 승인은 그대로 받습니다.
+      </p>
       {servers.map((server, index) => (
         <div key={index} className="pin-row">
           <input
@@ -129,12 +133,20 @@ export function WorkspaceSettingsPanel() {
             onChange={(e) => setServers(servers.map((s, i) => (i === index ? { ...s, argsText: e.target.value } : s)))}
             spellCheck={false}
           />
+          {/* 도구 허용목록 (32절). **비워 두면 좁히지 않는다** — 빈 목록("아무것도 못 부름")은
+              만들 수 없고, 그건 등록하지 않는 것과 같기 때문이다. */}
+          <textarea
+            value={server.toolsText}
+            placeholder={"허용할 도구 (한 줄에 하나, 비우면 전부)"}
+            onChange={(e) => setServers(servers.map((s, i) => (i === index ? { ...s, toolsText: e.target.value } : s)))}
+            spellCheck={false}
+          />
           <button type="button" onClick={() => setServers(servers.filter((_, i) => i !== index))}>
             제거
           </button>
         </div>
       ))}
-      <button type="button" onClick={() => setServers([...servers, { name: "", program: "", argsText: "" }])}>
+      <button type="button" onClick={() => setServers([...servers, { name: "", program: "", argsText: "", toolsText: "" }])}>
         서버 추가
       </button>
 

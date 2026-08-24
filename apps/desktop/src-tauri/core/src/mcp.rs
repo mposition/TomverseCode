@@ -41,6 +41,16 @@ pub struct McpServerConfig {
     /// API 키가 우리가 모르는 프로세스로 나간다(원칙 3의 정신).
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// 이 서버에서 **부를 수 있는 도구**를 좁힌다 (state-machine 32절).
+    ///
+    /// `None`이면 서버가 내놓는 전부다. `Some`이면 그 목록만이고, 목록 밖의 도구는
+    /// **승인을 묻지도 않고 게이트가 거부한다** — 물어본 뒤 실패시키면 사용자는 자기 승인이
+    /// 의미 없었다고 배운다.
+    ///
+    /// **빈 목록은 오류다.** "아무것도 부를 수 없는 서버"를 등록하는 것은 등록하지 않는 것과
+    /// 같은데, 화면에는 등록된 것으로 보인다 — 스킬의 도구 허용목록과 같은 판단이다(26.3절).
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +61,10 @@ pub enum McpConfigError {
     /// 프로그램 자리에 셸 메타문자가 들어왔다 — 문자열 명령을 넣으려는 시도다.
     ShellLike { name: String, program: String },
     Duplicate { name: String },
+    /// 도구 허용목록이 비어 있다 — "아무것도 못 부르는 서버"는 등록의 뜻이 아니다.
+    EmptyToolAllowlist { name: String },
+    /// 허용목록 항목이 비어 있다.
+    EmptyToolName { name: String },
 }
 
 impl std::fmt::Display for McpConfigError {
@@ -67,6 +81,11 @@ impl std::fmt::Display for McpConfigError {
                 "{name}: 프로그램 자리에 셸 명령을 넣을 수 없습니다 ({program}) — program과 args를 나눠서 적으세요"
             ),
             Self::Duplicate { name } => write!(f, "서버 이름이 중복됩니다: {name}"),
+            Self::EmptyToolAllowlist { name } => write!(
+                f,
+                "{name}: 도구 허용목록이 비어 있습니다 — 아무 도구도 부를 수 없는 서버는 등록하지 않는 것과 같습니다. 전부 허용하려면 목록 자체를 비워 두세요"
+            ),
+            Self::EmptyToolName { name } => write!(f, "{name}: 도구 허용목록에 빈 이름이 있습니다"),
         }
     }
 }
@@ -99,6 +118,14 @@ pub fn validate_servers(servers: &[McpServerConfig]) -> Result<(), McpConfigErro
                 name: server.name.clone(),
                 program: server.program.clone(),
             });
+        }
+        if let Some(tools) = &server.tools {
+            if tools.is_empty() {
+                return Err(McpConfigError::EmptyToolAllowlist { name: server.name.clone() });
+            }
+            if tools.iter().any(|t| t.trim().is_empty()) {
+                return Err(McpConfigError::EmptyToolName { name: server.name.clone() });
+            }
         }
     }
     Ok(())
@@ -385,6 +412,37 @@ impl McpPool {
         entry.session.call_tool(call)
     }
 
+    /// 이 호출이 **등록의 범위 안인가** (state-machine 32절).
+    ///
+    /// # 왜 게이트가 이걸 묻는가
+    ///
+    /// 실행 직전에 물으면 사용자는 이미 승인을 누른 뒤다. **승인을 물은 뒤에 거부하면
+    /// 사용자는 자기 승인이 의미 없었다고 배우고**, 그 학습은 진짜 승인 화면에도 옮는다.
+    ///
+    /// # 이 함수는 좁히기만 한다
+    ///
+    /// 돌려주는 것은 `Ok`(=원래대로 승인을 묻는다) 아니면 `Err`(=거부)뿐이다. **자동 허용을
+    /// 만들 수 있는 반환값이 없다** — 23.3절의 "정책으로 낮출 수 없다"가 여기서도 유지되는
+    /// 이유는 게이트가 이 값을 안 보기 때문이 아니라, 이 값이 낮출 수 있는 모양이 아니기
+    /// 때문이다.
+    pub fn gate_check(&self, call: &McpCall) -> Result<(), McpRefusal> {
+        let Some(config) = self.servers.iter().find(|s| s.name == call.server) else {
+            return Err(McpRefusal::UnknownServer {
+                server: call.server.clone(),
+                registered: self.names(),
+            });
+        };
+        match &config.tools {
+            None => Ok(()),
+            Some(allowed) if allowed.iter().any(|t| t == &call.tool) => Ok(()),
+            Some(allowed) => Err(McpRefusal::ToolNotAllowed {
+                server: call.server.clone(),
+                tool: call.tool.clone(),
+                allowed: allowed.clone(),
+            }),
+        }
+    }
+
     /// 등록된 서버들이 **실제로 내놓는 도구 목록**을 모은다 (state-machine 31절).
     ///
     /// # 왜 이게 필요한가
@@ -429,7 +487,10 @@ impl McpPool {
             return ServerCatalog::failed(&config.name, "세션을 만들지 못했습니다");
         };
         match entry.session.list_tools() {
-            Ok(tools) => ServerCatalog::listed(&config.name, tools),
+            // **허용목록을 여기서 적용한다**(32절). 게이트가 거부할 도구를 목록에 실으면
+            // 모델은 거부될 것을 요청하고, 사용자는 이유 없는 거부 모달을 본다 —
+            // 보여주는 집합과 부를 수 있는 집합은 같은 곳에서 나와야 한다.
+            Ok(tools) => ServerCatalog::listed(&config.name, tools, config.tools.as_deref()),
             Err(e) => ServerCatalog::failed(&config.name, &e.to_string()),
         }
     }
@@ -441,6 +502,33 @@ impl McpPool {
         for (_, mut entry) in std::mem::take(&mut *sessions) {
             let _ = entry.child.kill();
             let _ = entry.child.wait();
+        }
+    }
+}
+
+/// 등록의 범위를 벗어난 호출 (state-machine 32절).
+///
+/// **"안 된다"만 말하지 않는다** — 사용자가 다음에 할 일이 이유마다 다르다. 서버 이름이
+/// 틀린 것과 도구가 목록 밖인 것은 고칠 곳이 서로 다르다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpRefusal {
+    UnknownServer { server: String, registered: Vec<String> },
+    ToolNotAllowed { server: String, tool: String, allowed: Vec<String> },
+}
+
+impl std::fmt::Display for McpRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownServer { server, registered } => write!(
+                f,
+                "등록되지 않은 MCP 서버입니다: {server} (등록된 것: {}) — 등록은 사용자만 할 수 있습니다",
+                if registered.is_empty() { "없음".to_string() } else { registered.join(", ") }
+            ),
+            Self::ToolNotAllowed { server, tool, allowed } => write!(
+                f,
+                "{server} 서버에서 허용된 도구가 아닙니다: {tool} (허용: {})",
+                allowed.join(", ")
+            ),
         }
     }
 }
@@ -464,8 +552,15 @@ pub struct ServerCatalog {
     pub error: Option<String>,
     /// 상한에 걸려 일부만 담겼는가.
     pub truncated: bool,
-    /// 상한 전에 이 서버가 내놓은 도구 수.
+    /// 상한 전에 이 서버가 내놓은 도구 수. **허용목록으로 걸러내기 전의 수다.**
     pub listed_count: usize,
+    /// 사용자가 허용목록에 적었는데 **서버가 내놓지 않은** 도구 (32절).
+    ///
+    /// 대개 오타다. 조용히 넘기면 그 도구는 목록에도 없고 부르면 거부되는데, 사용자는
+    /// 자기가 허용해 두었다고 믿는다 — 어디서도 원인을 볼 수 없는 상태가 된다.
+    pub unknown_allowlisted: Vec<String>,
+    /// 허용목록으로 좁혀졌는가.
+    pub narrowed: bool,
 }
 
 /// 한 서버에서 프롬프트에 실을 수 있는 도구의 최대 개수.
@@ -493,10 +588,36 @@ impl ServerCatalog {
             error: Some(detail.to_string()),
             truncated: false,
             listed_count: 0,
+            unknown_allowlisted: Vec::new(),
+            narrowed: false,
         }
     }
 
-    fn listed(server: &str, raw: Vec<Value>) -> Self {
+    /// `allowed`가 `Some`이면 그 목록 밖의 도구는 **목록에서 빠진다**(32절).
+    fn listed(server: &str, raw: Vec<Value>, allowed: Option<&[String]>) -> Self {
+        let offered: Vec<String> = raw
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let unknown_allowlisted: Vec<String> = allowed
+            .map(|list| {
+                list.iter()
+                    .filter(|t| !offered.iter().any(|o| o == *t))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let raw: Vec<Value> = match allowed {
+            None => raw,
+            Some(list) => raw
+                .into_iter()
+                .filter(|t| {
+                    t.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| list.iter().any(|a| a == name))
+                })
+                .collect(),
+        };
         let listed_count = raw.len();
         let tools: Vec<ToolEntry> = raw
             .into_iter()
@@ -521,6 +642,8 @@ impl ServerCatalog {
             listed_count,
             tools,
             error: None,
+            unknown_allowlisted,
+            narrowed: allowed.is_some(),
         }
     }
 }
@@ -544,6 +667,28 @@ impl Catalog {
 
     pub fn truncated(&self) -> bool {
         self.servers.iter().any(|s| s.truncated)
+    }
+
+    /// 감사 이벤트에 남길 요약 (32절). **프롬프트에 실리는 텍스트와 다른 것을 담는다** —
+    /// 오타 난 허용목록처럼 모델에게는 잡음이고 사용자에게는 원인인 사실이 여기 있다.
+    pub fn audit(&self) -> Value {
+        Value::Array(
+            self.servers
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "server": s.server,
+                        "toolCount": s.tools.len(),
+                        "listedCount": s.listed_count,
+                        "truncated": s.truncated,
+                        "narrowed": s.narrowed,
+                        // 비어 있지 않으면 **사용자가 고칠 것이 있다는 뜻이다.**
+                        "unknownAllowlisted": s.unknown_allowlisted,
+                        "error": s.error,
+                    })
+                })
+                .collect(),
+        )
     }
 
     /// 프롬프트에 실릴 문장.
@@ -573,6 +718,11 @@ impl Catalog {
             if server.tools.is_empty() {
                 lines.push("(this server reports no tools)".to_string());
                 continue;
+            }
+            if server.narrowed {
+                // **좁혀졌다는 사실을 적는다.** 적지 않으면 모델은 이 서버가 원래 도구가
+                // 적은 것으로 읽고, 없는 도구를 찾다 포기하는 대신 목록 밖의 것을 요청한다.
+                lines.push("(the user restricted this server to the tools listed below)".to_string());
             }
             if server.truncated {
                 lines.push(format!(
@@ -678,6 +828,7 @@ mod tests {
         let catalog = Catalog::new(vec![ServerCatalog::listed(
             "notes",
             vec![tool("append", "노트를 덧붙인다", tiny_schema())],
+            None,
         )]);
         let rendered = catalog.render();
         assert!(rendered.contains("### server: notes"), "{rendered}");
@@ -690,7 +841,7 @@ mod tests {
     /// 참고 사항으로 읽고, 부를 자리가 있다는 것도 거부될 수 있다는 것도 모른다.
     #[test]
     fn the_catalog_says_how_to_call_and_that_approval_is_required() {
-        let catalog = Catalog::new(vec![ServerCatalog::listed("notes", vec![tool("append", "d", tiny_schema())])]);
+        let catalog = Catalog::new(vec![ServerCatalog::listed("notes", vec![tool("append", "d", tiny_schema())], None)]);
         let rendered = catalog.render();
         assert!(rendered.contains("mcpCalls"), "부를 자리를 말하지 않습니다: {rendered}");
         assert!(rendered.contains("approval"), "승인이 필요하다는 것을 말하지 않습니다: {rendered}");
@@ -702,7 +853,7 @@ mod tests {
     fn a_server_that_could_not_be_queried_is_unknown_not_empty() {
         let catalog = Catalog::new(vec![
             ServerCatalog::failed("broken", "핸드셰이크 실패"),
-            ServerCatalog::listed("quiet", vec![]),
+            ServerCatalog::listed("quiet", vec![], None),
         ]);
         let rendered = catalog.render();
         assert!(rendered.contains("broken"), "{rendered}");
@@ -719,7 +870,7 @@ mod tests {
         let many: Vec<Value> = (0..(MAX_TOOLS_PER_SERVER + 3))
             .map(|i| tool(&format!("t{i}"), "d", tiny_schema()))
             .collect();
-        let entry = ServerCatalog::listed("big", many);
+        let entry = ServerCatalog::listed("big", many, None);
         assert_eq!(entry.tools.len(), MAX_TOOLS_PER_SERVER);
         assert!(entry.truncated);
         let rendered = Catalog::new(vec![entry]).render();
@@ -732,7 +883,7 @@ mod tests {
     #[test]
     fn an_oversized_schema_is_omitted_rather_than_truncated() {
         let big = json!({ "type": "object", "description": "x".repeat(MAX_SCHEMA_BYTES + 100) });
-        let rendered = Catalog::new(vec![ServerCatalog::listed("big", vec![tool("t", "d", big)])]).render();
+        let rendered = Catalog::new(vec![ServerCatalog::listed("big", vec![tool("t", "d", big)], None)]).render();
         assert!(rendered.contains("schema omitted"), "{rendered}");
         assert!(!rendered.contains("xxxxxxxxxx"), "잘린 스키마가 실렸습니다");
     }
@@ -740,10 +891,124 @@ mod tests {
     /// 이름 없는 도구는 부를 수 없다 — 목록에 넣으면 모델이 부르려다 실패한다.
     #[test]
     fn a_tool_without_a_name_is_dropped() {
-        let entry = ServerCatalog::listed("s", vec![json!({ "description": "이름이 없다" })]);
+        let entry = ServerCatalog::listed("s", vec![json!({ "description": "이름이 없다" })], None);
         assert!(entry.tools.is_empty());
         // **내놓은 개수는 그대로 센다** — 버린 것을 없었던 것으로 만들지 않는다.
         assert_eq!(entry.listed_count, 1);
+    }
+
+    // ---- 서버별 도구 허용목록 (32절) ----
+
+    fn allow(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// **보여주는 집합과 부를 수 있는 집합은 같은 곳에서 나온다.** 갈리면 모델이 거부될 것을
+    /// 요청하고, 사용자는 이유 없는 거부 모달을 본다.
+    #[test]
+    fn the_catalog_and_the_gate_agree_on_what_is_allowed() {
+        let allowed = allow(&["read"]);
+        let entry = ServerCatalog::listed(
+            "notes",
+            vec![
+                tool("read", "읽는다", tiny_schema()),
+                tool("write", "쓴다", tiny_schema()),
+            ],
+            Some(&allowed),
+        );
+        let names: Vec<&str> = entry.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["read"], "{names:?}");
+
+        let pool = McpPool::new(vec![McpServerConfig {
+            name: "notes".to_string(),
+            program: "node".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+            tools: Some(allowed),
+        }])
+        .unwrap();
+        // 목록에 있는 것은 게이트를 지나고, 없는 것은 지나지 못한다.
+        for name in &names {
+            assert!(pool
+                .gate_check(&McpCall {
+                    server: "notes".to_string(),
+                    tool: (*name).to_string(),
+                    arguments: json!({}),
+                })
+                .is_ok());
+        }
+        assert!(pool
+            .gate_check(&McpCall {
+                server: "notes".to_string(),
+                tool: "write".to_string(),
+                arguments: json!({}),
+            })
+            .is_err());
+    }
+
+    /// **허용목록에 있는데 서버가 내놓지 않은 도구는 따로 센다.** 대개 오타이고, 조용히
+    /// 넘기면 그 도구는 목록에도 없고 부르면 거부되는데 사용자는 허용해 두었다고 믿는다.
+    #[test]
+    fn a_typo_in_the_allowlist_is_recorded_not_swallowed() {
+        let allowed = allow(&["read", "raed"]);
+        let entry = ServerCatalog::listed("notes", vec![tool("read", "d", tiny_schema())], Some(&allowed));
+        assert_eq!(entry.unknown_allowlisted, vec!["raed".to_string()]);
+        assert!(entry.narrowed);
+    }
+
+    /// 좁히지 않은 서버는 `narrowed`가 false다 — "전부 허용"과 "하나만 허용"을 화면이
+    /// 구별할 수 있어야 한다.
+    #[test]
+    fn a_server_without_an_allowlist_is_not_narrowed() {
+        let entry = ServerCatalog::listed("notes", vec![tool("read", "d", tiny_schema())], None);
+        assert!(!entry.narrowed);
+        assert!(entry.unknown_allowlisted.is_empty());
+    }
+
+    /// 등록되지 않은 서버와 목록 밖 도구는 **다른 사유**다 — 사용자가 고칠 곳이 다르다.
+    #[test]
+    fn the_two_refusals_say_different_things() {
+        let pool = McpPool::new(vec![McpServerConfig {
+            name: "notes".to_string(),
+            program: "node".to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+            tools: Some(allow(&["read"])),
+        }])
+        .unwrap();
+        let unknown = pool
+            .gate_check(&McpCall { server: "other".to_string(), tool: "read".to_string(), arguments: json!({}) })
+            .unwrap_err();
+        let not_allowed = pool
+            .gate_check(&McpCall { server: "notes".to_string(), tool: "write".to_string(), arguments: json!({}) })
+            .unwrap_err();
+        assert!(matches!(unknown, McpRefusal::UnknownServer { .. }));
+        assert!(matches!(not_allowed, McpRefusal::ToolNotAllowed { .. }));
+        assert_ne!(unknown.to_string(), not_allowed.to_string());
+        // 등록된 것이 무엇인지 알려준다 — 알려주지 않으면 사용자가 이름을 맞출 방법이 없다.
+        assert!(unknown.to_string().contains("notes"), "{unknown}");
+    }
+
+    /// **빈 허용목록은 오류다.** 아무 도구도 부를 수 없는 서버를 등록하는 것은 등록하지 않는
+    /// 것과 같은데, 화면에는 등록된 것으로 보인다.
+    #[test]
+    fn an_empty_allowlist_is_rejected_at_registration() {
+        let mut config = server("notes", "node");
+        config.tools = Some(vec![]);
+        assert!(matches!(
+            validate_servers(&[config]).unwrap_err(),
+            McpConfigError::EmptyToolAllowlist { .. }
+        ));
+    }
+
+    #[test]
+    fn a_blank_tool_name_in_the_allowlist_is_rejected() {
+        let mut config = server("notes", "node");
+        config.tools = Some(vec!["read".to_string(), "  ".to_string()]);
+        assert!(matches!(
+            validate_servers(&[config]).unwrap_err(),
+            McpConfigError::EmptyToolName { .. }
+        ));
     }
 
     fn server(name: &str, program: &str) -> McpServerConfig {
@@ -752,6 +1017,7 @@ mod tests {
             program: program.to_string(),
             args: vec![],
             env: BTreeMap::new(),
+            tools: None,
         }
     }
 

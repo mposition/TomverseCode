@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { TaskRequest } from "@tomverse/protocol";
-import { Orchestrator } from "../src/orchestrator/orchestrator.js";
+import { MAX_MCP_CALLS_PER_ROUND, MAX_MCP_RESULT_BYTES, Orchestrator } from "../src/orchestrator/orchestrator.js";
 import { FakeHost, VALID_PATCH, type FakeHostOptions } from "./helpers/fakeHost.js";
 import { makePolicy } from "./helpers/fixtures.js";
 import { DEFAULT_RETRY_POLICY } from "../src/providers/retry.js";
@@ -1065,4 +1065,77 @@ test("MCP 도구 승인 거부는 결과 텍스트가 되고 태스크를 죽이
   const drafts = prompts.filter((p) => p.kind === "draft");
   assert.ok(drafts.length >= 2, "거부 뒤에 다시 그리지 않았습니다");
   assert.ok(drafts.at(-1)!.text.includes("REFUSED"), drafts.at(-1)!.text.slice(-600));
+});
+
+/**
+ * **서버가 준 응답에 상한이 있다** (state-machine 32절).
+ *
+ * 파일에는 컨텍스트 예산이 있는데 여기에는 없었다 — 서버가 큰 응답을 주면 프롬프트가 서버
+ * 마음대로 커진다. 그리고 **자른 사실을 적어야** 모델이 잘린 JSON을 완전한 것으로 읽지 않는다.
+ */
+test("큰 MCP 응답은 상한 안으로 잘리고, 잘렸다고 말한다", async () => {
+  const prompts: { kind: string; text: string }[] = [];
+  const huge = "Z".repeat(MAX_MCP_RESULT_BYTES * 2);
+  const { orchestrator } = build(
+    {
+      verifyResults: [{ overall: "pass" }, { overall: "pass" }],
+      mcpResults: [{ output: { content: huge } }],
+    },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [
+        { kind: "draft", payload: draftAskingForTools() },
+        { kind: "draft", payload: draftWithPatch() },
+      ],
+      onPrompt: (kind, text) => prompts.push({ kind, text }),
+    },
+    { mcpTools: MCP_CATALOG }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  const later = prompts.filter((p) => p.kind === "draft").at(-1)!;
+  assert.ok(later.text.includes("TRUNCATED"), "자른 사실을 말하지 않습니다");
+  // 원문 전체가 실리지 않았다 — 상한이 실제로 걸렸는가.
+  assert.ok(!later.text.includes(huge), "응답 원문이 통째로 실렸습니다");
+});
+
+/**
+ * **한 라운드에 부를 수 있는 개수에 상한이 있다** (원칙 5).
+ *
+ * 없으면 초안 하나가 임의 개수를 요청할 수 있고, 승인 모달이 그만큼 뜨며 프롬프트가 그만큼
+ * 자란다. 실행하지 않은 요청은 **말한다** — 말하지 않으면 모델은 결과가 없는 것으로 읽는다.
+ */
+test("한 라운드의 MCP 호출 개수에 상한이 있고, 버린 것을 말한다", async () => {
+  const prompts: { kind: string; text: string }[] = [];
+  const many = {
+    ...draftAskingForTools(),
+    mcpCalls: Array.from({ length: MAX_MCP_CALLS_PER_ROUND + 3 }, (_unused, i) => ({
+      server: "notes",
+      tool: "append",
+      arguments: { index: i },
+      reason: "많이 부른다",
+    })),
+  };
+  const { orchestrator, host } = build(
+    {
+      verifyResults: [{ overall: "pass" }, { overall: "pass" }],
+    },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [
+        { kind: "draft", payload: many },
+        { kind: "draft", payload: draftWithPatch() },
+      ],
+      onPrompt: (kind, text) => prompts.push({ kind, text }),
+    },
+    { mcpTools: MCP_CATALOG }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  const calls = host.toolRequests.filter((r) => r.tool === "mcp_call");
+  assert.equal(calls.length, MAX_MCP_CALLS_PER_ROUND, `${calls.length}건이 실행됐습니다`);
+  const later = prompts.filter((p) => p.kind === "draft").at(-1)!;
+  assert.ok(later.text.includes("not run"), "실행하지 않은 요청을 말하지 않습니다");
 });

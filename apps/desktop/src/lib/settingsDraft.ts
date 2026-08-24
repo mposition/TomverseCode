@@ -31,6 +31,13 @@ export interface ServerDraft {
   name: string;
   program: string;
   argsText: string;
+  /**
+   * 부를 수 있는 도구를 좁힌다 (32절). 한 줄에 하나. **비워 두면 좁히지 않는다.**
+   *
+   * 빈 목록("아무것도 못 부름")은 저장 형식에서 오류이고, 화면에서는 그 상태를 만들 수
+   * 없다 — 빈 텍스트는 `undefined`가 된다.
+   */
+  toolsText: string;
 }
 
 export interface StoredHook {
@@ -43,6 +50,8 @@ export interface StoredServer {
   name: string;
   program: string;
   args: string[];
+  /** 없으면 서버가 내놓는 전부. 있으면 그 목록만 (32절). */
+  tools?: string[];
 }
 
 export interface WorkspaceSettings {
@@ -83,10 +92,14 @@ export function buildSettings(hooks: HookDraft[], servers: ServerDraft[]): Draft
   const builtServers: StoredServer[] = servers.map((server, index) => {
     if (server.name.trim() === "") problems.push(`서버 ${index + 1}: 이름이 비었습니다`);
     if (server.program.trim() === "") problems.push(`서버 ${index + 1}: 프로그램이 비었습니다`);
+    const tools = parseArgs(server.toolsText);
     return {
       name: server.name.trim(),
       program: server.program.trim(),
       args: parseArgs(server.argsText),
+      // **빈 목록을 보내지 않는다.** Rust는 그것을 오류로 보고, 사용자가 만들려던 상태는
+      // "좁히지 않음"이다 — 둘을 뭉개면 빈 칸이 저장 실패가 된다.
+      ...(tools.length > 0 ? { tools } : {}),
     };
   });
 
@@ -116,6 +129,7 @@ export function toDrafts(settings: WorkspaceSettings): { hooks: HookDraft[]; ser
       name: server.name,
       program: server.program,
       argsText: server.args.join("\n"),
+      toolsText: (server.tools ?? []).join("\n"),
     })),
   };
 }

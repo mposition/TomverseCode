@@ -54,6 +54,12 @@ pub struct StoredServer {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// 이 서버에서 부를 수 있는 도구를 좁힌다 (32절). 없으면 서버가 내놓는 전부다.
+    ///
+    /// **`null`과 `[]`가 다르다.** 전자는 "좁히지 않는다"이고 후자는 오류다 — 아무것도
+    /// 부를 수 없는 서버를 등록하는 것은 등록하지 않는 것과 같은데 화면에는 등록된 것으로 보인다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +128,10 @@ pub fn to_configs(settings: &WorkspaceSettings) -> Result<(Vec<HookConfig>, Vec<
             program: s.program.trim().to_string(),
             args: s.args.clone(),
             env: Default::default(),
+            tools: s
+                .tools
+                .as_ref()
+                .map(|list| list.iter().map(|t| t.trim().to_string()).collect()),
         })
         .collect();
     Ok((hooks, servers))
@@ -181,6 +191,7 @@ mod tests {
                 name: "echo".to_string(),
                 program: "node".to_string(),
                 args: vec!["server.js".to_string()],
+                tools: None,
             }],
         };
         save(dir.path(), "ws-1", &settings).unwrap();

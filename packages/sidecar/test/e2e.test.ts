@@ -76,6 +76,8 @@ interface RunOptions {
   session?: string;
   /** MCP 서버 등록 — `이름=프로그램[,인자...]` (state-machine 23·31절). */
   mcpServers?: string[];
+  /** 서버별 도구 허용목록 — `이름=도구1[,도구2...]` (state-machine 32절). */
+  mcpTools?: string[];
 }
 
 function hostAvailable(): boolean {
@@ -118,6 +120,7 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
   if (options.skill) args.push("--skill", options.skill);
   if (options.session) args.push("--session", options.session);
   for (const server of options.mcpServers ?? []) args.push("--mcp-server", server);
+  for (const allow of options.mcpTools ?? []) args.push("--mcp-tools", allow);
   if (options.autoApproveWrites) args.push("--auto-approve-writes");
   if (options.autoApproveVerification) args.push("--auto-approve-verification");
   if (options.allowGitCommit) args.push("--allow-git-commit");
@@ -1153,11 +1156,15 @@ test("등록한 MCP 서버의 도구를 모델이 알고, 요청하면 실행되
 
     // ① 도구가 실제로 실행됐는가 — 게이트·승인·spawn을 전부 지난 뒤에만 남는 기록이다.
     const executions = hostQuery(stateDir, ["show", "--workspace", repo.root, "--task", run.taskId]) as {
-      toolExecutions: { tool: string }[];
+      toolExecutions: { tool: string; policyDecision: string | null; executionStatus: string | null }[];
       events: { type: string; payload: Record<string, unknown> }[];
     };
+    // **`tool_executions`는 요청도 담는 뷰다** — 행이 있다는 것만으로는 실행됐다는 뜻이
+    // 아니다. 상태까지 봐야 "게이트를 지나 실제로 돌았다"를 말할 수 있다.
     const mcpRuns = executions.toolExecutions.filter((t) => t.tool === "mcp_call");
     assert.equal(mcpRuns.length, 1, JSON.stringify(executions.toolExecutions.map((t) => t.tool)));
+    assert.equal(mcpRuns[0]!.executionStatus, "ok", JSON.stringify(mcpRuns[0]));
+    assert.notEqual(mcpRuns[0]!.policyDecision, "deny", JSON.stringify(mcpRuns[0]));
 
     // ② 목록과 결과가 **프롬프트로 나갔는가.** 전송 집계가 그것을 말해야 한다(31.4절) —
     //    말하지 못하면 화면이 "나간 것"을 실제보다 적게 보고한다.
@@ -1181,6 +1188,89 @@ test("등록한 MCP 서버의 도구를 모델이 알고, 요청하면 실행되
     const results = snapshot.mcpResults as { text: string } | null;
     assert.ok(results, "마지막 스냅샷에 MCP 결과가 없습니다");
     assert.ok(results!.text.includes("MCP_E2E_MARKER"), results!.text);
+  });
+});
+
+/**
+ * **허용목록 밖의 도구는 승인을 묻지도 않고 거부된다** (state-machine 32절).
+ *
+ * 실행 직전에 막으면 사용자는 이미 승인을 누른 뒤다 — **승인을 물은 뒤에 거부하면 사용자는
+ * 자기 승인이 의미 없었다고 배우고**, 그 학습은 진짜 승인 화면에도 옮는다. 그래서 게이트가
+ * 막는다는 것을 실제 실행으로 확인한다.
+ *
+ * `--approve auto`는 **모든 승인을 통과시키는** 테스트 모드다. 그런데도 이 호출이 실행되지
+ * 않는다는 것이 요점이다: 거부는 승인 단계 앞에서 일어난다.
+ */
+test("허용목록 밖의 MCP 도구는 게이트가 막는다 — 승인을 물어보기 전에", () => {
+  withRepo((repo, stateDir) => {
+    const askForBlocked = {
+      interpretation: "막힐 도구를 부른다",
+      patch: "",
+      plan: [],
+      risks: [],
+      requiredTests: [],
+      uncertainties: [],
+      doneCriteria: [],
+      mcpCalls: [{ server: "echo", tool: "echo", arguments: { probe: "x" }, reason: "부르려 한다" }],
+    };
+    const run = runHost(repo, stateDir, {
+      mode: "verified",
+      mcpServers: [`echo=node,${path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "examples", "fixtures", "echo-server.js")}`],
+      // 서버가 내놓는 것은 `echo` 하나인데, 허용한 것은 다른 이름이다.
+      mcpTools: ["echo=onlythis"],
+      script: [
+        { kind: "draft", payload: askForBlocked },
+        {
+          kind: "draft",
+          payload: {
+            interpretation: "막혔으니 그냥 고친다",
+            patch: FIX_PATCH,
+            plan: [],
+            risks: [],
+            requiredTests: [],
+            uncertainties: [],
+            doneCriteria: [],
+            mcpCalls: [],
+          },
+        },
+      ],
+    });
+
+    const detail = hostQuery(stateDir, ["show", "--workspace", repo.root, "--task", run.taskId]) as {
+      toolExecutions: { tool: string; policyDecision: string | null; executionStatus: string | null }[];
+      events: { type: string; payload: Record<string, unknown> }[];
+    };
+    // ① 요청은 기록되지만 **실행되지 않았다.** 요청이 기록되는 것은 감사의 요구이고
+    //    (무엇을 부르려 했는지가 남아야 한다), 실행 여부는 상태가 말한다.
+    const attempts = detail.toolExecutions.filter((t) => t.tool === "mcp_call");
+    assert.equal(attempts.length, 1, JSON.stringify(detail.toolExecutions.map((t) => t.tool)));
+    assert.equal(attempts[0]!.policyDecision, "deny", JSON.stringify(attempts[0]));
+    assert.notEqual(attempts[0]!.executionStatus, "ok", JSON.stringify(attempts[0]));
+    // ② 게이트가 거부로 판정했다 — "승인을 물었는데 사용자가 거부"가 아니다.
+    const denied = detail.events.filter(
+      (e) => e.type === "POLICY_DECIDED" && e.payload.decision === "deny" && e.payload.matchedRule === "mcp_not_registered"
+    );
+    assert.equal(denied.length, 1, JSON.stringify(detail.events.filter((e) => e.type === "POLICY_DECIDED").map((e) => e.payload)));
+    // 감사 기록이 **무엇을 부르려 했는지** 말한다 — "(malformed)"로 뭉개면 나중에 그 로그를
+    // 읽는 사람이 원인을 엉뚱한 곳에서 찾는다.
+    assert.ok(String(denied[0]!.payload.normalizedTarget).includes("echo"), JSON.stringify(denied[0]!.payload));
+
+    // ③ 오타 난 허용목록이 **감사 기록에 남는다** — 남기지 않으면 사용자는 어디서도 원인을 볼 수 없다.
+    const catalog = detail.events.find((e) => e.type === "MCP_CATALOG_COLLECTED");
+    assert.ok(catalog, "카탈로그 이벤트가 없습니다");
+    const servers = catalog!.payload.servers as { server: string; unknownAllowlisted: string[]; narrowed: boolean }[];
+    assert.deepEqual(servers[0]!.unknownAllowlisted, ["onlythis"], JSON.stringify(servers));
+    assert.equal(servers[0]!.narrowed, true);
+    // ④ 모델은 **거부를 결과로 본다.** 거부를 감추면 모델은 응답을 기다리다 없는 결과를
+    //    전제로 patch를 쓴다. 서버가 실제로 돌려준 내용은 물론 없다.
+    const snapshot = detail.events
+      .filter((e) => e.type === "SNAPSHOT_CREATED")
+      .map((e) => e.payload)
+      .at(-1)!;
+    const results = snapshot.mcpResults as { text: string } | null;
+    assert.ok(results, "거부가 결과로 전달되지 않았습니다");
+    assert.ok(results!.text.includes("REFUSED"), results!.text);
+    assert.ok(!results!.text.includes("echoed:"), `서버가 실제로 실행됐습니다: ${results!.text}`);
   });
 });
 

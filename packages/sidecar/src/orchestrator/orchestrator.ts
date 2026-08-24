@@ -105,6 +105,38 @@ export interface OrchestratorDeps {
   providerTimeoutMs?: number;
 }
 
+/**
+ * 한 라운드에 실행하는 MCP 도구 호출의 최대 개수 (state-machine 32절).
+ *
+ * **유도한 값이 아니라 관례적 선택이다.** 없으면 초안 하나가 임의 개수를 요청할 수 있고,
+ * 승인 모달이 그만큼 뜨며 프롬프트가 그만큼 자란다(원칙 5).
+ */
+export const MAX_MCP_CALLS_PER_ROUND = 5;
+
+/**
+ * MCP 응답 하나가 프롬프트에 실릴 수 있는 최대 바이트 (state-machine 32절).
+ *
+ * 파일에는 컨텍스트 예산이 있는데(context-engine 5절) 여기에는 없었다 — 서버가 큰 응답을
+ * 주면 프롬프트가 서버 마음대로 커진다. **우리가 통제하지 못하는 입력에 상한을 두지 않는
+ * 것은 상한이 없는 것과 같다.**
+ */
+export const MAX_MCP_RESULT_BYTES = 8_000;
+
+/**
+ * 응답을 상한 안으로 자른다. **자른 사실을 텍스트에 적는다** — 조용히 자르면 모델은 잘린
+ * JSON을 완전한 것으로 읽고, 없는 필드를 없다고 단정한다.
+ *
+ * 스키마와 달리 통째로 빼지 않는 이유: 스키마는 계약이라 일부만 있으면 틀린 계약이 되지만,
+ * 응답은 정보라서 앞부분만 있어도 쓸모가 있다.
+ */
+export function boundMcpBody(body: string): string {
+  if (body.length <= MAX_MCP_RESULT_BYTES) return body;
+  return (
+    body.slice(0, MAX_MCP_RESULT_BYTES) +
+    `\n(TRUNCATED: ${MAX_MCP_RESULT_BYTES} of ${body.length} bytes shown. The rest exists — do not assume it is absent.)`
+  );
+}
+
 export interface RunInput {
   taskRequest: TaskRequest;
   policy: TaskPolicy;
@@ -2393,9 +2425,12 @@ export class Orchestrator {
       return { kind: "retry" };
     }
 
-    const requested = calls.length;
+    // **한 라운드에 부를 수 있는 개수에 상한이 있다**(원칙 5). 없으면 초안 하나가 50건을
+    // 요청할 수 있고, 승인 모달이 50번 뜨며 프롬프트가 그만큼 자란다.
+    const running = calls.slice(0, MAX_MCP_CALLS_PER_ROUND);
+    const dropped = calls.length - running.length;
     const rendered: string[] = [];
-    for (const [index, call] of calls.entries()) {
+    for (const [index, call] of running.entries()) {
       if (await this.cancelledHere()) {
         return { kind: "final", result: await this.finish("cancelled", "MCP 도구 실행 중 취소됨") };
       }
@@ -2403,9 +2438,20 @@ export class Orchestrator {
       if (outcome.kind === "final") return outcome;
       rendered.push(outcome.text);
     }
+    if (dropped > 0) {
+      // **버린 것을 말한다.** 말하지 않으면 모델은 그 호출이 아무 결과도 내지 않은 것으로
+      // 읽고, 없는 결과를 전제로 patch를 쓴다.
+      rendered.push(
+        `### (not run)\n${dropped} more call(s) were requested but not run — at most ${MAX_MCP_CALLS_PER_ROUND} per round.`
+      );
+      await this.emit("ERROR", {
+        stage: "DRAFTING",
+        message: `MCP 도구 요청 ${dropped}건을 실행하지 않았습니다 (라운드당 상한 ${MAX_MCP_CALLS_PER_ROUND})`,
+      });
+    }
 
     this.state.counters.mcpRounds += 1;
-    await this.applyMcpResults(rendered.join("\n\n"), requested);
+    await this.applyMcpResults(rendered.join("\n\n"), running.length);
     return { kind: "retry" };
   }
 
@@ -2464,7 +2510,7 @@ export class Orchestrator {
     const raw = result.output as { result?: unknown } | string | null | undefined;
     const inner = typeof raw === "object" && raw !== null && "result" in raw ? raw.result : raw;
     const body = typeof inner === "string" ? inner : JSON.stringify(inner ?? null);
-    return { kind: "text", text: `### ${call.server}/${call.tool}\n${body}` };
+    return { kind: "text", text: `### ${call.server}/${call.tool}\n${boundMcpBody(body)}` };
   }
 
   /**

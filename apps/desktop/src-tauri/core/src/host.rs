@@ -142,7 +142,15 @@ pub struct TaskProfile {
 
 impl TaskProfile {
     pub fn new(root: &WorkspaceRoot, policy: TaskPolicy) -> Self {
-        let gate = PolicyGate::new(&policy);
+        Self::with_mcp(root, policy, None)
+    }
+
+    /// 등록된 MCP 서버를 게이트에 붙여서 만든다 (32절).
+    ///
+    /// **게이트와 실행 경로가 같은 풀을 본다.** 목록을 복사해 넣으면 등록과 게이트가
+    /// 갈라질 수 있고, 갈라진 쪽이 느슨하면 그게 우회 경로가 된다.
+    pub fn with_mcp(root: &WorkspaceRoot, policy: TaskPolicy, mcp: Option<Arc<crate::mcp::McpPool>>) -> Self {
+        let gate = PolicyGate::new(&policy).with_mcp(mcp);
         // 아직 아무것도 고치지 않은 시점의 매니페스트를 읽는다. 이 호출이 뒤로 밀리면
         // 고정의 의미가 사라진다.
         let verification_pin = crate::verify::detect_commands(root)
@@ -275,6 +283,14 @@ impl TaskHost {
         )
         .with_mcp(pool.clone());
         self.mcp = Some(pool);
+        // **기본 프로필의 게이트도 다시 만든다.** 이 프로필은 태스크에 속하지 않는 요청과
+        // `begin_task` 전의 요청이 쓰는데, 여기서 갱신하지 않으면 그 경로의 게이트만 등록을
+        // 모른 채로 남아 모든 `mcp_call`을 거부한다 — 증상은 "가끔 MCP가 안 된다"로 보인다.
+        self.default_profile = Arc::new(TaskProfile::with_mcp(
+            &self.root,
+            self.default_profile.policy.clone(),
+            self.mcp.clone(),
+        ));
         self
     }
 
@@ -285,12 +301,21 @@ impl TaskHost {
     ///
     /// 이 호출은 등록된 서버를 실제로 띄운다. 태스크 시작 시점에 한 번 부르는 것을 전제로
     /// 하며, 실패한 서버는 사유와 함께 목록에 남는다 — **태스크를 세우지 않는다.**
-    pub fn mcp_catalog(&self) -> Option<crate::mcp::Catalog> {
+    pub fn mcp_catalog(&self, task_id: &str) -> Option<crate::mcp::Catalog> {
         let pool = self.mcp.as_ref()?;
         if pool.is_empty() {
             return None;
         }
-        Some(pool.catalog())
+        let catalog = pool.catalog();
+        // **프롬프트에 실리지 않는 사실을 여기 남긴다**(32절): 어느 서버를 물어보지 못했는지,
+        // 허용목록에 적혔는데 서버가 내놓지 않은 도구가 무엇인지. 모델에게는 잡음이지만
+        // 사용자에게는 원인이고, 남기지 않으면 아무 데서도 볼 수 없다.
+        let _ = self.append_event(
+            task_id,
+            "MCP_CATALOG_COLLECTED",
+            json!({ "servers": catalog.audit(), "toolCount": catalog.tool_count() }),
+        );
+        Some(catalog)
     }
 
     /// 등록하려는 훅을 **게이트에 미리 태워 본다.**
@@ -374,7 +399,10 @@ impl TaskHost {
                 "이 태스크의 정책이 이미 정해졌습니다: {task_id} — 진행 중에 정책을 바꿀 수 없습니다"
             ));
         }
-        profiles.insert(task_id.to_string(), Arc::new(TaskProfile::new(&self.root, policy)));
+        profiles.insert(
+            task_id.to_string(),
+            Arc::new(TaskProfile::with_mcp(&self.root, policy, self.mcp.clone())),
+        );
         Ok(())
     }
 

@@ -117,6 +117,11 @@ struct Args {
     /// **셸 문자열이 아니라 쉼표로 나눈 argv다**(원칙 6). 등록은 사용자만 할 수 있다 —
     /// 모델이 서버를 추가하는 경로는 없으며, 그것이 이 기능의 안전 모델 전부다.
     mcp_servers: Vec<tomverse_core::mcp::McpServerConfig>,
+    /// `--mcp-tools 이름=도구...` — 등록된 서버의 도구를 좁힌다 (32절).
+    ///
+    /// **서버 등록과 따로 받는 이유**는 구분자다. `--mcp-server`의 쉼표는 argv를 나누므로,
+    /// 같은 자리에 도구 이름을 이어 붙이면 둘이 구별되지 않는다.
+    mcp_tool_allowlists: Vec<(String, Vec<String>)>,
     hooks: Vec<tomverse_core::hooks::HookConfig>,
     skill: Option<PathBuf>,
     session_id: Option<String>,
@@ -186,6 +191,7 @@ fn parse_args() -> Result<Args, String> {
         verbose: false,
         cancel_after_ms: None,
         mcp_servers: Vec::new(),
+        mcp_tool_allowlists: Vec::new(),
         hooks: Vec::new(),
         skill: None,
         session_id: None,
@@ -224,6 +230,7 @@ fn parse_args() -> Result<Args, String> {
             "--worktree-base" => args.worktree_base = Some(value()?),
             "--force" => args.force = true,
             "--mcp-server" => args.mcp_servers.push(parse_mcp_server(&value()?)?),
+            "--mcp-tools" => args.mcp_tool_allowlists.push(parse_mcp_tools(&value()?)?),
             "--hook" => args.hooks.push(parse_hook(&value()?)?),
             "--skill" => args.skill = Some(PathBuf::from(value()?)),
             "--session" => args.session_id = Some(value()?),
@@ -361,7 +368,11 @@ fn usage() -> String {
                  검증 명령은 남는다. 명시한 --pin-* 가 스킬의 모델 지정을 이긴다\n\
      run --mcp-server <이름=프로그램[,인자...]> — MCP 서버 등록(반복 가능). **셸 문자열이 아니라\n\
                  쉼표로 나눈 argv다.** 그 도구는 `mcp_call`로 변환되어 Policy Gate를 지나며,\n\
-                 **언제나 사용자 승인을 요구한다**(정책으로 낮출 수 없다)\n\
+                 **언제나 사용자 승인을 요구한다**(정책으로 낮출 수 없다). 등록하면 그 서버의\n\
+                 도구 목록이 프롬프트에 실리고, 초안이 요청하면 실행한 뒤 결과와 함께 다시 그린다\n\
+     run --mcp-tools <이름=도구1[,도구2...]> — 그 서버에서 부를 수 있는 도구를 좁힌다(반복 가능).\n\
+                 **목록 밖의 도구는 승인을 묻지도 않고 거부된다.** 프롬프트에 실리는 목록도\n\
+                 함께 좁아진다 — 보여주는 집합과 부를 수 있는 집합은 같아야 한다\n\
      --approve autopilot — **무인 실행.** 정책이 자동 허용하는 것만 진행하고, 승인이 필요한\n\
                  지점에 닿으면 멈춘다(대신 승인해 주지 않는다). `auto`는 전부 승인하는\n\
                  **테스트 전용** 모드이며 Autopilot이 아니다\n\
@@ -457,7 +468,29 @@ fn parse_mcp_server(spec: &str) -> Result<tomverse_core::mcp::McpServerConfig, S
         program: program.to_string(),
         args: parts.map(str::to_string).collect(),
         env: Default::default(),
+        // 허용목록은 **별도 플래그**로 받는다(`--mcp-tools`). 여기 쉼표 목록에 이어 붙이면
+        // 인자와 도구 이름이 같은 구분자를 쓰게 되어 서로 구별되지 않는다.
+        tools: None,
     })
+}
+
+/// `--mcp-tools 이름=도구1,도구2` — 그 서버에서 부를 수 있는 도구를 좁힌다 (32절).
+fn parse_mcp_tools(spec: &str) -> Result<(String, Vec<String>), String> {
+    let (name, rest) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--mcp-tools 형식은 이름=도구1[,도구2...] 입니다: {spec}"))?;
+    let tools: Vec<String> = rest
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if tools.is_empty() {
+        // **빈 목록을 "전부 허용"으로 읽지 않는다.** 그렇게 읽으면 오타 하나가 좁히려던
+        // 의도를 정반대로 뒤집는다.
+        return Err(format!("--mcp-tools에 도구가 없습니다: {spec}"));
+    }
+    Ok((name.trim().to_string(), tools))
 }
 
 /// 격리 트리를 어디에 만드는가.
@@ -623,11 +656,29 @@ fn real_main() -> Result<i32, String> {
 
             // 등록이 잘못되면 **태스크를 시작하기 전에** 멈춘다 — 실행 중에 알면 이미 모델이
             // 그 서버의 도구를 쓸 수 있다고 믿고 계획을 세운 뒤다.
-            let mcp = if args.mcp_servers.is_empty() {
+            // 허용목록을 등록에 접어 넣는다 (32절). **알 수 없는 서버 이름은 오류다** —
+            // 조용히 넘기면 좁히려던 의도가 사라지고 서버 전체가 열린 채로 돈다.
+            let mut mcp_servers = args.mcp_servers.clone();
+            for (name, tools) in &args.mcp_tool_allowlists {
+                match mcp_servers.iter_mut().find(|s| &s.name == name) {
+                    Some(server) => server.tools = Some(tools.clone()),
+                    None => {
+                        return Err(format!(
+                            "--mcp-tools가 가리키는 서버가 등록되어 있지 않습니다: {name} (등록된 것: {})",
+                            if mcp_servers.is_empty() {
+                                "없음".to_string()
+                            } else {
+                                mcp_servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                            }
+                        ))
+                    }
+                }
+            }
+            let mcp = if mcp_servers.is_empty() {
                 None
             } else {
                 Some(Arc::new(
-                    tomverse_core::mcp::McpPool::new(args.mcp_servers.clone()).map_err(|e| e.to_string())?,
+                    tomverse_core::mcp::McpPool::new(mcp_servers).map_err(|e| e.to_string())?,
                 ))
             };
             let mut task_host = TaskHost::new(
@@ -1122,7 +1173,7 @@ fn run_task(
     // **태스크를 만든 뒤, 첫 프롬프트 전에 한 번만 묻는다.** 서버를 실제로 띄우므로
     // 반복해서 물으면 그만큼 프로세스를 건드린다. 실패한 서버는 사유와 함께 목록에 남고
     // 태스크를 세우지 않는다 — 관계없는 서버 하나가 죽었다고 작업이 막히면 안 된다.
-    let mcp_tools = match host.mcp_catalog() {
+    let mcp_tools = match host.mcp_catalog(task_id) {
         None => Value::Null,
         Some(catalog) => json!({
             "text": catalog.render(),

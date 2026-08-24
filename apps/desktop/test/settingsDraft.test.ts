@@ -22,7 +22,7 @@ test("빈 줄과 앞뒤 공백은 인자가 아니다", () => {
 test("정상 입력은 저장 형식이 된다", () => {
   const result = buildSettings(
     [{ phase: "COMPLETED", program: "npm", argsText: "run\nfmt" }],
-    [{ name: "echo", program: "node", argsText: "server.js" }]
+    [{ name: "echo", program: "node", argsText: "server.js", toolsText: "" }]
   );
   assert.deepEqual(result.problems, []);
   assert.deepEqual(result.settings, {
@@ -54,8 +54,8 @@ test("서버 이름 중복은 행 번호와 함께 보고된다", () => {
   const result = buildSettings(
     [],
     [
-      { name: "echo", program: "node", argsText: "a.js" },
-      { name: "echo", program: "node", argsText: "b.js" },
+      { name: "echo", program: "node", argsText: "a.js", toolsText: "" },
+      { name: "echo", program: "node", argsText: "b.js", toolsText: "" },
     ]
   );
   assert.equal(result.settings, null);
@@ -77,9 +77,24 @@ test("오타 난 phase는 여기서 막지 않는다 — 판정은 Rust의 것�
 test("저장된 값과 편집 중인 값을 오갈 수 있다", () => {
   const settings: WorkspaceSettings = {
     hooks: [{ phase: "VERIFYING", program: "npm", args: ["run", "lint"] }],
-    servers: [{ name: "s", program: "node", args: ["x.js"] }],
+    servers: [{ name: "s", program: "node", args: ["x.js"], tools: ["read"] }],
   };
   const drafts = toDrafts(settings);
   const back = buildSettings(drafts.hooks, drafts.servers);
   assert.deepEqual(back.settings, settings);
+});
+
+/**
+ * **비워 두면 좁히지 않는다.** 빈 목록을 보내면 Rust가 오류로 보는데, 사용자가 빈 칸으로
+ * 만들려던 상태는 "전부 허용"이다 — 뭉개면 빈 칸이 저장 실패가 된다.
+ */
+test("도구 칸이 비면 허용목록을 보내지 않는다", () => {
+  const result = buildSettings([], [{ name: "s", program: "node", argsText: "x.js", toolsText: "  \n " }]);
+  assert.deepEqual(result.problems, []);
+  assert.equal(result.settings?.servers[0]?.tools, undefined);
+});
+
+test("도구를 적으면 목록으로 간다", () => {
+  const result = buildSettings([], [{ name: "s", program: "node", argsText: "x.js", toolsText: "read\nwrite" }]);
+  assert.deepEqual(result.settings?.servers[0]?.tools, ["read", "write"]);
 });

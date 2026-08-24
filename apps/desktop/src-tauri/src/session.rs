@@ -810,7 +810,7 @@ impl SessionState {
             // 등록된 MCP 서버의 도구 목록 (31절). **Rust가 서버를 띄워 묻는다.**
             // 이것이 없으면 모델은 서버 이름도 도구 이름도 몰라 `mcp_call`을 부를 수 없다 —
             // 등록만 있고 걸어 들어갈 길이 없는 상태가 된다.
-            "mcpTools": match host.mcp_catalog() {
+            "mcpTools": match host.mcp_catalog(&task_id) {
                 None => Value::Null,
                 Some(catalog) => json!({
                     "text": catalog.render(),

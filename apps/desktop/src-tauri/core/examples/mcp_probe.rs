@@ -33,6 +33,7 @@ fn main() {
         program: "node".to_string(),
         args: vec![script],
         env: Default::default(),
+        tools: None,
     };
     let pool = match tomverse_core::mcp::McpPool::new(vec![config]) {
         Ok(pool) => pool,

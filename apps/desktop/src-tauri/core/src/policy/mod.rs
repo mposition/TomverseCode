@@ -36,6 +36,15 @@ use command::{default_command_policy, is_network_capable, match_command, program
 
 pub struct PolicyGate {
     command_policy: CommandPolicy,
+    /// 등록된 MCP 서버 (state-machine 32절).
+    ///
+    /// **`TaskPolicy`에 복사해 넣지 않고 실행 경로와 같은 객체를 본다.** 복사하면 등록과
+    /// 게이트가 갈라질 수 있고, 갈라진 쪽이 느슨하면 그게 우회 경로가 된다 — 여기서는
+    /// 게이트가 보는 목록과 실제로 도구를 부르는 `ToolRuntime`이 보는 목록이 **같은 값**이다.
+    ///
+    /// 붙지 않았으면 `None`이고, 그때 모든 `mcp_call`은 거부된다. 등록되지 않은 서버를
+    /// 부르는 것은 성공할 수 없는 요청이고, **성공할 수 없는 요청에 승인을 묻지 않는다.**
+    mcp: Option<std::sync::Arc<crate::mcp::McpPool>>,
 }
 
 impl PolicyGate {
@@ -45,7 +54,14 @@ impl PolicyGate {
                 .command_policy
                 .clone()
                 .unwrap_or_else(default_command_policy),
+            mcp: None,
         }
+    }
+
+    /// 등록된 MCP 서버를 붙인다. 붙이지 않으면 `mcp_call`은 전부 거부된다.
+    pub fn with_mcp(mut self, pool: Option<std::sync::Arc<crate::mcp::McpPool>>) -> Self {
+        self.mcp = pool;
+        self
     }
 
     /// 모든 도구 실행이 반드시 통과하는 단일 지점.
@@ -207,7 +223,11 @@ impl PolicyGate {
             // `run_command`처럼 allowlist로 완화하는 길도 두지 않는다 — allowlist는 "이 명령이
             // 무엇을 하는지 안다"에 기대는데, 그 전제가 여기서는 성립하지 않는다.
             //
-            // 그래서 `task_policy`를 **보지 않는다**. 보면 언젠가 누군가 완화 조건을 넣는다.
+            // **`task_policy`를 보지 않는다.** 32절이 등록 목록을 보게 만들었지만 그것은
+            // 정책이 아니라 등록이고, 볼 수 있는 결과가 "거부"뿐이라 낮추는 데 쓸 수 없다 —
+            // 자세한 것은 `classify_mcp`에 적어두었다.
+            ToolName::McpCall => self.classify_mcp(request),
+
             // ---- git push: 아는 모양만, 그리고 언제나 승인 (28.2절) ----
             //
             // `mcp_call`과 같은 처리다. 다른 점은 여기서는 **우리가 argv를 조립한다**는 것이고,
@@ -228,24 +248,48 @@ impl PolicyGate {
                 ),
             },
 
-            ToolName::McpCall => match crate::mcp::parse_call(&request.args) {
-                // 승인 화면이 무엇을 보여줄지 정하지 못하는 요청은 승인받을 수 없다 —
-                // "무엇을 승인하는지 모르는 승인"은 승인이 아니다.
-                Err(reason) => Outcome::deny_malformed(reason),
-                Ok(call) => Outcome::needs_approval(
-                    "mcp_always_requires_approval".to_string(),
-                    format!(
-                        "MCP 도구는 이 게이트 밖에서 동작할 수 있어 언제나 승인을 요구합니다: {}",
-                        crate::mcp::describe(&call)
-                    ),
-                    // 승인 화면과 이벤트가 **이 문자열 그대로**를 보여준다(원칙 6의 MCP판).
-                    crate::mcp::describe(&call),
-                    RiskLevel::High,
-                    // 23.3절: 정책으로 낮출 수 없다. 여기에 레버를 붙이는 순간 그 규칙이 깨진다.
-                    PolicyLever::HumanOnly,
-                ),
-            },
         }
+    }
+
+    /// `mcp_call` 분류 (23.2~23.4절, 32절).
+    ///
+    /// 세 갈래뿐이다: **모양이 틀리면 거부**, **등록의 범위 밖이면 거부**, 나머지는
+    /// 언제나 사용자 승인이다. 자동 허용이 나오는 갈래가 없다는 것이 23.3절의 보장이다.
+    fn classify_mcp(&self, request: &ToolRequest) -> Outcome {
+        let call = match crate::mcp::parse_call(&request.args) {
+            // 승인 화면이 무엇을 보여줄지 정하지 못하는 요청은 승인받을 수 없다 —
+            // "무엇을 승인하는지 모르는 승인"은 승인이 아니다.
+            Err(reason) => return Outcome::deny_malformed(reason),
+            Ok(call) => call,
+        };
+
+        // **등록의 범위 밖이면 묻지 않고 거부한다**(32절). 물어본 뒤 실행에서 실패시키면
+        // 사용자는 자기 승인이 의미 없었다고 배우고, 그 학습은 진짜 승인 화면에도 옮는다.
+        //
+        // 풀이 없으면 등록된 서버가 하나도 없다는 뜻이다 — 성공할 수 없는 요청이다.
+        let check = match self.mcp.as_ref() {
+            Some(pool) => pool.gate_check(&call),
+            None => Err(crate::mcp::McpRefusal::UnknownServer {
+                server: call.server.clone(),
+                registered: Vec::new(),
+            }),
+        };
+        if let Err(refusal) = check {
+            return Outcome::deny_out_of_registration(refusal.to_string(), crate::mcp::describe(&call));
+        }
+
+        Outcome::needs_approval(
+            "mcp_always_requires_approval".to_string(),
+            format!(
+                "MCP 도구는 이 게이트 밖에서 동작할 수 있어 언제나 승인을 요구합니다: {}",
+                crate::mcp::describe(&call)
+            ),
+            // 승인 화면과 이벤트가 **이 문자열 그대로**를 보여준다(원칙 6의 MCP판).
+            crate::mcp::describe(&call),
+            RiskLevel::High,
+            // 23.3절: 정책으로 낮출 수 없다. 여기에 레버를 붙이는 순간 그 규칙이 깨진다.
+            PolicyLever::HumanOnly,
+        )
     }
 
     fn classify_command(&self, request: &ToolRequest, root: &WorkspaceRoot, task_policy: &TaskPolicy) -> Outcome {
@@ -431,6 +475,23 @@ impl Outcome {
             matched_rule: "workspace_boundary".to_string(),
             reason: format!("경로 {candidate:?}를 거부함: {violation}"),
             normalized_target: candidate.to_string(),
+            unblocked_by: PolicyLever::NotApplicable,
+        }
+    }
+
+    /// 등록의 범위를 벗어난 MCP 호출 (32절).
+    ///
+    /// **`deny_malformed`를 쓰지 않는다.** 요청의 모양은 멀쩡하고, 틀린 것은 등록이거나
+    /// 도구 이름이다 — 감사 기록의 `matchedRule`이 "malformed"라고 말하면 나중에 그 로그를
+    /// 읽는 사람이 원인을 엉뚱한 곳에서 찾는다. 대상도 `(malformed)`가 아니라 **무엇을
+    /// 부르려 했는지**를 남긴다.
+    fn deny_out_of_registration(reason: String, target: String) -> Self {
+        Self {
+            decision: Decision::Deny,
+            risk_level: RiskLevel::Prohibited,
+            matched_rule: "mcp_not_registered".to_string(),
+            reason,
+            normalized_target: target,
             unblocked_by: PolicyLever::NotApplicable,
         }
     }
@@ -781,7 +842,8 @@ mod tests {
         // 비밀값 경로 규칙은 **실재하는 파일**에 대해서만 도달한다 — 없으면 그 앞의 경계
         // 검사가 먼저 거부하고, 그러면 이 표는 규칙이 아니라 "파일이 없다"를 재게 된다.
         fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
-        let gate = PolicyGate::new(&TaskPolicy::default());
+        // MCP는 **등록된 서버여야** 승인까지 온다(32절) — 등록 밖이면 묻지 않고 거부한다.
+        let gate = PolicyGate::new(&TaskPolicy::default()).with_mcp(Some(pool_with("s", None)));
         let cases: &[(ToolName, serde_json::Value, PolicyLever)] = &[
             // 워크스페이스 쓰기는 미리 넓힐 수 있다.
             (
@@ -859,7 +921,21 @@ mod tests {
         assert_eq!(decision.unblocked_by, PolicyLever::NotApplicable);
     }
 
-    // ---- MCP (state-machine 23절) ----
+    // ---- MCP (state-machine 23·32절) ----
+
+    /// 등록된 서버 하나를 가진 풀. **프로그램은 띄우지 않는다** — 게이트는 등록 목록만 본다.
+    fn pool_with(name: &str, tools: Option<Vec<String>>) -> std::sync::Arc<crate::mcp::McpPool> {
+        std::sync::Arc::new(
+            crate::mcp::McpPool::new(vec![crate::mcp::McpServerConfig {
+                name: name.to_string(),
+                program: "node".to_string(),
+                args: vec![],
+                env: Default::default(),
+                tools,
+            }])
+            .unwrap(),
+        )
+    }
 
     /// **어떤 정책으로도 자동 허용이 되지 않는다.**
     ///
@@ -877,7 +953,9 @@ mod tests {
             TaskPolicy::default(),
             TaskPolicy { auto_approve_workspace_writes: true, ..TaskPolicy::default() },
         ] {
-            let d = PolicyGate::new(&policy).evaluate(&request(ToolName::McpCall, call.clone()), &root, &policy);
+            let d = PolicyGate::new(&policy)
+                .with_mcp(Some(pool_with("fs", None)))
+                .evaluate(&request(ToolName::McpCall, call.clone()), &root, &policy);
             assert_eq!(d.decision, Decision::RequireUserApproval, "{policy:?}");
             assert!(d.requires_user_approval);
             assert_eq!(d.risk_level, RiskLevel::High);
@@ -891,7 +969,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = WorkspaceRoot::new(dir.path()).unwrap();
         let policy = TaskPolicy::default();
-        let d = PolicyGate::new(&policy).evaluate(
+        let d = PolicyGate::new(&policy).with_mcp(Some(pool_with("fs", None))).evaluate(
             &request(
                 ToolName::McpCall,
                 json!({ "server": "fs", "tool": "write_file", "arguments": { "path": "/etc/hosts" } }),
@@ -902,6 +980,104 @@ mod tests {
         assert!(d.normalized_target.contains("fs"), "{}", d.normalized_target);
         assert!(d.normalized_target.contains("write_file"), "{}", d.normalized_target);
         assert!(d.normalized_target.contains("/etc/hosts"), "{}", d.normalized_target);
+    }
+
+    /// **등록되지 않은 서버는 묻지 않고 거부한다** (32절).
+    ///
+    /// 물어본 뒤 실행에서 실패시키면 사용자는 자기 승인이 의미 없었다고 배우고, 그 학습은
+    /// 진짜 승인 화면에도 옮는다.
+    #[test]
+    fn an_unregistered_server_is_denied_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let policy = TaskPolicy::default();
+        let d = PolicyGate::new(&policy).with_mcp(Some(pool_with("notes", None))).evaluate(
+            &request(ToolName::McpCall, json!({ "server": "other", "tool": "t", "arguments": {} })),
+            &root,
+            &policy,
+        );
+        assert_eq!(d.decision, Decision::Deny);
+        assert!(!d.requires_user_approval);
+        // 사유가 **고칠 곳**을 말한다 — 등록된 것이 무엇인지 함께 낸다.
+        assert!(d.reason.contains("notes"), "{}", d.reason);
+    }
+
+    /// 서버가 아예 붙지 않은 게이트에서는 모든 `mcp_call`이 거부된다 — 성공할 수 없는
+    /// 요청에 승인을 묻지 않는다.
+    #[test]
+    fn a_gate_without_any_registration_denies_every_mcp_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let policy = TaskPolicy::default();
+        let d = PolicyGate::new(&policy).evaluate(
+            &request(ToolName::McpCall, json!({ "server": "notes", "tool": "t", "arguments": {} })),
+            &root,
+            &policy,
+        );
+        assert_eq!(d.decision, Decision::Deny);
+    }
+
+    /// 허용목록 밖의 도구도 **묻지 않고 거부**다.
+    #[test]
+    fn a_tool_outside_the_allowlist_is_denied_without_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let policy = TaskPolicy::default();
+        let pool = pool_with("notes", Some(vec!["read".to_string()]));
+
+        let allowed = PolicyGate::new(&policy).with_mcp(Some(pool.clone())).evaluate(
+            &request(ToolName::McpCall, json!({ "server": "notes", "tool": "read", "arguments": {} })),
+            &root,
+            &policy,
+        );
+        assert_eq!(allowed.decision, Decision::RequireUserApproval, "{}", allowed.reason);
+
+        let refused = PolicyGate::new(&policy).with_mcp(Some(pool)).evaluate(
+            &request(ToolName::McpCall, json!({ "server": "notes", "tool": "write", "arguments": {} })),
+            &root,
+            &policy,
+        );
+        assert_eq!(refused.decision, Decision::Deny);
+        assert!(refused.reason.contains("read"), "허용된 것이 무엇인지 말하지 않습니다: {}", refused.reason);
+    }
+
+    /// **허용목록은 좁히기만 한다.** 어떤 등록으로도 `mcp_call`이 자동 허용이 되지 않는다 —
+    /// 23.3절의 보장이 게이트가 등록을 보게 된 뒤에도 유지되는지 확인한다.
+    ///
+    /// 이 검사가 공허하지 않다는 것: 아래 목록에는 실제로 승인이 나오는 경우가 들어 있다.
+    #[test]
+    fn no_registration_can_turn_an_mcp_call_into_an_auto_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let pools = [
+            None,
+            Some(pool_with("notes", None)),
+            Some(pool_with("notes", Some(vec!["read".to_string()]))),
+        ];
+        let mut approvals = 0;
+        for pool in pools {
+            for policy in [
+                TaskPolicy::default(),
+                TaskPolicy { auto_approve_workspace_writes: true, ..TaskPolicy::default() },
+                TaskPolicy { auto_approve_verification: true, ..TaskPolicy::default() },
+            ] {
+                let d = PolicyGate::new(&policy).with_mcp(pool.clone()).evaluate(
+                    &request(ToolName::McpCall, json!({ "server": "notes", "tool": "read", "arguments": {} })),
+                    &root,
+                    &policy,
+                );
+                assert!(
+                    matches!(d.decision, Decision::Deny | Decision::RequireUserApproval),
+                    "{:?}로 자동 허용이 나왔습니다",
+                    d.decision
+                );
+                if d.decision == Decision::RequireUserApproval {
+                    approvals += 1;
+                    assert_eq!(d.unblocked_by, PolicyLever::HumanOnly);
+                }
+            }
+        }
+        assert!(approvals > 0, "승인이 한 번도 나오지 않았습니다 — 이 검사는 아무것도 말하지 않습니다");
     }
 
     /// 무엇을 승인하는지 정하지 못하는 요청은 **승인 대상이 아니라 거부 대상**이다.
