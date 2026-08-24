@@ -10,8 +10,9 @@
 //! 사용:
 //! ```text
 //! tomverse-host run --workspace <path> --message "..." [--mode fast|verified]
-//!                   [--approve auto|deny] [--db <path>] [--artifacts <path>]
-//!                   [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit]
+//!                   [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>]
+//!                   [--sidecar <index.js>] [--auto-approve-writes] [--auto-approve-verification]
+//!                   [--allow-git-commit]
 //!                   [--cancel-after-ms <n>] [--budget-usd <n>]
 //!                   [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]
 //! tomverse-host rollback --workspace <path> --task <taskId> --db <path> [--artifacts <path>]
@@ -80,6 +81,7 @@ struct Args {
     artifacts: Option<PathBuf>,
     sidecar: Option<PathBuf>,
     auto_approve_writes: bool,
+    auto_approve_verification: bool,
     allow_git_commit: bool,
     /// 이 태스크의 예산 상한(USD). `None`이면 **상한 없이** 돈다.
     ///
@@ -162,6 +164,7 @@ fn parse_args() -> Result<Args, String> {
         artifacts: None,
         sidecar: None,
         auto_approve_writes: false,
+        auto_approve_verification: false,
         allow_git_commit: false,
         budget_usd: None,
         pin_executor: None,
@@ -205,6 +208,7 @@ fn parse_args() -> Result<Args, String> {
             "--artifacts" => args.artifacts = Some(PathBuf::from(value()?)),
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
             "--auto-approve-writes" => args.auto_approve_writes = true,
+            "--auto-approve-verification" => args.auto_approve_verification = true,
             "--allow-git-commit" => args.allow_git_commit = true,
             "--pin-executor" => args.pin_executor = Some(value()?),
             "--pin-reviewer" => args.pin_reviewer = Some(value()?),
@@ -308,8 +312,9 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 
 fn usage() -> String {
     "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
-     [--task <id>] [--mode fast|verified] [--approve auto|deny] [--db <path>] [--artifacts <path>] \
-     [--sidecar <index.js>] [--auto-approve-writes] [--allow-git-commit] [--cancel-after-ms <n>]\n\
+     [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
+     [--sidecar <index.js>] [--auto-approve-writes] [--auto-approve-verification]\n\
+     [--allow-git-commit] [--cancel-after-ms <n>]\n\
      [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
      \n\
      가설 게이트 전용: [--providers <csv>] [--review-mode blind|informed] [--replay-draft <file>]\n\
@@ -320,6 +325,12 @@ fn usage() -> String {
      run --mcp-server <이름=프로그램[,인자...]> — MCP 서버 등록(반복 가능). **셸 문자열이 아니라\n\
                  쉼표로 나눈 argv다.** 그 도구는 `mcp_call`로 변환되어 Policy Gate를 지나며,\n\
                  **언제나 사용자 승인을 요구한다**(정책으로 낮출 수 없다)\n\
+     --approve autopilot — **무인 실행.** 정책이 자동 허용하는 것만 진행하고, 승인이 필요한\n\
+                 지점에 닿으면 멈춘다(대신 승인해 주지 않는다). `auto`는 전부 승인하는\n\
+                 **테스트 전용** 모드이며 Autopilot이 아니다\n\
+     --auto-approve-verification — 프로젝트가 매니페스트에 **선언해 둔** 검증 명령을 묻지 않고\n\
+                 실행한다. 집합은 태스크 시작 시점에 고정된다 — 실행 중에 매니페스트가 바뀌어도\n\
+                 새 명령은 자동 승인되지 않는다. Autopilot이 검증까지 도달하려면 이게 필요하다\n\
      worktree — 격리 트리 목록(JSON). [--worktree <branch>]를 주면 그 트리를 정리한다.\n\
                  커밋되지 않은 변경이 있으면 지우지 않고 사유를 낸다 — 버리려면 [--force]\n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
@@ -473,15 +484,22 @@ fn real_main() -> Result<i32, String> {
 
     let policy = TaskPolicy {
         auto_approve_workspace_writes: args.auto_approve_writes,
+        auto_approve_verification: args.auto_approve_verification,
         allow_git_commit: args.allow_git_commit,
         execution_mode: args.mode,
+        // sidecar가 완료 판정에 쓴다 — 무인 실행에서는 "검증되지 않음"을 완료로 보고하지 않는다.
+        unattended: args.approve == "autopilot",
         ..TaskPolicy::default()
     };
 
     let approvals: Arc<dyn ApprovalGateway> = match args.approve.as_str() {
+        // **`auto`는 테스트 전용이며 제품의 Autopilot이 아니다.** 전부 승인하므로 게이트의
+        // `RequireUserApproval`이 의미를 잃는다 — MCP 호출까지 포함해서(23.3절).
         "auto" => Arc::new(AutoApprove),
         "deny" => Arc::new(AlwaysDeny),
-        other => return Err(format!("알 수 없는 --approve: {other} (auto|deny)")),
+        // Autopilot: 정책이 자동 허용하는 것만 무인으로 진행하고 사람이 필요하면 멈춘다.
+        "autopilot" => Arc::new(tomverse_core::host::UnattendedStop),
+        other => return Err(format!("알 수 없는 --approve: {other} (auto|deny|autopilot)")),
     };
     let sink = Arc::new(StderrSink { verbose: args.verbose });
 
@@ -904,12 +922,17 @@ fn run_task(
         },
         "policy": {
             "autoApproveWorkspaceWrites": args.auto_approve_writes,
+            "autoApproveVerification": args.auto_approve_verification,
             "allowGitCommit": args.allow_git_commit,
             // null은 "기본값을 쓰라"가 아니라 **"상한 없음"**이다. 키를 빼면 sidecar의
             // 기본 상한이 적용되어, 이 바이너리를 쓰는 하네스가 모르는 상한이 생긴다.
             "budgetUsd": args.budget_usd,
             "modelPins": model_pins,
             "executionMode": match args.mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
+            // **이 map은 Rust의 `TaskPolicy`가 아니라 TS의 `TaskPolicy`를 향해 손으로 조립된다.**
+            // 그래서 Rust 구조체에 필드를 더해도 여기 넣지 않으면 sidecar에 도달하지 않는다 —
+            // 실제로 `unattended`를 추가하고 그렇게 빠뜨렸고, e2e가 잡았다.
+            "unattended": args.approve == "autopilot",
         },
         "workspaceName": workspace_name(host.root()),
         "availableProviders": providers,

@@ -38,9 +38,19 @@ pub trait ApprovalGateway: Send + Sync {
 pub enum ApprovalOutcome {
     Granted,
     Denied { note: Option<String> },
+    /// **물을 사람이 없다** — 무인 실행(Autopilot)에서 승인이 필요한 지점에 닿았다.
+    ///
+    /// `Denied`와 나누는 이유: 뭉개면 최종 보고가 **"사용자가 거부했다"고 거짓말한다.**
+    /// 사용자는 아무것도 거부한 적이 없고, 다음에 할 일도 다르다 — 거부는 요청을 다시
+    /// 생각하라는 뜻이고, 이쪽은 사람이 붙어서 한 번 봐 달라는 뜻이다.
+    Unattended,
 }
 
-/// 모든 승인을 허용. **테스트와 명시적 자동 모드 전용.**
+/// 모든 승인을 허용. **테스트 전용이며 제품의 Autopilot이 아니다.**
+///
+/// Autopilot은 승인을 대신해 주지 않는다(`UnattendedStop`). 이 둘을 같은 것으로 쓰면
+/// "무인 실행"이 곧 "전부 자동 승인"이 되어 Policy Gate의 `RequireUserApproval`이
+/// 의미를 잃는다 — MCP 호출까지 포함해서(state-machine 23.3절).
 pub struct AutoApprove;
 impl ApprovalGateway for AutoApprove {
     fn request_approval(&self, _request: &ApprovalRequest) -> ApprovalOutcome {
@@ -55,6 +65,22 @@ impl ApprovalGateway for AlwaysDeny {
         ApprovalOutcome::Denied {
             note: Some("자동 거부 정책".to_string()),
         }
+    }
+}
+
+/// **Autopilot** — 무인 실행 (product-strategy 8.2절, state-machine 24절).
+///
+/// 정책이 자동 허용하는 것은 그대로 진행하고, **사람이 필요한 지점에 닿으면 멈춘다.**
+/// 대신 승인해 주지 않는 것이 이 게이트웨이의 전부다.
+///
+/// "승인 정책은 그대로 적용"이라는 출시 기준을 이렇게 읽는다: 게이트의 분류를 바꾸지 않는다.
+/// 더 많은 것을 무인으로 돌리고 싶으면 **정책을 미리 넓히는 것**이 사용자의 수단이다
+/// (`auto_approve_workspace_writes` 등) — 그건 사전에, 보이는 곳에서, 워크스페이스 단위로
+/// 내리는 결정이다. 실행 중에 우리가 대신 눌러 주는 것과는 다르다.
+pub struct UnattendedStop;
+impl ApprovalGateway for UnattendedStop {
+    fn request_approval(&self, _request: &ApprovalRequest) -> ApprovalOutcome {
+        ApprovalOutcome::Unattended
     }
 }
 
@@ -84,6 +110,13 @@ pub struct TaskHost {
     cancels: Arc<CancellationRegistry>,
     /// baseline 검증 리포트 — post 리포트가 "새로 깨진 것"을 계산할 때 쓴다.
     baseline: Mutex<Option<VerificationReport>>,
+    /// **태스크가 시작되기 전에** 프로젝트가 선언해 두었던 검증 명령 (program, args).
+    ///
+    /// `auto_approve_verification`이 켜졌을 때 자동 승인의 유일한 근거다. 매번 다시
+    /// 탐지하지 않고 여기 찍어 두는 이유는 24.5절에 있다 — `detect_commands`는 매니페스트에서
+    /// 유도하므로 모델이 명령을 **지어낼** 수는 없지만, 모델은 매니페스트를 **고칠** 수 있다.
+    /// `scripts.test`를 바꿔 놓고 검증을 부르면 모델이 고른 명령이 자동 승인을 받는다.
+    verification_pin: Vec<(String, Vec<String>)>,
     /// 이번 태스크에서 마지막으로 만들어진 diff 모음 (UI 표시용)
     diffs: Mutex<Vec<(String, String)>>,
     /// IPC 한 줄 크기를 재는 쪽 (process-architecture.md 3.1절 — 32 MiB가 맞는지).
@@ -106,6 +139,13 @@ impl TaskHost {
         cancels: Arc<CancellationRegistry>,
     ) -> Self {
         let gate = PolicyGate::new(&policy);
+        // 아직 아무것도 고치지 않은 시점의 매니페스트를 읽는다. 이 호출이 뒤로 밀리면
+        // 고정의 의미가 사라진다.
+        let verification_pin = crate::verify::detect_commands(&root)
+            .commands
+            .values()
+            .map(|(_, cmd, _)| (cmd.program.clone(), cmd.args.clone()))
+            .collect();
         let runtime = ToolRuntime::new(
             root.clone(),
             artifacts.clone(),
@@ -122,6 +162,7 @@ impl TaskHost {
             sink,
             cancels,
             baseline: Mutex::new(None),
+            verification_pin,
             diffs: Mutex::new(Vec::new()),
             ipc_meter: Mutex::new(None),
         }
@@ -355,6 +396,30 @@ impl TaskHost {
     }
 
     /// ToolRequest 하나를 끝까지 처리한다. 이 함수가 신뢰 경계의 핵심 경로다.
+    /// 이 요청이 **태스크 시작 전에 프로젝트가 선언해 둔** 검증 명령과 정확히 같은가.
+    ///
+    /// 세 가지를 모두 본다. 하나라도 느슨하게 하면 레버가 검증 밖으로 새어 나간다:
+    ///  - 도구가 `run_tests`인가 — 검증 러너가 쓰는 이름이다. `run_command`로 온 같은 argv는
+    ///    통과하지 못한다.
+    ///  - cwd가 워크스페이스 루트인가 — 탐지된 명령은 전부 루트에서 돈다. 하위 디렉터리에서
+    ///    같은 이름의 스크립트를 돌리는 것은 다른 명령이다.
+    ///  - program과 args가 **완전히** 같은가. prefix 비교를 하면 `npm test --ignore-scripts`
+    ///    같은 변형이 딸려 들어온다.
+    fn is_pinned_verification(&self, request: &ToolRequest) -> bool {
+        if request.tool != ToolName::RunTests {
+            return false;
+        }
+        let Ok(cmd) = parse_run_command(&request.args) else {
+            return false;
+        };
+        if cmd.cwd != "." {
+            return false;
+        }
+        self.verification_pin
+            .iter()
+            .any(|(program, args)| *program == cmd.program && *args == cmd.args)
+    }
+
     pub fn execute_tool(&self, request: &ToolRequest) -> Result<Value, String> {
         let cancel = self.cancels.token(&request.task_id);
 
@@ -368,6 +433,7 @@ impl TaskHost {
                 error: Some("태스크가 취소되어 도구를 실행하지 않음".to_string()),
                 duration_ms: 0,
                 completed_at: now_iso(),
+                denial_kind: None,
             };
             // 취소 후 거부도 감사 로그에 남는다 — "취소했는데 뭐가 더 실행됐나"를 확인할 수 있어야 한다.
             let _ = self.append_event(
@@ -414,8 +480,29 @@ impl TaskHost {
             .map_err(|e| format!("tool_request 기록 실패: {e}"))?;
 
         // 2) 승인이 필요하면 UI 왕복. Node는 이 과정에 관여하지 않는다.
-        let mut approved = false;
-        if decision.requires_user_approval {
+        //
+        // **기본값이 `NotRequired`다.** 게이트가 승인을 요구하지 않은 요청은 "승인되지 않음"이
+        // 아니라 "물을 일이 아니었음"이고, 둘을 같은 값으로 두면 결과 기록이 그 사실을 잃는다.
+        let mut approval_state = crate::tools::ApprovalState::NotRequired;
+        if decision.requires_user_approval && self.policy.auto_approve_verification && self.is_pinned_verification(request)
+        {
+            // 사용자가 미리 켜 둔 규칙이 답한다 (state-machine 24.5절). **게이트 분류는
+            // 그대로다** — 바뀐 것은 "누가 답하는가"뿐이고, 그 대상은 프로젝트가 태스크
+            // 시작 전에 선언해 둔 명령으로 한정된다.
+            approval_state = crate::tools::ApprovalState::GrantedByPolicy;
+            let _ = self.append_event(
+                &request.task_id,
+                "APPROVAL_AUTO_VERIFICATION",
+                json!({
+                    "requestId": request.request_id,
+                    "normalizedTarget": decision.normalized_target,
+                    // 게이트가 무엇을 요구했는지 지운 채로 남기면, 나중에 이 레버가 무엇을
+                    // 통과시켰는지 되짚을 수 없다.
+                    "wouldHaveAsked": decision.matched_rule,
+                    "riskLevel": decision.risk_level,
+                }),
+            );
+        } else if decision.requires_user_approval {
             let approval = ApprovalRequest {
                 approval_id: format!("approval-{}", uuid::Uuid::new_v4()),
                 task_id: request.task_id.clone(),
@@ -435,14 +522,18 @@ impl TaskHost {
                 redact_approval_for_event(&approval),
             );
 
-            match self.approvals.request_approval(&approval) {
+            // **`match`의 값을 그대로 받는다.** 한때 왕복 전에 `DeniedByUser`를 넣어 두는
+            // 방어 코드가 있었지만, 그건 "어떤 경로로도 승인 없이 빠져나가지 않는다"를 사람이
+            // 지키는 규칙으로 만든다. 값을 match에서 받으면 컴파일러가 지킨다 —
+            // `ApprovalOutcome`에 변형이 늘면 여기가 컴파일되지 않는다.
+            approval_state = match self.approvals.request_approval(&approval) {
                 ApprovalOutcome::Granted => {
-                    approved = true;
                     let _ = self.append_event(
                         &request.task_id,
                         "APPROVAL_GRANTED",
                         json!({ "approvalId": approval.approval_id, "requestId": request.request_id }),
                     );
+                    crate::tools::ApprovalState::Granted
                 }
                 ApprovalOutcome::Denied { note } => {
                     let _ = self.append_event(
@@ -450,13 +541,28 @@ impl TaskHost {
                         "APPROVAL_DENIED",
                         json!({ "approvalId": approval.approval_id, "requestId": request.request_id, "note": note }),
                     );
+                    crate::tools::ApprovalState::DeniedByUser
                 }
-            }
+                // **같은 이벤트를 쓰지 않는다.** `APPROVAL_DENIED`로 남기면 감사 로그가
+                // 사용자의 판단을 기록한 것처럼 보이는데, 사용자는 이 자리에 없었다.
+                ApprovalOutcome::Unattended => {
+                    let _ = self.append_event(
+                        &request.task_id,
+                        "APPROVAL_UNATTENDED",
+                        json!({
+                            "approvalId": approval.approval_id,
+                            "requestId": request.request_id,
+                            "reason": "무인 실행(Autopilot)이라 승인을 물을 사람이 없습니다",
+                        }),
+                    );
+                    crate::tools::ApprovalState::Unattended
+                }
+            };
         }
 
         // 3) 실행. 승인되지 않았으면 Tool Runtime이 스스로 Denied를 반환한다 —
         //    호출자가 승인 확인을 잊는 경로를 없애기 위해 판단을 런타임에도 넘긴다.
-        let outcome = self.runtime.execute(request, &decision, approved, &cancel);
+        let outcome = self.runtime.execute(request, &decision, approval_state, &cancel);
 
         // 4) 결과 기록. **레코드와 이벤트를 같은 트랜잭션에** 쓴다 (M0.1 트랜잭션 규칙).
         if let Some(mutation) = &outcome.mutation {
@@ -877,7 +983,7 @@ impl TaskHost {
             return Err(format!("git {}이(가) 정책에 막혔습니다: {}", args[0], decision.reason));
         }
         let token = CancellationToken::new();
-        let outcome = self.runtime.execute(&request, &decision, true, &token);
+        let outcome = self.runtime.execute(&request, &decision, crate::tools::ApprovalState::NotRequired, &token);
 
         if record {
             self.with_store(|s| s.record_tool_request(&request, "rollback", &decision))
@@ -969,7 +1075,7 @@ impl TaskHost {
             // 가장 필요한 순간이다. 그래서 태스크 취소 토큰이 아니라 새 토큰을 쓴다.
             // Policy Gate는 그대로 거치므로 workspace 경계 보장은 유지된다.
             let rollback_token = CancellationToken::new();
-            let outcome = self.runtime.execute(&request, &decision, true, &rollback_token);
+            let outcome = self.runtime.execute(&request, &decision, crate::tools::ApprovalState::NotRequired, &rollback_token);
             self.with_store(|s| s.record_tool_request(&request, "rollback", &decision))
                 .ok();
             let payload = json!({
@@ -1015,6 +1121,7 @@ impl CommandExecutor for HostExecutor<'_> {
                     error: Some("검증 결과를 파싱할 수 없음".to_string()),
                     duration_ms: 0,
                     completed_at: now_iso(),
+                    denial_kind: None,
                 })
             }
             Err(message) => ToolResult {
@@ -1024,6 +1131,7 @@ impl CommandExecutor for HostExecutor<'_> {
                 error: Some(message),
                 duration_ms: 0,
                 completed_at: now_iso(),
+                denial_kind: None,
             },
         }
     }
@@ -1401,9 +1509,22 @@ mod tests {
         policy: TaskPolicy,
         approvals: Arc<dyn ApprovalGateway>,
     ) -> (tempfile::TempDir, tempfile::TempDir, TaskHost) {
+        host_with_manifest(policy, approvals, None)
+    }
+
+    /// `manifest`가 있으면 **호스트를 만들기 전에** `package.json`으로 쓴다 — 검증 명령 고정이
+    /// 생성 시점의 매니페스트를 읽는지 확인하려면 순서가 이래야 한다.
+    fn host_with_manifest(
+        policy: TaskPolicy,
+        approvals: Arc<dyn ApprovalGateway>,
+        manifest: Option<&str>,
+    ) -> (tempfile::TempDir, tempfile::TempDir, TaskHost) {
         let ws = tempfile::tempdir().unwrap();
         fs::create_dir_all(ws.path().join("src")).unwrap();
         fs::write(ws.path().join("src/app.ts"), "a\nb\nc\n").unwrap();
+        if let Some(text) = manifest {
+            fs::write(ws.path().join("package.json"), text).unwrap();
+        }
         let art = tempfile::tempdir().unwrap();
         let artifacts = ArtifactStore::new(art.path()).unwrap();
         let mut store = Store::open_in_memory(artifacts.clone()).unwrap();
@@ -1819,6 +1940,90 @@ mod tests {
         assert!(policy_decided < approval_requested);
         assert!(approval_requested < approval_granted);
         assert!(approval_granted < tool_completed);
+    }
+
+    /// 고정 집합은 매니페스트가 **선언한 것만** 담는다. 없는 스크립트를 담으면 자동 승인이
+    /// 프로젝트가 정하지 않은 명령까지 덮는다.
+    #[test]
+    fn the_verification_pin_holds_only_what_the_manifest_declared() {
+        let (_ws, _a, host) = host_with_manifest(
+            TaskPolicy::default(),
+            Arc::new(AlwaysDeny),
+            Some(r#"{"scripts":{"test":"node -e 0","build":"node -e 0"}}"#),
+        );
+        let pinned: Vec<String> = host
+            .verification_pin
+            .iter()
+            .map(|(p, a)| format!("{p} {}", a.join(" ")))
+            .collect();
+        assert!(pinned.iter().any(|c| c == "npm test"), "{pinned:?}");
+        assert!(pinned.iter().any(|c| c == "npm run build"), "{pinned:?}");
+        // lint는 선언되지 않았다 — 담기면 "매니페스트에서 유도한다"가 거짓이 된다.
+        assert!(!pinned.iter().any(|c| c.contains("lint")), "{pinned:?}");
+    }
+
+    /// **이 테스트가 24.5절이 막으려는 경로 그 자체다.** 모델은 검증 명령을 지어낼 수는
+    /// 없지만 매니페스트는 고칠 수 있다. 실행 중에 추가된 스크립트가 자동 승인을 받으면,
+    /// 자동 승인의 근거였던 "프로젝트가 미리 선언했다"가 사라진다.
+    #[test]
+    fn a_manifest_edited_mid_task_does_not_widen_the_pin() {
+        let (ws, _a, host) = host_with_manifest(
+            TaskPolicy {
+                auto_approve_verification: true,
+                ..TaskPolicy::default()
+            },
+            Arc::new(AlwaysDeny),
+            Some(r#"{"scripts":{"test":"node -e 0"}}"#),
+        );
+        // 시작 시점에 선언돼 있던 명령은 매치된다 — 아래 부정 단언이 공허하지 않다는 증거다.
+        assert!(host.is_pinned_verification(&req(
+            ToolName::RunTests,
+            json!({ "program": "npm", "args": ["test"], "cwd": "." })
+        )));
+
+        fs::write(
+            ws.path().join("package.json"),
+            r#"{"scripts":{"test":"node -e 0","lint":"node -e 0"}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !host.is_pinned_verification(&req(
+                ToolName::RunTests,
+                json!({ "program": "npm", "args": ["run", "lint"], "cwd": "." })
+            )),
+            "실행 중에 추가된 스크립트가 자동 승인 집합에 들어왔습니다"
+        );
+    }
+
+    /// 매치는 세 축 전부를 본다. 하나라도 느슨하면 레버가 검증 밖으로 샌다.
+    #[test]
+    fn the_pin_does_not_match_a_variant_a_subdirectory_or_another_tool() {
+        let (_ws, _a, host) = host_with_manifest(
+            TaskPolicy::default(),
+            Arc::new(AlwaysDeny),
+            Some(r#"{"scripts":{"test":"node -e 0"}}"#),
+        );
+        let cases = [
+            // 같은 argv라도 `run_command`로 오면 검증 러너가 부른 것이 아니다.
+            (ToolName::RunCommand, json!({ "program": "npm", "args": ["test"], "cwd": "." })),
+            // 인자가 붙은 변형은 다른 명령이다 (prefix 비교였다면 통과했을 것).
+            (
+                ToolName::RunTests,
+                json!({ "program": "npm", "args": ["test", "--ignore-scripts"], "cwd": "." }),
+            ),
+            // 하위 디렉터리에서 도는 같은 이름의 스크립트도 다른 명령이다.
+            (
+                ToolName::RunTests,
+                json!({ "program": "npm", "args": ["test"], "cwd": "src" }),
+            ),
+        ];
+        for (tool, args) in cases {
+            assert!(
+                !host.is_pinned_verification(&req(tool, args.clone())),
+                "고정 집합이 {args}를 검증 명령으로 인정했습니다"
+            );
+        }
     }
 
     #[test]

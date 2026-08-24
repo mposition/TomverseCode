@@ -16,6 +16,17 @@ export type TaskEventType =
   | "APPROVAL_REQUESTED"
   | "APPROVAL_GRANTED"
   | "APPROVAL_DENIED"
+  /**
+   * 무인 실행(Autopilot)에서 승인이 필요한 지점에 닿았다 — product-strategy 8.2절.
+   *
+   * **`APPROVAL_DENIED`로 남기지 않는다.** 그러면 감사 로그가 사용자의 판단을 기록한 것처럼
+   * 보이는데, 사용자는 이 자리에 없었다. 뒤에 로그를 읽는 사람이 "왜 거부했지?"를 묻게 된다.
+   */
+  | "APPROVAL_UNATTENDED"
+  // 사용자가 미리 켜 둔 규칙이 승인을 대신했다. `APPROVAL_GRANTED`와 나누는 이유는
+  // `APPROVAL_UNATTENDED`를 `APPROVAL_DENIED`와 나눈 것과 같다 — 사람이 이 요청을 보고
+  // 답한 것이 아니다.
+  | "APPROVAL_AUTO_VERIFICATION"
   | "TOOL_REQUESTED"
   | "TOOL_COMPLETED"
   | "POLICY_DECIDED"

@@ -1063,6 +1063,22 @@ export class Orchestrator {
             : "검증 명령을 **실행하지 못해** 검증되지 않았습니다" +
               (blocked ? `: ${blocked}` : "") +
               ". 스크립트가 없는 것이 아니라 이번 실행에서 돌리지 못한 것입니다.";
+        // **무인 실행에서는 완료로 보고하지 않는다** (8.2절 "검사 실패 시 정지").
+        //
+        // 사람이 보고 있으면 "검증되지 않았습니다"가 달린 완료는 정직한 보고다 — 읽고
+        // 판단할 사람이 있다. 무인이면 그 문장을 읽을 사람이 없고, 검증 없이 끝난 작업이
+        // **완료로 기록되어 다음 단계가 그 위에 쌓인다.** 원칙 1이 말하는 최종 판정자가
+        // 침묵한 채로 통과하는 경로다.
+        if (this.policy.unattended) {
+          return {
+            kind: "final",
+            result: await this.finish(
+              "failed",
+              `무인 실행이라 ${explanation} 검증되지 않은 결과를 완료로 보고하지 않습니다${criteria ? ` · ${criteria}` : ""}`,
+              "unverified_unattended"
+            ),
+          };
+        }
         return {
           kind: "final",
           result: await this.finish("completed", `변경을 적용했으나 ${explanation}${criteria ? ` · ${criteria}` : ""}`),
@@ -1334,9 +1350,23 @@ export class Orchestrator {
         }
 
         if (result.status === "denied") {
-          // Policy Gate 거부 또는 사용자 승인 거부. 재시도하지 않는다 —
+          // Policy Gate 거부 / 사용자 승인 거부 / 무인 실행. 재시도하지 않는다 —
           // 같은 요청을 다시 보내는 것은 승인 피로도를 유발하는 것 말고는 하는 일이 없다.
           const denialReason = result.error ?? policy.reason;
+          // **세 결말을 뭉개지 않는다.** 사용자가 거부한 것은 사용자의 의사(cancelled)이고,
+          // 게이트가 거부한 것은 요청을 다시 생각해야 하는 실패이며, 무인 실행에서 멈춘 것은
+          // **사람이 붙으면 그대로 진행되는** 상태다. 같은 이름으로 보고하면 사용자가
+          // 정책을 의심하며 고칠 곳을 찾아 헤맨다.
+          if (result.denialKind === "unattended") {
+            return {
+              kind: "final",
+              result: await this.finish(
+                "failed",
+                `무인 실행 중 승인이 필요한 지점에서 멈췄습니다 (${request.tool}): ${denialReason}`,
+                "unattended_stop"
+              ),
+            };
+          }
           return {
             kind: "final",
             result: await this.finish(

@@ -126,6 +126,27 @@ pub struct ToolResult {
     pub duration_ms: u64,
     #[serde(rename = "completedAt")]
     pub completed_at: String,
+    /// `status == Denied`일 때 **누가 막았는가**.
+    ///
+    /// 사유 문장만으로는 소비자가 구별할 수 없다 — 한국어 산문을 파싱하게 만들면 문구를
+    /// 다듬는 순간 분기가 조용히 바뀐다(`CriterionCheckCode`를 따로 둔 것과 같은 이유).
+    ///
+    /// 특히 **"게이트가 거부"와 "물을 사람이 없음"은 다음에 할 일이 다르다**: 전자는 요청을
+    /// 다시 생각해야 하고, 후자는 사람이 붙으면 그대로 진행된다.
+    #[serde(rename = "denialKind", skip_serializing_if = "Option::is_none")]
+    pub denial_kind: Option<DenialKind>,
+}
+
+/// `Denied`의 종류. 문자열이 아니라 값이라 소비자가 분기할 수 있다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenialKind {
+    /// Policy Gate가 거부했다 (workspace 경계 위반 등).
+    Policy,
+    /// 사용자가 승인 요청을 거부했다.
+    User,
+    /// 무인 실행(Autopilot)이라 물을 사람이 없었다 — product-strategy 8.2절.
+    Unattended,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +299,16 @@ pub struct TaskPolicy {
     pub command_policy: Option<CommandPolicy>,
     #[serde(rename = "autoApproveWorkspaceWrites", default)]
     pub auto_approve_workspace_writes: bool,
+    /// 무인 실행(Autopilot)인가 — product-strategy 8.2절. sidecar가 완료 판정에 쓴다.
+    #[serde(default)]
+    pub unattended: bool,
+    /// 프로젝트가 **매니페스트에 선언해 둔** 검증 명령을 매번 묻지 않고 실행한다.
+    ///
+    /// 이 레버가 안전한 근거는 명령의 출처다 — `verify::detect_commands`가 `package.json`·
+    /// `Cargo.toml`에서 유도하므로 모델이 명령을 지어낼 수 없고, 집합은 태스크 **시작
+    /// 시점에 고정**되므로 모델이 매니페스트를 고쳐 넣을 수도 없다(state-machine 24.5절).
+    #[serde(rename = "autoApproveVerification", default)]
+    pub auto_approve_verification: bool,
     #[serde(rename = "allowGitCommit", default)]
     pub allow_git_commit: bool,
     #[serde(rename = "commandTimeoutMs", default = "default_timeout")]
@@ -300,6 +331,8 @@ impl Default for TaskPolicy {
             force_complexity_tier: None,
             command_policy: None,
             auto_approve_workspace_writes: false,
+            unattended: false,
+            auto_approve_verification: false,
             allow_git_commit: false,
             command_timeout_ms: default_timeout(),
             execution_mode: ExecutionMode::Verified,

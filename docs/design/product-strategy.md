@@ -418,6 +418,7 @@ excluded from context"). 모델이 그 파일이 없다고 보고 내용을 추�
 | **저장소 인덱싱 · 토큰 사용량** | Tree-sitter 3개 언어(JS/TS·Python·Rust) + ripgrep 폴백, 태스크별 토큰 표시 | 언어 추가, 증분 인덱싱 최적화 |
 | **Chat · Plan 모드** | 계획 제시 → 사용자 확인 → 실행 | — |
 | **Interactive · Autopilot 모드** | Autopilot = 무인 실행하되 **검사 실패 시 정지**. 승인 정책은 그대로 적용 | 장시간 루프 안정성, 예산 기반 자동 중단 |
+| ↳ 위 행의 현재 상태 | **코어 구현 완료, UI 미배선**(M3) — `tomverse-host run --approve autopilot`. 게이트 분류는 그대로 두고 승인이 필요한 지점에서 **멈추며**, 그 정지를 사용자 거부로 기록하지 않는다. **"검사 실패 시 정지"에는 검사가 돌지 못한 경우가 포함된다**(`unverified_unattended`) — 포함시키지 않으면 검사를 못 돌리는 것이 검사를 통과하는 가장 쉬운 길이 된다. 검증까지 도달하려면 `--auto-approve-verification`이 필요하고, 그것이 우회 플래그가 아닌 근거는 명령의 **출처**다([state-machine 24절](./state-machine-and-protocol.md)). 화면에는 무인 실행 토글도 정지를 이어받는 경로도 없다(24.7절) <!-- present: apps/desktop/src-tauri/core/src/host.rs --> | — |
 | **세션 중지·재개·취소** | 진행 중 취소, 앱 재시작 후 상태 복원(자동 재개는 안 함) | 다중 태스크 동시 실행 |
 | **Git status·diff·commit·branch** | 도구로 노출 + Policy Gate 적용 | — |
 | **Git worktree · 브랜치별 격리** | worktree 생성·격리 실행·정리 | Arena(M3)가 이 위에 올라감 |

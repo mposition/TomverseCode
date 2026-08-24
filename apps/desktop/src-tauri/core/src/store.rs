@@ -2439,6 +2439,7 @@ mod tests {
                     error: Some("사용자 취소".into()),
                     duration_ms: 42,
                     completed_at: now_iso(),
+                    denial_kind: None,
                 },
                 None,
                 "task-1",
@@ -2812,6 +2813,7 @@ mod tests {
                     error: None,
                     duration_ms: 5,
                     completed_at: now_iso(),
+                    denial_kind: None,
                 },
                 None,
             )

@@ -61,6 +61,25 @@ export interface TaskPolicy {
   commandTimeoutMs: number;
   executionMode: ExecutionMode;
   /**
+   * **무인 실행인가** (Autopilot — product-strategy 8.2절, state-machine 24절).
+   *
+   * 오케스트레이터가 이 값을 보는 이유는 하나다: 8.2 기준의 **"검사 실패 시 정지"** 는
+   * 사람이 있을 때와 없을 때 뜻이 다르다. 사람이 보고 있으면 "검증되지 않았습니다"라는
+   * 문장이 달린 완료가 정직한 보고지만, **무인 실행에서는 그 문장을 읽을 사람이 없다** —
+   * 검증 없이 완료된 작업이 완료로 기록되고 다음 단계가 그 위에 쌓인다.
+   */
+  unattended: boolean;
+  /**
+   * 프로젝트가 매니페스트에 **선언해 둔** 검증 명령을 매번 묻지 않고 실행한다
+   * (state-machine 24.5절).
+   *
+   * 오케스트레이터는 이 값을 읽지 않는다 — 판단은 전부 Rust에서 일어난다. 여기 있는 이유는
+   * 정책이 한 덩어리로 오가기 때문이고, **읽지 않는다는 사실 자체가 중요하다**: Node가
+   * 장악당해도 이 값으로 승인을 우회할 수 없다. 자동 승인의 대상 집합은 Rust가 태스크 시작
+   * 시점의 매니페스트에서 유도해 고정한다.
+   */
+  autoApproveVerification: boolean;
+  /**
    * 이 **태스크 하나**가 공급자 호출에 쓸 수 있는 상한(USD). `null`이면 상한이 없다.
    *
    * # 왜 태스크당인가 (multi-engine-routing.md 10.6절)
@@ -122,6 +141,12 @@ export const DEFAULT_TASK_POLICY: TaskPolicy = {
   allowGitCommit: false,
   commandTimeoutMs: 120_000,
   executionMode: "verified",
+  // **기본은 사람이 있다고 본다.** 무인이 기본이면 UI 경로가 실수로 무인 규칙을 타게 되고,
+  // 그건 완료로 보고돼야 할 것을 실패로 만든다.
+  unattended: false,
+  // 검증 명령도 기본은 물어본다. "프로젝트가 선언했다"는 것은 안전의 근거이지 사용자가
+  // 그렇게 하기로 정했다는 뜻이 아니다.
+  autoApproveVerification: false,
   budgetUsd: DEFAULT_TASK_BUDGET_USD,
 };
 
@@ -204,7 +229,22 @@ export type FailureReason =
    * `provider_config_error`와 섞지 않는 이유: 저쪽은 고칠 것이 설정에 있고, 이쪽은 사용자가
    * 정한 값에 도달한 정상 동작이다. 같은 이름으로 보고하면 사용자가 키나 모델을 의심한다.
    */
-  | "budget_exceeded";
+  | "budget_exceeded"
+  /**
+   * 무인 실행(Autopilot) 중 **승인이 필요한 지점에 닿아** 멈췄다 (8.2절, state-machine 24절).
+   *
+   * `policy_denied`와 섞지 않는다: 저쪽은 게이트가 **거부**한 것이고 요청 자체를 다시 생각해야
+   * 한다. 이쪽은 게이트가 "사람에게 물어라"라고 했는데 물을 사람이 없었던 것이며, 사람이
+   * 붙으면 그대로 진행된다. 뭉개면 사용자가 정책을 의심하며 고칠 곳을 찾아 헤맨다.
+   */
+  | "unattended_stop"
+  /**
+   * 무인 실행에서 **검증이 돌지 않았는데** 변경이 적용된 상태로 끝났다 (8.2절).
+   *
+   * `unattended_stop`과 나눈다: 저쪽은 승인 지점에서 멈춰 **아무것도 바꾸지 않은** 것이고,
+   * 이쪽은 바꿨는데 검증이 침묵한 것이다. 되돌릴 것이 있는지가 다르므로 다음에 할 일이 다르다.
+   */
+  | "unverified_unattended";
 
 /**
  * 이 태스크가 공급자 호출에 **실제로 쓴 돈**과 상한이 강제됐는지 여부.

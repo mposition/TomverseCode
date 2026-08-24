@@ -52,6 +52,17 @@ export interface ToolResult {
   error?: string;
   durationMs: number;
   completedAt: ISODateTime;
+  /**
+   * `status === "denied"`일 때 **누가 막았는가** (product-strategy 8.2절 Autopilot).
+   *
+   * 사유 문장으로 구별하게 두지 않는 이유: 소비자가 한국어 산문을 파싱하게 되고, 문구를
+   * 다듬는 순간 분기가 조용히 바뀐다.
+   *
+   * 특히 `user`와 `unattended`는 **다음에 할 일이 다르다**: 전자는 사용자가 그 요청을
+   * 원하지 않은 것이고, 후자는 무인 실행이라 물을 사람이 없었을 뿐이라 사람이 붙으면
+   * 그대로 진행된다. 뭉개면 최종 보고가 "사용자가 거부했다"고 거짓말한다.
+   */
+  denialKind?: "policy" | "user" | "unattended";
 }
 
 export type PolicyRiskLevel = "none" | "low" | "medium" | "high" | "prohibited";

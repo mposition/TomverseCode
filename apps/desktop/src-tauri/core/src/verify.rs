@@ -453,6 +453,7 @@ mod tests {
                 error: None,
                 duration_ms: 10,
                 completed_at: now_iso(),
+                denial_kind: None,
             }
         }
     }
@@ -659,6 +660,7 @@ mod tests {
                     error: Some("policy denied".into()),
                     duration_ms: 0,
                     completed_at: now_iso(),
+                    denial_kind: None,
                 }
             }
         }
@@ -695,6 +697,7 @@ mod tests {
                         error: None,
                         duration_ms: 5,
                         completed_at: now_iso(),
+                        denial_kind: None,
                     };
                 }
                 ToolResult {
@@ -704,6 +707,7 @@ mod tests {
                     error: Some("npm를 실행할 수 없음: program not found".into()),
                     duration_ms: 1,
                     completed_at: now_iso(),
+                    denial_kind: None,
                 }
             }
         }
@@ -796,6 +800,7 @@ mod tests {
                     error: Some("timed out".into()),
                     duration_ms: 1000,
                     completed_at: now_iso(),
+                    denial_kind: None,
                 }
             }
         }

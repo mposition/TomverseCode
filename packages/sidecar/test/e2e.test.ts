@@ -58,8 +58,10 @@ interface HostRun {
 interface RunOptions {
   message?: string;
   mode?: "fast" | "verified";
-  approve?: "auto" | "deny";
+  approve?: "auto" | "deny" | "autopilot";
   autoApproveWrites?: boolean;
+  /** 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절). */
+  autoApproveVerification?: boolean;
   script?: FakeScriptStep[];
   defaultPatch?: string;
   timeoutSecs?: number;
@@ -105,6 +107,7 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
   ];
   if (options.worktree) args.push("--worktree", options.worktree);
   if (options.autoApproveWrites) args.push("--auto-approve-writes");
+  if (options.autoApproveVerification) args.push("--auto-approve-verification");
   if (options.allowGitCommit) args.push("--allow-git-commit");
 
   const fakeConfig = {
@@ -586,6 +589,95 @@ test("격리 실행은 본체 작업 트리를 건드리지 않는다", () => {
     // ③ 그리고 사용자에게 격리 트리가 어디인지 말한다 — 결과 diff를 어디서 볼지 알아야 한다.
     assert.match(run.stderr, /격리 실행/, run.stderr);
   }, { gitRepo: true });
+});
+
+/**
+ * **Autopilot은 승인을 대신해 주지 않는다** — product-strategy 8.2절, state-machine 24절.
+ *
+ * 출시 기준의 "승인 정책은 그대로 적용"을 이렇게 읽는다: 게이트의 분류를 바꾸지 않는다.
+ * 정책이 자동 허용하는 것만 무인으로 진행하고, 사람이 필요한 지점에 닿으면 멈춘다.
+ *
+ * 이 검사가 없으면 언젠가 "무인이니까 승인도 자동으로"가 들어오고, 그 순간 Policy Gate의
+ * `RequireUserApproval`이 의미를 잃는다 — MCP 호출까지 포함해서(23.3절).
+ */
+test("Autopilot은 승인이 필요한 지점에서 멈추고, 그것을 사용자 거부로 기록하지 않는다", () => {
+  withRepo((repo, stateDir) => {
+    const before = repo.read("paginate.js");
+    // `--auto-approve-writes`를 주지 않았으므로 patch 적용은 승인을 요구한다.
+    const run = runHost(repo, stateDir, { approve: "autopilot" });
+
+    // ① 멈췄다 — 그리고 파일을 바꾸지 않았다.
+    assert.equal(run.final.status, "failed", run.final.summary);
+    assert.equal(repo.read("paginate.js"), before, "무인 실행이 승인 없이 파일을 바꿨습니다");
+
+    // ② **사용자 거부로 기록하지 않는다.** 사용자는 이 자리에 없었다.
+    assert.equal(run.final.failureReason, "unattended_stop", run.final.summary);
+    assert.ok(run.eventTypes.includes("APPROVAL_UNATTENDED"), run.eventTypes.join(", "));
+    assert.ok(!run.eventTypes.includes("APPROVAL_GRANTED"), "무인인데 승인이 났습니다");
+    assert.ok(!run.eventTypes.includes("APPROVAL_DENIED"), "사용자가 거부한 것으로 기록됐습니다");
+  });
+});
+
+/**
+ * **게이트의 분류는 그대로다** — 사용자가 **미리** 넓힌 정책은 무인으로도 그대로 적용된다.
+ *
+ * 위 테스트만 있으면 "Autopilot은 아무것도 못 한다"로 만들어도 통과한다. 그건 이 기능이 아니다.
+ *
+ * 그런데 `--auto-approve-verification` 없이는 이 실행이 **완료되지 않는다**, 그리고 그게 맞다:
+ * 검증 명령도 승인을 요구하므로 무인에서는 돌지 않고, 검증이 침묵한 결과를 완료로 보고하지
+ * 않는 것이 8.2절의 "검사 실패 시 정지"다(24.4절). 그 조각은 아래 테스트가 채운다.
+ */
+test("Autopilot에서 미리 넓힌 정책은 적용되지만, 검증이 못 돌면 완료로 보고하지 않는다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir, { approve: "autopilot", autoApproveWrites: true });
+
+    // ① 미리 넓힌 정책은 그대로 적용됐다 — patch가 승인 왕복 없이 적용됐다.
+    assert.deepEqual(run.mutatedPaths, ["paginate.js"], run.final.summary);
+
+    // ② 그런데 검증이 돌지 못했으므로 **완료가 아니다.** 여기서 completed로 보고하면
+    //    검증 없이 끝난 작업이 완료로 기록되고 다음 단계가 그 위에 쌓인다(원칙 1).
+    assert.equal(run.final.status, "failed", run.final.summary);
+    assert.equal(run.final.failureReason, "unverified_unattended", run.final.summary);
+    assert.equal(run.final.verificationReport?.overall, "could_not_run");
+  });
+});
+
+/**
+ * **Autopilot이 실제로 끝까지 간다** — 그리고 끝까지 가는 이유가 "검증을 건너뛰어서"가 아니다
+ * (state-machine 24.5절).
+ *
+ * 위 두 테스트만 있으면 Autopilot은 "아무것도 못 하거나, 해도 완료되지 않는" 기능이다. 그건
+ * 8.2절이 말하는 Autopilot이 아니다. 마지막 조각은 **검증 명령의 출처**에 기댄다: 그 명령은
+ * 모델이 고른 것이 아니라 프로젝트가 `package.json`에 선언해 둔 것이고, Rust가 태스크 시작
+ * 시점에 그것을 읽어 고정한다.
+ *
+ * 그래서 이 테스트는 "완료됐다"로 끝내지 않는다 — **검증이 실제로 돌아 통과했는지**까지
+ * 본다. 검증을 조용히 건너뛰고 완료로 보고하는 것이 이 기능에서 가장 피해야 할 결말이고,
+ * `overall`을 확인하지 않으면 그 결말이 이 테스트를 통과한다.
+ */
+test("Autopilot은 프로젝트가 선언한 검증 명령까지 돌고서야 완료된다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir, {
+      approve: "autopilot",
+      autoApproveWrites: true,
+      autoApproveVerification: true,
+    });
+
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+    // ① 검증이 **돌았고** 통과했다. `could_not_run`이면 위 테스트와 같은 결말이다.
+    assert.equal(run.final.verificationReport?.overall, "pass", run.final.summary);
+    assert.ok(
+      // 리포트의 `checks[].status`는 대문자다(`overall`만 소문자다) — 소문자로 비교하면
+      // 이 단언은 언제나 거짓이 되고, 그때 실패 메시지는 원인을 가리키지 않는다.
+      run.final.verificationReport?.checks.some((c) => c.kind === "test" && c.status === "PASSED"),
+      JSON.stringify(run.final.verificationReport)
+    );
+
+    // ② 승인은 **규칙이** 했다. 사람이 답한 것으로 기록되면 감사 로그가 거짓말한다.
+    assert.ok(run.eventTypes.includes("APPROVAL_AUTO_VERIFICATION"), run.eventTypes.join(", "));
+    assert.ok(!run.eventTypes.includes("APPROVAL_GRANTED"), "무인인데 사용자 승인이 기록됐습니다");
+    assert.ok(!run.eventTypes.includes("APPROVAL_DENIED"), "사용자가 거부한 것으로 기록됐습니다");
+  });
 });
 
 test("fast 모드 + 단일 파일은 단일 모델 경로를 타지만 검증은 그대로 돈다", () => {

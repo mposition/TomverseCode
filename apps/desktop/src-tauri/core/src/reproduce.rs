@@ -839,7 +839,14 @@ pub fn apply(export: &Value, opts: &ApplyOptions, acknowledged: Option<&str>) ->
                 break;
             }
 
-            let outcome = runtime.execute(&request, &decision, approved, &cancel);
+            // 재현에서 "승인되지 않음"은 언제나 사람의 판단이다 — 무인 재현이라는 것은 없다
+            // (적용기는 사람이 부른다).
+            let state = if approved {
+                crate::tools::ApprovalState::Granted
+            } else {
+                crate::tools::ApprovalState::DeniedByUser
+            };
+            let outcome = runtime.execute(&request, &decision, state, &cancel);
             let exit_code = outcome
                 .result
                 .output

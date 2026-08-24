@@ -15,8 +15,8 @@ use crate::policy::parse_run_command;
 use crate::proctree;
 use crate::time::{elapsed_ms, now_iso};
 use crate::types::{
-    Decision, FileMutationRecord, ImageRef, PolicyDecision, RunCommandArgs, ToolName, ToolRequest, ToolResult,
-    ToolStatus,
+    Decision, DenialKind, FileMutationRecord, ImageRef, PolicyDecision, RunCommandArgs, ToolName, ToolRequest,
+    ToolResult, ToolStatus,
 };
 use serde_json::json;
 use std::io::Read;
@@ -59,6 +59,32 @@ pub struct ToolOutcome {
     pub diff: Option<String>,
 }
 
+/// 이 요청에 대한 승인 상태.
+///
+/// `bool`을 쓰지 않는 이유는 `execute`의 주석에 있다 — `false`가 세 가지 서로 다른 사실을
+/// 뭉친다: 승인이 필요 없었다 / 사람이 거부했다 / 물을 사람이 없었다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalState {
+    /// 게이트가 승인을 요구하지 않았다.
+    NotRequired,
+    Granted,
+    /// 사용자가 **미리** 정해 둔 정책이 승인했다 — 그 순간 사람이 답한 것이 아니다.
+    ///
+    /// `Granted`와 나누는 이유는 `Unattended`를 `Denied`와 나눈 이유와 같다: 뭉개면 감사
+    /// 로그가 "사용자가 이 요청을 보고 승인했다"고 말하는데, 사용자는 명령이 무엇인지 모르는
+    /// 채로 규칙만 켜 두었다. 규칙이 승인한 것과 사람이 승인한 것은 다른 사실이다.
+    GrantedByPolicy,
+    DeniedByUser,
+    /// 무인 실행이라 물을 사람이 없었다 (product-strategy 8.2절 Autopilot).
+    Unattended,
+}
+
+impl ApprovalState {
+    pub fn is_granted(self) -> bool {
+        matches!(self, Self::Granted | Self::GrantedByPolicy | Self::NotRequired)
+    }
+}
+
 impl ToolRuntime {
     pub fn new(root: WorkspaceRoot, artifacts: ArtifactStore, default_timeout: Duration) -> Self {
         Self {
@@ -85,24 +111,32 @@ impl ToolRuntime {
     /// 실행하지 않는다. 승인 여부(`approved`)는 host가 사용자 응답을 받아 넘긴다.
     /// `cancel`은 태스크의 취소 신호다. 실행 직전과 (파일 도구의 경우) 기록 직전에 검사하며,
     /// `run_command`는 실행 **중에도** 감시한다.
+    /// 도구 하나를 실행한다.
+    ///
+    /// `approval`이 `bool`이 아닌 이유: `false`는 **"왜 승인되지 않았는가"를 이미 잃은 값**이다.
+    /// 사람이 거부한 것과 무인 실행이라 물을 사람이 없었던 것은 결과 기록에서 구별되어야 하고
+    /// (다음에 할 일이 다르다), 그 구별을 아는 것은 호출자다.
     pub fn execute(
         &self,
         request: &ToolRequest,
         decision: &PolicyDecision,
-        approved: bool,
+        approval: ApprovalState,
         cancel: &CancellationToken,
     ) -> ToolOutcome {
         let start = Instant::now();
 
         if matches!(decision.decision, Decision::Deny) {
-            return self.denied(request, start, &decision.reason);
+            return self.denied(request, start, &decision.reason, DenialKind::Policy);
         }
-        if decision.requires_user_approval && !approved {
-            return self.denied(
-                request,
-                start,
-                &format!("사용자 승인이 필요하지만 승인되지 않았음: {}", decision.reason),
-            );
+        if decision.requires_user_approval && !approval.is_granted() {
+            let (label, kind) = match approval {
+                ApprovalState::Unattended => (
+                    "무인 실행(Autopilot)이라 승인을 물을 사람이 없었음",
+                    DenialKind::Unattended,
+                ),
+                _ => ("사용자 승인이 필요하지만 승인되지 않았음", DenialKind::User),
+            };
+            return self.denied(request, start, &format!("{label}: {}", decision.reason), kind);
         }
         // 취소된 태스크의 도구는 시작하지 않는다. `Denied`가 아니라 `Cancelled`로 보고해야
         // 호출자가 "정책이 막았다"와 "사용자가 멈췄다"를 구별할 수 있다.
@@ -120,6 +154,7 @@ impl ToolRuntime {
                     error: Some(message),
                     duration_ms: elapsed_ms(start),
                     completed_at: now_iso(),
+                    denial_kind: None,
                 },
                 mutation: None,
                 output_ref: None,
@@ -128,7 +163,7 @@ impl ToolRuntime {
         }
     }
 
-    fn denied(&self, request: &ToolRequest, start: Instant, reason: &str) -> ToolOutcome {
+    fn denied(&self, request: &ToolRequest, start: Instant, reason: &str, kind: DenialKind) -> ToolOutcome {
         ToolOutcome {
             result: ToolResult {
                 request_id: request.request_id.clone(),
@@ -137,6 +172,7 @@ impl ToolRuntime {
                 error: Some(reason.to_string()),
                 duration_ms: elapsed_ms(start),
                 completed_at: now_iso(),
+                denial_kind: Some(kind),
             },
             mutation: None,
             output_ref: None,
@@ -153,6 +189,7 @@ impl ToolRuntime {
                 error: Some(reason.to_string()),
                 duration_ms: elapsed_ms(start),
                 completed_at: now_iso(),
+                denial_kind: None,
             },
             mutation: None,
             output_ref: None,
@@ -642,6 +679,7 @@ impl ToolRuntime {
                     error: None,
                     duration_ms: elapsed_ms(start),
                     completed_at: now_iso(),
+                    denial_kind: None,
                 },
                 mutation: None,
                 output_ref: None,
@@ -786,6 +824,7 @@ impl ToolRuntime {
                 error,
                 duration_ms: elapsed_ms(start),
                 completed_at: now_iso(),
+                denial_kind: None,
             },
             mutation: None,
             output_ref,
@@ -824,6 +863,7 @@ impl ToolRuntime {
                 error: None,
                 duration_ms: elapsed_ms(start),
                 completed_at: now_iso(),
+                denial_kind: None,
             },
             mutation: None,
             output_ref,
@@ -1215,15 +1255,19 @@ mod tests {
         /// "게이트를 반드시 지난다"는 불변식을 테스트가 검증하지 않게 된다.
         fn run(&self, request: &ToolRequest) -> ToolOutcome {
             let decision = self.gate.evaluate(request, self.runtime.root(), &self.policy);
-            let approved = decision.requires_user_approval;
+            let approval = if decision.requires_user_approval {
+                ApprovalState::Granted
+            } else {
+                ApprovalState::NotRequired
+            };
             self.runtime
-                .execute(request, &decision, approved, &CancellationToken::new())
+                .execute(request, &decision, approval, &CancellationToken::new())
         }
 
         fn run_unapproved(&self, request: &ToolRequest) -> ToolOutcome {
             let decision = self.gate.evaluate(request, self.runtime.root(), &self.policy);
             self.runtime
-                .execute(request, &decision, false, &CancellationToken::new())
+                .execute(request, &decision, ApprovalState::DeniedByUser, &CancellationToken::new())
         }
 
         fn read(&self, rel: &str) -> String {
@@ -1236,7 +1280,8 @@ mod tests {
         fn run_with_cancel(&self, request: &ToolRequest, cancel: &CancellationToken) -> ToolOutcome {
             let decision = self.gate.evaluate(request, self.runtime.root(), &self.policy);
             let approved = decision.requires_user_approval;
-            self.runtime.execute(request, &decision, approved, cancel)
+            let approval = if approved { ApprovalState::Granted } else { ApprovalState::DeniedByUser };
+            self.runtime.execute(request, &decision, approval, cancel)
         }
     }
 
