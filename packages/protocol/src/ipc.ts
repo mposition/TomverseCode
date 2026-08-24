@@ -60,6 +60,21 @@ export interface TaskStartParams {
   /** 사용 가능한 공급자 (자격증명이 실제로 있는 것만 Rust가 알려준다) */
   availableProviders: string[];
   /**
+   * 적용된 스킬의 **프롬프트 프리셋과 모델 지정** (state-machine 26절).
+   *
+   * **도구 허용목록은 여기 오지 않는다.** 그건 `policy.allowedTools`로 오며 강제하는 곳도
+   * Rust다 — sidecar가 지키는 규칙으로 두면 장악당한 sidecar에서 그 규칙이 사라진다(원칙 2).
+   * 여기 오는 것은 sidecar가 실제로 해야 하는 일(프롬프트에 싣기, 모델 고르기)뿐이다.
+   *
+   * **역할별 모델 지정도 여기 오지 않는다.** 스킬이 지정한 모델은 Rust가 `policy.modelPins`에
+   * 접어 넣는다 — 명시한 CLI 지정이 스킬의 지정을 이긴다는 우선순위를 한 곳에서 정하기
+   * 위해서다. 두 곳에서 오면 sidecar가 그 우선순위를 다시 정하게 되고, 그러면 규칙이 둘이 된다.
+   *
+   * **Rust가 파일을 읽어 채운다.** sidecar가 파일에 직접 접근하지 않는다는 원칙은 여기서도
+   * 유지된다.
+   */
+  skill?: { name: string; instructions: string };
+  /**
    * 실험 제어 — **평가 하네스 전용**이며 UI 경로에서는 항상 비어 있다.
    *
    * 왜 프로토콜에 두는가: 가설 게이트(evals/hypothesis-gate)는 production 실행 경로를 그대로

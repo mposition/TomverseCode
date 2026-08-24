@@ -80,6 +80,14 @@ export interface TaskPolicy {
    */
   autoApproveVerification: boolean;
   /**
+   * 스킬이 **좁힌** 도구 집합 (state-machine 26절). 없으면 좁히지 않는다.
+   *
+   * **sidecar는 이것을 지키지 않는다** — 강제하는 곳은 Rust의 Policy Gate다. 여기 있는 이유는
+   * 화면이 "이 스킬이 무엇을 좁혔는가"를 말할 수 있어야 하기 때문이고, **지키지 않는다는
+   * 사실이 중요하다**: Node가 장악당해도 이 값을 바꿔 도구를 늘릴 수 없다.
+   */
+  allowedTools?: string[];
+  /**
    * 이 **태스크 하나**가 공급자 호출에 쓸 수 있는 상한(USD). `null`이면 상한이 없다.
    *
    * # 왜 태스크당인가 (multi-engine-routing.md 10.6절)

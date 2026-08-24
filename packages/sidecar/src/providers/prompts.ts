@@ -39,6 +39,12 @@ export function renderSnapshot(snapshot: WorkspaceSnapshot): string {
     parts.push(`## Project rules (${(meta.agentsMdSources ?? []).join(", ")})\n${meta.agentsMdContent}`);
   }
 
+  // 스킬 지시문은 **프로젝트 규칙 다음, 파일 앞**에 온다. 프로젝트 규칙은 저장소의 것이고
+  // 스킬은 이번 작업에 사용자가 고른 것이라, 충돌하면 뒤에 오는 쪽이 더 구체적인 요구다.
+  if (snapshot.skill) {
+    parts.push(`## Skill instructions (${snapshot.skill.name})\n${snapshot.skill.instructions}`);
+  }
+
   parts.push("## Files");
   for (const file of snapshot.relevantFiles) {
     const header = `### ${file.path}\n(selected because: ${file.reasonDetail})${

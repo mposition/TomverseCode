@@ -108,6 +108,13 @@ export interface RunInput {
   policy: TaskPolicy;
   availableProviders: string[];
   /**
+   * 적용된 스킬의 프롬프트 프리셋 (state-machine 26절). **Rust가 파일을 읽어 채운다.**
+   *
+   * 도구 허용목록은 여기 없다 — `policy.allowedTools`로 오고 강제하는 곳은 Rust다.
+   * 모델 지정도 여기 없다 — Rust가 `policy.modelPins`에 접어 넣었다.
+   */
+  skill?: { name: string; instructions: string };
+  /**
    * 실험 하네스(evals/hypothesis-gate) 전용 제어. **production 경로에서는 항상 undefined다.**
    * Rust가 `task.start` params로 채우며, Node는 이 값을 만들어내지 않는다.
    */
@@ -392,6 +399,12 @@ export class Orchestrator {
       // 실제 모델 예산은 라우팅 후 어댑터가 프롬프트를 조립할 때 반영된다.
       tokenBudgets: [{ modelId: "(pending-routing)", maxTokens: 60_000 }],
     });
+    // **스냅샷에 얹는다** — 프롬프트에 실리는 것은 스냅샷을 통해 나간다는 규칙(26.2절).
+    // 여기서 얹지 않고 빌더마다 따로 실으면 전송 집계가 "각 공급자 모두에게 갔다"고 말할
+    // 근거를 잃는다(7.1절).
+    if (this.input.skill) {
+      this.snapshot.skill = { name: this.input.skill.name, instructions: this.input.skill.instructions };
+    }
     await this.emit("SNAPSHOT_CREATED", {
       snapshotId: this.snapshot.snapshotId,
       gitBranch: this.snapshot.gitBranch,
@@ -400,6 +413,8 @@ export class Orchestrator {
       // 이걸 이벤트에 넣지 않으면 전송 기록이 그것을 말할 수 없고, 화면은 "선정된 파일만
       // 나갔다"로 읽힌다 — 이 요약에는 선정되지 않은 파일의 경로도 들어간다(7.2절).
       gitDiffSummary: this.snapshot.gitDiffSummary ?? null,
+      // 스킬 지시문도 프롬프트에 실려 나간다 — 전송 집계가 세야 한다(7.2절).
+      skill: this.snapshot.skill ?? null,
       // 어떤 파일이 어느 공급자에 갔는지 표시하기 위한 데이터 (README "데이터 전송 투명성").
       relevantFiles: this.snapshot.relevantFiles.map((f) => ({
         path: f.path,

@@ -338,6 +338,12 @@ pub struct TaskPolicy {
     /// 무인 실행(Autopilot)인가 — product-strategy 8.2절. sidecar가 완료 판정에 쓴다.
     #[serde(default)]
     pub unattended: bool,
+    /// 스킬이 **좁힌** 도구 집합 (skills.rs, state-machine 26절).
+    ///
+    /// `None`이면 좁히지 않는다. **넓히는 방향은 없다** — 여기 있는 도구도 게이트의 분류를
+    /// 그대로 지나며, 이 목록은 그 앞에서 한 겹 더 막을 뿐이다.
+    #[serde(rename = "allowedTools", default)]
+    pub allowed_tools: Option<Vec<ToolName>>,
     /// 프로젝트가 **매니페스트에 선언해 둔** 검증 명령을 매번 묻지 않고 실행한다.
     ///
     /// 이 레버가 안전한 근거는 명령의 출처다 — `verify::detect_commands`가 `package.json`·
@@ -368,6 +374,7 @@ impl Default for TaskPolicy {
             command_policy: None,
             auto_approve_workspace_writes: false,
             unattended: false,
+            allowed_tools: None,
             auto_approve_verification: false,
             allow_git_commit: false,
             command_timeout_ms: default_timeout(),

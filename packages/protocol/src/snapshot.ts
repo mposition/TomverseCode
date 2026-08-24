@@ -41,6 +41,21 @@ export interface ProjectMeta {
   agentsMdSources?: string[];
 }
 
+/**
+ * 사용자가 고른 스킬의 프롬프트 프리셋 (state-machine 26절).
+ *
+ * **스냅샷에 두는 이유가 있다.** 이건 워크스페이스에서 모은 것이 아니라 사용자 설정이므로
+ * 여기 있는 것이 어색해 보인다. 그런데 전송 투명성이 "이 내용이 각 공급자 모두에게 갔다"고
+ * 말할 수 있는 근거는 **모든 프롬프트 빌더가 같은 스냅샷을 싣는다**는 것 하나다(7.1절).
+ * 스킬 지시문을 스냅샷 밖에 두면 빌더마다 실을지 말지가 갈리고, 그 순간 그 근거가 사라진다.
+ * 그래서 **나가는 것은 스냅샷을 통해 나간다**로 규칙을 지킨다.
+ */
+export interface SnapshotSkill {
+  name: string;
+  /** 프롬프트에 실리는 지시문 **원문**. 공급자로 그대로 나간다. */
+  instructions: string;
+}
+
 export interface WorkspaceSnapshot {
   snapshotId: string;
   workspaceId: string;
@@ -57,6 +72,8 @@ export interface WorkspaceSnapshot {
    */
   tokenBudget: { modelId: ModelId; maxTokens: number }[];
   /** 제외된 파일 중 사용자에게 알려야 하는 것 (너무 큼, secret 패턴 등) */
+  /** 이 태스크에 적용된 스킬. 없으면 스킬을 쓰지 않은 것이다. */
+  skill?: SnapshotSkill;
   excludedNotes?: { path: string; reason: string }[];
   createdAt: ISODateTime;
 }

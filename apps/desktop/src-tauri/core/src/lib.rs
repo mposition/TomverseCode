@@ -29,6 +29,7 @@ pub mod policy;
 pub mod proctree;
 pub mod reproduce;
 pub mod sidecar;
+pub mod skills;
 pub mod store;
 pub mod time;
 pub mod tools;

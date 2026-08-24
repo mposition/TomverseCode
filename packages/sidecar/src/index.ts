@@ -145,7 +145,7 @@ export function createSidecar(
   });
 
   transport.onRequest("task.start", async (params) => {
-    const { taskRequest, policy, availableProviders, experiment } = params as TaskStartParams;
+    const { taskRequest, policy, availableProviders, experiment, skill } = params as TaskStartParams;
     if (!taskRequest?.taskId) throw new Error("task.start params에 taskRequest.taskId가 없습니다");
 
     const deps: OrchestratorDeps = {
@@ -159,6 +159,8 @@ export function createSidecar(
         taskRequest,
         policy: mergePolicy(policy),
         availableProviders: availableProviders ?? [],
+        // 스킬도 Rust가 준 것을 그대로 넘긴다 — 파일을 읽는 것은 Rust다(26.1절).
+        skill,
         // 실험 제어는 Rust가 준 것을 그대로 넘긴다 — sidecar가 만들어내지 않는다.
         experiment,
       },

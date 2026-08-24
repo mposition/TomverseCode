@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -70,6 +70,8 @@ interface RunOptions {
   worktree?: string;
   /** phase 전환 훅. `phase=프로그램[,인자...]` (state-machine 25절). */
   hooks?: string[];
+  /** 스킬 파일 경로 (state-machine 26절). */
+  skill?: string;
 }
 
 function hostAvailable(): boolean {
@@ -109,6 +111,7 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
   ];
   if (options.worktree) args.push("--worktree", options.worktree);
   for (const hook of options.hooks ?? []) args.push("--hook", hook);
+  if (options.skill) args.push("--skill", options.skill);
   if (options.autoApproveWrites) args.push("--auto-approve-writes");
   if (options.autoApproveVerification) args.push("--auto-approve-verification");
   if (options.allowGitCommit) args.push("--allow-git-commit");
@@ -901,6 +904,136 @@ test("오타 난 phase의 훅은 조용히 무시되지 않고 등록에서 거�
     assert.notEqual(result.status, 0, "오타 난 phase가 통과했습니다");
     // 거부만 하면 사용자가 추측하게 된다 — 쓸 수 있는 이름을 함께 말한다.
     assert.match(result.stderr, /VERIFYING/, result.stderr);
+  });
+});
+
+/**
+ * **스킬의 도구 허용목록은 Rust가 강제한다** (state-machine 26절).
+ *
+ * 이 테스트가 보는 것은 셋이다:
+ *  ① 허용목록 밖의 도구가 **거부**된다 — 이 실행에서는 `apply_patch`를 빼서 패치가 막힌다.
+ *  ② 그런데 **검증은 그대로 돈다.** 허용목록에 `run_tests`를 적지 않았는데도 그렇다 —
+ *    적어야 돌게 두면 스킬 파일 한 줄로 `VERIFYING`이 조용히 꺼진다(원칙 1).
+ *  ③ 지시문이 프롬프트로 나갔고 **전송 집계가 그것을 센다**(7.2절).
+ *
+ * ②가 이 기능에서 가장 조용히 틀릴 수 있는 자리다. 검증이 막히면 리포트는 `could_not_run`이
+ * 되는데, 그건 "스킬이 도구를 좁혔다"는 정상 동작처럼 보인다.
+ */
+test("스킬은 도구를 좁히지만 검증을 끄지는 못한다", () => {
+  withRepo((repo, stateDir) => {
+    const skillPath = path.join(stateDir, "skill.json");
+    writeFileSync(
+      skillPath,
+      JSON.stringify({
+        name: "read-only-reviewer",
+        instructions: "You must not modify files. Explain instead.",
+        // apply_patch가 없다. run_tests도 적지 않았다 — 그래도 검증은 돌아야 한다.
+        allowedTools: ["list_files", "search_text", "read_file", "git_status", "git_diff"],
+      }) + "\n"
+    );
+
+    const before = repo.read("paginate.js");
+    const run = runHost(repo, stateDir, { mode: "fast", autoApproveWrites: true, skill: skillPath });
+
+    // ① 허용목록 밖의 도구는 거부된다 — `--auto-approve-writes`를 켰는데도 그렇다.
+    //    좁히기가 넓히기보다 뒤에 오면 이 단언이 깨진다.
+    assert.equal(repo.read("paginate.js"), before, "스킬이 막은 도구가 파일을 바꿨습니다");
+    assert.deepEqual(run.mutatedPaths, [], run.final.summary);
+
+    // 거부 사유가 **무엇이 허용됐는지** 함께 말한다 — 거부만 하면 사용자가 추측하게 된다.
+    assert.equal(run.final.failureReason, "policy_denied", run.final.summary);
+    assert.match(run.final.summary, /이 스킬이 허용한 도구가 아닙니다/, run.final.summary);
+
+    // ② **검증은 그대로 돌았다.** 최종 결과에는 리포트가 없다 — 태스크가 패치 단계에서
+    //    끝났기 때문이고, 그건 이 시나리오에서 정상이다. 그러므로 증거는 **저장된 검증
+    //    기록**에서 찾는다: baseline 검증이 실제로 `test`를 돌렸는가.
+    //
+    //    여기가 `SKIPPED_WITH_REASON`이면 스킬이 `run_tests`를 막은 것이고, 그건 스킬 파일
+    //    한 줄로 원칙 1이 꺼졌다는 뜻이다. 최종 상태만 보면 그 결말이 "스킬이 도구를 좁혔다"는
+    //    정상 동작과 구별되지 않는다.
+    const shown = JSON.parse(
+      execFileSync(
+        HOST_BIN,
+        [
+          "show",
+          "--workspace",
+          repo.root,
+          "--task",
+          run.taskId,
+          "--db",
+          path.join(stateDir, "state.db"),
+          "--artifacts",
+          path.join(stateDir, "artifacts"),
+        ],
+        { encoding: "utf8" }
+      )
+        .trim()
+        .split("\n")
+        .pop() as string
+    ) as { verificationChecks: { kind: string; status: string; summary: string }[] };
+    const testCheck = shown.verificationChecks.find((c) => c.kind === "test");
+    assert.ok(testCheck, `검증 기록이 없습니다: ${JSON.stringify(shown.verificationChecks)}`);
+    assert.notEqual(
+      testCheck.status,
+      "SKIPPED_WITH_REASON",
+      `스킬 허용목록이 검증 명령을 막았습니다: ${testCheck.summary}`
+    );
+
+    // ③ 지시문이 나갔고 집계가 그것을 센다.
+    const raw = execFileSync(
+      HOST_BIN,
+      [
+        "transmission",
+        "--workspace",
+        repo.root,
+        "--task",
+        run.taskId,
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+      ],
+      { encoding: "utf8" }
+    );
+    const transmission = JSON.parse(raw.trim().split("\n").pop() as string) as {
+      sentContext: { section: string; bytes: number }[];
+    };
+    const skillSection = transmission.sentContext.find((c) => c.section === "Skill instructions");
+    assert.ok(skillSection, `스킬 지시문이 전송 집계에 없습니다: ${raw}`);
+    assert.ok(skillSection.bytes > 0, raw);
+  });
+});
+
+/**
+ * **오타 난 도구 이름은 조용히 무시되지 않는다.**
+ *
+ * 무시하면 좁히려던 도구가 그대로 열린다 — 사용자는 좁혔다고 믿는데 정반대가 된다.
+ */
+test("스킬 파일의 알 수 없는 도구 이름은 실행 전에 거절된다", () => {
+  withRepo((repo, stateDir) => {
+    const skillPath = path.join(stateDir, "bad-skill.json");
+    writeFileSync(skillPath, JSON.stringify({ name: "s", allowedTools: ["read_files"] }) + "\n");
+    const result = spawnSync(
+      HOST_BIN,
+      [
+        "run",
+        "--workspace",
+        repo.root,
+        "--message",
+        "아무거나",
+        "--skill",
+        skillPath,
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+        "--sidecar",
+        SIDECAR_ENTRY,
+      ],
+      { encoding: "utf8" }
+    );
+    assert.notEqual(result.status, 0, "오타 난 도구 이름이 통과했습니다");
+    assert.match(result.stderr, /read_file/, result.stderr);
   });
 });
 

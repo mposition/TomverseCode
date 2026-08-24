@@ -123,6 +123,7 @@ pub const REPORTED_SECTIONS: &[&str] = &[
     "Repository state",
     "Project",
     "Project rules",
+    "Skill instructions",
     "Files",
     "Files deliberately excluded from context",
 ];
@@ -200,6 +201,21 @@ fn collect_context(payload: &Value, out: &mut Vec<SentContext>) {
             bytes: (branch.len() + diff_summary.len()) as u64,
             sources: Vec::new(),
         });
+    }
+
+    // ② 스킬 지시문 — 사용자가 고른 프리셋의 **원문**이 매 호출에 실린다(26절).
+    //    `projectMeta`보다 먼저 본다: 메타가 없는 스냅샷에서도 스킬은 나갈 수 있다.
+    if let Some(skill) = payload.get("skill").filter(|v| !v.is_null()) {
+        let name = skill.get("name").and_then(Value::as_str).unwrap_or("(이름 없음)");
+        let instructions = skill.get("instructions").and_then(Value::as_str).unwrap_or("");
+        if !instructions.is_empty() {
+            out.push(SentContext {
+                section: "Skill instructions".to_string(),
+                detail: format!("스킬 \"{name}\"의 지시문 **원문**이 매 호출에 실립니다"),
+                bytes: instructions.len() as u64,
+                sources: Vec::new(),
+            });
+        }
     }
 
     let Some(meta) = payload.get("projectMeta") else {

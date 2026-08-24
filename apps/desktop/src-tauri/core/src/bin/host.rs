@@ -11,7 +11,7 @@
 //! ```text
 //! tomverse-host run --workspace <path> --message "..." [--mode fast|verified]
 //!                   [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>]
-//!                   [--hook <phase=프로그램[,인자...]>]
+//!                   [--hook <phase=프로그램[,인자...]>] [--skill <파일.json>]
 //!                   [--sidecar <index.js>] [--auto-approve-writes] [--auto-approve-verification]
 //!                   [--allow-git-commit]
 //!                   [--cancel-after-ms <n>] [--budget-usd <n>]
@@ -118,6 +118,7 @@ struct Args {
     /// 모델이 서버를 추가하는 경로는 없으며, 그것이 이 기능의 안전 모델 전부다.
     mcp_servers: Vec<tomverse_core::mcp::McpServerConfig>,
     hooks: Vec<tomverse_core::hooks::HookConfig>,
+    skill: Option<PathBuf>,
     /// `metrics` 전용: 워크스페이스 필터를 끄고 DB 전체를 집계한다.
     all_workspaces: bool,
     /// `windows-landing` 전용 — tauri 번들 디렉터리.
@@ -176,6 +177,7 @@ fn parse_args() -> Result<Args, String> {
         cancel_after_ms: None,
         mcp_servers: Vec::new(),
         hooks: Vec::new(),
+        skill: None,
         worktree: None,
         worktree_base: None,
         force: false,
@@ -208,6 +210,7 @@ fn parse_args() -> Result<Args, String> {
             "--force" => args.force = true,
             "--mcp-server" => args.mcp_servers.push(parse_mcp_server(&value()?)?),
             "--hook" => args.hooks.push(parse_hook(&value()?)?),
+            "--skill" => args.skill = Some(PathBuf::from(value()?)),
             "--db" => args.db = Some(PathBuf::from(value()?)),
             "--artifacts" => args.artifacts = Some(PathBuf::from(value()?)),
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
@@ -317,7 +320,7 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 fn usage() -> String {
     "usage: tomverse-host <run|rollback|revert|recover|tasks|show|blocked|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
-     [--sidecar <index.js>] [--auto-approve-writes] [--auto-approve-verification]\n\
+     [--sidecar <index.js>] [--skill <파일.json>] [--auto-approve-writes] [--auto-approve-verification]\n\
      [--allow-git-commit] [--cancel-after-ms <n>]\n\
      [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
      \n\
@@ -330,6 +333,9 @@ fn usage() -> String {
                  쉼표로 나눈 argv다.** 등록한 argv 그대로 Policy Gate를 지나 실행되며,\n\
                  **실패해도 태스크의 판정을 바꾸지 않는다**(훅은 관찰자다). 걸 수 있는 phase는\n\
                  PLANNING/EXECUTING/VERIFYING/COMPLETED/FAILED/CANCELLED\n\
+     run --skill <파일.json> — 스킬 적용. 지시문(프롬프트에 실린다)·도구 허용목록(게이트가\n\
+                 좁힌다)·역할별 모델 지정을 담는다. **허용목록은 좁히기만 하며**, 적지 않아도\n\
+                 검증 명령은 남는다. 명시한 --pin-* 가 스킬의 모델 지정을 이긴다\n\
      run --mcp-server <이름=프로그램[,인자...]> — MCP 서버 등록(반복 가능). **셸 문자열이 아니라\n\
                  쉼표로 나눈 argv다.** 그 도구는 `mcp_call`로 변환되어 Policy Gate를 지나며,\n\
                  **언제나 사용자 승인을 요구한다**(정책으로 낮출 수 없다)\n\
@@ -514,7 +520,20 @@ fn real_main() -> Result<i32, String> {
         .upsert_workspace(&workspace_id, &root.display(), workspace_name(&root))
         .map_err(|e| format!("워크스페이스 기록 실패: {e}"))?;
 
+    // 스킬을 **Rust가 읽는다**(26.1절). sidecar가 읽으면 도구 허용목록의 출처가 sidecar가 되고,
+    // 장악당한 sidecar가 "허용목록은 전부입니다"라고 말할 수 있다.
+    let skill = match &args.skill {
+        None => None,
+        Some(path) => {
+            let loaded = tomverse_core::skills::load(path).map_err(|e| e.to_string())?;
+            eprintln!("스킬 적용: {}", loaded.describe());
+            Some(loaded)
+        }
+    };
+
     let policy = TaskPolicy {
+        // 도구 허용목록은 **게이트에 꽂힌다.** sidecar에 알려 주기는 하지만 지키는 것은 여기다.
+        allowed_tools: skill.as_ref().and_then(|s| s.allowed_tools.clone()),
         auto_approve_workspace_writes: args.auto_approve_writes,
         auto_approve_verification: args.auto_approve_verification,
         allow_git_commit: args.allow_git_commit,
@@ -600,7 +619,7 @@ fn real_main() -> Result<i32, String> {
                 task_host = task_host.with_hooks(tomverse_core::hooks::HookRegistry::new(args.hooks.clone()));
             }
             let host = Arc::new(task_host);
-            let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id);
+            let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id, skill.as_ref());
             // **띄운 서버를 반드시 내린다.** 남기면 사용자가 모르는 프로세스가 계속 돈다.
             // 태스크가 실패해도 내려야 하므로 `?` 앞에서 한다.
             if let Some(pool) = &mcp {
@@ -851,6 +870,9 @@ fn run_task(
     workspace_id: &str,
     session_id: &str,
     task_id: &str,
+    // **이미 읽은 것을 받는다.** 여기서 파일을 다시 읽으면 정책에 꽂힌 것과 sidecar로 보내는
+    // 것이 서로 다른 시점의 파일이 될 수 있다.
+    skill: Option<&tomverse_core::skills::Skill>,
 ) -> Result<Value, String> {
     // 진입점도 인터프리터도 **launcher가 정한다**(launcher.rs). 여기서 따로 찾으면
     // 헤드리스 호스트와 데스크톱 앱이 서로 다른 규칙으로 sidecar를 띄우게 되고,
@@ -957,6 +979,16 @@ fn run_task(
     // 지정이 없으면 키 자체를 넣지 않는다 — 빈 객체를 넣으면 "지정했는데 비었다"와
     // "지정하지 않았다"가 같은 모양이 된다.
     let mut pins = serde_json::Map::new();
+    // **스킬의 지정을 먼저 깔고 명시한 플래그로 덮는다.** 우선순위를 여기 한 곳에서 정한다 —
+    // sidecar에도 스킬 지정을 보내면 거기서 다시 정하게 되고, 그러면 규칙이 둘이 된다.
+    if let Some(p) = skill.as_ref().and_then(|s| s.model_pins.as_ref()) {
+        if let Some(m) = &p.executor {
+            pins.insert("executor".to_string(), json!(m));
+        }
+        if let Some(m) = &p.reviewer {
+            pins.insert("reviewer".to_string(), json!(m));
+        }
+    }
     if let Some(m) = &args.pin_executor {
         pins.insert("executor".to_string(), json!(m));
     }
@@ -990,7 +1022,16 @@ fn run_task(
             // 그래서 Rust 구조체에 필드를 더해도 여기 넣지 않으면 sidecar에 도달하지 않는다 —
             // 실제로 `unattended`를 추가하고 그렇게 빠뜨렸고, e2e가 잡았다.
             "unattended": args.approve == "autopilot",
+            // sidecar는 이 목록을 **지키지 않는다** — 지키는 것은 Rust의 게이트다. 보내는
+            // 이유는 화면이 "이 스킬이 무엇을 좁혔는가"를 말할 수 있어야 하기 때문이다.
+            "allowedTools": skill
+                .as_ref()
+                .and_then(|s| s.allowed_tools.as_ref())
+                .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
         },
+        // 프롬프트 프리셋과 모델 지정만 sidecar로 간다 — 도구 허용목록은 policy로 갔고
+        // 강제하는 곳은 Rust다(26.1절).
+        "skill": skill.as_ref().map(|s| json!({ "name": s.name, "instructions": s.instructions })),
         "workspaceName": workspace_name(host.root()),
         "availableProviders": providers,
         // 비어 있으면 아예 넣지 않는다 — production 실행과 바이트 단위로 같은 params가 되도록.

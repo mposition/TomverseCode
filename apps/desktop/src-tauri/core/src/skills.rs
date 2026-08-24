@@ -1,0 +1,299 @@
+//! Skills · 커스텀 에이전트 (얕은 버전) — state-machine-and-protocol.md 26절.
+//!
+//! product-strategy 8.2절 기준: **"이름 붙인 프롬프트 프리셋 + 도구 허용목록 + 역할별 모델
+//! 지정"**. 세 조각이고, 세 조각이 사는 곳이 다르다.
+//!
+//! | 조각 | 어디서 강제되는가 | 왜 거기인가 |
+//! |---|---|---|
+//! | 도구 허용목록 | **Rust (Policy Gate)** | Node가 지키면 장악당한 Node에서 그 규칙이 사라진다(원칙 2) |
+//! | 프롬프트 프리셋 | Node (프롬프트 조립) | 프롬프트를 만드는 곳이 거기다 |
+//! | 역할별 모델 지정 | Node (라우터) | 이미 `modelPins`가 하는 일이다 |
+//!
+//! **파일을 Rust가 읽는다.** Node가 읽어 넘기면 도구 허용목록의 출처가 Node가 되고, 그러면
+//! 장악당한 Node가 "허용목록은 전부입니다"라고 말할 수 있다. Rust가 읽어서 자기 게이트에
+//! 꽂고, 프롬프트와 모델 지정만 Node로 넘긴다.
+//!
+//! # 허용목록은 **좁히기만** 한다
+//!
+//! 스킬이 도구를 늘릴 수는 없다. 게이트의 분류는 그대로이고, 허용목록은 그 앞에서 한 겹 더
+//! 막을 뿐이다. 넓히는 방향을 열면 "스킬 파일 하나로 정책을 푼다"가 되고, 그건 이 저장소가
+//! 반복해서 거부해 온 우회 경로다.
+//!
+//! # 검증 명령은 허용목록의 대상이 아니다
+//!
+//! `run_tests`는 선언하지 않아도 남는다. 이 목록이 좁히는 것은 **모델이 쓸 수 있는 도구**이고,
+//! 검증은 모델의 도구가 아니라 우리의 판정자다(원칙 1). 좁힐 수 있게 두면 스킬 파일 한 줄로
+//! `VERIFYING`이 조용히 무력화되는데, 그건 "검증은 `complexityTier`와 무관하게 항상 실행된다"를
+//! 정면으로 깨는 것이다. 빠뜨렸다고 꺼지는 것이 아니라 **애초에 끌 수 없어야 한다.**
+
+use crate::types::ToolName;
+use serde::Deserialize;
+use std::path::Path;
+
+/// 스킬 파일의 모양. 사용자가 손으로 쓰는 JSON이다.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillFile {
+    pub name: String,
+    /// 프롬프트에 실릴 지시문. **공급자로 나간다** — 전송 집계가 이것을 센다(7.2절).
+    #[serde(default)]
+    pub instructions: String,
+    /// 모델이 쓸 수 있는 도구. 비어 있거나 없으면 **좁히지 않는다**.
+    #[serde(rename = "allowedTools", default)]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(rename = "modelPins", default)]
+    pub model_pins: Option<ModelPins>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct ModelPins {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+}
+
+/// 검증된 스킬. 여기까지 오면 도구 이름이 전부 실재한다.
+#[derive(Debug, Clone)]
+pub struct Skill {
+    pub name: String,
+    pub instructions: String,
+    /// `None`이면 좁히지 않는다. `Some`이면 **여기 없는 도구는 거부**된다.
+    pub allowed_tools: Option<Vec<ToolName>>,
+    pub model_pins: Option<ModelPins>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SkillError {
+    #[error("스킬 파일을 읽을 수 없습니다: {path} ({detail})")]
+    Unreadable { path: String, detail: String },
+    #[error("스킬 파일이 JSON이 아닙니다: {path} ({detail})")]
+    Malformed { path: String, detail: String },
+    #[error("스킬에 이름이 없습니다")]
+    EmptyName,
+    #[error("알 수 없는 도구입니다: {tool} (쓸 수 있는 이름: {known})")]
+    UnknownTool { tool: String, known: String },
+    #[error("허용목록이 비어 있습니다 — 아무 도구도 못 쓰는 스킬은 아무 일도 하지 못합니다. 좁히지 않으려면 키를 빼세요")]
+    EmptyAllowlist,
+    #[error("스킬에 지시문도 허용목록도 모델 지정도 없습니다 — 이 스킬은 아무것도 하지 않습니다")]
+    Empty,
+}
+
+/// 이름으로 도구를 찾는다.
+///
+/// **`ToolName::as_str`에서 유도한다.** 별도 표를 만들면 `ToolName`에 변형이 늘 때 한쪽만
+/// 갱신되고, 그러면 새 도구는 스킬 파일에서 "알 수 없는 도구"가 된다.
+fn parse_tool(name: &str) -> Option<ToolName> {
+    ALL_TOOLS.iter().copied().find(|t| t.as_str() == name)
+}
+
+/// 모든 도구.
+///
+/// **이건 손으로 적은 목록이고, 그래서 `ToolName`에 변형이 늘면 낡을 수 있다.** 낡으면 새
+/// 도구는 스킬 파일에서 "알 수 없는 도구"가 되고, 사용자는 우리 누락을 자기 오타로 읽는다.
+/// 그래서 `all_tools_matches_the_tool_name_enum`이 `types.rs`의 `as_str` 매치 팔에서 이름을
+/// **유도해** 대조한다 — 목록을 두 번 적는 대신 두 번째가 첫 번째에서 나오게 한다.
+pub const ALL_TOOLS: &[ToolName] = &[
+    ToolName::ListFiles,
+    ToolName::SearchText,
+    ToolName::ReadFile,
+    ToolName::ApplyPatch,
+    ToolName::CreateFile,
+    ToolName::DeleteFile,
+    ToolName::RunCommand,
+    ToolName::GitStatus,
+    ToolName::GitDiff,
+
+    ToolName::RunTests,
+    ToolName::McpCall,
+];
+
+/// 스킬 파일을 읽고 검증한다.
+pub fn load(path: &Path) -> Result<Skill, SkillError> {
+    let text = std::fs::read_to_string(path).map_err(|e| SkillError::Unreadable {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    let file: SkillFile = serde_json::from_str(&text).map_err(|e| SkillError::Malformed {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    validate(file)
+}
+
+pub fn validate(file: SkillFile) -> Result<Skill, SkillError> {
+    if file.name.trim().is_empty() {
+        return Err(SkillError::EmptyName);
+    }
+    let allowed_tools = match file.allowed_tools {
+        None => None,
+        Some(names) => {
+            // **빈 목록은 "좁히지 않는다"가 아니다.** 그렇게 읽으면 사용자가 실수로 비운
+            // 목록이 조용히 전체 허용이 된다 — 좁히려던 의도와 정반대다.
+            if names.is_empty() {
+                return Err(SkillError::EmptyAllowlist);
+            }
+            let mut tools = Vec::new();
+            for name in &names {
+                let tool = parse_tool(name).ok_or_else(|| SkillError::UnknownTool {
+                    tool: name.clone(),
+                    known: ALL_TOOLS.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "),
+                })?;
+                if !tools.contains(&tool) {
+                    tools.push(tool);
+                }
+            }
+            // 검증 명령은 선언하지 않아도 남는다 — 모듈 주석 참조.
+            if !tools.contains(&ToolName::RunTests) {
+                tools.push(ToolName::RunTests);
+            }
+            Some(tools)
+        }
+    };
+
+    let skill = Skill {
+        name: file.name.trim().to_string(),
+        instructions: file.instructions.trim().to_string(),
+        allowed_tools,
+        model_pins: file.model_pins,
+    };
+    // 셋 다 없으면 이 스킬은 이름만 있는 것이다. 등록을 통과시키면 사용자는 무언가
+    // 적용됐다고 믿는다.
+    if skill.instructions.is_empty()
+        && skill.allowed_tools.is_none()
+        && skill
+            .model_pins
+            .as_ref()
+            .map(|p| p.executor.is_none() && p.reviewer.is_none())
+            .unwrap_or(true)
+    {
+        return Err(SkillError::Empty);
+    }
+    Ok(skill)
+}
+
+impl Skill {
+    /// 사용자에게 보여주는 한 줄 요약. **무엇이 적용됐는지 말하지 않으면 적용된 줄 모른다.**
+    pub fn describe(&self) -> String {
+        let tools = match &self.allowed_tools {
+            None => "도구 제한 없음".to_string(),
+            Some(t) => format!("도구 {}개로 제한", t.len()),
+        };
+        let pins = match &self.model_pins {
+            Some(p) => format!(
+                "모델 지정(executor={}, reviewer={})",
+                p.executor.as_deref().unwrap_or("-"),
+                p.reviewer.as_deref().unwrap_or("-")
+            ),
+            None => "모델 지정 없음".to_string(),
+        };
+        format!(
+            "{} — 지시문 {}자 · {tools} · {pins}",
+            self.name,
+            self.instructions.chars().count()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(json: &str) -> Result<Skill, SkillError> {
+        validate(serde_json::from_str(json).unwrap())
+    }
+
+    /// `ALL_TOOLS`가 `ToolName` 전체를 담고 있는가 — **`as_str`의 매치 팔에서 유도해** 본다.
+    ///
+    /// 기대 목록을 여기 다시 적으면 갈라질 자리가 셋이 된다. `as_str`은 exhaustive match라
+    /// 변형이 늘면 컴파일러가 그쪽을 잡아 주므로, 거기서 이름을 읽는 것이 가장 앞선 정본이다.
+    #[test]
+    fn all_tools_matches_the_tool_name_enum() {
+        let source = include_str!("types.rs");
+        // needle을 런타임에 조립한다 — 리터럴로 적으면 이 파일이 검사 대상처럼 보인다.
+        let marker = "fn as_str".to_string() + "(&self)";
+        let at = source.find(&marker).expect("ToolName::as_str를 찾지 못했습니다");
+        let end = at + source[at..].find("\n    }").expect("as_str 본문이 닫히지 않았습니다");
+        let arrow = "=> ".to_string() + "\"";
+        let mut from_enum: Vec<&str> = source[at..end]
+            .lines()
+            .filter_map(|line| line.split_once(arrow.as_str()))
+            .filter_map(|(_, rest)| rest.split('"').next())
+            .collect();
+        // 0개면 아래 비교가 빈 집합끼리의 비교가 된다 — 형식이 바뀐 경우다.
+        assert!(from_enum.len() >= 8, "as_str에서 도구 이름을 {}개만 읽었습니다", from_enum.len());
+
+        from_enum.sort_unstable();
+        let mut from_list: Vec<&str> = ALL_TOOLS.iter().map(|t| t.as_str()).collect();
+        from_list.sort_unstable();
+        assert_eq!(
+            from_list, from_enum,
+            "ALL_TOOLS가 ToolName과 갈라졌습니다 — 빠진 도구는 스킬 파일에서 '알 수 없는 도구'가 됩니다"
+        );
+    }
+
+    /// **모든 도구 이름이 파싱된다.** 목록과 파서가 갈라지면 새 도구는 스킬 파일에서
+    /// "알 수 없는 도구"가 되고, 사용자는 우리 오타를 자기 오타로 읽는다.
+    #[test]
+    fn every_tool_name_round_trips() {
+        for tool in ALL_TOOLS {
+            assert_eq!(parse_tool(tool.as_str()), Some(*tool), "{}", tool.as_str());
+        }
+    }
+
+    /// 오타는 조용히 무시되면 안 된다 — 무시하면 좁히려던 도구가 그대로 열린다.
+    #[test]
+    fn an_unknown_tool_is_rejected_and_the_known_names_are_shown() {
+        let err = file(r#"{"name":"s","allowedTools":["read_files"]}"#).unwrap_err();
+        match err {
+            SkillError::UnknownTool { tool, known } => {
+                assert_eq!(tool, "read_files");
+                assert!(known.contains("read_file"), "{known}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **빈 목록을 "제한 없음"으로 읽지 않는다.** 좁히려다 비운 사용자에게 정반대를 준다.
+    #[test]
+    fn an_empty_allowlist_is_an_error_not_unrestricted() {
+        assert_eq!(file(r#"{"name":"s","allowedTools":[]}"#).unwrap_err(), SkillError::EmptyAllowlist);
+    }
+
+    /// 키가 아예 없는 것은 "좁히지 않는다"이며, 그건 빈 목록과 다른 사실이다.
+    #[test]
+    fn an_absent_allowlist_means_no_narrowing() {
+        let skill = file(r#"{"name":"s","instructions":"x"}"#).unwrap();
+        assert!(skill.allowed_tools.is_none());
+    }
+
+    /// **검증 명령은 선언하지 않아도 남는다.** 좁힐 수 있게 두면 스킬 파일 한 줄로
+    /// `VERIFYING`이 조용히 꺼진다 — 원칙 1을 정면으로 깨는 경로다.
+    #[test]
+    fn verification_survives_an_allowlist_that_forgot_it() {
+        let skill = file(r#"{"name":"s","allowedTools":["read_file"]}"#).unwrap();
+        let tools = skill.allowed_tools.unwrap();
+        assert!(tools.contains(&ToolName::RunTests), "{tools:?}");
+        assert!(tools.contains(&ToolName::ReadFile));
+        // 그 외에는 넓어지지 않았다 — 검증을 남기는 것이 전체 허용이 되면 안 된다.
+        assert_eq!(tools.len(), 2, "{tools:?}");
+    }
+
+    /// 이름만 있는 스킬은 아무 일도 하지 않는다. 통과시키면 사용자는 적용됐다고 믿는다.
+    #[test]
+    fn a_skill_that_does_nothing_is_rejected() {
+        assert_eq!(file(r#"{"name":"s"}"#).unwrap_err(), SkillError::Empty);
+    }
+
+    #[test]
+    fn a_nameless_skill_is_rejected() {
+        assert_eq!(file(r#"{"name":"  ","instructions":"x"}"#).unwrap_err(), SkillError::EmptyName);
+    }
+
+    /// 중복은 조용히 접는다 — 사용자 실수이지 거절할 일은 아니다.
+    #[test]
+    fn duplicate_tools_are_folded() {
+        let skill = file(r#"{"name":"s","allowedTools":["read_file","read_file"]}"#).unwrap();
+        let tools = skill.allowed_tools.unwrap();
+        assert_eq!(tools.iter().filter(|t| **t == ToolName::ReadFile).count(), 1);
+    }
+}

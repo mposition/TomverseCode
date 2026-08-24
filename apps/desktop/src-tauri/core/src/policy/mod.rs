@@ -65,6 +65,27 @@ impl PolicyGate {
     }
 
     fn classify(&self, request: &ToolRequest, root: &WorkspaceRoot, task_policy: &TaskPolicy) -> Outcome {
+        // 0) 스킬이 좁힌 도구 집합 (state-machine 26절).
+        //
+        //    **분류보다 먼저 본다.** 뒤에 두면 도구별 분기마다 같은 검사를 되풀이해야 하고,
+        //    하나를 빠뜨리면 그 도구만 조용히 새어 나간다. 그리고 이 검사는 **좁히기만**
+        //    하므로 앞에 두어도 어떤 도구가 새로 허용되지 않는다.
+        if let Some(allowed) = &task_policy.allowed_tools {
+            if !allowed.contains(&request.tool) {
+                return Outcome {
+                    decision: Decision::Deny,
+                    risk_level: RiskLevel::Prohibited,
+                    matched_rule: "tool_not_in_skill_allowlist".to_string(),
+                    reason: format!(
+                        "이 스킬이 허용한 도구가 아닙니다: {} (허용: {})",
+                        request.tool.as_str(),
+                        allowed.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                    normalized_target: String::new(),
+                    unblocked_by: PolicyLever::NotApplicable,
+                };
+            }
+        }
         match request.tool {
             // ---- 읽기·검색·git 조회: workspace 내부면 자동 허용 ----
             ToolName::ListFiles | ToolName::SearchText | ToolName::GitStatus | ToolName::GitDiff => {
@@ -510,6 +531,129 @@ mod tests {
         fs::write(dir.path().join("src/app.ts"), "const a = 1;\n").unwrap();
         let root = WorkspaceRoot::new(dir.path()).unwrap();
         (dir, root)
+    }
+
+    // ---- 스킬의 도구 허용목록 (state-machine 26절) ----
+
+    fn skill_policy(tools: &[ToolName]) -> TaskPolicy {
+        TaskPolicy {
+            allowed_tools: Some(tools.to_vec()),
+            // **넓히는 스위치를 함께 켠다.** 허용목록이 좁히는 쪽에서만 작동하는지 보려면,
+            // 정책이 원래 자동 허용했을 도구를 막는 것까지 확인해야 한다.
+            auto_approve_workspace_writes: true,
+            ..TaskPolicy::default()
+        }
+    }
+
+    /// 허용목록 밖의 도구는 **거부**다. 승인 필요가 아니다 — 스킬이 안 쓰기로 한 도구를
+    /// 사용자에게 물으면, 사용자는 자기가 고른 스킬이 왜 그걸 요구하는지 알 수 없다.
+    #[test]
+    fn a_tool_outside_the_skill_allowlist_is_denied() {
+        let (_d, root) = setup();
+        let policy = skill_policy(&[ToolName::ReadFile]);
+        let gate = PolicyGate::new(&policy);
+        let request = ToolRequest {
+            request_id: "req-1".to_string(),
+            task_id: "task-1".to_string(),
+            tool: ToolName::CreateFile,
+            args: json!({ "path": "src/new.ts", "content": "x" }),
+            risk_tier: None,
+            requested_by: json!({ "role": "executor" }),
+            created_at: None,
+        };
+        let decision = gate.evaluate(&request, &root, &policy);
+        assert_eq!(decision.decision, Decision::Deny, "{}", decision.reason);
+        assert_eq!(decision.matched_rule, "tool_not_in_skill_allowlist");
+        // 무엇이 허용됐는지 함께 말한다 — 거부만 하면 사용자가 추측하게 된다.
+        assert!(decision.reason.contains("read_file"), "{}", decision.reason);
+    }
+
+    /// **허용목록은 넓히지 않는다.** 목록에 있어도 게이트의 분류를 그대로 지난다 —
+    /// 여기서 자동 허용이 되면 스킬 파일 한 줄이 정책을 푸는 경로가 된다.
+    #[test]
+    fn being_on_the_allowlist_does_not_relax_the_gate() {
+        let (dir, root) = setup();
+        std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+        let policy = skill_policy(&[ToolName::ApplyPatch, ToolName::DeleteFile]);
+        let gate = PolicyGate::new(&policy);
+
+        // 삭제는 허용목록에 있어도 여전히 승인이 필요하다(정책으로 낮출 수 없는 자리).
+        let delete = ToolRequest {
+            request_id: "req-1".to_string(),
+            task_id: "task-1".to_string(),
+            tool: ToolName::DeleteFile,
+            args: json!({ "path": "src/app.ts" }),
+            risk_tier: None,
+            requested_by: json!({ "role": "executor" }),
+            created_at: None,
+        };
+        let d = gate.evaluate(&delete, &root, &policy);
+        assert!(d.requires_user_approval, "{}", d.matched_rule);
+
+        // 비밀값 파일 쓰기도 마찬가지 — `auto_approve_workspace_writes`가 켜져 있어도 그렇다.
+        let secret = ToolRequest {
+            request_id: "req-2".to_string(),
+            task_id: "task-1".to_string(),
+            tool: ToolName::ApplyPatch,
+            args: json!({ "path": ".env", "patch": "@@ -1,1 +1,1 @@\n-a\n+A\n" }),
+            risk_tier: None,
+            requested_by: json!({ "role": "executor" }),
+            created_at: None,
+        };
+        let d = gate.evaluate(&secret, &root, &policy);
+        assert!(d.requires_user_approval, "{}", d.matched_rule);
+    }
+
+    /// **검증은 스킬이 끌 수 없다.** 허용목록에 `run_tests`를 적지 않아도 검증 명령은 지나야
+    /// 한다 — 여기서 막히면 스킬 파일 한 줄로 `VERIFYING`이 조용히 무력화된다(원칙 1).
+    ///
+    /// 목록을 만드는 쪽(`skills::validate`)이 `run_tests`를 넣어 주지만, **게이트가 그 사실에
+    /// 기대고 있다는 것을 여기서 고정한다** — 정책을 다른 경로로 만들면 그 보정이 없다.
+    #[test]
+    fn a_policy_that_forgot_run_tests_still_lets_verification_through() {
+        let (_d, root) = setup();
+        let skill = crate::skills::validate(
+            serde_json::from_str(r#"{"name":"s","allowedTools":["read_file"]}"#).unwrap(),
+        )
+        .unwrap();
+        let policy = TaskPolicy {
+            allowed_tools: skill.allowed_tools.clone(),
+            ..TaskPolicy::default()
+        };
+        let gate = PolicyGate::new(&policy);
+        let request = ToolRequest {
+            request_id: "req-1".to_string(),
+            task_id: "task-1".to_string(),
+            tool: ToolName::RunTests,
+            args: json!({ "program": "npm", "args": ["test"], "cwd": "." }),
+            risk_tier: None,
+            requested_by: json!({ "role": "orchestrator" }),
+            created_at: None,
+        };
+        let decision = gate.evaluate(&request, &root, &policy);
+        assert_ne!(
+            decision.matched_rule, "tool_not_in_skill_allowlist",
+            "스킬 허용목록이 검증 명령을 막았습니다 — 원칙 1이 깨집니다"
+        );
+    }
+
+    /// 허용목록이 없으면 아무것도 달라지지 않는다.
+    #[test]
+    fn no_allowlist_changes_nothing() {
+        let (_d, root) = setup();
+        let policy = TaskPolicy::default();
+        let gate = PolicyGate::new(&policy);
+        let request = ToolRequest {
+            request_id: "req-1".to_string(),
+            task_id: "task-1".to_string(),
+            tool: ToolName::CreateFile,
+            args: json!({ "path": "src/new.ts", "content": "x" }),
+            risk_tier: None,
+            requested_by: json!({ "role": "executor" }),
+            created_at: None,
+        };
+        let decision = gate.evaluate(&request, &root, &policy);
+        assert_ne!(decision.matched_rule, "tool_not_in_skill_allowlist");
     }
 
     // ---- 무인 정지의 처방 (state-machine 24.8절) ----
