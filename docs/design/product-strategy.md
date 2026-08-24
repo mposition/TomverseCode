@@ -55,7 +55,7 @@ status: accepted (2026-07-25) — 단, 2절의 **가설 게이트**를 통과하
 | §5 위험도 기반 적응형 검증 | **구현 완료(2단계)** — `TRIAGE` + `complexityTier`, 판정 신호에 경로 기반 위험 축 추가(13.4.1절). **4단계 확장은 보류**이며 이유는 로드맵이 아니라 측정에 있다(13.4.2절) — 지금 축이 두 라벨을 가르지 못하므로 넷으로 늘리면 이름만 넷이 된다. <!-- present: packages/sidecar/src/triage.ts --> |
 | §6 실제 성과 학습 라우터 | **부분** — 무엇이 표본인지를 정하고(multi-engine 8.1절) **집계까지 만들었다**(`tomverse-host metrics`의 `modelEvaluation`). 라우터를 그 값으로 바꾸는 일은 아직 하지 않았다 — `verdict`가 `separated`인 쌍이 실제로 생겼을 때가 그 시점이다. <!-- present: apps/desktop/src-tauri/core/src/metrics.rs, packages/sidecar/src/routing --> |
 | §7 검수 독립성 | **구현 완료** — 공급자 독립성은 불변식으로 강제(multi-engine 5절), narrative 독립성은 `blind` 모드로 구현했다. **기본값은 `informed`다** — 4.1절 실측이 blind의 이득을 지지하지 않았고, 그 철회 자체가 결과다. <!-- present: packages/sidecar/src/providers/prompts.ts --> |
-| §9 데이터 전송 투명성 | **구현 완료** — 하드 제외(context-engine 7절)에 더해 **화면과 CLI 양쪽에 표시가 있다**(`TransmissionPanel`, `tomverse-host transmission`, 감사 export). 이 집계가 서 있던 전제("모든 프롬프트 빌더가 같은 스냅샷을 싣는다")는 Rust 주석의 주장일 뿐이었고 이제 검사가 지킨다(7.1절). <!-- present: apps/desktop/src/components/TransmissionPanel.tsx, apps/desktop/src/components/AuditExportPanel.tsx, packages/sidecar/test/transmissionClaim.test.ts --> |
+| §9 데이터 전송 투명성 | **구현 완료** — 하드 제외(context-engine 7절)에 더해 **화면과 CLI 양쪽에 표시가 있다**(`TransmissionPanel`, `tomverse-host transmission`, 감사 export). 이 집계가 서 있던 전제("모든 프롬프트 빌더가 같은 스냅샷을 싣는다")는 Rust 주석의 주장일 뿐이었고 이제 검사가 지킨다(7.1절). **그러나 파일만 세고 있었다** — 프로젝트 규칙 전문과 커밋되지 않은 변경 요약이 매 호출에 함께 나가는데 화면에 없었고, 이제 `sentContext`로 나온다. 아직 세지 않는 것(검증 출력·사용자 판정 원문)은 `UNREPORTED_SECTIONS`에 **적혀 있다**(7.2절). <!-- present: apps/desktop/src/components/TransmissionPanel.tsx, apps/desktop/src/components/AuditExportPanel.tsx, packages/sidecar/test/transmissionClaim.test.ts --> |
 | §10 재현 가능한 Agent Trace | **구현 완료** — 기록(`task_events` append-only + export)에 더해 **러너가 있다**: `tomverse-host reproduce`가 DB 없이 검사하고 `--apply`가 각 단계를 Policy Gate에 그대로 태운다(state-machine 21절). <!-- present: apps/desktop/src-tauri/core/src/reproduce.rs --> |
 | §2 모델 불일치 화면 | **구현 완료** — 3.9절 불일치 판정 카드. 표가 아니라 **강제 선택 카드**가 된 이유는 16절에 있다. <!-- present: apps/desktop/src/components/DisagreementCard.tsx --> |
 | §3 Candidate Arena | **미착수** — 복수 구현 경쟁·선택 로직이 없다. ~~worktree 격리 자체가 없다~~ → **그 선행 조건은 M2에서 갖춰졌다**(state-machine 22절). <!-- absent: apps/desktop/src-tauri/core/src/arena.rs --> |
@@ -384,6 +384,53 @@ excluded from context"). 모델이 그 파일이 없다고 보고 내용을 추�
 대한 전칭 명제는 언제나 참이기 때문이다.
 
 같은 이유로 Rust 주석에서 **개수를 뺐다**. 숫자를 적으면 늘었을 때 주석이 낡는다.
+
+### 7.2 세 번째 자리 — 파일 목록이 "전부"로 읽혔다
+
+7.1이 두 자리를 잡았는데, 세 번째가 남아 있었다. 그리고 이건 문장의 문제가 아니라 **집계가
+아예 세지 않던 것**이다.
+
+전송 화면은 `sentFiles`와 `namedOnlyFiles`만 보여줬다. 그런데 프롬프트에 실리는 것은 파일만이
+아니다:
+
+- **프로젝트 규칙**(`CLAUDE.md`/`AGENTS.md`)은 **전문이 매 호출에** 실린다. 컨텍스트 엔진의
+  선정을 거치지 않으므로 `relevantFiles`에 없고, 따라서 화면에도 없었다. **그 화면을 본
+  사용자는 자기 `CLAUDE.md`가 나가지 않았다고 믿는다.**
+- **커밋되지 않은 변경 요약**(`git diff --stat`)은 바뀐 파일을 전부 세므로, 컨텍스트로
+  선정되지 않은 파일의 **경로도 나간다.** 파일 목록만 보여주면 "이것만 나갔다"로 읽힌다.
+
+7.1이 "제외된 파일도 이름은 나간다"를 잡은 것과 같은 종류의 오독인데, 이번에는 **표시가 아니라
+데이터가 없었다.** 그래서 `sentContext`를 만들어 파일이 아닌 전송 내용을 같은 화면에 둔다.
+`sentFiles`와 섞지 않는 이유도 7.1과 같다: 선정을 거쳐 실린 것과 언제나 실리는 것은 다른
+사실이고, 섞으면 둘 다 뜻을 잃는다.
+
+#### 7.2.1 축이 둘이 아니었다 — 그래서 목록이 셋이다
+
+같은 일이 다시 생기는 것을 막으려고 "프롬프트의 모든 섹션을 집계가 설명하는가"를 검사로
+만들려 했다. 섹션을 전부 뽑아 보니 그 문항으로는 답할 수 없는 것들이 있었다:
+
+| 칸 | 무엇 | 왜 나눴나 |
+|---|---|---|
+| `REPORTED_SECTIONS` | 화면이 실제로 설명하는 것 | — |
+| `INSTRUCTION_SECTIONS` | 출력 형식 규칙 같은 **우리 지시문** | 사용자 데이터가 없다. 전송 목록에 올리면 진짜 데이터가 그 사이에 묻힌다 |
+| `UNREPORTED_SECTIONS` | **나가지만 아직 세지 않는 것** | 지시문 칸에 넣으면 거짓이고, 설명한다고 적으면 더 큰 거짓이다 |
+
+세 번째 칸이 이 설계의 핵심이다. 검증 출력(`Failing checks`)에는 실패한 테스트의 스택 트레이스와
+소스 조각이 들어가고 그건 `relevantFiles`에 없던 파일의 내용일 수 있다. 사용자 판정 원문
+(`Acceptance criteria`, `Clarifications`)도 그대로 나간다. 지금 화면은 그것들을 말하지 않으며,
+**말하지 않는다는 사실을 적어 두지 않으면 `REPORTED_SECTIONS`가 "전부"로 읽힌다.**
+
+그래서 이 목록 자체가 남은 과제 목록이 된다. `transmissionClaim.test.ts`가 `prompts.ts`에서
+섹션을 뽑아 셋 중 정확히 한 칸에 있는지 확인하므로, 새 섹션은 **누군가 결정을 내려야** 통과한다.
+반대 방향도 본다 — 사라진 섹션이 목록에 남으면 이 검사는 통과하면서 목록만 낡고, 특히 세 번째
+칸에 낡은 항목이 남으면 "아직 할 일이 있다"고 계속 말하게 된다.
+
+#### 7.2.2 이 검사를 만들자 검사가 결함을 하나 더 찾았다
+
+섹션 대조를 처음 돌렸을 때 `Acceptance criteria`가 미분류로 걸렸다. 그건 `renderSnapshot`이
+아니라 다른 함수가 만드는 섹션인데, **프롬프트에 실리는 것은 마찬가지**다. 처음 문항을
+"`renderSnapshot`의 섹션"으로 좁게 잡았다면 못 잡았을 것이다 — 전송 투명성이 답해야 하는
+질문은 "무엇이 공급자에게 도달하는가"이지 "어느 함수가 만들었는가"가 아니다.
 
 ## 8. 기능 범위: Copilot 기능 전체 커버를 제품 명제로 삼는다
 

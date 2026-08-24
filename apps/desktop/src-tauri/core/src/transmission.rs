@@ -85,6 +85,73 @@ pub struct NamedOnlyFile {
     pub reason: String,
 }
 
+/// **파일이 아닌데 프롬프트에 실려 나가는 것.**
+///
+/// 이게 없던 동안 화면은 파일 목록만 보여줬고, 그건 "나간 것은 이 파일들뿐"으로 읽혔다.
+/// 실제로는 프로젝트 규칙 전문과 커밋되지 않은 변경 요약이 매 호출마다 함께 나가고 있었다
+/// (7.2절).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SentContext {
+    /// `renderSnapshot`이 만드는 섹션과 짝이다 — 아래 `REPORTED_SECTIONS` 참조.
+    pub section: String,
+    /// 사람이 읽는 설명. "무엇이" 나갔는지를 말한다.
+    pub detail: String,
+    /// 프롬프트에 실린 크기. **0이 "안 나갔다"는 뜻이 아니다** — 섹션 제목은 언제나 나간다.
+    pub bytes: u64,
+    /// 이 내용이 온 파일들(있으면). 프로젝트 규칙은 파일에서 오지만 `sentFiles`에는 없다 —
+    /// 컨텍스트 엔진이 고른 것이 아니라 항상 실리는 것이라 경로가 다르다.
+    pub sources: Vec<String>,
+}
+
+/// 프롬프트에 실리는 섹션의 **분류**. 세 목록의 합집합이 `prompts.ts`의 모든 섹션이어야 한다.
+///
+/// # 왜 셋인가
+///
+/// 처음에는 "집계가 설명하는가"만 물었다. 그런데 섹션을 전부 뽑아 보니 축이 둘이 아니었다:
+/// 우리가 모델에게 주는 **지시문**(출력 형식 규칙 같은 것)에는 사용자 데이터가 없고, 그걸
+/// 화면에 "나갔습니다"로 올리면 진짜 데이터가 그 안에 묻힌다. 반대로 **나가는데 아직 세지
+/// 못하는 것**도 있다 — 그걸 지시문 칸에 넣으면 거짓이 되고, 설명한다고 적으면 더 큰 거짓이
+/// 된다. 그래서 "아직 세지 않는다"를 **적어 두는 칸**을 만들었다.
+///
+/// 셋으로 나눈 덕분에 이 목록 자체가 7.2절의 남은 과제 목록이 된다.
+///
+/// `packages/sidecar/test/transmissionClaim.test.ts`가 `prompts.ts`에서 섹션을 뽑아 이
+/// 목록들과 대조한다 — 새 섹션은 **누군가 여기서 결정을 내려야** 통과한다.
+
+/// 화면이 무엇이 나갔는지 실제로 설명하는 섹션.
+pub const REPORTED_SECTIONS: &[&str] = &[
+    "Repository state",
+    "Project",
+    "Project rules",
+    "Files",
+    "Files deliberately excluded from context",
+];
+
+/// **우리가 모델에게 주는 지시문.** 사용자 데이터가 들어 있지 않으므로 전송 목록에 올리지
+/// 않는다 — 올리면 진짜 데이터가 지시문 사이에 묻힌다.
+pub const INSTRUCTION_SECTIONS: &[&str] = &["Output rules", "Verdict rules"];
+
+/// **나가지만 아직 세지 않는 것** (7.2절의 남은 과제).
+///
+/// 여기 있는 것들은 전부 사용자·저장소에서 온 내용이다. 특히 검증 출력에는 실패한 테스트의
+/// 스택 트레이스와 소스 조각이 그대로 들어가고, 그건 `relevantFiles`에 없던 파일의 내용일 수
+/// 있다. **지금 화면은 그것을 말하지 않는다.** 말하지 않는다는 사실을 여기 적어 두는 이유는,
+/// 적지 않으면 위 `REPORTED_SECTIONS`가 "전부"로 읽히기 때문이다.
+pub const UNREPORTED_SECTIONS: &[&str] = &[
+    "Task",
+    "Acceptance criteria",
+    "Clarifications already provided by the user",
+    "Draft author's interpretation",
+    "Draft author's stated risks",
+    "Proposed patch",
+    "Your previous draft was rejected before it was applied",
+    "Attempt number",
+    "Failing checks",
+    "Checks that passed",
+    "Already failing before your change — DO NOT try to fix these",
+    "Files your previous attempt changed",
+];
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Transmission {
     #[serde(rename = "taskId")]
@@ -100,12 +167,86 @@ pub struct Transmission {
     /// **경로와 사유만** 나간 파일 (secret 등으로 내용이 제외된 것). 위 모듈 주석 ①.
     #[serde(rename = "namedOnlyFiles")]
     pub named_only_files: Vec<NamedOnlyFile>,
+    /// 파일이 아닌데 함께 나간 것 — 프로젝트 규칙 전문, 커밋되지 않은 변경 요약 등(7.2절).
+    #[serde(rename = "sentContext")]
+    pub sent_context: Vec<SentContext>,
     /// 저장 기록에서 가려진 자격증명 모양의 수. **보낸 것에서 가려진 수가 아니다** — ②.
     #[serde(rename = "secretShapesMaskedInLog")]
     pub secret_shapes_masked_in_log: u64,
     /// 사용자가 자유 텍스트로 답한 횟수. 그 원문은 프롬프트에 그대로 실린다(17.11절).
     #[serde(rename = "freeTextAnswers")]
     pub free_text_answers: u64,
+}
+
+/// 파일이 아닌 전송 내용을 스냅샷 이벤트에서 뽑는다.
+///
+/// **섹션이 비어 있으면 넣지 않는다.** 0바이트짜리 항목을 늘어놓으면 화면이 "이것도 나갔다"로
+/// 읽히는데, 그 섹션은 프롬프트에 아예 없었다.
+fn collect_context(payload: &Value, out: &mut Vec<SentContext>) {
+    // ① 저장소 상태 — 브랜치 이름과 **커밋되지 않은 변경 요약**이다. 요약에는 이번 컨텍스트에
+    //    선정되지 않은 파일의 경로도 들어간다(`git diff --stat`은 바뀐 파일을 전부 센다).
+    //    그래서 "선정된 파일만 나갔다"는 읽기가 틀린다.
+    let branch = payload.get("gitBranch").and_then(Value::as_str).unwrap_or("");
+    let diff_summary = payload.get("gitDiffSummary").and_then(Value::as_str).unwrap_or("");
+    if !branch.is_empty() || !diff_summary.is_empty() {
+        let detail = if diff_summary.is_empty() {
+            format!("브랜치 이름 ({branch})")
+        } else {
+            format!("브랜치 이름 ({branch})과 커밋되지 않은 변경 요약 — 요약에는 컨텍스트로 선정되지 않은 파일의 경로도 들어갑니다")
+        };
+        out.push(SentContext {
+            section: "Repository state".to_string(),
+            detail,
+            bytes: (branch.len() + diff_summary.len()) as u64,
+            sources: Vec::new(),
+        });
+    }
+
+    let Some(meta) = payload.get("projectMeta") else {
+        return;
+    };
+
+    // ② 프로젝트 메타 — 언어 목록과 감지된 검증 명령.
+    let languages: Vec<String> = meta
+        .get("languages")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    let commands: Vec<&str> = ["buildCommand", "testCommand", "lintCommand", "typecheckCommand"]
+        .into_iter()
+        .filter(|k| meta.get(*k).map(|v| !v.is_null()).unwrap_or(false))
+        .collect();
+    if !languages.is_empty() || !commands.is_empty() {
+        out.push(SentContext {
+            section: "Project".to_string(),
+            detail: format!(
+                "언어({}) · 감지된 검증 명령 {}개",
+                if languages.is_empty() { "없음".to_string() } else { languages.join(", ") },
+                commands.len()
+            ),
+            bytes: meta.get("languages").map(|v| v.to_string().len()).unwrap_or(0) as u64,
+            sources: Vec::new(),
+        });
+    }
+
+    // ③ 프로젝트 규칙 — **파일 전문이 나간다.** 이게 빠져 있던 것이 7.2절의 결함이다.
+    //    `sentFiles`에 넣지 않는 이유: 저 목록은 컨텍스트 엔진이 고른 것이고, 규칙 파일은
+    //    선정을 거치지 않고 언제나 실린다. 같은 칸에 넣으면 두 사실이 뭉개진다.
+    if let Some(rules) = meta.get("agentsMdContent").and_then(Value::as_str) {
+        if !rules.is_empty() {
+            let sources: Vec<String> = meta
+                .get("agentsMdSources")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            out.push(SentContext {
+                section: "Project rules".to_string(),
+                detail: "프로젝트 규칙 파일의 **전문**이 매 호출에 실립니다".to_string(),
+                bytes: rules.len() as u64,
+                sources,
+            });
+        }
+    }
 }
 
 /// 한 태스크의 전송 사실을 모은다. **아무것도 쓰지 않는다.**
@@ -145,6 +286,7 @@ pub fn collect(store: &Store, task_id: &str) -> Result<Transmission, String> {
                 });
             }
         }
+        collect_context(payload, &mut out.sent_context);
         if let Some(excluded) = payload.get("excludedNotes").and_then(Value::as_array) {
             for note in excluded {
                 let Some(path) = note.get("path").and_then(Value::as_str) else {
@@ -322,6 +464,104 @@ mod tests {
         let p = &t.providers[0];
         assert!(!p.substituted, "모르는 것을 대체로 보고했습니다");
         assert!(p.resolved_models.is_empty(), "{:?}", p.resolved_models);
+    }
+
+    /// **프로젝트 규칙 파일의 전문이 나가는데 화면에 없었다** (7.2절).
+    ///
+    /// `sentFiles`에 `CLAUDE.md`가 없으므로, 그 화면을 본 사용자는 자기 규칙 파일이 나가지
+    /// 않았다고 믿는다. 정반대다 — 규칙 파일은 컨텍스트 선정을 거치지 않고 **매 호출에 전문이
+    /// 실린다.**
+    #[test]
+    fn project_rules_are_reported_even_though_they_are_not_selected_files() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &json!({
+                    "snapshotId": "snap-1",
+                    "gitBranch": "main",
+                    "relevantFiles": [],
+                    "excludedNotes": [],
+                    "projectMeta": {
+                        "languages": ["typescript"],
+                        "agentsMdPresent": true,
+                        "agentsMdContent": "규칙 본문 전체",
+                        "agentsMdSources": ["CLAUDE.md", "AGENTS.md"],
+                    },
+                }),
+            )
+            .unwrap();
+
+        let t = collect(&store, "task-1").unwrap();
+        let rules = t
+            .sent_context
+            .iter()
+            .find(|c| c.section == "Project rules")
+            .expect("프로젝트 규칙이 전송 목록에 없습니다");
+        assert_eq!(rules.sources, vec!["CLAUDE.md".to_string(), "AGENTS.md".to_string()]);
+        assert!(rules.bytes > 0, "전문이 나갔는데 크기가 0입니다");
+        // 선정된 파일 칸에 섞지 않는다 — 두 사실은 다른 경로로 실린다.
+        assert!(t.sent_files.is_empty(), "{:?}", t.sent_files);
+    }
+
+    /// **커밋되지 않은 변경 요약에는 선정되지 않은 파일의 경로가 들어간다.**
+    ///
+    /// `git diff --stat`은 바뀐 파일을 전부 세므로, 컨텍스트에 들어가지 않은 파일의 이름도
+    /// 프롬프트로 나간다. 화면이 파일 목록만 보여주면 "이것만 나갔다"로 읽힌다.
+    #[test]
+    fn the_uncommitted_diff_summary_is_reported_as_going_out() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &json!({
+                    "snapshotId": "snap-1",
+                    "gitBranch": "feature/x",
+                    "gitDiffSummary": " src/unrelated.ts | 3 +-\n 1 file changed",
+                    "relevantFiles": [],
+                    "excludedNotes": [],
+                }),
+            )
+            .unwrap();
+
+        let t = collect(&store, "task-1").unwrap();
+        let state = t
+            .sent_context
+            .iter()
+            .find(|c| c.section == "Repository state")
+            .expect("저장소 상태가 전송 목록에 없습니다");
+        assert!(state.bytes > 0);
+        // 그 요약이 무엇을 담는지 화면이 말해야 한다 — 크기만으로는 읽는 사람이 알 수 없다.
+        assert!(state.detail.contains("선정되지 않은"), "{}", state.detail);
+    }
+
+    /// **없는 섹션을 0바이트로 늘어놓지 않는다.** 그러면 화면이 "이것도 나갔다"로 읽히는데
+    /// 그 섹션은 프롬프트에 아예 없었다.
+    #[test]
+    fn a_section_that_was_never_rendered_is_not_listed() {
+        let (_d, mut store) = seeded();
+        // **`projectMeta`가 있는데 규칙만 비어 있는 상태**여야 한다. 메타 자체가 없으면
+        // 수집이 그 앞에서 끝나 이 검사가 빈 분기를 지나간다 — 실제로 그렇게 공허했다.
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &json!({
+                    "snapshotId": "snap-1",
+                    "relevantFiles": [],
+                    "excludedNotes": [],
+                    "projectMeta": { "languages": ["typescript"], "agentsMdPresent": false, "agentsMdContent": "" },
+                }),
+            )
+            .unwrap();
+        let t = collect(&store, "task-1").unwrap();
+        assert!(
+            !t.sent_context.iter().any(|c| c.section == "Project rules"),
+            "규칙이 없는데 목록에 있습니다: {:?}",
+            t.sent_context
+        );
     }
 
     /// **제외된 파일도 이름은 나간다.** 내용이 빠졌다고 아무것도 안 나간 것이 아니다 —

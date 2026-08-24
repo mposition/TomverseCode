@@ -12,6 +12,11 @@ import type { Transmission } from "../types";
  * 있다고 착각해 추측하는 것을 막기 위해서다). 그래서 "Local only"라고만 쓰면 안 된다 —
  * 경로도 안 나간 것으로 읽힌다.
  *
+ * **③ 파일만 보여주면 "이것만 나갔다"로 읽힌다.** 프롬프트에는 프로젝트 규칙 파일의 **전문**과
+ * 커밋되지 않은 변경 요약(선정되지 않은 파일의 경로를 포함한다)이 함께 실린다. 한동안 이
+ * 화면은 그것들을 말하지 않았고, 그래서 자기 `CLAUDE.md`가 나가지 않았다고 믿게 만들었다
+ * (7.2절).
+ *
  * **② 마스킹은 저장 기록에만 걸린다.** `secretShapesMaskedInLog`는 DB에 남기기 전에 가린
  * 개수이고, 같은 답변은 프롬프트에 **원문으로** 실려 나갔다(17.11절). 이 숫자를 그냥 올리면
  * "가려져서 안 나갔다"로 읽히는데 정반대다.
@@ -22,7 +27,7 @@ import type { Transmission } from "../types";
  * 않은 것은 다른 사실이고, 화면이 그걸 뭉개면 거짓 안심을 준다.
  */
 export function TransmissionPanel({ transmission }: { transmission: Transmission }) {
-  const { providers, sentFiles, namedOnlyFiles } = transmission;
+  const { providers, sentFiles, namedOnlyFiles, sentContext } = transmission;
 
   if (!transmission.snapshotTaken) {
     return (
@@ -93,6 +98,29 @@ export function TransmissionPanel({ transmission }: { transmission: Transmission
             </li>
           ))}
         </ul>
+      )}
+
+      {sentContext.length > 0 && (
+        <>
+          <h3>파일 목록에 없지만 함께 나간 것</h3>
+          {/* ③ — 파일 목록이 "전부"로 읽히지 않도록 같은 화면에 둔다. */}
+          <p className="muted small">
+            아래는 컨텍스트 선정을 거치지 않고 <strong>매 호출에 함께 실리는 내용</strong>입니다.
+          </p>
+          <ul className="transmission-files">
+            {sentContext.map((c) => (
+              <li key={c.section}>
+                <code>{c.section}</code> <span className="muted small">({c.bytes.toLocaleString()}자)</span>
+                <div className="muted small">{c.detail}</div>
+                {c.sources.length > 0 && (
+                  <div className="muted small">
+                    출처: {c.sources.map((p) => <code key={p}>{p}</code>).reduce((a, b) => <>{a}, {b}</>)}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
       )}
 
       {namedOnlyFiles.length > 0 && (

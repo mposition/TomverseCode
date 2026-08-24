@@ -452,6 +452,14 @@ export interface Transmission {
   providers: ProviderTransmission[];
   sentFiles: { path: string; reason: string; truncated: boolean }[];
   namedOnlyFiles: { path: string; reason: string }[];
+  /**
+   * **파일이 아닌데 함께 나간 것** (7.2절). 프로젝트 규칙 파일의 전문, 커밋되지 않은 변경
+   * 요약 등이 여기 온다.
+   *
+   * 이 칸이 없던 동안 화면은 파일 목록만 보여줬고 그건 "나간 것은 이 파일들뿐"으로 읽혔다 —
+   * 정작 `CLAUDE.md`는 매 호출에 전문이 실려 나가는데 목록에 없었다.
+   */
+  sentContext: { section: string; detail: string; bytes: number; sources: string[] }[];
   /** **저장 기록에서** 가려진 자격증명 모양의 수. 보낸 것에서 가려진 수가 아니다(17.11절). */
   secretShapesMaskedInLog: number;
   freeTextAnswers: number;

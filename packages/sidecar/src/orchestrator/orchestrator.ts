@@ -396,6 +396,10 @@ export class Orchestrator {
       snapshotId: this.snapshot.snapshotId,
       gitBranch: this.snapshot.gitBranch,
       gitDirty: this.snapshot.gitDirty,
+      // **커밋되지 않은 변경 요약도 프롬프트에 실린다**(`renderSnapshot`의 Repository state).
+      // 이걸 이벤트에 넣지 않으면 전송 기록이 그것을 말할 수 없고, 화면은 "선정된 파일만
+      // 나갔다"로 읽힌다 — 이 요약에는 선정되지 않은 파일의 경로도 들어간다(7.2절).
+      gitDiffSummary: this.snapshot.gitDiffSummary ?? null,
       // 어떤 파일이 어느 공급자에 갔는지 표시하기 위한 데이터 (README "데이터 전송 투명성").
       relevantFiles: this.snapshot.relevantFiles.map((f) => ({
         path: f.path,
@@ -2290,6 +2294,7 @@ export class Orchestrator {
         snapshotId: refreshed.snapshot.snapshotId,
         gitBranch: refreshed.snapshot.gitBranch,
         gitDirty: refreshed.snapshot.gitDirty,
+        gitDiffSummary: refreshed.snapshot.gitDiffSummary ?? null,
         relevantFiles: refreshed.snapshot.relevantFiles.map((f) => ({
           path: f.path,
           reason: f.reason,
