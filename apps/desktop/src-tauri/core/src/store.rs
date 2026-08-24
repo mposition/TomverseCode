@@ -114,6 +114,8 @@ pub enum StoreOp {
     ReadTransmission,
     /// 감사 export를 만들지 못했다.
     ReadExport,
+    /// 무인 정지의 처방을 모으지 못했다 (state-machine 24.8절).
+    ReadBlocked,
 }
 
 impl StoreOp {
@@ -132,6 +134,7 @@ impl StoreOp {
         StoreOp::ReadThresholds,
         StoreOp::ReadTransmission,
         StoreOp::ReadExport,
+        StoreOp::ReadBlocked,
     ];
 }
 
@@ -164,6 +167,7 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::ReadThresholds => "storeReadThresholds",
             StoreOp::ReadTransmission => "storeReadTransmission",
             StoreOp::ReadExport => "storeReadExport",
+            StoreOp::ReadBlocked => "storeReadBlocked",
         }
     }
 
@@ -182,6 +186,7 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::ReadThresholds => "화면이 쓰는 문턱을 집계할 수 없습니다",
             StoreOp::ReadTransmission => "전송 내역을 읽을 수 없습니다",
             StoreOp::ReadExport => "감사 기록을 만들 수 없습니다",
+            StoreOp::ReadBlocked => "무인 정지의 처방을 읽을 수 없습니다",
         };
         format!("{what}: {}", self.detail)
     }

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,7 +42,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..", "..");
 
 const RUST_TYPES = path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "src", "types.rs");
-const RUST_HOST_BIN = path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "src", "bin", "host.rs");
+const SRC_TAURI = path.join(REPO_ROOT, "apps", "desktop", "src-tauri");
 const TS_TASK = path.join(REPO_ROOT, "packages", "protocol", "src", "task.ts");
 
 /**
@@ -135,22 +135,77 @@ function tsPolicyFields(): Set<string> {
   return names;
 }
 
-/** 호스트가 Rust `TaskPolicy` 리터럴에서 **명시적으로 세팅하는** 필드. */
-function hostSetsRustFields(): Set<string> {
-  const source = stripLineComments(readFileSync(RUST_HOST_BIN, "utf8"));
-  const block = blockAfter(source, "let policy = TaskPolicy {", "bin/host.rs");
-  const names = new Set<string>();
-  for (const line of topLevelLines(block)) {
-    const field = line.match(/^\s*([a-z0-9_]+)\s*:/);
-    if (field) names.add(field[1]!);
+/**
+ * sidecar로 policy를 보내는 **모든** 자리.
+ *
+ * 처음에는 헤드리스 호스트 하나만 봤다. **그때 UI 경로가 이미 갈라져 있었다** — `session.rs`가
+ * 자기 map을 따로 조립하고 있었고 M3에서 늘어난 필드가 거기에는 없었다. 검사가 한 파일만
+ * 보면 "지켜지고 있다"는 인상만 주고 정작 production 경로를 놓친다.
+ *
+ * 그래서 파일 목록을 적지 않는다. `src-tauri` 아래를 훑어 `"policy": {` 블록을 전부 찾고,
+ * 그중 **`TaskPolicy`를 향하는 것**만 고른다 — 판정 기준은 그 블록이 `executionMode`를
+ * 담고 있는가다(`PolicyDecision` 응답 map과 구별된다).
+ */
+function policySites(): { label: string; source: string; block: string }[] {
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === "target" || entry.name === "node_modules") continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".rs")) files.push(full);
+    }
+  };
+  walk(SRC_TAURI);
+
+  const sites: { label: string; source: string; block: string }[] = [];
+  for (const file of files) {
+    const source = stripLineComments(readFileSync(file, "utf8"));
+    let at = source.indexOf('"policy": {');
+    while (at !== -1) {
+      const block = blockFrom(source, at + '"policy":'.length);
+      // `PolicyDecision` 응답 map은 `executionMode`를 담지 않는다.
+      if (block.includes("executionMode")) {
+        sites.push({ label: path.relative(REPO_ROOT, file), source, block });
+      }
+      at = source.indexOf('"policy": {', at + 1);
+    }
   }
+  return sites;
+}
+
+/** 여는 중괄호부터 짝이 맞는 닫는 중괄호까지. */
+function blockFrom(source: string, from: number): string {
+  const open = source.indexOf("{", from);
+  assert.notEqual(open, -1);
+  let depth = 0;
+  for (let i = open; i < source.length; i += 1) {
+    if (source[i] === "{") depth += 1;
+    else if (source[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(open + 1, i);
+    }
+  }
+  assert.fail("policy 블록이 닫히지 않았습니다");
+}
+
+/** 한 파일이 Rust `TaskPolicy` 리터럴에서 **명시적으로 세팅하는** 필드. */
+function rustFieldsSetIn(source: string, label: string): Set<string> {
+  const names = new Set<string>();
+  let at = source.indexOf("TaskPolicy {");
+  while (at !== -1) {
+    for (const line of topLevelLines(blockFrom(source, at + "TaskPolicy".length))) {
+      const field = line.match(/^\s*([a-z0-9_]+)\s*:/);
+      if (field) names.add(field[1]!);
+    }
+    at = source.indexOf("TaskPolicy {", at + 1);
+  }
+  assert.ok(label.length > 0);
   return names;
 }
 
-/** 호스트가 sidecar로 **실제로 보내는** policy map의 키. */
-function hostSendsJsonKeys(): Set<string> {
-  const source = stripLineComments(readFileSync(RUST_HOST_BIN, "utf8"));
-  const block = blockAfter(source, '"policy": {', "bin/host.rs");
+/** 한 policy map이 실제로 보내는 키. */
+function jsonKeysIn(block: string): Set<string> {
   const keys = new Set<string>();
   for (const line of topLevelLines(block)) {
     const key = line.match(/^\s*"([A-Za-z][A-Za-z0-9]*)"\s*:/);
@@ -159,14 +214,13 @@ function hostSendsJsonKeys(): Set<string> {
   return keys;
 }
 
-test("정책 다리의 세 곳을 파싱할 수 있다", () => {
-  // 아래 단언들은 전부 "집합에 들어 있는가"를 묻는다. 파서가 조용히 빈 집합을 주면 그
-  // 단언들이 어느 쪽으로 무너지는지가 검사마다 다르고, 최악의 경우 전부 통과한다.
-  // 그래서 개수를 먼저 고정한다 — **파싱이 죽으면 여기서 죽는다.**
+test("policy를 보내는 자리를 전부 찾을 수 있다", () => {
+  const sites = policySites();
+  // **최소 둘이다** — 헤드리스 호스트와 UI(`session.rs`). 하나만 찾았다면 스캔이 깨졌거나
+  // 한쪽이 사라진 것이고, 어느 쪽이든 아래 검사가 절반만 돌게 된다.
+  assert.ok(sites.length >= 2, `policy map을 ${sites.length}곳만 찾았습니다: ${sites.map((s) => s.label).join(", ")}`);
   assert.ok(rustPolicyFields().size >= 5, `Rust TaskPolicy 필드를 ${rustPolicyFields().size}개만 찾았습니다`);
   assert.ok(tsPolicyFields().size >= 5, `TS TaskPolicy 필드를 ${tsPolicyFields().size}개만 찾았습니다`);
-  assert.ok(hostSetsRustFields().size >= 3, `호스트가 세팅하는 필드를 ${hostSetsRustFields().size}개만 찾았습니다`);
-  assert.ok(hostSendsJsonKeys().size >= 5, `호스트가 보내는 키를 ${hostSendsJsonKeys().size}개만 찾았습니다`);
 });
 
 /**
@@ -174,42 +228,49 @@ test("정책 다리의 세 곳을 파싱할 수 있다", () => {
  *
  * 조건이 둘인 이유: Rust에만 있는 정책(sidecar가 관여하지 않는 값)을 넣을 자리를 남겨야 하고,
  * 동시에 "양쪽에 같은 이름이 있다"는 것은 **두 프로세스가 그 값을 함께 쓰기로 했다**는 뜻이다.
- * 함께 쓰기로 한 값을 호스트가 한쪽에만 세팅하면, 다른 쪽은 기본값을 자기 사실로 믿는다.
+ * 함께 쓰기로 한 값을 한쪽에만 세팅하면, 다른 쪽은 기본값을 자기 사실로 믿는다.
+ *
+ * **자리마다 따로 본다.** 한 자리가 지키고 있어도 다른 자리가 갈라져 있을 수 있고, 실제로
+ * 그랬다.
  */
-test("호스트가 세팅한 정책 중 sidecar도 아는 것은 반드시 전달된다", () => {
+test("정책을 세팅한 자리는 그것을 sidecar로도 보낸다", () => {
   const rust = rustPolicyFields();
   const ts = tsPolicyFields();
-  const setInRust = hostSetsRustFields();
-  const sent = hostSendsJsonKeys();
+  let checked = 0;
 
-  const shared: string[] = [];
-  for (const field of setInRust) {
-    const jsonKey = rust.get(field);
-    // `..TaskPolicy::default()`처럼 필드가 아닌 줄은 무시한다.
-    if (!jsonKey || !ts.has(jsonKey)) continue;
-    shared.push(jsonKey);
-    assert.ok(
-      sent.has(jsonKey),
-      `호스트가 Rust 정책 ${field}를 세팅하지만 sidecar로는 ${jsonKey}를 보내지 않습니다. ` +
-        `sidecar는 기본값을 자기 사실로 믿게 됩니다 (state-machine 24.3절)`
-    );
+  for (const site of policySites()) {
+    const setInRust = rustFieldsSetIn(site.source, site.label);
+    const sent = jsonKeysIn(site.block);
+    for (const field of setInRust) {
+      const jsonKey = rust.get(field);
+      // `..TaskPolicy::default()`처럼 필드가 아닌 줄은 무시한다.
+      if (!jsonKey || !ts.has(jsonKey)) continue;
+      checked += 1;
+      assert.ok(
+        sent.has(jsonKey),
+        `${site.label}이 Rust 정책 ${field}를 세팅하지만 sidecar로는 ${jsonKey}를 보내지 않습니다. ` +
+          `sidecar는 기본값을 자기 사실로 믿게 됩니다 (state-machine 24.3절)`
+      );
+    }
   }
 
-  // 공유 필드가 하나도 없으면 위 루프는 아무것도 검사하지 않는다.
-  assert.ok(shared.length >= 3, `양쪽이 함께 아는 정책을 ${shared.length}개만 찾았습니다: ${shared.join(", ")}`);
+  // 공유 필드를 하나도 못 봤으면 위 루프는 아무것도 검사하지 않았다.
+  assert.ok(checked >= 5, `양쪽이 함께 아는 정책을 ${checked}번만 확인했습니다`);
 });
 
 /**
  * 반대 방향. 오타는 값이 없는 게 아니라 **키가 다른 값**을 만들고, 받는 쪽에서는 그냥
  * `undefined`라 기본값이 적용된다 — 위 검사와 정확히 같은 방식으로 조용하다.
  */
-test("호스트가 보내는 정책 키는 전부 TS TaskPolicy에 있다", () => {
+test("보내는 정책 키는 전부 TS TaskPolicy에 있다", () => {
   const ts = tsPolicyFields();
-  for (const key of hostSendsJsonKeys()) {
-    assert.ok(
-      ts.has(key),
-      `호스트가 보내는 policy 키 ${JSON.stringify(key)}가 TS TaskPolicy에 없습니다 — ` +
-        `오타이거나, 받는 쪽에서 지워진 필드입니다`
-    );
+  for (const site of policySites()) {
+    for (const key of jsonKeysIn(site.block)) {
+      assert.ok(
+        ts.has(key),
+        `${site.label}이 보내는 policy 키 ${JSON.stringify(key)}가 TS TaskPolicy에 없습니다 — ` +
+          `오타이거나, 받는 쪽에서 지워진 필드입니다`
+      );
+    }
   }
 });

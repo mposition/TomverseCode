@@ -252,6 +252,22 @@ impl SessionState {
             .map_err(|e| StoreIssue::new(StoreOp::ReadTransmission, format!("직렬화: {e}")).ui())
     }
 
+    /// 무인 정지의 처방 (state-machine 24.8절). **읽기 전용이다.**
+    pub fn task_blocked(&self, task_id: &str) -> Result<Value, UiMessage> {
+        let out = self.read_store(StoreOp::ReadBlocked, |s| tomverse_core::blocked::collect(s, task_id))?;
+        serde_json::to_value(out).map_err(|e| StoreIssue::new(StoreOp::ReadBlocked, format!("직렬화: {e}")).ui())
+    }
+
+    /// 브랜치를 remote로 올리고 PR 폼 URL을 만든다 (state-machine 28절).
+    ///
+    /// **읽기 전용이 아니다** — push가 일어난다. 그래서 다른 조회들과 달리 `read_store`가 아니라
+    /// 활성 호스트를 지나며, 승인 왕복도 그대로 탄다(28.4절). 호출자는 별도 스레드에서 부른다:
+    /// 승인 모달이 뜨는 동안 이 호출이 블록되므로, 같은 스레드면 교착된다.
+    pub fn open_pull_request(&self, task_id: &str, remote: &str, base: &str) -> Result<Value, String> {
+        let host = self.with_active(|active| Ok(active.host.clone()))?;
+        host.open_pull_request(task_id, remote, base)
+    }
+
     /// 이 워크스페이스에서 쓸 공급자를 정한다 (multi-engine-routing.md 16절).
     ///
     /// **즉시 반영되지 않는다.** 강제는 sidecar spawn 시 자격증명을 거르는 것으로 일어나므로,

@@ -44,6 +44,8 @@ import { TransmissionPanel } from "./components/TransmissionPanel";
 import { BudgetPanel } from "./components/BudgetPanel";
 import { precheckBudget } from "./lib/budgetCheck";
 import { AuditExportPanel } from "./components/AuditExportPanel";
+import { BlockedPanel } from "./components/BlockedPanel";
+import { PullRequestPanel } from "./components/PullRequestPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
 import { TaskHistory } from "./components/TaskHistory";
@@ -1358,6 +1360,10 @@ export default function App() {
               {/* 6.3절 감사 export. 전송 패널보다 **아래**에 둔다 — "무엇이 나갔는가"는 이 작업을
                   보는 사람의 질문이고, "감사에 낼 기록을 다오"는 다른 시점의 질문이다. */}
               {finalResult && <AuditExportPanel taskId={finalResult.taskId} />}
+              {/* 무인 정지의 처방(24.8절)과 PR 올리기(28절). 둘 다 **끝난 작업에 대한 질문**이라
+                  결과 옆에 둔다 — 진행 중에는 답이 아직 없다. */}
+              {finalResult && <BlockedPanel taskId={finalResult.taskId} />}
+              {finalResult && <PullRequestPanel taskId={finalResult.taskId} />}
             </div>
 
             <div className="column">

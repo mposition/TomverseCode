@@ -225,6 +225,35 @@ fn task_export(state: tauri::State<'_, SessionState>, task_id: String) -> Result
     Ok(envelope(state.task_export(&task_id)))
 }
 
+/// 무인 정지의 처방 (state-machine 24.8절). **읽기 전용이다.**
+#[tauri::command]
+fn task_blocked(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
+    Ok(envelope(state.task_blocked(&task_id)))
+}
+
+/// 브랜치를 올리고 PR 폼 URL을 만든다 (state-machine 28절).
+///
+/// **별도 스레드로 보낸다.** push는 승인 모달을 띄우고 그 답을 기다리는데, 같은 스레드면
+/// `respond_approval`이 처리되지 못해 교착된다 — `start_task`와 같은 이유다.
+#[tauri::command]
+async fn open_pull_request(
+    app: tauri::AppHandle,
+    task_id: String,
+    remote: Option<String>,
+    base: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = app.state::<SessionState>();
+        session.open_pull_request(
+            &task_id,
+            remote.as_deref().unwrap_or("origin"),
+            base.as_deref().unwrap_or("main"),
+        )
+    })
+    .await
+    .map_err(|e| format!("PR 스레드 오류: {e}"))?
+}
+
 /// 백엔드(sidecar) 상태. **읽기 전용이다** — 물었다고 다시 띄우지 않는다.
 ///
 /// `recovery`가 화면의 "다시 열기" 버튼을 정한다. 안내 문장을 화면이 문자열로 비교하게 두면
@@ -386,6 +415,8 @@ pub fn run() {
             list_tasks,
             derived_thresholds,
             task_transmission,
+            task_blocked,
+            open_pull_request,
             task_export,
             list_models,
             set_allowed_providers,
