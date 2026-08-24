@@ -74,6 +74,16 @@ export interface WorkspaceSnapshot {
   /** 제외된 파일 중 사용자에게 알려야 하는 것 (너무 큼, secret 패턴 등) */
   /** 이 태스크에 적용된 스킬. 없으면 스킬을 쓰지 않은 것이다. */
   skill?: SnapshotSkill;
+  /**
+   * 같은 세션의 **앞선 태스크에서 사용자가 정한 것** (state-machine 27절).
+   *
+   * 스킬과 같은 이유로 스냅샷에 있다 — 프롬프트에 실리는 것은 스냅샷을 통해 나가야 전송
+   * 집계가 "각 공급자 모두에게 갔다"고 말할 수 있다(7.1절).
+   *
+   * **이 태스크의 `doneCriteria`가 아니다.** 섞으면 기준 평가가 사용자가 이번에 말한 적 없는
+   * 요구로 태스크를 판정한다(17.9절).
+   */
+  sessionMemory?: { text: string; decisionCount: number; truncated: boolean };
   excludedNotes?: { path: string; reason: string }[];
   createdAt: ISODateTime;
 }

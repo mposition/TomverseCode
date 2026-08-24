@@ -39,6 +39,13 @@ export function renderSnapshot(snapshot: WorkspaceSnapshot): string {
     parts.push(`## Project rules (${(meta.agentsMdSources ?? []).join(", ")})\n${meta.agentsMdContent}`);
   }
 
+  // 앞선 판정은 프로젝트 규칙 **다음**이다 — 저장소의 규칙보다 이번 세션에서 사용자가 정한
+  // 것이 더 구체적인 요구다. 그리고 이 자리는 `## Acceptance criteria`와 **다르다**:
+  // 저기는 이번 태스크에서 검증할 것, 여기는 이미 합의된 제약이다(27.2절).
+  if (snapshot.sessionMemory) {
+    parts.push(`## Decisions carried from earlier tasks\n${snapshot.sessionMemory.text}`);
+  }
+
   // 스킬 지시문은 **프로젝트 규칙 다음, 파일 앞**에 온다. 프로젝트 규칙은 저장소의 것이고
   // 스킬은 이번 작업에 사용자가 고른 것이라, 충돌하면 뒤에 오는 쪽이 더 구체적인 요구다.
   if (snapshot.skill) {

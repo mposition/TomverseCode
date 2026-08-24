@@ -75,6 +75,14 @@ export interface TaskStartParams {
    */
   skill?: { name: string; instructions: string };
   /**
+   * 같은 세션의 앞선 태스크에서 사용자가 정한 것 (state-machine 27절).
+   *
+   * **Rust가 저장소에서 유도해 채운다.** sidecar가 SQLite를 직접 열지 않는다는 규칙 때문만이
+   * 아니다 — "무엇을 나를 수 있는가"(사용자 판정만, 모델 제안은 아님)는 권위에 관한 판정이고,
+   * 그 판정이 sidecar에 있으면 장악당한 sidecar가 모델 제안을 사용자 판정으로 나를 수 있다.
+   */
+  sessionMemory?: { text: string; decisionCount: number; truncated: boolean };
+  /**
    * 실험 제어 — **평가 하네스 전용**이며 UI 경로에서는 항상 비어 있다.
    *
    * 왜 프로토콜에 두는가: 가설 게이트(evals/hypothesis-gate)는 production 실행 경로를 그대로

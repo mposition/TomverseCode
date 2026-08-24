@@ -119,6 +119,7 @@ struct Args {
     mcp_servers: Vec<tomverse_core::mcp::McpServerConfig>,
     hooks: Vec<tomverse_core::hooks::HookConfig>,
     skill: Option<PathBuf>,
+    session_id: Option<String>,
     /// `metrics` 전용: 워크스페이스 필터를 끄고 DB 전체를 집계한다.
     all_workspaces: bool,
     /// `windows-landing` 전용 — tauri 번들 디렉터리.
@@ -178,6 +179,7 @@ fn parse_args() -> Result<Args, String> {
         mcp_servers: Vec::new(),
         hooks: Vec::new(),
         skill: None,
+        session_id: None,
         worktree: None,
         worktree_base: None,
         force: false,
@@ -211,6 +213,7 @@ fn parse_args() -> Result<Args, String> {
             "--mcp-server" => args.mcp_servers.push(parse_mcp_server(&value()?)?),
             "--hook" => args.hooks.push(parse_hook(&value()?)?),
             "--skill" => args.skill = Some(PathBuf::from(value()?)),
+            "--session" => args.session_id = Some(value()?),
             "--db" => args.db = Some(PathBuf::from(value()?)),
             "--artifacts" => args.artifacts = Some(PathBuf::from(value()?)),
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
@@ -320,7 +323,8 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 fn usage() -> String {
     "usage: tomverse-host <run|rollback|revert|recover|tasks|show|blocked|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
-     [--sidecar <index.js>] [--skill <파일.json>] [--auto-approve-writes] [--auto-approve-verification]\n\
+     [--sidecar <index.js>] [--skill <파일.json>] [--session <id>]\n\
+     [--auto-approve-writes] [--auto-approve-verification]\n\
      [--allow-git-commit] [--cancel-after-ms <n>]\n\
      [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
      \n\
@@ -333,6 +337,8 @@ fn usage() -> String {
                  쉼표로 나눈 argv다.** 등록한 argv 그대로 Policy Gate를 지나 실행되며,\n\
                  **실패해도 태스크의 판정을 바꾸지 않는다**(훅은 관찰자다). 걸 수 있는 phase는\n\
                  PLANNING/EXECUTING/VERIFYING/COMPLETED/FAILED/CANCELLED\n\
+     run --session <id> — 이 세션에 붙는다. 같은 세션의 앞선 태스크에서 **사용자가 정한 것**이\n\
+                 이번 프롬프트에 실린다(모델 제안은 실리지 않는다). 생략하면 새 세션이다\n\
      run --skill <파일.json> — 스킬 적용. 지시문(프롬프트에 실린다)·도구 허용목록(게이트가\n\
                  좁힌다)·역할별 모델 지정을 담는다. **허용목록은 좁히기만 하며**, 적지 않아도\n\
                  검증 명령은 남는다. 명시한 --pin-* 가 스킬의 모델 지정을 이긴다\n\
@@ -559,7 +565,12 @@ fn real_main() -> Result<i32, String> {
             if args.message.trim().is_empty() {
                 return Err("run에는 --message가 필요합니다".to_string());
             }
-            let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+            // **세션을 명시하면 그 세션에 붙는다.** 매번 새 세션을 만들면 세션 메모리는
+            // 영원히 비어 있고, 그러면 그 기능이 동작하는지 확인할 방법이 없다(27절).
+            let session_id = args
+                .session_id
+                .clone()
+                .unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
             let task_id = args
                 .task_id
                 .clone()
@@ -1001,6 +1012,19 @@ fn run_task(
         Value::Object(pins)
     };
 
+    // **이 태스크를 만든 뒤에 모은다.** 앞에서 모으면 이번 태스크가 아직 없어 제외 대상도
+    // 없지만, 재실행 경로에서는 이미 있을 수 있다 — 그때 자기 판정을 자기에게 나르게 된다.
+    let memory = host.with_store(|s| tomverse_core::session_memory::collect(s, session_id, task_id))?;
+    let session_memory = if memory.is_empty() {
+        Value::Null
+    } else {
+        json!({
+            "text": memory.render(),
+            "decisionCount": memory.decisions.len(),
+            "truncated": memory.truncated,
+        })
+    };
+
     let params = json!({
         "taskRequest": {
             "taskId": task_id,
@@ -1032,6 +1056,10 @@ fn run_task(
         // 프롬프트 프리셋과 모델 지정만 sidecar로 간다 — 도구 허용목록은 policy로 갔고
         // 강제하는 곳은 Rust다(26.1절).
         "skill": skill.as_ref().map(|s| json!({ "name": s.name, "instructions": s.instructions })),
+        // 세션 메모리는 **Rust가 저장소에서 유도한다**(27.1절) — 무엇을 나를 수 있는지는
+        // 권위에 관한 판정이고, 그 판정이 sidecar에 있으면 장악당한 sidecar가 모델 제안을
+        // 사용자 판정으로 나를 수 있다.
+        "sessionMemory": session_memory,
         "workspaceName": workspace_name(host.root()),
         "availableProviders": providers,
         // 비어 있으면 아예 넣지 않는다 — production 실행과 바이트 단위로 같은 params가 되도록.

@@ -123,6 +123,7 @@ pub const REPORTED_SECTIONS: &[&str] = &[
     "Repository state",
     "Project",
     "Project rules",
+    "Decisions carried from earlier tasks",
     "Skill instructions",
     "Files",
     "Files deliberately excluded from context",
@@ -213,6 +214,25 @@ fn collect_context(payload: &Value, out: &mut Vec<SentContext>) {
                 section: "Skill instructions".to_string(),
                 detail: format!("스킬 \"{name}\"의 지시문 **원문**이 매 호출에 실립니다"),
                 bytes: instructions.len() as u64,
+                sources: Vec::new(),
+            });
+        }
+    }
+
+    // ③ 세션 메모리 — 앞선 태스크에서 사용자가 정한 것이 이 태스크의 프롬프트로 나간다(27절).
+    //    **한 태스크에만 실렸던 판정이 다른 태스크로 넘어간다는 사실**이라 화면이 말해야 한다.
+    if let Some(memory) = payload.get("sessionMemory").filter(|v| !v.is_null()) {
+        let text = memory.get("text").and_then(Value::as_str).unwrap_or("");
+        if !text.is_empty() {
+            let count = memory.get("decisionCount").and_then(Value::as_u64).unwrap_or(0);
+            let truncated = memory.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+            out.push(SentContext {
+                section: "Decisions carried from earlier tasks".to_string(),
+                detail: format!(
+                    "이 세션의 앞선 태스크에서 사용자가 정한 {count}건이 이번 호출에도 실립니다{}",
+                    if truncated { " (상한에 걸려 일부만)" } else { "" }
+                ),
+                bytes: text.len() as u64,
                 sources: Vec::new(),
             });
         }

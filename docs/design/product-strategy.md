@@ -481,6 +481,7 @@ excluded from context"). 모델이 그 파일이 없다고 보고 내용을 추�
 | **병렬 서브에이전트(Fleet)** | worktree 격리 기반 N개 병렬 실행 + 비용 상한 | 자동 위임, 작업 분해 |
 | **명령별 승인 · workspace 경계 · secret 탐지** | 이미 설계 완료(Policy Gate, allowlist, context-engine 7절) | 정책 문법 확장 |
 | **세션 메모리** | 세션 내 대화·결정 유지 | 장기 프로젝트 메모리 |
+| ↳ 위 행의 현재 상태 | **코어 구현 완료, UI 미배선**(M3) — `tomverse-host run --session <id>`. **사용자 판정만 나르고 모델 제안은 나르지 않는다** — 후보를 세션 너머로 나르면 사용자가 동의한 적 없는 문장이 "이미 정해진 것"이 되고 권위의 계층(16.1절)이 조용히 무너진다. 유도를 Rust가 하는 이유도 그것이다: 그 판정이 sidecar에 있으면 장악당한 sidecar가 제안을 판정으로 나를 수 있다. 나른 것은 **이 태스크의 기준이 아니며**(섞으면 사용자가 말한 적 없는 요구로 판정한다) 상한과 절단 표시가 있다([state-machine 27절](./state-machine-and-protocol.md)) <!-- present: apps/desktop/src-tauri/core/src/session_memory.rs --> | — |
 | **Windows 특화** | 12절 상위 항목 | 12절 전체 |
 
 ### 8.3 명시적 제외 — 다만 "야심"이 아니라 "정의" 때문

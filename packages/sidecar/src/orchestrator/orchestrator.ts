@@ -115,6 +115,11 @@ export interface RunInput {
    */
   skill?: { name: string; instructions: string };
   /**
+   * 같은 세션의 앞선 태스크에서 사용자가 정한 것 (state-machine 27절).
+   * **Rust가 저장소에서 유도해 채운다** — 무엇을 나를 수 있는지는 권위에 관한 판정이다.
+   */
+  sessionMemory?: { text: string; decisionCount: number; truncated: boolean };
+  /**
    * 실험 하네스(evals/hypothesis-gate) 전용 제어. **production 경로에서는 항상 undefined다.**
    * Rust가 `task.start` params로 채우며, Node는 이 값을 만들어내지 않는다.
    */
@@ -405,6 +410,9 @@ export class Orchestrator {
     if (this.input.skill) {
       this.snapshot.skill = { name: this.input.skill.name, instructions: this.input.skill.instructions };
     }
+    if (this.input.sessionMemory) {
+      this.snapshot.sessionMemory = this.input.sessionMemory;
+    }
     await this.emit("SNAPSHOT_CREATED", {
       snapshotId: this.snapshot.snapshotId,
       gitBranch: this.snapshot.gitBranch,
@@ -415,6 +423,8 @@ export class Orchestrator {
       gitDiffSummary: this.snapshot.gitDiffSummary ?? null,
       // 스킬 지시문도 프롬프트에 실려 나간다 — 전송 집계가 세야 한다(7.2절).
       skill: this.snapshot.skill ?? null,
+      // 앞선 태스크의 판정이 이 태스크의 프롬프트로 넘어간다는 사실도 마찬가지다(27.3절).
+      sessionMemory: this.snapshot.sessionMemory ?? null,
       // 어떤 파일이 어느 공급자에 갔는지 표시하기 위한 데이터 (README "데이터 전송 투명성").
       relevantFiles: this.snapshot.relevantFiles.map((f) => ({
         path: f.path,

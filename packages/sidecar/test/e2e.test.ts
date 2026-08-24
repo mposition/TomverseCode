@@ -72,6 +72,8 @@ interface RunOptions {
   hooks?: string[];
   /** 스킬 파일 경로 (state-machine 26절). */
   skill?: string;
+  /** 이 세션에 붙는다 (state-machine 27절). 생략하면 새 세션이다. */
+  session?: string;
 }
 
 function hostAvailable(): boolean {
@@ -112,6 +114,7 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
   if (options.worktree) args.push("--worktree", options.worktree);
   for (const hook of options.hooks ?? []) args.push("--hook", hook);
   if (options.skill) args.push("--skill", options.skill);
+  if (options.session) args.push("--session", options.session);
   if (options.autoApproveWrites) args.push("--auto-approve-writes");
   if (options.autoApproveVerification) args.push("--auto-approve-verification");
   if (options.allowGitCommit) args.push("--allow-git-commit");
@@ -1034,6 +1037,54 @@ test("스킬 파일의 알 수 없는 도구 이름은 실행 전에 거절된�
     );
     assert.notEqual(result.status, 0, "오타 난 도구 이름이 통과했습니다");
     assert.match(result.stderr, /read_file/, result.stderr);
+  });
+});
+
+/**
+ * **모델 제안은 세션을 넘지 않는다** (state-machine 27.2절).
+ *
+ * 세션 메모리가 나르는 것은 사용자 판정뿐이다. 모델 제안까지 나르면 사용자가 한 번도 동의한
+ * 적 없는 문장이 다음 태스크에서 "이미 정해진 것"으로 보인다 — 제안이 요구로 세탁되는
+ * 경로이고, 권위의 계층(16.1절)이 조용히 무너지는 자리다.
+ *
+ * **이 시나리오가 e2e로 만들 수 있는 쪽이다.** 반대쪽(사용자 판정이 실제로 넘어가는 것)은
+ * 헤드리스 호스트가 판정 카드에 답할 수 없어 여기서 만들 수 없다 — 그 배선은 Rust 단위
+ * 테스트(수집 규칙)와 sidecar 단위 테스트(프롬프트 도달)가 나눠 본다(27.6절).
+ */
+test("세션을 이어도 모델 제안은 다음 태스크로 넘어가지 않는다", () => {
+  withRepo((repo, stateDir) => {
+    const session = "sess-e2e-memory";
+    const first = runHost(repo, stateDir, { mode: "verified", session });
+    // 첫 태스크가 **모델 제안 기준을 실제로 만들었는지** 먼저 확인한다. 안 만들었으면
+    // 아래 단언은 "나를 것이 없어서" 통과하고, 아무것도 검증하지 않는다.
+    const proposals = (first.final.acceptanceCriteria ?? []).filter((c) => c.source !== "user_decision");
+    assert.ok(proposals.length > 0, `첫 태스크가 모델 제안 기준을 만들지 않았습니다: ${JSON.stringify(first.final.acceptanceCriteria)}`);
+
+    const second = runHost(repo, stateDir, { mode: "fast", session });
+    assert.notEqual(second.taskId, first.taskId);
+
+    const raw = execFileSync(
+      HOST_BIN,
+      [
+        "transmission",
+        "--workspace",
+        repo.root,
+        "--task",
+        second.taskId,
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+      ],
+      { encoding: "utf8" }
+    );
+    const transmission = JSON.parse(raw.trim().split("\n").pop() as string) as {
+      sentContext: { section: string }[];
+    };
+    assert.ok(
+      !transmission.sentContext.some((c) => c.section === "Decisions carried from earlier tasks"),
+      `모델 제안이 다음 태스크로 넘어갔습니다: ${raw}`
+    );
   });
 });
 

@@ -38,6 +38,7 @@ function build(
     message?: string;
     retry?: typeof DEFAULT_RETRY_POLICY;
     providerTimeoutMs?: number;
+    sessionMemory?: { text: string; decisionCount: number; truncated: boolean };
   } = {}
 ): { orchestrator: Orchestrator; host: FakeHost } {
   const host = new FakeHost({ ...WORKSPACE_FILES, ...hostOptions });
@@ -46,6 +47,7 @@ function build(
       taskRequest: taskRequest(overrides.message),
       policy: makePolicy(overrides.policy),
       availableProviders: overrides.providers ?? ["fake-a", "fake-b"],
+      sessionMemory: overrides.sessionMemory,
     },
     {
       transport: host.asTransport(),
@@ -807,4 +809,58 @@ test("fix loop 라운드마다 다시 읽는다", async () => {
 
   // 최초 1회 + 라운드마다 1회.
   assert.equal(host.events.filter((e) => e.type === "SNAPSHOT_CREATED").length, 3);
+});
+
+// ---- 세션 메모리가 프롬프트까지 도달하는가 (state-machine 27절) ----
+
+/**
+ * **params에서 프롬프트까지의 배선을 확인한다.**
+ *
+ * Rust가 세션 메모리를 유도하는 규칙은 Rust 단위 테스트가 본다. 여기서 보는 것은 그 값이
+ * `RunInput` → 스냅샷 → 프롬프트로 **실제로 도달하는가**다. 바로 이 배선이 스킬을 붙일 때
+ * 한 번 끊겨 있었다(`index.ts`가 params에서 꺼내지 않았다) — 그때는 e2e가 잡았지만, 세션
+ * 메모리의 양성 경로는 e2e로 만들 수 없다(헤드리스 호스트가 판정 카드에 답할 수 없다).
+ *
+ * 그래서 **모든 프롬프트**를 확인한다. 하나에만 실리면 전송 집계가 "각 공급자 모두에게
+ * 갔다"고 말할 근거가 사라진다(7.1절).
+ */
+test("세션 메모리는 모든 프롬프트에 실린다", async () => {
+  const prompts: { kind: string; text: string }[] = [];
+  const carried = "EARLIER_DECISION_MARKER";
+  const { orchestrator } = build(
+    { contents: { "package.json": '{"scripts":{"test":"node --test"}}', "src/app.ts": "a\n" } },
+    {
+      defaultPatch: VALID_PATCH,
+      onPrompt: (kind, text) => prompts.push({ kind, text }),
+    },
+    { sessionMemory: { text: carried, decisionCount: 1, truncated: false } }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  assert.ok(prompts.length > 0, "프롬프트가 하나도 만들어지지 않았습니다");
+  for (const prompt of prompts) {
+    assert.ok(
+      prompt.text.includes(carried),
+      `${prompt.kind} 프롬프트에 세션 메모리가 없습니다 — 전송 집계의 전제가 깨집니다`
+    );
+  }
+});
+
+/** 세션 메모리가 없으면 그 섹션도 없다. 빈 섹션을 싣으면 모델이 "앞선 판정이 없다"가 아니라
+ * "여기 뭔가 있어야 하는데 비었다"로 읽는다. */
+test("세션 메모리가 없으면 그 섹션도 프롬프트에 없다", async () => {
+  const prompts: { kind: string; text: string }[] = [];
+  const { orchestrator } = build(
+    { contents: { "package.json": '{"scripts":{"test":"node --test"}}', "src/app.ts": "a\n" } },
+    { defaultPatch: VALID_PATCH, onPrompt: (kind, text) => prompts.push({ kind, text }) }
+  );
+  await orchestrator.run();
+  assert.ok(prompts.length > 0);
+  for (const prompt of prompts) {
+    assert.ok(
+      !prompt.text.includes("Decisions carried from earlier tasks"),
+      `${prompt.kind} 프롬프트에 빈 세션 메모리 섹션이 있습니다`
+    );
+  }
 });

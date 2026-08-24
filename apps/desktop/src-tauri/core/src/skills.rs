@@ -102,7 +102,6 @@ pub const ALL_TOOLS: &[ToolName] = &[
     ToolName::RunCommand,
     ToolName::GitStatus,
     ToolName::GitDiff,
-
     ToolName::RunTests,
     ToolName::McpCall,
 ];

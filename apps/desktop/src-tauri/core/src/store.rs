@@ -646,6 +646,29 @@ impl Store {
     /// 정렬을 `source` 우선으로 하는 이유: 권위를 가진 것(`user_decision`)이 먼저 보여야
     /// 최종 보고 화면에서 사용자가 자기 판정을 먼저 읽는다. 알파벳 순으로 `draft_proposal`이
     /// 앞서므로 명시적으로 뒤집는다.
+    /// 이 세션의 **다른** 태스크에서 사용자가 정한 것들 — 최신순 (session_memory.rs, 27절).
+    ///
+    /// **`source = 'user_decision'`으로 좁히는 것이 이 질의의 전부다.** 모델 제안까지 주면
+    /// 부르는 쪽이 그것을 다시 걸러야 하고, 한 번 빠뜨리면 제안이 요구로 세탁된다(16.1절).
+    /// 걸러야 할 것을 애초에 주지 않는다.
+    pub fn session_user_decisions(
+        &self,
+        session_id: &str,
+        exclude_task_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.task_id, c.text, c.decided_at
+             FROM acceptance_criteria c
+             JOIN tasks t ON t.task_id = c.task_id
+             WHERE t.session_id = ?1 AND c.task_id != ?2 AND c.source = 'user_decision'
+             ORDER BY c.decided_at DESC, c.rowid DESC",
+        )?;
+        let rows = stmt.query_map(params![session_id, exclude_task_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn acceptance_criteria(&self, task_id: &str) -> Result<Vec<AcceptanceCriterionRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT criterion_id, text, source, disagreement_id, decided_at

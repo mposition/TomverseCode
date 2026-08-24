@@ -28,6 +28,7 @@ pub mod paths;
 pub mod policy;
 pub mod proctree;
 pub mod reproduce;
+pub mod session_memory;
 pub mod sidecar;
 pub mod skills;
 pub mod store;
