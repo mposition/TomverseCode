@@ -547,7 +547,7 @@ fn real_main() -> Result<i32, String> {
         }
     };
 
-    let policy = TaskPolicy {
+    let policy_for_task = TaskPolicy {
         // 도구 허용목록은 **게이트에 꽂힌다.** sidecar에 알려 주기는 하지만 지키는 것은 여기다.
         allowed_tools: skill.as_ref().and_then(|s| s.allowed_tools.clone()),
         auto_approve_workspace_writes: args.auto_approve_writes,
@@ -616,7 +616,7 @@ fn real_main() -> Result<i32, String> {
             };
             let mut task_host = TaskHost::new(
                 root,
-                policy,
+                policy_for_task.clone(),
                 store.clone(),
                 artifacts,
                 approvals,
@@ -640,6 +640,10 @@ fn real_main() -> Result<i32, String> {
                 task_host = task_host.with_hooks(tomverse_core::hooks::HookRegistry::new(args.hooks.clone()));
             }
             let host = Arc::new(task_host);
+            // **이 태스크의 정책을 등록한다**(ui-wireframes 3.16.2절). 헤드리스 호스트는
+            // 태스크가 하나뿐이라 워크스페이스 기본값과 같지만, **경로를 하나로 둔다** —
+            // 두 경로면 언젠가 한쪽만 고쳐진다.
+            host.begin_task(&task_id, policy_for_task)?;
             let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id, skill.as_ref());
             // **띄운 서버를 반드시 내린다.** 남기면 사용자가 모르는 프로세스가 계속 돈다.
             // 태스크가 실패해도 내려야 하므로 `?` 앞에서 한다.
@@ -671,7 +675,7 @@ fn real_main() -> Result<i32, String> {
                 .ok_or_else(|| "rollback에는 --task가 필요합니다".to_string())?;
             let host = TaskHost::new(
                 root,
-                policy,
+                policy_for_task.clone(),
                 store,
                 artifacts,
                 approvals,
@@ -774,7 +778,7 @@ fn real_main() -> Result<i32, String> {
                 .ok_or_else(|| "revert에는 --task가 필요합니다".to_string())?;
             let host = TaskHost::new(
                 root,
-                policy,
+                policy_for_task.clone(),
                 store,
                 artifacts,
                 approvals,
@@ -843,7 +847,7 @@ fn real_main() -> Result<i32, String> {
                 .ok_or_else(|| "pr에는 --task가 필요합니다".to_string())?;
             let host = TaskHost::new(
                 root,
-                policy,
+                policy_for_task.clone(),
                 store.clone(),
                 artifacts,
                 approvals,

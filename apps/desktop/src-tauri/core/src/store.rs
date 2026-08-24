@@ -116,6 +116,8 @@ pub enum StoreOp {
     ReadExport,
     /// 무인 정지의 처방을 모으지 못했다 (state-machine 24.8절).
     ReadBlocked,
+    /// 앞선 태스크에서 사용자가 정한 것을 읽지 못했다 (state-machine 27절).
+    ReadSessionMemory,
 }
 
 impl StoreOp {
@@ -135,6 +137,7 @@ impl StoreOp {
         StoreOp::ReadTransmission,
         StoreOp::ReadExport,
         StoreOp::ReadBlocked,
+        StoreOp::ReadSessionMemory,
     ];
 }
 
@@ -168,6 +171,7 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::ReadTransmission => "storeReadTransmission",
             StoreOp::ReadExport => "storeReadExport",
             StoreOp::ReadBlocked => "storeReadBlocked",
+            StoreOp::ReadSessionMemory => "storeReadSessionMemory",
         }
     }
 
@@ -187,6 +191,7 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::ReadTransmission => "전송 내역을 읽을 수 없습니다",
             StoreOp::ReadExport => "감사 기록을 만들 수 없습니다",
             StoreOp::ReadBlocked => "무인 정지의 처방을 읽을 수 없습니다",
+            StoreOp::ReadSessionMemory => "앞선 태스크에서 정한 것을 읽을 수 없습니다",
         };
         format!("{what}: {}", self.detail)
     }

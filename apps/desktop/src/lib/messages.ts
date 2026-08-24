@@ -56,6 +56,7 @@ const KO: Record<string, Render> = {
   storeReadTransmission: (p) => `전송 내역을 읽을 수 없습니다: ${p.detail}`,
   storeReadExport: (p) => `감사 기록을 만들 수 없습니다: ${p.detail}`,
   storeReadBlocked: (p) => `무인 정지의 처방을 읽을 수 없습니다: ${p.detail}`,
+  storeReadSessionMemory: (p) => `앞선 태스크에서 정한 것을 읽을 수 없습니다: ${p.detail}`,
 };
 
 export interface Rendered {

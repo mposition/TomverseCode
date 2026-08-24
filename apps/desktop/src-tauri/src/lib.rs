@@ -81,6 +81,13 @@ async fn start_task(
     /// 역할별 모델 지정(`{ executor?, reviewer? }`). 없으면 라우터가 정한다.
     /// **Rust는 해석하지 않고 그대로 넘긴다** — 모델 목록은 Node의 것이다.
     model_pins: Option<Value>,
+    /// 무인 실행 (state-machine 24절). 켜면 승인이 필요한 지점에서 **멈춘다** —
+    /// 대신 승인해 주지 않는다.
+    unattended: Option<bool>,
+    /// 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
+    auto_approve_verification: Option<bool>,
+    /// 스킬 파일 경로 (26절). **Rust가 읽는다.**
+    skill_path: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Result<Value, String> {
     let execution_mode = match mode.as_str() {
@@ -101,6 +108,9 @@ async fn start_task(
             allow_git_commit.unwrap_or(false),
             budget,
             model_pins.unwrap_or(Value::Null),
+            unattended.unwrap_or(false),
+            auto_approve_verification.unwrap_or(false),
+            skill_path.as_deref(),
             timeout,
         )
     })

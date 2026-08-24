@@ -155,6 +155,17 @@ export default function App() {
    */
   const [allowGitCommit, setAllowGitCommit] = useState(false);
   /**
+   * 무인 실행 (state-machine 24절)과 그 짝인 검증 명령 자동 승인(24.5절).
+   *
+   * **두 스위치를 따로 둔다.** 무인 실행만 켜면 태스크는 검증 명령 승인에서 멈추고, 그건
+   * 버그가 아니라 24.4절이 정한 동작이다. 하나로 합치면 "무인을 켰더니 검증 명령이 자동
+   * 승인됐다"가 되는데, 그 둘은 사용자가 따로 판단할 일이다.
+   */
+  const [unattended, setUnattended] = useState(false);
+  const [autoApproveVerification, setAutoApproveVerification] = useState(false);
+  /** 스킬 파일 경로 (26절). **Rust가 읽는다** — 화면은 경로만 넘긴다. */
+  const [skillPath, setSkillPath] = useState("");
+  /**
    * 이 작업의 예산 상한 (multi-engine-routing.md 10.6절).
    *
    * `""`(빈 문자열)는 **상한 없음**이다. `0`이나 `null`로 표현하지 않는 이유: 입력란을 비운
@@ -551,6 +562,10 @@ export default function App() {
         allowGitCommit,
         ...budgetArgs(budgetText),
         modelPins: modelPins(pinExecutor, pinReviewer),
+        unattended,
+        autoApproveVerification,
+        // 빈 문자열은 "경로 없음"이지 "빈 경로"가 아니다.
+        skillPath: skillPath.trim() === "" ? null : skillPath.trim(),
       });
       setFinalResult(result);
       // 전송 내역은 **끝난 뒤에** 읽는다. 실패해도 결과 화면을 막지 않는다 — 이건 사후 조회이고,
@@ -1020,6 +1035,48 @@ export default function App() {
                   />
                   변경을 git에 커밋 (매번 승인을 묻습니다)
                 </label>
+              </fieldset>
+              {/* 무인 실행 (state-machine 24절). **켜도 승인 정책은 그대로다** — 달라지는 것은
+                  승인이 필요한 지점에서 묻는 대신 멈춘다는 것뿐이고, 그 정지는 사용자 거부로
+                  기록되지 않는다(24.2절). */}
+              <fieldset className="modes" disabled={running}>
+                <legend>무인 실행</legend>
+                <label>
+                  <input type="checkbox" checked={unattended} onChange={(e) => setUnattended(e.target.checked)} />
+                  승인을 묻지 않고, 필요한 지점에서 멈춤
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={autoApproveVerification}
+                    onChange={(e) => setAutoApproveVerification(e.target.checked)}
+                  />
+                  프로젝트가 선언한 검증 명령은 묻지 않고 실행
+                </label>
+                {/* 켜지 않으면 무인 실행이 검증에서 멈춘다는 것을 **미리** 말한다 —
+                    멈춘 뒤에 알면 그건 도구의 오작동으로 읽힌다(24.5절). */}
+                {unattended && !autoApproveVerification && (
+                  <p className="muted small">
+                    검증 명령도 승인을 요구하므로, 이 상태의 무인 실행은 <strong>검증에서 멈춥니다</strong>.
+                  </p>
+                )}
+              </fieldset>
+              {/* 스킬 (26절). 파일을 **Rust가 읽는다** — 도구 허용목록의 출처가 화면이 되면
+                  장악당한 화면이 "허용목록은 전부입니다"라고 말할 수 있다. */}
+              <fieldset className="modes" disabled={running}>
+                <legend>스킬 (비우면 사용 안 함)</legend>
+                <label className="pin-row">
+                  <input
+                    value={skillPath}
+                    onChange={(e) => setSkillPath(e.target.value)}
+                    placeholder="skill.json 경로"
+                    spellCheck={false}
+                  />
+                </label>
+                <p className="muted small">
+                  지시문은 프롬프트에 실리고 <strong>전송 내역에 집계됩니다</strong>. 도구 허용목록은 좁히기만
+                  하며, 검증 명령은 적지 않아도 남습니다.
+                </p>
               </fieldset>
               {/* 역할별 모델 지정 (multi-engine-routing.md 15절).
                   **목록이 비면 이 블록 자체를 그리지 않는다** — 빈 select는 "고를 것이 없다"와

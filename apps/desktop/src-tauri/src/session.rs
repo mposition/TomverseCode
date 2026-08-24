@@ -118,6 +118,36 @@ pub struct SessionState {
     cancels: Arc<CancellationRegistry>,
 }
 
+/// 스킬의 모델 지정 위에 화면이 명시한 지정을 덮는다.
+///
+/// **우선순위를 한 곳에서 정한다**(26.1절). 두 값을 sidecar로 각각 보내면 거기서 다시 정하게
+/// 되고, 그러면 규칙이 둘이 된다.
+fn merge_model_pins(skill: Option<&tomverse_core::skills::ModelPins>, explicit: Value) -> Value {
+    let mut merged = serde_json::Map::new();
+    if let Some(pins) = skill {
+        if let Some(m) = &pins.executor {
+            merged.insert("executor".to_string(), Value::String(m.clone()));
+        }
+        if let Some(m) = &pins.reviewer {
+            merged.insert("reviewer".to_string(), Value::String(m.clone()));
+        }
+    }
+    if let Some(obj) = explicit.as_object() {
+        for (key, value) in obj {
+            // **null은 "지정 없음"이지 "지우기"가 아니다.** 화면이 키만 보내고 값을 비운
+            // 경우까지 스킬의 지정을 지우면, 사용자가 스킬로 정한 것이 조용히 사라진다.
+            if !value.is_null() {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if merged.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(merged)
+    }
+}
+
 impl SessionState {
     /// 앱 시작 시 1회. 저장 계층을 열고 **비정상 종료된 작업을 INTERRUPTED로 확정한다.**
     ///
@@ -567,13 +597,27 @@ impl SessionState {
     /// 태스크 시작. sidecar 요청이 끝날 때까지 블록되므로 호출자는 별도 스레드에서 부른다.
     /// `allow_git_commit`은 **커밋을 제안할지**를 정할 뿐 승인 등급을 낮추지 않는다.
     ///
-    /// Rust `TaskPolicy`는 워크스페이스를 열 때 고정되고 여기서 바뀌지 않는다. 그래서 UI 토글이
-    /// 켜져도 Policy Gate는 `git commit`을 계속 High 승인으로 다룬다 — **UI에서 켠 스위치가
-    /// 신뢰 경계의 위험 등급을 낮출 수 있으면 그건 게이트가 아니다**(원칙 2·3).
-    /// 토글이 하는 일은 "매 태스크마다 커밋 승인 모달을 띄울 것인가"뿐이다.
+    /// # 정책의 수명은 **태스크**다 (ui-wireframes 3.16.2절)
+    ///
+    /// 종전에는 Rust `TaskPolicy`가 워크스페이스를 열 때 고정되고 여기서 바뀌지 않았다.
+    /// 그 결정의 이유는 지금도 유효하다 — **UI에서 켠 스위치가 신뢰 경계의 위험 등급을 낮출 수
+    /// 있으면 그건 게이트가 아니다**(원칙 2·3). 그래서 `allow_git_commit` 토글은 지금도 게이트를
+    /// 건드리지 않는다: `git commit`은 계속 High 승인이고, 토글이 정하는 것은 "커밋을 제안할
+    /// 것인가"뿐이다.
+    ///
+    /// 바뀐 것은 **어떤 필드가 태스크마다 달라져도 되는가**이고, 그 판정은 방향으로 한다:
+    ///
+    ///  - `allowed_tools`(Skills)는 **좁힌다** — 어떤 도구도 새로 허용되지 않는다(26.3절).
+    ///  - `unattended`(Autopilot)는 넓히지도 좁히지도 않는다 — 승인을 *묻지 않고 멈춘다*(24.2절).
+    ///  - `auto_approve_verification`은 **넓힌다.** 그런데도 받는 이유는 대상 집합을
+    ///    **Rust가 매니페스트에서 유도해 태스크 시작 시점에 고정**하기 때문이다(24.5절).
+    ///
+    /// **넓히는 방향은 이것이 마지막이어야 한다.** 위 셋이 통과하는 이유는 각각 다르고,
+    /// 그 이유가 없는 필드는 통과하지 못한다.
     /// `budget_usd`가 `None`이면 **상한 없이** 실행한다 — 사용자가 명시적으로 고른 경우이거나
     /// (가격을 모르는 모델) 화면이 그렇게 보낸 경우다. 값을 우리가 대신 채워 넣지 않는다:
     /// 상한은 사용자의 승인이고, 코드가 만들어낸 승인은 승인이 아니다.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_task(
         &self,
         message: &str,
@@ -581,6 +625,13 @@ impl SessionState {
         allow_git_commit: bool,
         budget_usd: Option<f64>,
         model_pins: Value,
+        /// 무인 실행 (state-machine 24절). 승인이 필요한 지점에서 **멈춘다**.
+        unattended: bool,
+        /// 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
+        auto_approve_verification: bool,
+        /// 스킬 파일 경로 (26절). **Rust가 읽는다** — 도구 허용목록의 출처가 UI가 되면
+        /// 장악당한 UI가 "허용목록은 전부입니다"라고 말할 수 있다.
+        skill_path: Option<&str>,
         timeout: Duration,
     ) -> Result<Value, String> {
         // **태스크를 시작하기 전에** 살아 있는지 확인한다(5절). 도중에 바꿔치기하면 진행 중인
@@ -611,6 +662,39 @@ impl SessionState {
         })
             .map_err(|e| format!("태스크를 만들 수 없습니다: {e}"))?;
 
+        // 스킬 파일은 **Rust가 읽는다**(26.1절). 화면이 읽어 넘기면 도구 허용목록의 출처가
+        // 화면이 되고, 그러면 장악당한 화면이 "허용목록은 전부입니다"라고 말할 수 있다.
+        let skill = match skill_path {
+            None => None,
+            Some(path) => Some(tomverse_core::skills::load(std::path::Path::new(path)).map_err(|e| e.to_string())?),
+        };
+
+        // **이 태스크의 정책을 여기서 정하고, 여기서만 정한다.** 등록은 한 번뿐이므로
+        // 진행 중에 바뀌지 않는다(3.16.2절).
+        let task_policy = TaskPolicy {
+            execution_mode: mode,
+            allow_git_commit,
+            unattended,
+            auto_approve_verification,
+            allowed_tools: skill.as_ref().and_then(|s| s.allowed_tools.clone()),
+            ..TaskPolicy::default()
+        };
+        host.begin_task(&task_id, task_policy)?;
+
+        // 스킬의 모델 지정은 화면이 명시한 지정에 **진다** — 우선순위를 한 곳에서 정한다(26.1절).
+        let model_pins = merge_model_pins(skill.as_ref().and_then(|s| s.model_pins.as_ref()), model_pins);
+
+        // 세션 메모리는 **Rust가 저장소에서 유도한다**(27.1절). 화면 경로에서는 세션이 실제로
+        // 여러 태스크를 담으므로, 헤드리스와 달리 이 값이 대체로 비어 있지 않다.
+        //
+        // **읽지 못하면 태스크를 시작하지 않는다.** 조용히 빈 값으로 넘어가면 사용자가 앞서
+        // 정한 것이 이번 태스크에서 사라지고, 그 사실은 아무 데도 보이지 않는다.
+        let memory = self
+            .read_store(StoreOp::ReadSessionMemory, |s| {
+                tomverse_core::session_memory::collect(s, &session_id, &task_id)
+            })
+            .map_err(|m| m.text.clone())?;
+
         let params = json!({
             "taskRequest": {
                 "taskId": task_id,
@@ -628,6 +712,23 @@ impl SessionState {
                 // 역할별 모델 지정. **Rust는 값을 해석하지 않고 그대로 넘긴다** — 모델 목록은
                 // Node의 것이고, 여기서 검증하면 두 곳이 서로 다른 규칙을 갖게 된다.
                 "modelPins": model_pins,
+                "unattended": unattended,
+                "autoApproveVerification": auto_approve_verification,
+                // 화면은 이 목록을 **지키지 않는다** — 지키는 것은 Rust의 게이트다(26.1절).
+                "allowedTools": skill
+                    .as_ref()
+                    .and_then(|s| s.allowed_tools.as_ref())
+                    .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
+            },
+            "skill": skill.as_ref().map(|s| json!({ "name": s.name, "instructions": s.instructions })),
+            "sessionMemory": if memory.is_empty() {
+                Value::Null
+            } else {
+                json!({
+                    "text": memory.render(),
+                    "decisionCount": memory.decisions.len(),
+                    "truncated": memory.truncated,
+                })
             },
             "workspaceName": self.info().and_then(|i| i.get("name").cloned()).unwrap_or(Value::Null),
             // 라우터가 보는 후보도 같은 목록이어야 한다 — 주입된 키와 후보가 어긋나면
@@ -705,7 +806,20 @@ impl SessionState {
         // **기억나지 않는 설정으로 저장소 이력을 바꾸는 것**보다 제안하지 않는 편이 안전하다.
         // **다시 실행은 새 승인이다.** 이전 태스크의 상한을 이어받지 않고 화면이 준 값을 쓴다 —
         // 상한이 태스크당이라는 결정의 직접적 귀결이고, 그 사실은 화면이 말해야 한다.
-        self.start_task(&task.user_message, mode, false, budget_usd, model_pins, timeout)
+        // **다시 실행은 새 태스크다**(16.6절). 그래서 원래 태스크의 정책을 물려받지 않는다 —
+        // 무인 실행이었다면 이번에도 무인일 이유가 없고, 스킬을 골랐다면 이번에도 그것을
+        // 고를지는 사용자가 정할 일이다. 물려받게 하려면 화면이 그것을 **보여준 뒤**여야 한다.
+        self.start_task(
+            &task.user_message,
+            mode,
+            false,
+            budget_usd,
+            model_pins,
+            false,
+            false,
+            None,
+            timeout,
+        )
     }
 
     /// 취소 요청. **두 방향 모두 필요하다:**

@@ -94,10 +94,63 @@ impl EventSink for NullSink {
     fn emit(&self, _channel: &str, _payload: &Value) {}
 }
 
+/// 한 태스크의 정책과 **그로부터 유도된 것들**. 태스크 수명 동안 불변이다.
+///
+/// # 왜 정책의 수명이 태스크인가
+///
+/// 종전에는 `TaskHost`가 정책 하나를 들고 있었고, UI 경로에서 그것은 **워크스페이스를 열 때
+/// 고정**됐다. 그 결정에는 이유가 있었다(`session.rs`): *"UI에서 켠 스위치가 신뢰 경계의 위험
+/// 등급을 낮출 수 있으면 그건 게이트가 아니다."* 그런데 그 대가로 **태스크마다 다른 정책이
+/// 필요한 기능들이 전부 배선될 수 없었다** — Autopilot·Skills·검증 명령 자동 승인
+/// (ui-wireframes 3.16.2절).
+///
+/// 정책을 가변 필드로 바꿔 태스크마다 갈아끼우는 것이 가장 짧은 길인데, 그러면 **진행 중인
+/// 태스크의 게이트가 도중에 바뀔 수 있다.** 승인 화면이 보여준 근거와 실행 시점의 근거가
+/// 달라지고, 그건 이 게이트가 파는 성질을 직접 깨뜨린다.
+///
+/// 그래서 갈아끼우지 않고 **태스크별로 하나씩 만든다.** 등록은 한 번뿐이고(`begin_task`),
+/// 그 뒤로 그 태스크의 정책은 바뀌지 않는다.
+///
+/// # 검증 명령 고정이 여기로 온 것도 같은 이유다
+///
+/// 24.5절은 자동 승인 대상을 **태스크 시작 시점**에 고정한다고 적었는데, 호스트가 워크스페이스
+/// 수명을 갖는 UI 경로에서는 그게 **워크스페이스 열 때**였다. 문서와 코드가 갈라져 있었다.
+/// 프로필이 태스크마다 만들어지므로 이제 문서대로 동작한다.
+pub struct TaskProfile {
+    pub policy: TaskPolicy,
+    gate: PolicyGate,
+    /// **이 프로필이 만들어진 시점에** 프로젝트가 선언해 두었던 검증 명령 (program, args).
+    ///
+    /// `auto_approve_verification`이 켜졌을 때 자동 승인의 유일한 근거다. 매번 다시 탐지하지
+    /// 않는 이유는 24.5절에 있다 — `detect_commands`는 매니페스트에서 유도하므로 모델이 명령을
+    /// **지어낼** 수는 없지만, 모델은 매니페스트를 **고칠** 수 있다.
+    verification_pin: Vec<(String, Vec<String>)>,
+}
+
+impl TaskProfile {
+    pub fn new(root: &WorkspaceRoot, policy: TaskPolicy) -> Self {
+        let gate = PolicyGate::new(&policy);
+        // 아직 아무것도 고치지 않은 시점의 매니페스트를 읽는다. 이 호출이 뒤로 밀리면
+        // 고정의 의미가 사라진다.
+        let verification_pin = crate::verify::detect_commands(root)
+            .commands
+            .values()
+            .map(|(_, cmd, _)| (cmd.program.clone(), cmd.args.clone()))
+            .collect();
+        Self {
+            policy,
+            gate,
+            verification_pin,
+        }
+    }
+}
+
 pub struct TaskHost {
     root: WorkspaceRoot,
-    policy: TaskPolicy,
-    gate: PolicyGate,
+    /// 태스크에 속하지 않는 요청(되돌리기·PR 등)이 쓰는 프로필. 워크스페이스 수명이다.
+    default_profile: Arc<TaskProfile>,
+    /// task_id별 프로필. **등록은 한 번뿐이다.**
+    profiles: Mutex<std::collections::HashMap<String, Arc<TaskProfile>>>,
     runtime: ToolRuntime,
     /// 저장 계층은 **공유**한다. Tauri가 활성 워크스페이스 없이도 작업 목록을 조회해야 하고
     /// (앱 재시작 직후), 여러 컴포넌트가 각자 Store를 열면 SQLite 단일 writer 원칙이 깨진다.
@@ -110,13 +163,6 @@ pub struct TaskHost {
     cancels: Arc<CancellationRegistry>,
     /// baseline 검증 리포트 — post 리포트가 "새로 깨진 것"을 계산할 때 쓴다.
     baseline: Mutex<Option<VerificationReport>>,
-    /// **태스크가 시작되기 전에** 프로젝트가 선언해 두었던 검증 명령 (program, args).
-    ///
-    /// `auto_approve_verification`이 켜졌을 때 자동 승인의 유일한 근거다. 매번 다시
-    /// 탐지하지 않고 여기 찍어 두는 이유는 24.5절에 있다 — `detect_commands`는 매니페스트에서
-    /// 유도하므로 모델이 명령을 **지어낼** 수는 없지만, 모델은 매니페스트를 **고칠** 수 있다.
-    /// `scripts.test`를 바꿔 놓고 검증을 부르면 모델이 고른 명령이 자동 승인을 받는다.
-    verification_pin: Vec<(String, Vec<String>)>,
     /// 사용자가 등록한 phase 훅 (hooks.rs, state-machine 25절). 비어 있으면 아무것도 하지 않는다.
     hooks: crate::hooks::HookRegistry,
     /// 훅 실행 중인가 — 훅이 훅을 부르는 것을 **구조적으로** 막는다.
@@ -146,23 +192,18 @@ impl TaskHost {
         sink: Arc<dyn EventSink>,
         cancels: Arc<CancellationRegistry>,
     ) -> Self {
-        let gate = PolicyGate::new(&policy);
-        // 아직 아무것도 고치지 않은 시점의 매니페스트를 읽는다. 이 호출이 뒤로 밀리면
-        // 고정의 의미가 사라진다.
-        let verification_pin = crate::verify::detect_commands(&root)
-            .commands
-            .values()
-            .map(|(_, cmd, _)| (cmd.program.clone(), cmd.args.clone()))
-            .collect();
+        // **도구 실행 상한은 호스트 수명이다.** 태스크별로 바꿀 수 있게 하면 화면 토글이
+        // 실행 중인 명령의 상한을 바꿀 수 있게 되는데, 그건 이 값이 하는 일이 아니다.
         let runtime = ToolRuntime::new(
             root.clone(),
             artifacts.clone(),
             Duration::from_millis(policy.command_timeout_ms),
         );
+        let default_profile = Arc::new(TaskProfile::new(&root, policy));
         Self {
             root,
-            policy,
-            gate,
+            default_profile,
+            profiles: Mutex::new(std::collections::HashMap::new()),
             runtime,
             store,
             artifacts,
@@ -170,7 +211,6 @@ impl TaskHost {
             sink,
             cancels,
             baseline: Mutex::new(None),
-            verification_pin,
             hooks: crate::hooks::HookRegistry::default(),
             in_hook: std::sync::atomic::AtomicBool::new(false),
             diffs: Mutex::new(Vec::new()),
@@ -188,7 +228,7 @@ impl TaskHost {
             ToolRuntime::new(
                 self.root.clone(),
                 self.artifacts.clone(),
-                Duration::from_millis(self.policy.command_timeout_ms),
+                Duration::from_millis(self.default_profile.policy.command_timeout_ms),
             ),
         )
         .with_mcp(pool);
@@ -216,7 +256,9 @@ impl TaskHost {
                 requested_by: json!({ "role": "hook-preflight" }),
                 created_at: None,
             };
-            let decision = self.gate.evaluate(&request, &self.root, &self.policy);
+            // 훅 등록은 태스크에 속하지 않는다 — 워크스페이스 기본 정책으로 미리 태워 본다.
+            let profile = &self.default_profile;
+            let decision = profile.gate.evaluate(&request, &self.root, &profile.policy);
             if !decision.allowed() {
                 return Err(format!(
                     "훅 {}의 명령을 Policy Gate가 거부합니다: {} ({})\n\
@@ -244,8 +286,38 @@ impl TaskHost {
         &self.root
     }
 
+    /// 태스크에 속하지 않는 경로가 쓰는 정책. **태스크의 정책이 아니다** — 그건 `profile()`이다.
     pub fn policy(&self) -> &TaskPolicy {
-        &self.policy
+        &self.default_profile.policy
+    }
+
+    /// 이 태스크의 프로필. 등록된 적이 없으면 워크스페이스 기본값이다.
+    ///
+    /// **없는 것을 오류로 만들지 않는다.** 되돌리기·PR·복구처럼 태스크가 끝난 뒤에 도는
+    /// 경로가 있고, 그때 그 태스크의 정책은 이미 의미가 없다 — 그 동작들은 사용자의 것이지
+    /// 그 태스크의 실행이 아니다.
+    fn profile(&self, task_id: &str) -> Arc<TaskProfile> {
+        self.profiles
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .unwrap_or_else(|| self.default_profile.clone())
+    }
+
+    /// 이 태스크의 정책을 **한 번** 등록한다 (ui-wireframes 3.16.2절).
+    ///
+    /// 두 번째 등록은 오류다. 갈아끼울 수 있게 두면 진행 중인 태스크의 게이트가 도중에
+    /// 바뀔 수 있고, 그러면 승인 화면이 보여준 근거와 실행 시점의 근거가 달라진다.
+    pub fn begin_task(&self, task_id: &str, policy: TaskPolicy) -> Result<(), String> {
+        let mut profiles = self.profiles.lock().unwrap();
+        if profiles.contains_key(task_id) {
+            return Err(format!(
+                "이 태스크의 정책이 이미 정해졌습니다: {task_id} — 진행 중에 정책을 바꿀 수 없습니다"
+            ));
+        }
+        profiles.insert(task_id.to_string(), Arc::new(TaskProfile::new(&self.root, policy)));
+        Ok(())
     }
 
     /// 태스크 취소 요청. **idempotent**하며, 터미널 상태를 바꾸지 않는다.
@@ -532,7 +604,7 @@ impl TaskHost {
     ///    같은 이름의 스크립트를 돌리는 것은 다른 명령이다.
     ///  - program과 args가 **완전히** 같은가. prefix 비교를 하면 `npm test --ignore-scripts`
     ///    같은 변형이 딸려 들어온다.
-    fn is_pinned_verification(&self, request: &ToolRequest) -> bool {
+    fn is_pinned_verification(&self, request: &ToolRequest, profile: &TaskProfile) -> bool {
         if request.tool != ToolName::RunTests {
             return false;
         }
@@ -542,7 +614,8 @@ impl TaskHost {
         if cmd.cwd != "." {
             return false;
         }
-        self.verification_pin
+        profile
+            .verification_pin
             .iter()
             .any(|(program, args)| *program == cmd.program && *args == cmd.args)
     }
@@ -554,11 +627,16 @@ impl TaskHost {
     /// 고정 집합을 넘겨 거기서 판단하게 하지 않는 이유는 게이트를 순수하게 두기 위해서다:
     /// 게이트가 태스크의 시작 시점 상태를 들고 있으면 "args만 보고 처음부터 다시 판정한다"가
     /// 깨진다.
-    fn lever_for(&self, request: &ToolRequest, decision: &PolicyDecision) -> crate::types::PolicyLever {
+    fn lever_for(
+        &self,
+        request: &ToolRequest,
+        decision: &PolicyDecision,
+        profile: &TaskProfile,
+    ) -> crate::types::PolicyLever {
         use crate::types::PolicyLever;
         if decision.unblocked_by == PolicyLever::HumanOnly
-            && !self.policy.auto_approve_verification
-            && self.is_pinned_verification(request)
+            && !profile.policy.auto_approve_verification
+            && self.is_pinned_verification(request, profile)
         {
             return PolicyLever::AutoApproveVerification;
         }
@@ -570,8 +648,8 @@ impl TaskHost {
     /// 둘 다 근거가 같다: 명령의 출처가 모델이 아니라 사용자이고, 그 사실을 이 프로세스가
     /// 구조적으로 확인할 수 있다. 그러나 **하나의 스위치로 뭉개지 않는다** — 검증 명령을
     /// 자동 승인하기로 한 것과 훅을 등록한 것은 다른 결정이고, 기록도 달라야 한다.
-    fn pre_approval(&self, request: &ToolRequest) -> Option<PreApproval> {
-        if self.policy.auto_approve_verification && self.is_pinned_verification(request) {
+    fn pre_approval(&self, request: &ToolRequest, profile: &TaskProfile) -> Option<PreApproval> {
+        if profile.policy.auto_approve_verification && self.is_pinned_verification(request, profile) {
             return Some(PreApproval::DeclaredVerification);
         }
         if self.is_registered_hook(request) {
@@ -628,7 +706,10 @@ impl TaskHost {
         }
 
         // 1) Policy Gate. Node가 보낸 riskTier는 여기서 판단 근거로 쓰이지 않는다.
-        let decision = self.gate.evaluate(request, &self.root, &self.policy);
+        // **이 태스크의 정책으로 판정한다.** 등록된 적이 없으면 워크스페이스 기본값이다
+        // (되돌리기처럼 태스크가 끝난 뒤에 도는 경로).
+        let profile = self.profile(&request.task_id);
+        let decision = profile.gate.evaluate(request, &self.root, &profile.policy);
 
         let _ = self.append_event(
             &request.task_id,
@@ -662,7 +743,7 @@ impl TaskHost {
         // 아니라 "물을 일이 아니었음"이고, 둘을 같은 값으로 두면 결과 기록이 그 사실을 잃는다.
         let mut approval_state = crate::tools::ApprovalState::NotRequired;
         let pre_approval = if decision.requires_user_approval {
-            self.pre_approval(request)
+            self.pre_approval(request, &profile)
         } else {
             None
         };
@@ -683,6 +764,29 @@ impl TaskHost {
                     "riskLevel": decision.risk_level,
                 }),
             );
+        } else if decision.requires_user_approval && profile.policy.unattended {
+            // **무인 여부는 정책이 정한다.** 종전에는 승인 게이트웨이를 `UnattendedStop`으로
+            // 바꿔 끼우는 것으로 표현했는데, 게이트웨이는 호스트 수명이라 **태스크마다 다른
+            // 무인 여부**를 표현할 수 없었다(ui-wireframes 3.16.2절).
+            //
+            // 게이트웨이 쪽 `UnattendedStop`을 지우지는 않았다. 이 짧은 길이 어떤 이유로
+            // 우회되더라도 그쪽이 같은 답을 내야 하기 때문이다 — 두 규칙이 아니라 같은 답의
+            // 두 겹이다.
+            let lever = self.lever_for(request, &decision, &profile);
+            let _ = self.append_event(
+                &request.task_id,
+                "APPROVAL_UNATTENDED",
+                json!({
+                    "requestId": request.request_id,
+                    "reason": "무인 실행(Autopilot)이라 승인을 물을 사람이 없습니다",
+                    "tool": request.tool.as_str(),
+                    "normalizedTarget": decision.normalized_target,
+                    "matchedRule": decision.matched_rule,
+                    "unblockedBy": lever,
+                    "rerunFlag": lever.rerun_flag(),
+                }),
+            );
+            approval_state = crate::tools::ApprovalState::Unattended;
         } else if decision.requires_user_approval {
             let approval = ApprovalRequest {
                 approval_id: format!("approval-{}", uuid::Uuid::new_v4()),
@@ -730,7 +834,7 @@ impl TaskHost {
                     // **여기가 무인 정지의 유일한 기록이다.** 사용자가 다음에 물을 것은
                     // "무엇을 바꾸면 지나가는가"이고(24.8절), 그 답을 지금 남기지 않으면
                     // 나중에는 게이트 규칙을 사람이 다시 읽어 추론해야 한다.
-                    let lever = self.lever_for(request, &decision);
+                    let lever = self.lever_for(request, &decision, &profile);
                     let _ = self.append_event(
                         &request.task_id,
                         "APPROVAL_UNATTENDED",
@@ -1288,7 +1392,8 @@ impl TaskHost {
         record: bool,
     ) -> Result<(bool, String, String), String> {
         let request = self.git_request(task_id, label, args);
-        let decision = self.gate.evaluate(&request, &self.root, &self.policy);
+        let profile = self.profile(task_id);
+        let decision = profile.gate.evaluate(&request, &self.root, &profile.policy);
         if !decision.allowed() {
             return Err(format!("git {}이(가) 정책에 막혔습니다: {}", args[0], decision.reason));
         }
@@ -1375,8 +1480,12 @@ impl TaskHost {
         // 다시 거치지 않는다 — 다만 Policy Gate는 반드시 거친다(workspace 경계는 예외 없음).
         let mut restored = Vec::new();
         let mut failed = Vec::new();
+        // 되돌리기는 **사용자의 동작이지 그 태스크의 실행이 아니다.** 태스크가 이미 끝났으면
+        // 프로필은 워크스페이스 기본값이고, 그게 맞다 — 그 태스크가 스킬로 도구를 좁혔더라도
+        // 그 제한은 "모델이 무엇을 요청할 수 있는가"였지 사용자의 되돌리기가 아니었다.
+        let profile = self.profile(task_id);
         for request in self.runtime.rollback_requests(task_id, &mutations) {
-            let decision = self.gate.evaluate(&request, &self.root, &self.policy);
+            let decision = profile.gate.evaluate(&request, &self.root, &profile.policy);
             if !decision.allowed() {
                 failed.push(json!({ "path": request.args.get("path"), "reason": decision.reason }));
                 continue;
@@ -1488,7 +1597,10 @@ impl SidecarHandler for TaskHost {
                     .ok_or_else(|| "policy.evaluate params에 \"request\"가 없음".to_string())?;
                 let request: ToolRequest =
                     serde_json::from_value(raw.clone()).map_err(|e| format!("잘못된 ToolRequest: {e}"))?;
-                let decision = self.gate.evaluate(&request, &self.root, &self.policy);
+                // Node가 "이 요청이 어떻게 분류되나"를 미리 묻는 자리다. **그 태스크의
+                // 정책으로 답해야** 미리 본 것과 실제 판정이 같다.
+                let profile = self.profile(&request.task_id);
+                let decision = profile.gate.evaluate(&request, &self.root, &profile.policy);
                 Ok(serde_json::to_value(decision).unwrap_or(Value::Null))
             }
 
@@ -2124,7 +2236,7 @@ mod tests {
 
         // 1) 자동 허용이 아니라 승인 필요로 분류된다.
         let read = req(ToolName::ReadFile, json!({ "path": ".env" }));
-        let decision = host.gate.evaluate(&read, host.root(), host.policy());
+        let decision = host.default_profile.gate.evaluate(&read, host.root(), host.policy());
         assert!(
             decision.requires_user_approval,
             "비밀값 파일 읽기가 자동 허용되었습니다: {decision:?}"
@@ -2173,7 +2285,7 @@ mod tests {
             ToolName::CreateFile,
             json!({ "path": ".env.local", "content": format!("KEY={NEW_SECRET}\n") }),
         );
-        let decision = host.gate.evaluate(&write, host.root(), host.policy());
+        let decision = host.default_profile.gate.evaluate(&write, host.root(), host.policy());
         assert!(
             decision.requires_user_approval,
             "auto_approve_workspace_writes가 비밀값 파일 쓰기까지 자동 승인했습니다: {decision:?}"
@@ -2200,7 +2312,7 @@ mod tests {
     fn ordinary_files_are_still_auto_approved_for_reading() {
         let (_ws, _a, host) = host(TaskPolicy::default(), Arc::new(AutoApprove));
         let read = req(ToolName::ReadFile, json!({ "path": "src/app.ts" }));
-        let decision = host.gate.evaluate(&read, host.root(), host.policy());
+        let decision = host.default_profile.gate.evaluate(&read, host.root(), host.policy());
         assert!(!decision.requires_user_approval, "일반 파일 읽기에 승인을 요구했습니다");
     }
 
@@ -2270,6 +2382,93 @@ mod tests {
         assert!(approval_granted < tool_completed);
     }
 
+    // ---- 정책의 수명 (ui-wireframes 3.16.2절) ----
+
+    /// **정책은 태스크 수명 동안 불변이다.** 두 번째 등록은 오류다 — 갈아끼울 수 있게 두면
+    /// 진행 중인 태스크의 게이트가 도중에 바뀌고, 승인 화면이 보여준 근거와 실행 시점의
+    /// 근거가 달라진다.
+    #[test]
+    fn a_tasks_policy_cannot_be_changed_once_it_started() {
+        let (_ws, _a, host) = host(TaskPolicy::default(), Arc::new(AlwaysDeny));
+        host.begin_task("task-1", TaskPolicy::default()).unwrap();
+        let err = host.begin_task("task-1", TaskPolicy::default()).unwrap_err();
+        assert!(err.contains("이미 정해졌습니다"), "{err}");
+    }
+
+    /// 태스크마다 다른 정책이 **실제로 다르게 판정된다.** 이게 안 되면 3.16.2절이 막혔던
+    /// 이유가 그대로 남는다.
+    #[test]
+    fn two_tasks_in_one_host_can_have_different_policies() {
+        let (ws, _a, host) = host(TaskPolicy::default(), Arc::new(AlwaysDeny));
+        // task-1은 스킬이 도구를 좁혔고, task-2는 좁히지 않았다.
+        host.begin_task(
+            "task-1",
+            TaskPolicy {
+                allowed_tools: Some(vec![ToolName::ReadFile, ToolName::RunTests]),
+                ..TaskPolicy::default()
+            },
+        )
+        .unwrap();
+        host.begin_task("task-2", TaskPolicy::default()).unwrap();
+
+        let narrowed = host.profile("task-1");
+        let open = host.profile("task-2");
+        let request = |task: &str| ToolRequest {
+            request_id: "req-1".to_string(),
+            task_id: task.to_string(),
+            tool: ToolName::CreateFile,
+            args: json!({ "path": "new.ts", "content": "x" }),
+            risk_tier: None,
+            requested_by: json!({ "role": "executor" }),
+            created_at: None,
+        };
+        let d1 = narrowed
+            .gate
+            .evaluate(&request("task-1"), host.root(), &narrowed.policy);
+        let d2 = open.gate.evaluate(&request("task-2"), host.root(), &open.policy);
+        assert_eq!(d1.matched_rule, "tool_not_in_skill_allowlist", "{}", d1.reason);
+        assert_ne!(d2.matched_rule, "tool_not_in_skill_allowlist", "{}", d2.reason);
+        drop(ws);
+    }
+
+    /// **등록되지 않은 태스크는 워크스페이스 기본값으로 판정된다.** 오류로 만들면 되돌리기·PR
+    /// 처럼 태스크가 끝난 뒤에 도는 경로가 전부 막힌다.
+    #[test]
+    fn an_unregistered_task_falls_back_to_the_workspace_policy() {
+        let (_ws, _a, host) = host(
+            TaskPolicy {
+                allow_git_commit: true,
+                ..TaskPolicy::default()
+            },
+            Arc::new(AlwaysDeny),
+        );
+        let profile = host.profile("never-registered");
+        assert!(profile.policy.allow_git_commit, "기본 프로필이 아닙니다");
+    }
+
+    /// **검증 명령 고정이 태스크 시작 시점으로 옮겨졌다.** 종전에는 호스트를 만들 때였고,
+    /// 워크스페이스 수명을 갖는 UI 경로에서는 그게 **워크스페이스를 열 때**였다 —
+    /// 24.5절이 적어 둔 것과 코드가 갈라져 있었다.
+    #[test]
+    fn the_verification_pin_is_taken_when_the_task_starts_not_when_the_host_is_made() {
+        let (ws, _a, host) = host_with_manifest(TaskPolicy::default(), Arc::new(AlwaysDeny), None);
+        // 호스트를 만들 때는 매니페스트가 없었다.
+        assert!(host.default_profile.verification_pin.is_empty());
+
+        fs::write(ws.path().join("package.json"), r#"{"scripts":{"test":"node -e 0"}}"#).unwrap();
+        host.begin_task("task-1", TaskPolicy::default()).unwrap();
+
+        let profile = host.profile("task-1");
+        assert!(
+            profile
+                .verification_pin
+                .iter()
+                .any(|(p, a)| p == "npm" && a == &vec!["test".to_string()]),
+            "{:?}",
+            profile.verification_pin
+        );
+    }
+
     /// 고정 집합은 매니페스트가 **선언한 것만** 담는다. 없는 스크립트를 담으면 자동 승인이
     /// 프로젝트가 정하지 않은 명령까지 덮는다.
     #[test]
@@ -2280,6 +2479,7 @@ mod tests {
             Some(r#"{"scripts":{"test":"node -e 0","build":"node -e 0"}}"#),
         );
         let pinned: Vec<String> = host
+            .default_profile
             .verification_pin
             .iter()
             .map(|(p, a)| format!("{p} {}", a.join(" ")))
@@ -2304,10 +2504,11 @@ mod tests {
             Some(r#"{"scripts":{"test":"node -e 0"}}"#),
         );
         // 시작 시점에 선언돼 있던 명령은 매치된다 — 아래 부정 단언이 공허하지 않다는 증거다.
-        assert!(host.is_pinned_verification(&req(
-            ToolName::RunTests,
-            json!({ "program": "npm", "args": ["test"], "cwd": "." })
-        )));
+        let profile = host.default_profile.clone();
+        assert!(host.is_pinned_verification(
+            &req(ToolName::RunTests, json!({ "program": "npm", "args": ["test"], "cwd": "." })),
+            &profile
+        ));
 
         fs::write(
             ws.path().join("package.json"),
@@ -2316,10 +2517,10 @@ mod tests {
         .unwrap();
 
         assert!(
-            !host.is_pinned_verification(&req(
-                ToolName::RunTests,
-                json!({ "program": "npm", "args": ["run", "lint"], "cwd": "." })
-            )),
+            !host.is_pinned_verification(
+                &req(ToolName::RunTests, json!({ "program": "npm", "args": ["run", "lint"], "cwd": "." })),
+                &profile
+            ),
             "실행 중에 추가된 스크립트가 자동 승인 집합에 들어왔습니다"
         );
     }
@@ -2348,7 +2549,7 @@ mod tests {
         ];
         for (tool, args) in cases {
             assert!(
-                !host.is_pinned_verification(&req(tool, args.clone())),
+                !host.is_pinned_verification(&req(tool, args.clone()), &host.default_profile),
                 "고정 집합이 {args}를 검증 명령으로 인정했습니다"
             );
         }
