@@ -216,6 +216,10 @@ pub struct TaskHost {
     /// 삼아 sidecar를 띄우므로, 만들 때는 잴 대상이 아직 없다. 없으면 그냥 재지 않는다 —
     /// 계측이 없다고 태스크를 세우지 않는다.
     ipc_meter: Mutex<Option<std::sync::Weak<dyn IpcLineMeter>>>,
+    /// 등록된 MCP 서버 (mcp.rs). `ToolRuntime`도 같은 풀을 들고 있다 — 여기 따로 두는 이유는
+    /// **도구 목록을 태스크 시작 시점에 물어야 하기 때문**이고(31절), 그건 도구 실행 경로가
+    /// 아니다.
+    mcp: Option<Arc<crate::mcp::McpPool>>,
 }
 
 impl TaskHost {
@@ -252,6 +256,7 @@ impl TaskHost {
             in_hook: std::sync::atomic::AtomicBool::new(false),
             diffs: Mutex::new(Vec::new()),
             ipc_meter: Mutex::new(None),
+            mcp: None,
         }
     }
 
@@ -268,8 +273,24 @@ impl TaskHost {
                 Duration::from_millis(self.default_profile.policy.command_timeout_ms),
             ),
         )
-        .with_mcp(pool);
+        .with_mcp(pool.clone());
+        self.mcp = Some(pool);
         self
+    }
+
+    /// 등록된 서버들이 내놓는 도구 목록 (state-machine 31절).
+    ///
+    /// **없으면 `None`이다 — 빈 목록이 아니다.** 서버를 등록하지 않은 것과 등록했는데 아무
+    /// 도구도 없는 것은 다른 사실이고, 프롬프트가 다르게 말해야 한다.
+    ///
+    /// 이 호출은 등록된 서버를 실제로 띄운다. 태스크 시작 시점에 한 번 부르는 것을 전제로
+    /// 하며, 실패한 서버는 사유와 함께 목록에 남는다 — **태스크를 세우지 않는다.**
+    pub fn mcp_catalog(&self) -> Option<crate::mcp::Catalog> {
+        let pool = self.mcp.as_ref()?;
+        if pool.is_empty() {
+            return None;
+        }
+        Some(pool.catalog())
     }
 
     /// 등록하려는 훅을 **게이트에 미리 태워 본다.**

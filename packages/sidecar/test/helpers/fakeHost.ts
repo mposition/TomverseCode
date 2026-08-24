@@ -42,6 +42,18 @@ export interface FakeHostOptions {
     error?: string;
     policyDecision?: string;
   }[];
+  /**
+   * `mcp_call` 응답 override (호출 순서대로) — state-machine 31절.
+   *
+   * **변경 도구와 따로 센다.** 한 목록에 섞으면 MCP 호출 하나가 `apply_patch`용 스텁을
+   * 먹어치우고, 그 어긋남은 "왜 patch가 실패했지"로 나타난다.
+   */
+  mcpResults?: {
+    status?: "ok" | "error" | "denied" | "cancelled";
+    output?: unknown;
+    error?: string;
+    denialKind?: string;
+  }[];
 }
 
 export interface VerifyStub {
@@ -62,6 +74,7 @@ export class FakeHost {
   readonly indexSaves: { fingerprint: string; buildMs: number }[] = [];
   private eventSeq = 0;
   private toolCursor = 0;
+  private mcpCursor = 0;
   private verifyCursor = 0;
 
   constructor(private options: FakeHostOptions = {}) {}
@@ -198,6 +211,31 @@ export class FakeHost {
         return ok({ stdout: this.options.gitStatus ?? "## main", exitCode: 0 });
       case "git_diff":
         return ok({ stdout: this.options.gitDiff ?? "", exitCode: 0 });
+      case "mcp_call": {
+        const stub = this.options.mcpResults?.[this.mcpCursor];
+        this.mcpCursor += 1;
+        const status = stub?.status ?? "ok";
+        if (status === "ok") {
+          return ok(stub?.output ?? { content: [{ type: "text", text: `echoed:${request.args.tool}` }] });
+        }
+        return {
+          result: {
+            requestId: request.requestId,
+            status,
+            error: stub?.error ?? "fake mcp failure",
+            ...(stub?.denialKind ? { denialKind: stub.denialKind } : {}),
+            durationMs: 1,
+            completedAt: new Date().toISOString(),
+          },
+          policy: {
+            decision: status === "denied" ? "deny" : "require_user_approval",
+            riskLevel: "medium",
+            reason: stub?.error ?? "fake",
+            matchedRule: "mcp_call",
+            normalizedTarget: `${request.args.server}/${request.args.tool}`,
+          },
+        };
+      }
       default: {
         // 변경 도구 — 스크립트된 응답을 순서대로 소비한다.
         const stub = this.options.toolResults?.[this.toolCursor];

@@ -1119,6 +1119,19 @@ fn run_task(
         })
     };
 
+    // **태스크를 만든 뒤, 첫 프롬프트 전에 한 번만 묻는다.** 서버를 실제로 띄우므로
+    // 반복해서 물으면 그만큼 프로세스를 건드린다. 실패한 서버는 사유와 함께 목록에 남고
+    // 태스크를 세우지 않는다 — 관계없는 서버 하나가 죽었다고 작업이 막히면 안 된다.
+    let mcp_tools = match host.mcp_catalog() {
+        None => Value::Null,
+        Some(catalog) => json!({
+            "text": catalog.render(),
+            "serverCount": catalog.server_count(),
+            "toolCount": catalog.tool_count(),
+            "truncated": catalog.truncated(),
+        }),
+    };
+
     let params = json!({
         "taskRequest": {
             "taskId": task_id,
@@ -1154,6 +1167,10 @@ fn run_task(
         // 권위에 관한 판정이고, 그 판정이 sidecar에 있으면 장악당한 sidecar가 모델 제안을
         // 사용자 판정으로 나를 수 있다.
         "sessionMemory": session_memory,
+        // 등록된 MCP 서버가 실제로 내놓는 도구 목록 (31절). **Rust가 서버를 띄워 묻는다** —
+        // MCP 서버는 프로세스이고 그것을 띄우는 것은 Node에게 금지된 일이다(원칙 2).
+        // 이것이 없으면 모델은 서버 이름도 도구 이름도 몰라 `mcp_call`을 부를 수 없다.
+        "mcpTools": mcp_tools,
         "workspaceName": workspace_name(host.root()),
         "availableProviders": providers,
         // 비어 있으면 아예 넣지 않는다 — production 실행과 바이트 단위로 같은 params가 되도록.

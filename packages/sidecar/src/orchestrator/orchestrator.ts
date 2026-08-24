@@ -10,6 +10,7 @@ import type {
   ExecutionPlan,
   FailureReason,
   FinalResult,
+  McpCallRequest,
   RoutingDecision,
   SingleModelFixResult,
   TaskCounters,
@@ -18,6 +19,7 @@ import type {
   TaskPolicy,
   TaskRequest,
   TaskState,
+  ToolRequest,
   ToolRequester,
   VerificationReport,
   WorkspaceSnapshot,
@@ -120,6 +122,11 @@ export interface RunInput {
    */
   sessionMemory?: { text: string; decisionCount: number; truncated: boolean };
   /**
+   * 등록된 MCP 서버가 내놓은 도구 목록 (state-machine 31절).
+   * **Rust가 서버를 띄워 물어 채운다** — 프로세스를 띄우는 것은 Node에게 금지된 일이다.
+   */
+  mcpTools?: { text: string; serverCount: number; toolCount: number; truncated: boolean };
+  /**
    * 실험 하네스(evals/hypothesis-gate) 전용 제어. **production 경로에서는 항상 undefined다.**
    * Rust가 `task.start` params로 채우며, Node는 이 값을 만들어내지 않는다.
    */
@@ -188,6 +195,11 @@ export class Orchestrator {
    * 다시 읽는 것은 아무도 보지 않는 일을 하는 것이다.
    */
   private snapshotStale = false;
+  /**
+   * MCP 라운드 상한을 알렸는가 (31절). **이 플래그가 루프의 종료 논증이다** — 상한을 알린
+   * 뒤에도 도구를 요청하면 그 요청을 무시하고 진행한다.
+   */
+  private mcpBudgetNoticeSent = false;
   /**
    * 진행 중인 다시 읽기.
    *
@@ -267,6 +279,7 @@ export class Orchestrator {
       routing: null,
       counters: {
         clarificationRounds: 0,
+        mcpRounds: 0,
         reviseRounds: 0,
         fixLoopRounds: 0,
         toolRetries: {},
@@ -413,28 +426,12 @@ export class Orchestrator {
     if (this.input.sessionMemory) {
       this.snapshot.sessionMemory = this.input.sessionMemory;
     }
-    await this.emit("SNAPSHOT_CREATED", {
-      snapshotId: this.snapshot.snapshotId,
-      gitBranch: this.snapshot.gitBranch,
-      gitDirty: this.snapshot.gitDirty,
-      // **커밋되지 않은 변경 요약도 프롬프트에 실린다**(`renderSnapshot`의 Repository state).
-      // 이걸 이벤트에 넣지 않으면 전송 기록이 그것을 말할 수 없고, 화면은 "선정된 파일만
-      // 나갔다"로 읽힌다 — 이 요약에는 선정되지 않은 파일의 경로도 들어간다(7.2절).
-      gitDiffSummary: this.snapshot.gitDiffSummary ?? null,
-      // 스킬 지시문도 프롬프트에 실려 나간다 — 전송 집계가 세야 한다(7.2절).
-      skill: this.snapshot.skill ?? null,
-      // 앞선 태스크의 판정이 이 태스크의 프롬프트로 넘어간다는 사실도 마찬가지다(27.3절).
-      sessionMemory: this.snapshot.sessionMemory ?? null,
-      // 어떤 파일이 어느 공급자에 갔는지 표시하기 위한 데이터 (README "데이터 전송 투명성").
-      relevantFiles: this.snapshot.relevantFiles.map((f) => ({
-        path: f.path,
-        reason: f.reason,
-        reasonDetail: f.reasonDetail,
-        truncated: f.truncated,
-      })),
-      excludedNotes: this.snapshot.excludedNotes ?? [],
-      projectMeta: this.snapshot.projectMeta,
-    });
+    // 등록된 MCP 서버의 도구 목록 (31절). **Rust가 서버를 띄워 물어본 값이고 우리는 옮길
+    // 뿐이다** — 여기서 목록을 만들거나 고치면 프롬프트가 실제 서버와 어긋난다.
+    if (this.input.mcpTools) {
+      this.snapshot.mcpTools = this.input.mcpTools;
+    }
+    await this.emit("SNAPSHOT_CREATED", this.snapshotPayload(this.snapshot));
 
     // ---- baseline 검증 ----
     // 작업 전 상태를 먼저 측정한다. 이걸 하지 않으면 "원래 깨져 있던 것"과
@@ -621,6 +618,18 @@ export class Orchestrator {
         criteria: index === 0 ? draftCriteria : undefined,
       });
     }
+
+    // ---- MCP 도구 라운드 (31절) ----
+    //
+    // **대조와 검수 앞이다.** 도구를 요청한 초안은 아직 없는 결과를 전제로 쓰여 있으므로
+    // 그것을 대조하거나 검수하는 것은 의미가 없다. primary의 요청만 실행한다 — 이유는
+    // `runMcpRound`에 적어두었다.
+    //
+    // 여기서 `retry`면 `criteriaFeedback`은 **소비되지 않은 채로 남는다.** 이번 초안은
+    // 판정된 적이 없으므로 직전 재요청 사유는 아직 유효하다.
+    const mcpOutcome = await this.runMcpRound(proposal.mcpCalls);
+    if (mcpOutcome.kind === "final") return mcpOutcome;
+    if (mcpOutcome.kind === "retry") return { kind: "retry" };
 
     // 재요청 사유는 이번 라운드에서 소비했다. 남겨두면 다음 라운드에도 "직전 초안이
     // 거부됐다"가 붙어 이미 고쳐진 문제를 계속 고치라고 말하게 된다.
@@ -959,6 +968,12 @@ export class Orchestrator {
       reviewerIndependent: false,
       reviewerDroppedReason: this.routing?.appliedPolicies.find((p) => p.startsWith("reviewer_dropped")) ?? null,
     });
+
+    // 단일 모델 경로에도 같은 라운드를 둔다 (31절). 여기 두지 않으면 `fast` 모드에서만
+    // MCP가 조용히 사라지고, 사용자는 같은 서버를 등록해 두고도 모드에 따라 다른 동작을 본다.
+    const mcpOutcome = await this.runMcpRound(result.mcpCalls);
+    if (mcpOutcome.kind === "final") return mcpOutcome;
+    if (mcpOutcome.kind === "retry") return { kind: "retry" };
 
     switch (result.verdict) {
       case "ACCEPT": {
@@ -2295,6 +2310,186 @@ export class Orchestrator {
    * 다시 읽기에 실패하면 **옛 스냅샷을 그대로 쓴다.** 낡은 컨텍스트는 나쁘지만, 컨텍스트 없이
    * 부르는 것보다는 낫고 태스크를 여기서 세울 이유는 없다 — 다만 그 사실을 이벤트로 남긴다.
    */
+  /**
+   * `SNAPSHOT_CREATED`의 payload.
+   *
+   * **한 곳에서 만든다.** 이 payload가 전송 화면의 재료이고(transmission.rs가 마지막
+   * 스냅샷 이벤트를 읽는다), 스냅샷을 내는 자리가 늘 때마다 필드를 손으로 맞추면 어느
+   * 자리에서는 **나간 것을 나가지 않았다고** 말하게 된다.
+   */
+  private snapshotPayload(snapshot: WorkspaceSnapshot): Record<string, unknown> {
+    return {
+      snapshotId: snapshot.snapshotId,
+      gitBranch: snapshot.gitBranch,
+      gitDirty: snapshot.gitDirty,
+      // **커밋되지 않은 변경 요약도 프롬프트에 실린다**(`renderSnapshot`의 Repository state).
+      // 이걸 이벤트에 넣지 않으면 전송 기록이 그것을 말할 수 없고, 화면은 "선정된 파일만
+      // 나갔다"로 읽힌다 — 이 요약에는 선정되지 않은 파일의 경로도 들어간다(7.2절).
+      gitDiffSummary: snapshot.gitDiffSummary ?? null,
+      // 스킬 지시문도 프롬프트에 실려 나간다 — 전송 집계가 세야 한다(7.2절).
+      skill: snapshot.skill ?? null,
+      // 앞선 태스크의 판정이 이 태스크의 프롬프트로 넘어간다는 사실도 마찬가지다(27.3절).
+      sessionMemory: snapshot.sessionMemory ?? null,
+      // MCP 도구 목록과 그 응답도 나간다(31.4절). 응답은 **외부 서버가 준 텍스트**라
+      // 특히 세야 한다 — 우리가 만든 것도 사용자가 쓴 것도 아니다.
+      mcpTools: snapshot.mcpTools ?? null,
+      mcpResults: snapshot.mcpResults ?? null,
+      // 어떤 파일이 어느 공급자에 갔는지 표시하기 위한 데이터 (README "데이터 전송 투명성").
+      relevantFiles: snapshot.relevantFiles.map((f) => ({
+        path: f.path,
+        reason: f.reason,
+        reasonDetail: f.reasonDetail,
+        truncated: f.truncated,
+      })),
+      excludedNotes: snapshot.excludedNotes ?? [],
+      projectMeta: snapshot.projectMeta,
+    };
+  }
+
+  // ---- MCP 도구 라운드 (state-machine 31절) ----
+
+  /**
+   * 초안이 요청한 MCP 도구를 실행하고, 결과를 스냅샷에 얹어 **DRAFTING을 다시 돌게 한다.**
+   *
+   * # 왜 초안을 버리는가
+   *
+   * 도구를 요청한 초안의 `patch`는 아직 없는 결과를 전제로 쓰여 있다. 그걸 그대로 쓰면
+   * 모델이 "조회한 뒤에 정하겠다"고 말한 것을 우리가 무시하는 셈이 된다. 재질문 왕복과
+   * 같은 모양이다 — 답을 받고 처음부터 다시 그린다.
+   *
+   * # 왜 primary의 요청만 실행하는가
+   *
+   * 대조 실행에서는 초안이 둘이고 각자 다른 도구를 요청할 수 있다. 둘 다 실행하면 승인이
+   * 두 배가 되고, **부수효과가 있는 도구라면 두 번 일어난다.** 그리고 두 실행자가 서로 다른
+   * 결과를 보게 되어 "같은 입력을 받는다"(13.1절)가 깨진다. 그래서 primary만 부르고, 그
+   * 결과는 다음 라운드에서 **둘 다** 본다.
+   *
+   * # 상한에 걸리면 실패시키지 않는다
+   *
+   * 도구 없이도 초안은 나올 수 있다. 상한을 알리고 한 번 더 요청하며, 그 뒤로도 도구를
+   * 요청하면 그 요청을 무시하고 진행한다 — 그래야 이 루프가 끝난다(원칙 5).
+   */
+  private async runMcpRound(
+    calls: readonly McpCallRequest[] | undefined
+  ): Promise<{ kind: "none" } | { kind: "retry" } | { kind: "final"; result: FinalResult }> {
+    if (!calls || calls.length === 0) return { kind: "none" };
+
+    if (this.state.counters.mcpRounds >= this.policy.limits.mcpRounds) {
+      if (this.mcpBudgetNoticeSent) {
+        // 이미 알렸는데 또 요청했다. **무시하고 진행한다** — 여기서 다시 재요청하면
+        // 종료 논증이 사라진다. 무시했다는 사실은 로그에 남는다.
+        await this.emit("ERROR", {
+          stage: "DRAFTING",
+          message: `MCP 도구 요청 ${calls.length}건을 무시하고 진행합니다 (라운드 상한 ${this.policy.limits.mcpRounds} 소진)`,
+        });
+        return { kind: "none" };
+      }
+      this.mcpBudgetNoticeSent = true;
+      await this.applyMcpResults(
+        `(No tools were run: the tool-call budget for this task is spent — ${this.state.counters.mcpRounds} of ${this.policy.limits.mcpRounds} rounds used.\n` +
+          "Do not request more tools. Produce a patch with what you already have.)",
+        0
+      );
+      return { kind: "retry" };
+    }
+
+    const requested = calls.length;
+    const rendered: string[] = [];
+    for (const [index, call] of calls.entries()) {
+      if (await this.cancelledHere()) {
+        return { kind: "final", result: await this.finish("cancelled", "MCP 도구 실행 중 취소됨") };
+      }
+      const outcome = await this.runOneMcpCall(call, index);
+      if (outcome.kind === "final") return outcome;
+      rendered.push(outcome.text);
+    }
+
+    this.state.counters.mcpRounds += 1;
+    await this.applyMcpResults(rendered.join("\n\n"), requested);
+    return { kind: "retry" };
+  }
+
+  private async runOneMcpCall(
+    call: McpCallRequest,
+    index: number
+  ): Promise<{ kind: "text"; text: string } | { kind: "final"; result: FinalResult }> {
+    const bridge = this.requireBridge();
+    const request: ToolRequest = {
+      requestId: `${this.taskId}-mcp-${this.state.counters.mcpRounds + 1}-${index}`,
+      taskId: this.taskId,
+      tool: "mcp_call",
+      args: { server: call.server, tool: call.tool, arguments: call.arguments },
+      requestedBy: { role: "executor", modelId: this.routing?.assignments.find((a) => a.role === "executor")?.modelId ?? "(unknown)" },
+      // Node의 1차 분류일 뿐이다. **최종 판정은 Rust이고 이 도구는 정책으로 낮출 수 없다**(23.3절).
+      riskTier: "user_approval",
+      createdAt: new Date().toISOString(),
+    };
+
+    const { result, policy } = await bridge.executeRequest(request);
+
+    if (result.status === "cancelled") {
+      return { kind: "final", result: await this.finish("cancelled", `MCP 도구 실행이 취소되었습니다 (${call.server}/${call.tool})`) };
+    }
+    if (result.status === "denied") {
+      // **거부는 태스크의 실패가 아니다.** 사용자가 이 도구를 부르지 말라고 한 것이며,
+      // 모델은 그 사실을 알고 다른 안을 낼 수 있어야 한다. 무인 실행의 정지만 예외다 —
+      // 거기엔 답할 사람이 없으므로 24절의 결말로 간다.
+      if (result.denialKind === "unattended") {
+        return {
+          kind: "final",
+          result: await this.finish(
+            "failed",
+            `무인 실행 중 MCP 도구 승인 지점에서 멈췄습니다 (${call.server}/${call.tool})`,
+            "unattended_stop"
+          ),
+        };
+      }
+      return {
+        kind: "text",
+        text: `### ${call.server}/${call.tool}\nREFUSED: ${result.error ?? policy.reason}\n(The user declined this call. Do not request it again.)`,
+      };
+    }
+    if (result.status !== "ok") {
+      // 실패도 결과다 — 재시도하지 않는다. MCP 도구는 부수효과를 가질 수 있고,
+      // 실패한 것처럼 보이는 호출이 실제로는 일어났을 수 있다.
+      return {
+        kind: "text",
+        text: `### ${call.server}/${call.tool}\nFAILED: ${result.error ?? "사유 없음"}`,
+      };
+    }
+
+    // Rust는 `{ server, tool, result }`로 감싸서 준다. **우리 봉투는 벗기되 서버가 준
+    // 내용은 요약하지 않는다** — 요약하면 모델이 본 것과 감사 기록이 갈라진다.
+    // 모양이 예상과 다르면 통째로 싣는다: 벗기지 못한 것을 벗긴 척하지 않는다.
+    const raw = result.output as { result?: unknown } | string | null | undefined;
+    const inner = typeof raw === "object" && raw !== null && "result" in raw ? raw.result : raw;
+    const body = typeof inner === "string" ? inner : JSON.stringify(inner ?? null);
+    return { kind: "text", text: `### ${call.server}/${call.tool}\n${body}` };
+  }
+
+  /**
+   * 도구 결과를 스냅샷에 얹고 **새 스냅샷 이벤트를 낸다.**
+   *
+   * 이벤트를 내지 않으면 전송 화면은 이 텍스트가 공급자로 나간다는 사실을 말할 수 없다 —
+   * 집계는 마지막 `SNAPSHOT_CREATED`를 읽는다(transmission.rs).
+   */
+  private async applyMcpResults(text: string, callCount: number): Promise<void> {
+    const before = this.requireSnapshot();
+    const previous = before.mcpResults?.text;
+    this.snapshot = {
+      ...before,
+      // 새 내용은 새 스냅샷이다. id를 물려주면 "지금 무엇이 나가 있는가"에 옛 답이 남는다.
+      snapshotId: `snap-mcp-${this.state.counters.mcpRounds}-${before.snapshotId}`,
+      // 앞 라운드의 결과를 지우지 않는다 — 지우면 모델이 이미 본 것을 다시 요청한다.
+      mcpResults: {
+        text: previous ? `${previous}\n\n${text}` : text,
+        callCount: (before.mcpResults?.callCount ?? 0) + callCount,
+      },
+      createdAt: new Date().toISOString(),
+    };
+    await this.emit("SNAPSHOT_CREATED", this.snapshotPayload(this.snapshot));
+  }
+
   private async snapshotForPrompt(): Promise<WorkspaceSnapshot> {
     if (!this.snapshotStale) return this.requireSnapshot();
     // 검사와 대입 사이에 `await`가 없다 — 동시 호출 둘이 각자 다시 읽으면 두 모델이 다른
@@ -2316,18 +2511,7 @@ export class Orchestrator {
       // 새 스냅샷은 새 전송이다. 전송 기록이 마지막 `SNAPSHOT_CREATED`를 읽으므로
       // (core/src/transmission.rs), 이 이벤트를 빠뜨리면 화면은 옛 목록을 계속 보여준다.
       await this.emit("SNAPSHOT_CREATED", {
-        snapshotId: refreshed.snapshot.snapshotId,
-        gitBranch: refreshed.snapshot.gitBranch,
-        gitDirty: refreshed.snapshot.gitDirty,
-        gitDiffSummary: refreshed.snapshot.gitDiffSummary ?? null,
-        relevantFiles: refreshed.snapshot.relevantFiles.map((f) => ({
-          path: f.path,
-          reason: f.reason,
-          reasonDetail: f.reasonDetail,
-          truncated: f.truncated,
-        })),
-        excludedNotes: refreshed.snapshot.excludedNotes ?? [],
-        projectMeta: refreshed.snapshot.projectMeta,
+        ...this.snapshotPayload(refreshed.snapshot),
         // 무엇이 달라져서 다시 만들었는지. 이게 없으면 같은 태스크에 SNAPSHOT_CREATED가
         // 여러 개 남은 이유를 로그만 보고는 알 수 없다.
         refreshedAfterMutation: {

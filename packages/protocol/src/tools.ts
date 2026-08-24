@@ -10,7 +10,17 @@ export type ToolName =
   | "run_command"
   | "git_status"
   | "git_diff"
-  | "run_tests";
+  | "run_tests"
+  /**
+   * 등록된 MCP 서버의 도구 하나 (state-machine 23·31절).
+   *
+   * **닫힌 집합에 문 하나다.** MCP 도구는 서버마다 동적이라 이름을 열면 Policy Gate의
+   * exhaustive match가 무너진다. 그래서 칸 하나만 내고, 그 문의 위험도는 "모른다, 그러므로
+   * 승인이다"로 고정한다 — 정책으로 낮출 수 없다(23.3절).
+   *
+   * `git_push`는 여기 없다. 그건 사용자가 부르는 도구이고 모델에게는 경로가 없다(28.2절).
+   */
+  | "mcp_call";
 
 /**
  * docs/design/multi-engine-routing.md 7절 — 공급자가 아니라 역할로 기록한다.

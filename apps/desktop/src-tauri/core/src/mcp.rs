@@ -385,6 +385,55 @@ impl McpPool {
         entry.session.call_tool(call)
     }
 
+    /// 등록된 서버들이 **실제로 내놓는 도구 목록**을 모은다 (state-machine 31절).
+    ///
+    /// # 왜 이게 필요한가
+    ///
+    /// 이것이 없으면 모델은 `mcp_call`을 부를 수 없다 — 서버 이름도 도구 이름도 인자 모양도
+    /// 모르기 때문이다. 등록만 해두고 이 목록을 내지 않으면 **문은 있는데 걸어 들어갈 길이
+    /// 없는 상태**가 된다.
+    ///
+    /// # 실패한 서버를 목록에서 지우지 않는다
+    ///
+    /// 지우면 "도구가 없는 서버"와 "물어보지 못한 서버"가 같은 모양이 되고, 모델은 그 서버를
+    /// 없는 것으로 읽는다. 사유를 담아 남긴다.
+    ///
+    /// # 서버를 띄운다 — 그래서 실패가 태스크를 죽이면 안 된다
+    ///
+    /// 이 호출은 등록된 서버를 실제로 spawn하고 핸드셰이크한다. 서버 하나가 죽어 있다고
+    /// 태스크가 시작되지 못하면, 사용자는 관계없는 작업을 하려다 막힌다.
+    pub fn catalog(&self) -> Catalog {
+        let mut servers = Vec::new();
+        for config in &self.servers {
+            servers.push(self.catalog_one(config));
+        }
+        Catalog::new(servers)
+    }
+
+    fn catalog_one(&self, config: &McpServerConfig) -> ServerCatalog {
+        let mut sessions = match self.sessions.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return ServerCatalog::failed(&config.name, "세션 잠금이 오염되었습니다");
+            }
+        };
+        if !sessions.contains_key(&config.name) {
+            match spawn_session(config) {
+                Ok(session) => {
+                    sessions.insert(config.name.clone(), session);
+                }
+                Err(e) => return ServerCatalog::failed(&config.name, &e.to_string()),
+            }
+        }
+        let Some(entry) = sessions.get_mut(&config.name) else {
+            return ServerCatalog::failed(&config.name, "세션을 만들지 못했습니다");
+        };
+        match entry.session.list_tools() {
+            Ok(tools) => ServerCatalog::listed(&config.name, tools),
+            Err(e) => ServerCatalog::failed(&config.name, &e.to_string()),
+        }
+    }
+
     /// 띄운 서버를 모두 종료한다. **태스크가 끝나면 반드시 부른다** — 남기면 사용자가 모르는
     /// 프로세스가 계속 돈다.
     pub fn shutdown(&self) {
@@ -393,6 +442,162 @@ impl McpPool {
             let _ = entry.child.kill();
             let _ = entry.child.wait();
         }
+    }
+}
+
+/// 한 서버가 내놓은 도구 하나.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolEntry {
+    pub name: String,
+    pub description: String,
+    /// 인자 모양. **이게 없으면 모델은 인자 이름을 추측하고, 서버가 거부한다.**
+    pub input_schema: Value,
+}
+
+/// 한 서버의 조회 결과. **성공과 실패가 같은 타입에 있다** — 실패한 서버를 목록에서 빼면
+/// "도구가 없는 서버"와 구별되지 않는다.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerCatalog {
+    pub server: String,
+    pub tools: Vec<ToolEntry>,
+    /// 물어보지 못했다면 왜인가. `Some`이면 `tools`는 "없다"가 아니라 **"모른다"**이다.
+    pub error: Option<String>,
+    /// 상한에 걸려 일부만 담겼는가.
+    pub truncated: bool,
+    /// 상한 전에 이 서버가 내놓은 도구 수.
+    pub listed_count: usize,
+}
+
+/// 한 서버에서 프롬프트에 실을 수 있는 도구의 최대 개수.
+///
+/// **유도한 값이 아니라 관례적 선택이다.** 서버가 도구를 몇 개 내놓는지는 서버마다 다르고,
+/// 실사용 분포를 아직 모른다. 상한이 없으면 프롬프트가 서버 설정에 따라 무한정 자란다(원칙 5).
+pub const MAX_TOOLS_PER_SERVER: usize = 20;
+
+/// 도구 하나의 인자 스키마를 프롬프트에 실을 때의 최대 바이트.
+///
+/// 넘으면 **자르지 않고 통째로 뺀다.** 잘린 JSON 스키마는 읽는 쪽에서 유효한 스키마처럼
+/// 보이면서 실제와 다르고, 그 차이는 모델이 만든 인자가 거부될 때에야 드러난다.
+pub const MAX_SCHEMA_BYTES: usize = 1_200;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Catalog {
+    pub servers: Vec<ServerCatalog>,
+}
+
+impl ServerCatalog {
+    fn failed(server: &str, detail: &str) -> Self {
+        Self {
+            server: server.to_string(),
+            tools: Vec::new(),
+            error: Some(detail.to_string()),
+            truncated: false,
+            listed_count: 0,
+        }
+    }
+
+    fn listed(server: &str, raw: Vec<Value>) -> Self {
+        let listed_count = raw.len();
+        let tools: Vec<ToolEntry> = raw
+            .into_iter()
+            .take(MAX_TOOLS_PER_SERVER)
+            .filter_map(|tool| {
+                // 이름 없는 도구는 부를 수 없다 — 목록에 넣으면 모델이 부르려다 실패한다.
+                let name = tool.get("name").and_then(Value::as_str)?.to_string();
+                Some(ToolEntry {
+                    name,
+                    description: tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(설명 없음)")
+                        .to_string(),
+                    input_schema: tool.get("inputSchema").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        Self {
+            server: server.to_string(),
+            truncated: listed_count > MAX_TOOLS_PER_SERVER,
+            listed_count,
+            tools,
+            error: None,
+        }
+    }
+}
+
+impl Catalog {
+    pub fn new(servers: Vec<ServerCatalog>) -> Self {
+        Self { servers }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    pub fn server_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    pub fn tool_count(&self) -> usize {
+        self.servers.iter().map(|s| s.tools.len()).sum()
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.servers.iter().any(|s| s.truncated)
+    }
+
+    /// 프롬프트에 실릴 문장.
+    ///
+    /// **부르는 방법을 함께 적는다.** 목록만 주면 모델은 그것을 참고 사항으로 읽고, 부를
+    /// 자리(`mcpCalls`)가 있다는 것을 모른다.
+    ///
+    /// **승인이 필요하다는 것도 적는다.** 적지 않으면 모델은 도구가 즉시 실행된다고 가정하고
+    /// 계획을 세우며, 거부됐을 때의 대안을 내놓지 않는다.
+    pub fn render(&self) -> String {
+        let mut lines = vec![
+            "These MCP servers are registered by the USER. You may request their tools via `mcpCalls`.".to_string(),
+            "Every call is judged by the Policy Gate and requires the user's approval — it may be refused.".to_string(),
+            "Requesting a tool DISCARDS this draft: the tools run, their results are added, and you are asked again.".to_string(),
+            "Leave `mcpCalls` empty unless you actually need one.".to_string(),
+        ];
+        for server in &self.servers {
+            lines.push(String::new());
+            lines.push(format!("### server: {}", server.server));
+            if let Some(error) = &server.error {
+                // **"도구가 없다"가 아니라 "모른다"라고 적는다.**
+                lines.push(format!(
+                    "(could NOT be queried: {error} — its tools are UNKNOWN, not absent. Do not call it.)"
+                ));
+                continue;
+            }
+            if server.tools.is_empty() {
+                lines.push("(this server reports no tools)".to_string());
+                continue;
+            }
+            if server.truncated {
+                lines.push(format!(
+                    "(NOTE: {} of {} tools shown — the rest are omitted. Do not assume the omitted ones do not exist.)",
+                    server.tools.len(),
+                    server.listed_count
+                ));
+            }
+            for tool in &server.tools {
+                lines.push(format!("- {}: {}", tool.name, tool.description));
+                let schema = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+                if tool.input_schema.is_null() {
+                    lines.push("  arguments: (the server did not declare a schema)".to_string());
+                } else if schema.len() > MAX_SCHEMA_BYTES {
+                    // 자른 스키마를 주지 않는다 — 유효해 보이면서 실제와 다르다.
+                    lines.push(format!(
+                        "  arguments: (schema omitted — {} bytes, over the {MAX_SCHEMA_BYTES}-byte limit)",
+                        schema.len()
+                    ));
+                } else {
+                    lines.push(format!("  arguments: {schema}"));
+                }
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -455,6 +660,91 @@ fn spawn_session(config: &McpServerConfig) -> Result<SpawnedSession, McpError> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    // ---- 도구 카탈로그 (31절) ----
+
+    fn tool(name: &str, description: &str, schema: Value) -> Value {
+        json!({ "name": name, "description": description, "inputSchema": schema })
+    }
+
+    fn tiny_schema() -> Value {
+        json!({ "type": "object", "properties": { "text": { "type": "string" } } })
+    }
+
+    /// **인자 스키마가 프롬프트에 실려야 한다.** 없으면 모델이 인자 이름을 추측하고, 그
+    /// 추측은 서버가 거부할 때에야 드러난다.
+    #[test]
+    fn the_catalog_carries_the_argument_schema() {
+        let catalog = Catalog::new(vec![ServerCatalog::listed(
+            "notes",
+            vec![tool("append", "노트를 덧붙인다", tiny_schema())],
+        )]);
+        let rendered = catalog.render();
+        assert!(rendered.contains("### server: notes"), "{rendered}");
+        assert!(rendered.contains("append"), "{rendered}");
+        assert!(rendered.contains("\"properties\""), "스키마가 실리지 않았습니다: {rendered}");
+        assert_eq!(catalog.tool_count(), 1);
+    }
+
+    /// **부르는 방법과 승인이 필요하다는 사실을 함께 적는다.** 목록만 주면 모델은 그것을
+    /// 참고 사항으로 읽고, 부를 자리가 있다는 것도 거부될 수 있다는 것도 모른다.
+    #[test]
+    fn the_catalog_says_how_to_call_and_that_approval_is_required() {
+        let catalog = Catalog::new(vec![ServerCatalog::listed("notes", vec![tool("append", "d", tiny_schema())])]);
+        let rendered = catalog.render();
+        assert!(rendered.contains("mcpCalls"), "부를 자리를 말하지 않습니다: {rendered}");
+        assert!(rendered.contains("approval"), "승인이 필요하다는 것을 말하지 않습니다: {rendered}");
+    }
+
+    /// 물어보지 못한 서버는 **"도구가 없다"가 아니라 "모른다"**여야 한다. 목록에서 빼면
+    /// 모델은 그 서버를 없는 것으로 읽는다.
+    #[test]
+    fn a_server_that_could_not_be_queried_is_unknown_not_empty() {
+        let catalog = Catalog::new(vec![
+            ServerCatalog::failed("broken", "핸드셰이크 실패"),
+            ServerCatalog::listed("quiet", vec![]),
+        ]);
+        let rendered = catalog.render();
+        assert!(rendered.contains("broken"), "{rendered}");
+        assert!(rendered.contains("UNKNOWN"), "실패한 서버를 '모른다'로 적지 않았습니다: {rendered}");
+        // 도구가 없는 서버는 그렇게 말한다 — 실패와 같은 문장을 쓰지 않는다.
+        assert!(rendered.contains("reports no tools"), "{rendered}");
+        assert!(!rendered.contains("quiet: (could NOT"), "{rendered}");
+    }
+
+    /// 상한에 걸리면 **잘렸다는 사실을 적는다.** 조용히 자르면 모델은 이 목록이 전부라고 보고
+    /// 목록에 없는 도구를 없는 것으로 취급한다.
+    #[test]
+    fn a_truncated_tool_list_says_so() {
+        let many: Vec<Value> = (0..(MAX_TOOLS_PER_SERVER + 3))
+            .map(|i| tool(&format!("t{i}"), "d", tiny_schema()))
+            .collect();
+        let entry = ServerCatalog::listed("big", many);
+        assert_eq!(entry.tools.len(), MAX_TOOLS_PER_SERVER);
+        assert!(entry.truncated);
+        let rendered = Catalog::new(vec![entry]).render();
+        assert!(rendered.contains("tools shown"), "{rendered}");
+        assert!(rendered.contains("omitted"), "{rendered}");
+    }
+
+    /// **큰 스키마는 자르지 않고 통째로 뺀다.** 잘린 JSON은 유효한 스키마처럼 보이면서
+    /// 실제와 다르고, 그 차이는 모델이 만든 인자가 거부될 때에야 드러난다.
+    #[test]
+    fn an_oversized_schema_is_omitted_rather_than_truncated() {
+        let big = json!({ "type": "object", "description": "x".repeat(MAX_SCHEMA_BYTES + 100) });
+        let rendered = Catalog::new(vec![ServerCatalog::listed("big", vec![tool("t", "d", big)])]).render();
+        assert!(rendered.contains("schema omitted"), "{rendered}");
+        assert!(!rendered.contains("xxxxxxxxxx"), "잘린 스키마가 실렸습니다");
+    }
+
+    /// 이름 없는 도구는 부를 수 없다 — 목록에 넣으면 모델이 부르려다 실패한다.
+    #[test]
+    fn a_tool_without_a_name_is_dropped() {
+        let entry = ServerCatalog::listed("s", vec![json!({ "description": "이름이 없다" })]);
+        assert!(entry.tools.is_empty());
+        // **내놓은 개수는 그대로 센다** — 버린 것을 없었던 것으로 만들지 않는다.
+        assert_eq!(entry.listed_count, 1);
+    }
 
     fn server(name: &str, program: &str) -> McpServerConfig {
         McpServerConfig {

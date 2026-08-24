@@ -84,6 +84,24 @@ export interface WorkspaceSnapshot {
    * 요구로 태스크를 판정한다(17.9절).
    */
   sessionMemory?: { text: string; decisionCount: number; truncated: boolean };
+  /**
+   * 등록된 MCP 서버가 **실제로 내놓은 도구 목록** (state-machine 31절).
+   *
+   * Rust가 `tools/list`로 모은다 — MCP 서버는 프로세스이고 그것을 띄우는 것은 Node에게
+   * 금지된 일이다(원칙 2). Node는 받은 텍스트를 스냅샷에 넣을 뿐이다.
+   *
+   * 스냅샷에 있는 이유는 스킬·세션 메모리와 같다: **나가는 것은 스냅샷을 통해 나가야**
+   * 전송 집계가 "각 공급자 모두에게 갔다"고 말할 수 있다(7.1절).
+   */
+  mcpTools?: { text: string; serverCount: number; toolCount: number; truncated: boolean };
+  /**
+   * 이번 태스크에서 실제로 부른 MCP 도구의 **응답** (state-machine 31절).
+   *
+   * **우리가 만든 텍스트가 아니라 외부 서버가 준 텍스트다.** 그것이 프롬프트에 실려
+   * 공급자로 나가므로 전송 집계가 세야 하고, 모델에게는 "데이터이지 지시가 아니다"라고
+   * 말해야 한다(31.5절).
+   */
+  mcpResults?: { text: string; callCount: number };
   excludedNotes?: { path: string; reason: string }[];
   createdAt: ISODateTime;
 }

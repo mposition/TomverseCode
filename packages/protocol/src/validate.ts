@@ -129,9 +129,40 @@ export function validateDraftProposal(
     requiredTests: optionalStringArray(o.requiredTests, "draftProposal.requiredTests") ?? [],
     uncertainties: optionalStringArray(o.uncertainties, "draftProposal.uncertainties") ?? [],
     doneCriteria: optionalStringArray(o.doneCriteria, "draftProposal.doneCriteria") ?? [],
+    mcpCalls: validateMcpCalls(o.mcpCalls),
     model: ctx.model,
     createdAt: ctx.createdAt,
   };
+}
+
+/**
+ * 초안이 요청한 MCP 도구 호출 — state-machine 31절.
+ *
+ * **형태가 틀린 항목은 버리지 않고 오류로 만든다.** 조용히 버리면 모델은 도구를 요청했다고
+ * 믿고 결과를 기다리는데 아무 일도 일어나지 않으며, 그 초안의 patch는 있지도 않은 결과를
+ * 전제로 쓰여 있다.
+ *
+ * `arguments`가 객체여야 한다는 것도 여기서 본다. MCP는 named arguments를 쓰므로 배열이면
+ * 우리가 잘못 조립한 것이고(23.4절), **무엇을 승인하는지 정하지 못하는 요청은 승인 대상이
+ * 아니라 거부 대상**이다.
+ */
+function validateMcpCalls(raw: unknown): DraftProposal["mcpCalls"] {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new ValidationError("draftProposal.mcpCalls", "expected an array");
+  if (raw.length === 0) return [];
+  return raw.map((item, i) => {
+    const call = requireObject(item, `draftProposal.mcpCalls[${i}]`);
+    const args = call.arguments;
+    if (args !== undefined && (typeof args !== "object" || args === null || Array.isArray(args))) {
+      throw new ValidationError(`draftProposal.mcpCalls[${i}].arguments`, "expected an object (MCP uses named arguments)");
+    }
+    return {
+      server: requireNonEmptyString(call.server, `draftProposal.mcpCalls[${i}].server`),
+      tool: requireNonEmptyString(call.tool, `draftProposal.mcpCalls[${i}].tool`),
+      arguments: (args ?? {}) as Record<string, unknown>,
+      reason: optionalString(call.reason, `draftProposal.mcpCalls[${i}].reason`),
+    };
+  });
 }
 
 /**
@@ -185,11 +216,15 @@ export function validateSingleModelFixResult(
     patch: optionalString(o.patch, "singleModelFixResult.patch"),
     questionsForUser: optionalStringArray(o.questionsForUser, "singleModelFixResult.questionsForUser"),
     rejectionReason: optionalString(o.rejectionReason, "singleModelFixResult.rejectionReason"),
+    mcpCalls: validateMcpCalls(o.mcpCalls),
     model: ctx.model,
     createdAt: ctx.createdAt,
   };
   assertVerdictConsistency(verdict, result.questionsForUser, "singleModelFixResult");
-  if (verdict === "ACCEPT" && !result.patch) {
+  // **도구를 요청했으면 patch가 없어도 된다** (state-machine 31절). 그 patch는 어차피
+  // 버려지며, 여기서 거부하면 도구를 요청하는 응답이 검증 단계에서 죽어 라운드가
+  // 시작조차 하지 못한다 — 증상은 "모델이 잘못된 응답을 냈다"로 보인다.
+  if (verdict === "ACCEPT" && !result.patch && (result.mcpCalls ?? []).length === 0) {
     throw new ValidationError("singleModelFixResult.patch", "verdict=ACCEPT requires a patch");
   }
   return result;

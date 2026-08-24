@@ -30,10 +30,30 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
    * **새 상태를 만들지 않았다.** 대조는 LLM 호출이 아니라 필드 비교 연산이라 사용자에게 노출할
    * 단계가 아니고, 상태를 늘리면 2절 다이어그램과 UI 매핑만 복잡해진다.
    */
-  DRAFTING: ["REVIEWING", "AWAITING_USER_INPUT", "CANCELLING", "CANCELLED", "FAILED"],
+  /**
+   * **자기 자신으로의 전이가 있다** — MCP 도구 라운드(31절).
+   *
+   * 초안이 도구를 요청하면 그 초안을 버리고 도구를 실행한 뒤 다시 그린다. 그 사이에 다른
+   * 단계로 간 적이 없으므로 정직한 표현은 `DRAFTING → DRAFTING`이다. 승인은 phase가 아니라
+   * 승인 이벤트로 표현되므로(모달은 phase를 보지 않는다) `AWAITING_APPROVAL`을 빌리지 않는다 —
+   * 빌리면 "실행 승인을 기다리는 중"과 "초안이 도구를 요청했다"가 화면에서 같아진다.
+   *
+   * **자기 전이는 이 표의 종료 논증을 약화시킨다.** 그래서 그 상한은 표가 아니라 counter가
+   * 진다: `mcpRounds`(기본 1)와 "상한을 알린 뒤에는 요청을 무시한다"는 규칙 둘이 함께
+   * 유한성을 보장한다(원칙 5). 새로 자기 전이를 추가하려면 같은 논증을 함께 만들 것.
+   */
+  DRAFTING: ["DRAFTING", "REVIEWING", "AWAITING_USER_INPUT", "CANCELLING", "CANCELLED", "FAILED"],
   // SINGLE_MODEL_FIX의 verdict: ACCEPT → PLANNING, NEED_USER_INPUT → AWAITING_USER_INPUT,
-  // REJECT → REJECTED (문서 14.1절)
-  SINGLE_MODEL_FIX: ["PLANNING", "AWAITING_USER_INPUT", "REJECTED", "CANCELLING", "CANCELLED", "FAILED"],
+  // REJECT → REJECTED (문서 14.1절). 자기 전이의 이유는 DRAFTING과 같다(31절).
+  SINGLE_MODEL_FIX: [
+    "SINGLE_MODEL_FIX",
+    "PLANNING",
+    "AWAITING_USER_INPUT",
+    "REJECTED",
+    "CANCELLING",
+    "CANCELLED",
+    "FAILED",
+  ],
   // REVIEWING의 4갈래: ACCEPT/REVISE → PLANNING, REJECT → REJECTED, NEED_USER_INPUT → AWAITING_USER_INPUT
   REVIEWING: ["PLANNING", "REJECTED", "AWAITING_USER_INPUT", "CANCELLING", "CANCELLED", "FAILED"],
   // 14.1절 tier 승격 규칙: 사용자 응답 후에는 **항상** DRAFTING(standard 경로)으로 간다.

@@ -98,6 +98,11 @@ export class ToolBridge {
       case "run_command":
       case "run_tests":
         return "user_approval";
+      // **닫힌 집합의 값이 여기서 나온다.** `mcp_call`을 `ToolName`에 더하자 컴파일러가
+      // 이 자리를 지목했다 — 분류되지 않은 도구가 조용히 생기지 않는다(23.2절).
+      // 그리고 이 문의 위험도는 우리가 안다: **모른다, 그러므로 승인이다.**
+      case "mcp_call":
+        return "user_approval";
     }
   }
 

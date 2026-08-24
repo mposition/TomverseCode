@@ -23,6 +23,14 @@ export interface TaskLoopLimits {
   fixLoopRounds: number; // 기본 3
   toolRetries: number; // 기본 2
   providerRetries: number; // 기본 3
+  /**
+   * 초안이 MCP 도구를 요청해 DRAFTING을 다시 도는 횟수 (state-machine 31절). 기본 1.
+   *
+   * **기본이 1인 것은 관례가 아니라 판단이다.** 라운드마다 초안 하나가 버려지므로 비용과
+   * 지연이 라운드 수만큼 는다. 이 기능의 이득은 아직 측정되지 않았고, 측정되지 않은 이득에
+   * 곱셈을 걸지 않는다.
+   */
+  mcpRounds: number; // 기본 1
 }
 
 export const DEFAULT_LOOP_LIMITS: TaskLoopLimits = {
@@ -31,6 +39,7 @@ export const DEFAULT_LOOP_LIMITS: TaskLoopLimits = {
   fixLoopRounds: 3,
   toolRetries: 2,
   providerRetries: 3,
+  mcpRounds: 1,
 };
 
 /**
@@ -206,6 +215,8 @@ export interface TaskCounters {
   clarificationRounds: number;
   reviseRounds: number;
   fixLoopRounds: number;
+  /** 초안의 요청으로 MCP 도구를 실행한 라운드 수 (state-machine 31절). */
+  mcpRounds: number;
   toolRetries: Record<string, number>;
   providerRetries: Record<string, number>;
 }

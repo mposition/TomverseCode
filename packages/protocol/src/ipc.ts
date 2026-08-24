@@ -83,6 +83,13 @@ export interface TaskStartParams {
    */
   sessionMemory?: { text: string; decisionCount: number; truncated: boolean };
   /**
+   * 등록된 MCP 서버가 내놓은 도구 목록 (state-machine 31절).
+   *
+   * **Rust가 서버를 띄워 `tools/list`로 모은다.** MCP 서버는 프로세스이고 그것을 띄우는 것은
+   * Node에게 금지된 일이다(원칙 2) — 그래서 Node는 완성된 텍스트를 받아 스냅샷에 넣을 뿐이다.
+   */
+  mcpTools?: { text: string; serverCount: number; toolCount: number; truncated: boolean };
+  /**
    * 실험 제어 — **평가 하네스 전용**이며 UI 경로에서는 항상 비어 있다.
    *
    * 왜 프로토콜에 두는가: 가설 게이트(evals/hypothesis-gate)는 production 실행 경로를 그대로

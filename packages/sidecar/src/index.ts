@@ -145,7 +145,8 @@ export function createSidecar(
   });
 
   transport.onRequest("task.start", async (params) => {
-    const { taskRequest, policy, availableProviders, experiment, skill, sessionMemory } = params as TaskStartParams;
+    const { taskRequest, policy, availableProviders, experiment, skill, sessionMemory, mcpTools } =
+      params as TaskStartParams;
     if (!taskRequest?.taskId) throw new Error("task.start params에 taskRequest.taskId가 없습니다");
 
     const deps: OrchestratorDeps = {
@@ -163,6 +164,9 @@ export function createSidecar(
         skill,
         // 세션 메모리도 Rust가 유도한 것을 그대로 넘긴다(27.1절).
         sessionMemory,
+        // **여기서 꺼내지 않으면 스냅샷에 닿지 않는다.** 스킬을 붙일 때 정확히 이걸 빠뜨려
+        // 프리셋이 프롬프트에 실리지 않은 적이 있고, e2e가 잡았다(26절).
+        mcpTools,
         // 실험 제어는 Rust가 준 것을 그대로 넘긴다 — sidecar가 만들어내지 않는다.
         experiment,
       },

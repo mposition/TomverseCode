@@ -807,6 +807,18 @@ impl SessionState {
                     "truncated": memory.truncated,
                 })
             },
+            // 등록된 MCP 서버의 도구 목록 (31절). **Rust가 서버를 띄워 묻는다.**
+            // 이것이 없으면 모델은 서버 이름도 도구 이름도 몰라 `mcp_call`을 부를 수 없다 —
+            // 등록만 있고 걸어 들어갈 길이 없는 상태가 된다.
+            "mcpTools": match host.mcp_catalog() {
+                None => Value::Null,
+                Some(catalog) => json!({
+                    "text": catalog.render(),
+                    "serverCount": catalog.server_count(),
+                    "toolCount": catalog.tool_count(),
+                    "truncated": catalog.truncated(),
+                }),
+            },
             "workspaceName": self.info().and_then(|i| i.get("name").cloned()).unwrap_or(Value::Null),
             // 라우터가 보는 후보도 같은 목록이어야 한다 — 주입된 키와 후보가 어긋나면
             // "고를 수 있다고 했는데 호출이 실패"가 된다.

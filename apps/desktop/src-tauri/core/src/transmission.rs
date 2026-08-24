@@ -125,6 +125,8 @@ pub const REPORTED_SECTIONS: &[&str] = &[
     "Project rules",
     "Decisions carried from earlier tasks",
     "Skill instructions",
+    "MCP tools available",
+    "MCP tool results",
     "Files",
     "Files deliberately excluded from context",
 ];
@@ -231,6 +233,43 @@ fn collect_context(payload: &Value, out: &mut Vec<SentContext>) {
                 detail: format!(
                     "이 세션의 앞선 태스크에서 사용자가 정한 {count}건이 이번 호출에도 실립니다{}",
                     if truncated { " (상한에 걸려 일부만)" } else { "" }
+                ),
+                bytes: text.len() as u64,
+                sources: Vec::new(),
+            });
+        }
+    }
+
+    // ④ MCP — 등록된 서버의 도구 목록과 그 응답 (31절).
+    //
+    //    응답을 따로 세는 이유: **그 텍스트는 우리가 만든 것도 사용자가 쓴 것도 아니다.**
+    //    외부 서버가 준 것이 프롬프트에 실려 공급자로 나가므로, 목록과 한 줄로 뭉치면
+    //    "우리가 무엇을 보냈는가"에서 가장 설명이 필요한 쪽이 사라진다.
+    if let Some(tools) = payload.get("mcpTools").filter(|v| !v.is_null()) {
+        let text = tools.get("text").and_then(Value::as_str).unwrap_or("");
+        if !text.is_empty() {
+            let servers = tools.get("serverCount").and_then(Value::as_u64).unwrap_or(0);
+            let count = tools.get("toolCount").and_then(Value::as_u64).unwrap_or(0);
+            let truncated = tools.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+            out.push(SentContext {
+                section: "MCP tools available".to_string(),
+                detail: format!(
+                    "등록된 MCP 서버 {servers}개의 도구 {count}개(이름·설명·인자 스키마)가 매 호출에 실립니다{}",
+                    if truncated { " (상한에 걸려 일부만)" } else { "" }
+                ),
+                bytes: text.len() as u64,
+                sources: Vec::new(),
+            });
+        }
+    }
+    if let Some(results) = payload.get("mcpResults").filter(|v| !v.is_null()) {
+        let text = results.get("text").and_then(Value::as_str).unwrap_or("");
+        if !text.is_empty() {
+            let calls = results.get("callCount").and_then(Value::as_u64).unwrap_or(0);
+            out.push(SentContext {
+                section: "MCP tool results".to_string(),
+                detail: format!(
+                    "MCP 도구 {calls}건의 **응답 원문**이 이후 호출에 실립니다 — 외부 서버가 준 내용이며 우리가 만든 것이 아닙니다"
                 ),
                 bytes: text.len() as u64,
                 sources: Vec::new(),

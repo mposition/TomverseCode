@@ -7,6 +7,21 @@ export interface PlanStep {
   targetPaths?: string[];
 }
 
+/**
+ * 초안이 요청하는 MCP 도구 호출 하나 (state-machine 31절).
+ *
+ * **이것은 요청이지 실행이 아니다.** 실행 여부는 Policy Gate가 정하고 매번 사용자 승인을
+ * 지난다(23.3절). 모델이 이 배열을 채운다고 무엇이 실행되지는 않는다.
+ */
+export interface McpCallRequest {
+  server: string;
+  tool: string;
+  /** MCP는 named arguments를 쓴다 — 배열이면 우리가 잘못 조립한 것이다(23.4절). */
+  arguments: Record<string, unknown>;
+  /** 왜 이 호출이 필요한가. 승인 화면이 사용자에게 보여줄 근거다. */
+  reason?: string;
+}
+
 // OpenAI 산출물 (DRAFTING) — docs/design/state-machine-and-protocol.md 3절
 export interface DraftProposal {
   taskId: string;
@@ -19,6 +34,13 @@ export interface DraftProposal {
   requiredTests: string[];
   uncertainties: string[];
   doneCriteria: string[];
+  /**
+   * 이 초안을 내기 전에 필요한 MCP 도구 호출 (state-machine 31절).
+   *
+   * 비어 있는 것이 정상이다. 채워져 있으면 **이 초안의 patch는 쓰이지 않는다** — 도구를
+   * 부른 뒤 DRAFTING을 다시 돈다(재질문 왕복과 같은 모양). 상한은 `limits.mcpRounds`.
+   */
+  mcpCalls?: McpCallRequest[];
   model: string;
   createdAt: ISODateTime;
 }
@@ -36,6 +58,8 @@ export interface ReviewDecision {
   revisedPatch?: string;
   questionsForUser?: string[]; // verdict = NEED_USER_INPUT
   rejectionReason?: string; // verdict = REJECT
+  /** 대조 경로의 `DraftProposal.mcpCalls`와 같은 자리 (state-machine 31절). */
+  mcpCalls?: McpCallRequest[];
   model: string;
   createdAt: ISODateTime;
 }
@@ -50,6 +74,8 @@ export interface SingleModelFixResult {
   patch?: string; // verdict = ACCEPT
   questionsForUser?: string[]; // verdict = NEED_USER_INPUT
   rejectionReason?: string; // verdict = REJECT
+  /** 대조 경로의 `DraftProposal.mcpCalls`와 같은 자리 (state-machine 31절). */
+  mcpCalls?: McpCallRequest[];
   model: string;
   createdAt: ISODateTime;
 }

@@ -74,6 +74,8 @@ interface RunOptions {
   skill?: string;
   /** 이 세션에 붙는다 (state-machine 27절). 생략하면 새 세션이다. */
   session?: string;
+  /** MCP 서버 등록 — `이름=프로그램[,인자...]` (state-machine 23·31절). */
+  mcpServers?: string[];
 }
 
 function hostAvailable(): boolean {
@@ -115,6 +117,7 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
   for (const hook of options.hooks ?? []) args.push("--hook", hook);
   if (options.skill) args.push("--skill", options.skill);
   if (options.session) args.push("--session", options.session);
+  for (const server of options.mcpServers ?? []) args.push("--mcp-server", server);
   if (options.autoApproveWrites) args.push("--auto-approve-writes");
   if (options.autoApproveVerification) args.push("--auto-approve-verification");
   if (options.allowGitCommit) args.push("--allow-git-commit");
@@ -164,6 +167,16 @@ function withRepo(
     repo.cleanup();
     rmSync(stateDir, { recursive: true, force: true });
   }
+}
+
+/** DB만 읽는 하위 명령을 새 프로세스로 돌린다. 마지막 한 줄이 JSON이다. */
+function hostQuery(stateDir: string, args: string[]): Record<string, unknown> {
+  const raw = execFileSync(
+    HOST_BIN,
+    [...args, "--db", path.join(stateDir, "state.db"), "--artifacts", path.join(stateDir, "artifacts")],
+    { encoding: "utf8" }
+  );
+  return JSON.parse(raw.trim().split("\n").pop() as string) as Record<string, unknown>;
 }
 
 /** 이벤트 로그를 SQLite에서 직접 읽는다 — 감사 추적이 실제로 남았는지 확인한다. */
@@ -1085,6 +1098,89 @@ test("세션을 이어도 모델 제안은 다음 태스크로 넘어가지 않�
       !transmission.sentContext.some((c) => c.section === "Decisions carried from earlier tasks"),
       `모델 제안이 다음 태스크로 넘어갔습니다: ${raw}`
     );
+  });
+});
+
+/**
+ * **등록한 MCP 서버에 걸어 들어갈 길이 있다** (state-machine 31절).
+ *
+ * 23절이 MCP를 프로세스 경계까지 만들어 두었지만 **모델이 그 문에 닿을 경로가 없었다** —
+ * 도구 목록이 프롬프트에 실리지 않았고 초안이 도구를 요청할 칸도 없었다. 그래서 서버를
+ * 등록해도 아무 일도 일어나지 않았다. 이 시나리오가 그 길 전체를 태운다.
+ *
+ * 여기서만 확인할 수 있는 것: **실제 spawn과 핸드셰이크**다. 프로토콜 처리는 in-memory
+ * 스트림으로 단위 테스트되지만 프로세스를 띄우는 부분은 그렇지 않았고(23.9절), 도구 목록
+ * 조회는 태스크 시작마다 그 경로를 지난다.
+ *
+ * fixture 서버는 `tools/list`에 이름만 있는 도구 하나를 주고 stdout에 로그를 섞는다 —
+ * 설명도 스키마도 없는 서버가 흔하고, 그때 목록이 깨지지 않아야 한다.
+ */
+test("등록한 MCP 서버의 도구를 모델이 알고, 요청하면 실행되고 결과가 다음 프롬프트로 간다", () => {
+  withRepo((repo, stateDir) => {
+    const askForTool = {
+      interpretation: "먼저 서버에 물어봐야 한다",
+      patch: "",
+      plan: [],
+      risks: [],
+      requiredTests: [],
+      uncertainties: [],
+      doneCriteria: [],
+      mcpCalls: [{ server: "echo", tool: "echo", arguments: { probe: "MCP_E2E_MARKER" }, reason: "확인이 필요하다" }],
+    };
+    const run = runHost(repo, stateDir, {
+      // **교차검증 경로로 고정한다.** `fast`는 TRIAGE가 단일 모델로 보낼 수 있고, 그러면
+      // 이 시나리오가 무엇을 태웠는지가 실행마다 달라진다.
+      mode: "verified",
+      mcpServers: [`echo=node,${path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "examples", "fixtures", "echo-server.js")}`],
+      // 첫 초안만 도구를 요청한다. 두 번째 초안이 실제 patch를 낸다.
+      script: [
+        { kind: "draft", payload: askForTool },
+        {
+          kind: "draft",
+          payload: {
+            interpretation: "도구 결과를 보고 고친다",
+            patch: FIX_PATCH,
+            plan: [],
+            risks: [],
+            requiredTests: [],
+            uncertainties: [],
+            doneCriteria: [],
+            mcpCalls: [],
+          },
+        },
+      ],
+    });
+
+    // ① 도구가 실제로 실행됐는가 — 게이트·승인·spawn을 전부 지난 뒤에만 남는 기록이다.
+    const executions = hostQuery(stateDir, ["show", "--workspace", repo.root, "--task", run.taskId]) as {
+      toolExecutions: { tool: string }[];
+      events: { type: string; payload: Record<string, unknown> }[];
+    };
+    const mcpRuns = executions.toolExecutions.filter((t) => t.tool === "mcp_call");
+    assert.equal(mcpRuns.length, 1, JSON.stringify(executions.toolExecutions.map((t) => t.tool)));
+
+    // ② 목록과 결과가 **프롬프트로 나갔는가.** 전송 집계가 그것을 말해야 한다(31.4절) —
+    //    말하지 못하면 화면이 "나간 것"을 실제보다 적게 보고한다.
+    const transmission = hostQuery(stateDir, ["transmission", "--workspace", repo.root, "--task", run.taskId]) as {
+      sentContext: { section: string; bytes: number }[];
+    };
+    const sections = transmission.sentContext.map((c) => c.section);
+    assert.ok(sections.includes("MCP tools available"), sections.join(", "));
+    assert.ok(sections.includes("MCP tool results"), sections.join(", "));
+    // 0바이트로 세면 "섹션은 있는데 아무것도 안 나갔다"가 되어 정반대로 읽힌다.
+    for (const section of ["MCP tools available", "MCP tool results"]) {
+      const entry = transmission.sentContext.find((c) => c.section === section)!;
+      assert.ok(entry.bytes > 0, `${section}의 bytes가 0입니다`);
+    }
+
+    // ③ 서버가 실제로 우리 인자를 받았는가 — echo 서버는 받은 인자를 돌려준다.
+    const snapshot = executions.events
+      .filter((e) => e.type === "SNAPSHOT_CREATED")
+      .map((e) => e.payload)
+      .at(-1)!;
+    const results = snapshot.mcpResults as { text: string } | null;
+    assert.ok(results, "마지막 스냅샷에 MCP 결과가 없습니다");
+    assert.ok(results!.text.includes("MCP_E2E_MARKER"), results!.text);
   });
 });
 
