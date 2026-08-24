@@ -247,6 +247,26 @@ fn set_workspace_settings(state: tauri::State<'_, SessionState>, settings: Value
     state.set_workspace_settings(settings)
 }
 
+/// 이 세션에서 사용자가 정한 것 목록 (state-machine 30절). **읽기 전용이다.**
+#[tauri::command]
+fn session_decisions(state: tauri::State<'_, SessionState>) -> Result<Value, String> {
+    Ok(envelope(state.session_decisions()))
+}
+
+/// 앞선 판정을 거둔다 (state-machine 30절).
+///
+/// **승인 모달이 뜨지 않으므로 별도 스레드가 필요 없다** — 실행되는 것이 없고 바뀌는 것은
+/// 다음 프롬프트에 무엇이 실리는가 하나다.
+#[tauri::command]
+fn withdraw_decision(
+    state: tauri::State<'_, SessionState>,
+    task_id: String,
+    criterion_id: String,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    state.withdraw_decision(&task_id, &criterion_id, reason)
+}
+
 /// 무인 정지의 처방 (state-machine 24.8절). **읽기 전용이다.**
 #[tauri::command]
 fn task_blocked(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
@@ -438,6 +458,8 @@ pub fn run() {
             derived_thresholds,
             task_transmission,
             task_blocked,
+            session_decisions,
+            withdraw_decision,
             workspace_settings,
             set_workspace_settings,
             open_pull_request,

@@ -46,6 +46,7 @@ import { precheckBudget } from "./lib/budgetCheck";
 import { AuditExportPanel } from "./components/AuditExportPanel";
 import { BlockedPanel } from "./components/BlockedPanel";
 import { WorkspaceSettingsPanel } from "./components/WorkspaceSettingsPanel";
+import { CarriedDecisionsPanel } from "./components/CarriedDecisionsPanel";
 import { PullRequestPanel } from "./components/PullRequestPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
@@ -1040,6 +1041,10 @@ export default function App() {
               {/* 훅·MCP 등록 (29절). **워크스페이스 수명의 설정**이라 태스크 옵션과 나란히
                   두지 않는다 — 여기 두면 "이번 작업에만 적용되는가"로 읽힌다. */}
               {workspace && <WorkspaceSettingsPanel />}
+              {/* 이 세션에서 정한 것과 그것을 거두는 자리 (30절). **세션 수명**이라 태스크
+                  옵션이 아니라 워크스페이스 설정 옆에 둔다 — 태스크 옵션 자리에 있으면
+                  "이번 작업에만 적용된다"로 읽히는데, 실제로는 다음 태스크들에 실린다. */}
+              {workspace && <CarriedDecisionsPanel />}
               {/* 무인 실행 (state-machine 24절). **켜도 승인 정책은 그대로다** — 달라지는 것은
                   승인이 필요한 지점에서 묻는 대신 멈춘다는 것뿐이고, 그 정지는 사용자 거부로
                   기록되지 않는다(24.2절). */}

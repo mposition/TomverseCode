@@ -1089,6 +1089,64 @@ test("세션을 이어도 모델 제안은 다음 태스크로 넘어가지 않�
 });
 
 /**
+ * **모델이 낸 기준은 거둘 대상이 아니다** (state-machine 30.2절).
+ *
+ * 철회는 **사용자 판정**에만 있는 동작이다. 모델 제안까지 거둘 수 있게 하면 "거뒀다"는 기록이
+ * 권위와 무관해지고, 목록에 뜨는 순간 사용자는 그것들도 자기가 정한 것이라고 읽는다.
+ *
+ * **이 시나리오가 e2e로 만들 수 있는 쪽이다.** 반대쪽(사용자 판정을 실제로 거두는 것)은
+ * 헤드리스 호스트가 판정 카드에 답할 수 없어 여기서 만들 수 없다 — 그 배선은 Rust 단위
+ * 테스트가 본다(27.6절과 같은 이유, 30.5절).
+ *
+ * 첫 태스크가 **모델 제안 기준을 실제로 만들었는지** 먼저 확인한다. 안 만들었으면 아래
+ * 단언들은 빈 집합에 대해 통과하고 아무것도 검증하지 않는다.
+ */
+test("모델이 낸 기준은 목록에 없고, 가리켜도 거두지 못한다", () => {
+  withRepo((repo, stateDir) => {
+    const session = "sess-e2e-withdraw";
+    const run = runHost(repo, stateDir, { mode: "verified", session });
+    const proposals = (run.final.acceptanceCriteria ?? []).filter((c) => c.source !== "user_decision");
+    assert.ok(
+      proposals.length > 0,
+      `태스크가 모델 제안 기준을 만들지 않았습니다: ${JSON.stringify(run.final.acceptanceCriteria)}`
+    );
+
+    const dbArgs = [
+      "--workspace",
+      repo.root,
+      "--db",
+      path.join(stateDir, "state.db"),
+      "--artifacts",
+      path.join(stateDir, "artifacts"),
+    ];
+
+    // ① 목록에는 사용자 판정만 나온다. 모델 제안이 있는데도 비어 있어야 한다.
+    const listed = JSON.parse(
+      execFileSync(HOST_BIN, ["decisions", ...dbArgs, "--session", session], { encoding: "utf8" })
+        .trim()
+        .split("\n")
+        .pop() as string
+    ) as { decisions: unknown[] };
+    assert.deepEqual(listed.decisions, [], `모델 제안이 거둘 수 있는 판정으로 나왔습니다: ${JSON.stringify(listed)}`);
+
+    // ② 제안의 id를 그대로 가리켜도 거절된다.
+    const attempt = spawnSync(
+      HOST_BIN,
+      ["withdraw", ...dbArgs, "--session", session, "--task", run.taskId, "--criterion", proposals[0].criterionId],
+      { encoding: "utf8" }
+    );
+    // **거두지 못한 것이 0으로 보고되면 호출자가 성공으로 읽는다.**
+    assert.notEqual(attempt.status, 0, `거절인데 종료 코드가 0입니다: ${attempt.stdout}`);
+    const outcome = JSON.parse(attempt.stdout.trim().split("\n").pop() as string) as {
+      withdrawn: boolean;
+      refusal?: string;
+    };
+    assert.equal(outcome.withdrawn, false, attempt.stdout);
+    assert.equal(outcome.refusal, "not_found", attempt.stdout);
+  });
+});
+
+/**
  * **PR 연동 — 브랜치를 올리고 폼 URL을 낸다** (state-machine 28절).
  *
  * remote를 **로컬 bare 저장소**로 둔다. 네트워크 없이 push 경로 전체(게이트 분류·승인·argv·

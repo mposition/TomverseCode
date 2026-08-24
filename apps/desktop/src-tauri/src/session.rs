@@ -305,6 +305,37 @@ impl SessionState {
         Ok(json!({ "note": "저장했습니다. 등록은 워크스페이스를 다시 열 때 적용됩니다." }))
     }
 
+    /// 이 세션에서 사용자가 정한 것 목록 (state-machine 30절). **읽기 전용이다.**
+    ///
+    /// 거둔 것도 함께 낸다 — 목록에서까지 지우면 "사라졌다"와 "거뒀다"가 화면에서 같은
+    /// 모양이 되고, 사용자는 자기가 무엇을 거뒀는지 확인할 수 없다.
+    pub fn session_decisions(&self) -> Result<Value, UiMessage> {
+        let session_id = self
+            .with_active(|active| Ok(active.session_id.clone()))
+            .map_err(|e| StoreIssue::new(StoreOp::ReadDecisions, e).ui())?;
+        let items = self.read_store(StoreOp::ReadDecisions, |s| {
+            tomverse_core::decisions::list(s, &session_id)
+        })?;
+        serde_json::to_value(json!({ "decisions": items }))
+            .map_err(|e| StoreIssue::new(StoreOp::ReadDecisions, format!("직렬화: {e}")).ui())
+    }
+
+    /// 앞선 판정을 거둔다 (state-machine 30절).
+    ///
+    /// **읽기 전용이 아니다** — 이벤트가 하나 남는다. 그래도 승인 왕복은 없다: 실행되는 것이
+    /// 없고 저장소도 건드리지 않으며, 바뀌는 것은 **다음 프롬프트에 무엇이 실리는가** 하나다.
+    /// 사용자가 자기 판정을 거두는 데 자기 승인을 다시 받을 이유가 없다.
+    pub fn withdraw_decision(
+        &self,
+        task_id: &str,
+        criterion_id: &str,
+        reason: Option<String>,
+    ) -> Result<Value, String> {
+        let (host, session_id) =
+            self.with_active(|active| Ok((active.host.clone(), active.session_id.clone())))?;
+        host.withdraw_decision(&session_id, task_id, criterion_id, reason.as_deref())
+    }
+
     /// 무인 정지의 처방 (state-machine 24.8절). **읽기 전용이다.**
     pub fn task_blocked(&self, task_id: &str) -> Result<Value, UiMessage> {
         let out = self.read_store(StoreOp::ReadBlocked, |s| tomverse_core::blocked::collect(s, task_id))?;

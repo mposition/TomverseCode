@@ -632,7 +632,9 @@ test("[시나리오 E] 무엇이 어느 공급자로 나갔는지 사후에 답�
       fileMutations: { path: string; postSha256?: string | null; postExisted?: boolean }[];
     };
 
-    assert.equal(exported.formatVersion, 2);
+    // **버전을 리터럴로 박아 둔다.** 형식이 바뀌면 여기서 실패해야 한다 — 감사 기록의 형식은
+    // 조용히 움직이면 안 되고, 올릴 때는 `SUPPORTED_FORMAT_VERSIONS`도 함께 봐야 한다.
+    assert.equal(exported.formatVersion, 3);
     // 재현과 재실행이 둘 다 적혀야 한다 — 하나만 적으면 독자가 나머지를 같은 것으로 읽는다.
     assert.ok(exported.guarantees.reproduce && exported.guarantees.reRun, JSON.stringify(exported.guarantees));
     // 재현의 전제가 최상위에 있어야 한다.

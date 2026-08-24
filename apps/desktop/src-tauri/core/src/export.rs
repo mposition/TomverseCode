@@ -44,7 +44,8 @@ use serde_json::{json, Value};
 /// |---|---|
 /// | 1 | 최초 |
 /// | 2 | `fileMutations`에 내용 해시(`preSha256`/`postSha256`)와 존재 여부가 들어갔다. **재현기가 "기록과 같은 내용이 됐는가"를 판정할 수 있게 하려는 것**이다 — 그 전까지 재현기가 말할 수 있는 것은 "단계가 다 돌았다"뿐이었고, 그건 6.3절이 약속한 "최종 상태 복원"의 확인이 아니었다 |
-pub const EXPORT_FORMAT_VERSION: u32 = 2;
+/// | 3 | `acceptanceCriteria[]`에 `withdrawnAt`이 들어갔다 — 사용자가 그 판정을 나중에 **거뒀다**는 사실(30절). 필드가 없는 것을 "거두지 않았다"로 읽으면 v2 파일을 조용히 틀리게 해석한다: 그 형식에는 거둘 방법 자체가 없었으므로 "없음"이 아니라 **"알 수 없음"**이다 |
+pub const EXPORT_FORMAT_VERSION: u32 = 3;
 
 /// 한 태스크의 감사 기록을 만든다. **아무것도 쓰지 않는다.**
 pub fn collect(store: &Store, task_id: &str) -> Result<Value, String> {

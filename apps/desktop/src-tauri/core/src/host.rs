@@ -10,6 +10,7 @@
 
 use crate::artifacts::ArtifactStore;
 use crate::cancel::{CancelOutcome, CancellationRegistry, CancellationToken};
+use crate::decisions;
 use crate::paths::WorkspaceRoot;
 use crate::policy::{parse_run_command, secrets, PolicyGate};
 use crate::sidecar::{IpcLineMeter, SidecarHandler};
@@ -1082,6 +1083,49 @@ impl TaskHost {
     /// 되돌리기와 다른 점이 하나 있고 그게 중요하다: **여기서는 승인을 건너뛰지 않는다.**
     /// 되돌리기는 사용자가 "되돌려"를 누른 것 자체가 그 동작의 승인이지만, push는 *무엇이*
     /// 올라가는지가 매번 다르다. 그래서 승인 왕복을 그대로 지난다.
+    /// 앞선 태스크의 사용자 판정을 **거둔다** (state-machine 30절).
+    ///
+    /// **사용자만 부른다.** 모델도 오케스트레이터도 이 경로에 닿지 않는다 — `revert`/`pr`과
+    /// 같은 자리이고, `db.appendEvent`는 이 이벤트 종류를 아예 거절한다(`NODE_MAY_NOT_EMIT`).
+    ///
+    /// 거두는 것은 **다음 태스크로 나르는가** 하나뿐이다. 소유 태스크의 기록은 그대로 남는다.
+    pub fn withdraw_decision(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        criterion_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Value, String> {
+        // **거절도 오류가 아니라 값이다.** 오류로 내면 "거두지 못했다"와 "저장소가 깨졌다"가
+        // 호출자에게 같은 모양이 된다.
+        if let Err(refusal) = self.with_store(|s| decisions::check(s, session_id, task_id, criterion_id)) {
+            return Ok(json!({
+                "withdrawn": false,
+                "taskId": task_id,
+                "criterionId": criterion_id,
+                "refusal": refusal,
+                "detail": refusal.message(),
+            }));
+        }
+
+        let withdrawn_at = now_iso();
+        let payload = json!({
+            "criterionId": criterion_id,
+            "withdrawnAt": withdrawn_at,
+            "reason": reason,
+            // 파생 캐시를 바꾸는 열쇠. `sync_acceptance_criteria_tx`가 이 키만 본다 —
+            // 이벤트 없이 기준이 사라지는 길을 만들지 않기 위해서다(원칙 7).
+            "acceptanceCriteriaWithdrawn": [criterion_id],
+        });
+        self.append_event(task_id, "USER_DECISION_WITHDRAWN", payload)?;
+        Ok(json!({
+            "withdrawn": true,
+            "taskId": task_id,
+            "criterionId": criterion_id,
+            "withdrawnAt": withdrawn_at,
+        }))
+    }
+
     pub fn open_pull_request(&self, task_id: &str, remote: &str, base: &str) -> Result<Value, String> {
         let (ok, branch, err) = self.git_try(task_id, "pr-branch", &["rev-parse", "--abbrev-ref", "HEAD"], false)?;
         if !ok {
@@ -1667,6 +1711,12 @@ impl SidecarHandler for TaskHost {
                     .get("type")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "db.appendEvent params에 \"type\"이 없음".to_string())?;
+                // **Node가 낼 수 없는 이벤트가 있다**(30절) — 아래 상수 참조.
+                if NODE_MAY_NOT_EMIT.contains(&event_type) {
+                    return Err(format!(
+                        "{event_type}은 sidecar가 낼 수 없는 이벤트입니다 — 사용자가 직접 부르는 경로에서만 기록됩니다"
+                    ));
+                }
                 let payload = params.get("payload").cloned().unwrap_or(Value::Null);
                 self.append_event(task_id, event_type, payload)
             }
@@ -1873,12 +1923,47 @@ fn redact_args(args: &Value) -> Value {
 ///
 /// 마스킹 **개수**를 payload에 남기는 이유: 0이 아니면 "가린 것이 있었다"가 로그에 보인다.
 /// 이건 "남은 것이 없다"는 주장이 아니다 — 모양 기반 탐지의 한계는 `secrets` 모듈에 적어두었다.
+/// **sidecar가 낼 수 없는 이벤트 종류.** `db.appendEvent`가 이 목록을 거절한다 (30절).
+///
+/// # 왜 목록이 이것뿐인가 — 원칙이 있다
+///
+/// Node는 `USER_DECISION_RECORDED`처럼 "사용자가 이렇게 답했다"는 이벤트를 **낼 수 있다.**
+/// 그 답변은 오케스트레이터가 던진 질문의 회신이라 그 경로를 지나는 것이 자연스럽고, 막으면
+/// 재질문 왕복 자체가 성립하지 않는다.
+///
+/// 여기 있는 것은 성질이 다르다: **오케스트레이터가 관여하지 않는 사용자 행위**의 기록이다.
+/// 사용자가 화면이나 CLI에서 직접 부르고, 그 사이 어디에도 Node가 없다. Node가 이걸 낼 이유가
+/// 없으므로 거절해도 잃는 것이 없고, 거절하면 장악당한 Node가 **사용자가 하지 않은 일을
+/// 했다고 기록하는 경로**가 하나 닫힌다 — 철회는 앞선 판정을 조용히 지우는 데 쓸 수 있고,
+/// 롤백 기록은 복원되지 않은 파일을 복원됐다고 말하는 데 쓸 수 있다.
+///
+/// **"Rust가 내는 이벤트 전부"가 아니다.** 그런 목록이었다면 Node가 정당하게 내는 것까지
+/// 섞여 언젠가 한쪽을 풀어야 하고, 그때 이 상수는 판정 근거가 되지 못한다.
+/// 이 목록이 실제로 그 성질을 갖는지는 sidecar 소스에서 유도해 검사한다
+/// (`packages/toolchain/test/rustOnlyEvents.test.ts`).
+pub const NODE_MAY_NOT_EMIT: &[&str] = &[
+    "USER_DECISION_WITHDRAWN",
+    "ROLLBACK_STARTED",
+    "ROLLBACK_COMPLETED",
+    "ROLLBACK_FAILED",
+];
+
 fn redact_user_decision(event_type: &str, payload: Value) -> Value {
-    if event_type != "USER_DECISION_RECORDED" {
+    // 철회 사유도 **사용자가 자유 입력한 텍스트**다. 여기를 빼면 붙여넣은 토큰이 가려지는
+    // 자리와 가려지지 않는 자리가 생기고, 사용자는 둘을 구별할 방법이 없다.
+    if event_type != "USER_DECISION_RECORDED" && event_type != "USER_DECISION_WITHDRAWN" {
         return payload;
     }
     let mut value = payload;
     let mut total_masked = 0usize;
+
+    if let Some(Value::String(reason)) = value.get("reason") {
+        let (masked, count) = secrets::mask_secret_shapes(reason);
+        total_masked += count;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("reason".to_string(), Value::String(masked));
+        }
+    }
 
     if let Some(Value::String(answer)) = value.get("answer") {
         let (masked, count) = secrets::mask_secret_shapes(answer);
@@ -2199,6 +2284,147 @@ mod tests {
         // 완료를 취소로 덮어쓰지 않는다 — 먼저 확정된 쪽이 남는다.
         let task = host.with_store(|s| s.get_task("task-1")).unwrap().unwrap();
         assert_eq!(task.terminal_status.as_deref(), Some("COMPLETED"));
+    }
+
+    // ---- 판정의 철회 (30절) ----
+
+    fn decided(host: &TaskHost, task_id: &str, criterion_id: &str, text: &str) {
+        host.append_event(
+            task_id,
+            "USER_DECISION_RECORDED",
+            json!({ "acceptanceCriteria": [{
+                "criterionId": criterion_id, "text": text, "source": "user_decision",
+                "decidedAt": "2026-01-01T00:00:00Z",
+            }] }),
+        )
+        .unwrap();
+    }
+
+    /// 끝난 태스크의 판정을 거두면 **다음 태스크로 나르지 않는다.** 그것이 철회의 전부다.
+    #[test]
+    fn withdrawing_a_decision_stops_it_from_being_carried() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink.clone());
+        decided(&host, "task-1", "c-1", "1페이지는 첫 항목부터");
+        host.finish_task("task-1", "COMPLETED", "TASK_COMPLETED", None, json!({}))
+            .unwrap();
+
+        let before = host
+            .with_store(|s| crate::session_memory::collect(s, "sess-1", "task-9"))
+            .unwrap();
+        assert_eq!(before.decisions.len(), 1);
+
+        let out = host.withdraw_decision("sess-1", "task-1", "c-1", None).unwrap();
+        assert_eq!(out.get("withdrawn").and_then(Value::as_bool), Some(true), "{out}");
+
+        let after = host
+            .with_store(|s| crate::session_memory::collect(s, "sess-1", "task-9"))
+            .unwrap();
+        assert!(after.decisions.is_empty(), "{:?}", after.decisions);
+        // 화면도 그 사실을 받는다 — DB에만 남고 화면에 안 보이는 변화를 만들지 않는다.
+        let seen = sink.seen.lock().unwrap().clone();
+        assert!(
+            seen.contains(&"USER_DECISION_WITHDRAWN".to_string()),
+            "sink에 철회 이벤트가 없습니다: {seen:?}"
+        );
+    }
+
+    /// **거절은 오류가 아니라 값이다.** 오류로 내면 "거두지 못했다"와 "저장소가 깨졌다"가
+    /// 호출자에게 같은 모양이 된다.
+    #[test]
+    fn a_running_tasks_decision_is_refused_with_a_reason_not_an_error() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        decided(&host, "task-1", "c-1", "진행 중");
+
+        let out = host.withdraw_decision("sess-1", "task-1", "c-1", None).unwrap();
+        assert_eq!(out.get("withdrawn").and_then(Value::as_bool), Some(false), "{out}");
+        assert_eq!(out.get("refusal").and_then(Value::as_str), Some("task_still_running"), "{out}");
+        assert!(out.get("detail").and_then(Value::as_str).unwrap_or("").contains("진행 중"), "{out}");
+        // 거절했으면 이벤트도 남기지 않는다 — 남기면 로그가 하지 않은 일을 말한다.
+        let types = host.with_store(|s| s.event_types("task-1")).unwrap();
+        assert!(!types.contains(&"USER_DECISION_WITHDRAWN".to_string()), "{types:?}");
+    }
+
+    /// 철회 사유도 **사용자가 자유 입력한 텍스트**다. 가리는 자리와 가리지 않는 자리가
+    /// 갈리면 사용자는 둘을 구별할 방법이 없다.
+    #[test]
+    fn a_withdrawal_reason_is_masked_like_any_other_free_text() {
+        const PASTED: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        decided(&host, "task-1", "c-1", "거둘 것");
+        host.finish_task("task-1", "COMPLETED", "TASK_COMPLETED", None, json!({}))
+            .unwrap();
+
+        host.withdraw_decision("sess-1", "task-1", "c-1", Some(&format!("이 토큰 때문 {PASTED}")))
+            .unwrap();
+
+        let stored = host.with_store(|s| s.events_after("task-1", None)).unwrap();
+        let event = stored
+            .into_iter()
+            .find(|e| e.event_type == "USER_DECISION_WITHDRAWN")
+            .expect("철회 이벤트가 없습니다");
+        let reason = event.payload.get("reason").and_then(Value::as_str).unwrap_or("");
+        assert!(!reason.contains(PASTED), "사유에 원문이 남았습니다: {reason}");
+        assert!(reason.contains("이 토큰 때문"), "사유 본문까지 지웠습니다: {reason}");
+    }
+
+    /// **sidecar는 철회를 기록할 수 없다.** 낼 수 있으면 장악당한 Node가 사용자가 하지 않은
+    /// 철회를 기록해 앞선 판정을 조용히 지울 수 있다.
+    ///
+    /// **이벤트 이름을 여기 적는 것이 맞다.** `NODE_MAY_NOT_EMIT`을 훑는 것만으로는 이 성질을
+    /// 지킬 수 없다 — 목록에서 항목을 지우면 훑을 것이 사라져 검사가 통과한다(실제로 그 probe가
+    /// 통과했다). 목록은 **수단**이고, 지켜야 하는 것은 "철회는 Node를 지나지 않는다"는
+    /// **주장**이므로, 주장은 목록과 무관하게 적는다.
+    #[test]
+    fn the_sidecar_cannot_emit_a_withdrawal() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        decided(&host, "task-1", "c-1", "거둘 것");
+
+        let err = host
+            .handle_request(
+                "db.appendEvent",
+                &json!({ "taskId": "task-1", "type": "USER_DECISION_WITHDRAWN", "payload": {
+                    "withdrawnAt": "2026-02-02T00:00:00Z",
+                    "acceptanceCriteriaWithdrawn": ["c-1"],
+                } }),
+            )
+            .unwrap_err();
+        assert!(err.contains("USER_DECISION_WITHDRAWN"), "{err}");
+
+        // 판정은 그대로 나른다 — 거부가 실제로 효력을 가졌는지는 결과로 본다.
+        let memory = host
+            .with_store(|s| crate::session_memory::collect(s, "sess-1", "task-9"))
+            .unwrap();
+        assert_eq!(memory.decisions.len(), 1, "{:?}", memory.decisions);
+
+        // **이 거부가 모든 이벤트를 막는 것이 아니다.** 막았다면 위 단언은 아무 말도 하지 않는다.
+        assert!(host
+            .handle_request(
+                "db.appendEvent",
+                &json!({ "taskId": "task-1", "type": "PLAN_CREATED", "payload": {} }),
+            )
+            .is_ok());
+    }
+
+    /// 목록에 **올라간 것은 전부** 거절된다. 위 테스트가 주장 하나를 지킨다면 이것은 수단이
+    /// 목록 전체에 대해 작동하는지를 본다 — 항목이 늘어날 때 조용히 빠지는 것을 막는다.
+    #[test]
+    fn every_entry_in_the_deny_list_is_actually_refused() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        assert!(!NODE_MAY_NOT_EMIT.is_empty(), "거절 목록이 비면 이 검사는 아무 말도 하지 않습니다");
+        for event_type in NODE_MAY_NOT_EMIT.iter().copied() {
+            let err = host
+                .handle_request(
+                    "db.appendEvent",
+                    &json!({ "taskId": "task-1", "type": event_type, "payload": {} }),
+                )
+                .unwrap_err();
+            assert!(err.contains(event_type), "{err}");
+        }
     }
 
     /// 문서 17.3절: 판정 원문은 남되 비밀값 모양은 가려야 한다.

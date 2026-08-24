@@ -18,7 +18,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "//test": "이 Node 버전은 `node --test <디렉터리>`가 동작하지 않는다 — 파일을 직접 나열한다(CLAUDE.md 함정 기록).",
-    "test": "npm run build && node --test dist/test/hostBinary.test.js dist/test/msvc.test.js dist/test/verifyOrder.test.js dist/test/exec.test.js dist/test/buildOrder.test.js dist/test/cargoLauncher.test.js dist/test/nodeVersion.test.js dist/test/docStatus.test.js dist/test/policyBridge.test.js"
+    "test": "npm run build && node --test dist/test/hostBinary.test.js dist/test/msvc.test.js dist/test/verifyOrder.test.js dist/test/exec.test.js dist/test/buildOrder.test.js dist/test/cargoLauncher.test.js dist/test/nodeVersion.test.js dist/test/docStatus.test.js dist/test/policyBridge.test.js dist/test/rustOnlyEvents.test.js"
   },
   "devDependencies": {
     "@types/node": "^24.9.0",

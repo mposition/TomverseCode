@@ -120,6 +120,13 @@ struct Args {
     hooks: Vec<tomverse_core::hooks::HookConfig>,
     skill: Option<PathBuf>,
     session_id: Option<String>,
+    /// `decisions`/`withdraw` 전용 — 거둘 판정의 id (30절).
+    ///
+    /// **`--task`와 함께 쓴다.** `acceptance_criteria`의 키가 `(task_id, criterion_id)`이므로
+    /// id 하나는 세션 안에서 유일하지 않고, 그것만으로 가리키면 엉뚱한 판정을 거둔다.
+    criterion_id: Option<String>,
+    /// 철회 사유 (선택). 사용자가 자유 입력하는 텍스트라 저장 직전 마스킹을 지난다.
+    reason: Option<String>,
     remote: String,
     base: String,
     /// `metrics` 전용: 워크스페이스 필터를 끄고 DB 전체를 집계한다.
@@ -182,6 +189,8 @@ fn parse_args() -> Result<Args, String> {
         hooks: Vec::new(),
         skill: None,
         session_id: None,
+        criterion_id: None,
+        reason: None,
         remote: "origin".to_string(),
         base: "main".to_string(),
         worktree: None,
@@ -218,6 +227,8 @@ fn parse_args() -> Result<Args, String> {
             "--hook" => args.hooks.push(parse_hook(&value()?)?),
             "--skill" => args.skill = Some(PathBuf::from(value()?)),
             "--session" => args.session_id = Some(value()?),
+            "--criterion" => args.criterion_id = Some(value()?),
+            "--reason" => args.reason = Some(value()?),
             "--remote" => args.remote = value()?,
             "--base" => args.base = value()?,
             "--db" => args.db = Some(PathBuf::from(value()?)),
@@ -327,7 +338,7 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|pr|recover|tasks|show|blocked|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|pr|recover|tasks|show|blocked|decisions|withdraw|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--skill <파일.json>] [--session <id>]\n\
      [--auto-approve-writes] [--auto-approve-verification]\n\
@@ -367,6 +378,11 @@ fn usage() -> String {
      blocked — 무인 정지의 처방(JSON). 무엇이 막았고 **무엇을 켜면 지나가는지**, 그리고\n\
                  어떤 정지는 정책으로 열 수 없는지를 기록에서 유도한다. 아무것도 쓰지 않는다.\n\
                  이번 실행이 도달한 지점까지만 안다 — 켜고 다시 돌리면 더 진행하다 또 멈출 수 있다\n\
+     decisions — 이 세션에서 사용자가 정한 것 목록 (읽기 전용, --session 필요). **거둔 것도 나온다** —\n\
+                 목록에서까지 지우면 '사라졌다'와 '거뒀다'가 같은 모양이 된다\n\
+     withdraw — 앞선 판정을 거둔다 (--session --task --criterion [--reason]). 바뀌는 것은\n\
+                 **다음 태스크로 나르는가** 하나뿐이며, 그 태스크의 기준 기록은 그대로 남는다.\n\
+                 진행 중인 태스크의 기준은 거둘 수 없다 (0=거둠, 1=거두지 않음)\n\
      tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
      show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다\n\
      transmission — 이 작업에서 무엇이 어느 공급자로 나갔는지 (읽기 전용, --task 필요)\n\
@@ -859,6 +875,49 @@ fn real_main() -> Result<i32, String> {
             println!("{out}");
             // **올리지 못한 것을 0으로 보고하지 않는다** — 호출자가 성공으로 읽는다.
             Ok(if pushed { 0 } else { 1 })
+        }
+
+        // 판정의 철회 (30절). **목록은 읽기 전용이다.**
+        "decisions" => {
+            let session_id = args
+                .session_id
+                .clone()
+                .ok_or_else(|| "decisions에는 --session이 필요합니다".to_string())?;
+            let guard = store.lock().unwrap();
+            let items = tomverse_core::decisions::list(&guard, &session_id)?;
+            println!("{}", json!({ "decisions": items }));
+            Ok(0)
+        }
+
+        // **읽기 전용이 아니다** — 이벤트가 하나 남는다. 그래도 `run`과 달리 모델도 sidecar도
+        // 부르지 않는다: 사용자가 직접 부르는 자리이고, Node는 이 이벤트를 낼 수 없다.
+        "withdraw" => {
+            let session_id = args
+                .session_id
+                .clone()
+                .ok_or_else(|| "withdraw에는 --session이 필요합니다".to_string())?;
+            let task_id = args
+                .task_id
+                .clone()
+                .ok_or_else(|| "withdraw에는 --task가 필요합니다 (판정의 열쇠는 태스크와 기준 id 둘입니다)".to_string())?;
+            let criterion_id = args
+                .criterion_id
+                .clone()
+                .ok_or_else(|| "withdraw에는 --criterion이 필요합니다".to_string())?;
+            let host = TaskHost::new(
+                root,
+                policy_for_task.clone(),
+                store,
+                artifacts,
+                approvals,
+                sink,
+                Arc::new(CancellationRegistry::new()),
+            );
+            let out = host.withdraw_decision(&session_id, &task_id, &criterion_id, args.reason.as_deref())?;
+            let withdrawn = out.get("withdrawn").and_then(Value::as_bool).unwrap_or(false);
+            println!("{out}");
+            // **거두지 못한 것을 0으로 보고하지 않는다** — 호출자가 성공으로 읽는다.
+            Ok(if withdrawn { 0 } else { 1 })
         }
 
         "blocked" => {

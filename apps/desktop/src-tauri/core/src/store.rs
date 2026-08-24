@@ -24,7 +24,9 @@ use std::path::Path;
 /// 과정에서 잃는 것은 "append-only 진실의 원천"이라는 약속을 깨는 것이다.
 ///
 /// v3(M1): `acceptance_criteria` — 사용자 판정의 파생 캐시(문서 17.3절). 역시 additive다.
-pub const SCHEMA_VERSION: i64 = 7;
+///
+/// v8(M3): `acceptance_criteria.withdrawn_at` — 판정을 **거둔 시각**(문서 30절). 컬럼 추가라 additive다.
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub struct Store {
     conn: Connection,
@@ -118,6 +120,8 @@ pub enum StoreOp {
     ReadBlocked,
     /// 앞선 태스크에서 사용자가 정한 것을 읽지 못했다 (state-machine 27절).
     ReadSessionMemory,
+    /// 세션의 사용자 판정 목록을 읽지 못했다 (state-machine 30절).
+    ReadDecisions,
 }
 
 impl StoreOp {
@@ -138,6 +142,7 @@ impl StoreOp {
         StoreOp::ReadExport,
         StoreOp::ReadBlocked,
         StoreOp::ReadSessionMemory,
+        StoreOp::ReadDecisions,
     ];
 }
 
@@ -172,6 +177,7 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::ReadExport => "storeReadExport",
             StoreOp::ReadBlocked => "storeReadBlocked",
             StoreOp::ReadSessionMemory => "storeReadSessionMemory",
+            StoreOp::ReadDecisions => "storeReadDecisions",
         }
     }
 
@@ -192,6 +198,7 @@ impl crate::uimsg::UserFacing for StoreIssue {
             StoreOp::ReadExport => "감사 기록을 만들 수 없습니다",
             StoreOp::ReadBlocked => "무인 정지의 처방을 읽을 수 없습니다",
             StoreOp::ReadSessionMemory => "앞선 태스크에서 정한 것을 읽을 수 없습니다",
+            StoreOp::ReadDecisions => "이 세션에서 정한 것의 목록을 읽을 수 없습니다",
         };
         format!("{what}: {}", self.detail)
     }
@@ -247,6 +254,30 @@ pub struct AcceptanceCriterionRow {
     pub disagreement_id: Option<String>,
     #[serde(rename = "decidedAt")]
     pub decided_at: String,
+    /// 이 판정을 사용자가 거둔 시각 (30절). **행은 남는다** — 그 태스크가 무엇을 기준으로
+    /// 판정됐는지는 소급해서 바뀌지 않고, 여기 더해지는 것은 "이후 거뒀다"는 나중의 사실이다.
+    #[serde(rename = "withdrawnAt", skip_serializing_if = "Option::is_none")]
+    pub withdrawn_at: Option<String>,
+}
+
+/// 다음 태스크로 나를 판정 하나 (`session_user_decisions`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarriedDecisionRow {
+    pub task_id: String,
+    pub criterion_id: String,
+    pub text: String,
+    pub decided_at: String,
+}
+
+/// 사용자에게 보여줄 세션 판정 하나 — 철회된 것도 포함한다 (`session_decision_rows`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionDecisionRow {
+    pub task_id: String,
+    pub criterion_id: String,
+    pub text: String,
+    pub decided_at: String,
+    pub withdrawn_at: Option<String>,
+    pub task_final_status: Option<String>,
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -304,6 +335,9 @@ impl Store {
         }
         if current < 7 {
             tx.execute_batch(SCHEMA_V7)?;
+        }
+        if current < 8 {
+            tx.execute_batch(SCHEMA_V8)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -665,23 +699,60 @@ impl Store {
         &self,
         session_id: &str,
         exclude_task_id: &str,
-    ) -> Result<Vec<(String, String, String)>> {
+    ) -> Result<Vec<CarriedDecisionRow>> {
+        // **철회된 것은 여기서 사라진다.** 이 질의가 "다음 태스크로 나를 것"의 정의이고,
+        // 철회의 효력은 정확히 그것뿐이다(30절) — 아래 `session_decision_rows`는 같은 행을
+        // 여전히 돌려준다. 두 질의가 다른 답을 내는 것이 기능이다.
         let mut stmt = self.conn.prepare(
-            "SELECT c.task_id, c.text, c.decided_at
+            "SELECT c.task_id, c.criterion_id, c.text, c.decided_at
              FROM acceptance_criteria c
              JOIN tasks t ON t.task_id = c.task_id
              WHERE t.session_id = ?1 AND c.task_id != ?2 AND c.source = 'user_decision'
+               AND c.withdrawn_at IS NULL
              ORDER BY c.decided_at DESC, c.rowid DESC",
         )?;
         let rows = stmt.query_map(params![session_id, exclude_task_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok(CarriedDecisionRow {
+                task_id: r.get(0)?,
+                criterion_id: r.get(1)?,
+                text: r.get(2)?,
+                decided_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// 이 세션에서 사용자가 정한 것 **전부** — 철회된 것도 포함한다 (30절).
+    ///
+    /// 나를 것을 고르는 질의가 아니라 **사용자에게 보여줄 목록**이다. 철회한 것을 목록에서까지
+    /// 지우면 사용자는 자기가 무엇을 거뒀는지 확인할 방법이 없고, 그러면 "사라졌다"와
+    /// "거뒀다"가 화면에서 같은 모양이 된다.
+    ///
+    /// 소유 태스크가 아직 끝나지 않았는지도 함께 낸다 — 철회할 수 있는지를 정하는 사실이다.
+    pub fn session_decision_rows(&self, session_id: &str) -> Result<Vec<SessionDecisionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.task_id, c.criterion_id, c.text, c.decided_at, c.withdrawn_at, t.final_status
+             FROM acceptance_criteria c
+             JOIN tasks t ON t.task_id = c.task_id
+             WHERE t.session_id = ?1 AND c.source = 'user_decision'
+             ORDER BY c.decided_at DESC, c.rowid DESC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(SessionDecisionRow {
+                task_id: r.get(0)?,
+                criterion_id: r.get(1)?,
+                text: r.get(2)?,
+                decided_at: r.get(3)?,
+                withdrawn_at: r.get(4)?,
+                task_final_status: r.get(5)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn acceptance_criteria(&self, task_id: &str) -> Result<Vec<AcceptanceCriterionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT criterion_id, text, source, disagreement_id, decided_at
+            "SELECT criterion_id, text, source, disagreement_id, decided_at, withdrawn_at
              FROM acceptance_criteria WHERE task_id = ?1
              ORDER BY (source = 'user_decision') DESC, decided_at ASC, criterion_id ASC",
         )?;
@@ -692,6 +763,7 @@ impl Store {
                 source: r.get(2)?,
                 disagreement_id: r.get(3)?,
                 decided_at: r.get(4)?,
+                withdrawn_at: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1546,6 +1618,37 @@ fn sync_acceptance_criteria_tx(
     task_id: &str,
     payload: &serde_json::Value,
 ) -> std::result::Result<(), StoreError> {
+    // **철회도 이 한 곳을 지난다** (30절). 파생 캐시를 바꾸는 경로를 늘리지 않기 위해서다 —
+    // "이벤트 없이 기준이 생기거나 사라지는 길은 없다"가 유지되려면 사라지는 쪽도 여기 있어야 한다.
+    if let Some(raw) = payload.get("acceptanceCriteriaWithdrawn") {
+        let ids = raw
+            .as_array()
+            .ok_or_else(|| StoreError::Invariant("acceptanceCriteriaWithdrawn는 배열이어야 합니다".to_string()))?;
+        let withdrawn_at = payload
+            .get("withdrawnAt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| StoreError::Invariant("철회 이벤트에 \"withdrawnAt\"이 없음".to_string()))?;
+        for id in ids {
+            let criterion_id = id
+                .as_str()
+                .ok_or_else(|| StoreError::Invariant("acceptanceCriteriaWithdrawn 항목은 문자열이어야 합니다".to_string()))?;
+            // **`source = 'user_decision'`만 거둘 수 있다.** 모델 제안은 애초에 나르지 않으므로
+            // 거둘 대상이 아니고, 대상을 넓히면 "무엇을 거뒀는가"가 권위와 무관해진다.
+            let changed = tx.execute(
+                "UPDATE acceptance_criteria SET withdrawn_at = ?1
+                 WHERE task_id = ?2 AND criterion_id = ?3 AND source = 'user_decision' AND withdrawn_at IS NULL",
+                params![withdrawn_at, task_id, criterion_id],
+            )?;
+            // 0건이면 이벤트와 캐시가 어긋난다 — "철회했다고 적혀 있는데 여전히 나르는" 상태다.
+            // 조용히 넘기면 그 어긋남이 로그에서 보이지 않으므로 트랜잭션째 되돌린다.
+            if changed == 0 {
+                return Err(StoreError::Invariant(format!(
+                    "거둘 수 있는 사용자 판정이 없습니다: {task_id}/{criterion_id}"
+                )));
+            }
+        }
+    }
+
     let Some(raw) = payload.get("acceptanceCriteria") else {
         return Ok(());
     };
@@ -1921,6 +2024,15 @@ ALTER TABLE workspaces ADD COLUMN allowed_providers TEXT;
 ///
 /// 캐시이므로 **잃어도 정확성이 상하지 않는다** — 없으면 다시 만든다. 그래서 `task_events`와
 /// 달리 append-only가 아니고, 지워도 되는 유일한 테이블이다.
+/// v8 (M3) — **판정의 철회**(문서 30절).
+///
+/// 컬럼 하나를 더한다. 행을 지우지 않는 이유가 이 기능의 핵심이다: 철회는 "그때 그 기준이
+/// 없었다"가 아니라 **"앞으로는 나르지 않는다"**이므로, 그 태스크가 무엇을 기준으로 판정됐는지는
+/// 그대로 남아야 한다. 지우면 끝난 태스크의 감사 기록이 소급해서 바뀐다.
+const SCHEMA_V8: &str = r#"
+ALTER TABLE acceptance_criteria ADD COLUMN withdrawn_at TEXT;
+"#;
+
 const SCHEMA_V7: &str = r#"
 CREATE TABLE workspace_index_cache (
   workspace_id   TEXT PRIMARY KEY REFERENCES workspaces(workspace_id),
@@ -3190,6 +3302,127 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name, "ws");
+    }
+
+    /// v7 DB를 v8로 올려도 **이미 정해진 기준은 그대로 유효하다.**
+    ///
+    /// 마이그레이션이 컬럼을 추가하면서 기존 행을 "거둔 것"으로 만들면, 앱을 새 버전으로
+    /// 켠 순간 사용자가 정한 것이 조용히 사라진다 — 사용자에게는 판정이 증발한 것으로 보인다.
+    #[test]
+    fn migration_from_v7_leaves_existing_decisions_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let artifacts = ArtifactStore::new(dir.path().join("artifacts")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for batch in [
+                SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+            ] {
+                conn.execute_batch(batch).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 7i64).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces VALUES ('ws-1', '/tmp/ws', 'ws', '{}', '2020-01-01T00:00:00Z', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (session_id, workspace_id, title, started_at) VALUES ('sess-1', 'ws-1', NULL, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (task_id, session_id, workspace_id, user_message, phase, counters_json, final_status, created_at, updated_at)
+                 VALUES ('old-task', 'sess-1', 'ws-1', 'fix', 'COMPLETED', '{}', 'COMPLETED', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO acceptance_criteria (task_id, criterion_id, text, source, disagreement_id, decided_at)
+                 VALUES ('old-task', 'c-1', '예전 판정', 'user_decision', NULL, '2020-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&db, artifacts).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let carried = store.session_user_decisions("sess-1", "other").unwrap();
+        assert_eq!(carried.len(), 1, "{carried:?}");
+        assert_eq!(carried[0].text, "예전 판정");
+        assert!(store.acceptance_criteria("old-task").unwrap()[0].withdrawn_at.is_none());
+    }
+
+    /// **철회는 이벤트를 지나야만 일어난다.** payload 키가 없으면 캐시는 그대로다 —
+    /// 이벤트 없이 기준이 사라지는 길이 있으면 원칙 7이 무너진다.
+    #[test]
+    fn a_decision_is_only_withdrawn_through_an_event_payload() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &serde_json::json!({ "acceptanceCriteria": [{
+                    "criterionId": "c-1", "text": "기준", "source": "user_decision",
+                    "decidedAt": "2026-01-01T00:00:00Z",
+                }] }),
+            )
+            .unwrap();
+
+        // 철회 키가 없는 이벤트는 아무것도 거두지 않는다.
+        store
+            .append_event("task-1", "USER_DECISION_WITHDRAWN", &serde_json::json!({ "criterionId": "c-1" }))
+            .unwrap();
+        assert!(store.acceptance_criteria("task-1").unwrap()[0].withdrawn_at.is_none());
+
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_WITHDRAWN",
+                &serde_json::json!({
+                    "withdrawnAt": "2026-02-02T00:00:00Z",
+                    "acceptanceCriteriaWithdrawn": ["c-1"],
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            store.acceptance_criteria("task-1").unwrap()[0].withdrawn_at.as_deref(),
+            Some("2026-02-02T00:00:00Z")
+        );
+    }
+
+    /// 거둘 것이 없는데 철회 이벤트가 오면 **오류다.** 조용히 넘기면 "철회했다고 적혀 있는데
+    /// 여전히 나르는" 상태가 로그에 남고, 그 어긋남은 화면 어디에도 보이지 않는다.
+    #[test]
+    fn withdrawing_something_that_is_not_a_user_decision_fails_the_transaction() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &serde_json::json!({ "acceptanceCriteria": [{
+                    "criterionId": "p-1", "text": "모델 후보", "source": "draft_proposal",
+                    "decidedAt": "2026-01-01T00:00:00Z",
+                }] }),
+            )
+            .unwrap();
+
+        let err = store
+            .append_event(
+                "task-1",
+                "USER_DECISION_WITHDRAWN",
+                &serde_json::json!({
+                    "withdrawnAt": "2026-02-02T00:00:00Z",
+                    "acceptanceCriteriaWithdrawn": ["p-1"],
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invariant(_)), "예상과 다른 오류: {err:?}");
+        // **이벤트도 남지 않았다** — 트랜잭션째 되돌아가므로 로그와 캐시가 갈라지지 않는다.
+        assert!(!store
+            .event_types("task-1")
+            .unwrap()
+            .contains(&"USER_DECISION_WITHDRAWN".to_string()));
     }
 
     // ---- 화면에 뜨는 저장 계층 실패 ----

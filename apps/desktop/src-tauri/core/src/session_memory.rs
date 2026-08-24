@@ -19,6 +19,13 @@
 //! **사용자가 이번에 말한 적 없는 요구**에 대해 태스크를 판정하게 된다. 그래서 프롬프트에서도
 //! 자리를 나누고, 이 모듈은 `acceptance_criteria`에 아무것도 쓰지 않는다.
 //!
+//! # 거둔 것은 나르지 않는다
+//!
+//! 사용자는 앞선 판정을 **거둘 수 있다**(30절, `decisions.rs`). 거둔 판정은 이 목록에서
+//! 사라지며, 그 사실을 모델에게 말하지 않는다 — 잘린 것과는 성질이 다르다. 잘린 것은
+//! **유효한데 안 보낸 것**이라 "더 있다"고 알려야 하고, 거둔 것은 **유효하지 않은 것**이라
+//! 언급 자체가 거둔 판정을 되살린다.
+//!
 //! # 상한이 있다
 //!
 //! 세션이 길어지면 프롬프트가 무한정 자란다(원칙 5). 최근 것부터 상한까지만 나르고,
@@ -32,6 +39,10 @@ use serde::Serialize;
 pub struct CarriedDecision {
     #[serde(rename = "taskId")]
     pub task_id: String,
+    /// 이 판정을 가리키는 id. **거둘 때 이것으로 가리킨다**(30절) — 본문으로 가리키면
+    /// 같은 문장이 두 태스크에 있을 때 어느 것을 거뒀는지 정해지지 않는다.
+    #[serde(rename = "criterionId")]
+    pub criterion_id: String,
     pub text: String,
     #[serde(rename = "decidedAt")]
     pub decided_at: String,
@@ -67,10 +78,11 @@ pub fn collect(store: &Store, session_id: &str, current_task_id: &str) -> Result
     let decisions: Vec<CarriedDecision> = rows
         .into_iter()
         .take(MAX_CARRIED_DECISIONS)
-        .map(|(task_id, text, decided_at)| CarriedDecision {
-            task_id,
-            text,
-            decided_at,
+        .map(|row| CarriedDecision {
+            task_id: row.task_id,
+            criterion_id: row.criterion_id,
+            text: row.text,
+            decided_at: row.decided_at,
         })
         .collect();
 
