@@ -109,6 +109,30 @@ stateDiagram-v2
 
 모든 상한 값은 `TaskPolicy` 설정(워크스페이스별 override 가능)에서 읽는다. 하드코딩하지 않는다.
 
+### 2.2 터미널 목록은 경계 양쪽에 하나씩 있다 — 그리고 부탁으로 지켜지고 있었다 (M1)
+
+"어떤 phase가 터미널인가"는 **두 곳**에 적혀 있다: `packages/protocol/src/task.ts`의
+`TERMINAL_PHASES`와 `core/src/store.rs`의 `is_terminal_phase()`. 하나로 합칠 수 없는 이유는
+구조적이다 — Rust는 TypeScript를 import할 수 없고, 이 판정은 Node가 죽어 있을 때도 Rust가
+혼자 내려야 한다(앱 시작 시 `INTERRUPTED` 확정이 정확히 그 경우다).
+
+문제는 그 중복이 **부탁으로만 지켜지고 있었다**는 것이다. Rust 쪽 주석은 "한쪽만 고치면
+갈라진다 — 함께 유지할 것"이라고 적어두었을 뿐 대조하는 검사가 없었다.
+
+**갈라지면 무엇이 깨지는가.** Node가 터미널로 보는 phase를 Rust가 아니라고 보면 Rust는 그
+태스크를 "아직 진행 중"으로 취급해 앱 재시작 때 `INTERRUPTED`로 확정하려 든다. 반대 방향이면
+Node가 계속 돌리려는 태스크를 Rust가 이미 끝난 것으로 보고 이벤트를 거부한다. 둘 다 "정확히
+한 번"이라는 terminal 규칙이 겨냥하는 바로 그 상태다.
+
+**부탁이 이미 한 번 어긋나 있었다.** 그 주석은 목록이 `orchestrator/machine.ts`에 있다고
+가리켰는데 거기 없다 — 실제 위치는 protocol이다. **손으로 유지하는 포인터는 손으로 유지하는
+목록보다 먼저 낡는다**, 그리고 포인터가 낡으면 "함께 유지하라"는 지시는 따를 수 없는 지시가 된다.
+
+`packages/sidecar/test/terminalPhases.test.ts`가 대조한다. **기대 목록을 테스트에 적지 않는
+것이 핵심이다** — 적으면 목록이 셋이 되고, 셋이 되면 갈라질 자리도 셋이 된다. TypeScript 쪽은
+import로, Rust 쪽은 `matches!` 팔을 소스에서 읽어 가져온다. Rust에서 하나도 못 읽으면 그것도
+실패다: 빈 집합끼리는 언제나 같기 때문이다. 주석의 포인터가 실제 위치를 가리키는지도 함께 본다.
+
 ## 3. 프로토콜 스키마 (TypeScript, 단일 소스)
 
 Node sidecar와 UI가 공유하는 정식 타입. Rust 코어는 `ToolRequest`, `ToolResult`, `PolicyDecision`, `TaskState`(카운터/phase만)를 제외한 나머지는 `serde_json::Value`로 그대로 통과시킨다.

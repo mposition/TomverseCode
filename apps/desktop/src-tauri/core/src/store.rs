@@ -1454,7 +1454,12 @@ impl Store {
 }
 
 /// 터미널 phase 판정. Rust와 TypeScript 양쪽에 같은 목록이 있으므로 한쪽만 고치면 갈라진다 —
-/// `packages/sidecar/src/orchestrator/machine.ts`의 `TERMINAL_PHASES`와 함께 유지할 것.
+/// `packages/protocol/src/task.ts`의 `TERMINAL_PHASES`와 짝이다.
+///
+/// **"함께 유지할 것"이라고만 적혀 있었고 검사가 없었다.** 그 부탁은 이미 한 번 어긋나 있었다:
+/// 종전 주석은 목록이 `machine.ts`에 있다고 가리켰는데 거기 없다. 손으로 유지하는 포인터는
+/// 손으로 유지하는 목록보다 먼저 낡는다. 이제 `packages/sidecar/test/terminalPhases.test.ts`가
+/// 양쪽을 **소스에서 유도해** 대조한다(2.2절).
 ///
 /// `INTERRUPTED`는 M0.1에서 추가됐다: 앱이 비정상 종료된 태스크는 완료도 실패도 취소도 아니고,
 /// **사용자가 되돌릴지 재실행할지 결정해야 하는 상태**다. 다른 터미널로 뭉뚱그리면 그 구별이 사라진다.
