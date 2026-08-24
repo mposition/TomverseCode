@@ -2427,6 +2427,7 @@ mod tests {
             reason: "1클릭 승인".into(),
             requires_user_approval: true,
             normalized_target: "npm test".into(),
+            unblocked_by: crate::types::PolicyLever::NotApplicable,
             decided_at: now_iso(),
         };
         store.record_tool_request(&request, "plan-1", &decision).unwrap();
@@ -2552,6 +2553,7 @@ mod tests {
             reason: "t".into(),
             requires_user_approval: false,
             normalized_target: "src/a.ts".into(),
+            unblocked_by: crate::types::PolicyLever::NotApplicable,
             decided_at: now_iso(),
         };
         store.record_tool_request(&request, "plan-1", &decision).unwrap();
@@ -2741,6 +2743,7 @@ mod tests {
             reason: "t".into(),
             requires_user_approval: false,
             normalized_target: "src/a.ts".into(),
+            unblocked_by: crate::types::PolicyLever::NotApplicable,
             decided_at: now_iso(),
         };
         for (rid, pre) in [("r1", "v0"), ("r2", "v1")] {
@@ -2801,6 +2804,7 @@ mod tests {
             reason: "ok".into(),
             requires_user_approval: false,
             normalized_target: "a".into(),
+            unblocked_by: crate::types::PolicyLever::NotApplicable,
             decided_at: now_iso(),
         };
         store.record_tool_request(&req, "plan-1", &decision).unwrap();

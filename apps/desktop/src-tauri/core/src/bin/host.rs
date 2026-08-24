@@ -311,7 +311,7 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|blocked|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--auto-approve-writes] [--auto-approve-verification]\n\
      [--allow-git-commit] [--cancel-after-ms <n>]\n\
@@ -334,6 +334,9 @@ fn usage() -> String {
      worktree — 격리 트리 목록(JSON). [--worktree <branch>]를 주면 그 트리를 정리한다.\n\
                  커밋되지 않은 변경이 있으면 지우지 않고 사유를 낸다 — 버리려면 [--force]\n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
+     blocked — 무인 정지의 처방(JSON). 무엇이 막았고 **무엇을 켜면 지나가는지**, 그리고\n\
+                 어떤 정지는 정책으로 열 수 없는지를 기록에서 유도한다. 아무것도 쓰지 않는다.\n\
+                 이번 실행이 도달한 지점까지만 안다 — 켜고 다시 돌리면 더 진행하다 또 멈출 수 있다\n\
      tasks   — 저장된 작업 목록을 JSON으로 출력한다\n\
      show    — 한 작업의 상태·이벤트·mutation·검증 기록을 JSON으로 출력한다\n\
      transmission — 이 작업에서 무엇이 어느 공급자로 나갔는지 (읽기 전용, --task 필요)\n\
@@ -749,6 +752,19 @@ fn real_main() -> Result<i32, String> {
             };
             let metrics = tomverse_core::metrics::collect(&guard, scope.as_deref())?;
             println!("{}", serde_json::to_string(&metrics).unwrap_or_default());
+            Ok(0)
+        }
+
+        "blocked" => {
+            // **읽기 전용이다.** 저장된 이벤트에서 처방을 유도할 뿐, 정책을 고치지도
+            // 태스크를 다시 돌리지도 않는다 — 다시 돌리는 것은 사용자의 결정이다.
+            let task_id = args
+                .task_id
+                .clone()
+                .ok_or_else(|| "blocked에는 --task가 필요합니다".to_string())?;
+            let guard = store.lock().unwrap();
+            let report = tomverse_core::blocked::collect(&guard, &task_id)?;
+            println!("{}", serde_json::to_string(&report).unwrap_or_default());
             Ok(0)
         }
 

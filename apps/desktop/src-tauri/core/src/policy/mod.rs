@@ -29,7 +29,8 @@ pub mod secrets;
 use crate::paths::{PathViolation, WorkspaceRoot};
 use crate::time::now_iso;
 use crate::types::{
-    CommandPolicy, Decision, PolicyDecision, RiskLevel, RuleEffect, RunCommandArgs, TaskPolicy, ToolName, ToolRequest,
+    CommandPolicy, Decision, PolicyDecision, PolicyLever, RiskLevel, RuleEffect, RunCommandArgs, TaskPolicy, ToolName,
+    ToolRequest,
 };
 use command::{default_command_policy, is_network_capable, match_command, program_basename, CommandMatch};
 
@@ -58,6 +59,7 @@ impl PolicyGate {
             reason: outcome.reason,
             requires_user_approval: matches!(outcome.decision, Decision::RequireUserApproval),
             normalized_target: outcome.normalized_target,
+            unblocked_by: outcome.unblocked_by,
             decided_at: now_iso(),
         }
     }
@@ -96,13 +98,14 @@ impl PolicyGate {
                     // 거부가 아니라 승인 필요로 두는 이유: 사용자가 정말로 `.env`를 고쳐달라고
                     // 요청하는 경우가 있다. 그걸 원천 차단하면 도구가 쓸모없어지므로,
                     // "무엇을 읽으려 하는지 사용자에게 보이고 사용자가 결정한다"로 처리한다.
-                    Ok(safe) if secrets::is_secret_path(safe.relative()) => Outcome {
-                        decision: Decision::RequireUserApproval,
-                        risk_level: RiskLevel::High,
-                        matched_rule: "secret_path_read_requires_approval".to_string(),
-                        reason: "비밀값을 담을 수 있는 파일을 읽으려 함 — 사용자 승인 필요".to_string(),
-                        normalized_target: safe.relative().to_string(),
-                    },
+                    Ok(safe) if secrets::is_secret_path(safe.relative()) => Outcome::needs_approval(
+                        "secret_path_read_requires_approval".to_string(),
+                        "비밀값을 담을 수 있는 파일을 읽으려 함 — 사용자 승인 필요".to_string(),
+                        safe.relative().to_string(),
+                        RiskLevel::High,
+                        // 위 주석대로 "사용자가 결정한다"가 이 자리의 전부다 — 넓힐 스위치가 없다.
+                        PolicyLever::HumanOnly,
+                    ),
                     Ok(safe) => Outcome::auto(
                         "read_only_within_workspace",
                         "파일 읽기, workspace 내부 경로",
@@ -125,14 +128,14 @@ impl PolicyGate {
                             // 덮어쓰면 사용자가 잃는 것(되돌릴 수 없는 자격증명)이 일반 소스 파일과
                             // 비교할 수 없이 크다. 정책으로도 이 승인을 끌 수 없게 둔다.
                             if secrets::is_secret_path(&target) {
-                                Outcome {
-                                    decision: Decision::RequireUserApproval,
-                                    risk_level: RiskLevel::High,
-                                    matched_rule: "secret_path_write_requires_approval".to_string(),
-                                    reason: "비밀값을 담을 수 있는 파일을 변경함 — 자동 승인 정책과 무관하게 승인 필요"
-                                        .to_string(),
-                                    normalized_target: target,
-                                }
+                                Outcome::needs_approval(
+                                    "secret_path_write_requires_approval".to_string(),
+                                    "비밀값을 담을 수 있는 파일을 변경함 — 자동 승인 정책과 무관하게 승인 필요".to_string(),
+                                    target,
+                                    RiskLevel::High,
+                                    // 바로 위 주석: "정책으로도 이 승인을 끌 수 없게 둔다."
+                                    PolicyLever::HumanOnly,
+                                )
                             } else if task_policy.auto_approve_workspace_writes {
                                 Outcome {
                                     decision: Decision::AutoApprove,
@@ -140,15 +143,16 @@ impl PolicyGate {
                                     matched_rule: "workspace_write_auto_approved".to_string(),
                                     reason: "workspace 내부 쓰기이며 정책이 자동 승인을 허용함".to_string(),
                                     normalized_target: target,
+                                    unblocked_by: PolicyLever::NotApplicable,
                                 }
                             } else {
-                                Outcome {
-                                    decision: Decision::RequireUserApproval,
-                                    risk_level: RiskLevel::Medium,
-                                    matched_rule: "workspace_write_requires_approval".to_string(),
-                                    reason: "workspace 내부 파일을 변경함 — 사용자 승인 필요".to_string(),
-                                    normalized_target: target,
-                                }
+                                Outcome::needs_approval(
+                                    "workspace_write_requires_approval".to_string(),
+                                    "workspace 내부 파일을 변경함 — 사용자 승인 필요".to_string(),
+                                    target,
+                                    RiskLevel::Medium,
+                                    PolicyLever::AutoApproveWorkspaceWrites,
+                                )
                             }
                         }
                         Err(violation) => Outcome::deny_path(&candidate, violation),
@@ -160,13 +164,13 @@ impl PolicyGate {
             // ---- 파일 삭제: 항상 사용자 승인 (정책으로도 자동화하지 않는다) ----
             ToolName::DeleteFile => match required_path_arg(request) {
                 Ok(candidate) => match root.resolve_existing(&candidate) {
-                    Ok(safe) => Outcome {
-                        decision: Decision::RequireUserApproval,
-                        risk_level: RiskLevel::High,
-                        matched_rule: "delete_always_requires_approval".to_string(),
-                        reason: "파일 삭제는 되돌리기 비용이 크므로 정책과 무관하게 항상 승인이 필요함".to_string(),
-                        normalized_target: safe.relative().to_string(),
-                    },
+                    Ok(safe) => Outcome::needs_approval(
+                        "delete_always_requires_approval".to_string(),
+                        "파일 삭제는 되돌리기 비용이 크므로 정책과 무관하게 항상 승인이 필요함".to_string(),
+                        safe.relative().to_string(),
+                        RiskLevel::High,
+                        PolicyLever::HumanOnly,
+                    ),
                     Err(violation) => Outcome::deny_path(&candidate, violation),
                 },
                 Err(reason) => Outcome::deny_malformed(reason),
@@ -187,17 +191,18 @@ impl PolicyGate {
                 // 승인 화면이 무엇을 보여줄지 정하지 못하는 요청은 승인받을 수 없다 —
                 // "무엇을 승인하는지 모르는 승인"은 승인이 아니다.
                 Err(reason) => Outcome::deny_malformed(reason),
-                Ok(call) => Outcome {
-                    decision: Decision::RequireUserApproval,
-                    risk_level: RiskLevel::High,
-                    matched_rule: "mcp_always_requires_approval".to_string(),
-                    reason: format!(
+                Ok(call) => Outcome::needs_approval(
+                    "mcp_always_requires_approval".to_string(),
+                    format!(
                         "MCP 도구는 이 게이트 밖에서 동작할 수 있어 언제나 승인을 요구합니다: {}",
                         crate::mcp::describe(&call)
                     ),
                     // 승인 화면과 이벤트가 **이 문자열 그대로**를 보여준다(원칙 6의 MCP판).
-                    normalized_target: crate::mcp::describe(&call),
-                },
+                    crate::mcp::describe(&call),
+                    RiskLevel::High,
+                    // 23.3절: 정책으로 낮출 수 없다. 여기에 레버를 붙이는 순간 그 규칙이 깨진다.
+                    PolicyLever::HumanOnly,
+                ),
             },
         }
     }
@@ -213,6 +218,7 @@ impl PolicyGate {
                     matched_rule: "argv_contract_violation".to_string(),
                     reason,
                     normalized_target: "(malformed)".to_string(),
+                    unblocked_by: PolicyLever::NotApplicable,
                 }
             }
         };
@@ -227,6 +233,7 @@ impl PolicyGate {
                     matched_rule: "cwd_outside_workspace".to_string(),
                     reason: format!("cwd {:?}를 거부함: {violation}", cmd.cwd),
                     normalized_target: cmd.display(),
+                    unblocked_by: PolicyLever::NotApplicable,
                 }
             }
         };
@@ -242,6 +249,7 @@ impl PolicyGate {
                     matched_rule: "command_arg_path_outside_workspace".to_string(),
                     reason: format!("명령 인자 {arg:?}가 workspace를 벗어남: {violation}"),
                     normalized_target: cmd.display(),
+                    unblocked_by: PolicyLever::NotApplicable,
                 };
             }
         }
@@ -260,35 +268,43 @@ impl PolicyGate {
                 matched_rule: format!("deny:{rule}"),
                 reason: format!("deny 규칙 {rule:?}에 매치 — 정책 override로 해제할 수 없음"),
                 normalized_target: target,
+                unblocked_by: PolicyLever::NotApplicable,
             },
             CommandMatch::Allowed { rule, effect } => {
                 if is_git_commit && !task_policy.allow_git_commit {
-                    return Outcome {
-                        decision: Decision::RequireUserApproval,
-                        risk_level: RiskLevel::High,
-                        matched_rule: "git_commit_requires_explicit_approval".to_string(),
-                        reason: "git commit은 사용자가 명시적으로 승인해야 함".to_string(),
-                        normalized_target: target,
-                    };
+                    return Outcome::needs_approval(
+                        "git_commit_requires_explicit_approval".to_string(),
+                        "git commit은 사용자가 명시적으로 승인해야 함".to_string(),
+                        target,
+                        RiskLevel::High,
+                        PolicyLever::AllowGitCommit,
+                    );
                 }
                 if is_network_capable(&cmd) {
-                    return Outcome {
-                        decision: Decision::RequireUserApproval,
-                        risk_level: RiskLevel::High,
-                        matched_rule: format!("network_capable:{rule}"),
-                        reason: "네트워크를 발생시킬 수 있는 명령 — 사용자 승인 필요".to_string(),
-                        normalized_target: target,
-                    };
+                    return Outcome::needs_approval(
+                        format!("network_capable:{rule}"),
+                        "네트워크를 발생시킬 수 있는 명령 — 사용자 승인 필요".to_string(),
+                        target,
+                        RiskLevel::High,
+                        // 이 판정을 끄는 스위치는 없다 — 만들면 "네트워크를 탈 수 있다"를 미리
+                        // 승인하는 것이 되는데, 그 대상은 명령마다 다르고 우리가 모른다.
+                        PolicyLever::HumanOnly,
+                    );
                 }
                 match effect {
                     RuleEffect::Auto => Outcome::auto(&format!("allow:{rule}"), "allowlist auto 규칙", target),
-                    RuleEffect::Conditional => Outcome {
-                        decision: Decision::RequireUserApproval,
-                        risk_level: RiskLevel::Medium,
-                        matched_rule: format!("allow:{rule}"),
-                        reason: "allowlist conditional 규칙 — 1클릭 승인으로 노출".to_string(),
-                        normalized_target: target,
-                    },
+                    // **게이트는 여기서 `HumanOnly`밖에 말할 수 없다.** 이 명령이 프로젝트가
+                    // 선언해 둔 검증 명령이면 `autoApproveVerification`이 통과시키지만, 그
+                    // 고정 집합은 게이트가 아니라 `TaskHost`가 들고 있다(24.5절). 모르는 것을
+                    // 여기서 추측해 적으면 대부분의 conditional 명령에 틀린 처방이 붙는다 —
+                    // 아는 쪽이 무인 정지 시점에 고쳐 적는다.
+                    RuleEffect::Conditional => Outcome::needs_approval(
+                        format!("allow:{rule}"),
+                        "allowlist conditional 규칙 — 1클릭 승인으로 노출".to_string(),
+                        target,
+                        RiskLevel::Medium,
+                        PolicyLever::HumanOnly,
+                    ),
                 }
             }
             // 5) 분류할 수 없는 요청은 기본 거부다.
@@ -307,6 +323,7 @@ impl PolicyGate {
                      필요하면 워크스페이스 정책에 규칙을 추가할 것"
                 ),
                 normalized_target: target,
+                unblocked_by: PolicyLever::NotApplicable,
             },
         }
     }
@@ -318,6 +335,8 @@ struct Outcome {
     matched_rule: String,
     reason: String,
     normalized_target: String,
+    /// 승인을 요구하는 결정에서만 의미가 있다. 나머지는 `NotApplicable`.
+    unblocked_by: PolicyLever,
 }
 
 impl Outcome {
@@ -328,6 +347,32 @@ impl Outcome {
             matched_rule: rule.to_string(),
             reason: reason.to_string(),
             normalized_target: target,
+            unblocked_by: PolicyLever::NotApplicable,
+        }
+    }
+
+    /// 승인을 요구하는 **유일한** 생성 경로.
+    ///
+    /// 필드를 직접 채워 `RequireUserApproval`을 만들 수 있게 두면, 새 승인 자리를 만든 사람이
+    /// 레버를 정하지 않고 지나갈 수 있다. 그러면 무인 정지 보고가 그 자리에 대해 아무 말도
+    /// 못 하거나, 더 나쁘게는 기본값이 붙어 **틀린 처방**을 내놓는다. 인자로 받으면 컴파일러가
+    /// 매번 답을 요구한다 — "생각해 보니 사람만"도 `HumanOnly`라고 적어야 하는 답이다.
+    ///
+    /// 이 경로 밖에서 `RequireUserApproval`이 만들어지지 않는다는 것은 소스를 훑는 검사가
+    /// 지킨다(`the_only_way_to_require_approval_is_the_constructor`).
+    fn needs_approval(rule: String, reason: String, target: String, risk: RiskLevel, lever: PolicyLever) -> Self {
+        debug_assert_ne!(
+            lever,
+            PolicyLever::NotApplicable,
+            "승인을 요구하면서 넓힐 레버를 '해당 없음'으로 둘 수 없다"
+        );
+        Self {
+            decision: Decision::RequireUserApproval,
+            risk_level: risk,
+            matched_rule: rule,
+            reason,
+            normalized_target: target,
+            unblocked_by: lever,
         }
     }
 
@@ -345,6 +390,7 @@ impl Outcome {
             matched_rule: "workspace_boundary".to_string(),
             reason: format!("경로 {candidate:?}를 거부함: {violation}"),
             normalized_target: candidate.to_string(),
+            unblocked_by: PolicyLever::NotApplicable,
         }
     }
 
@@ -355,6 +401,7 @@ impl Outcome {
             matched_rule: "malformed_tool_args".to_string(),
             reason,
             normalized_target: "(malformed)".to_string(),
+            unblocked_by: PolicyLever::NotApplicable,
         }
     }
 }
@@ -463,6 +510,125 @@ mod tests {
         fs::write(dir.path().join("src/app.ts"), "const a = 1;\n").unwrap();
         let root = WorkspaceRoot::new(dir.path()).unwrap();
         (dir, root)
+    }
+
+    // ---- 무인 정지의 처방 (state-machine 24.8절) ----
+
+    /// 승인을 요구하는 결정은 **한 자리에서만** 만들어진다.
+    ///
+    /// 이 검사가 없으면 새 승인 자리를 만드는 사람이 필드를 직접 채워 레버를 정하지 않고
+    /// 지나갈 수 있다. 컴파일러는 `Outcome`의 필드가 다 찼는지만 보므로 그때 아무 말도 하지
+    /// 않고, `NotApplicable`이 조용히 들어가 무인 정지 보고가 **그 자리에 대해 틀린 처방**을
+    /// 내놓는다.
+    #[test]
+    fn the_only_way_to_require_approval_is_the_constructor() {
+        // needle을 런타임에 조립한다 — 리터럴로 적으면 이 파일 자체가 검사 대상에 들어가
+        // 개수가 언제나 어긋난다.
+        let construction = format!("decision: {}::{},", "Decision", "RequireUserApproval");
+        let source = include_str!("mod.rs");
+        // 테스트 모듈은 제외한다. 단언문에 같은 토큰이 있고, 그건 생성이 아니다.
+        let cfg_test = format!("#[cfg({})]", "test");
+        let end = source.find(&cfg_test).expect("테스트 모듈 경계를 찾지 못했습니다");
+        let production = &source[..end];
+
+        let sites: Vec<usize> = production.match_indices(&construction).map(|(i, _)| i).collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "승인 결정을 직접 만드는 자리가 {}곳입니다. `Outcome::needs_approval`을 쓰세요 — \
+             그래야 레버를 정하지 않고 지나갈 수 없습니다",
+            sites.len()
+        );
+
+        let ctor = production
+            .find("fn needs_approval")
+            .expect("needs_approval을 찾지 못했습니다");
+        // 생성자 다음 함수가 시작되기 전까지가 생성자의 범위다.
+        let after = production[ctor..]
+            .find("\n    fn ")
+            .map(|i| ctor + i)
+            .unwrap_or(production.len());
+        assert!(
+            sites[0] > ctor && sites[0] < after,
+            "유일한 생성 자리가 `needs_approval` 밖에 있습니다"
+        );
+    }
+
+    /// 게이트의 레버는 **규칙마다 다르다.** 하나로 뭉개면 처방이 무의미해진다.
+    #[test]
+    fn each_approval_rule_names_the_lever_that_widens_it() {
+        let (dir, root) = setup();
+        // 비밀값 경로 규칙은 **실재하는 파일**에 대해서만 도달한다 — 없으면 그 앞의 경계
+        // 검사가 먼저 거부하고, 그러면 이 표는 규칙이 아니라 "파일이 없다"를 재게 된다.
+        fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+        let gate = PolicyGate::new(&TaskPolicy::default());
+        let cases: &[(ToolName, serde_json::Value, PolicyLever)] = &[
+            // 워크스페이스 쓰기는 미리 넓힐 수 있다.
+            (
+                ToolName::CreateFile,
+                json!({ "path": "src/new.ts", "content": "x" }),
+                PolicyLever::AutoApproveWorkspaceWrites,
+            ),
+            // 삭제·비밀값·MCP는 정책으로 낮출 수 없다 — 여기에 레버를 붙이면 거짓말이 된다.
+            (
+                ToolName::DeleteFile,
+                json!({ "path": "src/app.ts" }),
+                PolicyLever::HumanOnly,
+            ),
+            (
+                ToolName::ReadFile,
+                json!({ "path": ".env" }),
+                PolicyLever::HumanOnly,
+            ),
+            (
+                ToolName::McpCall,
+                json!({ "server": "s", "tool": "t", "arguments": {} }),
+                PolicyLever::HumanOnly,
+            ),
+            (
+                ToolName::RunCommand,
+                json!({ "program": "git", "args": ["commit", "-m", "x"], "cwd": "." }),
+                PolicyLever::AllowGitCommit,
+            ),
+        ];
+        for (tool, args, expected) in cases {
+            let request = ToolRequest {
+                request_id: "req-1".to_string(),
+                task_id: "task-1".to_string(),
+                tool: *tool,
+                args: args.clone(),
+                risk_tier: None,
+                requested_by: json!({ "role": "orchestrator" }),
+                created_at: None,
+            };
+            let decision = gate.evaluate(&request, &root, &TaskPolicy::default());
+            assert!(
+                decision.requires_user_approval,
+                "{tool:?}가 승인을 요구하지 않았습니다 — 이 표가 낡았습니다: {}",
+                decision.matched_rule
+            );
+            assert_eq!(decision.unblocked_by, *expected, "{tool:?} / {}", decision.matched_rule);
+        }
+    }
+
+    /// 승인을 요구하지 **않는** 결정에 레버가 붙으면, 보고서가 넓힐 것이 없는 자리에
+    /// 스위치를 제안한다.
+    #[test]
+    fn a_decision_that_asks_nothing_names_no_lever() {
+        let (_d, root) = setup();
+        let gate = PolicyGate::new(&TaskPolicy::default());
+        let request = ToolRequest {
+            request_id: "req-1".to_string(),
+            task_id: "task-1".to_string(),
+            tool: ToolName::ListFiles,
+            args: json!({}),
+            risk_tier: None,
+            requested_by: json!({ "role": "orchestrator" }),
+            created_at: None,
+        };
+        let decision = gate.evaluate(&request, &root, &TaskPolicy::default());
+        assert!(!decision.requires_user_approval);
+        assert_eq!(decision.unblocked_by, PolicyLever::NotApplicable);
     }
 
     // ---- MCP (state-machine 23절) ----

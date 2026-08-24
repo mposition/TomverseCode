@@ -420,6 +420,24 @@ impl TaskHost {
             .any(|(program, args)| *program == cmd.program && *args == cmd.args)
     }
 
+    /// 게이트가 정한 레버를 **호스트만 아는 사실로 고쳐 적는다**.
+    ///
+    /// conditional allowlist 명령에 대해 게이트는 `HumanOnly`밖에 말할 수 없다 — 그 명령이
+    /// 프로젝트가 선언해 둔 검증 명령인지는 고정 집합을 든 이 쪽만 안다(24.5절). 게이트에
+    /// 고정 집합을 넘겨 거기서 판단하게 하지 않는 이유는 게이트를 순수하게 두기 위해서다:
+    /// 게이트가 태스크의 시작 시점 상태를 들고 있으면 "args만 보고 처음부터 다시 판정한다"가
+    /// 깨진다.
+    fn lever_for(&self, request: &ToolRequest, decision: &PolicyDecision) -> crate::types::PolicyLever {
+        use crate::types::PolicyLever;
+        if decision.unblocked_by == PolicyLever::HumanOnly
+            && !self.policy.auto_approve_verification
+            && self.is_pinned_verification(request)
+        {
+            return PolicyLever::AutoApproveVerification;
+        }
+        decision.unblocked_by
+    }
+
     pub fn execute_tool(&self, request: &ToolRequest) -> Result<Value, String> {
         let cancel = self.cancels.token(&request.task_id);
 
@@ -546,6 +564,10 @@ impl TaskHost {
                 // **같은 이벤트를 쓰지 않는다.** `APPROVAL_DENIED`로 남기면 감사 로그가
                 // 사용자의 판단을 기록한 것처럼 보이는데, 사용자는 이 자리에 없었다.
                 ApprovalOutcome::Unattended => {
+                    // **여기가 무인 정지의 유일한 기록이다.** 사용자가 다음에 물을 것은
+                    // "무엇을 바꾸면 지나가는가"이고(24.8절), 그 답을 지금 남기지 않으면
+                    // 나중에는 게이트 규칙을 사람이 다시 읽어 추론해야 한다.
+                    let lever = self.lever_for(request, &decision);
                     let _ = self.append_event(
                         &request.task_id,
                         "APPROVAL_UNATTENDED",
@@ -553,6 +575,13 @@ impl TaskHost {
                             "approvalId": approval.approval_id,
                             "requestId": request.request_id,
                             "reason": "무인 실행(Autopilot)이라 승인을 물을 사람이 없습니다",
+                            "tool": request.tool.as_str(),
+                            "normalizedTarget": decision.normalized_target,
+                            "matchedRule": decision.matched_rule,
+                            "unblockedBy": lever,
+                            // 플래그가 없다는 것은 **정보다** — 켤 것이 없다는 뜻이고,
+                            // 키를 빼면 "아직 안 적었다"와 구별되지 않는다.
+                            "rerunFlag": lever.rerun_flag(),
                         }),
                     );
                     crate::tools::ApprovalState::Unattended

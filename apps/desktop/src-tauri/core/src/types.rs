@@ -167,6 +167,39 @@ pub enum RiskLevel {
     Prohibited,
 }
 
+/// 승인을 요구한 결정을 **사용자가 미리 넓혀 통과시킬 수 있는 정책 레버**.
+///
+/// 무인 실행이 승인 지점에서 멈췄을 때(24.2절) 사용자가 다음에 물을 것은 하나다 —
+/// "무엇을 바꾸면 이게 지나가는가". 그 답은 게이트가 결정을 내리는 **그 자리에 있고**,
+/// 다른 곳에 표로 옮겨 적으면 규칙이 바뀔 때 조용히 어긋난다.
+///
+/// **`HumanOnly`가 있는 이유가 이 타입의 핵심이다.** 어떤 승인은 어떤 정책으로도 낮출 수
+/// 없다(비밀값 파일, 삭제, MCP — 23.3절). 그런 자리에 "이 스위치를 켜세요"를 제안하면
+/// 거짓말이 되고, 사용자는 켜 놓고 다시 돌렸다가 같은 자리에서 또 멈춘다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PolicyLever {
+    /// 승인을 요구하지 않은 결정 — 넓힐 것이 없다.
+    NotApplicable,
+    AutoApproveWorkspaceWrites,
+    AllowGitCommit,
+    AutoApproveVerification,
+    /// **어떤 정책으로도 무인 통과시킬 수 없다.** 사람이 있어야 한다.
+    HumanOnly,
+}
+
+impl PolicyLever {
+    /// 이 레버를 켜는 CLI 플래그. 없으면 `None` — **없는 플래그를 지어내지 않는다.**
+    pub fn rerun_flag(self) -> Option<&'static str> {
+        match self {
+            Self::AutoApproveWorkspaceWrites => Some("--auto-approve-writes"),
+            Self::AllowGitCommit => Some("--allow-git-commit"),
+            Self::AutoApproveVerification => Some("--auto-approve-verification"),
+            Self::NotApplicable | Self::HumanOnly => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyDecision {
     #[serde(rename = "requestId")]
@@ -181,6 +214,9 @@ pub struct PolicyDecision {
     pub requires_user_approval: bool,
     #[serde(rename = "normalizedTarget")]
     pub normalized_target: String,
+    /// 승인이 필요하다면, 사용자가 **미리** 그것을 넓힐 수 있는 정책 레버.
+    #[serde(rename = "unblockedBy")]
+    pub unblocked_by: PolicyLever,
     #[serde(rename = "decidedAt")]
     pub decided_at: String,
 }

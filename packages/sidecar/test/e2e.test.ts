@@ -643,6 +643,99 @@ test("Autopilot에서 미리 넓힌 정책은 적용되지만, 검증이 못 돌
 });
 
 /**
+ * **무인 정지의 처방** — 24.7절이 "재개 경로가 없다"고 적은 자리를 실제 실행으로 확인한다
+ * (state-machine 24.8절).
+ *
+ * 이 검사가 중요한 이유는 처방이 **기록에서 유도된다**는 점이다. 게이트가 승인을 요구하는
+ * 자리마다 "무엇을 켜면 지나가는가"를 함께 정하고 그 값이 이벤트에 남는데, 그 배선이 하나라도
+ * 끊기면 보고서는 조용히 "켤 것이 없다"고 말한다 — 그건 사람이 필요하다는 뜻이므로 **틀린
+ * 방향으로 조용하다**.
+ *
+ * 그래서 처방이 맞는지를 문자열 비교가 아니라 **실행으로** 확인한다: 보고서가 시키는 플래그를
+ * 그대로 붙여 다시 돌리면 그 정지가 사라져야 한다.
+ */
+test("무인 정지는 무엇을 켜면 지나가는지 기록에서 유도된다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir, { approve: "autopilot" });
+    assert.equal(run.final.failureReason, "unattended_stop", run.final.summary);
+
+    const raw = execFileSync(
+      HOST_BIN,
+      [
+        "blocked",
+        "--workspace",
+        repo.root,
+        "--task",
+        run.taskId,
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+      ],
+      { encoding: "utf8" }
+    );
+    const report = JSON.parse(raw.trim().split("\n").pop() as string) as {
+      verdict: string;
+      stops: { tool: string; matchedRule: string; unblockedBy: string; rerunFlag: string | null }[];
+      rerunFlags: string[];
+      humanOnly: string[];
+      caveat: string;
+    };
+
+    // ① 무엇이 막았는지. **정지는 둘이다** — baseline 검증 명령이 먼저 막히고(그건 태스크를
+    //    끝내지 않는다: 통과로 위장하지 않는 스킵이 된다), 태스크를 끝낸 것은 patch 거부다.
+    assert.equal(report.verdict, "unblockable_by_policy", raw);
+    assert.deepEqual(report.humanOnly, [], raw);
+    const rules = report.stops.map((s) => s.matchedRule);
+    assert.ok(rules.includes("workspace_write_requires_approval"), raw);
+    assert.ok(
+      report.stops.some((s) => s.tool === "run_tests" && s.unblockedBy === "autoApproveVerification"),
+      // 이 자리가 배선의 가장 약한 고리다 — 게이트는 conditional 명령에 `humanOnly`밖에
+      // 말할 수 없고, 검증 명령이라는 사실은 호스트가 고쳐 적는다(24.5절).
+      raw
+    );
+    assert.deepEqual(
+      [...report.rerunFlags].sort(),
+      ["--auto-approve-verification", "--auto-approve-writes"],
+      raw
+    );
+    // 한계가 **보고서 안에** 있다 — 주석은 이 JSON을 먹는 쪽에 도달하지 않는다.
+    assert.match(report.caveat, /또 멈출 수 있습니다/);
+
+    // ② 처방이 맞는지를 실행으로 확인한다. 시키는 플래그 중 하나를 켜고 다시 돌리면
+    //    **그 정지는 사라지고 나머지 처방만 남는다.** 문자열 비교가 아니라 실행으로 봐야
+    //    배선이 끊긴 것과 처방이 맞는 것을 가를 수 있다.
+    const again = runHost(repo, stateDir, { approve: "autopilot", autoApproveWrites: true });
+    assert.deepEqual(again.mutatedPaths, ["paginate.js"], again.final.summary);
+    const afterRaw = execFileSync(
+      HOST_BIN,
+      [
+        "blocked",
+        "--workspace",
+        repo.root,
+        "--task",
+        again.taskId,
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+      ],
+      { encoding: "utf8" }
+    );
+    const after = JSON.parse(afterRaw.trim().split("\n").pop() as string) as {
+      stops: { matchedRule: string }[];
+      rerunFlags: string[];
+    };
+    assert.ok(
+      !after.stops.some((s) => s.matchedRule === "workspace_write_requires_approval"),
+      `처방대로 켰는데 같은 자리에서 또 막혔습니다: ${afterRaw}`
+    );
+    // 그리고 다음 처방이 나온다 — 검증 명령이다(24.5절).
+    assert.deepEqual(after.rerunFlags, ["--auto-approve-verification"], afterRaw);
+  });
+});
+
+/**
  * **Autopilot이 실제로 끝까지 간다** — 그리고 끝까지 가는 이유가 "검증을 건너뛰어서"가 아니다
  * (state-machine 24.5절).
  *
