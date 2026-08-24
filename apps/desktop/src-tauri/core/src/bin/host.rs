@@ -120,6 +120,8 @@ struct Args {
     hooks: Vec<tomverse_core::hooks::HookConfig>,
     skill: Option<PathBuf>,
     session_id: Option<String>,
+    remote: String,
+    base: String,
     /// `metrics` 전용: 워크스페이스 필터를 끄고 DB 전체를 집계한다.
     all_workspaces: bool,
     /// `windows-landing` 전용 — tauri 번들 디렉터리.
@@ -180,6 +182,8 @@ fn parse_args() -> Result<Args, String> {
         hooks: Vec::new(),
         skill: None,
         session_id: None,
+        remote: "origin".to_string(),
+        base: "main".to_string(),
         worktree: None,
         worktree_base: None,
         force: false,
@@ -214,6 +218,8 @@ fn parse_args() -> Result<Args, String> {
             "--hook" => args.hooks.push(parse_hook(&value()?)?),
             "--skill" => args.skill = Some(PathBuf::from(value()?)),
             "--session" => args.session_id = Some(value()?),
+            "--remote" => args.remote = value()?,
+            "--base" => args.base = value()?,
             "--db" => args.db = Some(PathBuf::from(value()?)),
             "--artifacts" => args.artifacts = Some(PathBuf::from(value()?)),
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
@@ -321,7 +327,7 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|recover|tasks|show|blocked|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|pr|recover|tasks|show|blocked|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--skill <파일.json>] [--session <id>]\n\
      [--auto-approve-writes] [--auto-approve-verification]\n\
@@ -354,6 +360,10 @@ fn usage() -> String {
      worktree — 격리 트리 목록(JSON). [--worktree <branch>]를 주면 그 트리를 정리한다.\n\
                  커밋되지 않은 변경이 있으면 지우지 않고 사유를 낸다 — 버리려면 [--force]\n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
+     pr      — 현재 브랜치를 remote로 올리고 **PR 생성 폼 URL**을 낸다. [--remote origin]\n\
+                 [--base main]. **우리는 GitHub에 요청을 보내지 않는다** — 폼을 여는 것은\n\
+                 사용자의 브라우저이고 우리는 URL 한 줄을 낼 뿐이다(토큰이 필요 없다).\n\
+                 push는 언제나 승인을 요구하며 `--force`는 만들 방법이 없다\n\
      blocked — 무인 정지의 처방(JSON). 무엇이 막았고 **무엇을 켜면 지나가는지**, 그리고\n\
                  어떤 정지는 정책으로 열 수 없는지를 기록에서 유도한다. 아무것도 쓰지 않는다.\n\
                  이번 실행이 도달한 지점까지만 안다 — 켜고 다시 돌리면 더 진행하다 또 멈출 수 있다\n\
@@ -824,6 +834,27 @@ fn real_main() -> Result<i32, String> {
             let metrics = tomverse_core::metrics::collect(&guard, scope.as_deref())?;
             println!("{}", serde_json::to_string(&metrics).unwrap_or_default());
             Ok(0)
+        }
+
+        "pr" => {
+            let task_id = args
+                .task_id
+                .clone()
+                .ok_or_else(|| "pr에는 --task가 필요합니다".to_string())?;
+            let host = TaskHost::new(
+                root,
+                policy,
+                store.clone(),
+                artifacts,
+                approvals,
+                sink,
+                Arc::new(CancellationRegistry::new()),
+            );
+            let out = host.open_pull_request(&task_id, &args.remote, &args.base)?;
+            let pushed = out.get("pushed").and_then(Value::as_bool).unwrap_or(false);
+            println!("{out}");
+            // **올리지 못한 것을 0으로 보고하지 않는다** — 호출자가 성공으로 읽는다.
+            Ok(if pushed { 0 } else { 1 })
         }
 
         "blocked" => {

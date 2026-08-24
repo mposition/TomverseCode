@@ -214,6 +214,7 @@ impl ToolRuntime {
             ToolName::GitStatus => self.git(request, start, &["status", "--porcelain=v1", "--branch"], cancel),
             ToolName::GitDiff => self.git_diff(request, start, cancel),
             ToolName::McpCall => self.mcp_call(request, start),
+            ToolName::GitPush => self.git_push(request, start, cancel),
         }
     }
 
@@ -649,6 +650,22 @@ impl ToolRuntime {
             cwd: ".".to_string(),
             timeout_ms: None,
         };
+        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel)?;
+        self.finish_command(request, start, &cmd, execution)
+    }
+
+    /// 브랜치를 remote로 올린다 — pr.rs, state-machine 28절.
+    ///
+    /// **인자를 다시 뜯는다.** 게이트가 이미 검증했지만, 여기서 별도 경로로 argv를 조립하면
+    /// "승인된 것과 실행되는 것"이 갈라질 수 있다(`run_command`와 같은 이유).
+    fn git_push(
+        &self,
+        request: &ToolRequest,
+        start: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, String> {
+        let target = crate::pr::parse_push(&request.args).map_err(|e| e.to_string())?;
+        let cmd = target.command();
         let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel)?;
         self.finish_command(request, start, &cmd, execution)
     }

@@ -471,6 +471,7 @@ excluded from context"). 모델이 그 파일이 없다고 보고 내용을 추�
 | **Git worktree · 브랜치별 격리** | worktree 생성·격리 실행·정리 | Arena(M3)가 이 위에 올라감 |
 | ↳ 위 행의 현재 상태 | **구현 완료**(M2) — `tomverse-host run --worktree <branch>` / `tomverse-host worktree [--worktree <branch>] [--force]`. 격리는 **루트를 바꾸는 것이 전부**이고 Policy Gate에 분기를 만들지 않았다([state-machine 22절](./state-machine-and-protocol.md)) <!-- present: apps/desktop/src-tauri/core/src/worktree.rs --> | — |
 | **PR 연동** | GitHub PR 생성 | 리뷰 코멘트 반영, 타 호스팅 |
+| ↳ 위 행의 현재 상태 | **코어 구현 완료, UI 미배선**(M3) — `tomverse-host pr --task <id>`. **우리는 GitHub에 요청을 보내지 않는다**: 브랜치를 올리고 제목·본문을 미리 채운 PR 생성 폼 URL을 내며, 그 폼을 여는 것은 사용자의 브라우저다(토큰이 필요 없고 전송 투명성도 깨지지 않는다). 대가는 **PR 번호를 돌려받지 못한다는 것**이고 그건 "이후 깊이 확장"에 달렸다. `run_command`의 `git push`는 **여전히 거부**이며, 대신 `--force`도 refspec도 만들 수 없는 좁은 `git_push` 도구를 냈다 — 문을 연 것이 아니라 좁힌 것이다([state-machine 28절](./state-machine-and-protocol.md)) <!-- present: apps/desktop/src-tauri/core/src/pr.rs --> | — |
 | **MCP** | MCP 서버 등록, 그 도구가 `ToolRequest`로 변환되어 Policy Gate 통과 | 스펙 전 범위, 원격 서버 |
 | ↳ 위 행의 현재 상태 | **구현 완료**(M2) — stdio 서버 등록·`mcp_call`·게이트 통과. 언제나 승인이며 정책으로 낮출 수 없다([state-machine 23절](./state-machine-and-protocol.md)). 남은 것은 UI 등록 화면과 도구 목록 노출(23.10절) <!-- present: apps/desktop/src-tauri/core/src/mcp.rs --> | — |
 | **프로젝트 규칙** | `CLAUDE.md`/`AGENTS.md` 자동 로드 (이미 `agentsMdContent`로 설계됨) | 디렉터리별 규칙 |

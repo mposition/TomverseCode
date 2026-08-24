@@ -1088,6 +1088,77 @@ test("세션을 이어도 모델 제안은 다음 태스크로 넘어가지 않�
   });
 });
 
+/**
+ * **PR 연동 — 브랜치를 올리고 폼 URL을 낸다** (state-machine 28절).
+ *
+ * remote를 **로컬 bare 저장소**로 둔다. 네트워크 없이 push 경로 전체(게이트 분류·승인·argv·
+ * 실제 전송)를 실제로 태울 수 있고, 그게 이 기능에서 검증 가능한 전부다. GitHub API를
+ * 부르지 않는 설계라서 나머지도 확인할 것이 없다 — URL 한 줄을 만드는 일뿐이다(28.1절).
+ *
+ * `compareUrl`이 `null`인 것도 확인하지만, **이 단언이 무엇을 증명하는지는 좁다**: remote가
+ * 로컬 경로라 어떤 규칙으로도 GitHub slug가 나오지 않는다. 실제로 `github_slug`를 "무엇이든
+ * 통과"로 고쳐 심어 봤더니 이 e2e는 그대로 통과했고 Rust 단위 테스트만 실패했다. 호스팅처럼
+ * 생겼지만 GitHub이 아닌 remote(gitlab/bitbucket)는 그쪽이 본다 — 여기서 그걸 확인하려면
+ * 네트워크가 필요하다.
+ */
+test("pr은 브랜치를 실제로 올리고, GitHub이 아니면 URL을 지어내지 않는다", () => {
+  const repo = createFixtureRepo({ gitRepo: true });
+  const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
+  const bare = mkdtempSync(path.join(tmpdir(), "tomverse-remote-"));
+  try {
+    execFileSync("git", ["init", "--bare", bare], { stdio: "ignore" });
+    execFileSync("git", ["remote", "add", "origin", bare], { cwd: repo.root, stdio: "ignore" });
+    execFileSync("git", ["checkout", "-b", "feature/paginate"], { cwd: repo.root, stdio: "ignore" });
+
+    const run = runHost(repo, stateDir, { mode: "fast", allowGitCommit: true });
+    assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
+
+    const raw = execFileSync(
+      HOST_BIN,
+      [
+        "pr",
+        "--workspace",
+        repo.root,
+        "--task",
+        run.taskId,
+        "--approve",
+        "auto",
+        "--db",
+        path.join(stateDir, "state.db"),
+        "--artifacts",
+        path.join(stateDir, "artifacts"),
+      ],
+      { encoding: "utf8" }
+    );
+    const out = JSON.parse(raw.trim().split("\n").pop() as string) as {
+      pushed: boolean;
+      branch: string;
+      compareUrl: string | null;
+      title: string;
+      body: string;
+    };
+
+    // ① 실제로 올라갔다 — bare 저장소에 그 브랜치가 생겼는지로 본다. 우리 보고만 믿지 않는다.
+    assert.equal(out.pushed, true, raw);
+    assert.equal(out.branch, "feature/paginate");
+    const remoteBranches = execFileSync("git", ["branch", "--list"], { cwd: bare, encoding: "utf8" });
+    assert.match(remoteBranches, /feature\/paginate/, `remote에 브랜치가 없습니다: ${remoteBranches}`);
+
+    // ② 로컬 경로 remote에는 URL을 만들지 않는다(위 주석: 이 단언의 범위는 좁다).
+    assert.equal(out.compareUrl, null, raw);
+
+    // ③ 제목은 사용자의 요청문이고, 본문은 전체 기록으로 가는 열쇠를 남긴다(19.6절과 같은 규칙).
+    assert.match(out.title, /페이지 계산/, out.title);
+    assert.match(out.body, new RegExp(`Tomverse-Task: ${run.taskId}`), out.body);
+    // **검증했다고 지어내지 않는다** — 기록에서 나온 줄만 적힌다.
+    assert.match(out.body, /## 검증/, out.body);
+  } finally {
+    repo.cleanup();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
 test("fast 모드 + 단일 파일은 단일 모델 경로를 타지만 검증은 그대로 돈다", () => {
   withRepo((repo, stateDir) => {
     const run = runHost(repo, stateDir, { mode: "fast" });

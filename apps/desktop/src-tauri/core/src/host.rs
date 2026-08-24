@@ -918,6 +918,124 @@ impl TaskHost {
     /// 같은 것을 다시 확인해서, 그 `REVERT_HEAD`가 **이번 실행이 만든 것일 때만** 치운다.
     ///
     /// `reset --hard`를 쓰지 않는 이유는 19.2절에 있다.
+    /// 브랜치를 remote로 올리고 PR 폼 URL을 만든다 (pr.rs, state-machine 28절).
+    ///
+    /// **사용자 명령이지 모델의 도구가 아니다** — 되돌리기(19절)와 같은 자리다. 그러나
+    /// 되돌리기와 다른 점이 하나 있고 그게 중요하다: **여기서는 승인을 건너뛰지 않는다.**
+    /// 되돌리기는 사용자가 "되돌려"를 누른 것 자체가 그 동작의 승인이지만, push는 *무엇이*
+    /// 올라가는지가 매번 다르다. 그래서 승인 왕복을 그대로 지난다.
+    pub fn open_pull_request(&self, task_id: &str, remote: &str, base: &str) -> Result<Value, String> {
+        let (ok, branch, err) = self.git_try(task_id, "pr-branch", &["rev-parse", "--abbrev-ref", "HEAD"], false)?;
+        if !ok {
+            return Err(format!("현재 브랜치를 확인하지 못했습니다: {err}"));
+        }
+        let branch = branch.trim().to_string();
+        // **detached HEAD에서는 올릴 브랜치가 없다.** "HEAD"를 그대로 밀면 remote에 `HEAD`라는
+        // 브랜치가 생긴다 — 사용자가 의도한 적 없는 결과다.
+        if branch.is_empty() || branch == "HEAD" {
+            return Err("detached HEAD 상태라 올릴 브랜치가 없습니다. 먼저 브랜치를 만드세요".to_string());
+        }
+        if branch == base {
+            return Err(format!(
+                "현재 브랜치가 base와 같습니다 ({base}). PR은 서로 다른 두 브랜치 사이에만 만들 수 있습니다"
+            ));
+        }
+
+        let request = ToolRequest {
+            request_id: format!("push-{}", uuid::Uuid::new_v4()),
+            task_id: task_id.to_string(),
+            tool: ToolName::GitPush,
+            args: json!({ "remote": remote, "branch": branch }),
+            risk_tier: None,
+            requested_by: json!({ "role": "user", "command": "pr" }),
+            created_at: Some(now_iso()),
+        };
+        let outcome = self.execute_tool(&request)?;
+        let status = outcome
+            .get("result")
+            .and_then(|r| r.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let exit_code = outcome
+            .get("result")
+            .and_then(|r| r.get("output"))
+            .and_then(|o| o.get("exitCode"))
+            .and_then(Value::as_i64);
+        // `ToolStatus::Ok`은 "명령이 성공했다"가 아니다(CLAUDE.md 함정 기록).
+        let pushed = status == "ok" && exit_code == Some(0);
+        if !pushed {
+            let _ = self.append_event(
+                task_id,
+                "PR_PUSH_FAILED",
+                json!({ "remote": remote, "branch": branch, "status": status, "exitCode": exit_code }),
+            );
+            return Ok(json!({
+                "pushed": false,
+                "branch": branch,
+                "remote": remote,
+                "status": status,
+                "exitCode": exit_code,
+                "compareUrl": Value::Null,
+                "reason": outcome.get("result").and_then(|r| r.get("error")).cloned().unwrap_or(Value::Null),
+            }));
+        }
+
+        let (title, body) = self.pull_request_text(task_id)?;
+        // remote URL은 **push가 끝난 뒤에** 읽는다. 앞에서 읽으면 URL을 만들 수 없는 remote일 때
+        // 올리지도 않고 실패하게 되는데, 올리는 것 자체는 URL과 무관하게 성립한다.
+        let (ok, remote_url, _) = self.git_try(task_id, "pr-remote", &["remote", "get-url", remote], false)?;
+        let slug = if ok { crate::pr::github_slug(remote_url.trim()) } else { None };
+        let compare_url = slug
+            .as_ref()
+            .map(|s| crate::pr::compare_url(s, base, &branch, &title, &body));
+
+        let payload = json!({
+            "pushed": true,
+            "branch": branch,
+            "remote": remote,
+            "base": base,
+            "title": title,
+            "body": body,
+            // **GitHub이 아니면 `null`이다.** 모르는 호스팅의 URL을 추측해 만들면 사용자는
+            // 404를 받고 그 원인을 알 방법이 없다.
+            "compareUrl": compare_url,
+        });
+        let _ = self.append_event(
+            task_id,
+            "PR_BRANCH_PUSHED",
+            json!({ "remote": remote, "branch": branch, "base": base, "compareUrlAvailable": compare_url.is_some() }),
+        );
+        Ok(payload)
+    }
+
+    /// PR 제목과 본문. **커밋 메시지와 같은 규칙**이다(19.6절): 제목은 사용자의 요청문이고
+    /// 본문은 무엇을 했는지이며, 전체 기록으로 가는 열쇠(task id)를 남긴다.
+    fn pull_request_text(&self, task_id: &str) -> Result<(String, String), String> {
+        let task = self
+            .with_store(|s| s.get_task(task_id))
+            .map_err(|e| format!("작업 조회 실패: {e}"))?
+            .ok_or_else(|| format!("작업을 찾을 수 없습니다: {task_id}"))?;
+        let checks = self
+            .with_store(|s| s.verification_checks(task_id))
+            .map_err(|e| format!("검증 조회 실패: {e}"))?;
+        let mut lines = vec![task.user_message.clone(), String::new()];
+        if checks.is_empty() {
+            // **"검증했다"고 쓰지 않는다.** 기록이 없으면 없다고 쓴다.
+            lines.push("검증 기록이 없습니다.".to_string());
+        } else {
+            lines.push("## 검증".to_string());
+            for check in &checks {
+                let kind = check.get("kind").and_then(Value::as_str).unwrap_or("?");
+                let status = check.get("status").and_then(Value::as_str).unwrap_or("?");
+                let stage = check.get("stage").and_then(Value::as_str).unwrap_or("?");
+                lines.push(format!("- {kind} ({stage}): {status}"));
+            }
+        }
+        lines.push(String::new());
+        lines.push(format!("Tomverse-Task: {task_id}"));
+        Ok((task.user_message, lines.join("\n")))
+    }
+
     pub fn revert_commit(&self, task_id: &str) -> Result<Value, String> {
         let Some(sha) = self.committed_sha(task_id)? else {
             return Ok(json!({

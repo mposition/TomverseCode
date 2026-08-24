@@ -26,6 +26,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod paths;
 pub mod policy;
+pub mod pr;
 pub mod proctree;
 pub mod reproduce;
 pub mod session_memory;

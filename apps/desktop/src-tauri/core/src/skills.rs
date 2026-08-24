@@ -104,6 +104,7 @@ pub const ALL_TOOLS: &[ToolName] = &[
     ToolName::GitDiff,
     ToolName::RunTests,
     ToolName::McpCall,
+    ToolName::GitPush,
 ];
 
 /// 스킬 파일을 읽고 검증한다.

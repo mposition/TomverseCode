@@ -30,6 +30,12 @@ pub enum ToolName {
     /// `ToolName`으로 열면 Policy Gate의 exhaustive match가 무너지고 "분류되지 않은 도구"가
     /// 생긴다. 대신 문 하나를 두고 그 문의 위험도를 우리가 안다: **모른다, 그러므로 승인이다.**
     McpCall,
+    /// 브랜치를 remote로 올린다 (pr.rs, state-machine 28절).
+    ///
+    /// **`run_command`의 `git push`는 여전히 거부다.** 이 칸을 따로 낸 이유가 그것이다:
+    /// 임의 argv의 push는 우리가 모양을 모르고(`--force`, refspec), 아는 모양만 여기로 낸다.
+    /// 같은 동작에 대한 두 규칙이 아니라 **다른 능력**이다 — 이쪽이 좁다.
+    GitPush,
 }
 
 impl ToolName {
@@ -46,6 +52,7 @@ impl ToolName {
             ToolName::GitDiff => "git_diff",
             ToolName::RunTests => "run_tests",
             ToolName::McpCall => "mcp_call",
+            ToolName::GitPush => "git_push",
         }
     }
 

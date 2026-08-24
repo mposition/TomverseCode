@@ -208,6 +208,26 @@ impl PolicyGate {
             // 무엇을 하는지 안다"에 기대는데, 그 전제가 여기서는 성립하지 않는다.
             //
             // 그래서 `task_policy`를 **보지 않는다**. 보면 언젠가 누군가 완화 조건을 넣는다.
+            // ---- git push: 아는 모양만, 그리고 언제나 승인 (28.2절) ----
+            //
+            // `mcp_call`과 같은 처리다. 다른 점은 여기서는 **우리가 argv를 조립한다**는 것이고,
+            // 그래서 승인 화면이 보여주는 문자열이 실행되는 명령 그 자체다.
+            ToolName::GitPush => match crate::pr::parse_push(&request.args) {
+                Err(reason) => Outcome::deny_malformed(reason.to_string()),
+                Ok(target) => Outcome::needs_approval(
+                    "push_always_requires_approval".to_string(),
+                    format!(
+                        "코드를 remote로 올립니다 — 되돌리기 어렵고 워크스페이스 밖으로 나갑니다: {}",
+                        target.describe()
+                    ),
+                    target.describe(),
+                    RiskLevel::High,
+                    // 정책으로 낮출 수 없다. 자동으로 밀어도 되는 push는 없다 —
+                    // 무엇이 올라가는지는 매번 다르고, 올라간 뒤에는 우리 손을 떠난다.
+                    PolicyLever::HumanOnly,
+                ),
+            },
+
             ToolName::McpCall => match crate::mcp::parse_call(&request.args) {
                 // 승인 화면이 무엇을 보여줄지 정하지 못하는 요청은 승인받을 수 없다 —
                 // "무엇을 승인하는지 모르는 승인"은 승인이 아니다.
@@ -533,6 +553,62 @@ mod tests {
         (dir, root)
     }
 
+    // ---- git push (state-machine 28.2절) ----
+
+    /// **`run_command`의 `git push`는 여전히 거부다.** `git_push` 도구를 낸 것은 문을 연 것이
+    /// 아니라 좁힌 것이고, 두 문이 같이 열렸다면 `--force`도 refspec도 통과한다.
+    ///
+    /// 이걸 처음에는 e2e로 쓰려 했는데 **그 테스트는 공허했다**: 모델이 임의 명령을 낼 경로가
+    /// 애초에 없다(`DraftProposal`에 명령 필드가 없고 planner가 patch에서 argv를 조립한다).
+    /// 그래서 요청이 만들어지지 않았고, 빈 집합에 대한 전칭 명제로 통과했다. deny 규칙을
+    /// 지우는 probe를 심어도 그대로 통과하는 것을 확인하고 이리로 옮겼다 — **규칙이 사는
+    /// 곳에서 규칙을 본다.**
+    #[test]
+    fn an_arbitrary_git_push_through_run_command_is_denied() {
+        let (_d, root) = setup();
+        let policy = TaskPolicy::default();
+        let gate = PolicyGate::new(&policy);
+        for args in [
+            json!({ "program": "git", "args": ["push", "--force", "origin", "main"], "cwd": "." }),
+            json!({ "program": "git", "args": ["push", "origin", "main:refs/heads/other"], "cwd": "." }),
+            json!({ "program": "git", "args": ["push"], "cwd": "." }),
+        ] {
+            let request = ToolRequest {
+                request_id: "req-1".to_string(),
+                task_id: "task-1".to_string(),
+                tool: ToolName::RunCommand,
+                args: args.clone(),
+                risk_tier: None,
+                requested_by: json!({ "role": "executor" }),
+                created_at: None,
+            };
+            let decision = gate.evaluate(&request, &root, &policy);
+            assert_eq!(decision.decision, Decision::Deny, "{args} — {}", decision.reason);
+            assert!(decision.matched_rule.starts_with("deny:"), "{}", decision.matched_rule);
+        }
+    }
+
+    /// 좁은 문은 열려 있다 — 그렇지 않으면 위 검사가 "push가 아예 불가능하다"를 재는 것이 된다.
+    #[test]
+    fn the_narrow_push_door_is_open_but_always_asks() {
+        let (_d, root) = setup();
+        let policy = TaskPolicy::default();
+        let gate = PolicyGate::new(&policy);
+        let request = ToolRequest {
+            request_id: "req-1".to_string(),
+            task_id: "task-1".to_string(),
+            tool: ToolName::GitPush,
+            args: json!({ "remote": "origin", "branch": "feature/x" }),
+            risk_tier: None,
+            requested_by: json!({ "role": "user" }),
+            created_at: None,
+        };
+        let decision = gate.evaluate(&request, &root, &policy);
+        assert!(decision.requires_user_approval, "{}", decision.matched_rule);
+        // 승인 화면이 보는 문자열이 실행될 명령 그대로다(원칙 6).
+        assert_eq!(decision.normalized_target, "git push origin feature/x");
+    }
+
     // ---- 스킬의 도구 허용목록 (state-machine 26절) ----
 
     fn skill_policy(tools: &[ToolName]) -> TaskPolicy {
@@ -733,6 +809,14 @@ mod tests {
                 ToolName::RunCommand,
                 json!({ "program": "git", "args": ["commit", "-m", "x"], "cwd": "." }),
                 PolicyLever::AllowGitCommit,
+            ),
+            // push는 언제나 승인이고 정책으로 낮출 수 없다 (28.2절). **이 줄이 없어서
+            // "push를 자동 허용으로 바꾼다"는 probe가 통과했다** — 표에 없는 도구는 이 검사가
+            // 아무 말도 하지 않는다.
+            (
+                ToolName::GitPush,
+                json!({ "remote": "origin", "branch": "feature/x" }),
+                PolicyLever::HumanOnly,
             ),
         ];
         for (tool, args, expected) in cases {

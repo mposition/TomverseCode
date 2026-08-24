@@ -149,7 +149,12 @@ pub fn default_command_policy() -> CommandPolicy {
             deny("zsh", None),
             deny("wscript", None),
             deny("cscript", None),
-            // M0 범위 밖: push/배포
+            // **임의 argv의 push는 여전히 거부다** (state-machine 28.2절).
+            //
+            // 종전 사유는 "M0 범위 밖"이었고 그건 범위 표시였지 판단이 아니었다. M3에서
+            // PR 연동을 하면서 그 자리를 다시 봤고, 결론은 **여는 것이 아니라 좁히는 것**이다:
+            // `--force`와 refspec을 우리가 통제할 수 없는 문을 여는 대신, 아는 모양만 내는
+            // `git_push` 도구를 따로 두었다. 그쪽은 언제나 승인이고 정책으로 낮출 수 없다.
             deny("git", Some(&["push", "**"])),
             // 원격 코드 실행 유틸리티
             deny("curl", None),
@@ -163,6 +168,10 @@ pub fn default_command_policy() -> CommandPolicy {
             allow("git", &["log", "**"], RuleEffect::Auto),
             allow("git", &["show", "**"], RuleEffect::Auto),
             allow("git", &["rev-parse", "**"], RuleEffect::Auto),
+            // `remote get-url`은 `.git/config`를 읽을 뿐이다 — 네트워크를 타지 않는다.
+            // **`remote` 전체를 열지 않는다**: `add`/`set-url`은 설정을 바꾸고 `update`는
+            // 네트워크를 탄다. 여기서 여는 것은 읽기 하나뿐이다(28.3절).
+            allow("git", &["remote", "get-url", "**"], RuleEffect::Auto),
             allow("git", &["branch", "--list"], RuleEffect::Auto),
             allow("git", &["add", "**"], RuleEffect::Conditional),
             allow("git", &["commit", "**"], RuleEffect::Conditional),
@@ -207,7 +216,18 @@ pub fn is_network_capable(cmd: &RunCommandArgs) -> bool {
         "cargo" => matches!(first, "publish" | "install" | "update" | "fetch" | "add"),
         "pip" | "pip3" => matches!(first, "install" | "download" | "uninstall"),
         "dotnet" => matches!(first, "restore" | "nuget"),
-        "git" => matches!(first, "fetch" | "pull" | "clone" | "remote" | "submodule"),
+        // `push`는 `run_command`에서 deny라 이 분류에 닿지 않는다. **그래도 적어 둔다** —
+        // 나중에 그 deny를 푸는 사람이 있으면 네트워크 분류가 함께 따라와야 하고, 여기 없으면
+        // 조용히 "네트워크를 타지 않는 명령"으로 분류된다.
+        //
+        // **`remote`는 하위 명령을 봐야 한다.** 종전에는 `remote` 전체를 네트워크로 봤는데,
+        // `get-url`은 `.git/config`를 읽을 뿐이다. 로컬 조회에 승인을 요구하면 사용자는
+        // 승인을 습관으로 누르게 되고, 그러면 정작 네트워크를 타는 요청도 같이 지나간다.
+        // 넓히는 방향이지만 **allowlist가 먼저 막는다** — 여기 닿는 것은 이미 허용된 명령뿐이다.
+        "git" => match first {
+            "remote" => matches!(cmd.args.get(1).map(String::as_str), Some("update") | Some("prune")),
+            other => matches!(other, "fetch" | "pull" | "clone" | "submodule" | "push"),
+        },
         "ssh" | "scp" | "rsync" | "nc" | "ftp" | "telnet" => true,
         _ => false,
     }
