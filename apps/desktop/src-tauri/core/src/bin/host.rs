@@ -109,6 +109,11 @@ struct Args {
     worktree_base: Option<String>,
     /// `worktree` 하위 명령에서 커밋되지 않은 변경을 **버리고** 지운다.
     force: bool,
+    /// 등록된 MCP 서버 (`이름=프로그램[,인자...]`, 반복 가능) — mcp.rs.
+    ///
+    /// **셸 문자열이 아니라 쉼표로 나눈 argv다**(원칙 6). 등록은 사용자만 할 수 있다 —
+    /// 모델이 서버를 추가하는 경로는 없으며, 그것이 이 기능의 안전 모델 전부다.
+    mcp_servers: Vec<tomverse_core::mcp::McpServerConfig>,
     /// `metrics` 전용: 워크스페이스 필터를 끄고 DB 전체를 집계한다.
     all_workspaces: bool,
     /// `windows-landing` 전용 — tauri 번들 디렉터리.
@@ -164,6 +169,7 @@ fn parse_args() -> Result<Args, String> {
         timeout_secs: 600,
         verbose: false,
         cancel_after_ms: None,
+        mcp_servers: Vec::new(),
         worktree: None,
         worktree_base: None,
         force: false,
@@ -194,6 +200,7 @@ fn parse_args() -> Result<Args, String> {
             "--worktree" => args.worktree = Some(value()?),
             "--worktree-base" => args.worktree_base = Some(value()?),
             "--force" => args.force = true,
+            "--mcp-server" => args.mcp_servers.push(parse_mcp_server(&value()?)?),
             "--db" => args.db = Some(PathBuf::from(value()?)),
             "--artifacts" => args.artifacts = Some(PathBuf::from(value()?)),
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
@@ -310,6 +317,9 @@ fn usage() -> String {
      run --worktree <branch> — 격리 실행. 그 브랜치의 worktree를 만들고 **그 경로를 워크스페이스\n\
                  루트로 쓴다**. 브랜치가 없으면 만들고, 출발점은 [--worktree-base <ref>].\n\
                  본체의 커밋되지 않은 변경은 따라오지 않으며 그 사실을 stderr로 알린다\n\
+     run --mcp-server <이름=프로그램[,인자...]> — MCP 서버 등록(반복 가능). **셸 문자열이 아니라\n\
+                 쉼표로 나눈 argv다.** 그 도구는 `mcp_call`로 변환되어 Policy Gate를 지나며,\n\
+                 **언제나 사용자 승인을 요구한다**(정책으로 낮출 수 없다)\n\
      worktree — 격리 트리 목록(JSON). [--worktree <branch>]를 주면 그 트리를 정리한다.\n\
                  커밋되지 않은 변경이 있으면 지우지 않고 사유를 낸다 — 버리려면 [--force]\n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
@@ -345,6 +355,28 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// `이름=프로그램[,인자...]`를 서버 등록으로 읽는다.
+///
+/// 쉼표로 argv를 나누는 이유: 셸 문자열을 받으면 승인 화면에 보인 것과 실제 실행되는 것이
+/// 갈라진다(원칙 6). 쉼표가 인자에 들어가야 하는 서버는 이 CLI로 등록할 수 없다 —
+/// **못 하는 것을 조용히 추측해서 하지 않는다**(설정 파일이 생기면 그때 넓힌다).
+fn parse_mcp_server(spec: &str) -> Result<tomverse_core::mcp::McpServerConfig, String> {
+    let (name, rest) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--mcp-server 형식은 이름=프로그램[,인자...] 입니다: {spec}"))?;
+    let mut parts = rest.split(',');
+    let program = parts
+        .next()
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| format!("--mcp-server에 프로그램이 없습니다: {spec}"))?;
+    Ok(tomverse_core::mcp::McpServerConfig {
+        name: name.to_string(),
+        program: program.to_string(),
+        args: parts.map(str::to_string).collect(),
+        env: Default::default(),
+    })
 }
 
 /// 격리 트리를 어디에 만드는가.
@@ -483,7 +515,16 @@ fn real_main() -> Result<i32, String> {
                     .map_err(|e| format!("태스크 생성 실패: {e}"))?;
             }
 
-            let host = Arc::new(TaskHost::new(
+            // 등록이 잘못되면 **태스크를 시작하기 전에** 멈춘다 — 실행 중에 알면 이미 모델이
+            // 그 서버의 도구를 쓸 수 있다고 믿고 계획을 세운 뒤다.
+            let mcp = if args.mcp_servers.is_empty() {
+                None
+            } else {
+                Some(Arc::new(
+                    tomverse_core::mcp::McpPool::new(args.mcp_servers.clone()).map_err(|e| e.to_string())?,
+                ))
+            };
+            let mut task_host = TaskHost::new(
                 root,
                 policy,
                 store.clone(),
@@ -491,8 +532,19 @@ fn real_main() -> Result<i32, String> {
                 approvals,
                 sink,
                 Arc::new(CancellationRegistry::new()),
-            ));
-            let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id)?;
+            );
+            if let Some(pool) = mcp.clone() {
+                eprintln!("MCP 서버 등록: {}", pool.names().join(", "));
+                task_host = task_host.with_mcp(pool);
+            }
+            let host = Arc::new(task_host);
+            let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id);
+            // **띄운 서버를 반드시 내린다.** 남기면 사용자가 모르는 프로세스가 계속 돈다.
+            // 태스크가 실패해도 내려야 하므로 `?` 앞에서 한다.
+            if let Some(pool) = &mcp {
+                pool.shutdown();
+            }
+            let final_result = final_result?;
 
             // stdout에는 최종 결과만. 호출자(테스트)가 그대로 파싱한다.
             let mutated = host.with_store(|s| s.mutated_paths(&task_id)).unwrap_or_default();

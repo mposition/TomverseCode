@@ -20,6 +20,7 @@ pub mod export;
 pub mod host;
 pub mod landing;
 pub mod launcher;
+pub mod mcp;
 pub mod metrics;
 pub mod paths;
 pub mod policy;

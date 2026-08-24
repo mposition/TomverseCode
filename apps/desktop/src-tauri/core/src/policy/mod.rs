@@ -174,6 +174,31 @@ impl PolicyGate {
 
             // ---- 셸 명령 ----
             ToolName::RunCommand | ToolName::RunTests => self.classify_command(request, root, task_policy),
+
+            // ---- MCP: 언제나 사용자 승인. 정책으로 낮출 수 없다 ----
+            //
+            // **무엇을 하는 도구인지 우리가 모른다.** MCP 서버는 우리 게이트 밖에서 파일을
+            // 고치고 네트워크를 쓸 수 있으므로, 여기서 자동 허용할 근거를 만들 방법이 없다.
+            // `run_command`처럼 allowlist로 완화하는 길도 두지 않는다 — allowlist는 "이 명령이
+            // 무엇을 하는지 안다"에 기대는데, 그 전제가 여기서는 성립하지 않는다.
+            //
+            // 그래서 `task_policy`를 **보지 않는다**. 보면 언젠가 누군가 완화 조건을 넣는다.
+            ToolName::McpCall => match crate::mcp::parse_call(&request.args) {
+                // 승인 화면이 무엇을 보여줄지 정하지 못하는 요청은 승인받을 수 없다 —
+                // "무엇을 승인하는지 모르는 승인"은 승인이 아니다.
+                Err(reason) => Outcome::deny_malformed(reason),
+                Ok(call) => Outcome {
+                    decision: Decision::RequireUserApproval,
+                    risk_level: RiskLevel::High,
+                    matched_rule: "mcp_always_requires_approval".to_string(),
+                    reason: format!(
+                        "MCP 도구는 이 게이트 밖에서 동작할 수 있어 언제나 승인을 요구합니다: {}",
+                        crate::mcp::describe(&call)
+                    ),
+                    // 승인 화면과 이벤트가 **이 문자열 그대로**를 보여준다(원칙 6의 MCP판).
+                    normalized_target: crate::mcp::describe(&call),
+                },
+            },
         }
     }
 
@@ -438,6 +463,66 @@ mod tests {
         fs::write(dir.path().join("src/app.ts"), "const a = 1;\n").unwrap();
         let root = WorkspaceRoot::new(dir.path()).unwrap();
         (dir, root)
+    }
+
+    // ---- MCP (state-machine 23절) ----
+
+    /// **어떤 정책으로도 자동 허용이 되지 않는다.**
+    ///
+    /// `auto_approve_workspace_writes`는 워크스페이스 안의 쓰기를 자동화하는 스위치인데,
+    /// MCP 도구는 워크스페이스 안에서 도는지조차 우리가 모른다. 그 스위치가 여기에 걸리면
+    /// 사용자는 "내 저장소 안의 편집을 자동 승인"한다고 생각하면서 **게이트 밖의 임의 도구를
+    /// 자동 승인**하게 된다.
+    #[test]
+    fn mcp_always_requires_approval_regardless_of_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let call = json!({ "server": "fs", "tool": "write_file", "arguments": { "path": "/etc/hosts" } });
+
+        for policy in [
+            TaskPolicy::default(),
+            TaskPolicy { auto_approve_workspace_writes: true, ..TaskPolicy::default() },
+        ] {
+            let d = PolicyGate::new(&policy).evaluate(&request(ToolName::McpCall, call.clone()), &root, &policy);
+            assert_eq!(d.decision, Decision::RequireUserApproval, "{policy:?}");
+            assert!(d.requires_user_approval);
+            assert_eq!(d.risk_level, RiskLevel::High);
+        }
+    }
+
+    /// 승인 화면이 보는 것은 `normalizedTarget`이다. **인자가 거기 그대로 있어야** 사용자가
+    /// 승인한 것과 실제 나가는 것이 같다(원칙 6의 MCP판).
+    #[test]
+    fn the_decision_carries_the_call_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let policy = TaskPolicy::default();
+        let d = PolicyGate::new(&policy).evaluate(
+            &request(
+                ToolName::McpCall,
+                json!({ "server": "fs", "tool": "write_file", "arguments": { "path": "/etc/hosts" } }),
+            ),
+            &root,
+            &policy,
+        );
+        assert!(d.normalized_target.contains("fs"), "{}", d.normalized_target);
+        assert!(d.normalized_target.contains("write_file"), "{}", d.normalized_target);
+        assert!(d.normalized_target.contains("/etc/hosts"), "{}", d.normalized_target);
+    }
+
+    /// 무엇을 승인하는지 정하지 못하는 요청은 **승인 대상이 아니라 거부 대상**이다.
+    #[test]
+    fn a_malformed_mcp_call_is_denied_not_sent_for_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let policy = TaskPolicy::default();
+        let d = PolicyGate::new(&policy).evaluate(
+            &request(ToolName::McpCall, json!({ "server": "fs" })),
+            &root,
+            &policy,
+        );
+        assert_eq!(d.decision, Decision::Deny);
+        assert!(!d.requires_user_approval);
     }
 
     fn request(tool: ToolName, args: serde_json::Value) -> ToolRequest {

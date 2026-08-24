@@ -127,6 +127,23 @@ impl TaskHost {
         }
     }
 
+    /// 등록된 MCP 서버를 붙인다 (mcp.rs, state-machine 23절).
+    ///
+    /// **붙이지 않으면 `mcp_call`은 실행되지 않는다.** 서버를 등록하지 않은 사용자에게 MCP
+    /// 도구는 존재하지 않아야 하고, 그 사실이 사유로 남는다.
+    pub fn with_mcp(mut self, pool: Arc<crate::mcp::McpPool>) -> Self {
+        self.runtime = std::mem::replace(
+            &mut self.runtime,
+            ToolRuntime::new(
+                self.root.clone(),
+                self.artifacts.clone(),
+                Duration::from_millis(self.policy.command_timeout_ms),
+            ),
+        )
+        .with_mcp(pool);
+        self
+    }
+
     pub fn root(&self) -> &WorkspaceRoot {
         &self.root
     }

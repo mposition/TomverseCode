@@ -1,0 +1,650 @@
+//! MCP (Model Context Protocol) — product-strategy.md 8.2절, M2.
+//!
+//! 출시 기준은 **"MCP 서버 등록, 그 도구가 `ToolRequest`로 변환되어 Policy Gate 통과"** 다.
+//!
+//! # 왜 Rust가 소유하는가
+//!
+//! MCP 서버는 **프로세스**다. 그것을 띄우고 stdio로 말하는 것은 정확히 원칙 2가 Node에게
+//! 금지한 일이다(`packages/sidecar/test/boundary.test.ts`가 소스 수준에서 강제한다). Node가
+//! MCP 클라이언트를 가지면 "Node는 셸을 실행하지 않는다"가 거짓이 된다 — MCP 서버 하나가
+//! 곧 임의의 프로그램이기 때문이다.
+//!
+//! 그래서 Node는 **요청만** 한다: `mcp_call` 도구 하나로 서버 이름·도구 이름·인자를 보내고,
+//! 띄울지 말지는 Rust의 Policy Gate가 정한다.
+//!
+//! # 우리가 보장하는 것과 보장하지 못하는 것
+//!
+//! **보장한다**: 어떤 서버의 어떤 도구를 어떤 인자로 불렀는지가 승인 화면에 그대로 보이고
+//! 이벤트에 그대로 남는다(원칙 6의 MCP판 — 보이는 것이 실제 나가는 것이다).
+//!
+//! **보장하지 못한다**: 그 서버가 무엇을 하는지. MCP 서버는 우리 Policy Gate 밖에서 파일을
+//! 고치고 네트워크를 쓸 수 있다. **서버를 등록하는 순간 사용자는 게이트 밖의 능력을 들여온다.**
+//! 그래서 등록은 사용자만 할 수 있고(모델이 서버를 추가하는 경로가 없다), 호출은 언제나
+//! 승인을 요구하며, 화면이 이 한계를 문장으로 말해야 한다. 흐리게 말하면 사용자는 우리 게이트가
+//! MCP 도구의 행동까지 검사한다고 믿는다.
+
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::io::{BufRead, Write};
+
+/// 등록된 MCP 서버 하나.
+///
+/// **셸 문자열이 아니라 argv 배열이다**(원칙 6). 문자열로 받으면 승인 화면에 보인 것과 실제
+/// 실행되는 것이 갈라지고, 그 갈라짐은 정확히 이 도구가 위험한 이유가 된다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 이 서버에 넘길 환경변수. **비어 있는 것이 기본이다** — 부모 환경을 통째로 물려주면
+    /// API 키가 우리가 모르는 프로세스로 나간다(원칙 3의 정신).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpConfigError {
+    EmptyName,
+    InvalidName { name: String },
+    EmptyProgram { name: String },
+    /// 프로그램 자리에 셸 메타문자가 들어왔다 — 문자열 명령을 넣으려는 시도다.
+    ShellLike { name: String, program: String },
+    Duplicate { name: String },
+}
+
+impl std::fmt::Display for McpConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyName => write!(f, "서버 이름이 비어 있습니다"),
+            Self::InvalidName { name } => write!(
+                f,
+                "서버 이름에 쓸 수 없는 문자가 있습니다 ({name}) — 영숫자와 `-` `_`만 됩니다"
+            ),
+            Self::EmptyProgram { name } => write!(f, "{name}: 실행할 프로그램이 없습니다"),
+            Self::ShellLike { name, program } => write!(
+                f,
+                "{name}: 프로그램 자리에 셸 명령을 넣을 수 없습니다 ({program}) — program과 args를 나눠서 적으세요"
+            ),
+            Self::Duplicate { name } => write!(f, "서버 이름이 중복됩니다: {name}"),
+        }
+    }
+}
+
+/// 등록 목록을 검사한다. **여기서 거부하면 그 서버는 아예 존재하지 않는다.**
+pub fn validate_servers(servers: &[McpServerConfig]) -> Result<(), McpConfigError> {
+    let mut seen: Vec<&str> = Vec::new();
+    for server in servers {
+        if server.name.trim().is_empty() {
+            return Err(McpConfigError::EmptyName);
+        }
+        if !server
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return Err(McpConfigError::InvalidName { name: server.name.clone() });
+        }
+        if seen.contains(&server.name.as_str()) {
+            return Err(McpConfigError::Duplicate { name: server.name.clone() });
+        }
+        seen.push(&server.name);
+        if server.program.trim().is_empty() {
+            return Err(McpConfigError::EmptyProgram { name: server.name.clone() });
+        }
+        // `sh -c "..."`를 program 한 칸에 우겨넣는 것을 막는다. argv 배열이라는 보장은
+        // **program 자리도 하나의 실행 파일일 때만** 성립한다.
+        if looks_like_command_string(&server.program) {
+            return Err(McpConfigError::ShellLike {
+                name: server.name.clone(),
+                program: server.program.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// program 자리에 **명령 문자열**이 들어왔는가.
+///
+/// # 공백만으로는 판정할 수 없다
+///
+/// 처음에는 셸 메타문자(`|&;><`)만 봤는데 `sh -c 'rm -rf /'`가 통과했다 — 거기엔 메타문자가
+/// 없다. 그렇다고 공백을 거부할 수도 없다: Windows의 정상적인 실행 파일 경로가
+/// `C:\Program Files\nodejs\node.exe`다.
+///
+/// 그래서 **인자가 붙었다는 표시**를 본다: 따옴표, 그리고 공백 뒤에 오는 `-`(플래그의 모양).
+/// 경로에 공백이 있는 것은 괜찮고, 공백 뒤에 플래그가 오는 것은 명령 문자열이다.
+///
+/// 완벽한 판정이 아니라는 것을 적어 둔다 — `--`가 없는 인자(`sh -c` 대신 `sh script.sh`)는
+/// 이 규칙을 지나간다. 그때는 실행이 실패하고 사유가 남는다. **여기서 잡으려는 것은 공격이
+/// 아니라 흔한 설정 실수**이고, 공격 쪽은 "등록은 사용자만 한다"가 막는다.
+fn looks_like_command_string(program: &str) -> bool {
+    if program.chars().any(|c| matches!(c, '|' | '&' | ';' | '>' | '<' | '\n' | '\'' | '"')) {
+        return true;
+    }
+    program.split(' ').skip(1).any(|token| token.starts_with('-'))
+}
+
+/// `mcp_call` 요청이 담고 있는 것. 승인 화면과 이벤트가 **이 값 그대로**를 보여준다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct McpCall {
+    pub server: String,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+/// 도구 요청 인자에서 `McpCall`을 뽑는다.
+///
+/// **모르는 모양은 통과시키지 않는다.** 게이트가 승인 화면에 무엇을 보여줄지 정하지 못하는
+/// 요청은 승인받을 수 없다 — "무엇을 승인하는지 모르는 승인"은 승인이 아니다.
+pub fn parse_call(args: &Value) -> Result<McpCall, String> {
+    let server = args
+        .get("server")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "mcp_call 요청에 문자열 \"server\" 인자가 없음".to_string())?;
+    let tool = args
+        .get("tool")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "mcp_call 요청에 문자열 \"tool\" 인자가 없음".to_string())?;
+    // `arguments`는 없을 수 있다(인자 없는 도구). 하지만 **객체가 아니면** 거부한다 —
+    // MCP는 named arguments를 쓰므로 배열이나 문자열은 우리가 잘못 조립한 것이다.
+    let arguments = match args.get("arguments") {
+        None | Some(Value::Null) => json!({}),
+        Some(v) if v.is_object() => v.clone(),
+        Some(_) => return Err("mcp_call의 \"arguments\"는 객체여야 합니다".to_string()),
+    };
+    Ok(McpCall {
+        server: server.to_string(),
+        tool: tool.to_string(),
+        arguments,
+    })
+}
+
+/// 승인 화면에 나갈 한 줄. **인자를 요약하거나 자르지 않는다** — 자르면 사용자가 승인한 것과
+/// 실제 나가는 것이 달라지고, 그게 이 도구에서 가장 피해야 할 일이다.
+pub fn describe(call: &McpCall) -> String {
+    format!(
+        "{} 서버의 {} 도구 · 인자 {}",
+        call.server,
+        call.tool,
+        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "(직렬화 불가)".to_string())
+    )
+}
+
+// ---- JSON-RPC over stdio ----
+
+/// MCP 서버와의 한 세션.
+///
+/// **스트림에 대해 제네릭이다.** `sidecar.rs`가 줄 읽기를 순수 함수로 두고 테스트한 것과 같은
+/// 이유다 — 프로세스를 띄워야만 검증되는 프로토콜 코드는 검증되지 않는 코드가 된다.
+pub struct McpSession<R: BufRead, W: Write> {
+    reader: R,
+    /// 테스트가 **우리가 실제로 보낸 바이트**를 읽는다 — 승인 화면과 같은지 확인하는 자리다.
+    pub(crate) writer: W,
+    next_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpError {
+    Transport(String),
+    /// 서버가 JSON-RPC 오류를 돌려줬다. **우리 실패와 구별한다** — 고칠 곳이 다르다.
+    Server { code: i64, message: String },
+    Protocol(String),
+}
+
+impl std::fmt::Display for McpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(m) => write!(f, "MCP 전송 실패: {m}"),
+            Self::Server { code, message } => write!(f, "MCP 서버 오류 {code}: {message}"),
+            Self::Protocol(m) => write!(f, "MCP 프로토콜 위반: {m}"),
+        }
+    }
+}
+
+/// 한 줄의 상한. `sidecar.rs`의 32 MiB와 같은 이유로 둔다 — 상한이 없으면 상대가
+/// **우리 메모리를 무한히 키울 수 있다.** MCP 서버는 우리가 만든 프로그램이 아니다.
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+impl<R: BufRead, W: Write> McpSession<R, W> {
+    pub fn new(reader: R, writer: W) -> Self {
+        Self { reader, writer, next_id: 1 }
+    }
+
+    /// 핸드셰이크. 서버가 어떤 프로토콜 버전을 말하는지 그대로 돌려준다 —
+    /// **우리가 기대한 값으로 덮지 않는다**(공급자 envelope에서와 같은 규칙).
+    pub fn initialize(&mut self, client_name: &str) -> Result<Value, McpError> {
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": client_name, "version": env!("CARGO_PKG_VERSION") },
+            }),
+        )
+    }
+
+    /// 이 서버가 내놓는 도구 목록.
+    pub fn list_tools(&mut self) -> Result<Vec<Value>, McpError> {
+        let result = self.request("tools/list", json!({}))?;
+        match result.get("tools") {
+            Some(Value::Array(tools)) => Ok(tools.clone()),
+            // 빈 배열과 "tools 키가 없음"을 뭉개지 않는다 — 전자는 도구가 없는 서버이고
+            // 후자는 우리가 MCP 서버가 아닌 것과 말하고 있다는 뜻이다.
+            _ => Err(McpError::Protocol("tools/list 응답에 tools 배열이 없습니다".to_string())),
+        }
+    }
+
+    /// 도구 하나를 부른다. **여기까지 온 요청은 이미 Policy Gate와 사용자 승인을 지났다.**
+    pub fn call_tool(&mut self, call: &McpCall) -> Result<Value, McpError> {
+        self.request(
+            "tools/call",
+            json!({ "name": call.tool, "arguments": call.arguments }),
+        )
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, McpError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .map_err(|e| McpError::Transport(e.to_string()))?;
+        self.writer
+            .write_all(line.as_bytes())
+            .and_then(|()| self.writer.write_all(b"\n"))
+            .and_then(|()| self.writer.flush())
+            .map_err(|e| McpError::Transport(e.to_string()))?;
+
+        // **우리 id의 응답이 올 때까지 읽는다.** 서버는 알림(notification, id 없음)을 섞어
+        // 보낼 수 있고, 그것을 응답으로 착각하면 엉뚱한 값을 결과로 쓰게 된다.
+        loop {
+            let Some(message) = self.read_message()? else {
+                return Err(McpError::Transport("응답을 받기 전에 스트림이 닫혔습니다".to_string()));
+            };
+            match message.get("id").and_then(Value::as_u64) {
+                Some(got) if got == id => {
+                    if let Some(error) = message.get("error") {
+                        return Err(McpError::Server {
+                            code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
+                            message: error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("(메시지 없음)")
+                                .to_string(),
+                        });
+                    }
+                    return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+                }
+                // 다른 id의 응답도 무시한다 — 우리는 한 번에 하나만 보내므로 남의 것이다.
+                _ => continue,
+            }
+        }
+    }
+
+    /// 한 메시지를 읽는다. 줄 프레이밍은 **`sidecar.rs`의 것을 그대로 쓴다.**
+    ///
+    /// 두 번째 구현을 만들지 않는 이유: 상한을 넘긴 줄을 어떻게 다룰지(프레임 동기를 잃었으므로
+    /// 계속 읽지 않는다)는 이미 한 번 정한 규칙이고, 규칙이 두 곳에 있으면 언젠가 한쪽만 고쳐진다.
+    fn read_message(&mut self) -> Result<Option<Value>, McpError> {
+        loop {
+            match crate::sidecar::read_framed_line(&mut self.reader, MAX_LINE_BYTES) {
+                crate::sidecar::FramedLine::Eof => return Ok(None),
+                crate::sidecar::FramedLine::ReadError(e) => return Err(McpError::Transport(e)),
+                // **상한 초과에서 계속 읽지 않는다.** 그 줄의 나머지가 스트림에 남아 있어
+                // 다음 "줄"은 앞 메시지의 꼬리다 — 프레임 동기를 잃은 채 파싱하면 조용히
+                // 엉뚱한 값을 결과로 쓴다.
+                crate::sidecar::FramedLine::Oversized { bytes } => {
+                    return Err(McpError::Transport(format!(
+                        "한 줄이 상한({MAX_LINE_BYTES} 바이트)을 넘었습니다: {bytes} 바이트"
+                    )))
+                }
+                crate::sidecar::FramedLine::InvalidUtf8 { bytes } => {
+                    return Err(McpError::Protocol(format!("UTF-8이 아닌 줄({bytes} 바이트)")))
+                }
+                crate::sidecar::FramedLine::Line(line) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    // **파싱 불가한 줄은 무시한다**(sidecar.rs와 같은 원칙). 서버가 stdout에
+                    // 로그를 섞어 내는 경우가 흔하고, 그때마다 세션을 죽이면 쓸 수 있는
+                    // 서버가 거의 없다.
+                    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                        return Ok(Some(value));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- 프로세스로 띄운 세션 ----
+
+/// 등록된 서버들을 띄우고 재사용한다.
+///
+/// **`ToolRuntime`이 아니라 여기가 세션을 소유한다.** 런타임은 요청 하나를 실행하는 순수한
+/// 자리이고, 프로세스 수명은 태스크 수명에 걸린다 — 요청마다 서버를 새로 띄우면 MCP 서버가
+/// 들고 있는 상태(연결·캐시)가 매번 사라진다.
+pub struct McpPool {
+    servers: Vec<McpServerConfig>,
+    sessions: std::sync::Mutex<BTreeMap<String, SpawnedSession>>,
+}
+
+struct SpawnedSession {
+    child: std::process::Child,
+    session: McpSession<std::io::BufReader<std::process::ChildStdout>, std::process::ChildStdin>,
+}
+
+impl McpPool {
+    /// **검사를 통과한 목록만 받는다.** 통과하지 못한 서버는 아예 존재하지 않는다.
+    pub fn new(servers: Vec<McpServerConfig>) -> Result<Self, McpConfigError> {
+        validate_servers(&servers)?;
+        Ok(Self { servers, sessions: std::sync::Mutex::new(BTreeMap::new()) })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.servers.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// 도구 하나를 부른다. 서버가 아직 안 떠 있으면 띄우고 핸드셰이크한다.
+    pub fn call(&self, call: &McpCall) -> Result<Value, McpError> {
+        let config = self
+            .servers
+            .iter()
+            .find(|s| s.name == call.server)
+            // **등록되지 않은 서버는 프로토콜 위반이 아니라 설정 문제다.** 사용자가 고칠 곳이
+            // 다르므로 사유에 등록된 이름을 함께 낸다.
+            .ok_or_else(|| {
+                McpError::Protocol(format!(
+                    "등록되지 않은 MCP 서버입니다: {} (등록된 것: {})",
+                    call.server,
+                    if self.servers.is_empty() { "없음".to_string() } else { self.names().join(", ") }
+                ))
+            })?;
+
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| McpError::Transport("세션 잠금이 오염되었습니다".to_string()))?;
+        if !sessions.contains_key(&call.server) {
+            sessions.insert(call.server.clone(), spawn_session(config)?);
+        }
+        let entry = sessions
+            .get_mut(&call.server)
+            .ok_or_else(|| McpError::Transport("세션을 만들지 못했습니다".to_string()))?;
+        entry.session.call_tool(call)
+    }
+
+    /// 띄운 서버를 모두 종료한다. **태스크가 끝나면 반드시 부른다** — 남기면 사용자가 모르는
+    /// 프로세스가 계속 돈다.
+    pub fn shutdown(&self) {
+        let Ok(mut sessions) = self.sessions.lock() else { return };
+        for (_, mut entry) in std::mem::take(&mut *sessions) {
+            let _ = entry.child.kill();
+            let _ = entry.child.wait();
+        }
+    }
+}
+
+impl Drop for McpPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// 환경을 비운 뒤 **되돌려주는 최소 집합**.
+///
+/// `env_clear()`만 하면 `node`·`npx` 같은 이름을 찾을 수 없다(PATH가 없으므로). 실측으로
+/// `No such file or directory`가 났다 — 그리고 그 오류는 "서버 설정이 틀렸다"로 읽히기 쉽다.
+///
+/// 그래서 **이름을 대고** 되돌려준다. 목록에 없는 것은 넘어가지 않으므로 `OPENAI_API_KEY`
+/// 같은 값은 서버가 보지 못한다. Windows 항목이 함께 있는 이유는 그쪽에서 이 둘이 없으면
+/// 프로세스 생성 자체가 실패하기 때문이다.
+fn minimal_env() -> Vec<(String, String)> {
+    ["PATH", "SystemRoot", "PATHEXT", "TEMP", "TMP"]
+        .iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_string(), value)))
+        .collect()
+}
+
+fn spawn_session(config: &McpServerConfig) -> Result<SpawnedSession, McpError> {
+    let mut command = std::process::Command::new(&config.program);
+    command
+        .args(&config.args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        // **stderr는 물려주지 않는다.** 서버 로그가 우리 stdout에 섞이면 NDJSON 프레임이 깨진다.
+        .stderr(std::process::Stdio::null())
+        // **부모 환경을 물려주지 않는다.** API 키가 우리가 모르는 프로세스로 나가지 않도록,
+        // 등록에 적힌 것만 넘긴다(원칙 3의 정신).
+        .env_clear()
+        .envs(minimal_env())
+        .envs(&config.env);
+    let mut child = command
+        .spawn()
+        .map_err(|e| McpError::Transport(format!("{} 서버를 띄우지 못했습니다: {e}", config.name)))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| McpError::Transport("서버 stdout을 열지 못했습니다".to_string()))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| McpError::Transport("서버 stdin을 열지 못했습니다".to_string()))?;
+    let mut session = McpSession::new(std::io::BufReader::new(stdout), stdin);
+    // 핸드셰이크가 실패하면 **프로세스를 남기지 않는다.**
+    if let Err(e) = session.initialize("tomverse-code") {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    Ok(SpawnedSession { child, session })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn server(name: &str, program: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            program: program.to_string(),
+            args: vec![],
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// **program 자리에 셸 명령을 우겨넣는 것을 막는다.** argv 배열이라는 보장(원칙 6)은
+    /// program이 하나의 실행 파일일 때만 성립한다.
+    #[test]
+    fn a_shell_command_in_the_program_slot_is_refused() {
+        for program in ["sh -c 'rm -rf /'", "node a.js | tee x", "a && b", "a > b"] {
+            let err = validate_servers(&[server("s", program)]).unwrap_err();
+            assert!(matches!(err, McpConfigError::ShellLike { .. }), "{program}: {err:?}");
+        }
+        // 평범한 프로그램은 통과한다 — 위 거부가 전부를 막는 것이 아님을 확인한다.
+        assert!(validate_servers(&[server("s", "node")]).is_ok());
+        // **공백만으로 거부하지 않는다.** Windows의 정상적인 경로가 그렇게 생겼다.
+        assert!(
+            validate_servers(&[server("s", "C:\\Program Files\\nodejs\\node.exe")]).is_ok(),
+            "공백이 있는 정상 경로를 거부했습니다"
+        );
+    }
+
+    #[test]
+    fn server_names_are_constrained_and_unique() {
+        assert!(matches!(
+            validate_servers(&[server("a b", "node")]).unwrap_err(),
+            McpConfigError::InvalidName { .. }
+        ));
+        assert!(matches!(
+            validate_servers(&[server("dup", "node"), server("dup", "node")]).unwrap_err(),
+            McpConfigError::Duplicate { .. }
+        ));
+        assert!(validate_servers(&[server("fs-tools", "node"), server("db_2", "node")]).is_ok());
+    }
+
+    /// 승인 화면이 무엇을 보여줄지 정하지 못하는 요청은 승인받을 수 없다.
+    #[test]
+    fn a_call_we_cannot_describe_is_rejected() {
+        assert!(parse_call(&json!({ "tool": "x" })).is_err(), "server 없음");
+        assert!(parse_call(&json!({ "server": "s" })).is_err(), "tool 없음");
+        assert!(parse_call(&json!({ "server": " ", "tool": "x" })).is_err(), "빈 server");
+        // arguments는 **객체**여야 한다 — 배열이면 우리가 잘못 조립한 것이다.
+        assert!(parse_call(&json!({ "server": "s", "tool": "x", "arguments": [1] })).is_err());
+        // 없으면 빈 객체다(인자 없는 도구).
+        let call = parse_call(&json!({ "server": "s", "tool": "x" })).unwrap();
+        assert_eq!(call.arguments, json!({}));
+    }
+
+    /// **인자를 요약하거나 자르지 않는다.** 자르면 사용자가 승인한 것과 실제 나가는 것이 달라진다.
+    #[test]
+    fn the_approval_text_contains_the_arguments_verbatim() {
+        let call = parse_call(&json!({
+            "server": "fs",
+            "tool": "write_file",
+            "arguments": { "path": "/etc/hosts", "contents": "x".repeat(500) }
+        }))
+        .unwrap();
+        let text = describe(&call);
+        assert!(text.contains("fs"), "{text}");
+        assert!(text.contains("write_file"), "{text}");
+        assert!(text.contains("/etc/hosts"), "{text}");
+        // 500자가 그대로 들어 있다 — 요약했다면 길이가 줄었을 것이다.
+        assert!(text.len() > 500, "인자가 잘렸습니다: {}", text.len());
+    }
+
+    fn session_over(script: &str) -> McpSession<Cursor<Vec<u8>>, Vec<u8>> {
+        McpSession::new(Cursor::new(script.as_bytes().to_vec()), Vec::new())
+    }
+
+    #[test]
+    fn a_result_is_returned_for_our_id() {
+        let mut s = session_over("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n");
+        assert_eq!(s.call_tool(&McpCall {
+            server: "s".into(),
+            tool: "t".into(),
+            arguments: json!({}),
+        }).unwrap(), json!({ "ok": true }));
+    }
+
+    /// 서버는 알림(id 없음)과 로그를 섞어 보낸다. **그것을 응답으로 착각하면 엉뚱한 값을
+    /// 결과로 쓴다** — 조용히 틀리는 종류의 실패다.
+    #[test]
+    fn notifications_and_noise_are_skipped_until_our_response() {
+        let script = concat!(
+            "server starting...\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n",
+            "\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"other\":true}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"mine\":true}}\n"
+        );
+        let mut s = session_over(script);
+        let got = s
+            .call_tool(&McpCall { server: "s".into(), tool: "t".into(), arguments: json!({}) })
+            .unwrap();
+        assert_eq!(got, json!({ "mine": true }));
+    }
+
+    /// 서버가 낸 오류는 **우리 실패와 구별한다** — 고칠 곳이 다르다.
+    #[test]
+    fn a_server_error_is_its_own_kind() {
+        let mut s = session_over("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"no such tool\"}}\n");
+        let err = s
+            .call_tool(&McpCall { server: "s".into(), tool: "t".into(), arguments: json!({}) })
+            .unwrap_err();
+        assert!(matches!(err, McpError::Server { code: -32601, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_closed_stream_is_a_transport_error_not_a_hang() {
+        let mut s = session_over("");
+        let err = s
+            .call_tool(&McpCall { server: "s".into(), tool: "t".into(), arguments: json!({}) })
+            .unwrap_err();
+        assert!(matches!(err, McpError::Transport(_)), "{err:?}");
+    }
+
+    /// **상한을 넘긴 줄에서 계속 읽지 않는다.** 그 줄의 나머지가 스트림에 남아 다음 "줄"은
+    /// 앞 메시지의 꼬리이므로, 프레임 동기를 잃은 채 파싱하면 조용히 엉뚱한 값을 쓴다.
+    #[test]
+    fn an_oversized_line_stops_the_session() {
+        let huge = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{}\"}}\n", "x".repeat(MAX_LINE_BYTES));
+        let mut s = session_over(&huge);
+        let err = s
+            .call_tool(&McpCall { server: "s".into(), tool: "t".into(), arguments: json!({}) })
+            .unwrap_err();
+        assert!(matches!(err, McpError::Transport(_)), "{err:?}");
+    }
+
+    /// 우리가 보낸 것이 JSON-RPC 한 줄이어야 한다 — 서버가 읽는 것은 이 바이트다.
+    #[test]
+    fn the_request_we_write_is_one_json_line() {
+        let mut s = session_over("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+        s.call_tool(&McpCall {
+            server: "s".into(),
+            tool: "write".into(),
+            arguments: json!({ "path": "a" }),
+        })
+        .unwrap();
+        let written = String::from_utf8(s.writer.clone()).unwrap();
+        assert_eq!(written.matches('\n').count(), 1, "{written}");
+        let parsed: Value = serde_json::from_str(written.trim()).unwrap();
+        assert_eq!(parsed["method"], "tools/call");
+        // 도구 이름과 인자가 **그대로** 나간다 — 승인 화면이 보여준 것과 같아야 한다.
+        assert_eq!(parsed["params"]["name"], "write");
+        assert_eq!(parsed["params"]["arguments"], json!({ "path": "a" }));
+    }
+
+    #[test]
+    fn list_tools_distinguishes_empty_from_missing() {
+        let mut ok = session_over("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n");
+        assert_eq!(ok.list_tools().unwrap().len(), 0);
+        // tools 키가 없으면 MCP 서버가 아닌 것과 말하고 있다는 뜻이다 — 빈 목록과 뭉개지 않는다.
+        let mut bad = session_over("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+        assert!(matches!(bad.list_tools().unwrap_err(), McpError::Protocol(_)));
+    }
+
+    /// **비운 환경에 되돌려주는 것은 이름을 댄 것뿐이다.** 목록이 넓어지면 API 키가 우리가
+    /// 모르는 프로세스로 나간다.
+    #[test]
+    fn the_minimal_env_carries_no_secrets() {
+        // 이 프로세스에 비밀 모양의 값을 심어도 목록에 없으면 넘어가지 않는다.
+        std::env::set_var("OPENAI_API_KEY", "sk-should-not-travel");
+        let passed = minimal_env();
+        assert!(
+            !passed.iter().any(|(k, _)| k.contains("API_KEY")),
+            "비밀이 넘어갔습니다: {passed:?}"
+        );
+        // 그리고 실제로 무언가는 넘어간다 — 빈 목록이면 이 검사가 공허하다(그리고 서버가
+        // 실행되지 않는다).
+        assert!(passed.iter().any(|(k, _)| k == "PATH"), "PATH가 없어 서버를 찾을 수 없습니다");
+    }
+
+    /// 등록되지 않은 서버는 **설정 문제**로 말한다 — 등록된 이름을 함께 낸다.
+    #[test]
+    fn an_unregistered_server_names_what_is_registered() {
+        let pool = McpPool::new(vec![server("fs", "node")]).unwrap();
+        let err = pool
+            .call(&McpCall { server: "db".into(), tool: "q".into(), arguments: json!({}) })
+            .unwrap_err();
+        match err {
+            McpError::Protocol(message) => {
+                assert!(message.contains("db"), "{message}");
+                assert!(message.contains("fs"), "등록된 이름이 없습니다: {message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}

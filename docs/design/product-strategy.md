@@ -424,6 +424,7 @@ excluded from context"). 모델이 그 파일이 없다고 보고 내용을 추�
 | ↳ 위 행의 현재 상태 | **구현 완료**(M2) — `tomverse-host run --worktree <branch>` / `tomverse-host worktree [--worktree <branch>] [--force]`. 격리는 **루트를 바꾸는 것이 전부**이고 Policy Gate에 분기를 만들지 않았다([state-machine 22절](./state-machine-and-protocol.md)) <!-- present: apps/desktop/src-tauri/core/src/worktree.rs --> | — |
 | **PR 연동** | GitHub PR 생성 | 리뷰 코멘트 반영, 타 호스팅 |
 | **MCP** | MCP 서버 등록, 그 도구가 `ToolRequest`로 변환되어 Policy Gate 통과 | 스펙 전 범위, 원격 서버 |
+| ↳ 위 행의 현재 상태 | **구현 완료**(M2) — stdio 서버 등록·`mcp_call`·게이트 통과. 언제나 승인이며 정책으로 낮출 수 없다([state-machine 23절](./state-machine-and-protocol.md)). 남은 것은 UI 등록 화면과 도구 목록 노출(23.10절) <!-- present: apps/desktop/src-tauri/core/src/mcp.rs --> | — |
 | **프로젝트 규칙** | `CLAUDE.md`/`AGENTS.md` 자동 로드 (이미 `agentsMdContent`로 설계됨) | 디렉터리별 규칙 |
 | **Hooks** | 주요 phase 전환에 사용자 스크립트 실행. **스크립트 실행도 Policy Gate 적용** | 이벤트 종류 확대 |
 | **Skills · 커스텀 에이전트** | 얕은 버전 — 이름 붙인 프롬프트 프리셋 + 도구 허용목록 + 역할별 모델 지정 | 완전한 에이전트 프레임워크 |

@@ -39,6 +39,12 @@ pub struct ToolRuntime {
     root: WorkspaceRoot,
     artifacts: ArtifactStore,
     default_timeout: Duration,
+    /// 등록된 MCP 서버들(mcp.rs). **없는 것이 기본이다** — 서버를 등록하지 않은 사용자에게
+    /// MCP 도구는 존재하지 않아야 한다.
+    ///
+    /// 런타임이 세션을 **소유하지 않고 빌려 쓴다**: 프로세스 수명은 태스크 수명에 걸리므로
+    /// 호스트가 들고, 여기서는 요청 하나를 넘기기만 한다.
+    mcp: Option<std::sync::Arc<crate::mcp::McpPool>>,
 }
 
 /// 실행 결과 + 부수 기록. 호출자(host)가 이걸 받아 SQLite에 기록한다 —
@@ -59,7 +65,14 @@ impl ToolRuntime {
             root,
             artifacts,
             default_timeout,
+            mcp: None,
         }
+    }
+
+    /// 등록된 MCP 서버를 붙인다. 붙이지 않으면 `mcp_call`은 **실행되지 않고 사유가 남는다.**
+    pub fn with_mcp(mut self, pool: std::sync::Arc<crate::mcp::McpPool>) -> Self {
+        self.mcp = Some(pool);
+        self
     }
 
     pub fn root(&self) -> &WorkspaceRoot {
@@ -163,6 +176,7 @@ impl ToolRuntime {
             ToolName::RunCommand | ToolName::RunTests => self.run_command(request, start, cancel),
             ToolName::GitStatus => self.git(request, start, &["status", "--porcelain=v1", "--branch"], cancel),
             ToolName::GitDiff => self.git_diff(request, start, cancel),
+            ToolName::McpCall => self.mcp_call(request, start),
         }
     }
 
@@ -600,6 +614,44 @@ impl ToolRuntime {
         };
         let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel)?;
         self.finish_command(request, start, &cmd, execution)
+    }
+
+    /// MCP 도구 호출 — mcp.rs, state-machine 23절.
+    ///
+    /// **여기까지 온 요청은 이미 Policy Gate와 사용자 승인을 지났다**(게이트가 `mcp_call`을
+    /// 언제나 `RequireUserApproval`로 분류한다). 그래서 여기서 다시 판정하지 않는다 —
+    /// 두 곳에서 판정하면 언젠가 둘이 갈라지고, 갈라진 쪽이 느슨하면 그게 우회 경로가 된다.
+    fn mcp_call(&self, request: &ToolRequest, start: Instant) -> Result<ToolOutcome, String> {
+        let call = crate::mcp::parse_call(&request.args)?;
+        let Some(pool) = self.mcp.as_ref() else {
+            // **"서버가 없다"와 "호출이 실패했다"를 뭉개지 않는다.** 전자는 설정 문제이고
+            // 사용자가 할 일이 다르다.
+            return Err(
+                "MCP 서버가 등록되어 있지 않습니다 — 등록은 사용자만 할 수 있습니다(모델이 서버를 추가하는 경로는 없습니다)"
+                    .to_string(),
+            );
+        };
+        match pool.call(&call) {
+            Ok(value) => Ok(ToolOutcome {
+                result: ToolResult {
+                    request_id: request.request_id.clone(),
+                    status: ToolStatus::Ok,
+                    // 서버가 돌려준 것을 **그대로** 싣는다. 요약하면 감사 기록이 실제로
+                    // 무엇이 오갔는지에 답하지 못한다.
+                    output: Some(serde_json::json!({ "server": call.server, "tool": call.tool, "result": value })),
+                    error: None,
+                    duration_ms: elapsed_ms(start),
+                    completed_at: now_iso(),
+                },
+                mutation: None,
+                output_ref: None,
+                diff: None,
+            }),
+            // **`status`는 "우리가 호출할 수 있었는가"를 말한다.** 서버가 돌려준 결과 안의
+            // `isError`는 도구 자신의 판정이므로 그대로 실어 보내고 여기서 뒤집지 않는다 —
+            // `run_command`가 0이 아닌 종료 코드를 `Ok`로 두는 것과 같은 구별이다.
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     fn git_diff(

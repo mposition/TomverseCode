@@ -24,6 +24,12 @@ pub enum ToolName {
     GitStatus,
     GitDiff,
     RunTests,
+    /// MCP 서버의 도구 하나를 부른다 (product-strategy 8.2절, mcp.rs).
+    ///
+    /// **닫힌 집합에 한 칸만 낸다.** MCP 도구는 서버마다 동적으로 달라지지만, 그것을
+    /// `ToolName`으로 열면 Policy Gate의 exhaustive match가 무너지고 "분류되지 않은 도구"가
+    /// 생긴다. 대신 문 하나를 두고 그 문의 위험도를 우리가 안다: **모른다, 그러므로 승인이다.**
+    McpCall,
 }
 
 impl ToolName {
@@ -39,6 +45,7 @@ impl ToolName {
             ToolName::GitStatus => "git_status",
             ToolName::GitDiff => "git_diff",
             ToolName::RunTests => "run_tests",
+            ToolName::McpCall => "mcp_call",
         }
     }
 
