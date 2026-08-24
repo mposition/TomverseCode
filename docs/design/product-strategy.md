@@ -55,7 +55,7 @@ status: accepted (2026-07-25) — 단, 2절의 **가설 게이트**를 통과하
 | §5 위험도 기반 적응형 검증 | **구현 완료(2단계)** — `TRIAGE` + `complexityTier`, 판정 신호에 경로 기반 위험 축 추가(13.4.1절). **4단계 확장은 보류**이며 이유는 로드맵이 아니라 측정에 있다(13.4.2절) — 지금 축이 두 라벨을 가르지 못하므로 넷으로 늘리면 이름만 넷이 된다. <!-- present: packages/sidecar/src/triage.ts --> |
 | §6 실제 성과 학습 라우터 | **부분** — 무엇이 표본인지를 정하고(multi-engine 8.1절) **집계까지 만들었다**(`tomverse-host metrics`의 `modelEvaluation`). 라우터를 그 값으로 바꾸는 일은 아직 하지 않았다 — `verdict`가 `separated`인 쌍이 실제로 생겼을 때가 그 시점이다. <!-- present: apps/desktop/src-tauri/core/src/metrics.rs, packages/sidecar/src/routing --> |
 | §7 검수 독립성 | **구현 완료** — 공급자 독립성은 불변식으로 강제(multi-engine 5절), narrative 독립성은 `blind` 모드로 구현했다. **기본값은 `informed`다** — 4.1절 실측이 blind의 이득을 지지하지 않았고, 그 철회 자체가 결과다. <!-- present: packages/sidecar/src/providers/prompts.ts --> |
-| §9 데이터 전송 투명성 | **구현 완료** — 하드 제외(context-engine 7절)에 더해 **화면과 CLI 양쪽에 표시가 있다**(`TransmissionPanel`, `tomverse-host transmission`, 감사 export). <!-- present: apps/desktop/src/components/TransmissionPanel.tsx, apps/desktop/src/components/AuditExportPanel.tsx --> |
+| §9 데이터 전송 투명성 | **구현 완료** — 하드 제외(context-engine 7절)에 더해 **화면과 CLI 양쪽에 표시가 있다**(`TransmissionPanel`, `tomverse-host transmission`, 감사 export). 이 집계가 서 있던 전제("모든 프롬프트 빌더가 같은 스냅샷을 싣는다")는 Rust 주석의 주장일 뿐이었고 이제 검사가 지킨다(7.1절). <!-- present: apps/desktop/src/components/TransmissionPanel.tsx, apps/desktop/src/components/AuditExportPanel.tsx, packages/sidecar/test/transmissionClaim.test.ts --> |
 | §10 재현 가능한 Agent Trace | **구현 완료** — 기록(`task_events` append-only + export)에 더해 **러너가 있다**: `tomverse-host reproduce`가 DB 없이 검사하고 `--apply`가 각 단계를 Policy Gate에 그대로 태운다(state-machine 21절). <!-- present: apps/desktop/src-tauri/core/src/reproduce.rs --> |
 | §2 모델 불일치 화면 | **구현 완료** — 3.9절 불일치 판정 카드. 표가 아니라 **강제 선택 카드**가 된 이유는 16절에 있다. <!-- present: apps/desktop/src/components/DisagreementCard.tsx --> |
 | §3 Candidate Arena | **미착수** — worktree 격리 자체가 없다. <!-- absent: apps/desktop/src-tauri/core/src/arena.rs --> |
@@ -146,6 +146,7 @@ type ReviewMode = "informed" | "blind";
 - **기본값은 `informed`를 유지한다.** blind는 구현해두되 옵션으로 두고 계속 측정한다.
 - 다만 이 결론도 약하다: **n=3, 전부 합성 초안, 전부 의도적으로 고장난 코드**다. 실제 초안은 대체로 옳으므로 anchoring 위험의 양상이 다를 수 있다.
 - **여전히 유효한 것:** 공급자 독립성 불변식(multi-engine 5절)은 이 결과와 무관하게 유지된다. blind가 다룬 건 *서사* 독립성이고, 그건 실측 결과 이득이 확인되지 않았을 뿐이다.
+- **철회를 코드에도 적었다.** `prompts.ts`의 blind 분기 주석이 "M0에서는 기본 비활성이며 이 분기는 **M1이 켤 자리**다"로 남아 있었다 — 4.2절이 뒤집기 전의 계획이다. 그 주석만 읽은 사람은 M1에서 기본값을 뒤집는 것이 예정된 작업이라고 읽고, **측정으로 내린 결정을 되돌리게 된다.** 결론을 문서에만 적고 코드에 남은 예고를 지우지 않으면, 다음 사람이 만나는 것은 문서가 아니라 그 주석이다.
 - 14절의 `blind vs informed 판정 불일치율` 지표는 그대로 둔다. 실제 태스크에서 다시 재야 한다.
 
 **이 절 자체가 제품 명제의 자기적용 사례다.** 나는 blind review를 "명백한 개선"이라고 제안했고, 결정론적 테스트 결과가 그걸 반박했다. 모델의 의견(내 것 포함)이 아니라 테스트가 판정했다 — 우리가 만들려는 제품이 하려는 일이 정확히 이것이다.
@@ -365,6 +366,24 @@ excluded from context"). 모델이 그 파일이 없다고 보고 내용을 추�
 
 **말하지 않는 것**: 공급자가 전송받은 것을 어떻게 보관하거나 학습에 쓰는지. 우리 계측의 범위
 밖이고, 화면이 그 부분을 흐리게 말하면 이 기능의 신뢰가 통째로 없어진다.
+
+#### 7.1.1 이 집계는 검사되지 않는 전제 위에 서 있었다
+
+`transmission.rs`가 "이 파일들이 이 공급자들 **각각에게** 갔다"고 말할 수 있는 근거는 하나다:
+**모든 프롬프트 빌더가 같은 스냅샷을 싣는다.** 그 사실은 모듈 주석에 적혀 있었는데, 그건
+**TypeScript 코드에 대한 주장을 Rust 주석에 적어둔 것**이었고 아무도 대조하지 않았다.
+
+빌더가 하나 늘거나 하나가 `renderSnapshot`을 멈추면 이 화면은 **가지 않은 파일을 갔다고**
+말하거나 실제로 간 파일을 빠뜨린다. 전송 투명성은 게이트 G가 실패해도 살아남는 차별화 넷 중
+하나인데(13절), 그 정확성이 사람의 기억에 달려 있었다.
+
+`packages/sidecar/test/transmissionClaim.test.ts`가 대조한다. **판정 기준을 손으로 적지 않는
+것이 핵심이다** — "네 빌더"를 테스트에 다시 적으면 같은 문제가 한 겹 밑으로 옮겨갈 뿐이고,
+다섯 번째가 생겨도 목록이 안 늘면 검사는 조용히 통과한다. 그래서 소스에서 `build*Prompt`를
+찾아 각각이 `renderSnapshot`을 쓰는지 본다. 빌더를 하나도 못 찾으면 그것도 실패다 — 빈 집합에
+대한 전칭 명제는 언제나 참이기 때문이다.
+
+같은 이유로 Rust 주석에서 **개수를 뺐다**. 숫자를 적으면 늘었을 때 주석이 낡는다.
 
 ## 8. 기능 범위: Copilot 기능 전체 커버를 제품 명제로 삼는다
 

@@ -170,7 +170,12 @@ export function buildReviewPrompt(input: {
 
   if (input.blind) {
     // product-strategy.md 4절 Blind Review — 초안 작성자의 자기설명을 숨겨 anchoring을 줄인다.
-    // M0에서는 기본 비활성이며 이 분기는 M1이 켤 자리다.
+    //
+    // **기본값이 되지 않는다.** 한때 여기 "M1이 켤 자리"라고 적혀 있었는데, 4.1절 실측이
+    // 그 계획을 뒤집었다: anchoring은 관측되지 않았고(informed 검수가 확신에 찬 거짓 주장을
+    // 명시적으로 반박했다) 정보를 숨긴 대가는 실재했다(blind 0/3, informed 2/3). 4.2절이
+    // "blind를 기본값으로"를 **철회**했으므로, 이 주석을 읽고 기본값을 뒤집으면 측정으로 내린
+    // 결정을 되돌리는 것이 된다. 실험 플래그로 남겨 계속 잰다.
     parts.push(
       "## Proposed patch (author's own explanation withheld deliberately)\n```diff\n" + (input.draft.patch ?? "(no patch)") + "\n```"
     );
