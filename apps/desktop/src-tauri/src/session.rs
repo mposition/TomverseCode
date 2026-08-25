@@ -820,7 +820,7 @@ impl SessionState {
             allowed_tools: skill.as_ref().and_then(|s| s.allowed_tools.clone()),
             ..TaskPolicy::default()
         };
-        host.begin_task(&task_id, task_policy)?;
+        host.begin_task(&task_id, task_policy, skill.as_ref())?;
 
         // 스킬의 모델 지정은 화면이 명시한 지정에 **진다** — 우선순위를 한 곳에서 정한다(26.1절).
         let model_pins = merge_model_pins(skill.as_ref().and_then(|s| s.model_pins.as_ref()), model_pins);

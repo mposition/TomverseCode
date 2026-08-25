@@ -383,6 +383,24 @@ impl McpPool {
         self.servers.iter().map(|s| s.name.clone()).collect()
     }
 
+    /// 등록 요약 — 이름과 **좁혀진 도구** (state-machine 37절).
+    ///
+    /// 도구 목록을 함께 내는 이유: "서버 3개 등록됨"만 보면 사용자는 그 서버들이 무엇이든
+    /// 부를 수 있다고 읽는다. 좁혔다는 사실은 좁힌 사람에게도 잊힌다.
+    pub fn summary(&self) -> Vec<Value> {
+        self.servers
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "program": s.program,
+                    "args": s.args,
+                    "tools": s.tools,
+                })
+            })
+            .collect()
+    }
+
     /// 도구 하나를 부른다. 서버가 아직 안 떠 있으면 띄우고 핸드셰이크한다.
     pub fn call(&self, call: &McpCall) -> Result<Value, McpError> {
         let config = self

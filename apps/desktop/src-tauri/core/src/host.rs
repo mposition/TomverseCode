@@ -393,18 +393,75 @@ impl TaskHost {
     ///
     /// 두 번째 등록은 오류다. 갈아끼울 수 있게 두면 진행 중인 태스크의 게이트가 도중에
     /// 바뀔 수 있고, 그러면 승인 화면이 보여준 근거와 실행 시점의 근거가 달라진다.
-    pub fn begin_task(&self, task_id: &str, policy: TaskPolicy) -> Result<(), String> {
+    pub fn begin_task(
+        &self,
+        task_id: &str,
+        policy: TaskPolicy,
+        skill: Option<&crate::skills::Skill>,
+    ) -> Result<(), String> {
         let mut profiles = self.profiles.lock().unwrap();
         if profiles.contains_key(task_id) {
             return Err(format!(
                 "이 태스크의 정책이 이미 정해졌습니다: {task_id} — 진행 중에 정책을 바꿀 수 없습니다"
             ));
         }
-        profiles.insert(
-            task_id.to_string(),
-            Arc::new(TaskProfile::with_mcp(&self.root, policy, self.mcp.clone())),
-        );
+        let profile = Arc::new(TaskProfile::with_mcp(&self.root, policy, self.mcp.clone()));
+        let summary = self.effective_config(&profile, skill);
+        profiles.insert(task_id.to_string(), profile);
+        // **잠금을 놓고 나서 기록한다.** `append_event`는 훅을 부를 수 있고(PHASE_CHANGED),
+        // 훅 경로가 다시 프로필을 읽으면 같은 잠금에서 교착된다.
+        drop(profiles);
+        let _ = self.append_event(task_id, "TASK_CONFIG_PINNED", summary);
         Ok(())
+    }
+
+    /// 이 태스크가 **무엇을 가지고 도는가** (state-machine 37절).
+    ///
+    /// # 요청한 것과 적용된 것은 다른 사실이다
+    ///
+    /// 화면의 입력칸은 사용자가 **무엇을 요청했는가**이고, 여기 담기는 것은 **무엇이 고정
+    /// 됐는가**다. 둘은 갈릴 수 있다 — 스킬이 도구를 좁히고, 등록은 워크스페이스를 열 때 붙고,
+    /// 검증 명령 집합은 태스크 시작 시점의 매니페스트에서 유도된다(24.5절).
+    ///
+    /// 그래서 화면이 자기 폼 상태로 이 답을 만들면 **틀린 답을 자신 있게 말한다.**
+    ///
+    /// # 시작 시점의 사실이다
+    ///
+    /// 이후의 변화(사전 승인 철회 같은 것)는 각자의 이벤트로 남는다. 이 하나로 "지금 상태"를
+    /// 말하려 하면 그 뒤의 이벤트를 무시하게 된다.
+    fn effective_config(&self, profile: &TaskProfile, skill: Option<&crate::skills::Skill>) -> Value {
+        let policy = &profile.policy;
+        json!({
+            "executionMode": match policy.execution_mode {
+                crate::types::ExecutionMode::Fast => "fast",
+                crate::types::ExecutionMode::Verified => "verified",
+            },
+            "unattended": policy.unattended,
+            "autoApproveWorkspaceWrites": policy.auto_approve_workspace_writes,
+            "autoApproveVerification": policy.auto_approve_verification,
+            "allowGitCommit": policy.allow_git_commit,
+            // 스킬이 좁힌 결과. **이름과 목록을 함께 낸다** — 이름만 보면 무엇이 좁혀졌는지
+            // 모르고, 목록만 보면 왜 좁혀졌는지 모른다.
+            "skill": skill.map(|s| json!({ "name": s.name, "summary": s.describe() })),
+            "allowedTools": policy
+                .allowed_tools
+                .as_ref()
+                .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
+            // 24.5절의 고정을 **눈에 보이게** 한다. 이 집합이 비어 있으면 자동 승인 스위치를
+            // 켜도 아무것도 자동 승인되지 않는다 — 그건 설정이 아니라 프로젝트의 사실이다.
+            "verificationPin": profile
+                .verification_pin
+                .iter()
+                .map(|(program, args)| json!({ "program": program, "args": args }))
+                .collect::<Vec<_>>(),
+            "hooks": self
+                .hooks
+                .all()
+                .iter()
+                .map(|h| json!({ "phase": h.phase, "command": h.describe() }))
+                .collect::<Vec<_>>(),
+            "mcpServers": self.mcp.as_ref().map(|p| p.summary()).unwrap_or_default(),
+        })
     }
 
     /// 태스크 취소 요청. **idempotent**하며, 터미널 상태를 바꾸지 않는다.
@@ -2345,6 +2402,106 @@ mod tests {
         assert_eq!(task.terminal_status.as_deref(), Some("COMPLETED"));
     }
 
+    // ---- 적용된 설정 (37절) ----
+
+    fn pinned_config(host: &TaskHost, task_id: &str) -> Value {
+        host.with_store(|s| s.events_after(task_id, None))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "TASK_CONFIG_PINNED")
+            .expect("TASK_CONFIG_PINNED가 없습니다")
+            .payload
+    }
+
+    /// **태스크가 무엇을 가지고 도는지가 기록된다.** 기록하지 않으면 끝난 태스크에 대해
+    /// 그 질문에 답할 수 없고, 화면은 자기 폼 상태로 답을 지어내게 된다.
+    #[test]
+    fn beginning_a_task_records_what_is_in_force() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink.clone());
+        host.begin_task(
+            "task-1",
+            TaskPolicy {
+                unattended: true,
+                auto_approve_verification: true,
+                allowed_tools: Some(vec![ToolName::ReadFile, ToolName::RunTests]),
+                ..TaskPolicy::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let config = pinned_config(&host, "task-1");
+        assert_eq!(config.get("unattended").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            config.get("autoApproveVerification").and_then(Value::as_bool),
+            Some(true)
+        );
+        let tools = config.get("allowedTools").and_then(Value::as_array).expect("허용목록이 없습니다");
+        assert_eq!(tools.len(), 2, "{tools:?}");
+        // 화면도 받는다 — DB에만 남고 화면에 안 보이는 기록을 만들지 않는다.
+        assert!(
+            sink.seen.lock().unwrap().contains(&"TASK_CONFIG_PINNED".to_string()),
+            "sink에 없습니다"
+        );
+    }
+
+    /// **좁히지 않은 것과 좁힌 것을 구별한다.** 허용목록이 없으면 `null`이고 빈 배열이
+    /// 아니다 — 빈 배열은 "아무 도구도 못 쓴다"로 읽힌다.
+    #[test]
+    fn an_unnarrowed_task_records_no_allowlist_rather_than_an_empty_one() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+
+        let config = pinned_config(&host, "task-1");
+        assert!(config.get("allowedTools").is_some_and(Value::is_null), "{config}");
+        assert!(config.get("skill").is_some_and(Value::is_null), "{config}");
+    }
+
+    /// **24.5절의 고정을 눈에 보이게 한다.** 이 집합이 비어 있으면 자동 승인 스위치를 켜도
+    /// 아무것도 자동 승인되지 않는데, 그건 설정이 아니라 프로젝트의 사실이다.
+    #[test]
+    fn the_pinned_verification_commands_are_recorded() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        fs::write(
+            ws.path().join("package.json"),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+
+        let config = pinned_config(&host, "task-1");
+        let pin = config
+            .get("verificationPin")
+            .and_then(Value::as_array)
+            .expect("검증 고정 집합이 없습니다");
+        assert!(!pin.is_empty(), "매니페스트에 test가 있는데 고정 집합이 비었습니다: {config}");
+        assert!(
+            pin.iter().any(|c| c.get("program").and_then(Value::as_str) == Some("npm")),
+            "{pin:?}"
+        );
+    }
+
+    /// 등록된 훅이 요약에 들어간다 — "무엇을 가지고 도는가"에는 등록도 포함된다.
+    #[test]
+    fn registered_hooks_appear_in_the_pinned_config() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        let host = host.with_hooks(crate::hooks::HookRegistry::new(vec![crate::hooks::HookConfig {
+            phase: "COMPLETED".to_string(),
+            program: "npm".to_string(),
+            args: vec!["run".to_string(), "fmt".to_string()],
+        }]));
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+
+        let config = pinned_config(&host, "task-1");
+        let hooks = config.get("hooks").and_then(Value::as_array).expect("훅이 없습니다");
+        assert_eq!(hooks.len(), 1, "{hooks:?}");
+        assert_eq!(hooks[0].get("phase").and_then(Value::as_str), Some("COMPLETED"));
+    }
+
     // ---- 판정의 철회 (30절) ----
 
     fn decided(host: &TaskHost, task_id: &str, criterion_id: &str, text: &str) {
@@ -2730,8 +2887,8 @@ mod tests {
     #[test]
     fn a_tasks_policy_cannot_be_changed_once_it_started() {
         let (_ws, _a, host) = host(TaskPolicy::default(), Arc::new(AlwaysDeny));
-        host.begin_task("task-1", TaskPolicy::default()).unwrap();
-        let err = host.begin_task("task-1", TaskPolicy::default()).unwrap_err();
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+        let err = host.begin_task("task-1", TaskPolicy::default(), None).unwrap_err();
         assert!(err.contains("이미 정해졌습니다"), "{err}");
     }
 
@@ -2747,9 +2904,10 @@ mod tests {
                 allowed_tools: Some(vec![ToolName::ReadFile, ToolName::RunTests]),
                 ..TaskPolicy::default()
             },
+            None,
         )
         .unwrap();
-        host.begin_task("task-2", TaskPolicy::default()).unwrap();
+        host.begin_task("task-2", TaskPolicy::default(), None).unwrap();
 
         let narrowed = host.profile("task-1");
         let open = host.profile("task-2");
@@ -2797,7 +2955,7 @@ mod tests {
         assert!(host.default_profile.verification_pin.is_empty());
 
         fs::write(ws.path().join("package.json"), r#"{"scripts":{"test":"node -e 0"}}"#).unwrap();
-        host.begin_task("task-1", TaskPolicy::default()).unwrap();
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
 
         let profile = host.profile("task-1");
         assert!(
@@ -2832,6 +2990,7 @@ mod tests {
                 auto_approve_verification: true,
                 ..TaskPolicy::default()
             },
+            None,
         )
         .unwrap();
         let profile = host.profile("task-1");
@@ -2873,7 +3032,7 @@ mod tests {
             program: "npm".to_string(),
             args: vec!["run".to_string(), "fmt".to_string()],
         }]));
-        host.begin_task("task-1", TaskPolicy::default()).unwrap();
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
         let profile = host.profile("task-1");
         let request = req(
             ToolName::RunCommand,

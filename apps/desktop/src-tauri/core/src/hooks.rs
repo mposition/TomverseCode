@@ -126,6 +126,11 @@ impl HookRegistry {
         self.hooks.is_empty()
     }
 
+    /// 등록된 훅 전부 — **등록 순서 그대로** (state-machine 37절의 요약이 이걸 쓴다).
+    pub fn all(&self) -> &[HookConfig] {
+        &self.hooks
+    }
+
     /// 이 phase에 걸린 훅들 — **등록 순서 그대로**. 순서를 바꾸면 사용자가 적은 순서와
     /// 실행 순서가 달라지고, 훅끼리 의존이 있을 때(포맷 후 커밋) 조용히 틀린다.
     pub fn for_phase(&self, phase: &str) -> Vec<&HookConfig> {

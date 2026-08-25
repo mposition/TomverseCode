@@ -710,7 +710,7 @@ fn real_main() -> Result<i32, String> {
             // **이 태스크의 정책을 등록한다**(ui-wireframes 3.16.2절). 헤드리스 호스트는
             // 태스크가 하나뿐이라 워크스페이스 기본값과 같지만, **경로를 하나로 둔다** —
             // 두 경로면 언젠가 한쪽만 고쳐진다.
-            host.begin_task(&task_id, policy_for_task)?;
+            host.begin_task(&task_id, policy_for_task, skill.as_ref())?;
             let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id, skill.as_ref());
             // **띄운 서버를 반드시 내린다.** 남기면 사용자가 모르는 프로세스가 계속 돈다.
             // 태스크가 실패해도 내려야 하므로 `?` 앞에서 한다.

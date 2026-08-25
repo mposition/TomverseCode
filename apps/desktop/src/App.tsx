@@ -48,6 +48,7 @@ import { BlockedPanel } from "./components/BlockedPanel";
 import { WorkspaceSettingsPanel } from "./components/WorkspaceSettingsPanel";
 import { CarriedDecisionsPanel } from "./components/CarriedDecisionsPanel";
 import { SkillLibraryPicker } from "./components/SkillLibraryPicker";
+import { EffectiveConfigPanel } from "./components/EffectiveConfigPanel";
 import { PullRequestPanel } from "./components/PullRequestPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
@@ -1314,6 +1315,12 @@ export default function App() {
                 )}
               </div>
 
+              {/* 37절: **이 태스크가 무엇을 가지고 도는가.** "이번 태스크" 바로 아래에 둔다 —
+                  경과·비용은 얼마나 썼는가이고, 이건 무엇을 켠 채로 쓰고 있는가다. 그리고
+                  화면 입력칸이 아니라 Rust가 고정한 이벤트에서 읽으므로, 요청과 적용이
+                  갈렸을 때 갈린 쪽을 보여준다. */}
+              <EffectiveConfigPanel events={events} />
+
               {/* 3.9절 불일치 카드가 3.4절 확인 필요 카드를 **대체한다** — 같이 뜨면
                   사용자가 같은 질문에 두 번 답하게 된다. 두 상황이 다르므로 카드도 다르다. */}
               {questions && disagreements.length > 0 && (
@@ -1507,6 +1514,10 @@ export default function App() {
           </h2>
           <p className="muted small">{selectedTask.task.userMessage}</p>
           <AcceptanceCriteriaPanel criteria={selectedTask.criteria} evaluations={selectedTask.evaluations} />
+          {/* 지난 작업에도 같은 질문이 있다 — **그때 무엇을 가지고 돌았는가.** 그 답이 여기
+              없으면 사용자는 지금의 설정으로 지난 결과를 읽는다. 이 이벤트가 없던 시절의
+              기록에서는 패널이 스스로 사라진다(지어내지 않는다). */}
+          <EffectiveConfigPanel events={selectedTask.events} />
           {/* 실시간 로그와 다른 패널에 그린다 — 같은 목록에 섞으면 이벤트가 두 번 보인다. */}
           <EventLog events={selectedTask.events} devMode={devMode} />
         </section>
