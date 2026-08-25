@@ -263,6 +263,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "executor" }),
             created_at: Some(format!("2026-01-01T00:00:{id:0>2}Z")),
+            injected_env: Default::default(),
         };
         store
             .record_tool_request(&req, "plan-1", &decision(id, Decision::AutoApprove))

@@ -642,6 +642,7 @@ mod tests {
                 risk_tier: None,
                 requested_by: json!({ "role": "executor" }),
                 created_at: None,
+                injected_env: Default::default(),
             };
             let decision = gate.evaluate(&request, &root, &policy);
             assert_eq!(decision.decision, Decision::Deny, "{args} — {}", decision.reason);
@@ -663,6 +664,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "user" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let decision = gate.evaluate(&request, &root, &policy);
         assert!(decision.requires_user_approval, "{}", decision.matched_rule);
@@ -697,6 +699,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "executor" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let decision = gate.evaluate(&request, &root, &policy);
         assert_eq!(decision.decision, Decision::Deny, "{}", decision.reason);
@@ -723,6 +726,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "executor" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let d = gate.evaluate(&delete, &root, &policy);
         assert!(d.requires_user_approval, "{}", d.matched_rule);
@@ -736,6 +740,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "executor" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let d = gate.evaluate(&secret, &root, &policy);
         assert!(d.requires_user_approval, "{}", d.matched_rule);
@@ -766,6 +771,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "orchestrator" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let decision = gate.evaluate(&request, &root, &policy);
         assert_ne!(
@@ -788,6 +794,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "executor" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let decision = gate.evaluate(&request, &root, &policy);
         assert_ne!(decision.matched_rule, "tool_not_in_skill_allowlist");
@@ -890,6 +897,7 @@ mod tests {
                 risk_tier: None,
                 requested_by: json!({ "role": "orchestrator" }),
                 created_at: None,
+                injected_env: Default::default(),
             };
             let decision = gate.evaluate(&request, &root, &TaskPolicy::default());
             assert!(
@@ -915,6 +923,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "orchestrator" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let decision = gate.evaluate(&request, &root, &TaskPolicy::default());
         assert!(!decision.requires_user_approval);
@@ -1105,6 +1114,7 @@ mod tests {
             risk_tier: Some(crate::types::RiskTier::Auto),
             requested_by: json!({ "role": "orchestrator" }),
             created_at: None,
+            injected_env: Default::default(),
         }
     }
 

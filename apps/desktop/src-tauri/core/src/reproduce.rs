@@ -821,6 +821,7 @@ pub fn apply(export: &Value, opts: &ApplyOptions, acknowledged: Option<&str>) ->
                 // 재현으로 생긴 변경을 사람이 낸 것과 구별할 수 있어야 한다.
                 requested_by: serde_json::json!({ "role": "reproduce" }),
                 created_at: Some(crate::time::now_iso()),
+                injected_env: Default::default(),
             };
 
             let decision = gate.evaluate(&request, &opts.root, &opts.policy);

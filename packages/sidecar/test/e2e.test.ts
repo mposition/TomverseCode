@@ -826,7 +826,12 @@ test("phase 훅은 실행되고 기록되지만, 실패해도 태스크의 판�
     // 훅을 `npm run <스크립트>`로 거는 것은 우연이 아니라 **이 기능이 지나는 유일한 길**이다:
     // allowlist에 없는 프로그램은 게이트가 기본 거부한다(25.5절). `node hook.js`로 걸었을 때
     // 등록이 거절되는 것은 아래 테스트가 확인한다.
-    repo.write("hook-ok.js", "require('fs').writeFileSync('hook-ran.txt', 'yes');\n");
+    // 훅이 **문맥을 받았는지**도 같은 부작용으로 본다(33절). 환경변수는 프로세스 안에서만
+    // 보이므로, 훅이 스스로 적어내지 않으면 확인할 방법이 없다.
+    repo.write(
+      "hook-ok.js",
+      "require('fs').writeFileSync('hook-ran.txt', `${process.env.TOMVERSE_TASK_ID}|${process.env.TOMVERSE_PHASE}|${process.env.TOMVERSE_HOOK}`);\n"
+    );
     repo.write("hook-bad.js", "process.exit(3);\n");
     const manifest = JSON.parse(repo.read("package.json")) as { scripts: Record<string, string> };
     manifest.scripts["hook:ok"] = "node hook-ok.js";
@@ -850,11 +855,27 @@ test("phase 훅은 실행되고 기록되지만, 실패해도 태스크의 판�
       `실패한 훅 뒤의 훅이 실행되지 않았습니다\n${run.stderr}`
     );
 
-    // ③ 둘 다 기록됐다.
+    // ③ **훅이 자기가 어느 태스크의 어느 phase인지 안다**(33절). 이게 없으면 훅은
+    //    "무언가 일어났다"밖에 모르고, 알림 훅조차 쓸 수 없다.
+    assert.equal(repo.read("hook-ran.txt"), `${run.taskId}|VERIFYING|1`, run.stderr);
+
+    // ④ 둘 다 기록됐다.
     const hookEvents = run.eventTypes.filter((t) => t === "HOOK_EXECUTED");
     assert.equal(hookEvents.length, 2, run.eventTypes.join(", "));
 
-    // ④ 승인은 **등록이** 했다. 사람이 답한 것으로 기록되면 감사 로그가 거짓말한다.
+    // ⑤ **무엇이 넘어갔는지가 감사 기록에 있다**(25.7절이 요구한 투명성). 넘긴 것을
+    //    기록하지 않으면 "훅에 무엇을 줬나"에 답할 수 없다.
+    const detail = hostQuery(stateDir, ["show", "--workspace", repo.root, "--task", run.taskId]) as {
+      events: { type: string; payload: Record<string, unknown> }[];
+    };
+    const executed = detail.events.find((e) => e.type === "HOOK_EXECUTED")!;
+    assert.deepEqual(executed.payload.env, {
+      TOMVERSE_TASK_ID: run.taskId,
+      TOMVERSE_PHASE: "VERIFYING",
+      TOMVERSE_HOOK: "1",
+    }, JSON.stringify(executed.payload));
+
+    // ⑥ 승인은 **등록이** 했다. 사람이 답한 것으로 기록되면 감사 로그가 거짓말한다.
     assert.ok(run.eventTypes.includes("APPROVAL_REGISTERED_HOOK"), run.eventTypes.join(", "));
   });
 });

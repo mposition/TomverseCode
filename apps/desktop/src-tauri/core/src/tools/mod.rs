@@ -633,7 +633,9 @@ impl ToolRuntime {
             .map(Duration::from_millis)
             .unwrap_or(self.default_timeout);
 
-        let execution = run_process(&cmd, cwd.absolute(), timeout, cancel)?;
+        // **추가 환경변수는 요청 구조체에서만 온다** — Node의 JSON에서는 읽지 않는다
+        // (`ToolRequest::injected_env`의 `skip_deserializing`). 지금 채우는 곳은 phase 훅뿐이다.
+        let execution = run_process(&cmd, cwd.absolute(), timeout, cancel, &request.injected_env)?;
         self.finish_command(request, start, &cmd, execution)
     }
 
@@ -650,7 +652,7 @@ impl ToolRuntime {
             cwd: ".".to_string(),
             timeout_ms: None,
         };
-        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel)?;
+        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default())?;
         self.finish_command(request, start, &cmd, execution)
     }
 
@@ -666,7 +668,7 @@ impl ToolRuntime {
     ) -> Result<ToolOutcome, String> {
         let target = crate::pr::parse_push(&request.args).map_err(|e| e.to_string())?;
         let cmd = target.command();
-        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel)?;
+        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default())?;
         self.finish_command(request, start, &cmd, execution)
     }
 
@@ -734,7 +736,7 @@ impl ToolRuntime {
             cwd: ".".to_string(),
             timeout_ms: None,
         };
-        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel)?;
+        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default())?;
         self.finish_command(request, start, &cmd, execution)
     }
 
@@ -920,6 +922,7 @@ impl ToolRuntime {
                 risk_tier: None,
                 requested_by: json!({ "role": "orchestrator" }),
                 created_at: Some(now_iso()),
+                injected_env: Default::default(),
             });
         }
         requests
@@ -987,6 +990,7 @@ fn run_process(
     cwd: &Path,
     timeout: Duration,
     cancel: &CancellationToken,
+    extra_env: &std::collections::BTreeMap<String, String>,
 ) -> Result<Execution, String> {
     let start = Instant::now();
 
@@ -1033,6 +1037,11 @@ fn run_process(
         .env_remove("NODE_TEST_CONTEXT")
         .env_remove("NODE_OPTIONS")
         .env_remove("NODE_V8_COVERAGE");
+    // **제거 다음에 넣는다.** 순서가 반대면 위 제거 목록이 우리가 넣은 값을 지울 수 있고,
+    // 그러면 "넘겼다고 기록했는데 도착하지 않은" 상태가 된다 — 감사 기록이 거짓이 되는 방향이다.
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     // 취소 시 손자 프로세스까지 죽이려면 spawn 전에 그룹을 설정해야 한다 (proctree.rs).
     proctree::configure_group(&mut command);
     let mut child = command.spawn().map_err(|e| {
@@ -1264,6 +1273,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "orchestrator" }),
             created_at: Some(now_iso()),
+            injected_env: Default::default(),
         }
     }
 
@@ -1300,6 +1310,76 @@ mod tests {
             let approval = if approved { ApprovalState::Granted } else { ApprovalState::DeniedByUser };
             self.runtime.execute(request, &decision, approval, cancel)
         }
+    }
+
+    /// **주입한 환경변수가 실제로 자식 프로세스에 도착한다** (state-machine 33절).
+    ///
+    /// 기록만 남기고 도착하지 않으면 감사 기록이 거짓이 된다 — "넘겼다"고 적혀 있는데
+    /// 훅은 못 받은 상태다.
+    #[test]
+    fn injected_env_reaches_the_child_process() {
+        let h = harness();
+        let mut request = req(
+            ToolName::RunCommand,
+            json!({
+                "program": "node",
+                "args": ["-e", "process.stdout.write(process.env.TOMVERSE_TASK_ID ?? '(none)')"],
+                "cwd": ".",
+            }),
+        );
+        request.injected_env = crate::hooks::hook_env("task-42", "COMPLETED");
+
+        let out = h.run(&request);
+        let stdout = out
+            .result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("stdout"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(stdout, "task-42", "{stdout}");
+    }
+
+    /// 주입하지 않으면 그 변수는 **없다.** 있으면 부모 환경이 새는 것이고, 그때 훅은
+    /// 바깥 실행의 태스크를 이번 태스크로 착각한다.
+    #[test]
+    fn a_command_without_injection_does_not_see_the_variable() {
+        let h = harness();
+        let request = req(
+            ToolName::RunCommand,
+            json!({
+                "program": "node",
+                "args": ["-e", "process.stdout.write(process.env.TOMVERSE_TASK_ID ?? '(none)')"],
+                "cwd": ".",
+            }),
+        );
+        let out = h.run(&request);
+        let stdout = out
+            .result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("stdout"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(stdout, "(none)", "{stdout}");
+    }
+
+    /// **Node는 이 필드를 채울 수 없다** (33절). 채울 수 있으면 장악당한 sidecar가 임의
+    /// 명령에 임의 환경변수를 넣어, argv를 고정해 얻은 보장을 옆문으로 무효화한다.
+    #[test]
+    fn the_sidecar_cannot_set_injected_env_through_json() {
+        let raw = json!({
+            "requestId": "r1",
+            "taskId": "t1",
+            "tool": "run_command",
+            "args": { "program": "node", "args": [], "cwd": "." },
+            "injectedEnv": { "PATH": "/evil", "TOMVERSE_TASK_ID": "spoofed" },
+        });
+        let parsed: ToolRequest = serde_json::from_value(raw).unwrap();
+        assert!(parsed.injected_env.is_empty(), "{:?}", parsed.injected_env);
+
+        // **이 검사가 공허하지 않다는 것**: 같은 JSON의 다른 필드는 실제로 읽힌다.
+        assert_eq!(parsed.task_id, "t1");
     }
 
     #[test]

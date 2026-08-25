@@ -2563,6 +2563,7 @@ mod tests {
             risk_tier: None,
             requested_by: serde_json::json!({ "role": "orchestrator" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let decision = PolicyDecision {
             request_id: "r1".into(),
@@ -2689,6 +2690,7 @@ mod tests {
             risk_tier: None,
             requested_by: serde_json::json!({ "role": "orchestrator" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let decision = PolicyDecision {
             request_id: "r1".into(),
@@ -2900,6 +2902,7 @@ mod tests {
                 risk_tier: None,
                 requested_by: serde_json::json!({ "role": "orchestrator" }),
                 created_at: None,
+                injected_env: Default::default(),
             };
             req.request_id = rid.to_string();
             let mut d = decision.clone();
@@ -2940,6 +2943,7 @@ mod tests {
             risk_tier: None,
             requested_by: serde_json::json!({ "role": "orchestrator" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let decision = PolicyDecision {
             request_id: "r1".into(),

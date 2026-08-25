@@ -338,6 +338,7 @@ impl TaskHost {
                 risk_tier: None,
                 requested_by: json!({ "role": "hook-preflight" }),
                 created_at: None,
+                injected_env: Default::default(),
             };
             // 훅 등록은 태스크에 속하지 않는다 — 워크스페이스 기본 정책으로 미리 태워 본다.
             let profile = &self.default_profile;
@@ -630,6 +631,9 @@ impl TaskHost {
         if self.in_hook.swap(true, Ordering::SeqCst) {
             return;
         }
+        // **문맥은 여기서 만든다**(33절). 등록된 argv는 손대지 않는다 — 그것이 승인의
+        // 근거이기 때문이다(25.3절). 넘기는 것은 식별자뿐이고 내용은 넘기지 않는다.
+        let env = crate::hooks::hook_env(task_id, phase);
         for hook in self.hooks.for_phase(phase) {
             let command = hook.command();
             let request = ToolRequest {
@@ -642,6 +646,7 @@ impl TaskHost {
                 // 아니다 — 승인 근거는 argv가 등록된 것과 같은지다(25.3절).
                 requested_by: json!({ "role": "hook", "phase": phase }),
                 created_at: Some(now_iso()),
+                injected_env: env.clone(),
             };
             let outcome = self.execute_tool(&request);
             // `ToolStatus::Ok`은 "명령이 성공했다"가 아니다(CLAUDE.md 함정 기록) — 종료 코드를
@@ -674,6 +679,9 @@ impl TaskHost {
                     // 실패했다는 것과 **그것이 판정을 바꾸지 않는다**는 것을 함께 남긴다.
                     // 나중에 이 기록을 읽는 사람이 "왜 실패했는데 완료인가"를 묻지 않도록.
                     "affectsVerdict": false,
+                    // **무엇이 훅으로 넘어갔는가**(33절). 값이 식별자뿐이라 그대로 남길 수
+                    // 있고, 남기지 않으면 25.7절이 요구한 투명성이 성립하지 않는다.
+                    "env": env,
                 }),
             );
         }
@@ -1200,6 +1208,7 @@ impl TaskHost {
             risk_tier: None,
             requested_by: json!({ "role": "user", "command": "pr" }),
             created_at: Some(now_iso()),
+            injected_env: Default::default(),
         };
         let outcome = self.execute_tool(&request)?;
         let status = outcome
@@ -1607,6 +1616,7 @@ impl TaskHost {
             // 실제 등급은 아래에서 `gate.evaluate`가 정한다.
             risk_tier: Some(RiskTier::Auto),
             created_at: Some(now_iso()),
+            injected_env: Default::default(),
         }
     }
 
@@ -2688,6 +2698,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "orchestrator" }),
             created_at: Some(now_iso()),
+            injected_env: Default::default(),
         }
     }
 
@@ -2750,6 +2761,7 @@ mod tests {
             risk_tier: None,
             requested_by: json!({ "role": "executor" }),
             created_at: None,
+            injected_env: Default::default(),
         };
         let d1 = narrowed
             .gate

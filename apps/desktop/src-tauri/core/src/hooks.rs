@@ -160,6 +160,36 @@ impl HookConfig {
     }
 }
 
+/// 훅 프로세스에 넘기는 **문맥** (state-machine 33절).
+///
+/// # 왜 인자가 아니라 환경변수인가
+///
+/// 등록된 argv는 승인의 근거다(25.3절) — 실행되는 것이 등록된 것과 같아야 한다. 여기에
+/// 인자를 덧붙이면 그 등식이 깨지고, 사용자가 등록한 명령과 실제로 도는 명령이 달라진다.
+///
+/// # 넘기는 것은 **식별자뿐이다**
+///
+/// 훅은 게이트 밖의 임의 프로그램이고(25.5절), 우리가 넘긴 것은 우리가 모르는 곳으로 갈 수
+/// 있다. 그래서 사용자 요청문·patch·기준·검증 출력은 넘기지 않는다 — 그것들은 **내용**이고,
+/// 내용을 넘기는 순간 훅 등록이 곧 그 태스크 내용에 대한 접근 허가가 된다.
+///
+/// 식별자만으로도 훅은 할 일을 안다: 어느 태스크인지, 어느 phase인지. **성패는 phase가
+/// 말한다** — `COMPLETED`/`FAILED`/`CANCELLED`가 종료 phase이기 때문이다.
+///
+/// # 부모 환경을 덮어쓴다
+///
+/// 같은 이름이 이미 있으면 우리 값이 이긴다. 훅 안에서 `TOMVERSE_TASK_ID`가 바깥 실행의
+/// 것인지 이번 실행의 것인지 모호하면, 중첩 실행에서 훅이 엉뚱한 태스크를 가리킨다.
+pub fn hook_env(task_id: &str, phase: &str) -> std::collections::BTreeMap<String, String> {
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("TOMVERSE_TASK_ID".to_string(), task_id.to_string());
+    env.insert("TOMVERSE_PHASE".to_string(), phase.to_string());
+    // 스크립트 하나를 훅과 수동 실행 양쪽에 쓸 수 있게 한다 — 없으면 사용자가 그 구별을
+    // 위해 스크립트를 둘로 나눠야 한다.
+    env.insert("TOMVERSE_HOOK".to_string(), "1".to_string());
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +258,28 @@ mod tests {
         assert!(!registry.matches_registered("node", &["fmt.js".to_string(), "--write".to_string()]));
         assert!(!registry.matches_registered("node", &[]));
         assert!(!registry.matches_registered("npm", &["fmt.js".to_string()]));
+    }
+
+    // ---- 훅 문맥 (33절) ----
+
+    /// **식별자만 넘긴다.** 훅은 게이트 밖의 임의 프로그램이고, 내용을 넘기는 순간 훅 등록이
+    /// 곧 그 태스크 내용에 대한 접근 허가가 된다.
+    #[test]
+    fn the_hook_context_carries_identifiers_only() {
+        let env = hook_env("task-1", "COMPLETED");
+        let keys: Vec<&str> = env.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["TOMVERSE_HOOK", "TOMVERSE_PHASE", "TOMVERSE_TASK_ID"], "{keys:?}");
+        assert_eq!(env["TOMVERSE_TASK_ID"], "task-1");
+        assert_eq!(env["TOMVERSE_PHASE"], "COMPLETED");
+    }
+
+    /// **성패는 phase가 말한다.** 별도의 성공/실패 변수를 두지 않는 근거가 이것이고,
+    /// 종료 phase가 그 값에 실제로 들어오는지 확인한다.
+    #[test]
+    fn the_terminal_outcome_is_readable_from_the_phase() {
+        for phase in ["COMPLETED", "FAILED", "CANCELLED"] {
+            assert!(HOOKABLE_PHASES.contains(&phase), "{phase}");
+            assert_eq!(hook_env("t", phase)["TOMVERSE_PHASE"], phase);
+        }
     }
 }

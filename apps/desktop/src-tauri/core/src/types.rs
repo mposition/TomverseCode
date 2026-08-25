@@ -94,6 +94,21 @@ pub struct ToolRequest {
     pub requested_by: serde_json::Value,
     #[serde(rename = "createdAt", default)]
     pub created_at: Option<String>,
+    /// 이 명령에 **추가로 넣을 환경변수** (state-machine 33절).
+    ///
+    /// # `skip_deserializing`이 이 필드의 보안 모델 전부다
+    ///
+    /// Node가 보내는 JSON에서 **읽지 않는다.** 읽으면 장악당한 sidecar가 임의 명령에 임의
+    /// 환경변수를 넣을 수 있고, 그건 argv를 고정해 얻은 보장(원칙 6)을 옆문으로 무효화한다 —
+    /// 승인 화면은 argv만 보여주는데 동작은 환경이 바꾼다.
+    ///
+    /// 그래서 이 값은 **Rust 코드가 구조체를 직접 만들 때만** 채워진다. 지금 채우는 곳은
+    /// phase 훅 하나뿐이다(`host.rs`의 `run_phase_hooks`).
+    ///
+    /// **직렬화는 한다.** 감사 기록이 "무엇이 넘어갔는가"에 답해야 하기 때문이다 —
+    /// 넘긴 것을 기록하지 않으면 25.7절이 요구한 투명성이 성립하지 않는다.
+    #[serde(rename = "injectedEnv", default, skip_deserializing)]
+    pub injected_env: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

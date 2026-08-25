@@ -259,6 +259,7 @@ impl<'a> VerificationRunner<'a> {
             risk_tier: None,
             requested_by: json!({ "role": "orchestrator" }),
             created_at: Some(now_iso()),
+            injected_env: Default::default(),
         };
 
         let result = executor.execute(&request);
