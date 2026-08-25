@@ -241,6 +241,12 @@ fn workspace_settings(state: tauri::State<'_, SessionState>) -> Result<Value, St
     state.workspace_settings()
 }
 
+/// 저장소가 제안한 등록 (state-machine 35절). **읽기만 한다** — 등록하지 않는다.
+#[tauri::command]
+fn workspace_proposal(state: tauri::State<'_, SessionState>) -> Result<Value, String> {
+    state.workspace_proposal()
+}
+
 /// 등록을 저장한다. **즉시 반영되지 않는다** — 이유는 `SessionState`에 적어두었다.
 #[tauri::command]
 fn set_workspace_settings(state: tauri::State<'_, SessionState>, settings: Value) -> Result<Value, String> {
@@ -461,6 +467,7 @@ pub fn run() {
             session_decisions,
             withdraw_decision,
             workspace_settings,
+            workspace_proposal,
             set_workspace_settings,
             open_pull_request,
             task_export,

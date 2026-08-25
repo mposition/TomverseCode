@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   buildSettings,
+  describeProposal,
   toDrafts,
   type HookDraft,
+  type ProposalView,
   type ServerDraft,
   type WorkspaceSettings,
 } from "../lib/settingsDraft";
@@ -33,6 +35,8 @@ export function WorkspaceSettingsPanel() {
   const [error, setError] = useState<string | null>(null);
   const [problems, setProblems] = useState<string[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [proposal, setProposal] = useState<ProposalView | null>(null);
+  const [proposalError, setProposalError] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<WorkspaceSettings>("workspace_settings")
@@ -43,7 +47,14 @@ export function WorkspaceSettingsPanel() {
         setLoaded(true);
       })
       .catch((e: unknown) => setError(String(e)));
+    // **제안은 따로 읽는다.** 제안을 읽지 못했다고 등록 편집까지 막으면, 저장소의 파일
+    // 하나가 이 화면 전체를 못 쓰게 만든다.
+    invoke<ProposalView>("workspace_proposal")
+      .then(setProposal)
+      .catch((e: unknown) => setProposalError(String(e)));
   }, []);
+
+  const notice = describeProposal(proposal);
 
   const save = (): void => {
     setNote(null);
@@ -73,6 +84,35 @@ export function WorkspaceSettingsPanel() {
 
       {!loaded && !error && <p className="muted small">읽는 중…</p>}
       {error && <p className="error small">{error}</p>}
+
+      {/* 저장소의 제안 (35절). **불러오기는 입력칸을 채울 뿐이다** — 등록은 아래 저장이 한다.
+          출처를 흐리지 않는다: 이 내용은 워크스페이스 안의 파일에서 왔고 모델이 쓸 수 있다. */}
+      {proposalError && <p className="error small">저장소의 제안을 읽지 못했습니다: {proposalError}</p>}
+      {notice.show && (
+        <div className="panel">
+          <p className="muted small">{notice.headline}</p>
+          {notice.offerLoad && (
+            <>
+              <p className="muted small">
+                이 내용은 <strong>저장소 안의 파일</strong>에서 왔습니다 — 워크스페이스 안의 파일은 모델이 고칠 수
+                있습니다. 불러오면 아래 입력칸이 채워지고, <strong>저장을 눌러야 등록됩니다.</strong>
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!proposal?.proposal) return;
+                  const drafts = toDrafts(proposal.proposal);
+                  setHooks(drafts.hooks);
+                  setServers(drafts.servers);
+                  setNote("제안을 입력칸에 불러왔습니다. 확인한 뒤 저장을 누르세요 — 아직 등록되지 않았습니다.");
+                }}
+              >
+                제안 불러오기
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
       <h3>phase 훅</h3>
       <p className="muted small">

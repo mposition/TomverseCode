@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildSettings, parseArgs, toDrafts, type WorkspaceSettings } from "../src/lib/settingsDraft.js";
+import {
+  buildSettings,
+  describeProposal,
+  parseArgs,
+  toDrafts,
+  type WorkspaceSettings,
+} from "../src/lib/settingsDraft.js";
 
 test("여러 줄 인자가 argv가 된다", () => {
   assert.deepEqual(parseArgs("run\nfmt"), ["run", "fmt"]);
@@ -97,4 +103,53 @@ test("도구 칸이 비면 허용목록을 보내지 않는다", () => {
 test("도구를 적으면 목록으로 간다", () => {
   const result = buildSettings([], [{ name: "s", program: "node", argsText: "x.js", toolsText: "read\nwrite" }]);
   assert.deepEqual(result.settings?.servers[0]?.tools, ["read", "write"]);
+});
+
+// ---- 저장소의 제안 (state-machine 35절) ----
+
+const PROPOSAL: WorkspaceSettings = {
+  hooks: [{ phase: "COMPLETED", program: "npm", args: ["run", "fmt"] }],
+  servers: [{ name: "notes", program: "node", args: ["s.js"] }],
+};
+
+/** 제안이 없으면 아무것도 그리지 않는다 — 대부분의 저장소에는 이 파일이 없다. */
+test("제안이 없으면 영역 자체를 그리지 않는다", () => {
+  assert.equal(describeProposal(null).show, false);
+  assert.equal(
+    describeProposal({ path: ".tomverse/proposal.json", status: "absent", proposal: null }).show,
+    false
+  );
+});
+
+/**
+ * **"등록되었습니다"라고 쓰지 않는다.** 저장소는 아무것도 등록하지 않았다 — 불러오기는
+ * 입력칸을 채울 뿐이고 등록은 사용자가 저장을 누를 때 일어난다.
+ */
+test("제안 문장이 아직 등록되지 않았다고 말한다", () => {
+  const notice = describeProposal({ path: ".tomverse/proposal.json", status: "differs", proposal: PROPOSAL });
+  assert.equal(notice.show, true);
+  assert.equal(notice.offerLoad, true);
+  assert.ok(notice.headline.includes("아직 등록되지 않았습니다"), notice.headline);
+  assert.ok(!notice.headline.includes("등록되었습니다"), notice.headline);
+  // **두 수를 따로 낸다** — 합치면 무엇이 들어오는지 알 수 없다.
+  assert.equal(notice.hookCount, 1);
+  assert.equal(notice.serverCount, 1);
+});
+
+/** 이미 등록과 같으면 불러올 것이 없다 — 버튼을 그리면 누를 이유 없는 버튼이 된다. */
+test("제안이 등록과 같으면 불러오기를 권하지 않는다", () => {
+  const notice = describeProposal({
+    path: ".tomverse/proposal.json",
+    status: "same_as_registered",
+    proposal: PROPOSAL,
+  });
+  assert.equal(notice.show, true);
+  assert.equal(notice.offerLoad, false);
+  assert.ok(notice.headline.includes("같습니다"), notice.headline);
+});
+
+/** 경로는 **호스트가 준 값**을 그대로 쓴다 — 화면이 지어내면 사용자를 없는 파일로 보낸다. */
+test("문장이 호스트가 준 경로를 그대로 쓴다", () => {
+  const notice = describeProposal({ path: "어디/다른/곳.json", status: "differs", proposal: PROPOSAL });
+  assert.ok(notice.headline.includes("어디/다른/곳.json"), notice.headline);
 });

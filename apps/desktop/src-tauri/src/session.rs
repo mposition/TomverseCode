@@ -290,6 +290,28 @@ impl SessionState {
         serde_json::to_value(settings).map_err(|e| format!("직렬화: {e}"))
     }
 
+    /// **저장소가 제안한** 훅·MCP 등록 (state-machine 35절).
+    ///
+    /// 워크스페이스 안의 파일이므로 모델이 쓸 수 있다 — 그래서 이 호출은 **읽어서 돌려줄
+    /// 뿐이고 아무것도 등록하지 않는다.** 등록은 사용자가 화면에서 저장을 누를 때
+    /// `set_workspace_settings`가 하며, 그 경로는 제안이 있든 없든 똑같다.
+    pub fn workspace_proposal(&self) -> Result<Value, String> {
+        let (workspace_id, root) =
+            self.with_active(|active| Ok((active.workspace_id.clone(), active.host.root().clone())))?;
+        let registered = tomverse_core::settings::load(&app_state_dir(), &workspace_id)
+            .map_err(|e| format!("워크스페이스 설정: {e}"))?;
+        // **읽지 못한 것과 없는 것을 뭉개지 않는다.** 형식이 틀린 제안을 조용히 "없음"으로
+        // 만들면 저장소가 제안을 두었는데 화면에는 아무것도 안 뜬다.
+        let proposal = tomverse_core::settings::load_proposal(&root)
+            .map_err(|e| format!("저장소의 제안: {e}"))?;
+        let status = tomverse_core::settings::proposal_status(proposal.as_ref(), &registered);
+        Ok(json!({
+            "path": tomverse_core::settings::proposal_display_path(),
+            "status": status,
+            "proposal": proposal,
+        }))
+    }
+
     /// 등록을 저장한다.
     ///
     /// **즉시 반영되지 않는다.** 훅 레지스트리와 MCP 풀은 `TaskHost`를 만들 때 붙으므로,

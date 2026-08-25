@@ -133,3 +133,60 @@ export function toDrafts(settings: WorkspaceSettings): { hooks: HookDraft[]; ser
     })),
   };
 }
+
+// ---- 저장소의 제안 (state-machine 35절) ----
+
+export type ProposalStatus = "absent" | "same_as_registered" | "differs";
+
+export interface ProposalView {
+  path: string;
+  status: ProposalStatus;
+  proposal: WorkspaceSettings | null;
+}
+
+export interface ProposalNotice {
+  /** 이 영역을 그리는가. 제안이 없으면 아무것도 그리지 않는다. */
+  show: boolean;
+  headline: string;
+  /** 불러오기 버튼을 그리는가 — 등록과 이미 같으면 할 일이 없다. */
+  offerLoad: boolean;
+  /** 몇 건을 불러오는가. **두 수를 따로 낸다** — 합치면 무엇이 들어오는지 알 수 없다. */
+  hookCount: number;
+  serverCount: number;
+}
+
+/**
+ * 제안을 화면 문장으로.
+ *
+ * # 이 자리에서 하기 쉬운 거짓말
+ *
+ * **"저장소가 설정했습니다"라고 쓰는 것.** 저장소는 아무것도 설정하지 않았다 — 제안은 화면의
+ * 입력칸을 채울 뿐이고, 등록은 사용자가 저장을 누를 때 일어난다.
+ *
+ * 그리고 **출처를 흐리지 않는다.** 이 내용은 워크스페이스 안의 파일에서 왔고, 그 파일은
+ * 모델이 쓸 수 있다(34.1절). 그 사실을 말하지 않으면 사용자는 팀이 적어둔 것이라고 읽는다.
+ */
+export function describeProposal(view: ProposalView | null): ProposalNotice {
+  const empty: ProposalNotice = { show: false, headline: "", offerLoad: false, hookCount: 0, serverCount: 0 };
+  if (!view || view.status === "absent" || !view.proposal) return empty;
+
+  const hookCount = view.proposal.hooks.length;
+  const serverCount = view.proposal.servers.length;
+  if (view.status === "same_as_registered") {
+    return {
+      show: true,
+      headline: `${view.path}의 제안이 지금 등록과 같습니다.`,
+      offerLoad: false,
+      hookCount,
+      serverCount,
+    };
+  }
+  return {
+    show: true,
+    // **"등록되었습니다"가 아니다.** 불러오기는 입력칸을 채울 뿐이다.
+    headline: `${view.path}가 훅 ${hookCount}개와 MCP 서버 ${serverCount}개를 제안합니다 — 아직 등록되지 않았습니다.`,
+    offerLoad: true,
+    hookCount,
+    serverCount,
+  };
+}

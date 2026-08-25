@@ -137,6 +137,67 @@ pub fn to_configs(settings: &WorkspaceSettings) -> Result<(Vec<HookConfig>, Vec<
     Ok((hooks, servers))
 }
 
+// ---- 저장소의 제안 (state-machine 35절) ----
+
+/// 저장소가 제안을 두는 자리. **우리가 정한 규약이다** — 저장소가 알아서 고르는 값이 아니라
+/// 우리가 한 곳만 본다는 뜻이고, 그래서 "어디를 봤나"에 언제나 답할 수 있다.
+pub const PROPOSAL_DIR: &str = ".tomverse";
+pub const PROPOSAL_FILE: &str = "proposal.json";
+
+/// 화면과 문서가 쓰는 표시용 경로. **`load_proposal`이 실제로 여는 경로에서 유도한다** —
+/// 손으로 적으면 언젠가 둘이 갈라지고, 갈라진 문장은 사용자를 없는 파일로 보낸다.
+pub fn proposal_display_path() -> String {
+    format!("{PROPOSAL_DIR}/{PROPOSAL_FILE}")
+}
+
+/// 저장소의 제안이 등록과 어떤 관계인가 (35절).
+///
+/// **세 상태를 뭉개지 않는다.** "제안이 없다"와 "제안이 등록과 같다"와 "다르다"는 사용자가
+/// 할 일이 각각 다르고, 특히 마지막은 **저장소가 바뀌었다**는 신호다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    Absent,
+    SameAsRegistered,
+    Differs,
+}
+
+/// 저장소의 제안을 **읽는다. 적용하지 않는다.**
+///
+/// # 이 함수가 하는 일은 화면에 문장을 띄우는 것뿐이다
+///
+/// 이 파일은 워크스페이스 안에 있으므로 **모델이 쓸 수 있다**(29.1·34.1절). 그래서 읽은
+/// 내용으로 아무것도 등록하지 않는다 — 등록은 사용자가 화면에서 저장을 누를 때 기존 저장
+/// 경로(`save`)를 그대로 지나 일어난다. 여기서 곧장 등록하는 지름길을 만들면 그 순간
+/// **모델이 자기 훅과 자기 MCP 서버를 등록할 수 있게 된다.**
+///
+/// # 그래도 검증은 여기서 한다
+///
+/// 화면에 띄우기 전에 형식을 확인한다. 잘못된 제안을 그대로 띄우면 사용자는 저장을 누른
+/// 뒤에야 거절당하고, 그 거절의 원인이 자기 편집인지 저장소의 제안인지 구별할 수 없다.
+pub fn load_proposal(root: &crate::paths::WorkspaceRoot) -> Result<Option<WorkspaceSettings>, SettingsError> {
+    let path = root.path().join(PROPOSAL_DIR).join(PROPOSAL_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| SettingsError::Unreadable(e.to_string()))?;
+    let settings: WorkspaceSettings =
+        serde_json::from_str(&text).map_err(|e| SettingsError::Malformed(e.to_string()))?;
+    let (hooks, servers) = to_configs(&settings)?;
+    validate_hooks(&hooks).map_err(|e| SettingsError::Invalid(e.to_string()))?;
+    validate_servers(&servers).map_err(|e| SettingsError::Invalid(e.to_string()))?;
+    Ok(Some(settings))
+}
+
+/// 제안과 등록의 관계.
+pub fn proposal_status(proposal: Option<&WorkspaceSettings>, registered: &WorkspaceSettings) -> ProposalStatus {
+    match proposal {
+        None => ProposalStatus::Absent,
+        Some(p) if p == registered => ProposalStatus::SameAsRegistered,
+        Some(_) => ProposalStatus::Differs,
+    }
+}
+
 /// 저장된 설정을 읽어 **검증까지 마친** 것으로 돌려준다.
 ///
 /// 저장 시점에 검증했더라도 다시 한다: 파일은 사용자가 손으로 고칠 수 있고, 그때 앱이
@@ -209,6 +270,114 @@ mod tests {
         };
         assert!(save(dir.path(), "ws-1", &settings).is_err());
         assert!(!settings_path(dir.path(), "ws-1").exists(), "거부했는데 파일이 생겼습니다");
+    }
+
+    // ---- 저장소의 제안 (35절) ----
+
+    fn workspace_with_proposal(body: &str) -> (tempfile::TempDir, crate::paths::WorkspaceRoot) {
+        let ws = tempfile::tempdir().unwrap();
+        let dir = ws.path().join(PROPOSAL_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(PROPOSAL_FILE), body).unwrap();
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+        (ws, root)
+    }
+
+    /// **제안이 없는 것은 오류가 아니다.** 대부분의 저장소에는 이 파일이 없다.
+    #[test]
+    fn a_workspace_without_a_proposal_says_absent() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+        assert_eq!(load_proposal(&root).unwrap(), None);
+        assert_eq!(
+            proposal_status(None, &WorkspaceSettings::default()),
+            ProposalStatus::Absent
+        );
+    }
+
+    /// 제안을 읽는다 — **그러나 등록은 건드리지 않는다.** 이 함수가 하는 일은 화면에 띄울
+    /// 값을 돌려주는 것뿐이고, 등록 파일은 그대로 있어야 한다.
+    #[test]
+    fn reading_a_proposal_does_not_register_anything() {
+        let state = tempfile::tempdir().unwrap();
+        let (_ws, root) = workspace_with_proposal(
+            r#"{"hooks":[{"phase":"COMPLETED","program":"npm","args":["run","fmt"]}],"servers":[]}"#,
+        );
+
+        let proposal = load_proposal(&root).unwrap().expect("제안을 읽지 못했습니다");
+        assert_eq!(proposal.hooks.len(), 1);
+        // 등록은 여전히 비어 있다 — 읽기가 곧 등록이면 모델이 자기 훅을 등록할 수 있다.
+        assert_eq!(load(state.path(), "ws-1").unwrap(), WorkspaceSettings::default());
+        assert!(!settings_path(state.path(), "ws-1").exists());
+    }
+
+    /// **읽기가 등록이 될 수 없다는 것을 구조로 확인한다.**
+    ///
+    /// 위 테스트는 "지금은 등록되지 않았다"까지만 말한다 — `load_proposal`이 상태 디렉터리를
+    /// 받지 않으므로 그 함수 안에서는 등록할 대상 경로조차 만들 수 없고, 그것이 진짜 보장이다.
+    /// 그래서 **본문에 저장 호출이 없다**를 소스에서 확인한다: 저장하려면 먼저 인자가 늘어야
+    /// 하고, 그 변경은 이 검사에서 멈춘다.
+    #[test]
+    fn the_proposal_reader_cannot_register() {
+        let source = include_str!("settings.rs");
+        // needle을 런타임에 조립한다 — 리터럴로 적으면 이 검사 자체가 검사 대상에 걸린다.
+        let marker = "fn load_proposal".to_string();
+        let start = source.find(&marker).expect("load_proposal을 찾지 못했습니다");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("함수가 닫히지 않았습니다");
+        let body = &body[..end];
+        for forbidden in ["save".to_string() + "(", "write".to_string() + "("] {
+            assert!(
+                !body.contains(&forbidden),
+                "load_proposal이 `{forbidden}`을 부릅니다 — 읽기가 등록이 되면 모델이 자기 훅을 등록할 수 있습니다"
+            );
+        }
+        // **이 검사가 공허하지 않다는 것**: 같은 방식으로 찾으면 저장하는 함수는 실제로 걸린다.
+        let save_start = source.find("fn save").expect("save를 찾지 못했습니다");
+        let save_body = &source[save_start..];
+        let save_end = save_body.find("\n}\n").expect("save가 닫히지 않았습니다");
+        assert!(
+            save_body[..save_end].contains(&("write".to_string() + "(")),
+            "검사 방식이 아무것도 보지 않고 있습니다"
+        );
+    }
+
+    /// **화면에 띄우기 전에 검증한다.** 잘못된 제안을 그대로 띄우면 사용자는 저장을 누른
+    /// 뒤에야 거절당하고, 원인이 자기 편집인지 저장소의 제안인지 구별할 수 없다.
+    #[test]
+    fn an_invalid_proposal_is_refused_before_it_reaches_the_screen() {
+        let (_ws, root) = workspace_with_proposal(
+            r#"{"hooks":[{"phase":"NOPE","program":"npm","args":["test"]}],"servers":[]}"#,
+        );
+        assert!(load_proposal(&root).is_err());
+    }
+
+    /// **세 상태를 뭉개지 않는다.** "같다"와 "다르다"가 같은 모양이면 저장소가 바뀌었다는
+    /// 신호가 사라진다.
+    #[test]
+    fn the_status_separates_same_from_different() {
+        let registered = WorkspaceSettings {
+            hooks: vec![hook("COMPLETED", "npm")],
+            servers: vec![],
+        };
+        assert_eq!(
+            proposal_status(Some(&registered.clone()), &registered),
+            ProposalStatus::SameAsRegistered
+        );
+        let other = WorkspaceSettings {
+            hooks: vec![hook("FAILED", "npm")],
+            servers: vec![],
+        };
+        assert_eq!(proposal_status(Some(&other), &registered), ProposalStatus::Differs);
+    }
+
+    /// 표시용 경로는 **실제로 여는 경로에서 유도한다** — 손으로 적으면 사용자를 없는 파일로 보낸다.
+    #[test]
+    fn the_displayed_path_is_the_one_we_actually_open() {
+        let (ws, root) = workspace_with_proposal(r#"{"hooks":[],"servers":[]}"#);
+        assert!(load_proposal(&root).unwrap().is_some());
+        let shown = ws.path().join(proposal_display_path().replace('/', std::path::MAIN_SEPARATOR_STR));
+        assert!(shown.exists(), "{}", shown.display());
     }
 
     /// 손으로 고친 파일도 다시 검증한다 — 조용히 잘못된 등록으로 도는 것보다 열리지 않는
