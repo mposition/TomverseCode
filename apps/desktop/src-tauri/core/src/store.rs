@@ -1053,7 +1053,14 @@ impl Store {
     ///
     /// idempotent: 이미 기록되어 있으면 `None`을 반환하고 이벤트를 남기지 않는다.
     /// 터미널 상태면 `TerminalAlreadySet`을 반환한다 — 상태를 바꾸지 않는다.
-    pub fn record_cancellation_request(&mut self, task_id: &str, reason: &str) -> Result<Option<AppendedEvent>> {
+    /// **payload도 함께 돌려준다.** 이 이벤트는 화면으로 릴레이되어야 하는데(append_event를
+    /// 거치지 않으므로 자동으로 가지 않는다 — CLAUDE.md의 기록), 릴레이하는 쪽이 payload를
+    /// 다시 조립하면 `requestedAt`이 저장된 값과 갈린다. 같은 사실을 두 번 만들지 않는다.
+    pub fn record_cancellation_request(
+        &mut self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<Option<(AppendedEvent, serde_json::Value)>> {
         let tx = self.conn.transaction()?;
         let existing: Option<(Option<String>, Option<String>)> = tx
             .query_row(
@@ -1081,15 +1088,10 @@ impl Store {
             "UPDATE tasks SET cancellation_requested_at = ?1, updated_at = ?1 WHERE task_id = ?2",
             params![now, task_id],
         )?;
-        let appended = append_event_tx(
-            &tx,
-            &self.artifacts,
-            task_id,
-            "CANCELLATION_REQUESTED",
-            &serde_json::json!({ "requestedAt": now, "reason": reason }),
-        )?;
+        let payload = serde_json::json!({ "requestedAt": now, "reason": reason });
+        let appended = append_event_tx(&tx, &self.artifacts, task_id, "CANCELLATION_REQUESTED", &payload)?;
         tx.commit()?;
-        Ok(Some(appended))
+        Ok(Some((appended, payload)))
     }
 
     /// 터미널 상태 확정 + 해당 이벤트를 한 트랜잭션에.

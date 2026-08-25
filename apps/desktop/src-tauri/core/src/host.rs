@@ -236,6 +236,10 @@ pub struct TaskHost {
     isolation: Option<crate::worktree::Isolation>,
 }
 
+/// `abandon_unanswered`가 남기는 취소 사유. **사용자 취소·시한 초과와 다른 문자열이다** —
+/// 셋은 사용자가 다음에 할 일이 서로 다르다.
+pub const UNANSWERED_REASON: &str = "백엔드 무응답";
+
 impl TaskHost {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -429,11 +433,26 @@ impl TaskHost {
         }
         let profile = Arc::new(TaskProfile::with_mcp(&self.root, policy, self.mcp.clone()));
         let summary = self.effective_config(&profile, skill);
+        let deadline = profile.policy.deadline_ms;
         profiles.insert(task_id.to_string(), profile);
         // **잠금을 놓고 나서 기록한다.** `append_event`는 훅을 부를 수 있고(PHASE_CHANGED),
         // 훅 경로가 다시 프로필을 읽으면 같은 잠금에서 교착된다.
         drop(profiles);
         let _ = self.append_event(task_id, "TASK_CONFIG_PINNED", summary);
+
+        // **시한 감시를 여기서 건다**(39절). 태스크가 시작하는 자리는 여기 하나이므로, 여기서
+        // 걸면 진입점마다 거는 것을 사람이 기억할 필요가 없다 — 그 규칙은 언젠가 한쪽에서
+        // 잊히고, 잊힌 쪽에서는 무인 실행이 상한 없이 돈다.
+        if let Some(ms) = deadline {
+            crate::deadline::Watch::new(
+                self.cancels.clone(),
+                self.store.clone(),
+                self.sink.clone(),
+                task_id,
+                Duration::from_millis(ms),
+            )
+            .arm();
+        }
         Ok(())
     }
 
@@ -487,6 +506,9 @@ impl TaskHost {
             // 본체에 없는데, 그걸 모르면 사용자는 결과를 본체에서 찾다가 "아무것도 안 바뀌었다"고
             // 읽는다. 22.7절이 "태스크 기록과의 연결"로 남겨둔 것이 이 자리다.
             "isolation": self.isolation,
+            // **언제까지 도는가**(39절). 없으면 `null`이고, 그건 "상한 없이 돈다"는 사실이다 —
+            // 0으로 적으면 "즉시 멈춘다"로 읽힌다.
+            "deadlineMs": policy.deadline_ms,
         })
     }
 
@@ -505,7 +527,11 @@ impl TaskHost {
         // 취소가 새로 확정된 경우에만 이벤트를 남긴다 (연타가 로그를 채우지 않게).
         if let CancelOutcome::Requested { .. } = &outcome {
             match self.with_store(|s| s.record_cancellation_request(task_id, "사용자 요청")) {
-                Ok(_) => {}
+                // **화면으로 릴레이한다.** `record_*`는 `append_event`를 거치지 않으므로
+                // 자동으로 가지 않는다(CLAUDE.md의 기록). 안 보내면 DB에는 남는데 화면은
+                // 모르고, 실제로 화면은 이 이벤트로 열려 있던 질문 카드를 닫는다.
+                Ok(Some((appended, payload))) => self.relay(task_id, "CANCELLATION_REQUESTED", &payload, &appended),
+                Ok(None) => {}
                 // DB가 터미널이라고 하면 그쪽이 진실이다 — 메모리 토큰보다 DB를 믿는다.
                 Err(StoreError::TerminalAlreadySet { status }) => {
                     return Ok(json!({ "accepted": true, "outcome": "already_terminal", "status": status }));
@@ -526,6 +552,36 @@ impl TaskHost {
             }
             CancelOutcome::UnknownTask => json!({ "accepted": false, "outcome": "unknown_task" }),
         })
+    }
+
+    /// 백엔드가 시한 안에 답하지 않았다 (state-machine 39.2절).
+    ///
+    /// # 기다리기를 그만두는 것과 **멈추는 것은 다르다**
+    ///
+    /// 종전에는 이 자리에서 태스크를 FAILED로 적기만 했다. 그러면 화면은 실패라고 말하는데
+    /// sidecar는 계속 돈다 — 모델을 부르고, 도구를 요청하고, 파일을 쓴다. 게이트가 그 요청을
+    /// 막지 않는 이유는 게이트가 보는 것이 **취소 신호**이지 터미널 상태가 아니기 때문이다.
+    ///
+    /// 그래서 적기 전에 **먼저 멈춘다.** 순서가 중요하다: FAILED를 먼저 적으면 그 사이에 들어온
+    /// 도구 요청이 실행되고, 그 실행은 "이미 실패한 태스크"의 이름으로 남는다.
+    ///
+    /// 사유를 사용자 취소와 나눈다 — 24.2절과 같은 이유로, 사용자는 그 자리에 없었다.
+    pub fn abandon_unanswered(&self, task_id: &str, message: &str) {
+        self.cancels.token(task_id).cancel();
+        if let Ok(Some((appended, payload))) =
+            self.with_store(|s| s.record_cancellation_request(task_id, UNANSWERED_REASON))
+        {
+            self.relay(task_id, "CANCELLATION_REQUESTED", &payload, &appended);
+        }
+        // **터미널은 FAILED다.** 취소가 아니다 — 사용자도 시한도 아니고 백엔드가 답하지
+        // 않은 것이며, 그건 우리 쪽 고장이다. CANCELLED로 적으면 고장이 정상 종료로 읽힌다.
+        let _ = self.finish_task(
+            task_id,
+            "FAILED",
+            "TASK_FAILED",
+            Some(message),
+            json!({ "status": "failed", "summary": message, "source": "host-abandon" }),
+        );
     }
 
     /// **강제 포기** — 사용자가 "취소 중"에서 기다리기를 그만둔다 (12절 미해결 항목).
@@ -572,6 +628,19 @@ impl TaskHost {
 
     pub fn cancellation_token(&self, task_id: &str) -> CancellationToken {
         self.cancels.token(task_id)
+    }
+
+    /// 이 태스크가 이미 터미널에 도달했는가. **DB가 진실이다** — 메모리 토큰은 터미널 확정
+    /// 시점에 정리되므로 "취소되지 않았다"와 "끝났다"를 구별하지 못한다.
+    ///
+    /// 읽지 못하면 `false`다. 조회 실패로 도구를 막으면 DB가 흔들릴 때 정상 실행이 멈춘다 —
+    /// 이 검사는 안전장치이지 게이트가 아니고, 게이트는 그 다음에 그대로 돈다.
+    pub fn is_terminal(&self, task_id: &str) -> bool {
+        self.with_store(|s| s.get_task(task_id))
+            .ok()
+            .flatten()
+            .and_then(|t| t.terminal_status)
+            .is_some()
     }
 
     pub fn is_cancelled(&self, task_id: &str) -> bool {
@@ -870,34 +939,53 @@ impl TaskHost {
         cmd.cwd == "." && self.hooks.matches_registered(&cmd.program, &cmd.args)
     }
 
+    /// 실행하지 않고 돌려주는 결과. **`cancelled`로 보고한다** — 오케스트레이터가 정책 거부와
+    /// 구별해야 하고(재시도 대상이 아니다), 감사 로그에도 남아야 한다: "멈췄는데 뭐가 더
+    /// 실행됐나"에 답할 수 있어야 한다.
+    fn refuse_tool(
+        &self,
+        request: &ToolRequest,
+        event_type: &str,
+        error: &str,
+        reason: &str,
+        rule: &str,
+    ) -> Value {
+        let result = ToolResult {
+            request_id: request.request_id.clone(),
+            status: ToolStatus::Cancelled,
+            output: None,
+            error: Some(error.to_string()),
+            duration_ms: 0,
+            completed_at: now_iso(),
+            denial_kind: None,
+        };
+        let _ = self.append_event(
+            &request.task_id,
+            event_type,
+            json!({ "requestId": request.request_id, "tool": request.tool.as_str() }),
+        );
+        json!({
+            "result": result,
+            "policy": {
+                "decision": "deny", "riskLevel": "none",
+                "reason": reason, "matchedRule": rule, "normalizedTarget": ""
+            }
+        })
+    }
+
     pub fn execute_tool(&self, request: &ToolRequest) -> Result<Value, String> {
         let cancel = self.cancels.token(&request.task_id);
 
         // 0) 취소 확인. 취소된 태스크의 도구는 **시작하지 않는다.**
         //    `denied`가 아니라 `cancelled`로 보고해야 오케스트레이터가 정책 거부와 구별한다.
         if cancel.is_cancelled() {
-            let result = ToolResult {
-                request_id: request.request_id.clone(),
-                status: ToolStatus::Cancelled,
-                output: None,
-                error: Some("태스크가 취소되어 도구를 실행하지 않음".to_string()),
-                duration_ms: 0,
-                completed_at: now_iso(),
-                denial_kind: None,
-            };
-            // 취소 후 거부도 감사 로그에 남는다 — "취소했는데 뭐가 더 실행됐나"를 확인할 수 있어야 한다.
-            let _ = self.append_event(
-                &request.task_id,
+            return Ok(self.refuse_tool(
+                request,
                 "TOOL_SKIPPED_CANCELLED",
-                json!({ "requestId": request.request_id, "tool": request.tool.as_str() }),
-            );
-            return Ok(json!({
-                "result": result,
-                "policy": {
-                    "decision": "deny", "riskLevel": "none",
-                    "reason": "태스크가 취소됨", "matchedRule": "cancelled", "normalizedTarget": ""
-                }
-            }));
+                "태스크가 취소되어 도구를 실행하지 않음",
+                "태스크가 취소됨",
+                "cancelled",
+            ));
         }
 
         // 1) Policy Gate. Node가 보낸 riskTier는 여기서 판단 근거로 쓰이지 않는다.
@@ -1828,6 +1916,24 @@ impl SidecarHandler for TaskHost {
                     .ok_or_else(|| "tool.execute params에 \"request\"가 없음".to_string())?;
                 let request: ToolRequest =
                     serde_json::from_value(raw.clone()).map_err(|e| format!("잘못된 ToolRequest: {e}"))?;
+                // **터미널 이후 Node의 요청은 실행하지 않는다**(state-machine 39.3절).
+                //
+                // "취소 이후 실행 금지"(cancel.rs)의 형제 규칙이다. 취소 토큰만으로는 부족한
+                // 이유는 터미널 확정이 토큰을 **정리하기** 때문이다 — 그 뒤에 온 요청은 새
+                // 토큰을 만들어 그대로 실행됐다. 화면이 실패라고 말한 태스크가 계속 파일을
+                // 쓰는 경로가 거기였다.
+                //
+                // **Node의 요청에만 건다.** 호스트가 시작하는 도구(되돌리기·PR 올리기·훅)는
+                // 끝난 태스크에 대해 도는 것이 정상이고, 그건 사용자가 누른 것이다.
+                if self.is_terminal(&request.task_id) {
+                    return Ok(self.refuse_tool(
+                        &request,
+                        "TOOL_SKIPPED_TERMINAL",
+                        "태스크가 이미 끝나 도구를 실행하지 않음",
+                        "태스크가 이미 종료됨",
+                        "terminal",
+                    ));
+                }
                 self.execute_tool(&request)
             }
 
@@ -2561,6 +2667,190 @@ mod tests {
         host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
         let config = pinned_config(&host, "task-1");
         assert!(config.get("isolation").is_some_and(Value::is_null), "{config}");
+    }
+
+    // ---- 무인 실행의 시한 (39절) ----
+
+    /// **시한이 지나면 실제로 멈춘다.** 값을 정책에 담아 두기만 하고 아무도 보지 않으면
+    /// 화면에는 "30분 상한"이라고 적히는데 태스크는 영원히 돈다 — 그건 상한이 아니라 표시다.
+    #[test]
+    fn a_task_past_its_deadline_is_actually_stopped() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink.clone());
+        host.begin_task(
+            "task-1",
+            TaskPolicy {
+                unattended: true,
+                deadline_ms: Some(1),
+                ..TaskPolicy::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // 감시는 별도 스레드다. 시계를 기다리되 **무한정 기다리지 않는다** — 안 멈추면
+        // 이 테스트가 걸려 있는 것이 아니라 실패해야 한다.
+        let stopped = wait_until(Duration::from_secs(5), || host.is_cancelled("task-1"));
+        assert!(stopped, "시한이 지났는데 태스크가 멈추지 않았습니다");
+
+        // **왜 멈췄는지가 남는다.** 상한값이 없으면 사용자는 다음에 얼마로 올려야 할지 모른다.
+        let events = host.with_store(|s| s.events_after("task-1", None)).unwrap();
+        let exceeded = events
+            .iter()
+            .find(|e| e.event_type == "TASK_DEADLINE_EXCEEDED")
+            .expect("TASK_DEADLINE_EXCEEDED가 없습니다");
+        assert_eq!(exceeded.payload.get("limitMs").and_then(Value::as_u64), Some(1));
+
+        // **사용자가 취소한 것으로 기록되지 않는다**(24.2절과 같은 이유). 사용자는 그 자리에
+        // 없었고, 기록이 그렇게 말하면 감사 로그가 거짓말한다.
+        let requested = events
+            .iter()
+            .find(|e| e.event_type == "CANCELLATION_REQUESTED")
+            .expect("CANCELLATION_REQUESTED가 없습니다");
+        assert_eq!(
+            requested.payload.get("reason").and_then(Value::as_str),
+            Some(crate::deadline::REASON)
+        );
+        // 화면도 받는다 — DB에만 남고 화면에는 안 보이는 정지를 만들지 않는다.
+        assert!(
+            sink.seen.lock().unwrap().contains(&"TASK_DEADLINE_EXCEEDED".to_string()),
+            "sink에 없습니다"
+        );
+    }
+
+    /// 시한을 정하지 않은 태스크는 **아무도 멈추지 않는다.** 위 검사만 있으면 "언제나
+    /// 멈춘다"로 만들어도 통과한다.
+    #[test]
+    fn a_task_without_a_deadline_is_left_alone() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+        // 위 검사가 5초 안에 멈추는 것을 확인했으므로, 그보다 짧게 기다려 보는 것으로 충분하다.
+        assert!(!wait_until(Duration::from_millis(300), || host.is_cancelled("task-1")));
+
+        let config = pinned_config(&host, "task-1");
+        // `null`이지 0이 아니다 — 0은 "즉시 멈춘다"로 읽힌다.
+        assert!(config.get("deadlineMs").is_some_and(Value::is_null), "{config}");
+    }
+
+    /// 이미 끝난 태스크에는 시한이 아무 말도 하지 않는다 — DB가 진실이다.
+    #[test]
+    fn a_finished_task_is_not_marked_as_out_of_time() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        host.begin_task(
+            "task-1",
+            TaskPolicy {
+                deadline_ms: Some(400),
+                ..TaskPolicy::default()
+            },
+            None,
+        )
+        .unwrap();
+        host.finish_task("task-1", "COMPLETED", "TASK_COMPLETED", None, json!({}))
+            .unwrap();
+
+        assert!(!wait_until(Duration::from_millis(900), || {
+            host.with_store(|s| s.events_after("task-1", None))
+                .unwrap()
+                .iter()
+                .any(|e| e.event_type == "TASK_DEADLINE_EXCEEDED")
+        }));
+    }
+
+    /// 조건이 올 때까지 기다린다. **타임아웃이 있다** — 없으면 실패가 걸림으로 나타난다.
+    fn wait_until(limit: Duration, mut ready: impl FnMut() -> bool) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < limit {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ready()
+    }
+
+    /// **기다리기를 그만두는 것은 멈추는 것이 아니다**(39.2절).
+    ///
+    /// 종전에는 이 자리가 FAILED만 적었고, 그러면 화면이 실패라고 말한 뒤에도 sidecar의 도구
+    /// 요청이 그대로 실행됐다 — 게이트가 보는 것은 터미널 상태가 아니라 취소 신호이기 때문이다.
+    #[test]
+    fn giving_up_on_the_backend_also_stops_the_task() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+
+        host.abandon_unanswered("task-1", "백엔드가 응답하지 않았습니다");
+
+        // ① **Node의 다음 요청이 실행되지 않는다.** 이게 없으면 아래 ②는 "실패라고 적었다"만
+        //    말한다 — 그리고 실제로 그것만 하고 있었다.
+        let refused = host
+            .handle_request(
+                "tool.execute",
+                &json!({ "request": serde_json::to_value(req(ToolName::CreateFile, json!({ "path": "after.ts", "content": "x" }))).unwrap() }),
+            )
+            .unwrap();
+        assert_eq!(
+            refused.pointer("/result/status").and_then(Value::as_str),
+            Some("cancelled"),
+            "{refused}"
+        );
+        assert!(
+            !ws.path().join("after.ts").exists(),
+            "끝난 태스크가 파일을 썼습니다"
+        );
+        // ② 그리고 터미널은 FAILED다. 취소로 적으면 고장이 정상 종료로 읽힌다.
+        let task = host.with_store(|s| s.get_task("task-1")).unwrap().unwrap();
+        assert_eq!(task.terminal_status.as_deref(), Some("FAILED"));
+        // ③ 사유가 사용자 취소와 다르다 — 셋은 사용자가 다음에 할 일이 서로 다르다.
+        let events = host.with_store(|s| s.events_after("task-1", None)).unwrap();
+        let requested = events
+            .iter()
+            .find(|e| e.event_type == "CANCELLATION_REQUESTED")
+            .expect("CANCELLATION_REQUESTED가 없습니다");
+        assert_eq!(
+            requested.payload.get("reason").and_then(Value::as_str),
+            Some(UNANSWERED_REASON)
+        );
+    }
+
+    /// 그리고 **살아 있는 태스크의 요청은 그대로 실행된다.** 위 검사만 있으면 Node의 모든
+    /// 요청을 막아도 통과한다 — 그건 이 규칙이 아니라 sidecar를 끊는 것이다.
+    #[test]
+    fn a_running_task_still_gets_its_tools() {
+        let sink = Arc::new(RecordingSink::default());
+        let (ws, _art, host) = host_with_sink(sink);
+        host.begin_task(
+            "task-1",
+            TaskPolicy {
+                auto_approve_workspace_writes: true,
+                ..TaskPolicy::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let request = req(ToolName::CreateFile, json!({ "path": "live.ts", "content": "x" }));
+        let out = host
+            .handle_request("tool.execute", &json!({ "request": serde_json::to_value(request).unwrap() }))
+            .unwrap();
+        assert_eq!(out.pointer("/result/status").and_then(Value::as_str), Some("ok"), "{out}");
+        assert!(ws.path().join("live.ts").exists());
+    }
+
+    /// 취소 요청이 **화면에도 간다**. `record_*`는 `append_event`를 거치지 않으므로 자동으로
+    /// 가지 않는다(CLAUDE.md의 기록) — 안 가면 DB에는 남는데 화면은 모르고, 실제로 화면은 이
+    /// 이벤트로 열려 있던 질문 카드를 닫는다.
+    #[test]
+    fn a_cancellation_request_reaches_the_screen() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink.clone());
+        host.cancel_task("task-1").unwrap();
+        assert!(
+            sink.seen.lock().unwrap().contains(&"CANCELLATION_REQUESTED".to_string()),
+            "sink에 없습니다: {:?}",
+            sink.seen.lock().unwrap()
+        );
     }
 
     // ---- 판정의 철회 (30절) ----

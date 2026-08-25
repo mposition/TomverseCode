@@ -379,6 +379,19 @@ pub struct TaskPolicy {
     pub command_timeout_ms: u64,
     #[serde(rename = "executionMode", default = "default_mode")]
     pub execution_mode: ExecutionMode,
+    /// 무인 실행의 **시한** (state-machine 39절). `None`이면 상한이 없다.
+    ///
+    /// # sidecar로 보내지 않는다
+    ///
+    /// Node가 알아야 할 이유가 없고, 알면 언젠가 Node가 집행자가 된다 — 그 순간 장악당한
+    /// Node에서 상한이 사라진다. 시계도 판정도 Rust가 갖는다.
+    ///
+    /// # 기본값을 우리가 만들지 않는다
+    ///
+    /// 예산 상한과 같은 규칙이다: 코드가 만들어낸 승인은 승인이 아니다. 상한 없이 도는 것은
+    /// 사용자가 고를 수 있는 선택이고, **그 사실을 화면이 말한다.**
+    #[serde(rename = "deadlineMs", default)]
+    pub deadline_ms: Option<u64>,
 }
 
 fn default_timeout() -> u64 {
@@ -401,6 +414,9 @@ impl Default for TaskPolicy {
             allow_git_commit: false,
             command_timeout_ms: default_timeout(),
             execution_mode: ExecutionMode::Verified,
+            // **기본 시한을 만들지 않는다.** 예산 상한과 같은 규칙이다 — 코드가 만들어낸
+            // 승인은 승인이 아니다.
+            deadline_ms: None,
         }
     }
 }

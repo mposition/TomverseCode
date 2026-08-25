@@ -208,6 +208,72 @@ test("[시나리오 A] 오래 도는 명령 실행 중 취소하면 프로세스
   });
 });
 
+/**
+ * **무인 실행의 시한** — state-machine 39절.
+ *
+ * 시나리오 A와 같은 모양이지만 취소를 누르는 것이 사람이 아니라 **시계**다. 그래서 검사도
+ * 하나 더 있다: 왜 멈췄는지가 사용자 취소와 **다른 사실로** 기록되어야 한다.
+ *
+ * `--deadline-secs`가 값을 정책에 담아 두기만 하고 아무도 보지 않으면 이 실행은 60초짜리
+ * 명령을 끝까지 돌고 완료된다 — 그러면 여기서 걸린다.
+ */
+test("[시나리오 A-3] 시한이 지나면 태스크가 실제로 멈추고, 사용자 취소와 다른 사유로 기록된다", async () => {
+  requireArtifacts();
+  await withCtx({ slowTest: true }, (ctx) => {
+    const started = Date.now();
+    const result = spawnSync(
+      HOST_BIN,
+      // **`--timeout-secs`는 넉넉히 준다.** 짧게 주면 무엇이 멈춘 것인지 알 수 없다 —
+      // 호스트가 기다리기를 그만둔 것과 시한이 태스크를 멈춘 것은 다른 사실이고(39.2절),
+      // 이 테스트가 확인하려는 것은 후자다.
+      // 무인 실행이 **검증까지 도달해야** 60초짜리 명령이 돈다(24.5절) — 거기까지 가지
+      // 않으면 태스크가 0.3초에 끝나고 시한은 아무것도 검사하지 않는다.
+      runArgs(ctx, [
+        "--timeout-secs",
+        "120",
+        "--approve",
+        "autopilot",
+        "--auto-approve-writes",
+        "--auto-approve-verification",
+        "--deadline-secs",
+        "3",
+      ]),
+      { encoding: "utf8", timeout: 150_000, env: hostEnv() }
+    );
+    const elapsedMs = Date.now() - started;
+
+    const line = (result.stdout ?? "").trim().split("\n").filter(Boolean).pop();
+    assert.ok(line, `결과 JSON이 없습니다:\n${result.stdout}\n${result.stderr}`);
+    const run = JSON.parse(line) as { final: { status: string }; taskId: string; eventTypes: string[] };
+
+    // ① 60초짜리 명령이 실제로 잘렸다. 끝까지 돌았다면 이 시간에 끝날 수 없다.
+    assert.ok(elapsedMs < 45_000, `시한이 명령을 끊지 못했습니다 (${elapsedMs}ms 소요)`);
+    assert.equal(run.final.status, "cancelled", `${JSON.stringify(run.final)}\n${result.stderr}`);
+
+    const detail = hostQuery(ctx, [
+      "show",
+      "--workspace",
+      ctx.repo.root,
+      "--task",
+      run.taskId,
+      "--db",
+      ctx.db,
+      "--artifacts",
+      ctx.artifacts,
+    ]) as { eventTypes: string[]; events: { type: string; payload: Record<string, unknown> }[] };
+
+    // ② **왜 멈췄는지가 남는다.** 상한값이 없으면 사용자는 다음에 얼마로 올려야 할지 모른다.
+    const exceeded = detail.events.find((e) => e.type === "TASK_DEADLINE_EXCEEDED");
+    assert.ok(exceeded, `TASK_DEADLINE_EXCEEDED가 없습니다: ${detail.eventTypes.join(", ")}`);
+    assert.equal(exceeded.payload.limitMs, 3000, JSON.stringify(exceeded.payload));
+
+    // ③ **사용자가 취소한 것으로 기록되지 않는다**(24.2절과 같은 이유). 사용자는 그 자리에 없었다.
+    const requested = detail.events.find((e) => e.type === "CANCELLATION_REQUESTED");
+    assert.ok(requested, "CANCELLATION_REQUESTED가 없습니다");
+    assert.equal(requested.payload.reason, "시한 초과", JSON.stringify(requested.payload));
+  });
+});
+
 test("[시나리오 A-2] 취소된 뒤에는 새 도구 실행도 검증도 시작되지 않는다", async () => {
   requireArtifacts();
   await withCtx({ slowTest: true }, (ctx) => {

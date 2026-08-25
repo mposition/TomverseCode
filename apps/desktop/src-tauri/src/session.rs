@@ -866,6 +866,11 @@ impl SessionState {
         /// 스킬 파일 경로 (26절). **Rust가 읽는다** — 도구 허용목록의 출처가 UI가 되면
         /// 장악당한 UI가 "허용목록은 전부입니다"라고 말할 수 있다.
         skill_path: Option<&str>,
+        /// 무인 실행의 **시한**(초) — state-machine 39절. `None`이면 상한이 없다.
+        ///
+        /// `timeout`과 다른 값이다: 저쪽은 이 호출이 기다리기를 그만두는 시각이고, 이쪽은
+        /// 태스크가 멈추는 시각이다(39.2절).
+        deadline_secs: Option<u64>,
         timeout: Duration,
     ) -> Result<Value, String> {
         // **태스크를 시작하기 전에** 살아 있는지 확인한다(5절). 도중에 바꿔치기하면 진행 중인
@@ -917,6 +922,8 @@ impl SessionState {
             unattended,
             auto_approve_verification,
             allowed_tools: skill.as_ref().and_then(|s| s.allowed_tools.clone()),
+            // **sidecar로 가지 않는다**(39.1절). 시계도 판정도 Rust가 갖는다.
+            deadline_ms: deadline_secs.map(|s| s * 1_000),
             ..TaskPolicy::default()
         };
         host.begin_task(&task_id, task_policy, skill.as_ref())?;
@@ -1021,13 +1028,10 @@ impl SessionState {
             }
             Err(message) => {
                 // sidecar가 죽어도 이벤트 로그로 상태를 설명할 수 있어야 한다.
-                let _ = host.finish_task(
-                    &task_id,
-                    "FAILED",
-                    "TASK_FAILED",
-                    Some(&message),
-                    json!({ "status": "failed", "summary": message.clone() }),
-                );
+                //
+                // **적기 전에 멈춘다**(39.2절). 여기가 실제로 위험한 자리다 — 감독자가 sidecar를
+                // 살려 두므로, 실패로 적기만 하면 그 태스크는 화면 밖에서 계속 돈다.
+                host.abandon_unanswered(&task_id, &message);
                 Err(message)
             }
         }
@@ -1069,6 +1073,8 @@ impl SessionState {
             model_pins,
             false,
             false,
+            None,
+            // 시한도 물려받지 않는다 — 같은 이유다. 무인이 아니면 시한을 걸 이유도 없다.
             None,
             timeout,
         )

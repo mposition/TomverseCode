@@ -43,6 +43,7 @@ import { SecretShapeWarning, useSecretShapeScan } from "./components/SecretShape
 import { TransmissionPanel } from "./components/TransmissionPanel";
 import { BudgetPanel } from "./components/BudgetPanel";
 import { precheckBudget } from "./lib/budgetCheck";
+import { readDeadline } from "./lib/deadline";
 import { AuditExportPanel } from "./components/AuditExportPanel";
 import { BlockedPanel } from "./components/BlockedPanel";
 import { WorkspaceSettingsPanel } from "./components/WorkspaceSettingsPanel";
@@ -174,6 +175,11 @@ export default function App() {
    * 승인됐다"가 되는데, 그 둘은 사용자가 따로 판단할 일이다.
    */
   const [unattended, setUnattended] = useState(false);
+  /**
+   * 무인 실행의 시한 — 분 단위 문자열. **기본값을 채우지 않는다**(state-machine 39절):
+   * 예산 상한과 같은 규칙으로, 코드가 만들어낸 승인은 승인이 아니다.
+   */
+  const [deadlineText, setDeadlineText] = useState("");
   const [autoApproveVerification, setAutoApproveVerification] = useState(false);
   /** 스킬 파일 경로 (26절). **Rust가 읽는다** — 화면은 경로만 넘긴다. */
   const [skillPath, setSkillPath] = useState("");
@@ -503,6 +509,9 @@ export default function App() {
 
   // 배너의 "다시 열기". 대상 경로는 **지금 열려 있는 워크스페이스**이지 입력란의 값이 아니다 —
   // 입력란은 사용자가 다른 경로를 타이핑하던 중일 수 있고, 그러면 엉뚱한 곳이 열린다.
+  // 시한 입력의 판정은 **화면 밖**에 있다(39절). 시작 버튼과 안내 문장이 같은 값을 본다 —
+  // 두 번 계산하면 "시작할 수 없다"와 "문제 없다"가 동시에 보일 수 있다.
+  const deadline = readDeadline(deadlineText, unattended);
   const banner = bannerFor(backend);
   // **저장소 경로로 다시 연다.** 격리 실행에서 `rootPath`는 격리 트리이고, 그걸 저장소로 주면
   // 트리가 저장소가 되어 격리가 조용히 사라진다 — 게다가 workspace_id가 바뀌어 등록도 사라진다.
@@ -588,6 +597,8 @@ export default function App() {
         autoApproveVerification,
         // 빈 문자열은 "경로 없음"이지 "빈 경로"가 아니다.
         skillPath: skillPath.trim() === "" ? null : skillPath.trim(),
+        // 시한의 판정은 화면 밖(src/lib)에 있다 — 계산이 화면 안에 있으면 검증할 방법이 없다.
+        deadlineSecs: readDeadline(deadlineText, unattended).secs,
       });
       setFinalResult(result);
       // 전송 내역은 **끝난 뒤에** 읽는다. 실패해도 결과 화면을 막지 않는다 — 이건 사후 조회이고,
@@ -1133,6 +1144,26 @@ export default function App() {
                     검증 명령도 승인을 요구하므로, 이 상태의 무인 실행은 <strong>검증에서 멈춥니다</strong>.
                   </p>
                 )}
+
+                {/* 시한 (39절). **여기 두는 이유**: 시한이 필요한 까닭이 "물을 사람이 없다"는
+                    것이므로, 무인 실행 스위치와 같은 자리에 있어야 한다. */}
+                <div className="row">
+                  <label htmlFor="deadline">시한 (분, 비우면 상한 없음)</label>
+                  <input
+                    id="deadline"
+                    value={deadlineText}
+                    onChange={(e) => setDeadlineText(e.target.value)}
+                    placeholder="예: 30"
+                    spellCheck={false}
+                  />
+                </div>
+                {/* 읽지 못한 입력은 **상한 없음이 아니라 거부**다 — 바꿔치면 사용자는 상한을
+                    걸었다고 믿는데 실행은 끝없이 돈다. */}
+                {deadline.problem ? (
+                  <p className="error small">{deadline.problem}</p>
+                ) : (
+                  <p className="muted small">{deadline.notice}</p>
+                )}
               </fieldset>
               {/* 스킬 (26절). 파일을 **Rust가 읽는다** — 도구 허용목록의 출처가 화면이 되면
                   장악당한 화면이 "허용목록은 전부입니다"라고 말할 수 있다. */}
@@ -1245,7 +1276,12 @@ export default function App() {
               {/* 막지 않고 문구만 바꾼다. 자격증명 모양이 진짜 요구의 일부일 수 있고
                   ("sk-로 시작하는 키를 거부해야 한다"), 무엇이 자기 요구인지는 사용자가
                   판정한다(원칙 1). 대신 그대로 보내는 중이라는 사실은 눈에 남긴다. */}
-              <button onClick={runTask} disabled={running || message.trim().length === 0 || noProviders}>
+              {/* 읽지 못한 시한으로는 시작하지 않는다 — "상한을 걸었다"고 믿는 채로 상한 없이
+                  도는 것이 이 입력에서 가장 나쁜 결말이다(39절). */}
+              <button
+                onClick={runTask}
+                disabled={running || message.trim().length === 0 || noProviders || deadline.problem !== undefined}
+              >
                 {running ? "실행 중..." : messageSecrets.length > 0 ? "그대로 실행" : "실행"}
               </button>
               {running && (

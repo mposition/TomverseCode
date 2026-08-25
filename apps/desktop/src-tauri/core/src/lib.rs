@@ -17,6 +17,7 @@ pub mod artifacts;
 pub mod blocked;
 pub mod budget;
 pub mod cancel;
+pub mod deadline;
 pub mod decisions;
 pub mod export;
 pub mod hooks;

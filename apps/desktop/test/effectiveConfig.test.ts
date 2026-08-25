@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   describeAllowedTools,
+  describeDeadline,
   describeIsolation,
   describeMcpServer,
   describeVerificationPin,
@@ -105,4 +106,25 @@ test("이어 쓴 트리와 더러웠던 본체가 문장에 남는다", () => {
   assert.ok(dirty.includes("포함되지 않았습니다"), dirty);
   assert.notEqual(plain, reused);
   assert.notEqual(plain, dirty);
+});
+
+/** **상한이 없다는 것도 사실이다.** 침묵하면 사용자는 기본 상한이 있다고 가정한다. */
+test("시한이 없으면 없다고 말하고, 무인 실행이면 그 결과까지 말한다", () => {
+  const attended = describeDeadline({});
+  const unattended = describeDeadline({ unattended: true });
+  assert.ok(attended.includes("시한 없음"), attended);
+  assert.ok(unattended.includes("끝날 때까지"), unattended);
+  assert.notEqual(attended, unattended);
+});
+
+test("시한은 분으로 보이고, 사용자 취소와 다르다는 것을 말한다", () => {
+  const text = describeDeadline({ deadlineMs: 1_800_000 });
+  assert.ok(text.includes("30분"), text);
+  assert.ok(text.includes("다른 사유"), text);
+});
+
+/** 1분 미만을 "0분"으로 반올림하지 않는다 — 0은 "즉시 멈춘다"로 읽힌다. */
+test("1분 미만의 시한을 0분으로 뭉개지 않는다", () => {
+  const text = describeDeadline({ deadlineMs: 500 });
+  assert.ok(!text.includes("0분"), text);
 });

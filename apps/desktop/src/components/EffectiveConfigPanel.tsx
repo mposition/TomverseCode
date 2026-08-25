@@ -1,5 +1,6 @@
 import {
   describeAllowedTools,
+  describeDeadline,
   describeIsolation,
   describeMcpServer,
   describeVerificationPin,
@@ -58,6 +59,9 @@ export function EffectiveConfigPanel({ events }: { events: ConfigEvent[] }) {
       {/* **어디서 도는가도 "무엇을 가지고 도는가"의 한 줄이다**(38절). 격리 실행의 결과는
           본체에 없으므로, 이 줄이 없으면 사용자는 결과를 본체에서 찾는다. */}
       <p className="muted small">{describeIsolation(config)}</p>
+      {/* **언제까지 도는가**(39절). 상한이 없다는 것도 사실이고, 침묵하면 사용자는 어딘가에
+          기본 상한이 있다고 가정한다 — 그 가정은 무인 실행에서 가장 비싸게 틀린다. */}
+      <p className="muted small">{describeDeadline(config)}</p>
       {/* 스킬은 **이름과 요약을 함께** 낸다 — 이름만 보면 무엇이 좁혀졌는지 모른다. */}
       <p className="muted small">{skill ? `스킬: ${skill.summary}` : "스킬을 쓰지 않습니다."}</p>
       <p className="muted small">{describeAllowedTools(config)}</p>

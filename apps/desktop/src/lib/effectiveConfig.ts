@@ -35,6 +35,8 @@ export interface PinnedConfig {
     reused: boolean;
     mainTreeDirty: boolean;
   } | null;
+  /** 무인 실행의 시한(ms) — 39절. `null`이면 상한 없이 돈다. */
+  deadlineMs?: number | null;
 }
 
 export interface ConfigLine {
@@ -124,4 +126,24 @@ export function describeIsolation(config: PinnedConfig): string {
     ? " 시작 시점에 본체에 커밋되지 않은 변경이 있었고, 그 변경은 이 실행에 포함되지 않았습니다."
     : "";
   return `격리 실행 — ${iso.branch} 브랜치, ${iso.path}${reused}.${dirty}`;
+}
+
+/**
+ * 언제까지 도는가 한 줄 — 39절.
+ *
+ * **상한이 없다는 것도 사실이다.** 침묵하면 사용자는 어딘가에 기본 상한이 있다고 가정하고,
+ * 그 가정은 무인 실행에서 가장 비싸게 틀린다.
+ */
+export function describeDeadline(config: PinnedConfig): string {
+  const ms = config.deadlineMs;
+  if (ms === undefined || ms === null) {
+    return config.unattended
+      ? "시한 없음 — 아무도 멈추지 않으므로 끝날 때까지 돕니다."
+      : "시한 없음 (사람이 붙어 있는 실행입니다).";
+  }
+  const minutes = Math.round(ms / 60_000);
+  // 1분 미만을 "0분"으로 반올림하지 않는다 — 0은 "즉시 멈춘다"로 읽힌다.
+  return minutes >= 1
+    ? `시한 ${minutes}분 — 지나면 멈추고, 사용자 취소와 다른 사유로 기록됩니다.`
+    : `시한 ${ms}ms — 지나면 멈추고, 사용자 취소와 다른 사유로 기록됩니다.`;
 }

@@ -83,6 +83,11 @@ struct Args {
     sidecar: Option<PathBuf>,
     auto_approve_writes: bool,
     auto_approve_verification: bool,
+    /// 무인 실행의 시한(초) — state-machine 39절. `None`이면 상한이 없다.
+    ///
+    /// **`--timeout-secs`와 다른 값이다.** 저쪽은 호스트가 기다리기를 그만두는 시각이고,
+    /// 이쪽은 태스크가 멈추는 시각이다(39.2절).
+    deadline_secs: Option<u64>,
     allow_git_commit: bool,
     /// 이 태스크의 예산 상한(USD). `None`이면 **상한 없이** 돈다.
     ///
@@ -183,6 +188,7 @@ fn parse_args() -> Result<Args, String> {
         sidecar: None,
         auto_approve_writes: false,
         auto_approve_verification: false,
+        deadline_secs: None,
         allow_git_commit: false,
         budget_usd: None,
         pin_executor: None,
@@ -243,6 +249,17 @@ fn parse_args() -> Result<Args, String> {
             "--sidecar" => args.sidecar = Some(PathBuf::from(value()?)),
             "--auto-approve-writes" => args.auto_approve_writes = true,
             "--auto-approve-verification" => args.auto_approve_verification = true,
+            "--deadline-secs" => {
+                let secs: u64 = value()?
+                    .parse()
+                    .map_err(|_| "--deadline-secs는 정수여야 합니다".to_string())?;
+                // **0을 받지 않는다.** "즉시 멈춘다"를 시한으로 적을 이유가 없고, 받으면
+                // 시작하자마자 멈추는 실행이 정상 동작처럼 보인다.
+                if secs == 0 {
+                    return Err("--deadline-secs는 1 이상이어야 합니다".to_string());
+                }
+                args.deadline_secs = Some(secs);
+            }
             "--allow-git-commit" => args.allow_git_commit = true,
             "--pin-executor" => args.pin_executor = Some(value()?),
             "--pin-reviewer" => args.pin_reviewer = Some(value()?),
@@ -349,7 +366,7 @@ fn usage() -> String {
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--skill <파일.json>] [--session <id>]\n\
      [--auto-approve-writes] [--auto-approve-verification]\n\
-     [--allow-git-commit] [--cancel-after-ms <n>]\n\
+     [--allow-git-commit] [--cancel-after-ms <n>] [--deadline-secs <n>]\n\
      [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
      \n\
      가설 게이트 전용: [--providers <csv>] [--review-mode blind|informed] [--replay-draft <file>]\n\
@@ -379,6 +396,10 @@ fn usage() -> String {
      --auto-approve-verification — 프로젝트가 매니페스트에 **선언해 둔** 검증 명령을 묻지 않고\n\
                  실행한다. 집합은 태스크 시작 시점에 고정된다 — 실행 중에 매니페스트가 바뀌어도\n\
                  새 명령은 자동 승인되지 않는다. Autopilot이 검증까지 도달하려면 이게 필요하다\n\
+     --deadline-secs <n> — **태스크가 멈추는 시각.** 지나면 우리가 대신 취소를 누르고, 왜\n\
+                 멈췄는지를 기록에 남긴다(사용자 취소와 다른 사유다). 무인 실행에 \"언제까지\"를\n\
+                 주는 값이며, 주지 않으면 상한 없이 돈다. `--timeout-secs`와 다르다 —\n\
+                 저쪽은 호스트가 **기다리기를 그만두는** 시각이지 태스크가 멈추는 시각이 아니다\n\
      worktree — 격리 트리 목록(JSON). [--worktree <branch>]를 주면 그 트리를 정리한다.\n\
                  커밋되지 않은 변경이 있으면 지우지 않고 사유를 낸다 — 버리려면 [--force]\n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
@@ -604,6 +625,8 @@ fn real_main() -> Result<i32, String> {
         execution_mode: args.mode,
         // sidecar가 완료 판정에 쓴다 — 무인 실행에서는 "검증되지 않음"을 완료로 보고하지 않는다.
         unattended: args.approve == "autopilot",
+        // **sidecar로 가지 않는다**(39.1절). Rust가 재고 Rust가 집행한다.
+        deadline_ms: args.deadline_secs.map(|s| s * 1_000),
         ..TaskPolicy::default()
     };
 
@@ -1278,13 +1301,9 @@ fn run_task(
         }
         Err(message) => {
             // sidecar가 죽었어도 이벤트 로그로 마지막 상태를 설명할 수 있어야 한다.
-            let _ = host.finish_task(
-                task_id,
-                "FAILED",
-                "TASK_FAILED",
-                Some(&message),
-                json!({ "status": "failed", "summary": message.clone() }),
-            );
+            // **적기 전에 멈춘다**(39.2절) — 여기서는 바로 위에서 sidecar를 내렸으므로 남은
+            // 일이 없지만, 판정을 두 진입점에 따로 적지 않는다.
+            host.abandon_unanswered(task_id, &message);
             Ok(json!({ "status": "failed", "summary": message, "taskId": task_id }))
         }
     }
