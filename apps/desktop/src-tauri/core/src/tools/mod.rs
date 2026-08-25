@@ -633,10 +633,22 @@ impl ToolRuntime {
             .map(Duration::from_millis)
             .unwrap_or(self.default_timeout);
 
+        // **개발자 환경은 명령이 필요로 할 때만 붙는다**(msvc.rs, state-machine 40절).
+        // 준비하지 못해도 막지 않는다 — 탐지가 틀릴 수 있고, 틀린 판정으로 되는 명령을 막는
+        // 것이 못 준비한 채 실행하는 것보다 나쁘다. 대신 무엇을 확인했는지 결과에 남긴다.
+        let developer_env = developer_env_for(&cmd);
+
         // **추가 환경변수는 요청 구조체에서만 온다** — Node의 JSON에서는 읽지 않는다
         // (`ToolRequest::injected_env`의 `skip_deserializing`). 지금 채우는 곳은 phase 훅뿐이다.
-        let execution = run_process(&cmd, cwd.absolute(), timeout, cancel, &request.injected_env)?;
-        self.finish_command(request, start, &cmd, execution)
+        //
+        // 순서: 개발자 환경을 먼저 깔고 요청의 것을 덮는다. 훅이 넘기는 `TOMVERSE_*`와는
+        // 겹치지 않지만, 겹칠 때 이기는 쪽을 정해 두지 않으면 나중에 조용히 갈린다.
+        let mut env: std::collections::BTreeMap<String, String> =
+            developer_env.as_ref().map(|p| p.vars()).unwrap_or_default();
+        env.extend(request.injected_env.clone());
+
+        let execution = run_process(&cmd, cwd.absolute(), timeout, cancel, &env)?;
+        self.finish_command(request, start, &cmd, execution, developer_env)
     }
 
     fn git(
@@ -653,7 +665,7 @@ impl ToolRuntime {
             timeout_ms: None,
         };
         let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default())?;
-        self.finish_command(request, start, &cmd, execution)
+        self.finish_command(request, start, &cmd, execution, None)
     }
 
     /// 브랜치를 remote로 올린다 — pr.rs, state-machine 28절.
@@ -669,7 +681,7 @@ impl ToolRuntime {
         let target = crate::pr::parse_push(&request.args).map_err(|e| e.to_string())?;
         let cmd = target.command();
         let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default())?;
-        self.finish_command(request, start, &cmd, execution)
+        self.finish_command(request, start, &cmd, execution, None)
     }
 
     /// MCP 도구 호출 — mcp.rs, state-machine 23절.
@@ -737,7 +749,7 @@ impl ToolRuntime {
             timeout_ms: None,
         };
         let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default())?;
-        self.finish_command(request, start, &cmd, execution)
+        self.finish_command(request, start, &cmd, execution, None)
     }
 
     fn finish_command(
@@ -746,6 +758,9 @@ impl ToolRuntime {
         start: Instant,
         cmd: &RunCommandArgs,
         execution: Execution,
+        // 개발자 환경 (msvc.rs, 40절). `None`은 **필요 없는 명령이었다**는 뜻이고,
+        // "준비하지 못했다"와 다른 사실이다 — 그 구별은 `Preparation`의 변형이 담는다.
+        developer_env: Option<&crate::msvc::Preparation>,
     ) -> Result<ToolOutcome, String> {
         let combined = format!(
             "$ {}\n\n[stdout]\n{}\n[stderr]\n{}",
@@ -833,6 +848,11 @@ impl ToolRuntime {
             "outputTruncated": output_truncated,
             "outputRef": output_ref,
             "durationMs": execution.duration_ms,
+            // **환경은 argv가 아니다.** 승인 화면이 보여준 argv는 그대로이지만 환경은 달라지므로,
+            // 무엇이 붙었는지(또는 왜 못 붙었는지) 여기 남긴다 — 훅의 `injectedEnv`와 같은
+            // 규율이다(33.5절). 준비하지 못한 경우가 특히 중요하다: 그 명령이 실패하면
+            // 사용자가 읽어야 할 것이 `stdarg.h`가 아니라 이 기록이다.
+            "developerEnv": developer_env,
         });
 
         Ok(ToolOutcome {
@@ -985,6 +1005,99 @@ fn resolve_for_execution(cmd: &RunCommandArgs) -> Result<program::ResolvedProgra
 /// `Command`에 해석된 program/args를 그대로 넘긴다 — 셸을 경유하지 않으므로 인자 안의
 /// 공백이나 메타문자가 재해석되지 않는다. 이게 승인 모달의 표시가 실제 실행과 일치한다는
 /// 보장의 실체다.
+/// 이 프로세스가 준비한 개발자 환경 (msvc.rs, state-machine 40절).
+///
+/// # 성공도 실패도 한 번만 판정한다
+///
+/// 준비는 프로세스를 하나 띄우는 일이다. 명령마다 하면 **그것이 새 세금이 된다** — 이 기능이
+/// 없애려는 바로 그것이다. 그래서 실패도 캐시한다: 못 찾은 상태에서 명령마다 다시 찾으면
+/// 느린 데다 결과도 같다.
+///
+/// 대가는 **VS를 설치한 뒤 앱을 다시 시작해야 한다는 것**이고, 그 사실은 실패 문장이 말한다.
+static DEVELOPER_ENV: std::sync::OnceLock<crate::msvc::Preparation> = std::sync::OnceLock::new();
+
+/// 이 명령에 붙일 개발자 환경. 필요 없는 명령이면 `None`이다 —
+/// **"필요 없었다"와 "준비하지 못했다"는 다른 사실이고**, 기록에서도 갈려야 한다.
+fn developer_env_for(cmd: &RunCommandArgs) -> Option<&'static crate::msvc::Preparation> {
+    // 판정은 `msvc.rs`에 있다 — 플랫폼까지 포함해서. 여기서 `cfg!(windows)`를 읽으면 그
+    // 판정이 Linux에서 검증되지 않는다.
+    if !crate::msvc::applies(program::Platform::current(), &cmd.program, &cmd.args) {
+        return None;
+    }
+    Some(DEVELOPER_ENV.get_or_init(prepare_developer_env))
+}
+
+/// 바깥 세계를 실제로 들여다보는 쪽. **판정은 전부 `msvc.rs`에 있다** — 여기 있으면
+/// Windows에서만 검증할 수 있고, 그러면 이 환경에서 아무것도 확인되지 않는다.
+fn prepare_developer_env() -> crate::msvc::Preparation {
+    use crate::msvc;
+
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let is_file = |p: &Path| p.is_file();
+    let vswhere = |exe: &Path, args: &[&str]| -> Vec<String> {
+        // **환경을 물려주지 않는다**(23.7절과 같은 규율). 조회 도구에 자격증명을 넘길 이유가 없다.
+        let out = Command::new(exe).args(args).env_clear().stdin(Stdio::null()).output();
+        match out {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let search = |dir: &Path| -> Option<std::path::PathBuf> {
+        // **목록이 아니라 검색이다.** 버전·에디션 디렉터리 이름을 우리가 알 수 없다(실측:
+        // 드라이브도 `18`이라는 버전 디렉터리도 하드코딩 후보와 전부 달랐다).
+        //
+        // 깊이를 묶는다 — Program Files 전체를 훑으면 마지막 겹이 가장 비싼 겹이 된다.
+        let root = dir.join("Microsoft Visual Studio");
+        if !root.is_dir() {
+            return None;
+        }
+        ignore::WalkBuilder::new(&root)
+            .hidden(false)
+            .git_ignore(false)
+            .max_depth(Some(8))
+            .build()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name() == "vcvarsall.bat")
+            .map(|e| e.path().to_path_buf())
+    };
+    let run = |_vcvarsall: &Path, args: &[String]| -> Option<String> {
+        // **여기서 부르는 셸은 사용자의 명령이 아니다.** 인자는 전부 우리가 만들었고(원칙 6의
+        // 약속은 사용자 명령에 대한 것이다), 배치 파일은 셸 없이 실행되지 않는다.
+        //
+        // 자격증명은 물려주지 않는다 — 그런데 `PATH`는 넘겨야 한다: vcvarsall이 만드는 PATH가
+        // **우리 PATH 앞에 MSVC를 붙인 것**이어야 Git의 GNU `link.exe` 가림이 풀린다.
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("GOOGLE_API_KEY");
+        let out = command.output().ok()?;
+        // 종료 코드를 판정으로 쓰지 않는다 — vcvarsall은 0으로 끝나고도 환경을 안 잡을 수
+        // 있고, 그 판정은 `msvc.rs`가 `INCLUDE`의 존재로 한다.
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+
+    msvc::prepare(
+        &msvc::Probe {
+            env: &env,
+            is_file: &is_file,
+            vswhere: &vswhere,
+            search: &search,
+        },
+        // x64 고정. 다른 아키텍처를 고르게 하려면 "무엇을 빌드하는가"를 알아야 하고,
+        // 그건 명령 문자열에서 유도할 수 없다.
+        "x64",
+        &run,
+    )
+}
+
 fn run_process(
     cmd: &RunCommandArgs,
     cwd: &Path,

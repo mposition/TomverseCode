@@ -26,6 +26,7 @@ pub mod landing;
 pub mod launcher;
 pub mod mcp;
 pub mod metrics;
+pub mod msvc;
 pub mod paths;
 pub mod policy;
 pub mod pr;

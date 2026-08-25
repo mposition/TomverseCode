@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { TaskEvent } from "../types";
+import { describeDeveloperEnv, toolEventDeservesAttention } from "../lib/developerEnv";
 
 /**
  * 실시간 이벤트 로그.
@@ -52,7 +53,12 @@ type DisplayEvent = Omit<TaskEvent, "taskId"> & { taskId?: string };
 
 export function EventLog({ events, devMode }: { events: DisplayEvent[]; devMode: boolean }) {
   const endRef = useRef<HTMLDivElement>(null);
-  const visible = devMode ? events : events.filter((e) => IMPORTANT.includes(e.type));
+  // 기본 모드에서는 주요 이벤트만. **예외가 하나 있다**(40절): 개발자 환경을 준비하지 못한
+  // 도구 실행은 보여야 한다 — 그 한 줄이 없으면 사용자는 `stdarg.h`만 보게 되고, 그건 원인을
+  // 가리키지 않는다. 정상적으로 준비된 실행은 그대로 조용하다.
+  const visible = devMode
+    ? events
+    : events.filter((e) => IMPORTANT.includes(e.type) || toolEventDeservesAttention(e.payload));
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
@@ -143,6 +149,15 @@ function summarize(event: DisplayEvent): string {
       return truncate(String(p.interpretation ?? p.rationale ?? ""), 120);
     case "CANCELLATION_REQUESTED":
       return `취소 요청됨 — ${String(p.reason ?? "")}`;
+    case "TOOL_COMPLETED": {
+      // **개발자 환경 준비 결과를 여기서 말한다**(40절). 준비하지 못한 채 `cargo build`가
+      // 실패하면 사용자가 보는 것은 `stdarg.h` 한 줄이고, 그 문장은 원인을 가리키지 않는다.
+      // 판정과 문장은 화면 밖(src/lib)에 있다.
+      const env = describeDeveloperEnv((p.output as Record<string, unknown> | undefined)?.developerEnv);
+      const exit = p.exitCode ?? (p.output as Record<string, unknown> | undefined)?.exitCode;
+      const head = `${String(p.tool ?? "")}${exit === undefined || exit === null ? "" : ` (exit ${String(exit)})`}`;
+      return env ? `${head} — ${env}` : head;
+    }
     case "TOOL_SKIPPED_CANCELLED":
       return `취소로 건너뜀: ${String(p.tool ?? "")}`;
     case "VERIFICATION_SKIPPED_CANCELLED":

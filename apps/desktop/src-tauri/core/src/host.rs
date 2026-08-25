@@ -2292,6 +2292,10 @@ fn summarize_output(output: Option<&Value>) -> Value {
         "sizeBytes": serialized.len(),
         // 잘라도 이것만은 남긴다. 정수 하나이고, 이게 없으면 목록 전체가 "성공한 단계들"로 읽힌다.
         "exitCode": value.get("exitCode").cloned().unwrap_or(Value::Null),
+        // **개발자 환경도 같은 이유로 남긴다**(40절). 이 기록이 필요한 순간은 명령이 실패한
+        // 때이고, 실패한 빌드는 출력이 길다 — 즉 잘라내는 조건과 읽어야 하는 조건이 정확히
+        // 겹친다. 여기서 빠지면 사용자는 `stdarg.h` 한 줄만 보게 된다.
+        "developerEnv": value.get("developerEnv").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -2667,6 +2671,25 @@ mod tests {
         host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
         let config = pinned_config(&host, "task-1");
         assert!(config.get("isolation").is_some_and(Value::is_null), "{config}");
+    }
+
+    /// **잘라도 개발자 환경 기록은 남는다**(40절). 이 기록이 필요한 순간은 명령이 실패한
+    /// 때이고, 실패한 빌드는 출력이 길다 — 잘라내는 조건과 읽어야 하는 조건이 겹친다.
+    #[test]
+    fn a_truncated_output_still_says_what_the_environment_was() {
+        let big = "x".repeat(MAX_INLINE_OUTPUT_BYTES);
+        let output = json!({
+            "stdout": big,
+            "exitCode": 1,
+            "developerEnv": { "kind": "notFound", "advice": "TOMVERSE_VCVARSALL" },
+        });
+        let summarized = summarize_output(Some(&output));
+        assert!(summarized.get("preview").is_some(), "{summarized}");
+        assert_eq!(
+            summarized.pointer("/developerEnv/kind").and_then(Value::as_str),
+            Some("notFound"),
+            "{summarized}"
+        );
     }
 
     // ---- 무인 실행의 시한 (39절) ----

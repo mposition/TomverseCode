@@ -425,6 +425,58 @@ fn path_normalization_checks(obs: &Observations) -> Vec<Check> {
     ]
 }
 
+/// 개발자 환경 준비 (`msvc.rs`, product-strategy 12.4절).
+///
+/// **이 묶음은 그물이 놓친 자리에서 왔다.** 위 검사(`windows_only_code_has_a_landing_check`)는
+/// `cfg(windows)`나 `Platform::Windows`를 표식으로 삼는데, `msvc.rs`는 둘 다 쓰지 않는다 —
+/// 바깥 세계를 전부 인자로 받아 Linux에서 검증할 수 있게 만들었기 때문이다. 그래서 표식이
+/// 없고, 그물에도 안 걸린다. **판정 로직이 여기서 검증된다는 것과 그 동작이 Windows에서
+/// 확인됐다는 것은 다른 사실이다.**
+fn developer_env_checks(obs: &Observations) -> Vec<Check> {
+    let (status, detail) = if obs.os == "windows" {
+        (CheckStatus::NeedsHuman, "Windows에서 사람이 확인해야 한다.".to_string())
+    } else {
+        (
+            CheckStatus::NotCheckableHere,
+            format!("여기는 {} — vcvarsall.bat도 MSVC도 이 플랫폼에 없다.", obs.os),
+        )
+    };
+    vec![
+        check(
+            "vcvarsallIsFoundOnARealMachine",
+            "실제 설치에서 vcvarsall.bat을 찾는다 — 그리고 찾지 못하면 확인한 것을 전부 낸다.",
+            status.clone(),
+            format!(
+                "{detail} 탐지 순서(override → vswhere → VSINSTALLDIR → 서브트리 검색)는 Linux에서 검증되지만,                  **실제 설치 구조는 여기서 볼 수 없다** — 실측 머신의 경로는 드라이브도 버전 디렉터리도                  하드코딩 후보와 전부 달랐다."
+            ),
+        ),
+        check(
+            "cargoBuildLinksWithoutADeveloperShell",
+            "개발자 셸이 아닌 곳에서 시작한 앱이 `cargo build`를 링크까지 성공시킨다.",
+            status.clone(),
+            format!(
+                "{detail} 이게 이 기능의 **유일하게 눈에 보이는 증상**이다 — 준비가 안 되면                  `stdarg.h: No such file or directory`로 실패하고, 그 문장은 \"C 컴파일러가 없다\"로 읽힌다."
+            ),
+        ),
+        check(
+            "msvcLinkWinsOverGitLink",
+            "Git for Windows가 PATH에 있어도 `link.exe`가 MSVC의 것으로 해석된다.",
+            status.clone(),
+            format!(
+                "{detail} 준비한 PATH가 우리 PATH **앞에** 와야 성립한다. 증상은                  `link: extra operand`이고, rustc가 붙이는 힌트는 이 경우 오도한다."
+            ),
+        ),
+        check(
+            "aFailedPreparationDoesNotBlockTheCommand",
+            "준비하지 못해도 명령은 그대로 실행되고, 확인 목록이 결과에 남는다.",
+            status,
+            format!(
+                "{detail} 막지 않는 이유는 탐지가 틀릴 수 있기 때문이다(GNU 툴체인 프로젝트).                  **막았는데 틀린 경우**가 못 준비한 채 실행하는 것보다 나쁘다."
+            ),
+        ),
+    ]
+}
+
 /// Windows 전용 동작이 있는데 **착지 목록에 없어도 되는** 파일과 그 이유.
 ///
 /// 목록으로 두는 이유는 `METRICS_WITHOUT_QUESTION`과 같다: 새로 Windows 분기를 넣을 때
@@ -479,6 +531,15 @@ pub fn assess(obs: &Observations) -> LandingReport {
             Group {
                 id: "processGroup",
                 documented_at: "state-machine-and-protocol.md 16.3절 (`proctree.rs`)",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+        {
+            let checks = developer_env_checks(obs);
+            Group {
+                id: "developerEnv",
+                documented_at: "product-strategy.md 12.4절 (`msvc.rs`)",
                 verdict: verdict_of(&checks),
                 checks,
             }
