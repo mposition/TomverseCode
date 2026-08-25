@@ -149,6 +149,10 @@ pub const UNREPORTED_SECTIONS: &[&str] = &[
     "Draft author's stated risks",
     "Proposed patch",
     "Your previous draft was rejected before it was applied",
+    // 게이트 거부 사유(42절). 바로 위 항목과 같은 가족이다 — 우리 문장에 게이트의 사유가
+    // 붙고, 그 사유에는 **경로가 들어갈 수 있다**(경계 위반이면 그 경로가 문장에 있다).
+    // 그래서 우리 지시문으로 접지 않고 여기 둔다.
+    "Your previous plan was refused by the policy gate before anything ran",
     "Attempt number",
     "Failing checks",
     "Checks that passed",

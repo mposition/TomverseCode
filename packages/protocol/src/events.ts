@@ -13,6 +13,13 @@ export type TaskEventType =
   | "DRAFT_RECEIVED"
   | "REVIEW_RECEIVED"
   | "PLAN_CREATED"
+  /**
+   * 계획을 실행하기 **전에** 게이트에 태워 본 결과 (state-machine 42절).
+   *
+   * 거부가 없어도 남긴다 — "미리 태웠다"는 사실이 기록에 없으면 반쯤 적용된 워크스페이스를
+   * 만났을 때 이 검사가 돌기는 했는지 알 수 없다.
+   */
+  | "PLAN_PREFLIGHTED"
   | "APPROVAL_REQUESTED"
   | "APPROVAL_GRANTED"
   | "APPROVAL_DENIED"

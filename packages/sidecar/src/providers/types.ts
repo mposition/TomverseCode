@@ -50,6 +50,13 @@ export interface DraftInput {
    * 아직 아무것도 적용되지 않았고, 모델이 "적용된 변경을 고치는" 모드로 읽으면 안 된다.
    */
   criteriaFeedback?: string[];
+  /**
+   * 직전 계획을 **게이트가 거부해서** 다시 요청하는 경우의 사유 (state-machine 42절).
+   *
+   * `criteriaFeedback`과 섞지 않는다. 저쪽은 "사용자가 정한 것과 어긋난다"이고 이건 "우리가
+   * 받지 않는 모양이다" — 모델이 고쳐야 할 것이 다르므로 프롬프트에서도 다른 문단이다.
+   */
+  gateFeedback?: string[];
 }
 
 export interface ReviewInput {

@@ -1,6 +1,7 @@
 import type {
   EngineRole,
   ModelId,
+  PolicyDecision,
   RiskTier,
   ToolExecuteResult,
   ToolName,
@@ -127,6 +128,19 @@ export class ToolBridge {
 
   async executeRequest(request: ToolRequest): Promise<ToolExecuteResult> {
     return this.transport.request<ToolExecuteResult>("tool.execute", { request });
+  }
+
+  /**
+   * 이 요청이 **어떻게 분류되는지만** 묻는다 — 실행하지 않는다 (state-machine 42절).
+   *
+   * # 게이트를 대체하지 않는다
+   *
+   * 실행 시점에 게이트는 그대로 다시 돈다. 여기서 받은 답은 **미리 보기**이며, 그 사이에
+   * 파일이 생기거나 사라지면 두 판정이 달라질 수 있다. 대체하려고 들면 "미리 본 것"이
+   * 실행 근거가 되고, 그건 게이트를 Node가 대신하는 것이다(원칙 2).
+   */
+  async evaluateRequest(request: ToolRequest): Promise<PolicyDecision> {
+    return this.transport.request<PolicyDecision>("policy.evaluate", { request });
   }
 
   // ---- 읽기 헬퍼 (Context Engine이 쓴다) ----

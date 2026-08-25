@@ -6,6 +6,7 @@ import { normalizeProviderError } from "../src/providers/errors.js";
 import { backoffDelayMs, callWithRetry, DEFAULT_RETRY_POLICY, ProviderCallFailed, withTimeout } from "../src/providers/retry.js";
 import { OpenAIAdapter } from "../src/providers/openai.js";
 import { AnthropicAdapter } from "../src/providers/anthropic.js";
+import { buildDraftPrompt } from "../src/providers/prompts.js";
 import { BUILTIN_MODELS, ModelRegistry } from "../src/routing/registry.js";
 import { makeSnapshot } from "./helpers/fixtures.js";
 import type { ProviderCallContext } from "../src/providers/types.js";
@@ -306,4 +307,35 @@ test("레지스트리는 API 키 값을 담지 않는다", () => {
   for (const entry of BUILTIN_MODELS) {
     assert.ok(/^[A-Z0-9_]+$/.test(entry.apiKeyEnvName), `${entry.apiKeyEnvName}는 환경변수 이름 형태여야 합니다`);
   }
+});
+
+/**
+ * **게이트 거부 사유가 실제로 프롬프트에 실린다** — state-machine 42절.
+ *
+ * 이게 없으면 되돌리기가 눈을 가린 채로 돈다: 모델은 자기 계획이 거부됐다는 것도, 왜인지도
+ * 모른 채 같은 것을 다시 그린다. 그리고 그 공허함은 **아무 테스트도 깨뜨리지 않는다** —
+ * 프롬프트에서 그 문단을 지워도 오케스트레이터 검사는 전부 통과했다(실측).
+ */
+test("게이트 거부 사유가 프롬프트에 실리고, 기준 충돌과 다른 문단으로 간다", () => {
+  const base = {
+    snapshot: makeSnapshot(),
+    userMessage: "고쳐주세요",
+  };
+  const withGate = buildDraftPrompt({ ...base, gateFeedback: ["run_command: 인자에 && 가 있습니다"] });
+  assert.ok(withGate.includes("인자에 && 가 있습니다"), withGate);
+  // **적용된 것이 없다는 사실**을 말한다 — FIX_LOOP처럼 읽히면 모델이 없는 변경을 되돌리려 한다.
+  assert.ok(withGate.includes("Nothing has been applied"), withGate);
+
+  // 없으면 그 문단도 없다 — 빈 문단이 남으면 모델에게 잡음이다.
+  const without = buildDraftPrompt(base);
+  assert.ok(!without.includes("refused by the policy gate"), without);
+
+  // 기준 충돌과 **다른 문단**이다. 모델이 고쳐야 할 것이 다르기 때문이다.
+  const both = buildDraftPrompt({
+    ...base,
+    criteriaFeedback: ["기준과 어긋납니다"],
+    gateFeedback: ["게이트가 거부했습니다"],
+  });
+  assert.ok(both.includes("rejected before it was applied"), both);
+  assert.ok(both.includes("refused by the policy gate"), both);
 });

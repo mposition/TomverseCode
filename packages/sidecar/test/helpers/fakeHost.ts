@@ -45,6 +45,18 @@ export interface FakeHostOptions {
     redraftable?: boolean;
   }[];
   /**
+   * 계획 프리플라이트 응답 override — 도구 이름별 (state-machine 42절).
+   *
+   * **`toolResults`와 따로 둔다.** 프리플라이트는 실행하지 않으므로 그 목록을 소비하면
+   * 실제 실행이 스텁을 하나씩 잃는다.
+   */
+  preflight?: Record<string, { decision?: string; reason?: string; matchedRule?: string; redraftable?: boolean }>;
+  /**
+   * 호출마다 답을 바꿔야 하는 경우 — 되돌린 뒤 두 번째 계획은 지나가야 "되돌린 것이 쓸모
+   * 있었다"가 성립한다. `undefined`를 주면 기본값(자동 승인)이다.
+   */
+  preflightPerCall?: () => { decision?: string; reason?: string; matchedRule?: string; redraftable?: boolean } | undefined;
+  /**
    * `mcp_call` 응답 override (호출 순서대로) — state-machine 31절.
    *
    * **변경 도구와 따로 센다.** 한 목록에 섞으면 MCP 호출 하나가 `apply_patch`용 스텁을
@@ -68,6 +80,8 @@ export interface VerifyStub {
 export class FakeHost {
   readonly events: { type: string; payload: unknown }[] = [];
   readonly toolRequests: ToolRequest[] = [];
+  /** 프리플라이트로 **분류만** 물어본 요청들 — 실행한 것과 따로 센다(42절). */
+  readonly policyChecks: ToolRequest[] = [];
   readonly verifyCalls: { phase: string; attemptNumber: number }[] = [];
   readonly usage: unknown[] = [];
   /** 저장된 인덱스 캐시 — Rust의 `workspace_index_cache` 한 행에 해당한다. */
@@ -162,6 +176,24 @@ export class FakeHost {
         const { request } = params as { request: ToolRequest };
         this.toolRequests.push(request);
         return this.handleTool(request);
+      }
+
+      // 계획 프리플라이트 (state-machine 42절). **실행하지 않고 분류만 답한다.**
+      case "policy.evaluate": {
+        const { request } = params as { request: ToolRequest };
+        this.policyChecks.push(request);
+        const stub = this.options.preflightPerCall?.() ?? this.options.preflight?.[request.tool];
+        return {
+          requestId: request.requestId,
+          decision: stub?.decision ?? "auto_approve",
+          riskLevel: "none",
+          matchedRule: stub?.matchedRule ?? "fake-preflight",
+          reason: stub?.reason ?? "fake",
+          requiresUserApproval: false,
+          normalizedTarget: String((request.args as { path?: unknown }).path ?? ""),
+          redraftable: stub?.redraftable ?? false,
+          decidedAt: new Date().toISOString(),
+        };
       }
 
       default:

@@ -139,6 +139,13 @@ export function buildDraftPrompt(input: {
   userAnswers?: { question: string; answer: string }[];
   acceptanceCriteria?: AcceptanceCriterion[];
   criteriaFeedback?: string[];
+  /**
+   * 게이트가 계획을 거부한 사유 (state-machine 42절).
+   *
+   * **기준 충돌과 다른 문단으로 간다.** 저쪽은 "사용자가 정한 것과 어긋난다"이고 이건 "우리가
+   * 받지 않는 모양이다" — 모델이 고쳐야 할 것이 다르다.
+   */
+  gateFeedback?: string[];
 }): string {
   const parts = [
     "You are the executor in a verification-first coding agent. Your patch will be applied to a real repository and then judged by the project's build/test/lint commands — not by your own confidence.",
@@ -167,9 +174,26 @@ export function buildDraftPrompt(input: {
     );
   }
 
+  parts.push(renderGateFeedback(input.gateFeedback));
   parts.push(renderSnapshot(input.snapshot));
   parts.push(`## Output rules\n${PATCH_RULES}`);
-  return parts.join("\n\n");
+  return parts.filter((p) => p.length > 0).join("\n\n");
+}
+
+/**
+ * 게이트가 계획을 거부했다 — 42절.
+ *
+ * **적용된 것이 없다는 사실을 먼저 말한다.** 이 문단이 FIX_LOOP 문구처럼 읽히면 모델은
+ * "이미 적용된 변경을 고치는" 모드로 들어가고, 없는 변경을 되돌리려 한다.
+ */
+function renderGateFeedback(reasons: string[] | undefined): string {
+  if (!reasons || reasons.length === 0) return "";
+  return (
+    "## Your previous plan was refused by the policy gate before anything ran\n" +
+    reasons.map((r) => `- ${r}`).join("\n") +
+    "\nNothing has been applied to the repository. The refusal is about the **shape of the request**, " +
+    "not about the goal — produce a plan that the gate accepts."
+  );
 }
 
 export function buildReviewPrompt(input: {
@@ -247,6 +271,13 @@ export function buildSingleModelFixPrompt(input: {
   userAnswers?: { question: string; answer: string }[];
   acceptanceCriteria?: AcceptanceCriterion[];
   criteriaFeedback?: string[];
+  /**
+   * 게이트가 계획을 거부한 사유 (state-machine 42절).
+   *
+   * **기준 충돌과 다른 문단으로 간다.** 저쪽은 "사용자가 정한 것과 어긋난다"이고 이건 "우리가
+   * 받지 않는 모양이다" — 모델이 고쳐야 할 것이 다르다.
+   */
+  gateFeedback?: string[];
 }): string {
   const parts = [
     "You are fixing a bug alone — this task was classified as low-complexity, so no second model will review your patch before it is applied.",

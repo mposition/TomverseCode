@@ -427,6 +427,128 @@ test("검증을 실행하지 못한 경우에 '스크립트를 추가하라'고 
 });
 
 /**
+ * **계획을 실행하기 전에 게이트에 태워 본다** — state-machine 42절.
+ *
+ * 이게 없으면 계획의 세 번째 요청이 거부될 때 앞의 둘은 **이미 적용된 채로** 태스크가 끝난다.
+ * 반쯤 적용된 워크스페이스는 모델이 만들려던 것도 사용자가 승인한 것도 아니다.
+ */
+test("게이트가 거부할 계획은 파일을 하나도 건드리지 않고 멈춘다", async () => {
+  const { orchestrator, host } = build(
+    {
+      verifyResults: [{ overall: "pass" }],
+      preflight: { apply_patch: { decision: "deny", matchedRule: "workspace_boundary", reason: "경계를 벗어남" } },
+    },
+    { defaultPatch: VALID_PATCH }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.failureReason, "policy_denied");
+  // ① **아무것도 실행하지 않았다.** 이게 이 절의 전부다.
+  assert.equal(host.toolRequests.filter((r) => r.tool === "apply_patch").length, 0);
+  // ② 그런데 검사는 실제로 했다 — 없으면 ①은 "계획이 비었다"와 구별되지 않는다.
+  assert.ok(host.policyChecks.length > 0, "프리플라이트를 돌지 않았습니다");
+  // ③ 무엇이 막았는지가 보고에 있다.
+  assert.ok(result.summary.includes("경계를 벗어남"), result.summary);
+  assert.ok(host.eventTypes().includes("PLAN_PREFLIGHTED"), host.eventTypes().join(", "));
+});
+
+/**
+ * **요청의 모양 문제라면 모델에게 되돌린다** — 41.8절이 남긴 항목. 게이트가 "그렇게 요청하면
+ * 안 된다"고 말한 것은 모델이 고칠 수 있다.
+ */
+test("모양 문제로 거부된 계획은 모델에게 되돌아간다", async () => {
+  let round = 0;
+  const { orchestrator, host } = build(
+    {
+      verifyResults: [{ overall: "pass" }],
+      // 첫 라운드만 거부한다 — 두 번째 계획은 지나가야 "되돌린 것이 쓸모 있었다"가 성립한다.
+      preflightPerCall: () => {
+        round += 1;
+        return round === 1
+          ? { decision: "deny", matchedRule: "shell_chaining", reason: "인자에 && 가 있습니다", redraftable: true }
+          : undefined;
+      },
+    },
+    { defaultPatch: VALID_PATCH }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "completed", result.summary);
+  // 다시 그린 계획이 실제로 적용됐다.
+  assert.equal(host.toolRequests.filter((r) => r.tool === "apply_patch").length, 1);
+  // 되돌렸다는 사실이 기록에 남는다.
+  assert.ok(host.eventTypes().filter((t) => t === "PLAN_PREFLIGHTED").length >= 2, host.eventTypes().join(", "));
+});
+
+/**
+ * **되돌리기에도 상한이 있다** (원칙 5). 모델이 같은 실수를 계속하면 그 루프는 스스로 끝나야
+ * 한다 — 상한이 없으면 공급자 호출이 무한히 늘고 예산이 그것을 대신 막게 된다.
+ */
+// **시간 상한을 명시한다.** 상한(`reviseRounds`)을 지우고 실측해 보면 이 루프는 끝나지 않는다.
+// 그때 이 옵션이 있으면 30초에 **실패로 표시**되고, 없으면 아무 말 없이 매달린다.
+//
+// 다만 정직하게: 표시된 뒤에도 폭주하는 루프가 이벤트 루프를 붙잡아 **프로세스는 끝나지
+// 않는다.** 그래도 조용히 통과하지는 않는다는 것이 요점이다.
+test("모양 문제가 고쳐지지 않으면 상한에서 멈춘다", { timeout: 30_000 }, async () => {
+  const { orchestrator, host } = build(
+    {
+      verifyResults: [{ overall: "pass" }],
+      // 언제나 거부한다 — 모델이 고치지 못하는 상황이다.
+      preflight: {
+        apply_patch: { decision: "deny", matchedRule: "shell_chaining", reason: "같은 실수", redraftable: true },
+      },
+    },
+    { defaultPatch: VALID_PATCH }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.failureReason, "request_malformed");
+  // **상한만큼만 돈다.** `reviseRounds` 기본값은 2이므로 계획은 셋을 넘지 않는다
+  //  (처음 하나 + 되돌린 둘).
+  const rounds = host.eventTypes().filter((t) => t === "PLAN_PREFLIGHTED").length;
+  assert.ok(rounds <= 3, `되돌리기가 ${rounds}번 돌았습니다 — 상한이 없습니다`);
+  assert.ok(rounds >= 2, `되돌리기가 돌지 않았습니다 (${rounds})`);
+  // 파일은 끝까지 하나도 건드리지 않았다.
+  assert.equal(host.toolRequests.filter((r) => r.tool === "apply_patch").length, 0);
+});
+
+/**
+ * **하나라도 진짜 거부면 다시 그리게 하지 않는다.** 그 초대는 게이트를 두드려 보라는 말이
+ * 되고, 모델은 같은 벽에 다시 부딪힌다.
+ */
+test("진짜 거부가 섞여 있으면 되돌리지 않고 멈춘다", async () => {
+  const { orchestrator, host } = build(
+    {
+      verifyResults: [{ overall: "pass" }],
+      preflight: {
+        apply_patch: { decision: "deny", matchedRule: "workspace_boundary", reason: "경계를 벗어남" },
+      },
+    },
+    { defaultPatch: VALID_PATCH }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.failureReason, "policy_denied");
+  // 초안을 다시 요청하지 않았다 — 프리플라이트가 한 번만 돌았다.
+  assert.equal(host.eventTypes().filter((t) => t === "PLAN_PREFLIGHTED").length, 1);
+});
+
+/**
+ * **거부가 없으면 조용하다** — 다만 검사했다는 사실은 남는다. 남기지 않으면 반쯤 적용된
+ * 워크스페이스를 만났을 때 이 검사가 돌기는 했는지 알 수 없다.
+ */
+test("거부가 없으면 계획이 그대로 실행되고, 검사한 사실이 남는다", async () => {
+  const { orchestrator, host } = build({ verifyResults: [{ overall: "pass" }] }, { defaultPatch: VALID_PATCH });
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+  assert.equal(host.toolRequests.filter((r) => r.tool === "apply_patch").length, 1);
+  const preflighted = host.events.find((e) => e.type === "PLAN_PREFLIGHTED");
+  assert.ok(preflighted, "PLAN_PREFLIGHTED가 없습니다");
+  assert.equal((preflighted.payload as { denied: unknown[] }).denied.length, 0);
+});
+
+/**
  * **거부에도 두 종류가 있다** — state-machine 41.4절.
  *
  * "그건 하면 안 된다"(경계 위반)와 "그렇게 **요청하면** 안 된다"(argv에 든 셸 문법)는 사용자가

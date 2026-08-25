@@ -264,6 +264,14 @@ export class Orchestrator {
   /** 직전 계획이 기준과 충돌해 다시 요청할 때 모델에게 전달할 사유. 재요청 후 비운다. */
   private criteriaFeedback: string[] = [];
   /**
+   * 게이트가 계획을 거부해 다시 요청한 사유 (state-machine 42절).
+   *
+   * **`criteriaFeedback`과 섞지 않는다.** 기준 충돌은 "사용자가 정한 것과 어긋난다"이고
+   * 이건 "우리가 받지 않는 모양이다"이다 — 모델이 고쳐야 할 것이 다르므로 프롬프트에서도
+   * 다른 문단으로 간다.
+   */
+  private gateFeedback: string[] = [];
+  /**
    * 재요청을 유발한 충돌. **결말은 다음 라운드에야 정해지므로** 감지 이벤트와 따로 기억한다 —
    * 한 이벤트에 담으려면 미래를 알아야 한다.
    */
@@ -666,6 +674,7 @@ export class Orchestrator {
     // 재요청 사유는 이번 라운드에서 소비했다. 남겨두면 다음 라운드에도 "직전 초안이
     // 거부됐다"가 붙어 이미 고쳐진 문제를 계속 고치라고 말하게 된다.
     this.criteriaFeedback = [];
+    this.gateFeedback = [];
 
     // ---- 구조적 대조 ----
     //
@@ -833,6 +842,7 @@ export class Orchestrator {
           // 않지만(그래서 PLANNING 게이트가 따로 있다), 넣지 않으면 강제할 대상조차 없다.
           acceptanceCriteria: this.criteriaForPrompt(),
           criteriaFeedback: this.criteriaFeedback.length > 0 ? [...this.criteriaFeedback] : undefined,
+          gateFeedback: this.gateFeedback.length > 0 ? [...this.gateFeedback] : undefined,
         },
           ctx
         ),
@@ -984,6 +994,7 @@ export class Orchestrator {
           userAnswers: this.answers.length > 0 ? this.answers : undefined,
           acceptanceCriteria: this.criteriaForPrompt(),
           criteriaFeedback: this.criteriaFeedback.length > 0 ? [...this.criteriaFeedback] : undefined,
+          gateFeedback: this.gateFeedback.length > 0 ? [...this.gateFeedback] : undefined,
         },
         ctx
       )
@@ -1083,6 +1094,15 @@ export class Orchestrator {
         patch = gate.patch;
         continue;
       }
+
+      // ---- 게이트 프리플라이트 (42절) ----
+      //
+      // **파일을 하나도 건드리기 전에** 계획 전체를 게이트에 태워 본다. 이게 없으면 계획의
+      // 세 번째 요청이 거부될 때 앞의 둘은 이미 적용된 채로 태스크가 끝난다 — 반쯤 적용된
+      // 워크스페이스는 되돌리기가 있어도(19절) 애초에 만들지 않는 편이 낫다.
+      const preflight = await this.preflightPlan(plan);
+      if (preflight.kind === "final") return preflight;
+      if (preflight.kind === "redraft") return { kind: "redraft" };
 
       // ---- AWAITING_APPROVAL / EXECUTING ----
       //
@@ -1208,6 +1228,98 @@ export class Orchestrator {
    * **단, 이미 실행이 시작된 뒤(fix loop 안)라면 되돌리지 않는다.** 초안을 만든 근거인 스냅샷이
    * 이미 낡았기 때문이다. 그때는 결정론적 사실을 근거로 다시 요청하는 FIX_LOOP 경로가 맞다.
    */
+  /**
+   * 계획을 실행하기 **전에** 게이트에 태워 본다 — state-machine 42절.
+   *
+   * # 왜 실행 중간이 아니라 앞인가
+   *
+   * `executePlan`은 요청을 순서대로 실행하고, 거부를 만나면 그 자리에서 태스크를 끝낸다.
+   * 그런데 앞의 요청들은 **이미 적용됐다.** 세 파일짜리 patch에서 세 번째가 막히면 사용자의
+   * 워크스페이스는 두 파일만 바뀐 상태로 남는다 — 그 상태는 모델이 만들려던 것도, 사용자가
+   * 승인한 것도 아니다.
+   *
+   * # 게이트를 대체하지 않는다
+   *
+   * 실행 시점에 게이트는 그대로 다시 돈다. 여기서 보는 것은 **미리 보기**다 — 그 사이에
+   * 파일이 생기거나 사라지면 두 판정이 달라질 수 있고, 그때 정본은 실행 시점의 판정이다.
+   *
+   * # 예측할 수 없는 것
+   *
+   * **사용자의 거부는 여기서 보이지 않는다.** 승인이 필요한 요청은 `require_user_approval`로
+   * 나올 뿐이고, 사용자가 실제로 무엇을 답할지는 물어봐야 안다. 그래서 이 검사는 반쯤 적용된
+   * 상태를 **줄이지 없애지는 못한다** — 없애려면 계획 전체의 승인을 한 번에 받아야 하고,
+   * 그건 항목별 승인(ui-wireframes 4절)과 같은 자리에서 만나는 별개의 결정이다.
+   */
+  private async preflightPlan(
+    plan: ExecutionPlan
+  ): Promise<{ kind: "ok" } | { kind: "redraft" } | { kind: "final"; result: FinalResult }> {
+    const bridge = this.requireBridge();
+    const denied: { requestId: string; tool: string; reason: string; matchedRule: string; redraftable: boolean }[] = [];
+
+    for (const request of plan.toolRequests) {
+      const decision = await bridge.evaluateRequest(request);
+      if (decision.decision !== "deny") continue;
+      denied.push({
+        requestId: request.requestId,
+        tool: request.tool,
+        reason: decision.reason,
+        matchedRule: decision.matchedRule,
+        // **모르면 `false`다**(41.4절). 낡은 코어가 보내지 않은 것을 "다시 그리면 된다"로
+        // 읽으면 실제 거부를 요청 실수로 보고하게 된다.
+        redraftable: decision.redraftable === true,
+      });
+    }
+
+    await this.emit("PLAN_PREFLIGHTED", {
+      planId: plan.planId,
+      checked: plan.toolRequests.length,
+      denied,
+    });
+    if (denied.length === 0) return { kind: "ok" };
+
+    // **하나라도 진짜 거부면 다시 그리게 하지 않는다.** 그 초대는 게이트를 두드려 보라는
+    // 말이 되고(41.4절), 모델은 같은 벽에 다시 부딪힌다.
+    const allRedraftable = denied.every((d) => d.redraftable);
+    const summary = denied.map((d) => `${d.tool}(${d.matchedRule}): ${d.reason}`).join(" / ");
+
+    if (!allRedraftable) {
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          `계획이 게이트를 지나지 못해 **아무것도 적용하지 않았습니다**: ${summary}`,
+          "policy_denied"
+        ),
+      };
+    }
+
+    // 실행이 시작된 뒤(fix loop 안)라면 초안으로 되돌리지 않는다 — 한 루프를 두 counter가
+    // 함께 다스리게 되기 때문이다(`checkCriteriaBeforeExecuting`의 같은 판단).
+    if (this.state.counters.fixLoopRounds > 0) {
+      const retry = await this.enterFixLoopForBadPatch(summary);
+      if (retry.kind === "final") return retry;
+      // fix loop가 새 patch를 줬으면 이번 계획은 버린다. 바깥 루프가 다시 계획을 만든다.
+      return { kind: "redraft" };
+    }
+
+    this.state.counters.reviseRounds += 1;
+    if (this.state.counters.reviseRounds > this.policy.limits.reviseRounds) {
+      // **상한을 넘기면 진행하지 않는다.** 기준 충돌(휴리스틱)과 달리 이건 게이트의 확정
+      // 판정이므로, 그대로 실행하면 반드시 거부된다 — 그때는 반쯤 적용된 상태가 남는다.
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          `요청의 모양을 게이트가 받지 않아 ${this.policy.limits.reviseRounds}회 다시 요청했지만 고쳐지지 않았습니다: ${summary}`,
+          "request_malformed"
+        ),
+      };
+    }
+
+    this.gateFeedback = denied.map((d) => `${d.tool}: ${d.reason}`);
+    return { kind: "redraft" };
+  }
+
   private async checkCriteriaBeforeExecuting(
     plan: ExecutionPlan
   ): Promise<
