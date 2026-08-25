@@ -240,6 +240,13 @@ export type FailureReason =
   | "app_restart_interrupted"
   /** Policy Gate가 계획의 필수 도구를 거부해 계획 자체를 실행할 수 없는 경우 */
   | "policy_denied"
+  /**
+   * 게이트가 거부했지만 **고칠 것이 정책이 아니라 요청의 모양**인 경우 (state-machine 41.4절).
+   *
+   * `policy_denied`와 나누는 이유는 사용자가 갈 곳이 다르기 때문이다 — 저쪽은 정책을 보고,
+   * 이쪽은 볼 것이 없다(모델이 셸 문법을 argv에 넣는 등, 우리가 받지 않는 모양으로 요청했다).
+   */
+  | "request_malformed"
   /** 내부 불변식 위반 (잘못된 상태 전이 등) — 조용히 넘기지 않고 실패로 드러낸다 */
   | "internal_invariant_violated"
   /**

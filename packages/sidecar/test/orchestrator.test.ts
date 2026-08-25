@@ -426,6 +426,35 @@ test("검증을 실행하지 못한 경우에 '스크립트를 추가하라'고 
   assert.ok(result.summary.includes("program not found: npm"), result.summary);
 });
 
+/**
+ * **거부에도 두 종류가 있다** — state-machine 41.4절.
+ *
+ * "그건 하면 안 된다"(경계 위반)와 "그렇게 **요청하면** 안 된다"(argv에 든 셸 문법)는 사용자가
+ * 갈 곳이 다르다. 뭉개서 `policy_denied`로 보고하면 사용자는 정책 설정을 열어 고칠 곳을 찾다가
+ * 아무것도 찾지 못한다 — 고칠 것은 정책이 아니라 모델이 요청한 모양이기 때문이다.
+ */
+test("요청의 모양 때문에 거부된 것은 정책 거부와 다르게 보고된다", async () => {
+  const { orchestrator } = build(
+    {
+      verifyResults: [{ overall: "pass" }],
+      toolResults: [
+        {
+          status: "denied",
+          error: "인자 1번이 셸 연산자(&&)입니다",
+          policyDecision: "deny",
+          redraftable: true,
+        },
+      ],
+    },
+    { defaultPatch: VALID_PATCH }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "failed");
+  assert.equal(result.failureReason, "request_malformed");
+  // 사용자가 정책을 뒤지지 않도록, 요약이 어디를 봐야 하는지 말한다.
+  assert.ok(result.summary.includes("요청의 모양"), result.summary);
+});
+
 test("Policy Gate 거부는 policy_denied로 실패한다", async () => {
   const { orchestrator, host } = build(
     {

@@ -949,7 +949,7 @@ Tomverse Code를 개발하면서 이 환경에서 실제로 발생한 것:
 
 우선순위: **개발자 환경 자동 해석 후 명령 실행**(vcvarsall 상당, MSVC/GNU 도구 충돌 해소) → PowerShell 명령 의미 분석 → Visual Studio/MSBuild·SDK 사전 점검(`vswhere isComplete` 등) → 파일 잠금·긴 경로 처리 → Windows Credential Manager(이미 설계됨) → 관리자 권한 분리(이미 Policy Gate deny 규칙에 있음).
 
-**첫 항목은 구현했다**([state-machine 40절](./state-machine-and-protocol.md), `msvc.rs`). `cargo`·`msbuild` 같은 명령에만 개발자 환경을 붙이고, **막지는 않는다** — 탐지가 틀릴 수 있고(GNU 툴체인 프로젝트) 틀린 판정으로 되는 명령을 막는 것이 못 준비한 채 실행하는 것보다 나쁘다. 대신 준비하지 못하면 확인한 것을 전부 결과에 남긴다: 그러면 실패했을 때 사용자가 읽는 것이 `stdarg.h` 한 줄이 아니라 우리 기록이 되고, ①의 값어치는 거기서 나온다. 탐지 순서는 `scripts/_env.bat`과 **같아야 한다** — 다르면 우리 환경에서 되는 것이 사용자 환경에서 안 되는 상태가 되고, 그 차이는 우리가 가장 늦게 발견한다. **실제 동작은 Windows에서만 확인된다**(`tomverse-host windows-landing`의 `developerEnv` 묶음, 넷 다 `NeedsHuman`).
+**첫 항목은 구현했고**([state-machine 40절](./state-machine-and-protocol.md), `msvc.rs`) **③에도 손을 댔다**([41절](./state-machine-and-protocol.md), `shell_habits.rs`) — 모델이 요청한 `ls`·`grep`·`rm`을 못 찾았을 때 **같은 일을 하는 우리 도구**를 가리키고, argv에 든 `&&`는 실행 전에 거부한다. 그 교정은 Windows 교정이면서 동시에 보안 이득이다: 셸로 지우는 것보다 `delete_file`이 낫다(게이트가 경로를 알고 롤백이 그 변경을 안다). 곁가지로 **"정책이 거부했습니다"가 사용자를 엉뚱한 곳으로 보내고 있었다** — 고칠 것이 정책인 거부와 요청의 모양인 거부를 갈랐다(41.4절). `cargo`·`msbuild` 같은 명령에만 개발자 환경을 붙이고, **막지는 않는다** — 탐지가 틀릴 수 있고(GNU 툴체인 프로젝트) 틀린 판정으로 되는 명령을 막는 것이 못 준비한 채 실행하는 것보다 나쁘다. 대신 준비하지 못하면 확인한 것을 전부 결과에 남긴다: 그러면 실패했을 때 사용자가 읽는 것이 `stdarg.h` 한 줄이 아니라 우리 기록이 되고, ①의 값어치는 거기서 나온다. 탐지 순서는 `scripts/_env.bat`과 **같아야 한다** — 다르면 우리 환경에서 되는 것이 사용자 환경에서 안 되는 상태가 되고, 그 차이는 우리가 가장 늦게 발견한다. **실제 동작은 Windows에서만 확인된다**(`tomverse-host windows-landing`의 `developerEnv` 묶음, 넷 다 `NeedsHuman`).
 
 ## 13. 로드맵
 

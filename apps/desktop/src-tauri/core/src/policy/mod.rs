@@ -67,6 +67,9 @@ impl PolicyGate {
     /// 모든 도구 실행이 반드시 통과하는 단일 지점.
     pub fn evaluate(&self, request: &ToolRequest, root: &WorkspaceRoot, task_policy: &TaskPolicy) -> PolicyDecision {
         let outcome = self.classify(request, root, task_policy);
+        // **거부에도 두 종류가 있다**(41.4절). 판정을 여기 한 곳에서 유도한다 — `Outcome`마다
+        // 필드를 채우게 두면 새 거부를 만든 사람이 정하지 않고 지나간다.
+        let redraftable = matches!(outcome.decision, Decision::Deny) && redraftable(&outcome.matched_rule);
         PolicyDecision {
             request_id: request.request_id.clone(),
             decision: outcome.decision,
@@ -76,6 +79,7 @@ impl PolicyGate {
             requires_user_approval: matches!(outcome.decision, Decision::RequireUserApproval),
             normalized_target: outcome.normalized_target,
             unblocked_by: outcome.unblocked_by,
+            redraftable,
             decided_at: now_iso(),
         }
     }
@@ -308,6 +312,25 @@ impl PolicyGate {
             }
         };
 
+        // 1.5) **모델의 셸 습관**(state-machine 41절). argv 계약은 지켰지만 `&&`로 명령을
+        //      이으려 한 경우다 — 우리는 셸을 쓰지 않으므로 그 토큰은 프로그램에 문자 그대로
+        //      전달되고, 실패는 원인과 멀어진다. 여기서 잡으면 모델이 받는 것이 "알 수 없는
+        //      인자 오류"가 아니라 "나눠서 요청하라"가 된다.
+        //
+        //      게이트에서 하는 이유: 실행 전에 잡아야 하고, Node가 지키면 장악당한 Node에서
+        //      사라진다. 그리고 이건 **판정**이지 편의가 아니다 — 실행되면 잘못 실행된다.
+        if let Some(advice) = crate::shell_habits::chaining_in(&cmd.args) {
+            return Outcome {
+                decision: Decision::Deny,
+                risk_level: RiskLevel::Prohibited,
+                matched_rule: advice.habit.to_string(),
+                reason: advice.message,
+                normalized_target: cmd.display(),
+                // 정책으로 열 수 없다. 셸을 켜는 스위치는 없고, 만들지도 않는다.
+                unblocked_by: PolicyLever::HumanOnly,
+            };
+        }
+
         // 2) cwd가 workspace 내부인지. 밖이면 규칙을 볼 필요조차 없다.
         let cwd_safe = match root.resolve_existing(&cmd.cwd) {
             Ok(safe) => safe,
@@ -412,6 +435,24 @@ impl PolicyGate {
             },
         }
     }
+}
+
+/// 이 거부는 **요청을 다시 그리면 지나갈 수 있는가** (state-machine 41.4절).
+///
+/// # 두 종류의 거부
+///
+/// "그건 하면 안 된다"(워크스페이스 밖 쓰기, `git push --force`)와 "그렇게 **요청하면** 안
+/// 된다"(셸 문자열, argv에 든 `&&`)는 다른 사실이다. 뭉개면 보고가 "정책이 거부했습니다"가
+/// 되고, 사용자는 정책 설정을 열어 고칠 곳을 찾다가 아무것도 찾지 못한다 — 고칠 것은 정책이
+/// 아니라 모델이 요청한 모양이기 때문이다.
+///
+/// **목록을 좁게 둔다.** 경계 위반(`*_outside_workspace`)은 여기 넣지 않는다: 다시 그리면
+/// 지나갈 수 있는 것은 맞지만, 그 초대는 게이트를 두드려 보라는 말이 된다.
+pub fn redraftable(matched_rule: &str) -> bool {
+    matches!(
+        matched_rule,
+        "argv_contract_violation" | "malformed_tool_args" | "shell_chaining"
+    )
 }
 
 struct Outcome {
@@ -1133,6 +1174,83 @@ mod tests {
         assert_eq!(d.decision, Decision::AutoApprove);
         assert_eq!(d.normalized_target, "src/app.ts");
         assert!(!d.requires_user_approval);
+    }
+
+    /// **모델이 `&&`로 명령을 이으려 하면 실행 전에 잡는다**(41절). 실행하면 그 토큰이
+    /// 프로그램에 문자 그대로 전달되고, 실패는 원인과 멀어진다.
+    #[test]
+    fn shell_chaining_in_argv_is_refused_with_something_to_do() {
+        let (_d, root) = setup();
+        let d = gate().evaluate(
+            &request(
+                ToolName::RunCommand,
+                json!({ "program": "npm", "args": ["test", "&&", "npm", "run", "lint"], "cwd": "." }),
+            ),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert_eq!(d.decision, Decision::Deny);
+        assert_eq!(d.matched_rule, "shell_chaining");
+        // 모델이 다음에 할 일이 문장에 있어야 한다 — "잘못됐다"에서 끝나면 같은 모양을 다시 낸다.
+        assert!(d.reason.contains("나눠서"), "{}", d.reason);
+        // 정책으로 열 수 없다. 셸을 켜는 스위치는 없다.
+        assert_eq!(d.unblocked_by, crate::types::PolicyLever::HumanOnly);
+    }
+
+    /// **거부에도 두 종류가 있다**(41.4절). 뭉개면 보고가 "정책이 거부했습니다"가 되고,
+    /// 사용자는 정책 설정에서 고칠 곳을 찾다가 아무것도 찾지 못한다.
+    #[test]
+    fn a_malformed_request_is_marked_differently_from_a_real_refusal() {
+        let (_d, root) = setup();
+        let shape = gate().evaluate(
+            &request(
+                ToolName::RunCommand,
+                json!({ "program": "npm", "args": ["test", "&&", "ls"], "cwd": "." }),
+            ),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert!(shape.redraftable, "{}", shape.matched_rule);
+
+        // 경계 위반은 **다시 그리라고 초대하지 않는다** — 그 초대는 게이트를 두드려 보라는 말이다.
+        let boundary = gate().evaluate(
+            &request(ToolName::CreateFile, json!({ "path": "/tmp/evil.txt", "content": "x" })),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert_eq!(boundary.decision, Decision::Deny);
+        assert!(!boundary.redraftable, "{}", boundary.matched_rule);
+    }
+
+    /// 거부가 아닌 결정에는 이 표시가 붙지 않는다 — 붙으면 승인 요청이 "요청이 잘못됐다"로 읽힌다.
+    #[test]
+    fn only_denials_carry_the_mark() {
+        let (_d, root) = setup();
+        let allowed = gate().evaluate(
+            &request(ToolName::ReadFile, json!({ "path": "src/app.ts" })),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert!(!allowed.redraftable);
+    }
+
+    /// **거짓 양성이 이 검사에서 가장 비싼 실패다.** 정당한 인자를 막으면 사용자는 우리가
+    /// 고장 났다고 읽는다.
+    #[test]
+    fn ordinary_commands_still_pass_the_shell_habit_check() {
+        let (_d, root) = setup();
+        for args in [
+            json!(["test"]),
+            // find는 `;`를 인자로 받고, 커밋 메시지 안의 `&&`는 문자열의 일부다.
+            json!(["commit", "-m", "fix: a && b"]),
+        ] {
+            let d = gate().evaluate(
+                &request(ToolName::RunCommand, json!({ "program": "npm", "args": args, "cwd": "." })),
+                &root,
+                &TaskPolicy::default(),
+            );
+            assert_ne!(d.matched_rule, "shell_chaining", "{args} — {}", d.reason);
+        }
     }
 
     #[test]

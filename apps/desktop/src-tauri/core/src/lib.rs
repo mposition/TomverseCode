@@ -35,6 +35,7 @@ pub mod reproduce;
 pub mod session_memory;
 pub mod settings;
 pub mod sidecar;
+pub mod shell_habits;
 pub mod skills;
 pub mod store;
 pub mod time;

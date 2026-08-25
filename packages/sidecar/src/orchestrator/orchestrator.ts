@@ -1443,6 +1443,21 @@ export class Orchestrator {
               ),
             };
           }
+          // **거부에도 두 종류가 있다**(41.4절). 게이트가 "하면 안 된다"고 한 것과 "그렇게
+          // 요청하면 안 된다"고 한 것은 사용자가 갈 곳이 다르다 — 뭉개서 "정책이 거부했습니다"로
+          // 보고하면 사용자는 정책 설정을 열어 고칠 곳을 찾다가 아무것도 찾지 못한다.
+          //
+          // **판정은 Rust가 준다.** 규칙 이름으로 여기서 다시 판정하면 두 곳이 갈린다(24.3절).
+          if (policy.decision === "deny" && policy.redraftable) {
+            return {
+              kind: "final",
+              result: await this.finish(
+                "failed",
+                `요청의 모양을 게이트가 받지 않았습니다 (${request.tool}): ${denialReason}`,
+                "request_malformed"
+              ),
+            };
+          }
           return {
             kind: "final",
             result: await this.finish(

@@ -249,6 +249,7 @@ mod tests {
             requires_user_approval: false,
             normalized_target: String::new(),
             unblocked_by: crate::types::PolicyLever::NotApplicable,
+            redraftable: false,
             decided_at: "2026-01-01T00:00:00Z".into(),
         }
     }

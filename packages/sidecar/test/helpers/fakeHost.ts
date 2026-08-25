@@ -41,6 +41,8 @@ export interface FakeHostOptions {
     status: "ok" | "error" | "denied" | "timeout" | "cancelled";
     error?: string;
     policyDecision?: string;
+    /** 거부가 **요청의 모양** 때문인가 (state-machine 41.4절). Rust가 정하는 값이다. */
+    redraftable?: boolean;
   }[];
   /**
    * `mcp_call` 응답 override (호출 순서대로) — state-machine 31절.
@@ -258,6 +260,7 @@ export class FakeHost {
             reason: stub.error ?? "fake",
             matchedRule: "fake",
             normalizedTarget: String(request.args.path ?? ""),
+            redraftable: stub.redraftable ?? false,
           },
         };
       }

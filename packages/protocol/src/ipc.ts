@@ -159,6 +159,13 @@ export interface ToolExecuteResult {
     reason: string;
     matchedRule: string;
     normalizedTarget: string;
+    /**
+     * 이 거부가 **요청의 모양** 때문인가 (state-machine 41.4절).
+     *
+     * 낡은 코어는 보내지 않으므로 선택 필드다. **없으면 `false`로 읽는다** — 모르는 것을
+     * "다시 그리면 된다"로 읽으면 실제 거부를 요청 실수로 보고하게 된다.
+     */
+    redraftable?: boolean;
   };
 }
 

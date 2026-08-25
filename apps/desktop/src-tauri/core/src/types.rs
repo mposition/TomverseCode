@@ -239,6 +239,12 @@ pub struct PolicyDecision {
     /// 승인이 필요하다면, 사용자가 **미리** 그것을 넓힐 수 있는 정책 레버.
     #[serde(rename = "unblockedBy")]
     pub unblocked_by: PolicyLever,
+    /// 이 거부가 **요청의 모양** 때문인가 (state-machine 41.4절).
+    ///
+    /// "하면 안 된다"와 "그렇게 요청하면 안 된다"를 뭉개면 보고가 "정책이 거부했습니다"가
+    /// 되고, 사용자는 정책 설정에서 고칠 곳을 찾다가 아무것도 찾지 못한다.
+    #[serde(rename = "redraftable", default)]
+    pub redraftable: bool,
     #[serde(rename = "decidedAt")]
     pub decided_at: String,
 }

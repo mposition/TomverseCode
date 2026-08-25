@@ -380,11 +380,21 @@ fn not_found_message(program: &str, env: &ResolveEnv<'_>) -> String {
     } else {
         env.pathext
     };
-    format!(
+    let base = format!(
         "{program}을(를) 실행할 수 없습니다: PATH에서 찾지 못했습니다.\n  \
          검색한 디렉터리 수: {dirs}\n  시도한 확장자: {pathext}\n  \
          해당 도구가 설치되어 있고 PATH에 있는지 확인하세요."
-    )
+    );
+    // **모델의 Unix 편향을 여기서 교정한다**(state-machine 41절, product-strategy 12.3③).
+    // 이 문장의 주 독자는 사용자가 아니라 모델이다 — 도구 실패는 프롬프트로 돌아가고,
+    // "못 찾았다"에서 끝나면 모델은 같은 모양을 다시 시도한다.
+    //
+    // **해석이 실패한 뒤에만** 붙는다. `ls`가 PATH에 실제로 있으면(Git for Windows가 깔린
+    // 머신이 그렇다) 그대로 실행된다 — 우리가 사용자의 환경을 이기지 않는다.
+    match crate::shell_habits::alternative_for(program) {
+        Some(advice) => format!("{base}\n  {}", advice.message),
+        None => base,
+    }
 }
 
 #[cfg(test)]
@@ -427,6 +437,43 @@ mod tests {
             r"C:\Program Files\Git\cmd\git.exe",
             r"C:\Users\me\.cargo\bin\cargo.exe",
         ])
+    }
+
+    /// **못 찾았을 때 모델이 다음에 할 일을 말한다**(41절). 이 문장은 프롬프트로 돌아가므로,
+    /// "못 찾았다"에서 끝나면 모델은 같은 모양을 다시 시도한다.
+    #[test]
+    fn a_unix_command_that_is_missing_points_at_the_tool_that_replaces_it() {
+        let fs = node_install();
+        let env = win_env(&fs, "");
+        let err = resolve_program("ls", &[], &env).unwrap_err();
+        assert!(err.message.contains("list_files"), "{}", err.message);
+        // 사실 자체도 남아 있어야 한다 — 안내가 원인을 덮으면 안 된다.
+        assert!(err.message.contains("PATH"), "{}", err.message);
+    }
+
+    /// 대응 도구가 없으면 **지어내지 않는다.**
+    #[test]
+    fn a_missing_command_without_an_equivalent_gets_no_extra_advice() {
+        let fs = node_install();
+        let env = win_env(&fs, "");
+        let err = resolve_program("mv", &[], &env).unwrap_err();
+        assert!(err.message.contains("PATH"), "{}", err.message);
+        assert!(!err.message.contains("도구로 요청하세요"), "{}", err.message);
+    }
+
+    /// **PATH에 실제로 있으면 그대로 실행된다** — 우리가 사용자의 환경을 이기지 않는다.
+    /// Git for Windows가 깔린 머신에는 `ls.exe`가 있다.
+    #[test]
+    fn a_unix_command_that_actually_exists_is_not_second_guessed() {
+        let fs = Fs::new(&[r"C:\Program Files\Git\usr\bin\ls.exe"]);
+        let env = ResolveEnv {
+            platform: Platform::Windows,
+            path: r"C:\Program Files\Git\usr\bin",
+            pathext: "",
+            is_file: &fs.probe(),
+        };
+        let resolved = resolve_program("ls", &[], &env).expect("있는데 거부했습니다");
+        assert_eq!(resolved.kind, ResolutionKind::DirectExecutable);
     }
 
     const WIN_PATH: &str = r"C:\Program Files\nodejs;C:\Program Files\Git\cmd;C:\Users\me\.cargo\bin";
