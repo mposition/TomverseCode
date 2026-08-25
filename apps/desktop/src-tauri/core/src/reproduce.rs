@@ -867,7 +867,7 @@ pub fn apply(export: &Value, opts: &ApplyOptions, acknowledged: Option<&str>) ->
                 status: outcome.result.status.as_str().to_string(),
                 exit_code,
                 recorded_exit_code: step.recorded_exit_code,
-                pre_image_ref: outcome.mutation.as_ref().and_then(|m| m.pre_image.content_ref.clone()),
+                pre_image_ref: outcome.mutations.first().and_then(|m| m.pre_image.content_ref.clone()),
                 error: outcome.result.error.clone(),
             });
 

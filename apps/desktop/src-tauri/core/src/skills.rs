@@ -111,6 +111,7 @@ pub const ALL_TOOLS: &[ToolName] = &[
     ToolName::ApplyPatch,
     ToolName::CreateFile,
     ToolName::DeleteFile,
+    ToolName::MoveFile,
     ToolName::RunCommand,
     ToolName::GitStatus,
     ToolName::GitDiff,

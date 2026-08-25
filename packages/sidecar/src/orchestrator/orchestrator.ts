@@ -9,6 +9,7 @@ import type {
   ExperimentControls,
   ExecutionPlan,
   FailureReason,
+  FileMove,
   FinalResult,
   McpCallRequest,
   RoutingDecision,
@@ -549,6 +550,7 @@ export class Orchestrator {
     // 상한은 `reviseRounds`가 진다 — 실행 전 합의 실패에 이미 배정된 예산이다.
     for (;;) {
       let patch: string;
+      let moves: FileMove[] | undefined;
       for (;;) {
         if (await this.cancelledHere()) return this.finish("cancelled", "분석 중 취소됨");
 
@@ -556,6 +558,9 @@ export class Orchestrator {
 
         if (outcome.kind === "patch") {
           patch = outcome.patch;
+          // **이동은 patch와 함께 나른다**(44절). 따로 두면 되돌아갔을 때 낡은 초안의 이동이
+          // 새 patch에 붙는다.
+          moves = outcome.moves;
           break;
         }
         if (outcome.kind === "final") {
@@ -565,7 +570,7 @@ export class Orchestrator {
       }
 
       // ---- PLANNING → EXECUTING → VERIFYING (fix loop 포함) ----
-      const executed = await this.executeAndVerifyLoop(patch);
+      const executed = await this.executeAndVerifyLoop(patch, moves);
       if (executed.kind === "final") return executed.result;
       // executed.kind === "redraft" — 기준 게이트가 되돌렸다. 초안부터 다시.
     }
@@ -770,7 +775,9 @@ export class Orchestrator {
               ),
             };
           }
-          return { kind: "patch", patch };
+          // **이동도 함께 나른다**(44절). 검수자는 이동을 거부할 방법이 없지만(44.8절),
+          // 게이트가 이동마다 사용자 승인을 요구하는 것이 그 자리의 backstop이다.
+          return { kind: "patch", patch, moves: proposal.moves };
         }
 
         case "REVISE": {
@@ -789,7 +796,9 @@ export class Orchestrator {
           const revised = decision.revisedPatch;
           if (revised && revised.trim().length > 0) {
             // 검수자가 수정본을 직접 제시했으면 그것을 쓴다 (문서 4절 revisedPatch).
-            return { kind: "patch", patch: revised };
+            // 검수자가 고친 것은 patch다. 이동은 실행자의 초안 그대로 실린다 — 수정본이
+            // 옮긴 뒤 경로를 기준으로 쓰여 있을 수 있으므로 여기서 떨어뜨리면 그 patch가 깨진다.
+            return { kind: "patch", patch: revised, moves: proposal.moves };
           }
           // 수정본 없이 REVISE만 왔으면 초안을 다시 검토시킬 근거가 없다 — 초안을 그대로
           // 재검토해도 같은 결과가 나오므로 루프를 태우지 않고 실패로 확정한다.
@@ -1027,7 +1036,9 @@ export class Orchestrator {
             result: await this.finish("failed", "단일 모델이 ACCEPT했으나 patch가 없습니다.", "internal_invariant_violated"),
           };
         }
-        return { kind: "patch", patch };
+        // 단일 모델 경로에도 같은 자리를 둔다(44절) — 여기 두지 않으면 `fast` 모드에서만
+        // 이동이 조용히 사라지고, 사용자는 모드에 따라 다른 동작을 본다.
+        return { kind: "patch", patch, moves: result.moves };
       }
       case "REJECT":
         return { kind: "final", result: await this.finishRejected(result.rejectionReason ?? result.rationale) };
@@ -1045,9 +1056,18 @@ export class Orchestrator {
    * fix loop 상한이 이 루프의 유일한 종료 보장이다.
    */
   private async executeAndVerifyLoop(
-    initialPatch: string
+    initialPatch: string,
+    initialMoves: FileMove[] | undefined
   ): Promise<{ kind: "final"; result: FinalResult } | { kind: "redraft" }> {
     let patch = initialPatch;
+    /**
+     * 이동은 **첫 계획에서만** 실린다 (state-machine 44절).
+     *
+     * fix loop는 같은 초안의 이동을 다시 계획에 넣으면 안 된다 — 이미 옮겨졌으므로 `from`이
+     * 없고, 그 실패는 "고치려는 시도"처럼 보이지만 사실은 우리가 같은 일을 두 번 시킨 것이다.
+     * 되돌아가는 경우(redraft)에는 새 초안이 자기 이동을 가지고 온다.
+     */
+    let moves = initialMoves;
 
     for (;;) {
       if (await this.cancelledHere()) return { kind: "final", result: await this.finish("cancelled", "실행 중 취소됨") };
@@ -1062,7 +1082,10 @@ export class Orchestrator {
           plan: [],
           requestedBy: this.executorRequester(),
           attempt: this.state.counters.fixLoopRounds,
+          moves,
         });
+        // 실었으면 비운다. 남겨두면 fix loop가 같은 이동을 다시 시킨다.
+        moves = undefined;
       } catch (error) {
         if (error instanceof PlanningError || error instanceof ValidationError) {
           // 모델이 낸 patch가 계획으로 변환되지 않는다. fix loop를 태울 수 있으면 태운다 —
@@ -2754,7 +2777,10 @@ function describeCommit(outcome: CommitOutcome): string | null {
 }
 
 type PathOutcome =
-  | { kind: "patch"; patch: string }
+  // **이동은 patch와 함께 나온다**(state-machine 44절). unified diff가 이동을 표현하지 못하므로
+  // 따로 나르되, 같은 초안에서 나온 것이라는 사실이 타입에 남아야 한다 — 따로 두면 되돌아갔을
+  // 때 낡은 초안의 이동이 새 patch에 붙는다.
+  | { kind: "patch"; patch: string; moves?: FileMove[] }
   | { kind: "retry" }
   | { kind: "final"; result: FinalResult };
 

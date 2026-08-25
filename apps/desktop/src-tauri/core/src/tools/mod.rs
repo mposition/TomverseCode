@@ -52,7 +52,13 @@ pub struct ToolRuntime {
 /// "이벤트와 상태를 같은 트랜잭션에 쓴다"는 불변식을 지킬 수 있기 때문이다.
 pub struct ToolOutcome {
     pub result: ToolResult,
-    pub mutation: Option<FileMutationRecord>,
+    /// 이 요청이 남긴 파일 변경들.
+    ///
+    /// **`Option` 하나가 아니라 목록인 이유**(state-machine 44절): `move_file`은 한 요청으로
+    /// 두 파일을 바꾼다(원본이 사라지고 대상이 생긴다). 하나만 기록하면 되돌리기가 절반만
+    /// 알게 되고, 그러면 이동은 되돌려지지 않는다. 타입을 바꾸면 컴파일러가 소비하는 자리를
+    /// 전부 지목한다 — 사람이 기억할 규칙으로 두지 않는다.
+    pub mutations: Vec<FileMutationRecord>,
     /// 출력이 커서 artifact로 밀어낸 경우의 참조
     pub output_ref: Option<String>,
     /// UI diff 패널용 unified diff (파일 변경 도구일 때만)
@@ -156,7 +162,7 @@ impl ToolRuntime {
                     completed_at: now_iso(),
                     denial_kind: None,
                 },
-                mutation: None,
+                mutations: Vec::new(),
                 output_ref: None,
                 diff: None,
             },
@@ -174,7 +180,7 @@ impl ToolRuntime {
                 completed_at: now_iso(),
                 denial_kind: Some(kind),
             },
-            mutation: None,
+            mutations: Vec::new(),
             output_ref: None,
             diff: None,
         }
@@ -191,7 +197,7 @@ impl ToolRuntime {
                 completed_at: now_iso(),
                 denial_kind: None,
             },
-            mutation: None,
+            mutations: Vec::new(),
             output_ref: None,
             diff: None,
         }
@@ -210,6 +216,7 @@ impl ToolRuntime {
             ToolName::CreateFile => self.create_file(request, start, cancel),
             ToolName::ApplyPatch => self.apply_patch(request, start, cancel),
             ToolName::DeleteFile => self.delete_file(request, start, cancel),
+            ToolName::MoveFile => self.move_file(request, start, cancel),
             ToolName::RunCommand | ToolName::RunTests => self.run_command(request, start, cancel),
             ToolName::GitStatus => self.git(request, start, &["status", "--porcelain=v1", "--branch"], cancel),
             ToolName::GitDiff => self.git_diff(request, start, cancel),
@@ -465,7 +472,7 @@ impl ToolRuntime {
             start,
             json!({ "path": safe.relative(), "created": !existed, "bytesWritten": content.len() }),
         )?;
-        outcome.mutation = Some(mutation);
+        outcome.mutations = vec![mutation];
         outcome.diff = if diff.is_empty() { None } else { Some(diff) };
         Ok(outcome)
     }
@@ -538,7 +545,7 @@ impl ToolRuntime {
                 "bytesAfter": after.len(),
             }),
         )?;
-        outcome.mutation = Some(mutation);
+        outcome.mutations = vec![mutation];
         outcome.diff = if diff.is_empty() { None } else { Some(diff) };
         Ok(outcome)
     }
@@ -581,7 +588,113 @@ impl ToolRuntime {
         };
 
         let mut outcome = self.ok_json(request, start, json!({ "path": safe.relative(), "deleted": true }))?;
-        outcome.mutation = Some(mutation);
+        outcome.mutations = vec![mutation];
+        Ok(outcome)
+    }
+
+    /// 파일 하나를 다른 경로로 옮긴다 — state-machine 44절.
+    ///
+    /// # 덮어쓰지 않는다
+    ///
+    /// 대상이 이미 있으면 **거부한다.** 덮어쓰기는 삭제를 이동 안에 숨기는 것이고, 승인 화면이
+    /// "옮깁니다"라고 말한 것과 실제로 일어나는 일(그 자리의 파일이 사라진다)이 달라진다.
+    /// 정말 덮어써야 하면 사용자가 지우는 것을 먼저 승인하면 된다 — 우리가 대신 고르지 않는다.
+    ///
+    /// # 변경을 **둘로** 기록한다
+    ///
+    /// 요청은 하나지만 파일 시스템에서 일어난 일은 둘이다: 원본이 사라졌고 대상이 생겼다.
+    /// 되돌리기는 그 두 사실로 복원한다(기존 기계를 그대로 쓴다 — 이동 전용 복원 경로를
+    /// 만들지 않는다).
+    ///
+    /// # 내용을 읽어 옮기지 않는다
+    ///
+    /// `std::fs::rename`을 쓴다. 읽어서 쓰고 지우면 큰 파일에서 느리고, 중간에 죽으면 두
+    /// 곳에 남는다. 다만 **되돌리기용 pre-image는 읽어 둔다** — 그건 복원의 근거다.
+    fn move_file(
+        &self,
+        request: &ToolRequest,
+        start: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, String> {
+        let from = require_str_arg(request, "from")?;
+        let to = require_str_arg(request, "to")?;
+        let from_safe = self.root.resolve_existing(&from).map_err(|e| e.to_string())?;
+        let to_safe = self.root.resolve_for_create(&to).map_err(|e| e.to_string())?;
+
+        if from_safe.absolute().is_dir() {
+            // `delete_file`과 같은 이유다 — 디렉터리는 되돌리기 기록을 파일 단위로 남기는
+            // 구조와 맞지 않고, 잘못 승인했을 때의 피해가 비대칭적으로 크다.
+            return Err(format!("{}는 디렉터리임 — move_file은 파일만 옮긴다", from_safe.relative()));
+        }
+        if to_safe.absolute().exists() {
+            return Err(format!(
+                "{}가 이미 있음 — move_file은 덮어쓰지 않는다 (덮어쓰려면 그 파일 삭제를 먼저 승인할 것)",
+                to_safe.relative()
+            ));
+        }
+        if from_safe.relative() == to_safe.relative() {
+            return Err("from과 to가 같은 경로임".to_string());
+        }
+
+        let before = std::fs::read_to_string(from_safe.absolute()).unwrap_or_default();
+        if cancel.is_cancelled() {
+            return Ok(self.cancelled(request, start, "취소 요청으로 파일 이동을 수행하지 않음"));
+        }
+
+        // pre-image는 **옮기기 전에** 잡는다. 옮긴 뒤에는 원본이 없다.
+        let from_pre = self.capture_pre_image(request, from_safe.relative(), true, &before)?;
+        if let Some(parent) = to_safe.absolute().parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(from_safe.absolute(), to_safe.absolute()).map_err(|e| e.to_string())?;
+
+        // post-image도 남긴다 — 되돌리기가 "대상이 생겼다"를 지우려면 무엇이 생겼는지 알아야 한다.
+        let post_stored = self
+            .artifacts
+            .put_text(
+                &request.task_id,
+                &format!("{}-{}-post.txt", request.request_id, flatten_path(to_safe.relative())),
+                &before,
+            )
+            .map_err(|e| e.to_string())?;
+        let post = ImageRef {
+            existed: true,
+            content_ref: Some(post_stored.artifact_ref),
+            sha256: Some(post_stored.sha256),
+        };
+        let mutations = vec![
+            // ① 원본이 사라졌다 — `delete_file`이 남기는 것과 같은 모양이다.
+            FileMutationRecord {
+                request_id: request.request_id.clone(),
+                task_id: request.task_id.clone(),
+                path: from_safe.relative().to_string(),
+                pre_image: from_pre,
+                post_image: ImageRef {
+                    existed: false,
+                    content_ref: None,
+                    sha256: None,
+                },
+            },
+            // ② 대상이 생겼다 — `create_file`이 남기는 것과 같은 모양이다.
+            FileMutationRecord {
+                request_id: request.request_id.clone(),
+                task_id: request.task_id.clone(),
+                path: to_safe.relative().to_string(),
+                pre_image: ImageRef {
+                    existed: false,
+                    content_ref: None,
+                    sha256: None,
+                },
+                post_image: post,
+            },
+        ];
+
+        let mut outcome = self.ok_json(
+            request,
+            start,
+            json!({ "from": from_safe.relative(), "to": to_safe.relative(), "moved": true }),
+        )?;
+        outcome.mutations = mutations;
         Ok(outcome)
     }
 
@@ -712,7 +825,7 @@ impl ToolRuntime {
                     completed_at: now_iso(),
                     denial_kind: None,
                 },
-                mutation: None,
+                mutations: Vec::new(),
                 output_ref: None,
                 diff: None,
             }),
@@ -865,7 +978,7 @@ impl ToolRuntime {
                 completed_at: now_iso(),
                 denial_kind: None,
             },
-            mutation: None,
+            mutations: Vec::new(),
             output_ref,
             diff: None,
         })
@@ -904,7 +1017,7 @@ impl ToolRuntime {
                 completed_at: now_iso(),
                 denial_kind: None,
             },
-            mutation: None,
+            mutations: Vec::new(),
             output_ref,
             diff: None,
         })
@@ -1665,7 +1778,7 @@ mod tests {
             &cancel,
         );
         assert_eq!(out.result.status, ToolStatus::Cancelled);
-        assert!(out.mutation.is_none(), "취소됐는데 mutation이 기록되었습니다");
+        assert!(out.mutations.is_empty(), "취소됐는데 mutation이 기록되었습니다");
         assert_eq!(h.read("src/app.ts"), before, "취소됐는데 파일이 변경되었습니다");
     }
 
@@ -1769,7 +1882,7 @@ mod tests {
             json!({ "path": "src/new.ts", "content": "export const x = 1;\n" }),
         ));
         assert_eq!(out.result.status, ToolStatus::Ok);
-        let m = out.mutation.expect("expected a FileMutationRecord");
+        let m = out.mutations.into_iter().next().expect("expected a FileMutationRecord");
         assert_eq!(m.path, "src/new.ts");
         assert!(!m.pre_image.existed, "new file should have no pre-image");
         assert!(m.post_image.existed);
@@ -1783,7 +1896,7 @@ mod tests {
             ToolName::CreateFile,
             json!({ "path": "src/app.ts", "content": "replaced\n" }),
         ));
-        let m = out.mutation.unwrap();
+        let m = out.mutations.into_iter().next().expect("mutation이 없습니다");
         assert!(m.pre_image.existed);
         let pre = h
             .runtime
@@ -1816,8 +1929,94 @@ mod tests {
             json!({ "path": "src/app.ts", "patch": patch }),
         ));
         assert_eq!(out.result.status, ToolStatus::Error);
-        assert!(out.mutation.is_none(), "failed patch must not record a mutation");
+        assert!(out.mutations.is_empty(), "failed patch must not record a mutation");
         assert_eq!(h.read("src/app.ts"), before, "file must be unchanged");
+    }
+
+    // ---- 파일 이동 (44절) ----
+
+    /// **한 요청이 두 파일을 바꾼다.** 하나만 기록하면 되돌리기가 절반만 알게 되고,
+    /// 그러면 이동은 되돌려지지 않는다.
+    #[test]
+    fn moving_a_file_records_both_sides() {
+        let h = harness();
+        let before = std::fs::read_to_string(h.root_path.join("src/app.ts")).unwrap();
+
+        let out = h.run(&req(
+            ToolName::MoveFile,
+            json!({ "from": "src/app.ts", "to": "src/renamed.ts" }),
+        ));
+        assert_eq!(out.result.status, ToolStatus::Ok);
+        assert!(!h.root_path.join("src/app.ts").exists(), "원본이 남아 있습니다");
+        assert_eq!(std::fs::read_to_string(h.root_path.join("src/renamed.ts")).unwrap(), before);
+
+        assert_eq!(out.mutations.len(), 2, "{:?}", out.mutations);
+        // ① 원본이 사라졌다 — 되돌리기가 내용을 복원할 근거(pre-image)가 있어야 한다.
+        let gone = &out.mutations[0];
+        assert_eq!(gone.path, "src/app.ts");
+        assert!(gone.pre_image.existed && gone.pre_image.content_ref.is_some());
+        assert!(!gone.post_image.existed);
+        // ② 대상이 생겼다 — 되돌리기가 지울 근거가 있어야 한다.
+        let created = &out.mutations[1];
+        assert_eq!(created.path, "src/renamed.ts");
+        assert!(!created.pre_image.existed);
+        assert!(created.post_image.existed);
+    }
+
+    /// **덮어쓰지 않는다.** 덮어쓰기는 삭제를 이동 안에 숨기는 것이고, 승인 화면이
+    /// "옮깁니다"라고 말한 것과 실제로 일어나는 일이 달라진다.
+    #[test]
+    fn moving_onto_an_existing_file_is_refused_and_changes_nothing() {
+        let h = harness();
+        std::fs::write(h.root_path.join("src/other.ts"), "keep me\n").unwrap();
+
+        let out = h.run(&req(
+            ToolName::MoveFile,
+            json!({ "from": "src/app.ts", "to": "src/other.ts" }),
+        ));
+        assert_ne!(out.result.status, ToolStatus::Ok);
+        // 양쪽 다 그대로다 — 거부가 절반만 일어나지 않았다.
+        assert!(h.root_path.join("src/app.ts").exists());
+        assert_eq!(std::fs::read_to_string(h.root_path.join("src/other.ts")).unwrap(), "keep me\n");
+        assert!(out.mutations.is_empty());
+    }
+
+    /// 워크스페이스 밖으로 옮기는 것은 **파일을 밖으로 내보내는 것**이다. 게이트가 막지만,
+    /// 런타임도 스스로 막는다 — 두 겹인 이유는 게이트를 우회하는 호출 경로가 생겨도
+    /// 파일이 나가지 않게 하기 위해서다.
+    #[test]
+    fn moving_outside_the_workspace_is_refused() {
+        let h = harness();
+        let out = h.run(&req(
+            ToolName::MoveFile,
+            json!({ "from": "src/app.ts", "to": "../escaped.ts" }),
+        ));
+        assert_ne!(out.result.status, ToolStatus::Ok);
+        assert!(h.root_path.join("src/app.ts").exists());
+    }
+
+    #[test]
+    fn moving_a_directory_is_refused() {
+        let h = harness();
+        let out = h.run(&req(ToolName::MoveFile, json!({ "from": "src", "to": "src2" })));
+        assert_ne!(out.result.status, ToolStatus::Ok);
+        assert!(h.root_path.join("src").is_dir());
+    }
+
+    /// 취소된 뒤에는 **옮기지 않는다** — 다른 변경 도구와 같은 규칙이다.
+    #[test]
+    fn a_cancelled_move_does_not_touch_anything() {
+        let h = harness();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let out = h.run_with_cancel(
+            &req(ToolName::MoveFile, json!({ "from": "src/app.ts", "to": "src/renamed.ts" })),
+            &cancel,
+        );
+        assert_eq!(out.result.status, ToolStatus::Cancelled);
+        assert!(h.root_path.join("src/app.ts").exists());
+        assert!(!h.root_path.join("src/renamed.ts").exists());
+        assert!(out.mutations.is_empty());
     }
 
     #[test]
@@ -1826,7 +2025,7 @@ mod tests {
         let out = h.run(&req(ToolName::DeleteFile, json!({ "path": "src/app.ts" })));
         assert_eq!(out.result.status, ToolStatus::Ok);
         assert!(!h.root_path.join("src/app.ts").exists());
-        let m = out.mutation.unwrap();
+        let m = out.mutations.into_iter().next().expect("mutation이 없습니다");
         assert!(m.pre_image.existed);
         assert!(!m.post_image.existed);
     }
@@ -2129,7 +2328,10 @@ mod tests {
             ToolName::CreateFile,
             json!({ "path": "src/brand-new.ts", "content": "new\n" }),
         ));
-        let mutations = vec![patch_out.mutation.unwrap(), created_out.mutation.unwrap()];
+        let mutations = vec![
+            patch_out.mutations.into_iter().next().unwrap(),
+            created_out.mutations.into_iter().next().unwrap(),
+        ];
 
         // 롤백도 일반 ToolRequest 경로를 탄다.
         for request in h.runtime.rollback_requests("task-1", &mutations) {

@@ -1,4 +1,4 @@
-import type { ExecutionPlan, PlanStep, ToolRequest, ToolRequester } from "@tomverse/protocol";
+import type { ExecutionPlan, FileMove, PlanStep, ToolRequest, ToolRequester } from "@tomverse/protocol";
 import { assertRelativeWorkspacePath } from "@tomverse/protocol";
 
 /**
@@ -16,6 +16,8 @@ export interface PlanInput {
   requestedBy: ToolRequester;
   /** 이번이 몇 번째 계획인지 (fix loop에서 증가) — planId를 안정적으로 만든다 */
   attempt: number;
+  /** 이 초안이 옮기려는 파일들 (state-machine 44절). */
+  moves?: FileMove[];
 }
 
 export class PlanningError extends Error {
@@ -252,6 +254,28 @@ export function buildExecutionPlan(input: PlanInput): ExecutionPlan {
       createdAt: new Date().toISOString(),
     };
   });
+
+  // **이동을 patch보다 먼저 낸다**(44절). 순서가 뒤집히면 새 경로에 대한 patch가 아직 그
+  // 자리에 없는 파일에 적용된다 — 모델은 옮긴 뒤를 기준으로 쓰기 때문이다.
+  //
+  // 이동이 patch와 같은 파일을 건드리는 경우는 여기서 판정하지 않는다: 그건 `from`이 사라진
+  // 뒤 `to`에 대한 hunk가 오는 정상 흐름이고, 어긋나면 patch 적용이 실패한다(그리고 그
+  // 실패는 fix loop가 받는다).
+  const moves: ToolRequest[] = (input.moves ?? []).map((move, index) => ({
+    requestId: `${input.taskId}-plan${input.attempt}-move-${index + 1}`,
+    taskId: input.taskId,
+    tool: "move_file" as const,
+    args: {
+      // 두 경로 모두 형태를 검사한다 — 게이트가 최종 판정하지만, 명백히 잘못된 요청이
+      // 이벤트 로그에 쌓이지 않게 한다(위 `apply_patch`와 같은 이유).
+      from: assertRelativeWorkspacePath(move.from, `moves[${index}].from`),
+      to: assertRelativeWorkspacePath(move.to, `moves[${index}].to`),
+    },
+    requestedBy: input.requestedBy,
+    riskTier: "user_approval" as const,
+    createdAt: new Date().toISOString(),
+  }));
+  toolRequests.unshift(...moves);
 
   // `delete_file`을 요청하는 PlanStep이 있으면 반영한다. patch로는 파일 삭제를 표현하기
   // 어렵고(`+++ /dev/null`), 삭제는 항상 승인이 필요한 별개의 위험 등급이므로 명시적으로 다룬다.

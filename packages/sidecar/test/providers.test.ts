@@ -339,3 +339,19 @@ test("게이트 거부 사유가 프롬프트에 실리고, 기준 충돌과 다
   assert.ok(both.includes("rejected before it was applied"), both);
   assert.ok(both.includes("refused by the policy gate"), both);
 });
+
+/**
+ * **문을 만들었으면 걸어 들어가는 길도 있어야 한다** — state-machine 31절의 교훈, 44절에 적용.
+ *
+ * `moves` 필드를 만들어도 프롬프트가 말하지 않으면 모델은 그것을 채우지 않는다. 그리고 그
+ * 공허함은 **아무 테스트도 깨뜨리지 않는다** — 지워 보니 오케스트레이터 검사가 전부
+ * 통과했다(실측). 이름 바꾸기는 다시 파일 전체를 실어 보내는 일로 돌아간다.
+ */
+test("프롬프트가 파일 이동을 요청하는 방법을 말한다", () => {
+  const prompt = buildDraftPrompt({ snapshot: makeSnapshot(), userMessage: "파일 이름을 바꿔주세요" });
+  assert.ok(prompt.includes("`moves`"), prompt);
+  // **순서까지 말한다.** 이동이 먼저 돌므로 patch는 옮긴 뒤 경로 기준이어야 한다.
+  assert.ok(prompt.includes("moves run first"), prompt);
+  // 지우고 다시 만들지 말라고 명시한다 — 그게 이 필드가 없앨 낭비다.
+  assert.ok(prompt.toLowerCase().includes("delete-and-recreate"), prompt);
+});

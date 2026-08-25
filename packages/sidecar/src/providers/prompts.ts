@@ -101,6 +101,11 @@ const PATCH_RULES = [
   "Include at least one line of surrounding context per hunk when the file is non-empty.",
   "Hunks must appear in ascending order of original line number.",
   "Only modify files that appear in the Files section above.",
+  // **문을 만들었으면 걸어 들어가는 길도 만든다**(state-machine 31절의 교훈, 44절에 적용).
+  // 이 줄이 없으면 `moves` 필드는 영원히 비어 있고, 모델은 이름 바꾸기를 표현할 방법이 없어
+  // 파일 전체를 다시 써 보낸다.
+  "To rename or move a file, do NOT delete-and-recreate it: put `{from, to}` in the `moves` array.",
+  "Write the patch as it applies AFTER the moves — moves run first.",
 ].join("\n");
 
 /**

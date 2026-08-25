@@ -456,7 +456,8 @@ mod tests {
     fn a_missing_command_without_an_equivalent_gets_no_extra_advice() {
         let fs = node_install();
         let env = win_env(&fs, "");
-        let err = resolve_program("mv", &[], &env).unwrap_err();
+        // `mv`는 44절이 `move_file`을 만들면서 대안이 생겼다 — 여전히 대응이 없는 것을 쓴다.
+        let err = resolve_program("cp", &[], &env).unwrap_err();
         assert!(err.message.contains("PATH"), "{}", err.message);
         assert!(!err.message.contains("도구로 요청하세요"), "{}", err.message);
     }

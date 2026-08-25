@@ -66,6 +66,12 @@ const ALTERNATIVES: &[(&str, &str, &str)] = &[
     ("sed", "apply_patch", "파일 수정"),
     ("awk", "apply_patch", "파일 수정"),
     ("diff", "git_diff", "변경 비교"),
+    // 41.8·43.8절이 "대응 도구가 없다"고 적어둔 것 — 44절이 만들었다.
+    ("mv", "move_file", "파일 이동"),
+    ("move", "move_file", "파일 이동"),
+    ("rename", "move_file", "파일 이름 바꾸기"),
+    ("move-item", "move_file", "파일 이동"),
+    ("rename-item", "move_file", "파일 이름 바꾸기"),
     // PowerShell cmdlet — product-strategy 12.4절 우선순위의 둘째 줄(43절).
     //
     // **이것들은 실행 파일이 아니다.** `powershell.exe` 안에 사는 이름이라 PATH에 없고,
@@ -202,6 +208,7 @@ mod tests {
             ToolName::RunTests,
             ToolName::McpCall,
             ToolName::GitPush,
+            ToolName::MoveFile,
         ]
         .iter()
         .map(|t| t.as_str())
@@ -232,6 +239,7 @@ mod tests {
             ToolName::RunTests.as_str(),
             ToolName::McpCall.as_str(),
             ToolName::GitPush.as_str(),
+            ToolName::MoveFile.as_str(),
         ];
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(unique.len(), names.len(), "도구 이름이 겹칩니다: {names:?}");
@@ -312,7 +320,9 @@ mod tests {
     /// "PATH에서 못 찾았다"라는 사실 그대로다.
     #[test]
     fn commands_without_an_equivalent_get_no_invented_advice() {
-        for program in ["mv", "cp", "chmod", "curl", "ps", "sudo", "make"] {
+        // `mv`는 44절이 `move_file`을 만들면서 여기서 빠졌다 — **목록이 바뀌면 이 검사도
+        // 바뀌어야 한다**는 것이 요점이다.
+        for program in ["cp", "chmod", "curl", "ps", "sudo", "make"] {
             assert!(alternative_for(program).is_none(), "{program}에 없는 대안을 권했습니다");
         }
         // 우리 도구로 도는 정상 명령에도 붙지 않는다.

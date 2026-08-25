@@ -8,6 +8,20 @@ export interface PlanStep {
 }
 
 /**
+ * 초안이 요청하는 **파일 이동** 하나 (state-machine 44절).
+ *
+ * # 왜 `targetPaths`에 두 개를 넣지 않는가
+ *
+ * `["from", "to"]`로 두면 **순서가 곧 의미**가 되고, 뒤바뀐 요청은 조용히 반대로 실행된다.
+ * 그 실수는 승인 화면에서도 정상으로 보인다("옮깁니다"는 어느 쪽이든 같은 문장이다).
+ * 이름을 붙이면 뒤바뀔 수 없다.
+ */
+export interface FileMove {
+  from: string;
+  to: string;
+}
+
+/**
  * 초안이 요청하는 MCP 도구 호출 하나 (state-machine 31절).
  *
  * **이것은 요청이지 실행이 아니다.** 실행 여부는 Policy Gate가 정하고 매번 사용자 승인을
@@ -30,6 +44,14 @@ export interface DraftProposal {
   relevantFiles: { path: string; reason: string }[];
   plan: PlanStep[];
   patch?: string;
+  /**
+   * 이 초안이 옮기려는 파일들 (state-machine 44절).
+   *
+   * **patch와 따로 둔다.** unified diff는 이동을 표현하지 못하고(내용이 같은 파일의 전체
+   * 삭제 + 전체 추가로 나온다), 그렇게 표현하면 큰 파일의 이름을 바꾸는 데 그 파일을 두 번
+   * 실어 보내게 된다.
+   */
+  moves?: FileMove[];
   risks: string[];
   requiredTests: string[];
   uncertainties: string[];
@@ -76,6 +98,8 @@ export interface SingleModelFixResult {
   rejectionReason?: string; // verdict = REJECT
   /** 대조 경로의 `DraftProposal.mcpCalls`와 같은 자리 (state-machine 31절). */
   mcpCalls?: McpCallRequest[];
+  /** 대조 경로의 `DraftProposal.moves`와 같은 자리 (state-machine 44절). */
+  moves?: FileMove[];
   model: string;
   createdAt: ISODateTime;
 }

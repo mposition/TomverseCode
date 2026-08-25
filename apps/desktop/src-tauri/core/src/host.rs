@@ -1144,7 +1144,9 @@ impl TaskHost {
         let outcome = self.runtime.execute(request, &decision, approval_state, &cancel);
 
         // 4) 결과 기록. **레코드와 이벤트를 같은 트랜잭션에** 쓴다 (M0.1 트랜잭션 규칙).
-        if let Some(mutation) = &outcome.mutation {
+        // **여러 개일 수 있다**(44절). `move_file`은 한 요청으로 둘을 남긴다 — 원본이
+        // 사라진 것과 대상이 생긴 것. 되돌리기가 둘 다 알아야 이동이 되돌려진다.
+        for mutation in &outcome.mutations {
             let payload = json!({
                 "requestId": mutation.request_id,
                 "path": mutation.path,
@@ -1158,8 +1160,8 @@ impl TaskHost {
         }
         if let Some(diff) = &outcome.diff {
             let path = outcome
-                .mutation
-                .as_ref()
+                .mutations
+                .first()
                 .map(|m| m.path.clone())
                 .unwrap_or_else(|| "(unknown)".to_string());
             self.diffs.lock().unwrap().push((path, diff.clone()));

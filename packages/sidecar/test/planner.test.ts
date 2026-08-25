@@ -178,3 +178,54 @@ test("다이제스트는 build/test 실패를 lint보다 앞에 둔다", () => {
   });
   assert.deepEqual(digest.failingChecks.map((c) => c.kind), ["build", "test", "lint"]);
 });
+
+/**
+ * **이동은 patch보다 먼저 실행돼야 한다** — state-machine 44절.
+ *
+ * 모델은 옮긴 뒤를 기준으로 patch를 쓴다(프롬프트가 그렇게 지시한다). 순서가 뒤집히면 새
+ * 경로에 대한 hunk가 아직 그 자리에 없는 파일에 적용되고, 그 실패는 "모델이 잘못된 patch를
+ * 냈다"로 보인다.
+ */
+test("이동은 patch 적용보다 앞에 놓인다", () => {
+  const patch = ["--- a/src/renamed.ts", "+++ b/src/renamed.ts", "@@ -1,1 +1,1 @@", "-1", "+2", ""].join("\n");
+  const plan = buildExecutionPlan({
+    taskId: "task-1",
+    patch,
+    plan: [],
+    requestedBy,
+    attempt: 0,
+    moves: [{ from: "src/app.ts", to: "src/renamed.ts" }],
+  });
+
+  assert.equal(plan.toolRequests[0]?.tool, "move_file");
+  assert.deepEqual(plan.toolRequests[0]?.args, { from: "src/app.ts", to: "src/renamed.ts" });
+  assert.equal(plan.toolRequests[1]?.tool, "apply_patch");
+  // 이동은 원본을 지운다 — Node의 1차 분류도 그렇게 말해야 UI가 승인 모달을 미리 예상한다.
+  assert.equal(plan.toolRequests[0]?.riskTier, "user_approval");
+});
+
+/**
+ * **경로가 둘이므로 둘 다 검사한다.** 하나만 보면 나머지가 조용히 지나가고, 그 실패는
+ * 게이트까지 가서야 드러난다.
+ */
+test("이동의 두 경로 모두 형태 검사를 지난다", () => {
+  const patch = ["--- a/src/a.ts", "+++ b/src/a.ts", "@@ -1,1 +1,1 @@", "-1", "+2", ""].join("\n");
+  for (const move of [
+    { from: "../outside.ts", to: "src/x.ts" },
+    { from: "src/x.ts", to: "/etc/passwd" },
+  ]) {
+    assert.throws(
+      () => buildExecutionPlan({ taskId: "t", patch, plan: [], requestedBy, attempt: 0, moves: [move] }),
+      ValidationError,
+      JSON.stringify(move)
+    );
+  }
+});
+
+/** 이동이 없으면 계획은 종전과 한 글자도 다르지 않다. */
+test("이동이 없으면 계획이 달라지지 않는다", () => {
+  const patch = ["--- a/src/a.ts", "+++ b/src/a.ts", "@@ -1,1 +1,1 @@", "-1", "+2", ""].join("\n");
+  const plan = buildExecutionPlan({ taskId: "t", patch, plan: [], requestedBy, attempt: 0 });
+  assert.equal(plan.toolRequests.length, 1);
+  assert.equal(plan.toolRequests[0]?.tool, "apply_patch");
+});

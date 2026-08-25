@@ -130,9 +130,34 @@ export function validateDraftProposal(
     uncertainties: optionalStringArray(o.uncertainties, "draftProposal.uncertainties") ?? [],
     doneCriteria: optionalStringArray(o.doneCriteria, "draftProposal.doneCriteria") ?? [],
     mcpCalls: validateMcpCalls(o.mcpCalls),
+    moves: validateMoves(o.moves),
     model: ctx.model,
     createdAt: ctx.createdAt,
   };
+}
+
+/**
+ * 초안이 요청한 파일 이동 — state-machine 44절.
+ *
+ * **형태가 틀린 항목을 버리지 않고 오류로 만든다**(`mcpCalls`와 같은 이유). 조용히 버리면
+ * 모델은 파일을 옮겼다고 믿고 그 다음 patch를 **새 경로 기준으로** 쓰는데, 실제로는 옮겨지지
+ * 않았으므로 그 patch는 없는 파일에 적용된다.
+ *
+ * 두 경로가 같은 것도 여기서 거부한다 — 그건 이동이 아니고, 게이트까지 갈 이유가 없다.
+ */
+function validateMoves(raw: unknown): DraftProposal["moves"] {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new ValidationError("draftProposal.moves", "expected an array");
+  if (raw.length === 0) return [];
+  return raw.map((item, i) => {
+    const move = requireObject(item, `draftProposal.moves[${i}]`);
+    const from = requireNonEmptyString(move.from, `draftProposal.moves[${i}].from`);
+    const to = requireNonEmptyString(move.to, `draftProposal.moves[${i}].to`);
+    if (from === to) {
+      throw new ValidationError(`draftProposal.moves[${i}]`, "from and to are the same path");
+    }
+    return { from, to };
+  });
 }
 
 /**

@@ -95,6 +95,8 @@ export class ToolBridge {
       case "create_file":
         return "conditional";
       case "delete_file":
+      // 이동은 **원본을 지운다** — 되돌리기 비용이 삭제와 같으므로 등급도 같다(44절).
+      case "move_file":
         return "user_approval";
       case "run_command":
       case "run_tests":

@@ -427,6 +427,93 @@ test("검증을 실행하지 못한 경우에 '스크립트를 추가하라'고 
 });
 
 /**
+ * **모델이 파일을 옮길 수 있다** — state-machine 44절.
+ *
+ * 종전에는 이름을 바꾸려면 `create_file`(새 경로에 전체 내용) + `delete_file`이었고, 그건
+ * 파일을 통째로 다시 실어 보내는 일이었다. `moves`가 그 자리를 대신한다.
+ *
+ * 그리고 **문을 만들었으면 걸어 들어가는 길도 있어야 한다**(31절의 교훈): 이 검사는 모델의
+ * 응답에서 계획까지가 실제로 이어지는지를 본다.
+ */
+const MOVED_PATCH = [
+  "--- a/src/renamed.ts",
+  "+++ b/src/renamed.ts",
+  "@@ -1,1 +1,1 @@",
+  "-export const a = 1;",
+  "+export const a = 2;",
+  "",
+].join("\n");
+
+/** 이름을 바꾸는 초안. patch는 **옮긴 뒤 경로 기준**으로 쓰여 있다(프롬프트가 그렇게 지시한다). */
+const MOVE_DRAFT = {
+  interpretation: "이름을 바꾼다",
+  plan: [{ stepId: "s1", description: "rename" }],
+  patch: MOVED_PATCH,
+  moves: [{ from: "src/app.ts", to: "src/renamed.ts" }],
+  risks: [],
+};
+
+test("초안이 요청한 이동이 patch보다 먼저 실행된다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }] },
+    {
+      // **두 경로에 같은 응답을 준비한다.** TRIAGE가 단일 모델 경로를 고를 수 있고, 그때
+      // `draft` 스텝은 소비되지 않는다 — 한쪽만 준비하면 이 검사가 무엇을 검사했는지 모른다.
+      script: [
+        { kind: "draft", payload: MOVE_DRAFT },
+        { kind: "singleFix", payload: { verdict: "ACCEPT", rationale: "이름을 바꾼다", ...MOVE_DRAFT } },
+      ],
+      defaultPatch: MOVED_PATCH,
+    }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  const tools = host.toolRequests.filter((r) => r.tool === "move_file" || r.tool === "apply_patch");
+  assert.equal(tools[0]?.tool, "move_file", tools.map((t) => t.tool).join(", "));
+  assert.deepEqual(tools[0]?.args, { from: "src/app.ts", to: "src/renamed.ts" });
+  assert.equal(tools[1]?.tool, "apply_patch");
+});
+
+/**
+ * **이동은 한 번만 실린다.** fix loop가 같은 이동을 다시 계획에 넣으면 `from`이 이미 없으므로
+ * 실패하는데, 그 실패는 "고치려는 시도"처럼 보이지만 사실은 우리가 같은 일을 두 번 시킨 것이다.
+ */
+test("fix loop가 같은 이동을 두 번 시키지 않는다", async () => {
+  const { orchestrator, host } = build(
+    // 첫 검증은 실패시켜 fix loop를 태우고, 두 번째에 통과시킨다.
+    { verifyResults: [{ overall: "pass" }, { overall: "fail" }, { overall: "pass" }] },
+    {
+      // **두 경로에 같은 응답을 준비한다.** TRIAGE가 단일 모델 경로를 고를 수 있고, 그때
+      // `draft` 스텝은 소비되지 않는다 — 한쪽만 준비하면 이 검사가 무엇을 검사했는지 모른다.
+      script: [
+        { kind: "draft", payload: MOVE_DRAFT },
+        { kind: "singleFix", payload: { verdict: "ACCEPT", rationale: "이름을 바꾼다", ...MOVE_DRAFT } },
+        // **수정안에는 이동이 없다.** 이미 옮겨졌으므로 모델이 다시 요청할 이유가 없고,
+        // 그래도 우리가 다시 실으면 두 번 시키는 것이다 — 이 검사가 보려는 것이 그것이다.
+        {
+          kind: "fix",
+          payload: { verdict: "ACCEPT", rationale: "다시 고침", patch: MOVED_PATCH, plan: [] },
+        },
+      ],
+      defaultPatch: MOVED_PATCH,
+    }
+  );
+  await orchestrator.run();
+
+  // **fix loop가 실제로 돌았는지 먼저 확인한다.** 돌지 않았으면 아래 검사는 "계획이 하나뿐"을
+  // 말할 뿐이고, 두 번 시키는 결함을 잡지 못한다(실측으로 그랬다).
+  assert.ok(host.eventTypes().includes("FIX_LOOP_STARTED"), host.eventTypes().join(", "));
+  assert.ok(
+    host.toolRequests.filter((r) => r.tool === "apply_patch").length >= 2,
+    "두 번째 계획이 만들어지지 않았습니다"
+  );
+
+  const moves = host.toolRequests.filter((r) => r.tool === "move_file");
+  assert.equal(moves.length, 1, `이동이 ${moves.length}번 요청됐습니다`);
+});
+
+/**
  * **계획을 실행하기 전에 게이트에 태워 본다** — state-machine 42절.
  *
  * 이게 없으면 계획의 세 번째 요청이 거부될 때 앞의 둘은 **이미 적용된 채로** 태스크가 끝난다.

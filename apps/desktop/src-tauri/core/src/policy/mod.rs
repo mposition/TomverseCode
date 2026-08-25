@@ -217,6 +217,13 @@ impl PolicyGate {
                 Err(reason) => Outcome::deny_malformed(reason),
             },
 
+            // ---- 파일 이동: **두 경로를 모두 판정한다** (state-machine 44절) ----
+            //
+            // 이 도구가 다른 파일 도구와 다른 유일한 점이 이것이다. `required_path_arg` 하나로
+            // 끝나지 않으므로, 하나만 보고 통과시키면 **나머지 하나가 곧 구멍**이다 —
+            // 워크스페이스 밖으로 옮기는 것은 파일을 밖으로 내보내는 것이다.
+            ToolName::MoveFile => self.classify_move(request, root),
+
             // ---- 셸 명령 ----
             ToolName::RunCommand | ToolName::RunTests => self.classify_command(request, root, task_policy),
 
@@ -292,6 +299,59 @@ impl PolicyGate {
             crate::mcp::describe(&call),
             RiskLevel::High,
             // 23.3절: 정책으로 낮출 수 없다. 여기에 레버를 붙이는 순간 그 규칙이 깨진다.
+            PolicyLever::HumanOnly,
+        )
+    }
+
+    /// `move_file` 판정 — state-machine 44절.
+    ///
+    /// # 언제나 승인이다
+    ///
+    /// 이동은 **원본을 지운다.** 되돌리기 비용이 삭제와 같으므로 등급도 같다(`delete_file`이
+    /// 정책과 무관하게 승인을 요구하는 것과 같은 이유). `autoApproveWorkspaceWrites`로
+    /// 낮출 수 없다 — 그 스위치가 승인한 것은 "파일을 고치는 것"이지 "파일을 없애는 것"이 아니다.
+    ///
+    /// # 승인 화면은 **둘 다** 봐야 한다
+    ///
+    /// `normalizedTarget`이 `from → to`인 이유다. 한쪽만 보여주면 사용자는 무엇이 사라지는지
+    /// 또는 무엇이 덮이는지 모른 채 승인한다(원칙 6의 이동판).
+    fn classify_move(&self, request: &ToolRequest, root: &WorkspaceRoot) -> Outcome {
+        let from = match required_str_arg(request, "from") {
+            Ok(value) => value,
+            Err(reason) => return Outcome::deny_malformed(reason),
+        };
+        let to = match required_str_arg(request, "to") {
+            Ok(value) => value,
+            Err(reason) => return Outcome::deny_malformed(reason),
+        };
+        // 원본은 있어야 하고, 대상은 아직 없어도 된다.
+        let from_safe = match root.resolve_existing(&from) {
+            Ok(safe) => safe,
+            Err(violation) => return Outcome::deny_path(&from, violation),
+        };
+        let to_safe = match root.resolve_for_create(&to) {
+            Ok(safe) => safe,
+            Err(violation) => return Outcome::deny_path(&to, violation),
+        };
+        let target = format!("{} → {}", from_safe.relative(), to_safe.relative());
+
+        // 어느 쪽이든 비밀값 파일이면 그 사실을 승인 화면이 말해야 한다. **양쪽을 다 본다** —
+        // `.env`를 옮기는 것도, 무언가를 `.env` 자리로 옮기는 것도 같은 무게다.
+        if secrets::is_secret_path(from_safe.relative()) || secrets::is_secret_path(to_safe.relative()) {
+            return Outcome::needs_approval(
+                "secret_path_move_requires_approval".to_string(),
+                "비밀값을 담을 수 있는 파일이 관련된 이동 — 정책과 무관하게 승인 필요".to_string(),
+                target,
+                RiskLevel::High,
+                PolicyLever::HumanOnly,
+            );
+        }
+
+        Outcome::needs_approval(
+            "move_always_requires_approval".to_string(),
+            "파일 이동은 원본을 지우므로 정책과 무관하게 항상 승인이 필요함".to_string(),
+            target,
+            RiskLevel::High,
             PolicyLever::HumanOnly,
         )
     }
@@ -582,6 +642,18 @@ impl Outcome {
             unblocked_by: PolicyLever::NotApplicable,
         }
     }
+}
+
+/// 이름 붙은 문자열 인자 하나. `required_path_arg`가 `path` 하나만 다루는 데 비해, 경로가
+/// 둘인 도구는 이름으로 구별해야 한다 — **순서로 구별하면 뒤바뀐 요청이 조용히 지나간다.**
+fn required_str_arg(request: &ToolRequest, name: &str) -> Result<String, String> {
+    request
+        .args
+        .get(name)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{} 인자 {name:?}가 없거나 비어 있음", request.tool.as_str()))
 }
 
 fn required_path_arg(request: &ToolRequest) -> Result<String, String> {
@@ -1286,6 +1358,86 @@ mod tests {
             );
             assert_ne!(d.matched_rule, "shell_chaining", "{args} — {}", d.reason);
         }
+    }
+
+    // ---- 파일 이동 (44절) ----
+
+    /// **두 경로를 모두 판정한다.** 하나만 보고 통과시키면 나머지 하나가 곧 구멍이다 —
+    /// 워크스페이스 밖으로 옮기는 것은 파일을 밖으로 내보내는 것이다.
+    #[test]
+    fn a_move_out_of_the_workspace_is_denied_even_though_the_source_is_fine() {
+        let (_d, root) = setup();
+        let d = gate().evaluate(
+            &request(ToolName::MoveFile, json!({ "from": "src/app.ts", "to": "../escaped.ts" })),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert_eq!(d.decision, Decision::Deny, "{}", d.reason);
+    }
+
+    /// 반대 방향도 본다 — 밖에서 안으로 끌어오는 것도 경계를 지나는 일이다.
+    #[test]
+    fn a_move_from_outside_the_workspace_is_denied() {
+        let (_d, root) = setup();
+        let d = gate().evaluate(
+            &request(ToolName::MoveFile, json!({ "from": "../outside.ts", "to": "src/app2.ts" })),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert_eq!(d.decision, Decision::Deny, "{}", d.reason);
+    }
+
+    /// **자동 승인 정책으로 낮출 수 없다.** 그 스위치가 승인한 것은 "파일을 고치는 것"이지
+    /// "파일을 없애는 것"이 아니다 — 이동은 원본을 지운다.
+    #[test]
+    fn a_move_always_requires_approval() {
+        let (_d, root) = setup();
+        let d = gate().evaluate(
+            &request(ToolName::MoveFile, json!({ "from": "src/app.ts", "to": "src/renamed.ts" })),
+            &root,
+            &TaskPolicy {
+                auto_approve_workspace_writes: true,
+                ..TaskPolicy::default()
+            },
+        );
+        assert_eq!(d.decision, Decision::RequireUserApproval);
+        assert_eq!(d.unblocked_by, crate::types::PolicyLever::HumanOnly);
+        // **승인 화면은 둘 다 봐야 한다** — 한쪽만 보여주면 사용자는 무엇이 사라지는지 모른다.
+        assert!(d.normalized_target.contains("src/app.ts"), "{}", d.normalized_target);
+        assert!(d.normalized_target.contains("src/renamed.ts"), "{}", d.normalized_target);
+    }
+
+    /// 비밀값 파일은 **어느 쪽이든** 그 사실을 승인 화면이 말해야 한다.
+    #[test]
+    fn moving_a_secret_file_says_so_in_either_direction() {
+        let (_d, root) = setup();
+        for (from, to) in [("src/app.ts", ".env"), (".env", "src/leaked.ts")] {
+            let d = gate().evaluate(
+                &request(ToolName::MoveFile, json!({ "from": from, "to": to })),
+                &root,
+                &TaskPolicy::default(),
+            );
+            // `.env`가 없는 fixture에서는 원본 해석이 먼저 실패할 수 있으므로, 승인으로 온
+            // 경우에만 규칙 이름을 본다 — 그 경우가 이 검사가 말하려는 것이다.
+            if d.decision == Decision::RequireUserApproval {
+                assert_eq!(d.matched_rule, "secret_path_move_requires_approval", "{from} → {to}");
+            }
+        }
+    }
+
+    /// 이름이 없는 요청은 **모양이 틀린 것**이다 — 순서로 추측하지 않는다.
+    #[test]
+    fn a_move_without_named_paths_is_malformed() {
+        let (_d, root) = setup();
+        let d = gate().evaluate(
+            &request(ToolName::MoveFile, json!({ "paths": ["a", "b"] })),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert_eq!(d.decision, Decision::Deny);
+        assert_eq!(d.matched_rule, "malformed_tool_args");
+        // 모양 문제이므로 모델이 다시 그리면 지나간다(41.4절).
+        assert!(d.redraftable);
     }
 
     #[test]

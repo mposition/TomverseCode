@@ -20,6 +20,10 @@ pub enum ToolName {
     ApplyPatch,
     CreateFile,
     DeleteFile,
+    /// 파일 하나를 다른 경로로 옮긴다 (state-machine 44절).
+    ///
+    /// **경로가 둘인 첫 도구다.** 게이트가 둘 다 판정해야 하고, 하나를 빠뜨리면 그게 구멍이다.
+    MoveFile,
     RunCommand,
     GitStatus,
     GitDiff,
@@ -47,6 +51,7 @@ impl ToolName {
             ToolName::ApplyPatch => "apply_patch",
             ToolName::CreateFile => "create_file",
             ToolName::DeleteFile => "delete_file",
+            ToolName::MoveFile => "move_file",
             ToolName::RunCommand => "run_command",
             ToolName::GitStatus => "git_status",
             ToolName::GitDiff => "git_diff",
@@ -64,7 +69,10 @@ impl ToolName {
     }
 
     pub fn mutates_files(&self) -> bool {
-        matches!(self, ToolName::ApplyPatch | ToolName::CreateFile | ToolName::DeleteFile)
+        matches!(
+            self,
+            ToolName::ApplyPatch | ToolName::CreateFile | ToolName::DeleteFile | ToolName::MoveFile
+        )
     }
 }
 
