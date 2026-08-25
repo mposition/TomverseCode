@@ -498,13 +498,16 @@ fn parse_mcp_tools(spec: &str) -> Result<(String, Vec<String>), String> {
 /// **저장소 안에 만들지 않는다** — 안에 만들면 부모 워크스페이스의 게이트 루트가 그것을
 /// 포함해서, 본체에서 도는 태스크가 격리된 트리를 고칠 수 있다(worktree.rs 모듈 주석).
 /// 상태 디렉터리(`--db`가 사는 곳) 아래에 둔다: 태스크 기록과 같은 수명이라 정리 시점도 같다.
+///
+/// **자리를 정하는 것은 `worktree::parent_dir`이다**(38절). 여기서 다시 이어붙이면 데스크톱과
+/// 갈릴 수 있고, 갈리면 같은 브랜치로 트리가 둘 생긴다.
 fn worktree_parent_dir(args: &Args) -> PathBuf {
     let state_dir = args
         .db
         .as_ref()
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| args.workspace.join(".tomverse"));
-    state_dir.join("worktrees")
+    tomverse_core::worktree::parent_dir(&state_dir)
 }
 
 fn real_main() -> Result<i32, String> {
@@ -523,30 +526,26 @@ fn real_main() -> Result<i32, String> {
             let parent = worktree_parent_dir(&args);
             let wt = tomverse_core::worktree::ensure(repo.path(), &parent, branch, args.worktree_base.as_deref())
                 .map_err(|e| e.to_string())?;
-            // **본체의 커밋되지 않은 변경은 따라오지 않는다.** 말하지 않으면 사용자는 자기가
-            // 방금 고친 코드에 대해 태스크가 돈다고 믿고, 결과 diff를 "모델이 내 수정을
-            // 되돌렸다"로 읽는다.
-            if let Some(notice) = tomverse_core::worktree::isolation_notice(
-                tomverse_core::worktree::is_dirty(repo.path()),
-                &wt,
-            ) {
-                eprintln!("{notice}");
-            }
+            // **말하지 않으면 사용자가 정반대로 읽는 것들**(22.5절). 문장은 `Isolation`이
+            // 만든다 — 헤드리스와 데스크톱이 각자 조건을 적으면 한쪽 사용자만 듣게 된다.
+            let iso = tomverse_core::worktree::Isolation::of(repo.path(), &wt);
             eprintln!(
                 "격리 실행: {} ({}) — {}",
                 wt.path.display(),
                 wt.branch,
                 if wt.created { "새로 만듦" } else { "기존 트리 재사용" }
             );
-            Some(wt)
+            for notice in iso.notices() {
+                eprintln!("{notice}");
+            }
+            Some(iso)
         }
         None => None,
     };
 
-    let workspace_path = isolated
-        .as_ref()
-        .map(|w| w.path.clone())
-        .unwrap_or_else(|| args.workspace.clone());
+    // **격리는 게이트 루트만 바꾼다**(38절). 신원(workspace_id)은 저장소를 따라간다 —
+    // 여기서는 태스크가 하나뿐이라 차이가 드러나지 않지만, 규칙을 두 곳에 적지 않는다.
+    let workspace_path = tomverse_core::worktree::roots(&args.workspace, isolated.as_ref()).gate;
     let root = WorkspaceRoot::new(&workspace_path)
         .map_err(|e| format!("워크스페이스 {workspace_path:?}를 열 수 없습니다: {e}"))?;
 
@@ -705,6 +704,11 @@ fn real_main() -> Result<i32, String> {
                     eprintln!("훅 등록: {} → {}", hook.phase, hook.describe());
                 }
                 task_host = task_host.with_hooks(tomverse_core::hooks::HookRegistry::new(args.hooks.clone()));
+            }
+            // **격리 실행의 사실을 기록에 남긴다**(38절). 남기지 않으면 끝난 태스크에 대해
+            // "결과가 어디 있는가"에 답할 수 없다 — 22.7절이 남겨둔 "태스크 기록과의 연결"이다.
+            if let Some(iso) = isolated.clone() {
+                task_host = task_host.with_isolation(iso);
             }
             let host = Arc::new(task_host);
             // **이 태스크의 정책을 등록한다**(ui-wireframes 3.16.2절). 헤드리스 호스트는

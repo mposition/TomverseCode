@@ -288,20 +288,94 @@ pub fn remove(repo: &Path, worktree: &Path, force: bool) -> Result<(), WorktreeE
     Ok(())
 }
 
-/// 격리 실행이 사용자에게 **말해야 하는 사실**.
+/// 격리 트리들이 사는 디렉터리.
 ///
-/// worktree는 커밋에서 시작하므로 **본체의 커밋되지 않은 변경이 따라오지 않는다.** 이걸
-/// 말하지 않으면 사용자는 자기가 방금 고친 코드에 대해 태스크가 돈다고 믿는다 — 그리고
-/// 결과 diff를 보고 "모델이 내 수정을 되돌렸다"고 읽는다.
-pub fn isolation_notice(main_tree_dirty: bool, worktree: &Worktree) -> Option<String> {
-    if !main_tree_dirty {
-        return None;
+/// **이 지식을 두 곳에 두지 않는다.** 헤드리스 호스트와 데스크톱이 각자 계산하면 한쪽만
+/// 고쳐졌을 때 같은 브랜치로 두 개의 트리가 생기고, 사용자에게는 "지웠는데 남아 있다"로 보인다.
+/// 상태 디렉터리 아래인 이유는 22.2절 — 저장소 **안**은 부모 게이트 루트에 포함된다.
+pub fn parent_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("worktrees")
+}
+
+/// 격리 실행의 **기록 가능한 사실** — state-machine 38절.
+///
+/// 문자열 알림 하나로 두지 않는 이유: 이 사실들은 `TASK_CONFIG_PINNED`에 실려 지난 작업
+/// 기록에서도 읽힌다(37절). 문장으로 굳혀 두면 화면이 그 문장을 다시 뜯어야 한다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Isolation {
+    /// **사용자가 연 것은 이 저장소다.** 격리는 그 저장소를 *어디서* 도느냐일 뿐이다.
+    pub repo: PathBuf,
+    pub branch: String,
+    pub path: PathBuf,
+    /// 이미 있던 트리를 이어 쓰는가 (22.5②). 이전 실행의 잔해가 남아 있을 수 있다.
+    pub reused: bool,
+    /// 본체에 커밋되지 않은 변경이 있는가 (22.5①). 그 변경은 이 실행에 **포함되지 않는다.**
+    pub main_tree_dirty: bool,
+}
+
+impl Isolation {
+    pub fn of(repo: &Path, worktree: &Worktree) -> Self {
+        Self {
+            repo: repo.to_path_buf(),
+            branch: worktree.branch.clone(),
+            path: worktree.path.clone(),
+            reused: !worktree.created,
+            main_tree_dirty: is_dirty(repo),
+        }
     }
-    Some(format!(
-        "본체 작업 트리에 커밋되지 않은 변경이 있습니다. 격리 실행은 {} 브랜치의 마지막 커밋에서 \
-         시작하므로 그 변경은 이 실행에 **포함되지 않습니다**.",
-        worktree.branch
-    ))
+
+    /// 사용자가 **정반대로 읽지 않으려면 들어야 하는 문장들** (22.5절).
+    ///
+    /// 판정을 화면에 두지 않는 이유: 같은 사실을 헤드리스는 stderr로, 데스크톱은 패널로
+    /// 내는데 조건이 갈리면 한쪽 사용자만 듣게 된다.
+    pub fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.main_tree_dirty {
+            out.push(format!(
+                "본체 작업 트리에 커밋되지 않은 변경이 있습니다. 격리 실행은 {} 브랜치의 마지막 커밋에서 \
+                 시작하므로 그 변경은 이 실행에 **포함되지 않습니다**.",
+                self.branch
+            ));
+        }
+        if self.reused {
+            out.push(format!(
+                "{} 브랜치의 격리 트리를 **이어 씁니다**. 이전 실행의 결과가 남아 있을 수 있습니다.",
+                self.branch
+            ));
+        }
+        // **결과가 본체에 없다는 것**은 언제나 말한다. 위 둘과 달리 조건이 없다 — 격리 실행의
+        // 결과를 본체에서 찾는 것은 격리를 켠 사람이 가장 흔히 하는 일이다.
+        out.push(format!(
+            "결과는 본체가 아니라 {} 에 남습니다.",
+            self.path.display()
+        ));
+        out
+    }
+}
+
+/// 격리 실행에서 갈리는 **두 경로**.
+///
+/// # 왜 하나가 아닌가
+///
+/// 격리는 `WorkspaceRoot`를 바꾸는 것이 전부다(22.1절). 그런데 그 경로를 **신원**으로도 쓰면
+/// 격리할 때마다 `workspace_id`가 바뀌고, 그 id에 매달린 것들이 조용히 사라진다 — 등록한 훅과
+/// MCP 서버(29절), 세션 메모리가 나르는 판정(27절), 작업 기록. 사용자에게는 "격리를 켰더니
+/// 등록이 없어졌다"로 보이고, 그건 격리가 약속한 것이 아니다.
+///
+/// 사용자가 연 것은 **저장소**이고, 격리 트리는 이번 실행이 파일을 쓰는 자리다.
+pub struct Roots {
+    /// 게이트 루트 — 파일이 실제로 바뀌는 곳.
+    pub gate: PathBuf,
+    /// 신원 루트 — `workspace_id`와 거기 매달린 설정이 따라가는 곳.
+    pub identity: PathBuf,
+}
+
+pub fn roots(repo: &Path, isolation: Option<&Isolation>) -> Roots {
+    Roots {
+        gate: isolation.map(|i| i.path.clone()).unwrap_or_else(|| repo.to_path_buf()),
+        identity: repo.to_path_buf(),
+    }
 }
 
 #[cfg(test)]
@@ -453,13 +527,111 @@ mod tests {
         assert!(matches!(err, WorktreeError::NotARepository { .. }), "{err:?}");
     }
 
-    /// 본체에 커밋되지 않은 변경이 있으면 **그것이 따라오지 않는다는 사실**을 말한다.
+
+    // ---- 격리의 기록 가능한 사실 (38절) ----
+
+    /// **격리는 사용자가 연 것이 무엇인지를 바꾸지 않는다.** 바꾸면 그 id에 매달린 등록(훅·MCP)과
+    /// 작업 기록이 격리를 켤 때마다 사라지고, 사용자에게는 "격리를 켰더니 설정이 없어졌다"로 보인다.
     #[test]
-    fn the_isolation_notice_appears_only_when_it_matters() {
+    fn isolating_changes_where_files_go_but_not_who_the_workspace_is() {
+        let repo_path = PathBuf::from("/repo");
+        let iso = Isolation {
+            repo: repo_path.clone(),
+            branch: "b".into(),
+            path: PathBuf::from("/state/worktrees/tomverse-b"),
+            reused: false,
+            main_tree_dirty: false,
+        };
+
+        let plain = roots(&repo_path, None);
+        let isolated = roots(&repo_path, Some(&iso));
+
+        assert_eq!(plain.gate, repo_path);
+        assert_eq!(isolated.gate, iso.path, "게이트 루트는 격리 트리여야 합니다");
+        assert_eq!(
+            isolated.identity, plain.identity,
+            "신원 루트가 갈리면 workspace_id가 바뀌고 등록이 사라집니다"
+        );
+    }
+
+    /// 22.5절의 두 사실 — 말하지 않으면 사용자가 **정반대로 읽는다.**
+    #[test]
+    fn the_notices_cover_what_would_otherwise_be_read_backwards() {
+        let base = Isolation {
+            repo: PathBuf::from("/repo"),
+            branch: "b".into(),
+            path: PathBuf::from("/state/worktrees/tomverse-b"),
+            reused: false,
+            main_tree_dirty: false,
+        };
+        let quiet = base.notices();
+        // 결과가 어디 있는지는 **조건 없이** 말한다 — 격리를 켠 사람이 가장 흔히 하는 일이
+        // 본체에서 결과를 찾는 것이다.
+        assert_eq!(quiet.len(), 1, "{quiet:?}");
+        assert!(quiet[0].contains("tomverse-b"), "{quiet:?}");
+
+        let dirty = Isolation { main_tree_dirty: true, ..base.clone() };
+        assert!(
+            dirty.notices().iter().any(|n| n.contains("포함되지 않습니다")),
+            "{:?}",
+            dirty.notices()
+        );
+
+        let reused = Isolation { reused: true, ..base.clone() };
+        assert!(
+            reused.notices().iter().any(|n| n.contains("이어 씁니다")),
+            "{:?}",
+            reused.notices()
+        );
+        // **셋을 뭉개지 않는다** — 조건이 다르므로 개수도 달라야 한다.
+        assert!(dirty.notices().len() > quiet.len() && reused.notices().len() > quiet.len());
+    }
+
+    /// `created`의 뜻이 뒤집히면 "이어 씁니다"가 새 트리에 붙는다 — 그러면 깨끗한 트리를
+    /// 더럽다고 말하고, 더 나쁘게는 이어 쓰는 트리를 새것이라고 말한다.
+    #[test]
+    fn a_freshly_created_tree_is_not_reported_as_reused() {
         let wt = Worktree { path: PathBuf::from("/x"), branch: "b".into(), created: true };
-        assert!(isolation_notice(false, &wt).is_none(), "깨끗하면 말할 것이 없습니다");
-        let notice = isolation_notice(true, &wt).expect("더러우면 말해야 합니다");
-        assert!(notice.contains("포함되지 않습니다"), "{notice}");
+        let iso = Isolation::of(Path::new("/repo"), &wt);
+        assert!(!iso.reused);
+    }
+
+    /// **격리 트리가 사는 자리를 두 곳에서 계산하지 않는다.** 각자 계산하면 한쪽만 고쳐졌을 때
+    /// 같은 브랜치로 트리가 둘 생기고, 사용자에게는 "지웠는데 남아 있다"로 보인다.
+    #[test]
+    fn only_one_place_decides_where_isolated_trees_live() {
+        // needle을 **런타임에 조립한다** — 그대로 적으면 이 파일이 자기 자신을 센다.
+        // 그리고 **이어붙이는 것만** 센다: 같은 낱말이 JSON 키로 쓰이는 것은 자리를 정하는
+        // 행위가 아니다(실제로 그걸 세다 헛짚었다).
+        let needle = format!("join({}worktrees{})", '"', '"');
+        let mut hits: Vec<String> = Vec::new();
+        let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // 데스크톱 껍데기도 함께 본다 — 이 환경에서 컴파일되지 않으므로 컴파일러가 잡아주지 않는다.
+        let shell = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src");
+        let mut files: Vec<PathBuf> = Vec::new();
+        for dir in [core, shell] {
+            collect_rs(&dir, &mut files);
+        }
+        assert!(files.len() > 5, "소스를 찾지 못했습니다: {}", files.len());
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            if text.contains(&needle) {
+                hits.push(file.file_name().unwrap().to_string_lossy().to_string());
+            }
+        }
+        assert_eq!(hits, vec!["worktree.rs".to_string()], "격리 디렉터리를 정하는 곳이 여럿입니다");
+    }
+
+    fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
     }
 
     /// 판정할 수 없으면 더럽다고 본다 — 모르는 상태에서 지우지 않기 위해서다.

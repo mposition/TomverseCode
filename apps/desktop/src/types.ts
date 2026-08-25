@@ -280,8 +280,32 @@ export interface CredentialCheck {
   detail: string;
 }
 
+/**
+ * 격리 실행의 사실 (state-machine 38절). `null`이면 본체에서 돈다.
+ *
+ * **경로가 둘인 이유**: `repo`는 사용자가 연 저장소이고 `path`는 이번 실행이 파일을 쓰는
+ * 자리다. 하나로 뭉개면 화면이 결과를 본체에서 찾는다.
+ */
+export interface Isolation {
+  repo: string;
+  branch: string;
+  path: string;
+  /** 이미 있던 트리를 이어 쓰는가 — 이전 실행의 결과가 남아 있을 수 있다. */
+  reused: boolean;
+  /** 본체에 커밋되지 않은 변경이 있는가 — 그 변경은 이 실행에 포함되지 않는다. */
+  mainTreeDirty: boolean;
+}
+
 export interface WorkspaceInfo {
   rootPath: string;
+  /**
+   * 사용자가 연 **저장소**. 격리 실행에서 `rootPath`는 격리 트리를 가리키므로 둘이 갈린다 —
+   * 다시 열 때 쓰는 값은 이쪽이다.
+   */
+  repoPath?: string;
+  isolation?: Isolation | null;
+  /** 말하지 않으면 사용자가 정반대로 읽는 사실들 (22.5절). 문장은 Rust가 만든다. */
+  isolationNotices?: string[];
   name: string;
   workspaceId: string;
   sessionId: string;

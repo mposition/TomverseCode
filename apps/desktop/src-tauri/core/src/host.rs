@@ -228,6 +228,12 @@ pub struct TaskHost {
     /// **도구 목록을 태스크 시작 시점에 물어야 하기 때문**이고(31절), 그건 도구 실행 경로가
     /// 아니다.
     mcp: Option<Arc<crate::mcp::McpPool>>,
+    /// 이번 실행이 격리 트리에서 도는가 (worktree.rs, state-machine 38절).
+    ///
+    /// **호스트가 들고 있는 이유**: 격리는 루트를 바꾸는 것이 전부라(22.1절) 게이트는 자기가
+    /// 격리 안에 있는지 모른다. 그런데 사용자는 알아야 한다 — 결과가 본체에 없기 때문이다.
+    /// 그 사실을 기록으로 남길 수 있는 자리가 여기다.
+    isolation: Option<crate::worktree::Isolation>,
 }
 
 impl TaskHost {
@@ -265,6 +271,7 @@ impl TaskHost {
             diffs: Mutex::new(Vec::new()),
             ipc_meter: Mutex::new(None),
             mcp: None,
+            isolation: None,
         }
     }
 
@@ -366,6 +373,21 @@ impl TaskHost {
         self
     }
 
+    /// 이 호스트가 격리 트리에서 돈다는 사실을 붙인다 (38절).
+    ///
+    /// **루트를 여기서 바꾸지 않는다.** 루트는 호스트를 만들 때 이미 정해졌고(`worktree::roots`),
+    /// 이 값은 그 결정을 *기록으로* 남기기 위한 것이다. 여기서 바꿀 수 있게 두면 게이트 루트를
+    /// 나중에 갈아끼우는 길이 생긴다 — 원칙 2가 막는 바로 그 모양이다.
+    pub fn with_isolation(mut self, isolation: crate::worktree::Isolation) -> Self {
+        self.isolation = Some(isolation);
+        self
+    }
+
+    /// 격리 실행의 사실 — 화면이 "결과가 어디 있는가"에 답하는 데 쓴다.
+    pub fn isolation(&self) -> Option<&crate::worktree::Isolation> {
+        self.isolation.as_ref()
+    }
+
     pub fn root(&self) -> &WorkspaceRoot {
         &self.root
     }
@@ -461,6 +483,10 @@ impl TaskHost {
                 .map(|h| json!({ "phase": h.phase, "command": h.describe() }))
                 .collect::<Vec<_>>(),
             "mcpServers": self.mcp.as_ref().map(|p| p.summary()).unwrap_or_default(),
+            // **어디서 도는가도 "무엇을 가지고 도는가"의 한 줄이다**(38절). 격리 실행의 결과는
+            // 본체에 없는데, 그걸 모르면 사용자는 결과를 본체에서 찾다가 "아무것도 안 바뀌었다"고
+            // 읽는다. 22.7절이 "태스크 기록과의 연결"로 남겨둔 것이 이 자리다.
+            "isolation": self.isolation,
         })
     }
 
@@ -2500,6 +2526,41 @@ mod tests {
         let hooks = config.get("hooks").and_then(Value::as_array).expect("훅이 없습니다");
         assert_eq!(hooks.len(), 1, "{hooks:?}");
         assert_eq!(hooks[0].get("phase").and_then(Value::as_str), Some("COMPLETED"));
+    }
+
+    /// **어디서 돌았는지가 태스크 기록에 남는다**(38절). 남지 않으면 끝난 태스크에 대해
+    /// "결과가 어디 있는가"에 답할 수 없고, 사용자는 본체에서 결과를 찾다가 아무것도 안
+    /// 바뀌었다고 읽는다.
+    #[test]
+    fn a_task_records_the_tree_it_actually_ran_in() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        let host = host.with_isolation(crate::worktree::Isolation {
+            repo: std::path::PathBuf::from("/repo"),
+            branch: "feature".to_string(),
+            path: std::path::PathBuf::from("/state/worktrees/tomverse-feature"),
+            reused: true,
+            main_tree_dirty: true,
+        });
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+
+        let config = pinned_config(&host, "task-1");
+        let iso = config.get("isolation").expect("격리 사실이 없습니다");
+        assert_eq!(iso.get("branch").and_then(Value::as_str), Some("feature"));
+        // **두 사실을 함께 남긴다** — 이어 쓰는 트리인지, 본체가 더러웠는지.
+        assert_eq!(iso.get("reused").and_then(Value::as_bool), Some(true));
+        assert_eq!(iso.get("mainTreeDirty").and_then(Value::as_bool), Some(true));
+    }
+
+    /// 격리하지 않은 태스크는 `null`이다 — 빈 객체를 남기면 화면이 "격리했는데 경로를 모른다"로
+    /// 읽는다.
+    #[test]
+    fn a_task_in_the_main_tree_records_no_isolation() {
+        let sink = Arc::new(RecordingSink::default());
+        let (_ws, _art, host) = host_with_sink(sink);
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+        let config = pinned_config(&host, "task-1");
+        assert!(config.get("isolation").is_some_and(Value::is_null), "{config}");
     }
 
     // ---- 판정의 철회 (30절) ----

@@ -613,6 +613,38 @@ test("격리 실행은 본체 작업 트리를 건드리지 않는다", () => {
 
     // ③ 그리고 사용자에게 격리 트리가 어디인지 말한다 — 결과 diff를 어디서 볼지 알아야 한다.
     assert.match(run.stderr, /격리 실행/, run.stderr);
+
+    // ④ **끝난 뒤에도 답할 수 있어야 한다**(38절). stderr는 흘러가고, 지난 작업 기록을 여는
+    //    사람에게는 그 줄이 없다. 어디서 돌았는지가 기록에 없으면 사용자는 결과를 본체에서
+    //    찾다가 "아무것도 안 바뀌었다"고 읽는다 — ②가 확인한 바로 그 사실 때문에.
+    const detail = hostQuery(stateDir, ["show", "--workspace", repo.root, "--task", run.taskId]) as {
+      events: { type: string; payload: Record<string, unknown> }[];
+    };
+    const pinned = detail.events.find((e) => e.type === "TASK_CONFIG_PINNED");
+    assert.ok(pinned, `TASK_CONFIG_PINNED가 없습니다: ${detail.events.map((e) => e.type).join(", ")}`);
+    const isolation = pinned.payload.isolation as { branch?: string; path?: string } | null;
+    assert.equal(isolation?.branch, "iso-e2e", JSON.stringify(pinned.payload));
+    // 경로가 있어야 결과를 열 수 있다. 브랜치 이름만으로는 어디에 있는지 모른다.
+    assert.ok(String(isolation?.path ?? "").includes("iso-e2e"), JSON.stringify(pinned.payload));
+  }, { gitRepo: true });
+});
+
+/**
+ * **격리하지 않은 실행은 격리했다고 말하지 않는다** — 위 검사의 짝.
+ *
+ * 없으면 `isolation`을 언제나 채우는 구현도 위 검사를 통과한다. 그러면 화면이 모든 작업에
+ * "격리 실행"이라고 말하고, 본체에서 돈 작업의 결과를 사용자가 엉뚱한 곳에서 찾는다.
+ */
+test("본체에서 돈 작업의 기록에는 격리가 없다", () => {
+  withRepo((repo, stateDir) => {
+    const run = runHost(repo, stateDir, {});
+    assert.equal(run.final.status, "completed", run.final.summary);
+    const detail = hostQuery(stateDir, ["show", "--workspace", repo.root, "--task", run.taskId]) as {
+      events: { type: string; payload: Record<string, unknown> }[];
+    };
+    const pinned = detail.events.find((e) => e.type === "TASK_CONFIG_PINNED");
+    assert.ok(pinned, "TASK_CONFIG_PINNED가 없습니다");
+    assert.equal(pinned.payload.isolation, null, JSON.stringify(pinned.payload));
   }, { gitRepo: true });
 });
 

@@ -1,5 +1,6 @@
 import {
   describeAllowedTools,
+  describeIsolation,
   describeMcpServer,
   describeVerificationPin,
   switchLines,
@@ -54,6 +55,9 @@ export function EffectiveConfigPanel({ events }: { events: ConfigEvent[] }) {
         ))}
       </ul>
 
+      {/* **어디서 도는가도 "무엇을 가지고 도는가"의 한 줄이다**(38절). 격리 실행의 결과는
+          본체에 없으므로, 이 줄이 없으면 사용자는 결과를 본체에서 찾는다. */}
+      <p className="muted small">{describeIsolation(config)}</p>
       {/* 스킬은 **이름과 요약을 함께** 낸다 — 이름만 보면 무엇이 좁혀졌는지 모른다. */}
       <p className="muted small">{skill ? `스킬: ${skill.summary}` : "스킬을 쓰지 않습니다."}</p>
       <p className="muted small">{describeAllowedTools(config)}</p>

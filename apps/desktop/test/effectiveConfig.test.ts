@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   describeAllowedTools,
+  describeIsolation,
   describeMcpServer,
   describeVerificationPin,
   switchLines,
@@ -68,4 +69,40 @@ test("모르는 값이 있어도 문장이 만들어진다", () => {
   assert.ok(switchLines(empty).length > 0);
   assert.ok(describeAllowedTools(empty).length > 0);
   assert.ok(describeVerificationPin(empty).length > 0);
+});
+
+/**
+ * 격리 실행의 줄 (38절). **"격리했다"만으로는 부족하다** — 사용자가 다음에 하는 일은 결과를
+ * 여는 것이고, 그러려면 경로가 있어야 한다.
+ */
+test("격리 실행은 브랜치와 경로를 함께 말한다", () => {
+  const text = describeIsolation({
+    isolation: {
+      repo: "/repo",
+      branch: "feature",
+      path: "/state/worktrees/tomverse-feature",
+      reused: false,
+      mainTreeDirty: false,
+    },
+  });
+  assert.ok(text.includes("feature"), text);
+  assert.ok(text.includes("tomverse-feature"), text);
+});
+
+/** 본체에서 돌았다는 것도 **말한다** — 침묵하면 사용자는 격리됐다고 가정할 수 없다. */
+test("격리하지 않은 실행도 어디서 돌았는지 말한다", () => {
+  const text = describeIsolation({});
+  assert.ok(text.includes("본체"), text);
+});
+
+/** 이어 쓴 트리와 더러웠던 본체는 **다른 문장이 된다** — 뭉개면 결과 diff를 오독한다. */
+test("이어 쓴 트리와 더러웠던 본체가 문장에 남는다", () => {
+  const base = { repo: "/r", branch: "b", path: "/p", reused: false, mainTreeDirty: false };
+  const plain = describeIsolation({ isolation: base });
+  const reused = describeIsolation({ isolation: { ...base, reused: true } });
+  const dirty = describeIsolation({ isolation: { ...base, mainTreeDirty: true } });
+  assert.ok(reused.includes("이어 썼습니다"), reused);
+  assert.ok(dirty.includes("포함되지 않았습니다"), dirty);
+  assert.notEqual(plain, reused);
+  assert.notEqual(plain, dirty);
 });

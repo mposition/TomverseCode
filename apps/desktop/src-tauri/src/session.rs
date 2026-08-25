@@ -88,6 +88,11 @@ impl EventSink for TauriSink {
 
 pub struct ActiveWorkspace {
     pub root_display: String,
+    /// **본체 저장소.** 격리 실행에서 `root_display`는 격리 트리를 가리키지만, 사용자가 연
+    /// 것도 `git worktree`를 부를 대상도 저장소다 (state-machine 38절).
+    pub repo_display: String,
+    /// 이번 세션이 격리 트리에서 도는가 (worktree.rs). `None`이면 본체에서 돈다.
+    pub isolation: Option<tomverse_core::worktree::Isolation>,
     pub name: String,
     pub host: Arc<TaskHost>,
     pub workspace_id: String,
@@ -348,6 +353,55 @@ impl SessionState {
         Ok(json!({ "path": path.display().to_string() }))
     }
 
+    /// 격리 트리 목록 (state-machine 38절). **읽기 전용이다.**
+    ///
+    /// # 남의 트리도 보여주되 가른다
+    ///
+    /// `git worktree list`에는 사용자가 손으로 만든 것도 나온다. 목록에서 빼면 "왜 이 브랜치를
+    /// 못 쓰는가"에 답할 수 없고(그 트리가 브랜치를 잡고 있다), 정리 대상으로 세면 남의 작업을
+    /// 지운다. 그래서 함께 보여주고 `ours`로 가른다(22.6절).
+    pub fn worktrees(&self) -> Result<Value, String> {
+        let (repo, active_root) =
+            self.with_active(|active| Ok((active.repo_display.clone(), active.root_display.clone())))?;
+        let all = tomverse_core::worktree::list(std::path::Path::new(&repo)).map_err(|e| e.to_string())?;
+        let ours: Vec<&tomverse_core::worktree::Worktree> = tomverse_core::worktree::ours(&all);
+        let described: Vec<Value> = all
+            .iter()
+            .map(|w| {
+                let path = w.path.display().to_string();
+                json!({
+                    "path": path,
+                    "branch": w.branch,
+                    "ours": ours.iter().any(|o| o.path == w.path),
+                    // 더러운 트리는 지우지 않는다(22.6절). 화면이 **미리** 말할 수 있게 함께 낸다 —
+                    // 누른 뒤에 거절당하는 것보다 낫다.
+                    "dirty": tomverse_core::worktree::is_dirty(&w.path),
+                    // **지금 이 세션이 도는 트리**는 정리 대상이 아니다. 지우면 게이트 루트가
+                    // 사라진 채로 세션이 살아 있게 된다.
+                    "active": path == active_root,
+                })
+            })
+            .collect();
+        Ok(json!({ "repo": repo, "worktrees": described }))
+    }
+
+    /// 격리 트리를 정리한다 (22.6절).
+    ///
+    /// **더러우면 지우지 않는다.** `force`는 사용자의 커밋되지 않은 작업을 버리는 행위이므로
+    /// 화면이 그 사실을 말한 뒤 사용자가 고른다 — 우리가 대신 고르지 않는다.
+    pub fn remove_worktree(&self, path: &str, force: bool) -> Result<Value, String> {
+        let (repo, active_root) =
+            self.with_active(|active| Ok((active.repo_display.clone(), active.root_display.clone())))?;
+        if path == active_root {
+            // **여기서 막는다.** git은 이 삭제를 성공시킬 수도 있고, 그러면 이 세션의 게이트
+            // 루트가 사라진 채로 태스크가 계속 돈다.
+            return Err("지금 이 워크스페이스가 도는 트리입니다 — 다른 워크스페이스를 연 뒤에 정리하세요.".to_string());
+        }
+        tomverse_core::worktree::remove(std::path::Path::new(&repo), std::path::Path::new(path), force)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "removed": path }))
+    }
+
     /// 등록을 저장한다.
     ///
     /// **즉시 반영되지 않는다.** 훅 레지스트리와 MCP 풀은 `TaskHost`를 만들 때 붙으므로,
@@ -554,14 +608,41 @@ impl SessionState {
     }
 
     /// 워크스페이스를 열고 sidecar를 spawn한다. 이미 열려 있으면 교체한다.
-    pub fn open_workspace(&self, app: &AppHandle, path: &str, policy: TaskPolicy) -> Result<Value, String> {
-        let root = WorkspaceRoot::new(path).map_err(|e| format!("워크스페이스를 열 수 없습니다: {e}"))?;
+    pub fn open_workspace(
+        &self,
+        app: &AppHandle,
+        path: &str,
+        policy: TaskPolicy,
+        isolate: Option<&str>,
+    ) -> Result<Value, String> {
+        let repo = WorkspaceRoot::new(path).map_err(|e| format!("워크스페이스를 열 수 없습니다: {e}"))?;
+
+        // **격리는 루트를 바꾸는 것이 전부다**(22.1절). 트리를 먼저 만들고, 그 경로를 게이트
+        // 루트로 준다 — 게이트에 "격리 모드" 분기를 만들지 않는다.
+        //
+        // 기준 커밋을 고르지 않는다(`base = None`): 지금 체크아웃된 곳에서 시작한다. 고를 수
+        // 있게 하려면 화면이 "무엇에서 시작하는가"를 말해야 하고, 그건 별개의 결정이다.
+        let isolation = match isolate {
+            Some(branch) => {
+                let parent = tomverse_core::worktree::parent_dir(&app_state_dir());
+                let tree = tomverse_core::worktree::ensure(repo.path(), &parent, branch, None)
+                    .map_err(|e| e.to_string())?;
+                Some(tomverse_core::worktree::Isolation::of(repo.path(), &tree))
+            }
+            None => None,
+        };
+        // **게이트 루트와 신원 루트가 갈린다**(38절). 신원까지 격리 트리로 옮기면 workspace_id가
+        // 바뀌고 거기 매달린 등록(훅·MCP)과 작업 기록이 격리를 켤 때마다 사라진다.
+        let split = tomverse_core::worktree::roots(repo.path(), isolation.as_ref());
+        let root = WorkspaceRoot::new(&split.gate).map_err(|e| format!("격리 트리를 열 수 없습니다: {e}"))?;
+        let identity =
+            WorkspaceRoot::new(&split.identity).map_err(|e| format!("워크스페이스를 열 수 없습니다: {e}"))?;
 
         let artifacts = self.artifacts()?;
         let store = self.store()?;
 
-        let workspace_id = tomverse_core::paths::workspace_id_for(&root.display());
-        let name = root
+        let workspace_id = tomverse_core::paths::workspace_id_for(&identity.display());
+        let name = identity
             .path()
             .file_name()
             .and_then(|n| n.to_str())
@@ -571,7 +652,9 @@ impl SessionState {
         {
             let guard = store.lock().unwrap();
             guard
-                .upsert_workspace(&workspace_id, &root.display(), &name)
+                // **기록되는 경로는 저장소다.** 격리 트리를 적으면 작업 기록이 트리를 지울 때
+                // 없는 경로를 가리킨다.
+                .upsert_workspace(&workspace_id, &identity.display(), &name)
                 .map_err(|e| format!("워크스페이스 기록 실패: {e}"))?;
             guard
                 .upsert_session(&session_id, &workspace_id, Some(&name))
@@ -619,6 +702,10 @@ impl SessionState {
             // 등록만 되고 매 phase마다 조용히 거부되는 것보다 낫다.
             task_host.preflight_hooks(&hooks)?;
             task_host = task_host.with_hooks(tomverse_core::hooks::HookRegistry::new(hooks));
+        }
+        // 격리 실행의 사실을 호스트에 붙인다 — 태스크마다 `TASK_CONFIG_PINNED`에 실린다(37·38절).
+        if let Some(iso) = isolation.clone() {
+            task_host = task_host.with_isolation(iso);
         }
         let host = Arc::new(task_host);
 
@@ -674,10 +761,17 @@ impl SessionState {
 
         let info = json!({
             "rootPath": root.display(),
+            "repoPath": identity.display(),
             "name": name,
             "workspaceId": workspace_id,
             "sessionId": session_id,
             "protocolVersion": PROTOCOL_VERSION,
+            // **`clone`이다.** 아래에서 `ActiveWorkspace`가 같은 값을 들고 있어야 한다 —
+            // 화면이 다시 물을 때(`current_workspace`) 같은 답이 나와야 하기 때문이다.
+            "isolation": isolation.clone(),
+            // **말하지 않으면 사용자가 정반대로 읽는 것들**(22.5절). 문장을 core가 만든다 —
+            // 헤드리스는 stderr로, 여기서는 화면으로 내되 조건은 한 곳에서 정한다.
+            "isolationNotices": isolation.as_ref().map(|i| i.notices()).unwrap_or_default(),
         });
 
         let mut guard = self.inner.lock().unwrap();
@@ -695,6 +789,8 @@ impl SessionState {
         }
         *guard = Some(ActiveWorkspace {
             root_display: root.display(),
+            repo_display: identity.display(),
+            isolation,
             name,
             host,
             workspace_id,
@@ -718,6 +814,9 @@ impl SessionState {
         guard.as_ref().map(|active| {
             json!({
                 "rootPath": active.root_display,
+                "repoPath": active.repo_display,
+                "isolation": active.isolation.clone(),
+                "isolationNotices": active.isolation.as_ref().map(|i| i.notices()).unwrap_or_default(),
                 "name": active.name,
                 "workspaceId": active.workspace_id,
                 "sessionId": active.session_id,

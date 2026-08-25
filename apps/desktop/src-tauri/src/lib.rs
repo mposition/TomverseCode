@@ -25,12 +25,19 @@ use tomverse_core::{PROTOCOL_VERSION, PROVIDER_ENV_VARS};
 ///
 /// 경로는 UI가 문자열로 넘기지만 Rust가 canonicalize하고 디렉터리인지 확인한다.
 /// 이후 모든 파일 접근은 이 루트를 벗어날 수 없다(`WorkspaceRoot`).
+///
+/// `isolate_branch`가 있으면 **격리 트리에서 연다**(state-machine 38절). 여는 시점에 정하는
+/// 이유는 38.1절 — 게이트 루트가 sidecar 수명과 묶여 있어 태스크마다 바꿀 수 없다.
 #[tauri::command]
-async fn open_workspace(app: tauri::AppHandle, path: String) -> Result<Value, String> {
+async fn open_workspace(
+    app: tauri::AppHandle,
+    path: String,
+    isolate_branch: Option<String>,
+) -> Result<Value, String> {
     // SQLite 열기와 프로세스 spawn은 블로킹이다 — async 런타임 스레드를 막지 않는다.
     tauri::async_runtime::spawn_blocking(move || {
         let session = app.state::<SessionState>();
-        session.open_workspace(&app, &path, TaskPolicy::default())
+        session.open_workspace(&app, &path, TaskPolicy::default(), isolate_branch.as_deref())
     })
     .await
     .map_err(|e| format!("워크스페이스 열기 스레드 오류: {e}"))?
@@ -239,6 +246,18 @@ fn task_export(state: tauri::State<'_, SessionState>, task_id: String) -> Result
 #[tauri::command]
 fn workspace_settings(state: tauri::State<'_, SessionState>) -> Result<Value, String> {
     state.workspace_settings()
+}
+
+/// 격리 트리 목록 (state-machine 38절). **읽기 전용이다.**
+#[tauri::command]
+fn worktrees(state: tauri::State<'_, SessionState>) -> Result<Value, String> {
+    state.worktrees()
+}
+
+/// 격리 트리 정리 (22.6절). 더러운 트리는 `force` 없이는 지우지 않는다.
+#[tauri::command]
+fn remove_worktree(state: tauri::State<'_, SessionState>, path: String, force: bool) -> Result<Value, String> {
+    state.remove_worktree(&path, force)
 }
 
 /// 스킬 보관함과 저장소의 제안 (state-machine 36절). **읽기만 한다.**
@@ -492,6 +511,8 @@ pub fn run() {
             withdraw_decision,
             workspace_settings,
             workspace_proposal,
+            worktrees,
+            remove_worktree,
             skill_library,
             import_skill,
             remove_skill,

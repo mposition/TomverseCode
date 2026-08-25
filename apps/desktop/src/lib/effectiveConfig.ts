@@ -27,6 +27,14 @@ export interface PinnedConfig {
   verificationPin?: { program: string; args: string[] }[];
   hooks?: { phase: string; command: string }[];
   mcpServers?: { name: string; program: string; args: string[]; tools?: string[] | null }[];
+  /** 격리 실행 (38절). `null`이면 본체에서 돌았다. */
+  isolation?: {
+    repo: string;
+    branch: string;
+    path: string;
+    reused: boolean;
+    mainTreeDirty: boolean;
+  } | null;
 }
 
 export interface ConfigLine {
@@ -97,4 +105,23 @@ export function describeMcpServer(server: {
       ? "도구 전부"
       : `도구 ${server.tools.length}개로 제한 (${server.tools.join(", ")})`;
   return `${server.name} — ${command} · ${tools}`;
+}
+
+/**
+ * 어디서 돌았는가 한 줄 — 38절.
+ *
+ * **"격리했다"만 말하지 않는다.** 사용자가 다음에 하는 일은 결과를 여는 것이고, 그러려면
+ * 경로가 필요하다. 그리고 이 줄은 지난 작업 기록에서도 읽히므로, 그때는 트리가 이미 정리돼
+ * 사라졌을 수도 있다 — 그래도 **어디였는지**는 사실이다.
+ */
+export function describeIsolation(config: PinnedConfig): string {
+  const iso = config.isolation;
+  if (iso === undefined || iso === null) return "본체 작업 트리에서 돌았습니다.";
+  const reused = iso.reused ? " (이미 있던 트리를 이어 썼습니다)" : "";
+  // **본체가 더러웠다는 사실을 함께 남긴다.** 그 변경은 이 실행에 포함되지 않았고, 그걸 모르면
+  // 결과 diff를 "모델이 내 수정을 되돌렸다"로 읽는다.
+  const dirty = iso.mainTreeDirty
+    ? " 시작 시점에 본체에 커밋되지 않은 변경이 있었고, 그 변경은 이 실행에 포함되지 않았습니다."
+    : "";
+  return `격리 실행 — ${iso.branch} 브랜치, ${iso.path}${reused}.${dirty}`;
 }

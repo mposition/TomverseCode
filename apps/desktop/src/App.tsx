@@ -47,6 +47,7 @@ import { AuditExportPanel } from "./components/AuditExportPanel";
 import { BlockedPanel } from "./components/BlockedPanel";
 import { WorkspaceSettingsPanel } from "./components/WorkspaceSettingsPanel";
 import { CarriedDecisionsPanel } from "./components/CarriedDecisionsPanel";
+import { WorktreePanel } from "./components/WorktreePanel";
 import { SkillLibraryPicker } from "./components/SkillLibraryPicker";
 import { EffectiveConfigPanel } from "./components/EffectiveConfigPanel";
 import { PullRequestPanel } from "./components/PullRequestPanel";
@@ -135,6 +136,13 @@ function budgetArgs(text: string): { budgetUsd: number | null; budgetUnlimited: 
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [workspacePath, setWorkspacePath] = useState("");
+  /**
+   * 격리 실행의 브랜치 (state-machine 38절). 비어 있으면 본체에서 돈다.
+   *
+   * **여는 시점에 정한다.** 태스크마다 바꿀 수 없는 이유는 게이트 루트가 sidecar 수명과
+   * 묶여 있기 때문이고, 그건 화면이 정할 수 있는 것이 아니다(38.1절).
+   */
+  const [isolateBranch, setIsolateBranch] = useState("");
   const [openError, setOpenError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
 
@@ -446,7 +454,11 @@ export default function App() {
     setOpening(true);
     setOpenError(null);
     try {
-      const info = await invoke<WorkspaceInfo>("open_workspace", { path: workspacePath });
+      const info = await invoke<WorkspaceInfo>("open_workspace", {
+        path: workspacePath,
+        // 빈 문자열은 **격리하지 않음**이다. 그대로 넘기면 이름 없는 브랜치를 만들려다 거절된다.
+        isolateBranch: isolateBranch.trim() === "" ? null : isolateBranch.trim(),
+      });
       setWorkspace(info);
       // 다시 열었으면 감독자가 새로 만들어졌다 — 옛 배너를 그대로 두면 고쳐졌는데도 고장으로 보인다.
       void refreshBackend();
@@ -487,24 +499,30 @@ export default function App() {
     } finally {
       setOpening(false);
     }
-  }, [workspacePath, refreshBackend]);
+  }, [workspacePath, isolateBranch, refreshBackend]);
 
   // 배너의 "다시 열기". 대상 경로는 **지금 열려 있는 워크스페이스**이지 입력란의 값이 아니다 —
   // 입력란은 사용자가 다른 경로를 타이핑하던 중일 수 있고, 그러면 엉뚱한 곳이 열린다.
   const banner = bannerFor(backend);
-  const reopenPath = reopenTarget(banner, workspace?.rootPath ?? null);
+  // **저장소 경로로 다시 연다.** 격리 실행에서 `rootPath`는 격리 트리이고, 그걸 저장소로 주면
+  // 트리가 저장소가 되어 격리가 조용히 사라진다 — 게다가 workspace_id가 바뀌어 등록도 사라진다.
+  const reopenPath = reopenTarget(banner, workspace?.repoPath ?? workspace?.rootPath ?? null);
+  const reopenBranch = workspace?.isolation?.branch ?? null;
   const reopenBackend = useCallback(async () => {
     if (!reopenPath) return;
     setOpening(true);
     try {
-      setWorkspace(await invoke<WorkspaceInfo>("open_workspace", { path: reopenPath }));
+      // **같은 격리로 다시 연다.** 떨어뜨리면 sidecar가 죽었다 살아난 뒤부터 본체에 파일을 쓴다.
+      setWorkspace(
+        await invoke<WorkspaceInfo>("open_workspace", { path: reopenPath, isolateBranch: reopenBranch })
+      );
       await refreshBackend();
     } catch (error) {
       setOpenError(String(error));
     } finally {
       setOpening(false);
     }
-  }, [reopenPath, refreshBackend]);
+  }, [reopenPath, reopenBranch, refreshBackend]);
 
   const toggleProvider = useCallback(
     async (providerId: string, enable: boolean) => {
@@ -871,6 +889,9 @@ export default function App() {
           {workspace ? (
             <span title={workspace.rootPath}>
               워크스페이스: <strong>{workspace.name}</strong>
+              {/* **격리는 이름 옆에 붙인다.** 어디에 파일이 쓰이는지는 매 순간의 사실이고,
+                  패널을 펼쳐야 보이면 잊힌다. */}
+              {workspace.isolation && <span className="chip"> 격리: {workspace.isolation.branch}</span>}
             </span>
           ) : (
             <span>워크스페이스가 선택되지 않았습니다</span>
@@ -972,6 +993,19 @@ export default function App() {
         </section>
       )}
 
+      {/* 격리 실행이 **말하지 않으면 정반대로 읽히는 것들**(22.5절). 배너 자리인 이유:
+          "결과가 본체에 없다"는 사실은 결과를 볼 때가 아니라 **작업을 시작하기 전에** 알아야
+          한다. 문장은 Rust가 만든다 — 헤드리스는 stderr로 같은 것을 낸다. */}
+      {(workspace?.isolationNotices?.length ?? 0) > 0 && (
+        <section className="banner banner-warn">
+          <ul className="small">
+            {workspace?.isolationNotices?.map((notice) => (
+              <li key={notice}>{notice}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {!workspace && (
         <section className="panel">
           <h2>워크스페이스 선택</h2>
@@ -989,6 +1023,31 @@ export default function App() {
               {opening ? "여는 중..." : "열기"}
             </button>
           </div>
+
+          {/* 격리 실행 (state-machine 22·38절). **여는 시점에 정한다** — 게이트 루트가 sidecar
+              수명과 묶여 있어 태스크마다 바꿀 수 없다. */}
+          <fieldset className="policy">
+            <legend>격리 실행 (선택)</legend>
+            <div className="row">
+              <input
+                value={isolateBranch}
+                onChange={(e) => setIsolateBranch(e.target.value)}
+                placeholder="브랜치 이름 (비우면 본체에서 작업)"
+                spellCheck={false}
+              />
+            </div>
+            <p className="muted small">
+              브랜치 이름을 적으면 <strong>같은 저장소의 별도 작업 트리</strong>에서 돕니다. 본체 파일은 바뀌지
+              않고, 결과는 그 트리에 남습니다. 트리는 저장소 <strong>밖</strong>(앱 상태 디렉터리)에 만들어집니다 —
+              안에 만들면 본체에서 도는 작업이 그 파일을 고칠 수 있어 격리가 아니게 됩니다.
+            </p>
+            {/* 22.4절: 못 받는 이름을 **조용히 바꾸지 않는다**. 미리 말한다. */}
+            <p className="muted small">
+              쓸 수 있는 이름: 영숫자와 <code>-</code> <code>_</code> <code>.</code>. <code>feature/x</code>처럼
+              <code>/</code>가 든 이름은 받지 않습니다 — 이름을 우리가 바꾸면 사용자가 만든 브랜치와 다른 브랜치가
+              생깁니다.
+            </p>
+          </fieldset>
           {openError && <p className="error">{openError}</p>}
         </section>
       )}
@@ -1047,6 +1106,9 @@ export default function App() {
                   옵션이 아니라 워크스페이스 설정 옆에 둔다 — 태스크 옵션 자리에 있으면
                   "이번 작업에만 적용된다"로 읽히는데, 실제로는 다음 태스크들에 실린다. */}
               {workspace && <CarriedDecisionsPanel />}
+              {/* 격리 트리 (22.6·38절). **워크스페이스 수명**이라 여기 둔다 — 태스크 옵션
+                  자리에 있으면 "이번 작업만 격리한다"로 읽히는데, 격리는 여는 시점에 정해진다. */}
+              {workspace && <WorktreePanel isolatedPath={workspace.isolation?.path ?? null} />}
               {/* 무인 실행 (state-machine 24절). **켜도 승인 정책은 그대로다** — 달라지는 것은
                   승인이 필요한 지점에서 묻는 대신 멈춘다는 것뿐이고, 그 정지는 사용자 거부로
                   기록되지 않는다(24.2절). */}
