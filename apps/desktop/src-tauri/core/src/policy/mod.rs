@@ -374,7 +374,12 @@ impl PolicyGate {
                 decision: Decision::Deny,
                 risk_level: RiskLevel::Prohibited,
                 matched_rule: format!("deny:{rule}"),
-                reason: format!("deny 규칙 {rule:?}에 매치 — 정책 override로 해제할 수 없음"),
+                // **셸을 열려는 요청에는 처방을 붙인다**(43절). 거부는 그대로지만, "deny 규칙에
+                // 매치됨"만으로는 모델이 다음에 무엇을 할지 알 수 없다.
+                reason: match crate::shell_habits::shell_launcher_advice(&program, &cmd.args) {
+                    Some(advice) => format!("deny 규칙 {rule:?}에 매치 — 정책 override로 해제할 수 없음. {}", advice.message),
+                    None => format!("deny 규칙 {rule:?}에 매치 — 정책 override로 해제할 수 없음"),
+                },
                 normalized_target: target,
                 unblocked_by: PolicyLever::NotApplicable,
             },
@@ -422,16 +427,32 @@ impl PolicyGate {
             //    후자를 택했다 — 승인 모달은 사용자가 판단할 정보를 갖고 있을 때만 의미가 있고,
             //    allowlist에 없는 임의 실행 파일에 대해 사용자는 그 정보를 갖고 있지 않다.
             //    필요한 명령은 워크스페이스 정책에 규칙을 추가해 명시적으로 허용한다.
-            CommandMatch::NoMatch => Outcome {
-                decision: Decision::Deny,
-                risk_level: RiskLevel::High,
-                matched_rule: "no_rule_matched_default_deny".to_string(),
-                reason: format!(
-                    "{program:?}에 매치되는 allowlist 규칙이 없음 — 분류 불가한 명령은 기본 거부. \
-                     필요하면 워크스페이스 정책에 규칙을 추가할 것"
-                ),
-                normalized_target: target,
-                unblocked_by: PolicyLever::NotApplicable,
+            // **대체 도구를 아는 경우를 따로 가른다**(43절). 종전에는 `ls`·`Get-ChildItem`도
+            //    "워크스페이스 정책에 규칙을 추가할 것"으로 안내했는데, 그건 **틀린 처방**이다:
+            //    사용자가 `ls`를 allowlist에 넣을 일이 아니라 모델이 `list_files`를 쓸 일이고,
+            //    cmdlet은 애초에 추가할 수 있는 실행 파일도 아니다.
+            CommandMatch::NoMatch => match crate::shell_habits::alternative_for(&program) {
+                Some(advice) => Outcome {
+                    decision: Decision::Deny,
+                    risk_level: RiskLevel::High,
+                    // 규칙 이름이 갈리는 이유: **이 거부는 다시 그리면 지나간다**(41.4절).
+                    // 판정이 규칙 이름에서 유도되므로, 이름이 같으면 그 사실을 담을 수 없다.
+                    matched_rule: "no_rule_matched_but_a_tool_does_it".to_string(),
+                    reason: format!("{program:?}에 매치되는 allowlist 규칙이 없습니다. {}", advice.message),
+                    normalized_target: target,
+                    unblocked_by: PolicyLever::NotApplicable,
+                },
+                None => Outcome {
+                    decision: Decision::Deny,
+                    risk_level: RiskLevel::High,
+                    matched_rule: "no_rule_matched_default_deny".to_string(),
+                    reason: format!(
+                        "{program:?}에 매치되는 allowlist 규칙이 없음 — 분류 불가한 명령은 기본 거부. \
+                         필요하면 워크스페이스 정책에 규칙을 추가할 것"
+                    ),
+                    normalized_target: target,
+                    unblocked_by: PolicyLever::NotApplicable,
+                },
             },
         }
     }
@@ -449,9 +470,23 @@ impl PolicyGate {
 /// **목록을 좁게 둔다.** 경계 위반(`*_outside_workspace`)은 여기 넣지 않는다: 다시 그리면
 /// 지나갈 수 있는 것은 맞지만, 그 초대는 게이트를 두드려 보라는 말이 된다.
 pub fn redraftable(matched_rule: &str) -> bool {
+    // 셸을 열려는 요청(43절). **거부는 그대로이고, 다시 그릴 수 있다는 것만 다르다** —
+    // 답이 언제나 같기 때문이다: 셸 말고 도구를 쓰라. 경계 위반과 달리 이 초대는 게이트를
+    // 두드려 보라는 말이 아니다.
+    if matched_rule
+        .strip_prefix("deny:")
+        .is_some_and(crate::shell_habits::is_shell_launcher)
+    {
+        return true;
+    }
     matches!(
         matched_rule,
-        "argv_contract_violation" | "malformed_tool_args" | "shell_chaining"
+        "argv_contract_violation"
+            | "malformed_tool_args"
+            | "shell_chaining"
+            // 우리가 **대체 도구를 아는** 경우에만. 그냥 모르는 프로그램은 다시 그려도
+            // 지나가지 않으므로 되돌리지 않는다.
+            | "no_rule_matched_but_a_tool_does_it"
     )
 }
 
@@ -1413,13 +1448,90 @@ mod tests {
     #[test]
     fn unclassifiable_command_is_denied_by_default() {
         let (_d, root) = setup();
+        // **대체 도구를 모르는 명령.** 여기서 `rm`을 쓰지 않는 이유는 아래 검사에 있다 —
+        // 우리가 `delete_file`을 알고 있으므로 그건 다른 결말이 된다.
         let d = gate().evaluate(
-            &request(ToolName::RunCommand, json!({ "program": "rm", "args": ["-rf", "src"] })),
+            &request(ToolName::RunCommand, json!({ "program": "make", "args": ["all"] })),
             &root,
             &TaskPolicy::default(),
         );
         assert_eq!(d.decision, Decision::Deny);
         assert_eq!(d.matched_rule, "no_rule_matched_default_deny");
+        // 다시 그려도 지나가지 않는다 — 사용자가 규칙을 추가해야 하는 일이다.
+        assert!(!d.redraftable, "{}", d.reason);
+    }
+
+    /// **틀린 처방을 하고 있었다**(43절). `rm`·`Get-ChildItem`도 "워크스페이스 정책에 규칙을
+    /// 추가할 것"으로 안내했는데, 사용자가 `rm`을 allowlist에 넣을 일이 아니라 모델이
+    /// `delete_file`을 쓸 일이고, cmdlet은 애초에 추가할 수 있는 실행 파일도 아니다.
+    #[test]
+    fn a_command_we_have_a_tool_for_gets_the_tool_not_a_policy_lecture() {
+        let (_d, root) = setup();
+        for (program, tool) in [("rm", "delete_file"), ("Get-ChildItem", "list_files"), ("grep", "search_text")] {
+            let d = gate().evaluate(
+                &request(ToolName::RunCommand, json!({ "program": program, "args": ["x"] })),
+                &root,
+                &TaskPolicy::default(),
+            );
+            assert_eq!(d.decision, Decision::Deny, "{program}");
+            assert_eq!(d.matched_rule, "no_rule_matched_but_a_tool_does_it", "{program}");
+            assert!(d.reason.contains(tool), "{program}: {}", d.reason);
+            // 틀린 처방이 남아 있으면 사용자가 없는 문제를 고치러 간다.
+            assert!(!d.reason.contains("규칙을 추가"), "{program}: {}", d.reason);
+            // 모델이 고칠 수 있는 거부다(42절이 이걸 보고 되돌린다).
+            assert!(d.redraftable, "{program}");
+        }
+    }
+
+    /// 셸을 여는 요청은 **거부는 그대로**이고 처방만 붙는다 — 답이 언제나 같기 때문이다.
+    #[test]
+    fn a_shell_launcher_is_still_denied_but_now_says_what_to_do() {
+        let (_d, root) = setup();
+        let d = gate().evaluate(
+            &request(
+                ToolName::RunCommand,
+                json!({ "program": "powershell", "args": ["-Command", "Get-ChildItem -Path src"] }),
+            ),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert_eq!(d.decision, Decision::Deny);
+        assert!(d.matched_rule.starts_with("deny:"), "{}", d.matched_rule);
+        // 명령 문자열의 **첫 토큰**을 알아본다 — 그 이상은 해석하지 않는다.
+        assert!(d.reason.contains("list_files"), "{}", d.reason);
+        assert!(d.redraftable, "{}", d.matched_rule);
+    }
+
+    /// 알아보지 못하는 셸 명령에도 **셸을 쓰지 말라**까지는 말한다 — 그건 언제나 참이다.
+    #[test]
+    fn an_unrecognized_shell_command_still_gets_the_general_advice() {
+        let (_d, root) = setup();
+        let d = gate().evaluate(
+            &request(ToolName::RunCommand, json!({ "program": "bash", "args": ["-c", "./configure && make"] })),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert!(d.reason.contains("도구로"), "{}", d.reason);
+        assert!(d.redraftable);
+    }
+
+    /// **셸이 아닌 deny 규칙에는 붙지 않는다.** `sudo`에 "도구를 쓰세요"라고 말하면 그건
+    /// 거짓말이고, 다시 그리라고 초대해서도 안 된다.
+    #[test]
+    fn other_deny_rules_are_not_invited_to_redraft() {
+        let (_d, root) = setup();
+        let d = gate().evaluate(
+            // **경로가 아닌 인자를 쓴다.** `rm -rf /`로 적었더니 경로 검사가 먼저 걸려
+            // 이 검사가 deny 경로를 보지 못했다 — 아래 규칙 이름 확인이 그걸 잡는다.
+            &request(ToolName::RunCommand, json!({ "program": "sudo", "args": ["apt", "install", "curl"] })),
+            &root,
+            &TaskPolicy::default(),
+        );
+        assert_eq!(d.decision, Decision::Deny);
+        assert!(!d.redraftable, "{}", d.matched_rule);
+        assert!(!d.reason.contains("도구로"), "{}", d.reason);
+        // 규칙 이름이 실제로 deny 경로인지 확인한다 — 아니면 위 두 줄은 다른 경로를 검사한 것이다.
+        assert_eq!(d.matched_rule, "deny:sudo", "{}", d.reason);
     }
 
     #[test]

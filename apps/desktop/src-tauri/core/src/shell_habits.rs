@@ -66,7 +66,75 @@ const ALTERNATIVES: &[(&str, &str, &str)] = &[
     ("sed", "apply_patch", "파일 수정"),
     ("awk", "apply_patch", "파일 수정"),
     ("diff", "git_diff", "변경 비교"),
+    // PowerShell cmdlet — product-strategy 12.4절 우선순위의 둘째 줄(43절).
+    //
+    // **이것들은 실행 파일이 아니다.** `powershell.exe` 안에 사는 이름이라 PATH에 없고,
+    // 그래서 게이트의 "분류 불가"에 먼저 걸린다. 종전 메시지는 "워크스페이스 정책에 규칙을
+    // 추가하라"였는데, 그건 틀린 처방이다 — 추가할 수 있는 실행 파일이 아니다.
+    ("get-childitem", "list_files", "디렉터리 목록"),
+    ("gci", "list_files", "디렉터리 목록"),
+    ("get-content", "read_file", "파일 내용 읽기"),
+    ("gc", "read_file", "파일 내용 읽기"),
+    ("select-string", "search_text", "내용 검색"),
+    ("sls", "search_text", "내용 검색"),
+    ("remove-item", "delete_file", "파일 삭제"),
+    ("new-item", "create_file", "파일 만들기"),
+    ("set-content", "create_file", "파일 내용 쓰기"),
+    ("test-path", "list_files", "파일 존재 확인"),
 ];
+
+/// 셸을 여는 프로그램. **게이트가 거부하는 목록과 같은 뜻이어야 한다** —
+/// `policy/command.rs`의 deny 규칙이 정본이고, 여기 목록은 그 거부에 **처방을 붙이기 위한**
+/// 것이다. 갈리면 처방 없는 거부가 조용히 생긴다(테스트가 대조한다).
+const SHELL_LAUNCHERS: &[&str] = &["cmd", "powershell", "pwsh", "sh", "bash", "zsh", "wscript", "cscript"];
+
+pub fn is_shell_launcher(program: &str) -> bool {
+    let base = crate::policy::command::program_basename(program).to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    SHELL_LAUNCHERS.contains(&base)
+}
+
+/// 셸을 열려는 요청에 붙일 처방 (state-machine 43절).
+///
+/// # 왜 거부만으로는 부족한가
+///
+/// 게이트는 `cmd`·`powershell`·`bash`를 거부한다 — argv 약속을 무의미하게 만드는 경로이기
+/// 때문이다(원칙 6). 그런데 그 거부 문장은 "deny 규칙에 매치됨"이고, 모델이 다음에 무엇을
+/// 해야 하는지 아무 말도 하지 않는다.
+///
+/// # 명령 문자열의 **첫 토큰만** 본다
+///
+/// `-Command`/`-c`/`/c` 다음에 오는 문자열의 첫 낱말이 우리가 아는 것이면 그 도구를 이름으로
+/// 말해준다. **파이프라인이나 인용을 해석하지 않는다** — 셸 문법을 우리가 해석하기 시작하면
+/// 그 해석이 틀릴 수 있고, 틀린 처방은 침묵보다 나쁘다(41.2절과 같은 판단).
+pub fn shell_launcher_advice(program: &str, args: &[String]) -> Option<Advice> {
+    if !is_shell_launcher(program) {
+        return None;
+    }
+    let base = crate::policy::command::program_basename(program).to_ascii_lowercase();
+    let named = command_string_of(args).and_then(|text| {
+        let first = text.split_whitespace().next()?;
+        alternative_for(first)
+    });
+    let tail = match named {
+        Some(advice) => format!(" {}", advice.message),
+        None => String::new(),
+    };
+    Some(Advice {
+        habit: "shell_launcher",
+        message: format!(
+            "{base}은(는) 셸을 엽니다. 이 실행기는 셸을 쓰지 않으므로(승인 화면에 보인 argv가              그대로 실행됩니다) 셸을 여는 요청은 거부됩니다. 하려던 일을 **도구로** 요청하세요.{tail}"
+        ),
+    })
+}
+
+/// 셸에 넘기는 명령 문자열. 플래그 다음 인자 하나만 본다.
+fn command_string_of(args: &[String]) -> Option<&String> {
+    let at = args
+        .iter()
+        .position(|a| matches!(a.to_ascii_lowercase().as_str(), "-command" | "-c" | "/c" | "/k" | "-e"))?;
+    args.get(at + 1)
+}
 
 /// 이 프로그램을 못 찾았을 때, 대신 권할 도구가 있는가.
 ///
@@ -167,6 +235,68 @@ mod tests {
         ];
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(unique.len(), names.len(), "도구 이름이 겹칩니다: {names:?}");
+    }
+
+    /// **처방 목록과 거부 목록이 같은 뜻이어야 한다.** 갈리면 처방 없는 거부가 조용히
+    /// 생긴다 — 모델은 "deny 규칙에 매치됨"만 받고 다음에 무엇을 할지 모른다.
+    ///
+    /// 판정 기준을 손으로 적지 않는다: **실제 기본 정책에 물어본다.**
+    #[test]
+    fn every_shell_launcher_we_advise_about_is_actually_denied() {
+        let policy = crate::policy::command::default_command_policy();
+        assert!(!SHELL_LAUNCHERS.is_empty());
+        for program in SHELL_LAUNCHERS {
+            let cmd = crate::types::RunCommandArgs {
+                program: (*program).to_string(),
+                args: vec!["-c".to_string(), "echo hi".to_string()],
+                cwd: ".".to_string(),
+                timeout_ms: None,
+            };
+            let matched = crate::policy::command::match_command(&policy, &cmd, true);
+            assert!(
+                matches!(matched, crate::policy::command::CommandMatch::Denied { .. }),
+                "{program}에 처방을 준비했지만 게이트는 거부하지 않습니다: {matched:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_launcher_advice_names_the_tool_when_it_recognizes_the_command() {
+        let args: Vec<String> = ["-Command", "Get-ChildItem -Path src"].iter().map(|s| s.to_string()).collect();
+        let advice = shell_launcher_advice("powershell.exe", &args).expect("처방이 없습니다");
+        assert_eq!(advice.habit, "shell_launcher");
+        assert!(advice.message.contains("list_files"), "{}", advice.message);
+    }
+
+    /// **첫 토큰만 본다.** 파이프라인이나 인용을 해석하기 시작하면 그 해석이 틀릴 수 있고,
+    /// 틀린 처방은 침묵보다 나쁘다.
+    #[test]
+    fn an_unrecognized_command_string_still_gets_the_general_advice() {
+        let args: Vec<String> = ["-c", "./configure && make install"].iter().map(|s| s.to_string()).collect();
+        let advice = shell_launcher_advice("bash", &args).expect("처방이 없습니다");
+        assert!(advice.message.contains("도구로"), "{}", advice.message);
+        // 없는 도구를 지어내지 않는다.
+        assert!(!advice.message.contains("도구로 요청하세요"), "{}", advice.message);
+    }
+
+    /// **뒤쪽 토큰을 집어 처방하지 않는다.** `npm run build | grep error`에서 `grep`을 보고
+    /// "`search_text`를 쓰세요"라고 말하면, 하려던 일(빌드)과 아무 상관 없는 처방이 된다 —
+    /// 그런 문장은 모델을 엉뚱한 곳으로 보낸다.
+    #[test]
+    fn a_later_token_does_not_hijack_the_advice() {
+        let args: Vec<String> = ["-c", "npm run build 2>&1 | grep error"].iter().map(|s| s.to_string()).collect();
+        let advice = shell_launcher_advice("bash", &args).expect("처방이 없습니다");
+        assert!(!advice.message.contains("search_text"), "{}", advice.message);
+        // 그래도 셸을 쓰지 말라는 말은 남는다 — 그건 언제나 참이다.
+        assert!(advice.message.contains("도구로"), "{}", advice.message);
+    }
+
+    /// 셸이 아닌 프로그램에는 붙지 않는다 — `sudo`에 "도구를 쓰세요"는 거짓말이다.
+    #[test]
+    fn non_shell_programs_get_no_shell_advice() {
+        for program in ["sudo", "npm", "git", "reg"] {
+            assert!(shell_launcher_advice(program, &[]).is_none(), "{program}");
+        }
     }
 
     #[test]
