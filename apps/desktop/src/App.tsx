@@ -1078,13 +1078,18 @@ export default function App() {
                   <input
                     value={skillPath}
                     onChange={(e) => setSkillPath(e.target.value)}
-                    placeholder="skill.json 경로"
+                    placeholder="skill.json 경로 (워크스페이스 밖)"
                     spellCheck={false}
                   />
                 </label>
                 <p className="muted small">
                   지시문은 프롬프트에 실리고 <strong>전송 내역에 집계됩니다</strong>. 도구 허용목록은 좁히기만
                   하며, 검증 명령은 적지 않아도 남습니다.
+                </p>
+                {/* 34절. **미리 말한다** — 거부된 뒤에 알면 사용자는 경로 오타를 의심한다. */}
+                <p className="muted small">
+                  스킬 파일은 <strong>워크스페이스 밖</strong>에 있어야 합니다. 워크스페이스 안의 파일은 모델이
+                  고칠 수 있고, 그러면 모델이 자기 프롬프트에 지시문을 심거나 좁혀 둔 허용목록을 되돌릴 수 있습니다.
                 </p>
               </fieldset>
               {/* 역할별 모델 지정 (multi-engine-routing.md 15절).

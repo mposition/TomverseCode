@@ -97,6 +97,26 @@ impl WorkspaceRoot {
         self.canonical.display().to_string()
     }
 
+    /// 이 경로가 워크스페이스 **안**인가 (state-machine 34절).
+    ///
+    /// `resolve_existing`과 목적이 다르다. 저건 "모델이 준 상대경로를 안전하게 푼다"이고,
+    /// 이건 **사용자가 고른 절대경로가 모델이 쓸 수 있는 자리인지** 묻는다 — 답이 "예"면
+    /// 그 파일의 내용은 모델이 바꿀 수 있다.
+    ///
+    /// **canonical로 비교한다.** `..`이나 심링크로 우회할 수 있으면 이 질문의 답이 거짓이
+    /// 되고, 그 거짓은 "안전한 자리에서 읽었다"는 결론으로 이어진다. 워크스페이스 안의
+    /// 심링크가 밖을 가리키면 그 실체는 밖이므로 안이 아니다 — 그리고 그 심링크를 모델이
+    /// 다시 안쪽으로 돌리면 canonical이 안이 되어 여기서 걸린다.
+    ///
+    /// 존재하지 않는 경로는 `false`다. 없는 파일은 읽기에서 실패하고, **그 실패는 여기서
+    /// 만드는 것보다 원인에 가깝다.**
+    pub fn contains(&self, path: &Path) -> bool {
+        match dunce_canonicalize(path) {
+            Ok(canonical) => canonical.starts_with(&self.canonical),
+            Err(_) => false,
+        }
+    }
+
     /// 이미 존재해야 하는 경로 해석 (읽기, 삭제, patch 적용 대상).
     /// canonicalize가 symlink를 끝까지 따라가므로 symlink/junction 탈출이 여기서 잡힌다.
     pub fn resolve_existing(&self, candidate: &str) -> Result<SafePath, PathViolation> {

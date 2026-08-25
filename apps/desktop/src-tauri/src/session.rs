@@ -743,7 +743,13 @@ impl SessionState {
         // 화면이 되고, 그러면 장악당한 화면이 "허용목록은 전부입니다"라고 말할 수 있다.
         let skill = match skill_path {
             None => None,
-            Some(path) => Some(tomverse_core::skills::load(std::path::Path::new(path)).map_err(|e| e.to_string())?),
+            // **워크스페이스 안의 스킬 파일은 거부된다**(34절) — 모델이 쓸 수 있는 파일이
+            // 지시문과 도구 허용목록을 정하게 두지 않는다. 게이트의 루트를 그대로 넘긴다:
+            // "모델이 쓸 수 있는 곳"의 정의가 그것이기 때문이다.
+            Some(path) => Some(
+                tomverse_core::skills::load(std::path::Path::new(path), host.root())
+                    .map_err(|e| e.to_string())?,
+            ),
         };
 
         // **이 태스크의 정책을 여기서 정하고, 여기서만 정한다.** 등록은 한 번뿐이므로

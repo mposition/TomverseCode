@@ -590,7 +590,7 @@ fn real_main() -> Result<i32, String> {
     let skill = match &args.skill {
         None => None,
         Some(path) => {
-            let loaded = tomverse_core::skills::load(path).map_err(|e| e.to_string())?;
+            let loaded = tomverse_core::skills::load(path, &root).map_err(|e| e.to_string())?;
             eprintln!("스킬 적용: {}", loaded.describe());
             Some(loaded)
         }

@@ -76,6 +76,11 @@ pub enum SkillError {
     EmptyAllowlist,
     #[error("스킬에 지시문도 허용목록도 모델 지정도 없습니다 — 이 스킬은 아무것도 하지 않습니다")]
     Empty,
+    /// 워크스페이스 **안**의 스킬 파일 (34절). 모델이 쓸 수 있는 파일이므로 읽지 않는다.
+    #[error(
+        "스킬 파일이 워크스페이스 안에 있습니다: {path} (워크스페이스: {root})\n         워크스페이스 안의 파일은 모델이 고칠 수 있습니다 — 스킬은 지시문과 도구 허용목록을 정하므로,          모델이 자기 프롬프트에 지시문을 심고 자기가 좁혀 둔 허용목록을 되돌릴 수 있습니다.\n         워크스페이스 밖으로 복사한 뒤 그 경로를 쓰세요."
+    )]
+    InsideWorkspace { path: String, root: String },
 }
 
 /// 이름으로 도구를 찾는다.
@@ -108,7 +113,22 @@ pub const ALL_TOOLS: &[ToolName] = &[
 ];
 
 /// 스킬 파일을 읽고 검증한다.
-pub fn load(path: &Path) -> Result<Skill, SkillError> {
+pub fn load(path: &Path, root: &crate::paths::WorkspaceRoot) -> Result<Skill, SkillError> {
+    // **워크스페이스 안의 스킬 파일은 읽지 않는다** (state-machine 34절).
+    //
+    // Policy Gate가 파일 쓰기를 워크스페이스 안으로 가두므로, 워크스페이스 안의 파일은
+    // **모델이 쓸 수 있는 파일**이다. 스킬 파일은 두 가지를 정한다: 프롬프트에 실릴 지시문과
+    // 도구 허용목록. 모델이 그 파일을 고치면 자기 다음 프롬프트에 지시문을 심을 수 있고,
+    // 허용목록을 지워 **자기가 좁혀 둔 것을 스스로 되돌릴 수 있다.**
+    //
+    // 29.1절이 등록 설정에 대해 내린 판단과 같은 문장이며, 규칙의 근거도 같다: 모델이 쓸 수
+    // 있는 곳은 워크스페이스 안이므로, 그 밖에서 오는 것만 사용자의 것이라고 말할 수 있다.
+    if root.contains(path) {
+        return Err(SkillError::InsideWorkspace {
+            path: path.display().to_string(),
+            root: root.display(),
+        });
+    }
     let text = std::fs::read_to_string(path).map_err(|e| SkillError::Unreadable {
         path: path.display().to_string(),
         detail: e.to_string(),
@@ -200,6 +220,78 @@ mod tests {
 
     fn file(json: &str) -> Result<Skill, SkillError> {
         validate(serde_json::from_str(json).unwrap())
+    }
+
+    // ---- 스킬 파일이 어디서 오는가 (34절) ----
+
+    const SAMPLE: &str = r#"{"name":"s","instructions":"do it"}"#;
+
+    /// **워크스페이스 안의 스킬 파일은 읽지 않는다.** 모델이 쓸 수 있는 파일이 지시문과
+    /// 도구 허용목록을 정하면, 모델은 자기 프롬프트에 지시문을 심고 자기가 좁혀 둔
+    /// 허용목록을 되돌릴 수 있다.
+    #[test]
+    fn a_skill_inside_the_workspace_is_refused() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+        let inside = ws.path().join("skill.json");
+        std::fs::write(&inside, SAMPLE).unwrap();
+
+        let err = load(&inside, &root).unwrap_err();
+        assert!(matches!(err, SkillError::InsideWorkspace { .. }), "{err:?}");
+        // 사유가 **고칠 방법**을 말한다 — 거부만 하면 사용자는 왜 자기 파일이 안 되는지 모른다.
+        assert!(err.to_string().contains("밖으로 복사"), "{err}");
+    }
+
+    /// 하위 디렉터리도 마찬가지다 — 루트 바로 아래만 막으면 `.tomverse/skill.json`이 지나간다.
+    #[test]
+    fn a_skill_in_a_subdirectory_is_refused_too() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+        let dir = ws.path().join(".tomverse");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inside = dir.join("skill.json");
+        std::fs::write(&inside, SAMPLE).unwrap();
+
+        assert!(matches!(load(&inside, &root).unwrap_err(), SkillError::InsideWorkspace { .. }));
+    }
+
+    /// **`..`로 되돌아오는 경로도 안이다.** canonical로 비교하지 않으면 이 우회가 지나가고,
+    /// 그 통과는 "안전한 자리에서 읽었다"는 결론으로 이어진다.
+    #[test]
+    fn a_path_that_walks_back_into_the_workspace_is_refused() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+        let dir = ws.path().join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inside = ws.path().join("skill.json");
+        std::fs::write(&inside, SAMPLE).unwrap();
+
+        let sneaky = dir.join("..").join("skill.json");
+        assert!(matches!(load(&sneaky, &root).unwrap_err(), SkillError::InsideWorkspace { .. }));
+    }
+
+    /// **밖에 있으면 읽는다.** 이 단언이 없으면 위 검사들은 "언제나 거부"로도 통과한다.
+    #[test]
+    fn a_skill_outside_the_workspace_loads() {
+        let ws = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+        let outside = elsewhere.path().join("skill.json");
+        std::fs::write(&outside, SAMPLE).unwrap();
+
+        let skill = load(&outside, &root).unwrap();
+        assert_eq!(skill.name, "s");
+    }
+
+    /// 없는 파일은 **읽기 실패**여야 한다 — 위치 검사가 그 원인을 가리면 사용자는 경로 오타를
+    /// "워크스페이스 안이라서"로 읽는다.
+    #[test]
+    fn a_missing_file_reports_the_read_failure_not_the_location() {
+        let ws = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+        let missing = elsewhere.path().join("nope.json");
+        assert!(matches!(load(&missing, &root).unwrap_err(), SkillError::Unreadable { .. }));
     }
 
     /// `ALL_TOOLS`가 `ToolName` 전체를 담고 있는가 — **`as_str`의 매치 팔에서 유도해** 본다.
