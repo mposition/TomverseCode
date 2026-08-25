@@ -241,6 +241,30 @@ fn workspace_settings(state: tauri::State<'_, SessionState>) -> Result<Value, St
     state.workspace_settings()
 }
 
+/// 스킬 보관함과 저장소의 제안 (state-machine 36절). **읽기만 한다.**
+#[tauri::command]
+fn skill_library(state: tauri::State<'_, SessionState>) -> Result<Value, String> {
+    state.skill_library()
+}
+
+/// 저장소의 스킬을 보관함으로 복사한다 (36절). 사용자가 눌렀을 때만.
+#[tauri::command]
+fn import_skill(state: tauri::State<'_, SessionState>, file: String) -> Result<Value, String> {
+    state.import_skill(&file)
+}
+
+/// 보관함에서 지운다 (36절).
+#[tauri::command]
+fn remove_skill(state: tauri::State<'_, SessionState>, file: String) -> Result<Value, String> {
+    state.remove_skill(&file)
+}
+
+/// 보관함 항목의 절대 경로 (36절). **경로 조립은 Rust가 한다.**
+#[tauri::command]
+fn skill_path(state: tauri::State<'_, SessionState>, file: String) -> Result<Value, String> {
+    state.skill_path(&file)
+}
+
 /// 저장소가 제안한 등록 (state-machine 35절). **읽기만 한다** — 등록하지 않는다.
 #[tauri::command]
 fn workspace_proposal(state: tauri::State<'_, SessionState>) -> Result<Value, String> {
@@ -468,6 +492,10 @@ pub fn run() {
             withdraw_decision,
             workspace_settings,
             workspace_proposal,
+            skill_library,
+            import_skill,
+            remove_skill,
+            skill_path,
             set_workspace_settings,
             open_pull_request,
             task_export,

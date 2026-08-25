@@ -81,6 +81,13 @@ pub enum SkillError {
         "스킬 파일이 워크스페이스 안에 있습니다: {path} (워크스페이스: {root})\n         워크스페이스 안의 파일은 모델이 고칠 수 있습니다 — 스킬은 지시문과 도구 허용목록을 정하므로,          모델이 자기 프롬프트에 지시문을 심고 자기가 좁혀 둔 허용목록을 되돌릴 수 있습니다.\n         워크스페이스 밖으로 복사한 뒤 그 경로를 쓰세요."
     )]
     InsideWorkspace { path: String, root: String },
+    /// 보관함 파일 이름이 아니다 (36절) — 경로 조각이 들어오면 보관함 밖을 가리킬 수 있다.
+    #[error("보관함의 스킬 이름이 아닙니다: {file} (`.json`으로 끝나는 파일 이름이어야 하고 경로일 수 없습니다)")]
+    BadLibraryName { file: String },
+    #[error("보관함에 같은 이름이 이미 있습니다: {file} — 덮어쓰지 않습니다. 지우고 다시 가져오세요")]
+    AlreadyInLibrary { file: String },
+    #[error("스킬 파일을 쓸 수 없습니다: {path} ({detail})")]
+    Unwritable { path: String, detail: String },
 }
 
 /// 이름으로 도구를 찾는다.
@@ -113,6 +120,23 @@ pub const ALL_TOOLS: &[ToolName] = &[
 ];
 
 /// 스킬 파일을 읽고 검증한다.
+/// 위치를 묻지 않고 파일 하나를 읽어 검증한다.
+///
+/// **`load`와 나눠 둔다.** `load`는 "이 스킬을 태스크에 쓴다"이므로 워크스페이스 안을
+/// 거부해야 하고(34절), 이 함수는 "이 파일이 무엇인지 보여준다"이므로 거부가 목적이 아니다.
+/// 한 함수로 합치면 목록 화면이 저장소의 제안을 아예 읽지 못한다.
+pub fn load_from(path: &Path) -> Result<Skill, SkillError> {
+    let text = std::fs::read_to_string(path).map_err(|e| SkillError::Unreadable {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    let file: SkillFile = serde_json::from_str(&text).map_err(|e| SkillError::Malformed {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    validate(file)
+}
+
 pub fn load(path: &Path, root: &crate::paths::WorkspaceRoot) -> Result<Skill, SkillError> {
     // **워크스페이스 안의 스킬 파일은 읽지 않는다** (state-machine 34절).
     //
@@ -129,15 +153,7 @@ pub fn load(path: &Path, root: &crate::paths::WorkspaceRoot) -> Result<Skill, Sk
             root: root.display(),
         });
     }
-    let text = std::fs::read_to_string(path).map_err(|e| SkillError::Unreadable {
-        path: path.display().to_string(),
-        detail: e.to_string(),
-    })?;
-    let file: SkillFile = serde_json::from_str(&text).map_err(|e| SkillError::Malformed {
-        path: path.display().to_string(),
-        detail: e.to_string(),
-    })?;
-    validate(file)
+    load_from(path)
 }
 
 pub fn validate(file: SkillFile) -> Result<Skill, SkillError> {
@@ -212,6 +228,168 @@ impl Skill {
             self.instructions.chars().count()
         )
     }
+}
+
+// ---- 스킬 보관함 (state-machine 36절) ----
+
+/// 보관함이 사는 자리. **상태 디렉터리다** — 모델이 쓸 수 없는 곳이고, 그래서 34절의 규칙을
+/// 자동으로 만족한다. 규칙을 한 번 더 적는 대신 규칙을 만족하는 자리를 고른다.
+pub const LIBRARY_DIR: &str = "skills";
+
+/// 보관함의 항목 하나.
+///
+/// **깨진 파일도 목록에 남는다.** 지우면 사용자는 자기 파일이 왜 안 보이는지 모른다 —
+/// 31.6절이 "물어보지 못한 서버"에 대해 내린 판단과 같다: 없는 것과 읽지 못한 것은 다르다.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct LibraryEntry {
+    /// 파일 이름(확장자 포함). **이것이 고를 때 쓰는 열쇠다** — 스킬의 `name`은 중복될 수 있다.
+    pub file: String,
+    /// 검증을 통과했으면 그 요약, 아니면 `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// 스킬이 스스로 부르는 이름. 검증에 실패했으면 `None`이다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 읽지 못했다면 왜인가.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+}
+
+fn library_dir(state_dir: &Path) -> std::path::PathBuf {
+    state_dir.join(LIBRARY_DIR)
+}
+
+/// 보관함의 스킬 파일 경로. **이름을 검사한다** — 경로 조각이 들어오면 보관함 밖을 가리킬 수 있다.
+pub fn library_path(state_dir: &Path, file: &str) -> Result<std::path::PathBuf, SkillError> {
+    let trimmed = file.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || !trimmed.ends_with(".json")
+    {
+        return Err(SkillError::BadLibraryName { file: file.to_string() });
+    }
+    Ok(library_dir(state_dir).join(trimmed))
+}
+
+/// 보관함 목록. **아무것도 쓰지 않는다.** 디렉터리가 없으면 빈 목록이다.
+pub fn list_library(state_dir: &Path) -> Vec<LibraryEntry> {
+    let dir = library_dir(state_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<LibraryEntry> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .map(|e| {
+            let file = e.file_name().to_string_lossy().to_string();
+            match load_from(&e.path()) {
+                Ok(skill) => LibraryEntry {
+                    file,
+                    summary: Some(skill.describe()),
+                    name: Some(skill.name),
+                    problem: None,
+                },
+                Err(err) => LibraryEntry {
+                    file,
+                    summary: None,
+                    name: None,
+                    problem: Some(err.to_string()),
+                },
+            }
+        })
+        .collect();
+    // 파일 이름 순 — 디렉터리 순회 순서는 OS가 정하므로 화면이 실행마다 달라진다.
+    out.sort_by(|a, b| a.file.cmp(&b.file));
+    out
+}
+
+/// 저장소가 제안하는 스킬들 (35절의 두 번째 적용). **읽기만 한다.**
+///
+/// 워크스페이스 안이므로 모델이 쓸 수 있다 — 그래서 이 목록으로 하는 일은 화면에 띄우는
+/// 것뿐이고, 보관함에 들어가는 것은 사용자가 가져오기를 누를 때다.
+pub fn list_proposed(root: &crate::paths::WorkspaceRoot) -> Vec<LibraryEntry> {
+    let dir = root.path().join(".tomverse").join(LIBRARY_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<LibraryEntry> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .map(|e| {
+            let file = e.file_name().to_string_lossy().to_string();
+            // **`load`가 아니라 `load_from`이다.** `load`는 워크스페이스 안을 거부하는데,
+            // 여기서는 거부가 목적이 아니라 **보여주는 것**이 목적이다 — 거부는 그 내용이
+            // 태스크에 쓰이려 할 때 일어난다.
+            match load_from(&e.path()) {
+                Ok(skill) => LibraryEntry {
+                    file,
+                    summary: Some(skill.describe()),
+                    name: Some(skill.name),
+                    problem: None,
+                },
+                Err(err) => LibraryEntry {
+                    file,
+                    summary: None,
+                    name: None,
+                    problem: Some(err.to_string()),
+                },
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.file.cmp(&b.file));
+    out
+}
+
+/// 저장소의 스킬을 보관함으로 **복사한다** — 사용자가 가져오기를 눌렀을 때만.
+///
+/// # 사본이라는 것이 요점이다
+///
+/// 복사한 뒤에는 저장소의 파일이 바뀌어도 보관함의 것은 그대로다. 참조로 두면 34.1절의
+/// 구멍이 그대로 남는다 — 모델이 저장소의 파일을 고치면 다음 태스크가 다른 내용을 받는다.
+///
+/// **이미 있으면 덮어쓰지 않는다.** 덮어쓰면 사용자가 손으로 고쳐 둔 보관함의 스킬이 조용히
+/// 사라진다. 지우고 다시 가져오는 것은 사용자가 정한다.
+pub fn import_proposed(
+    state_dir: &Path,
+    root: &crate::paths::WorkspaceRoot,
+    file: &str,
+) -> Result<String, SkillError> {
+    // **이름 검사를 먼저 한 뒤 그 이름으로 양쪽 경로를 만든다.** 원본 쪽만 검사를 빠뜨리면
+    // 경로 조각이 워크스페이스 밖의 파일을 읽는 데 쓰인다.
+    let target = library_path(state_dir, file)?;
+    let name = file.trim();
+    let source = root.path().join(".tomverse").join(LIBRARY_DIR).join(name);
+    // **가져오기 전에 검증한다.** 깨진 파일을 보관함에 넣으면 목록에 문제 항목이 늘 뿐이다.
+    let skill = load_from(&source)?;
+    if target.exists() {
+        return Err(SkillError::AlreadyInLibrary { file: file.to_string() });
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| SkillError::Unwritable {
+            path: target.display().to_string(),
+            detail: e.to_string(),
+        })?;
+    }
+    let text = std::fs::read_to_string(&source).map_err(|e| SkillError::Unreadable {
+        path: source.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    std::fs::write(&target, text).map_err(|e| SkillError::Unwritable {
+        path: target.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    Ok(skill.name)
+}
+
+/// 보관함에서 지운다. **보관함 안의 파일만** — 이름 검사가 그것을 보장한다.
+pub fn remove_from_library(state_dir: &Path, file: &str) -> Result<(), SkillError> {
+    let path = library_path(state_dir, file)?;
+    std::fs::remove_file(&path).map_err(|e| SkillError::Unwritable {
+        path: path.display().to_string(),
+        detail: e.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -292,6 +470,155 @@ mod tests {
         let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
         let missing = elsewhere.path().join("nope.json");
         assert!(matches!(load(&missing, &root).unwrap_err(), SkillError::Unreadable { .. }));
+    }
+
+    // ---- 스킬 보관함 (36절) ----
+
+    fn write_skill(dir: &std::path::Path, file: &str, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(file),
+            format!(r#"{{"name":"{name}","instructions":"do it"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// 보관함이 없으면 빈 목록이다 — 오류가 아니다. 대부분의 설치에는 처음에 없다.
+    #[test]
+    fn an_absent_library_is_an_empty_list() {
+        let state = tempfile::tempdir().unwrap();
+        assert!(list_library(state.path()).is_empty());
+    }
+
+    /// **깨진 파일도 목록에 남는다.** 지우면 사용자는 자기 파일이 왜 안 보이는지 모른다.
+    #[test]
+    fn a_broken_skill_stays_in_the_list_with_its_reason() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join(LIBRARY_DIR);
+        write_skill(&dir, "good.json", "좋은 것");
+        std::fs::write(dir.join("bad.json"), "{ not json").unwrap();
+
+        let list = list_library(state.path());
+        assert_eq!(list.len(), 2, "{list:?}");
+        let bad = list.iter().find(|e| e.file == "bad.json").unwrap();
+        assert!(bad.problem.is_some(), "{bad:?}");
+        assert!(bad.name.is_none(), "읽지 못했는데 이름이 있습니다");
+        let good = list.iter().find(|e| e.file == "good.json").unwrap();
+        assert_eq!(good.name.as_deref(), Some("좋은 것"));
+        assert!(good.problem.is_none());
+    }
+
+    /// 순서가 실행마다 달라지면 화면이 흔들린다 — 디렉터리 순회 순서는 OS가 정한다.
+    #[test]
+    fn the_library_is_sorted_by_file_name() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join(LIBRARY_DIR);
+        for file in ["c.json", "a.json", "b.json"] {
+            write_skill(&dir, file, file);
+        }
+        let files: Vec<String> = list_library(state.path()).into_iter().map(|e| e.file).collect();
+        assert_eq!(files, vec!["a.json", "b.json", "c.json"]);
+    }
+
+    /// **경로 조각은 보관함 이름이 아니다.** 통과시키면 보관함 밖의 파일을 지우거나 덮어쓸 수 있다.
+    #[test]
+    fn a_path_fragment_is_not_a_library_name() {
+        let state = tempfile::tempdir().unwrap();
+        for bad in ["../escape.json", "sub/skill.json", "skill.txt", "", "..json/x.json"] {
+            assert!(
+                matches!(library_path(state.path(), bad), Err(SkillError::BadLibraryName { .. })),
+                "{bad} 가 통과했습니다"
+            );
+        }
+        // **공허하지 않다**: 평범한 이름은 실제로 통과한다.
+        assert!(library_path(state.path(), "skill.json").is_ok());
+    }
+
+    /// 저장소의 제안은 **읽기만 한다** — 보관함은 그대로다.
+    #[test]
+    fn listing_a_proposal_does_not_import_it() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        write_skill(&ws.path().join(".tomverse").join(LIBRARY_DIR), "team.json", "팀 스킬");
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+
+        let proposed = list_proposed(&root);
+        assert_eq!(proposed.len(), 1);
+        assert_eq!(proposed[0].name.as_deref(), Some("팀 스킬"));
+        // 보관함은 비어 있다 — 보는 것이 가져오는 것이면 모델이 자기 스킬을 넣을 수 있다.
+        assert!(list_library(state.path()).is_empty());
+    }
+
+    /// **가져오면 사본이 생기고, 그 뒤 저장소가 바뀌어도 사본은 그대로다.**
+    ///
+    /// 참조로 두면 34.1절의 구멍이 그대로 남는다 — 모델이 저장소의 파일을 고치면 다음
+    /// 태스크가 다른 내용을 받는다.
+    #[test]
+    fn importing_takes_a_copy_that_the_repository_cannot_change_later() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let proposed_dir = ws.path().join(".tomverse").join(LIBRARY_DIR);
+        write_skill(&proposed_dir, "team.json", "처음 이름");
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+
+        let name = import_proposed(state.path(), &root, "team.json").unwrap();
+        assert_eq!(name, "처음 이름");
+
+        // 저장소가 바뀐다 (모델이 고쳤다고 하자).
+        write_skill(&proposed_dir, "team.json", "바뀐 이름");
+        let list = list_library(state.path());
+        assert_eq!(list[0].name.as_deref(), Some("처음 이름"), "사본이 아니라 참조였습니다");
+    }
+
+    /// **덮어쓰지 않는다.** 덮어쓰면 사용자가 손으로 고쳐 둔 보관함의 스킬이 조용히 사라진다.
+    #[test]
+    fn importing_over_an_existing_name_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        write_skill(&ws.path().join(".tomverse").join(LIBRARY_DIR), "team.json", "저장소 것");
+        write_skill(&state.path().join(LIBRARY_DIR), "team.json", "내가 고친 것");
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+
+        assert!(matches!(
+            import_proposed(state.path(), &root, "team.json"),
+            Err(SkillError::AlreadyInLibrary { .. })
+        ));
+        assert_eq!(list_library(state.path())[0].name.as_deref(), Some("내가 고친 것"));
+    }
+
+    /// 깨진 제안은 **가져오기 전에** 걸린다 — 보관함에 문제 항목을 늘리지 않는다.
+    #[test]
+    fn a_broken_proposal_is_not_imported() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let dir = ws.path().join(".tomverse").join(LIBRARY_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bad.json"), "{ not json").unwrap();
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+
+        assert!(import_proposed(state.path(), &root, "bad.json").is_err());
+        assert!(list_library(state.path()).is_empty());
+    }
+
+    #[test]
+    fn removing_takes_the_entry_out_of_the_library() {
+        let state = tempfile::tempdir().unwrap();
+        write_skill(&state.path().join(LIBRARY_DIR), "s.json", "지울 것");
+        assert_eq!(list_library(state.path()).len(), 1);
+        remove_from_library(state.path(), "s.json").unwrap();
+        assert!(list_library(state.path()).is_empty());
+    }
+
+    /// 보관함의 스킬은 **워크스페이스 밖**이므로 태스크에 그대로 쓸 수 있다 — 34절의 규칙을
+    /// 자리 선택으로 만족한다.
+    #[test]
+    fn a_library_skill_can_be_used_by_a_task() {
+        let state = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        write_skill(&state.path().join(LIBRARY_DIR), "s.json", "보관함 것");
+        let root = crate::paths::WorkspaceRoot::new(ws.path()).unwrap();
+        let path = library_path(state.path(), "s.json").unwrap();
+        assert_eq!(load(&path, &root).unwrap().name, "보관함 것");
     }
 
     /// `ALL_TOOLS`가 `ToolName` 전체를 담고 있는가 — **`as_str`의 매치 팔에서 유도해** 본다.

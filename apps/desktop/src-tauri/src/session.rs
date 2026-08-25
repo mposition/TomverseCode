@@ -312,6 +312,42 @@ impl SessionState {
         }))
     }
 
+    /// 스킬 보관함과 저장소의 제안 (state-machine 36절). **읽기만 한다.**
+    ///
+    /// 보관함은 상태 디렉터리에 있다 — 모델이 쓸 수 없는 자리이므로 34절의 규칙을 자리
+    /// 선택으로 만족한다. 저장소의 제안은 워크스페이스 안이라 **보여줄 뿐**이고, 보관함에
+    /// 들어가는 것은 사용자가 가져오기를 누를 때다(35절과 같은 모양).
+    pub fn skill_library(&self) -> Result<Value, String> {
+        let root = self.with_active(|active| Ok(active.host.root().clone()))?;
+        Ok(json!({
+            "library": tomverse_core::skills::list_library(&app_state_dir()),
+            "proposed": tomverse_core::skills::list_proposed(&root),
+            "libraryDir": tomverse_core::skills::LIBRARY_DIR,
+        }))
+    }
+
+    /// 저장소의 스킬을 보관함으로 **복사한다** — 사용자가 눌렀을 때만.
+    pub fn import_skill(&self, file: &str) -> Result<Value, String> {
+        let root = self.with_active(|active| Ok(active.host.root().clone()))?;
+        let name = tomverse_core::skills::import_proposed(&app_state_dir(), &root, file)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "imported": file, "name": name }))
+    }
+
+    pub fn remove_skill(&self, file: &str) -> Result<Value, String> {
+        tomverse_core::skills::remove_from_library(&app_state_dir(), file).map_err(|e| e.to_string())?;
+        Ok(json!({ "removed": file }))
+    }
+
+    /// 보관함 항목의 절대 경로 — 화면이 태스크를 시작할 때 넘길 값이다.
+    ///
+    /// **경로를 화면이 조립하지 않는다.** 조립하게 두면 보관함의 자리가 화면에도 적히고,
+    /// 옮길 때 한쪽만 고쳐진다.
+    pub fn skill_path(&self, file: &str) -> Result<Value, String> {
+        let path = tomverse_core::skills::library_path(&app_state_dir(), file).map_err(|e| e.to_string())?;
+        Ok(json!({ "path": path.display().to_string() }))
+    }
+
     /// 등록을 저장한다.
     ///
     /// **즉시 반영되지 않는다.** 훅 레지스트리와 MCP 풀은 `TaskHost`를 만들 때 붙으므로,

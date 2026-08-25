@@ -47,6 +47,7 @@ import { AuditExportPanel } from "./components/AuditExportPanel";
 import { BlockedPanel } from "./components/BlockedPanel";
 import { WorkspaceSettingsPanel } from "./components/WorkspaceSettingsPanel";
 import { CarriedDecisionsPanel } from "./components/CarriedDecisionsPanel";
+import { SkillLibraryPicker } from "./components/SkillLibraryPicker";
 import { PullRequestPanel } from "./components/PullRequestPanel";
 import { EventLog } from "./components/EventLog";
 import { StageBar } from "./components/StageBar";
@@ -1091,6 +1092,12 @@ export default function App() {
                   스킬 파일은 <strong>워크스페이스 밖</strong>에 있어야 합니다. 워크스페이스 안의 파일은 모델이
                   고칠 수 있고, 그러면 모델이 자기 프롬프트에 지시문을 심거나 좁혀 둔 허용목록을 되돌릴 수 있습니다.
                 </p>
+                {/* 보관함에서 고르기 (36절). **직접 경로 입력을 없애지 않는다** — 보관함에
+                    넣을 수 없는 상황에서 기능 자체를 못 쓰게 되기 때문이다. 목록은 더 쉬운
+                    길이지 유일한 길이 아니다. */}
+                {workspace && (
+                  <SkillLibraryPicker value={skillPath} onPick={setSkillPath} disabled={running} />
+                )}
               </fieldset>
               {/* 역할별 모델 지정 (multi-engine-routing.md 15절).
                   **목록이 비면 이 블록 자체를 그리지 않는다** — 빈 select는 "고를 것이 없다"와
