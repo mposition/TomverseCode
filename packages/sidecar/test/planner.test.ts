@@ -1,7 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ValidationError } from "@tomverse/protocol";
-import { buildExecutionPlan, PlanningError, splitDiffByFile } from "../src/orchestrator/planner.js";
+import {
+  buildCommitPlan,
+  buildExecutionPlan,
+  NON_PATH_ARGS,
+  PATH_ARGS,
+  planPaths,
+  PlanningError,
+  splitDiffByFile,
+} from "../src/orchestrator/planner.js";
 import { buildDigest, extractFileReferences } from "../src/verify/digest.js";
 
 const requestedBy = { role: "executor" as const, modelId: "fake-executor" };
@@ -48,7 +56,7 @@ test("파일마다 별도 ToolRequest를 만든다", () => {
     "",
   ].join("\n");
 
-  const plan = buildExecutionPlan({ taskId: "task-1", patch, plan: [], requestedBy, attempt: 0 });
+  const plan = buildExecutionPlan({ taskId: "task-1", patch, requestedBy, attempt: 0 });
   assert.equal(plan.toolRequests.length, 2);
   assert.deepEqual(
     plan.toolRequests.map((r) => r.args.path),
@@ -64,20 +72,20 @@ test("파일 헤더가 없는 patch는 대상을 추측하지 않고 실패한�
 
 test("적용할 hunk가 없으면 조용히 성공하지 않는다", () => {
   assert.throws(
-    () => buildExecutionPlan({ taskId: "t", patch: "--- a/x\n+++ b/x\n", plan: [], requestedBy, attempt: 0 }),
+    () => buildExecutionPlan({ taskId: "t", patch: "--- a/x\n+++ b/x\n", requestedBy, attempt: 0 }),
     PlanningError
   );
-  assert.throws(() => buildExecutionPlan({ taskId: "t", patch: "", plan: [], requestedBy, attempt: 0 }), PlanningError);
+  assert.throws(() => buildExecutionPlan({ taskId: "t", patch: "", requestedBy, attempt: 0 }), PlanningError);
 });
 
 test("workspace를 벗어나는 경로는 계획 단계에서 거부한다", () => {
   const patch = ["--- a/../../etc/passwd", "+++ b/../../etc/passwd", "@@ -1,1 +1,1 @@", "-a", "+b", ""].join("\n");
-  assert.throws(() => buildExecutionPlan({ taskId: "t", patch, plan: [], requestedBy, attempt: 0 }), ValidationError);
+  assert.throws(() => buildExecutionPlan({ taskId: "t", patch, requestedBy, attempt: 0 }), ValidationError);
 });
 
 test("절대경로도 계획 단계에서 거부한다", () => {
   const patch = ["--- a//etc/passwd", "+++ /etc/passwd", "@@ -1,1 +1,1 @@", "-a", "+b", ""].join("\n");
-  assert.throws(() => buildExecutionPlan({ taskId: "t", patch, plan: [], requestedBy, attempt: 0 }), ValidationError);
+  assert.throws(() => buildExecutionPlan({ taskId: "t", patch, requestedBy, attempt: 0 }), ValidationError);
 });
 
 test("삭제 요청은 별도 도구로 계획한다", () => {
@@ -85,9 +93,9 @@ test("삭제 요청은 별도 도구로 계획한다", () => {
   const plan = buildExecutionPlan({
     taskId: "t",
     patch,
-    plan: [{ stepId: "s1", description: "구파일 제거", toolHint: "delete_file", targetPaths: ["src/old.ts"] }],
     requestedBy,
     attempt: 0,
+    deletions: ["src/old.ts"],
   });
   const del = plan.toolRequests.find((r) => r.tool === "delete_file")!;
   assert.equal(del.args.path, "src/old.ts");
@@ -96,8 +104,8 @@ test("삭제 요청은 별도 도구로 계획한다", () => {
 
 test("planId는 시도 횟수를 반영한다", () => {
   const patch = ["--- a/src/a.ts", "+++ b/src/a.ts", "@@ -1,1 +1,1 @@", "-1", "+2", ""].join("\n");
-  const first = buildExecutionPlan({ taskId: "t", patch, plan: [], requestedBy, attempt: 0 });
-  const second = buildExecutionPlan({ taskId: "t", patch, plan: [], requestedBy, attempt: 1 });
+  const first = buildExecutionPlan({ taskId: "t", patch, requestedBy, attempt: 0 });
+  const second = buildExecutionPlan({ taskId: "t", patch, requestedBy, attempt: 1 });
   assert.notEqual(first.planId, second.planId);
   assert.notEqual(first.toolRequests[0]!.requestId, second.toolRequests[0]!.requestId);
 });
@@ -191,7 +199,6 @@ test("이동은 patch 적용보다 앞에 놓인다", () => {
   const plan = buildExecutionPlan({
     taskId: "task-1",
     patch,
-    plan: [],
     requestedBy,
     attempt: 0,
     moves: [{ from: "src/app.ts", to: "src/renamed.ts" }],
@@ -215,7 +222,7 @@ test("이동의 두 경로 모두 형태 검사를 지난다", () => {
     { from: "src/x.ts", to: "/etc/passwd" },
   ]) {
     assert.throws(
-      () => buildExecutionPlan({ taskId: "t", patch, plan: [], requestedBy, attempt: 0, moves: [move] }),
+      () => buildExecutionPlan({ taskId: "t", patch, requestedBy, attempt: 0, moves: [move] }),
       ValidationError,
       JSON.stringify(move)
     );
@@ -225,7 +232,126 @@ test("이동의 두 경로 모두 형태 검사를 지난다", () => {
 /** 이동이 없으면 계획은 종전과 한 글자도 다르지 않다. */
 test("이동이 없으면 계획이 달라지지 않는다", () => {
   const patch = ["--- a/src/a.ts", "+++ b/src/a.ts", "@@ -1,1 +1,1 @@", "-1", "+2", ""].join("\n");
-  const plan = buildExecutionPlan({ taskId: "t", patch, plan: [], requestedBy, attempt: 0 });
+  const plan = buildExecutionPlan({ taskId: "t", patch, requestedBy, attempt: 0 });
   assert.equal(plan.toolRequests.length, 1);
   assert.equal(plan.toolRequests[0]?.tool, "apply_patch");
+});
+
+const SIMPLE_PATCH = ["--- a/src/a.ts", "+++ b/src/a.ts", "@@ -1,1 +1,1 @@", "-1", "+2", ""].join("\n");
+
+/**
+ * **삭제 → 이동 → patch.** 세 단계의 순서는 각 단계가 다음 단계의 자리를 비워 주는 방향이다
+ * (state-machine 45.3절).
+ *
+ * 삭제가 이동보다 앞이어야 `a.ts`를 지우고 `b.ts`를 그 자리로 옮기는 표현이 성립한다 —
+ * 뒤집으면 이동이 "대상이 이미 있음"으로 거부되고(44.4절), 그 거부는 모델의 잘못처럼 보인다.
+ */
+test("삭제가 이동보다, 이동이 patch보다 앞에 놓인다", () => {
+  const patch = ["--- a/src/a.ts", "+++ b/src/a.ts", "@@ -1,1 +1,1 @@", "-1", "+2", ""].join("\n");
+  const plan = buildExecutionPlan({
+    taskId: "t",
+    patch,
+    requestedBy,
+    attempt: 0,
+    moves: [{ from: "src/b.ts", to: "src/a.ts" }],
+    deletions: ["src/a.ts"],
+  });
+
+  assert.deepEqual(
+    plan.toolRequests.map((r) => r.tool),
+    ["delete_file", "move_file", "apply_patch"]
+  );
+});
+
+/**
+ * **삭제만 있는 계획도 정당하다** — "이 파일을 지워라"는 patch 없이 완결되는 요구다.
+ *
+ * 종전 조건("patch에 hunk가 없으면 실패")을 그대로 뒀다면 그 요구는 모델이 무엇을 내든
+ * 여기서 죽었다. 즉 삭제 필드를 열어도 걸어 들어갈 수 없었다.
+ */
+test("patch 없이 삭제만 있어도 계획이 선다", () => {
+  const plan = buildExecutionPlan({ taskId: "t", patch: "", requestedBy, attempt: 0, deletions: ["src/old.ts"] });
+  assert.deepEqual(
+    plan.toolRequests.map((r) => r.tool),
+    ["delete_file"]
+  );
+  assert.equal(plan.approvalRequired, true);
+});
+
+/** 그래도 **아무것도 없는** 계획은 여전히 거부한다 — 변경 없이 완료로 처리하지 않는다. */
+test("patch도 이동도 삭제도 없으면 계획이 서지 않는다", () => {
+  assert.throws(
+    () => buildExecutionPlan({ taskId: "t", patch: "", requestedBy, attempt: 0, deletions: [], moves: [] }),
+    PlanningError
+  );
+});
+
+/** 삭제 경로도 형태 검사를 지난다 — 게이트가 최종 판정하지만 여기서 먼저 걸러낸다. */
+test("삭제 경로가 워크스페이스를 벗어나면 계획 단계에서 막힌다", () => {
+  for (const target of ["../outside.ts", "/etc/passwd"]) {
+    assert.throws(
+      () => buildExecutionPlan({ taskId: "t", patch: SIMPLE_PATCH, requestedBy, attempt: 0, deletions: [target] }),
+      ValidationError,
+      target
+    );
+  }
+});
+
+/**
+ * **무엇이 사라지는지 계획 단계에서 보여야 한다** — 45절이 삭제를 열면서 답해야 했던 질문.
+ *
+ * `planPaths`가 `PLAN_CREATED.changedPaths`와 기준 대조의 근거다. 종전에는 `args.path`만
+ * 읽었고, 그래서 **이동은 여기서 조용히 빠져 있었다**(44절이 남긴 구멍): 이름만 바꾸는
+ * 계획은 `changedPaths: []`로 기록됐다.
+ */
+test("계획이 건드리는 경로에 삭제와 이동이 모두 보인다", () => {
+  const plan = buildExecutionPlan({
+    taskId: "t",
+    patch: SIMPLE_PATCH,
+    requestedBy,
+    attempt: 0,
+    moves: [{ from: "src/old.ts", to: "src/new.ts" }],
+    deletions: ["src/gone.ts"],
+  });
+
+  assert.deepEqual(planPaths(plan).sort(), ["src/a.ts", "src/gone.ts", "src/new.ts", "src/old.ts"]);
+});
+
+/**
+ * **이름 목록은 사람이 지키는 규칙이다** — 그래서 소스가 아니라 **계획이 실제로 만든 인자
+ * 키**에서 유도해 대조한다. 새 도구가 `target` 같은 다른 이름의 경로 인자를 쓰면 여기서
+ * 실패한다. 실패하지 않으면 그 경로는 `changedPaths`에서 조용히 빠지고, 그 누락은
+ * "기준 게이트가 아무것도 못 찾았다"는 **통과**로 보인다.
+ */
+test("계획이 만드는 모든 인자 이름이 경로/비경로로 분류되어 있다", () => {
+  const plan = buildExecutionPlan({
+    taskId: "t",
+    patch: SIMPLE_PATCH,
+    requestedBy,
+    attempt: 0,
+    moves: [{ from: "src/old.ts", to: "src/new.ts" }],
+    deletions: ["src/gone.ts"],
+  });
+  const commit = buildCommitPlan({
+    taskId: "t",
+    changedPaths: ["src/a.ts"],
+    message: "고침",
+    requestedBy,
+  });
+
+  const keys = new Set<string>();
+  for (const request of [...plan.toolRequests, ...commit.toolRequests]) {
+    for (const key of Object.keys(request.args)) keys.add(key);
+  }
+
+  // **빈 집합에 대한 전칭 명제는 언제나 참이다** — 무엇을 셌는지 먼저 확인한다.
+  assert.ok(keys.size >= 5, `인자 키가 ${keys.size}개뿐입니다: ${[...keys].join(", ")}`);
+
+  const known = new Set<string>([...PATH_ARGS, ...NON_PATH_ARGS]);
+  const unclassified = [...keys].filter((k) => !known.has(k));
+  assert.deepEqual(unclassified, [], `분류되지 않은 인자 이름: ${unclassified.join(", ")}`);
+
+  // 반대 방향도 본다 — 목록에만 있고 아무도 쓰지 않는 이름은 목록을 썩힌다.
+  const unusedPathArgs = PATH_ARGS.filter((k) => !keys.has(k));
+  assert.deepEqual(unusedPathArgs, [], `계획이 쓰지 않는 경로 인자 이름: ${unusedPathArgs.join(", ")}`);
 });

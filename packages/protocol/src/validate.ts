@@ -131,6 +131,7 @@ export function validateDraftProposal(
     doneCriteria: optionalStringArray(o.doneCriteria, "draftProposal.doneCriteria") ?? [],
     mcpCalls: validateMcpCalls(o.mcpCalls),
     moves: validateMoves(o.moves),
+    deletions: validateDeletions(o.deletions, "draftProposal"),
     model: ctx.model,
     createdAt: ctx.createdAt,
   };
@@ -145,18 +146,40 @@ export function validateDraftProposal(
  *
  * 두 경로가 같은 것도 여기서 거부한다 — 그건 이동이 아니고, 게이트까지 갈 이유가 없다.
  */
-function validateMoves(raw: unknown): DraftProposal["moves"] {
+function validateMoves(raw: unknown, path = "draftProposal"): DraftProposal["moves"] {
   if (raw === undefined || raw === null) return undefined;
-  if (!Array.isArray(raw)) throw new ValidationError("draftProposal.moves", "expected an array");
+  if (!Array.isArray(raw)) throw new ValidationError(`${path}.moves`, "expected an array");
   if (raw.length === 0) return [];
   return raw.map((item, i) => {
-    const move = requireObject(item, `draftProposal.moves[${i}]`);
-    const from = requireNonEmptyString(move.from, `draftProposal.moves[${i}].from`);
-    const to = requireNonEmptyString(move.to, `draftProposal.moves[${i}].to`);
+    const move = requireObject(item, `${path}.moves[${i}]`);
+    const from = requireNonEmptyString(move.from, `${path}.moves[${i}].from`);
+    const to = requireNonEmptyString(move.to, `${path}.moves[${i}].to`);
     if (from === to) {
-      throw new ValidationError(`draftProposal.moves[${i}]`, "from and to are the same path");
+      throw new ValidationError(`${path}.moves[${i}]`, "from and to are the same path");
     }
     return { from, to };
+  });
+}
+
+/**
+ * 초안이 요청한 파일 삭제 — state-machine 45절.
+ *
+ * **중복을 조용히 합치지 않는다.** 같은 경로가 두 번 오면 두 번째 요청은 게이트에서
+ * `resolve_existing` 실패로 거부되고, 프리플라이트가 거부하면 **계획 전체가 서지 않는다**
+ * (42절). 즉 중복 하나가 나머지 멀쩡한 삭제까지 없앤다. 합쳐서 넘기면 그 사실이 감춰지고,
+ * 모델은 자기가 같은 파일을 두 번 지우라고 했다는 것을 끝내 배우지 못한다.
+ */
+function validateDeletions(raw: unknown, path: string): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new ValidationError(`${path}.deletions`, "expected an array");
+  const seen = new Set<string>();
+  return raw.map((item, i) => {
+    const value = requireNonEmptyString(item, `${path}.deletions[${i}]`);
+    if (seen.has(value)) {
+      throw new ValidationError(`${path}.deletions[${i}]`, `duplicate path: ${value}`);
+    }
+    seen.add(value);
+    return value;
   });
 }
 
@@ -242,6 +265,12 @@ export function validateSingleModelFixResult(
     questionsForUser: optionalStringArray(o.questionsForUser, "singleModelFixResult.questionsForUser"),
     rejectionReason: optionalString(o.rejectionReason, "singleModelFixResult.rejectionReason"),
     mcpCalls: validateMcpCalls(o.mcpCalls),
+    // **여기가 비어 있으면 `fast` 모드에서만 이동이 사라진다.** 44절이 오케스트레이터에
+    // "단일 모델 경로에도 같은 자리를 둔다"고 적어두고 이 줄을 빠뜨렸다 — 타입에는 `moves`가
+    // 있고 소비하는 쪽도 읽고 있었지만, 검증기가 채우지 않으니 **언제나 undefined**였다.
+    // 대조 경로만 쓰는 테스트는 그 사실을 보지 못한다(45.5절).
+    moves: validateMoves(o.moves, "singleModelFixResult"),
+    deletions: validateDeletions(o.deletions, "singleModelFixResult"),
     model: ctx.model,
     createdAt: ctx.createdAt,
   };
@@ -249,8 +278,17 @@ export function validateSingleModelFixResult(
   // **도구를 요청했으면 patch가 없어도 된다** (state-machine 31절). 그 patch는 어차피
   // 버려지며, 여기서 거부하면 도구를 요청하는 응답이 검증 단계에서 죽어 라운드가
   // 시작조차 하지 못한다 — 증상은 "모델이 잘못된 응답을 냈다"로 보인다.
-  if (verdict === "ACCEPT" && !result.patch && (result.mcpCalls ?? []).length === 0) {
-    throw new ValidationError("singleModelFixResult.patch", "verdict=ACCEPT requires a patch");
+  //
+  // **삭제·이동만 있는 응답도 성립한다**(45절). "이 파일을 지워라"는 patch 없이 완결되는
+  // 요구이고, 여기서 거부하면 그 요구는 모델이 무엇을 내든 실패한다.
+  if (
+    verdict === "ACCEPT" &&
+    !result.patch &&
+    (result.mcpCalls ?? []).length === 0 &&
+    (result.moves ?? []).length === 0 &&
+    (result.deletions ?? []).length === 0
+  ) {
+    throw new ValidationError("singleModelFixResult.patch", "verdict=ACCEPT requires a patch, a move, or a deletion");
   }
   return result;
 }

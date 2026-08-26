@@ -1,4 +1,4 @@
-import type { ExecutionPlan, FileMove, PlanStep, ToolRequest, ToolRequester } from "@tomverse/protocol";
+import type { ExecutionPlan, FileMove, ToolRequest, ToolRequester } from "@tomverse/protocol";
 import { assertRelativeWorkspacePath } from "@tomverse/protocol";
 
 /**
@@ -12,12 +12,13 @@ import { assertRelativeWorkspacePath } from "@tomverse/protocol";
 export interface PlanInput {
   taskId: string;
   patch: string;
-  plan: PlanStep[];
   requestedBy: ToolRequester;
   /** 이번이 몇 번째 계획인지 (fix loop에서 증가) — planId를 안정적으로 만든다 */
   attempt: number;
   /** 이 초안이 옮기려는 파일들 (state-machine 44절). */
   moves?: FileMove[];
+  /** 이 초안이 지우려는 파일들 (state-machine 45절). */
+  deletions?: string[];
 }
 
 export class PlanningError extends Error {
@@ -236,8 +237,13 @@ function truncate(text: string, max: number): string {
 
 export function buildExecutionPlan(input: PlanInput): ExecutionPlan {
   const files = splitDiffByFile(input.patch);
-  if (files.length === 0) {
-    throw new PlanningError("patch에 적용할 hunk가 없습니다 — 변경 없이 완료로 처리하지 않습니다.");
+  const moveInputs = input.moves ?? [];
+  const deletionInputs = input.deletions ?? [];
+  // **판정 기준이 "patch가 있는가"에서 "바꾸는 것이 있는가"로 넓어졌다**(45절).
+  // 삭제만 있는 계획은 정당하다 — "이 파일을 지워라"는 patch 없이 완결되는 요구다.
+  // 종전 조건을 그대로 두면 그 요구는 모델이 무엇을 내든 여기서 죽는다.
+  if (files.length === 0 && moveInputs.length === 0 && deletionInputs.length === 0) {
+    throw new PlanningError("적용할 변경이 없습니다 — 변경 없이 완료로 처리하지 않습니다.");
   }
 
   const toolRequests: ToolRequest[] = files.map((file, index) => {
@@ -261,7 +267,7 @@ export function buildExecutionPlan(input: PlanInput): ExecutionPlan {
   // 이동이 patch와 같은 파일을 건드리는 경우는 여기서 판정하지 않는다: 그건 `from`이 사라진
   // 뒤 `to`에 대한 hunk가 오는 정상 흐름이고, 어긋나면 patch 적용이 실패한다(그리고 그
   // 실패는 fix loop가 받는다).
-  const moves: ToolRequest[] = (input.moves ?? []).map((move, index) => ({
+  const moves: ToolRequest[] = moveInputs.map((move, index) => ({
     requestId: `${input.taskId}-plan${input.attempt}-move-${index + 1}`,
     taskId: input.taskId,
     tool: "move_file" as const,
@@ -275,25 +281,31 @@ export function buildExecutionPlan(input: PlanInput): ExecutionPlan {
     riskTier: "user_approval" as const,
     createdAt: new Date().toISOString(),
   }));
-  toolRequests.unshift(...moves);
 
-  // `delete_file`을 요청하는 PlanStep이 있으면 반영한다. patch로는 파일 삭제를 표현하기
-  // 어렵고(`+++ /dev/null`), 삭제는 항상 승인이 필요한 별개의 위험 등급이므로 명시적으로 다룬다.
-  for (const [index, step] of input.plan.entries()) {
-    if (step.toolHint !== "delete_file") continue;
-    for (const target of step.targetPaths ?? []) {
-      const path = assertRelativeWorkspacePath(target, `plan[${index}].targetPaths`);
-      toolRequests.push({
-        requestId: `${input.taskId}-plan${input.attempt}-delete-${toolRequests.length + 1}`,
-        taskId: input.taskId,
-        tool: "delete_file",
-        args: { path },
-        requestedBy: input.requestedBy,
-        riskTier: "user_approval",
-        createdAt: new Date().toISOString(),
-      });
-    }
-  }
+  // **삭제를 이동보다도 먼저 낸다**(45절).
+  //
+  // 세 단계의 순서는 각 단계가 다음 단계의 자리를 비워 주는 방향이다:
+  // 삭제 → 이동 → patch.
+  //
+  // - 삭제가 이동보다 앞인 이유: `a.ts`를 지우고 `b.ts`를 `a.ts`로 옮기는 것이 "a를 b로
+  //   갈아끼운다"의 자연스러운 표현이다. 뒤집으면 이동이 "대상이 이미 있음"으로 거부되고
+  //   (44.4절 — 이동은 덮어쓰지 않는다), 그 거부는 모델의 잘못처럼 보인다.
+  // - 삭제가 patch보다 앞인 이유는 다르다. 같은 파일을 지우면서 고치라는 요청은 **모순**인데,
+  //   삭제를 뒤에 두면 patch가 성공한 뒤 그 결과가 조용히 사라진다. 앞에 두면 patch가 없는
+  //   파일에 적용되어 **소리 내며 실패**하고, 그 실패는 fix loop가 모델에게 돌려준다.
+  const deletions: ToolRequest[] = deletionInputs.map((target, index) => ({
+    requestId: `${input.taskId}-plan${input.attempt}-delete-${index + 1}`,
+    taskId: input.taskId,
+    tool: "delete_file" as const,
+    args: { path: assertRelativeWorkspacePath(target, `deletions[${index}]`) },
+    requestedBy: input.requestedBy,
+    // 게이트는 정책과 무관하게 사용자 승인을 요구한다. Node의 1차 분류도 그렇게 말해야
+    // UI가 승인 모달을 미리 예상한다.
+    riskTier: "user_approval" as const,
+    createdAt: new Date().toISOString(),
+  }));
+
+  toolRequests.unshift(...deletions, ...moves);
 
   return {
     taskId: input.taskId,
@@ -302,4 +314,35 @@ export function buildExecutionPlan(input: PlanInput): ExecutionPlan {
     // Node의 예상값이다. 실제 승인 필요 여부는 Rust Policy Gate가 결정한다.
     approvalRequired: toolRequests.some((r) => r.riskTier !== "auto"),
   };
+}
+
+/**
+ * 이 계획이 건드리는 워크스페이스 경로들 — `PLAN_CREATED.changedPaths`와 기준 대조의 근거다.
+ *
+ * # 왜 인자 이름 목록인가
+ *
+ * 종전에는 `args.path`만 읽었다. `path` 하나가 모든 파일 도구의 인자 이름이던 시절에는 그게
+ * 맞았지만, 44절이 `from`/`to`를 가진 도구를 들이면서 **이동은 이 목록에서 조용히 사라졌다** —
+ * 파일 이름을 바꾸기만 하는 계획은 `changedPaths: []`로 기록됐고, 기준 게이트도 그 계획에
+ * 대해 볼 것이 없었다. 45절이 삭제를 열면서 같은 질문("무엇이 사라지는지 계획 단계에서
+ * 보이는가")이 다시 나와 여기서 고친다.
+ *
+ * 이름 목록은 **사람이 지키는 규칙**이므로, 새 도구가 다른 이름을 쓰면 또 조용히 빠진다.
+ * 그래서 `planner.test.ts`가 이 목록을 소스가 아니라 **`buildExecutionPlan`이 실제로 만든
+ * 인자 키들에서 유도해** 대조한다 — 목록에 없는 경로 인자가 생기면 테스트가 실패한다.
+ */
+export const PATH_ARGS = ["path", "from", "to"] as const;
+
+/** 경로가 아닌 인자 키. 여기 없고 `PATH_ARGS`에도 없는 키가 생기면 위 테스트가 실패한다. */
+export const NON_PATH_ARGS = ["patch", "content", "program", "args", "cwd", "server", "tool", "arguments"] as const;
+
+export function planPaths(plan: ExecutionPlan): string[] {
+  const paths = new Set<string>();
+  for (const request of plan.toolRequests) {
+    for (const key of PATH_ARGS) {
+      const value = (request.args as Record<string, unknown>)[key];
+      if (typeof value === "string" && value.length > 0) paths.add(value);
+    }
+  }
+  return [...paths];
 }

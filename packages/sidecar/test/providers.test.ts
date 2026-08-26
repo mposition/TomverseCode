@@ -78,7 +78,7 @@ test("SingleModelFixResult는 REVISE를 받지 않는다", () => {
   );
 });
 
-test("SingleModelFixResult ACCEPT는 patch를 요구한다", () => {
+test("SingleModelFixResult ACCEPT는 적용할 변경을 요구한다", () => {
   assert.throws(
     () =>
       validateSingleModelFixResult(
@@ -87,6 +87,37 @@ test("SingleModelFixResult ACCEPT는 patch를 요구한다", () => {
       ),
     ValidationError
   );
+});
+
+/**
+ * **삭제만 있는 응답도 성립한다** — state-machine 45절.
+ *
+ * "이 파일을 지워라"는 patch 없이 완결되는 요구다. 종전 조건(`ACCEPT`면 patch가 있어야 한다)을
+ * 그대로 뒀다면 그 요구는 모델이 무엇을 내든 검증 단계에서 죽고, 증상은 "모델이 잘못된 응답을
+ * 냈다"로 보인다.
+ */
+test("SingleModelFixResult ACCEPT는 삭제만 있어도 성립한다", () => {
+  const result = validateSingleModelFixResult(
+    { verdict: "ACCEPT", rationale: "안 쓰는 파일이다", deletions: ["src/old.ts"] },
+    { taskId: "t", model: "m", createdAt: "now" }
+  );
+  assert.deepEqual(result.deletions, ["src/old.ts"]);
+  assert.equal(result.patch, undefined);
+});
+
+/**
+ * **중복을 조용히 합치지 않는다.** 같은 경로가 두 번 오면 두 번째는 게이트에서 거부되고,
+ * 프리플라이트가 거부하면 계획 전체가 서지 않는다(42절) — 중복 하나가 나머지 멀쩡한 삭제까지
+ * 없앤다. 합쳐서 넘기면 모델은 자기가 같은 파일을 두 번 지우라고 했다는 것을 배우지 못한다.
+ */
+test("초안의 중복 삭제 경로는 거부된다", () => {
+  const meta = { taskId: "t", proposalId: "p", model: "m", createdAt: "now" };
+  assert.throws(
+    () => validateDraftProposal({ interpretation: "정리", deletions: ["a.ts", "a.ts"] }, meta),
+    ValidationError
+  );
+  // 형태가 아닌 값의 문제이므로 배열이 아닌 것도 같은 자리에서 거부한다.
+  assert.throws(() => validateDraftProposal({ interpretation: "정리", deletions: "a.ts" }, meta), ValidationError);
 });
 
 test("fake 공급자도 실제 어댑터와 같은 검증을 통과한다", async () => {
@@ -350,8 +381,26 @@ test("게이트 거부 사유가 프롬프트에 실리고, 기준 충돌과 다
 test("프롬프트가 파일 이동을 요청하는 방법을 말한다", () => {
   const prompt = buildDraftPrompt({ snapshot: makeSnapshot(), userMessage: "파일 이름을 바꿔주세요" });
   assert.ok(prompt.includes("`moves`"), prompt);
-  // **순서까지 말한다.** 이동이 먼저 돌므로 patch는 옮긴 뒤 경로 기준이어야 한다.
-  assert.ok(prompt.includes("moves run first"), prompt);
+  // **순서까지 말한다.** 이동이 patch보다 먼저 돌므로 patch는 옮긴 뒤 경로 기준이어야 한다.
+  assert.ok(prompt.includes("then moves, then the patch"), prompt);
   // 지우고 다시 만들지 말라고 명시한다 — 그게 이 필드가 없앨 낭비다.
   assert.ok(prompt.toLowerCase().includes("delete-and-recreate"), prompt);
+});
+
+/**
+ * **문을 두 번 만들었으면 길도 두 번 만든다** — 44.7절의 교훈, 45절에 적용.
+ *
+ * 삭제도 같다. 프롬프트가 `deletions`를 말하지 않으면 모델은 파일을 지우려고 전체를 `-`로
+ * 실어 보내거나(그건 파일을 비우는 것이지 지우는 것이 아니다) 계획 문장에만 적는다 —
+ * 둘 다 아무 파일도 지우지 못하고, **그 공허함은 아무 테스트도 깨뜨리지 않는다.**
+ */
+test("프롬프트가 파일 삭제를 요청하는 방법을 말한다", () => {
+  const prompt = buildDraftPrompt({ snapshot: makeSnapshot(), userMessage: "안 쓰는 파일을 지워주세요" });
+  assert.ok(prompt.includes("`deletions`"), prompt);
+  // patch로 비우는 것과 지우는 것이 다르다는 것을 말한다.
+  assert.ok(prompt.toLowerCase().includes("blank it out"), prompt);
+  // **삭제가 이동보다 먼저**라는 것도 말한다 — 지운 자리로 옮기는 것이 성립하려면 그 순서여야 한다.
+  assert.ok(prompt.includes("Deletions run first"), prompt);
+  // **patch가 비어도 된다**는 것을 말하지 않으면 삭제만 하는 요구에 모델이 억지 patch를 짓는다.
+  assert.ok(prompt.includes("leave `patch` empty"), prompt);
 });

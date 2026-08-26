@@ -52,7 +52,7 @@ import {
   type CriteriaContext,
 } from "./criteria.js";
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
-import { buildCommitMessage, buildCommitPlan, buildExecutionPlan, PlanningError } from "./planner.js";
+import { buildCommitMessage, buildCommitPlan, buildExecutionPlan, planPaths, PlanningError } from "./planner.js";
 import { triage, type TriagePolicy, type TriageResult } from "../triage.js";
 import { BudgetRefused, TaskBudget } from "./budget.js";
 import type { BudgetEventType } from "../budget/ledger.js";
@@ -550,7 +550,7 @@ export class Orchestrator {
     // 상한은 `reviseRounds`가 진다 — 실행 전 합의 실패에 이미 배정된 예산이다.
     for (;;) {
       let patch: string;
-      let moves: FileMove[] | undefined;
+      let ops: FileOps | undefined;
       for (;;) {
         if (await this.cancelledHere()) return this.finish("cancelled", "분석 중 취소됨");
 
@@ -558,9 +558,9 @@ export class Orchestrator {
 
         if (outcome.kind === "patch") {
           patch = outcome.patch;
-          // **이동은 patch와 함께 나른다**(44절). 따로 두면 되돌아갔을 때 낡은 초안의 이동이
-          // 새 patch에 붙는다.
-          moves = outcome.moves;
+          // **이동과 삭제는 patch와 함께 나른다**(44·45절). 따로 두면 되돌아갔을 때 낡은
+          // 초안의 조작이 새 patch에 붙는다.
+          ops = outcome.ops;
           break;
         }
         if (outcome.kind === "final") {
@@ -570,7 +570,7 @@ export class Orchestrator {
       }
 
       // ---- PLANNING → EXECUTING → VERIFYING (fix loop 포함) ----
-      const executed = await this.executeAndVerifyLoop(patch, moves);
+      const executed = await this.executeAndVerifyLoop(patch, ops);
       if (executed.kind === "final") return executed.result;
       // executed.kind === "redraft" — 기준 게이트가 되돌렸다. 초안부터 다시.
     }
@@ -765,19 +765,22 @@ export class Orchestrator {
       switch (decision.verdict) {
         case "ACCEPT": {
           const patch = proposal.patch ?? "";
-          if (patch.trim().length === 0) {
+          const ops = fileOps(proposal);
+          // **patch가 없어도 조작이 있으면 성립한다**(45절). "이 파일을 지워라"는 patch 없이
+          // 완결되는 요구이고, 여기서 막으면 그 요구는 모델이 무엇을 내든 실패한다.
+          if (patch.trim().length === 0 && !hasFileOps(ops)) {
             return {
               kind: "final",
               result: await this.finish(
                 "failed",
-                "검수자가 초안을 수락했으나 적용할 patch가 없습니다.",
+                "검수자가 초안을 수락했으나 적용할 변경이 없습니다.",
                 "internal_invariant_violated"
               ),
             };
           }
-          // **이동도 함께 나른다**(44절). 검수자는 이동을 거부할 방법이 없지만(44.8절),
-          // 게이트가 이동마다 사용자 승인을 요구하는 것이 그 자리의 backstop이다.
-          return { kind: "patch", patch, moves: proposal.moves };
+          // **이동과 삭제도 함께 나른다**(44·45절). 검수자는 둘 중 어느 것도 거부할 방법이
+          // 없지만(44.9절), 게이트가 매번 사용자 승인을 요구하는 것이 그 자리의 backstop이다.
+          return { kind: "patch", patch, ops };
         }
 
         case "REVISE": {
@@ -796,9 +799,10 @@ export class Orchestrator {
           const revised = decision.revisedPatch;
           if (revised && revised.trim().length > 0) {
             // 검수자가 수정본을 직접 제시했으면 그것을 쓴다 (문서 4절 revisedPatch).
-            // 검수자가 고친 것은 patch다. 이동은 실행자의 초안 그대로 실린다 — 수정본이
-            // 옮긴 뒤 경로를 기준으로 쓰여 있을 수 있으므로 여기서 떨어뜨리면 그 patch가 깨진다.
-            return { kind: "patch", patch: revised, moves: proposal.moves };
+            // 검수자가 고친 것은 patch다. 이동과 삭제는 실행자의 초안 그대로 실린다 —
+            // 수정본이 옮긴 뒤/지운 뒤를 기준으로 쓰여 있을 수 있으므로 여기서 떨어뜨리면
+            // 그 patch가 깨진다.
+            return { kind: "patch", patch: revised, ops: fileOps(proposal) };
           }
           // 수정본 없이 REVISE만 왔으면 초안을 다시 검토시킬 근거가 없다 — 초안을 그대로
           // 재검토해도 같은 결과가 나오므로 루프를 태우지 않고 실패로 확정한다.
@@ -1030,15 +1034,17 @@ export class Orchestrator {
     switch (result.verdict) {
       case "ACCEPT": {
         const patch = result.patch ?? "";
-        if (patch.trim().length === 0) {
+        const ops = fileOps(result);
+        // 대조 경로와 같은 판정이다(45절): patch가 없어도 지우거나 옮길 것이 있으면 성립한다.
+        if (patch.trim().length === 0 && !hasFileOps(ops)) {
           return {
             kind: "final",
-            result: await this.finish("failed", "단일 모델이 ACCEPT했으나 patch가 없습니다.", "internal_invariant_violated"),
+            result: await this.finish("failed", "단일 모델이 ACCEPT했으나 적용할 변경이 없습니다.", "internal_invariant_violated"),
           };
         }
-        // 단일 모델 경로에도 같은 자리를 둔다(44절) — 여기 두지 않으면 `fast` 모드에서만
-        // 이동이 조용히 사라지고, 사용자는 모드에 따라 다른 동작을 본다.
-        return { kind: "patch", patch, moves: result.moves };
+        // 단일 모델 경로에도 같은 자리를 둔다(44·45절) — 여기 두지 않으면 `fast` 모드에서만
+        // 이동과 삭제가 조용히 사라지고, 사용자는 모드에 따라 다른 동작을 본다.
+        return { kind: "patch", patch, ops };
       }
       case "REJECT":
         return { kind: "final", result: await this.finishRejected(result.rejectionReason ?? result.rationale) };
@@ -1057,17 +1063,17 @@ export class Orchestrator {
    */
   private async executeAndVerifyLoop(
     initialPatch: string,
-    initialMoves: FileMove[] | undefined
+    initialOps: FileOps | undefined
   ): Promise<{ kind: "final"; result: FinalResult } | { kind: "redraft" }> {
     let patch = initialPatch;
     /**
-     * 이동은 **첫 계획에서만** 실린다 (state-machine 44절).
+     * 이동과 삭제는 **첫 계획에서만** 실린다 (state-machine 44·45절).
      *
-     * fix loop는 같은 초안의 이동을 다시 계획에 넣으면 안 된다 — 이미 옮겨졌으므로 `from`이
-     * 없고, 그 실패는 "고치려는 시도"처럼 보이지만 사실은 우리가 같은 일을 두 번 시킨 것이다.
-     * 되돌아가는 경우(redraft)에는 새 초안이 자기 이동을 가지고 온다.
+     * fix loop는 같은 초안의 조작을 다시 계획에 넣으면 안 된다 — 이동은 `from`이, 삭제는
+     * 지울 파일이 이미 없다. 그 실패는 "고치려는 시도"처럼 보이지만 사실은 우리가 같은 일을
+     * 두 번 시킨 것이다. 되돌아가는 경우(redraft)에는 새 초안이 자기 조작을 가지고 온다.
      */
-    let moves = initialMoves;
+    let ops = initialOps;
 
     for (;;) {
       if (await this.cancelledHere()) return { kind: "final", result: await this.finish("cancelled", "실행 중 취소됨") };
@@ -1079,13 +1085,13 @@ export class Orchestrator {
         plan = buildExecutionPlan({
           taskId: this.taskId,
           patch,
-          plan: [],
           requestedBy: this.executorRequester(),
           attempt: this.state.counters.fixLoopRounds,
-          moves,
+          moves: ops?.moves,
+          deletions: ops?.deletions,
         });
-        // 실었으면 비운다. 남겨두면 fix loop가 같은 이동을 다시 시킨다.
-        moves = undefined;
+        // 실었으면 비운다. 남겨두면 fix loop가 같은 조작을 다시 시킨다.
+        ops = undefined;
       } catch (error) {
         if (error instanceof PlanningError || error instanceof ValidationError) {
           // 모델이 낸 patch가 계획으로 변환되지 않는다. fix loop를 태울 수 있으면 태운다 —
@@ -2776,11 +2782,34 @@ function describeCommit(outcome: CommitOutcome): string | null {
   }
 }
 
+/**
+ * patch가 표현하지 못하는 파일 조작 — 이동(44절)과 삭제(45절).
+ *
+ * **둘을 한 값으로 묶는다.** 같은 규칙이 둘 모두에 걸리기 때문이다: *첫 계획에만 싣는다.*
+ * 두 번째 계획에서 이동은 `from`이 이미 없어서, 삭제는 지울 파일이 이미 없어서 게이트가
+ * 거부하고, 프리플라이트가 거부하면 계획 전체가 서지 않는다(42절). 따로 두면 한쪽만 비우는
+ * 실수가 컴파일러에 보이지 않는다 — 그리고 그 실수의 증상은 "모델이 이상한 계획을 냈다"다.
+ */
+export interface FileOps {
+  moves?: FileMove[];
+  deletions?: string[];
+}
+
+/** 조작이 하나라도 있는가. patch 없는 초안이 성립하는지 판정하는 유일한 자리다. */
+function hasFileOps(ops: FileOps): boolean {
+  return (ops.moves ?? []).length > 0 || (ops.deletions ?? []).length > 0;
+}
+
+/** 초안/수정 결과에서 patch 밖 조작만 꺼낸다. 두 경로가 같은 값을 만들도록 한 곳에 둔다. */
+function fileOps(source: { moves?: FileMove[]; deletions?: string[] }): FileOps {
+  return { moves: source.moves, deletions: source.deletions };
+}
+
 type PathOutcome =
-  // **이동은 patch와 함께 나온다**(state-machine 44절). unified diff가 이동을 표현하지 못하므로
+  // **이동과 삭제는 patch와 함께 나온다**(44·45절). unified diff가 둘 다 표현하지 못하므로
   // 따로 나르되, 같은 초안에서 나온 것이라는 사실이 타입에 남아야 한다 — 따로 두면 되돌아갔을
-  // 때 낡은 초안의 이동이 새 patch에 붙는다.
-  | { kind: "patch"; patch: string; moves?: FileMove[] }
+  // 때 낡은 초안의 조작이 새 patch에 붙는다.
+  | { kind: "patch"; patch: string; ops?: FileOps }
   | { kind: "retry" }
   | { kind: "final"; result: FinalResult };
 
@@ -2809,15 +2838,6 @@ function describeApplied(output: unknown): string | null {
  * patch 본문을 다시 파싱하지 않고 **ToolRequest에서 읽는다** — planner가 이미 파일별로 쪼개
  * 경로를 명시했고(planner.ts), 같은 사실을 두 곳에서 계산하면 어긋날 수 있다.
  */
-function planPaths(plan: ExecutionPlan): string[] {
-  const paths = new Set<string>();
-  for (const request of plan.toolRequests) {
-    const path = (request.args as { path?: unknown }).path;
-    if (typeof path === "string" && path.length > 0) paths.add(path);
-  }
-  return [...paths];
-}
-
 function describeArgs(request: { tool: string; args: Record<string, unknown> }): Record<string, unknown> {
   const { patch, content, ...rest } = request.args as { patch?: string; content?: string };
   return {

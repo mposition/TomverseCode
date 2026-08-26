@@ -105,7 +105,13 @@ const PATCH_RULES = [
   // 이 줄이 없으면 `moves` 필드는 영원히 비어 있고, 모델은 이름 바꾸기를 표현할 방법이 없어
   // 파일 전체를 다시 써 보낸다.
   "To rename or move a file, do NOT delete-and-recreate it: put `{from, to}` in the `moves` array.",
-  "Write the patch as it applies AFTER the moves — moves run first.",
+  // **문을 두 번 만들었으면 길도 두 번 만든다**(45절). 이 줄이 없으면 모델은 파일을 지우려고
+  // 전체를 `-`로 실어 보내거나(patch가 파일을 비운다) 계획 문장에만 적는다 — 둘 다 아무
+  // 파일도 지우지 못한다. `patch`가 비어도 된다는 것을 말해 주지 않으면 삭제만 하는 요구에
+  // 모델은 억지 patch를 지어낸다.
+  "To delete a file, do NOT blank it out with a patch: put its path in the `deletions` array.",
+  "Deletions run first, then moves, then the patch. Write the patch as it applies after both.",
+  "If the task only needs deletions or moves, leave `patch` empty — that is a valid proposal.",
 ].join("\n");
 
 /**

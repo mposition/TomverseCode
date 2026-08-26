@@ -513,6 +513,147 @@ test("fix loop가 같은 이동을 두 번 시키지 않는다", async () => {
   assert.equal(moves.length, 1, `이동이 ${moves.length}번 요청됐습니다`);
 });
 
+/** 지우기만 하는 초안. **patch가 없다** — 45절이 그것을 정당한 응답으로 만들었다. */
+const DELETE_DRAFT = {
+  interpretation: "안 쓰는 파일을 지운다",
+  plan: [{ stepId: "s1", description: "제거" }],
+  deletions: ["src/app.ts"],
+  risks: [],
+};
+
+/**
+ * **모델이 파일을 지울 수 있다** — state-machine 45절.
+ *
+ * 44절까지 `delete_file`은 계획에 실릴 길이 없었다. `buildExecutionPlan`에 분기는 있었지만
+ * 호출부가 `plan: []`을 넘기고 있어 **한 번도 돌지 않았다** — 도구도 게이트도 되돌리기도
+ * 다 있는데 모델은 파일을 지울 수 없었다.
+ */
+test("초안이 요청한 삭제가 실제 delete_file 요청까지 이어진다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    {
+      script: [
+        { kind: "draft", payload: DELETE_DRAFT },
+        { kind: "singleFix", payload: { verdict: "ACCEPT", rationale: "지운다", ...DELETE_DRAFT } },
+      ],
+    },
+    { message: "src/app.ts 는 안 쓰니 지워줘" }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  const deletes = host.toolRequests.filter((r) => r.tool === "delete_file");
+  assert.equal(deletes.length, 1, host.toolRequests.map((r) => r.tool).join(", "));
+  assert.equal(deletes[0]?.args.path, "src/app.ts");
+  // patch가 하나도 없는 계획이다 — 그래도 계획이 서고 실행까지 갔다는 것이 이 검사의 핵심이다.
+  assert.equal(host.toolRequests.filter((r) => r.tool === "apply_patch").length, 0);
+});
+
+/**
+ * **무엇이 사라지는지 계획 단계에서 보인다** — 45절이 삭제를 열면서 함께 답해야 했던 질문.
+ *
+ * `PLAN_CREATED.changedPaths`가 승인 이전에 남는 유일한 "이 계획이 무엇을 건드리는가"이고,
+ * 기준 대조(17.3절)도 같은 값을 본다. 여기에 빠지면 사용자도 기준 게이트도 삭제를 보지 못한다.
+ */
+test("PLAN_CREATED가 지워질 파일과 옮겨질 파일을 모두 보여준다", async () => {
+  const moves = [{ from: "src/app.ts", to: "src/renamed.ts" }];
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    {
+      script: [
+        { kind: "draft", payload: { ...DELETE_DRAFT, deletions: ["package.json"], moves } },
+        {
+          kind: "singleFix",
+          payload: { verdict: "ACCEPT", rationale: "지우고 옮긴다", ...DELETE_DRAFT, deletions: ["package.json"], moves },
+        },
+      ],
+    },
+    { message: "정리해줘" }
+  );
+  await orchestrator.run();
+
+  const created = host.events.find((e) => e.type === "PLAN_CREATED");
+  assert.ok(created, host.eventTypes().join(", "));
+  const changed = (created.payload as { changedPaths: string[] }).changedPaths;
+  // 삭제 대상과 이동의 **두 경로** 모두 보여야 한다. 종전에는 이동이 통째로 빠져 있었다.
+  assert.deepEqual([...changed].sort(), ["package.json", "src/app.ts", "src/renamed.ts"]);
+});
+
+/**
+ * **`fast` 모드에서도 같은 일이 일어난다** — 44·45절이 오케스트레이터에 "단일 모델 경로에도
+ * 같은 자리를 둔다"고 적어둔 자리의 검사.
+ *
+ * 그 자리는 44절부터 있었지만 **값이 도착하지 않았다**: `validateSingleModelFixResult`가
+ * `moves`를 채우지 않아 언제나 `undefined`였다. 타입에도 있고 읽는 쪽도 있는데 조용히 비어
+ * 있었고, 대조 경로만 태우는 테스트는 그 사실을 볼 수 없다 — 45절에서 삭제를 같은 길로
+ * 보내면서 드러났다.
+ */
+test("fast 모드에서도 초안의 삭제와 이동이 실행된다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    {
+      script: [
+        {
+          kind: "singleFix",
+          payload: {
+            verdict: "ACCEPT",
+            rationale: "지우고 옮긴다",
+            plan: [],
+            deletions: ["src/app.ts"],
+            moves: [{ from: "package.json", to: "package.json.bak" }],
+          },
+        },
+      ],
+    },
+    { policy: { executionMode: "fast" }, providers: ["fake-a"], message: "정리해줘" }
+  );
+  const result = await orchestrator.run();
+
+  // 단일 모델 경로를 실제로 탔는지 먼저 확인한다 — 대조 경로를 탔다면 아래 검사는
+  // 이 절이 고친 것에 대해 아무 말도 하지 않는다.
+  assert.ok(host.phaseSequence().includes("SINGLE_MODEL_FIX"), host.phaseSequence().join(" → "));
+  assert.equal(result.status, "completed", result.summary);
+  assert.deepEqual(
+    host.toolRequests.filter((r) => r.tool === "delete_file" || r.tool === "move_file").map((r) => r.tool),
+    ["delete_file", "move_file"]
+  );
+});
+
+/**
+ * **삭제도 첫 계획에만 실린다**(45.4절). fix loop가 같은 삭제를 다시 넣으면 지울 파일이 이미
+ * 없어 게이트가 거부하고, 프리플라이트가 거부하면 **계획 전체가 서지 않는다**(42절) —
+ * 즉 두 번 시키는 실수 하나가 수정 시도 자체를 없앤다.
+ */
+test("fix loop가 같은 삭제를 두 번 시키지 않는다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "fail" }, { overall: "pass" }] },
+    {
+      script: [
+        { kind: "draft", payload: { ...DELETE_DRAFT, deletions: ["package.json"] } },
+        {
+          kind: "singleFix",
+          payload: { verdict: "ACCEPT", rationale: "지운다", ...DELETE_DRAFT, deletions: ["package.json"] },
+        },
+        // 수정안에는 삭제가 없다 — 이미 지워졌으므로 모델이 다시 요청할 이유가 없다.
+        { kind: "fix", payload: { verdict: "ACCEPT", rationale: "다시 고침", patch: VALID_PATCH, plan: [] } },
+      ],
+      defaultPatch: VALID_PATCH,
+    },
+    { message: "안 쓰는 파일을 지워줘" }
+  );
+  await orchestrator.run();
+
+  // fix loop가 실제로 돌았는지 먼저 확인한다 — 돌지 않았으면 아래 검사는 공허하다.
+  assert.ok(host.eventTypes().includes("FIX_LOOP_STARTED"), host.eventTypes().join(", "));
+  assert.ok(
+    host.toolRequests.filter((r) => r.tool === "apply_patch").length >= 1,
+    "두 번째 계획이 만들어지지 않았습니다"
+  );
+
+  const deletes = host.toolRequests.filter((r) => r.tool === "delete_file");
+  assert.equal(deletes.length, 1, `삭제가 ${deletes.length}번 요청됐습니다`);
+});
+
 /**
  * **계획을 실행하기 전에 게이트에 태워 본다** — state-machine 42절.
  *

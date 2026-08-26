@@ -1,5 +1,16 @@
 import type { ISODateTime, ReviewMode, Verdict } from "./common.js";
 
+/**
+ * 모델이 서술하는 계획의 한 단계 — **사용자에게 보여주기 위한 것이다.**
+ *
+ * `toolHint`와 `targetPaths`는 **실행 근거가 아니다**(45.2절). 한때 `buildExecutionPlan`이
+ * `toolHint === "delete_file"`인 단계를 실제 삭제 요청으로 바꿨는데, 그 분기는 호출부가
+ * `plan: []`을 넘기고 있어 한 번도 돌지 않았다. 그 자리를 되살리는 대신 없앴다 — 서술을
+ * 실행 근거로 쓰면 **모델이 말을 바꾸는 것이 곧 실행을 바꾸는 것**이 되고, 검수자의
+ * `revisedPlan`은 서술을 고치라고 만든 자리인데 그것이 조용히 실행을 고치게 된다.
+ *
+ * 실행되는 것은 `patch`·`moves`·`deletions` 세 자리뿐이다.
+ */
 export interface PlanStep {
   stepId: string;
   description: string;
@@ -52,6 +63,18 @@ export interface DraftProposal {
    * 실어 보내게 된다.
    */
   moves?: FileMove[];
+  /**
+   * 이 초안이 지우려는 파일들 (state-machine 45절).
+   *
+   * **patch로 표현하지 않는다.** unified diff로 파일을 지우려면 전체를 `-`로 실어 보내야
+   * 하고(`+++ /dev/null`), 그건 지우려는 파일을 한 번 더 읽어 보내는 일이다. 그리고 그렇게
+   * 온 patch는 "파일을 비우는 것"과 "파일을 지우는 것"이 구별되지 않는다 — 둘은 되돌리기
+   * 비용도, 승인 등급도 다르다.
+   *
+   * `plan[].toolHint`로 받지 않는 이유는 45.2절에 있다: `plan`은 사용자에게 보여줄 서술이고,
+   * 서술을 실행 근거로 쓰면 **말을 바꾸는 것이 곧 실행을 바꾸는 것**이 된다.
+   */
+  deletions?: string[];
   risks: string[];
   requiredTests: string[];
   uncertainties: string[];
@@ -100,6 +123,8 @@ export interface SingleModelFixResult {
   mcpCalls?: McpCallRequest[];
   /** 대조 경로의 `DraftProposal.moves`와 같은 자리 (state-machine 44절). */
   moves?: FileMove[];
+  /** 대조 경로의 `DraftProposal.deletions`와 같은 자리 (state-machine 45절). */
+  deletions?: string[];
   model: string;
   createdAt: ISODateTime;
 }
