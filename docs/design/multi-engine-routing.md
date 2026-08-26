@@ -457,6 +457,129 @@ prefix 비교를 쓰면 `claude-sonnet-5`가 `claude-sonnet-5.5`의 prefix이므
 통과시킨다.** 목록이 비어 있으면 정확히 일치만 허용한다 — 기본값이 느슨한 쪽이면 이 축이 있으나
 마나다. 실험에서는 alias보다 pinned(dated) 모델 ID를 우선한다.
 
+## 10.9 승인 아티팩트의 무결성 — 해시가 무엇을 지키고 무엇을 지키지 않는가
+
+### 실측으로 확인된 결함: 해시가 최상위 스칼라만 지키고 있었다
+
+승인 아티팩트(Run Card, ProbeEvidence, P0 Attestation)의 해시는 이렇게 계산됐다.
+
+```ts
+JSON.stringify(value, Object.keys(value).sort())
+```
+
+`JSON.stringify`의 **array replacer는 property whitelist**이고, 그 whitelist는 **모든 깊이에**
+적용된다. 최상위 key만 목록에 넣었으므로 중첩 객체의 key는 하나도 살아남지 못하고 `{}`가 된다.
+
+```
+{a:1, nested:{x:1}, arr:[{h:"aaa"}]}  →  {"a":1,"arr":[{}],"nested":{}}
+{a:1, nested:{x:9}, arr:[{h:"bbb"}]}  →  {"a":1,"arr":[{}],"nested":{}}   ← 같다
+```
+
+그래서 `models.executor.modelId`, `stage.fixtureIds`, `stage.callBudget`,
+`fixtureHashes[*].hash`, `arms[*].providers`, `readiness` 내부, attestation의 `checks[*]`를
+**아무리 바꿔도 해시가 그대로였다.** 승인 절차가 지키던 것은 사실상 최상위 스칼라뿐이었다.
+
+### 규칙
+
+- 정규 직렬화는 `evals/hypothesis-gate/src/canonical.ts` **하나**다. key를 모든 깊이에서
+  재귀 정렬하고, 배열 순서는 보존하며, `undefined`·`NaN`·`Infinity`·함수·symbol·bigint·
+  `toJSON` 객체를 **경로와 함께 예외로 거부한다**(조용히 지우면 "해시는 같은데 내용이 다른"
+  두 문서가 생긴다).
+- 해시 대상에서 제외하는 것은 **해시 필드 자신뿐**이다. 예전처럼 대상 필드를 손으로 나열하면
+  새 필드를 목록에 넣는 것을 잊는 순간 그 필드가 조용히 해시 밖으로 빠진다.
+- SHA-256은 **64 hex 전체**를 저장한다. 32자리로 자르던 시절의 아티팩트는 형식 검사에서 먼저 걸린다.
+- 스키마 버전을 올리고 **이전 버전은 fail-closed로 거부한다.** 자동 마이그레이션하지 않는다 —
+  v1 해시는 중첩 필드를 덮지 않았으므로 "해시가 맞다"가 아무것도 보증하지 않는다.
+
+### 위협 모델 — 이건 전자서명이 아니다
+
+이 해시는 **무결성 검사**이지 위조 방지가 아니다. 로컬에서 코드를 실행할 수 있는 사용자는
+내용을 바꾼 뒤 같은 함수로 해시를 다시 계산해 넣으면 된다. 비밀 키가 없으므로 막을 수단이 없고,
+막으려면 서명 키를 사용자가 접근할 수 없는 곳(HSM, 원격 서명 서비스)에 두어야 한다.
+
+그 한계를 알고도 두는 이유: 이 절차가 막으려는 것은 **공격자가 아니라 사고**다.
+"plan-pilot을 다시 돌려서 카드가 바뀐 줄 몰랐다", "evidence 파일을 편집기로 열었다가 저장했다",
+"다른 실행의 attestation을 복사해 왔다" — 해시가 정확히 잡는 것은 이것들이다.
+
+## 10.10 승인은 immutable하고, 실행은 receipt로 승인에 묶인다
+
+### immutable 승인 아티팩트
+
+승인 아티팩트는 `<output-root>/approvals/{cards,evidence,attestations}/<id>.json`에 산다.
+
+- **같은 id에 다른 내용을 쓸 수 없다.** 같은 내용의 재저장만 idempotent하게 허용한다
+  (비교는 바이트가 아니라 canonical JSON — 들여쓰기 차이로 실패하면 사람이 고칠 수 없다).
+- `plan-pilot`을 다시 돌리면 **새 id의 새 카드**가 생기고, 이미 실행에 쓰인 카드는 그대로 남는다.
+- 덮어쓰이는 `*.pointer.json`은 **안내용**이며 Run Card 형태가 아니다. 실수로 `--run-card`에
+  넘겨도 카드로 해석되지 않는다. 승인의 대상이 시간에 따라 달라지면 "이것을 승인했다"는 말이
+  성립하지 않기 때문이다.
+- 카드는 자기 immutable 경로를 기록하고, 다른 경로에서 읽힌 카드는 **사본으로 보고 거부한다.**
+
+### Execution Authorization Receipt
+
+`pilot`/`run`은 **어댑터를 만들기 전에** `execution-authorizations.jsonl`에 receipt를 append한다.
+저장에 실패하면 유료 호출을 시작하지 않는다.
+
+receipt가 담는 것: 카드 id/hash/경로, evidence id/hash/경로, (P1이면) attestation id/hash/경로,
+protocol/criteria hash, registry snapshot hash, adapter contract version, stage/output,
+**실행 직전의 fixture 내용 해시 전부**, arms/repetitions/seed/concurrency, 역할별 provider·model,
+승인 상한, 정규화된 실행 argv, 자격증명 binding 다이제스트와 **환경변수 이름**.
+
+담지 않는 것: API 키 원문·prefix·suffix·길이, Authorization 헤더, 전체 환경변수.
+
+모든 `GateRunRecord`가 `receiptId`/`receiptHash`를 달고 나온다. 그래서 `attest-p0`는
+**명령 인자로 받은 카드가 아니라 기록이 가리키는 receipt**를 정본으로 삼는다 — 예전에는
+`plan-pilot` 재실행으로 카드 파일이 바뀌면 실제로 실행된 것과 다른 카드로 attestation을 만들 수 있었다.
+
+재개는 조건 해시가 같을 때만 기존 receipt를 이어받는다. 예산을 올렸든 fixture 내용이 바뀌었든
+조건이 다르면 **새 승인**이며, 새 카드와 새 receipt와 새 출력 디렉터리를 요구한다.
+
+### 호출별 dispatch 상태와 crash 복구
+
+`records.jsonl`의 각 기록은 `providerCalls[]`를 갖는다. 그 값은 DB 이벤트에서 만들어진다.
+
+| 이벤트 | 의미 | dispatch |
+|---|---|---|
+| `PROVIDER_CALL_STARTED` | adapter 호출 직전 | (terminal이 없으면) `dispatched_no_response` |
+| `PROVIDER_USAGE` | usage를 받은 성공 | `response_received_with_usage` |
+| `PROVIDER_CALL_FAILED` | 실패 + 어댑터가 아는 사실 | 어댑터가 실은 값 |
+
+불변식:
+
+- **`auth_failure`·`rate_limit`·`provider_5xx`는 HTTP 분류일 뿐 dispatch 사실이 아니다.**
+  429나 5xx를 받았다는 것은 요청이 공급자에게 도달했다는 뜻이고, 그 앞 호출이 과금됐을 수 있다.
+- 해제(`not_dispatched`)는 **적극적 증거**가 있을 때만이다: 이벤트를 읽을 수 있었고,
+  호출 개시 이벤트가 하나도 없으며, 실패가 호출 이전 단계(자격증명 없음, fixture 준비 실패,
+  툴체인 미준비)에서 났을 때.
+- **이벤트를 읽지 못한 것 자체가 과금 불확실 상태다.** "모른다"를 "안 썼다"로 읽지 않는다.
+- 공급자별 비과금 거부 상태를 두고 싶다면 검증 가능한 계약과 별도 상태와 테스트가 필요하다.
+  근거가 없으면 `unresolved`가 기본이다.
+
+### known spend와 maximum unresolved exposure는 다른 숫자다
+
+한 기록에서 executor는 성공(과금 확정)하고 reviewer는 5xx로 실패할 수 있다. 그때
+**전액 해제하면 쓴 돈이 사라지고, 전액 정산하면 불확실한 과금이 사라진다.** 둘 다 사실과 다르다.
+
+그래서 세 번째 종결 방식을 둔다: `reservation_partially_settled`. 확정분은 누적하고 나머지는
+미해결로 남기며, 그 디렉터리는 자동 재개가 불가능해진다.
+
+`gate:g:budget-status`는 두 숫자를 **분리해서** 보여준다.
+
+- **알려진 지출(known spend)**: 이미 확정된 돈. terminal 이벤트가 말하는 값이다.
+- **최대 미해결 노출(maximum unresolved exposure)**: 과금됐을 **수 있는** 금액.
+  그만큼 과금됐다는 뜻이 아니다. 실제 여부는 공급자 청구 내역으로만 확인된다.
+
+### 자격증명 resolver는 하나다
+
+`preflight`, 모델 준비성, ProbeEvidence binding, receipt binding, 어댑터 factory, 유료 실행
+authorization이 전부 `resolveCredential` 하나를 지난다. 후보는 레지스트리의 `apiKeyEnvName`과
+`TOMVERSE_` 접두 별칭 둘뿐이고, **값이 다른 별칭이 둘 다 있으면 조용히 고르지 않고 차단한다** —
+그 상태에서는 probe가 확인한 키와 실행이 쓰는 키가 다를 수 있다.
+
+credential binding의 HMAC은 **API 키를 HMAC 키로** 쓰고 salt/purpose/provider/envName을
+메시지로 쓴다. 예전에는 반대(salt가 키, API 키가 메시지)였고, salt가 공개값이므로 HMAC의
+"키를 모르면 다이제스트를 만들 수 없다"는 성질이 성립하지 않았다.
+
 ## 11. Tomverse Insight의 기존 자산 재사용
 
 **3절의 Model Registry를 백지에서 만들 필요가 없다.** Tomverse Insight(`H:\Project\ai-chat-hub`, 리포지토리 `mposition/Tomverse`)에 이미 동등한 구조가 프로덕션에서 돌고 있다.

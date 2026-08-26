@@ -264,15 +264,22 @@ export function readBudgetEvents(runDir: string, fileName: string = BUDGET_EVENT
 // 예약 상태 머신
 // ---------------------------------------------------------------------------
 
-/** 한 예약이 어떻게 끝났는가. `open`은 **끝나지 않았다**는 뜻이다. */
-export type ReservationOutcome = "settled" | "released" | "unresolved" | "open";
+/**
+ * 한 예약이 어떻게 끝났는가. `open`은 **끝나지 않았다**는 뜻이다.
+ *
+ * `partially_settled`는 확정된 비용과 불확실한 금액이 **둘 다** 있는 종결이다 —
+ * 확정분은 알려진 지출로 세고, 남은 금액은 미해결 노출로 센다(§2.7).
+ */
+export type ReservationOutcome = "settled" | "released" | "unresolved" | "partially_settled" | "open";
 
 export interface ReservationView {
   correlationId: string;
   reservedUsd: number;
   outcome: ReservationOutcome;
-  /** 정산된 경우의 확정 비용. */
+  /** 정산된 경우의 확정 비용. 부분 정산이면 **확정된 부분만** 담는다. */
   actualUsd?: number;
+  /** 부분 정산에서 미해결로 남은 금액. */
+  unresolvedUsd?: number;
   openedAt: string;
   runId: string;
   stage: string;
@@ -282,15 +289,27 @@ export interface ReservationView {
 
 export interface EventAnalysis {
   reservations: ReservationView[];
-  /** terminal `settled` 이벤트가 말하는 확정 비용의 합. **비용의 정본이다.** */
+  /**
+   * terminal 이벤트가 말하는 **확정 비용의 합.** 비용의 정본이며, 부분 정산의 확정분도 포함한다.
+   * 상태 조회에서는 "알려진 지출(known spend)"로 표시된다.
+   */
   settledUsd: number;
-  /** 열린 채로 남은 + 미해결로 남은 예약액. 사용 가능한 예산으로 되돌리지 않는다. */
+  /**
+   * 열린 채로 남은 + 미해결로 남은 + 부분 정산의 잔여 금액.
+   *
+   * 사용 가능한 예산으로 되돌리지 않는다. 상태 조회에서는 "최대 미해결 노출(maximum unresolved
+   * exposure)"로 표시된다 — 실제로 그만큼 과금됐다는 뜻이 아니라, **그만큼일 수 있다**는 뜻이다.
+   */
   unresolvedUsd: number;
   /** 상태 머신 위반 전부. 하나라도 있으면 재개하지 않는다. */
   problems: string[];
 }
 
-const TERMINAL: ReadonlySet<string> = new Set(["reservation_settled", "reservation_released"]);
+const TERMINAL: ReadonlySet<string> = new Set([
+  "reservation_settled",
+  "reservation_released",
+  "reservation_partially_settled",
+]);
 
 /**
  * 예산 이벤트를 correlationId별 상태 머신으로 검증한다.
@@ -382,6 +401,25 @@ export function analyzeBudgetEvents(events: readonly BudgetEvent[]): EventAnalys
       view.actualUsd = event.actualUsd;
       continue;
     }
+    if (event.type === "reservation_partially_settled") {
+      if (typeof event.actualUsd !== "number" || !Number.isFinite(event.actualUsd) || event.actualUsd < 0) {
+        view.problems.push(`부분 정산 이벤트의 확정 비용이 유효한 수가 아닙니다 (${String(event.actualUsd)})`);
+        view.outcome = "unresolved";
+        continue;
+      }
+      view.outcome = "partially_settled";
+      view.actualUsd = event.actualUsd;
+      view.unresolvedUsd =
+        typeof event.unresolvedUsd === "number" && Number.isFinite(event.unresolvedUsd) && event.unresolvedUsd >= 0
+          ? event.unresolvedUsd
+          : Math.max(0, view.reservedUsd - event.actualUsd);
+      // **확정분이 있어도 재개는 막는다.** 남은 금액의 과금 여부를 코드가 알 수 없다.
+      view.problems.push(
+        `확정 $${event.actualUsd.toFixed(6)} 외에 $${view.unresolvedUsd.toFixed(6)}의 과금 여부가 ` +
+          `확정되지 않았습니다: ${event.reason ?? "사유 없음"}`
+      );
+      continue;
+    }
     if (event.type === "reservation_released") {
       view.outcome = "released";
       continue;
@@ -409,6 +447,10 @@ export function analyzeBudgetEvents(events: readonly BudgetEvent[]): EventAnalys
   let unresolvedUsd = 0;
   for (const view of byId.values()) {
     if (view.outcome === "settled") settledUsd += view.actualUsd ?? 0;
+    if (view.outcome === "partially_settled") {
+      settledUsd += view.actualUsd ?? 0;
+      unresolvedUsd += view.unresolvedUsd ?? 0;
+    }
     if (view.outcome === "open" || view.outcome === "unresolved") {
       unresolvedUsd += view.reservedUsd;
       view.problems.push(
@@ -474,7 +516,9 @@ export function reconcileBudget(input: {
     return { ok: true, analysis };
   }
 
-  const hasUnresolved = analysis.reservations.some((r) => r.outcome === "open" || r.outcome === "unresolved");
+  const hasUnresolved = analysis.reservations.some(
+    (r) => r.outcome === "open" || r.outcome === "unresolved" || r.outcome === "partially_settled"
+  );
   return {
     ok: false,
     status: hasUnresolved || input.truncatedLastLine
@@ -564,7 +608,9 @@ export function budgetStatus(input: {
     ...(recordsUsd !== undefined ? { recordsCommittedUsd: recordsUsd } : {}),
     ...(input.eventRead.events.length > 0 ? { eventsSettledUsd: analysis.settledUsd } : {}),
     unresolvedUsd: analysis.unresolvedUsd,
-    openReservations: analysis.reservations.filter((r) => r.outcome === "open" || r.outcome === "unresolved"),
+    openReservations: analysis.reservations.filter(
+      (r) => r.outcome === "open" || r.outcome === "unresolved" || r.outcome === "partially_settled"
+    ),
     settledReservations: analysis.reservations.filter((r) => r.outcome === "settled").length,
     releasedReservations: analysis.reservations.filter((r) => r.outcome === "released").length,
     recordsAndEventsAgree: reconciled.ok,
@@ -581,10 +627,15 @@ export function renderBudgetStatus(report: BudgetStatusReport): string[] {
   lines.push(`실행 디렉터리: ${report.runDir}`);
   lines.push(`승인 상한: ${report.approvedLimitUsd === undefined ? "(이 조회에 지정되지 않음)" : `$${report.approvedLimitUsd}`}`);
   lines.push(`기록 파일 확정 비용: ${money(report.recordsCommittedUsd)}`);
-  lines.push(`이벤트 원장 정산 합계(정본): ${money(report.eventsSettledUsd)}`);
+  // **두 숫자를 분리해서 보여준다** (§2.7). "알려진 지출"은 이미 확정된 돈이고,
+  // "최대 미해결 노출"은 과금됐을 **수 있는** 금액이다. 하나로 합치면 사용자가
+  // 실제 지출을 과대평가하거나 노출을 과소평가한다.
+  lines.push(`알려진 지출(known spend, 정본): ${money(report.eventsSettledUsd)}`);
+  lines.push(`최대 미해결 노출(maximum unresolved exposure): ${money(report.unresolvedUsd)}`);
+  lines.push("  ↑ 그만큼 과금됐다는 뜻이 아니라, **그만큼일 수 있다**는 뜻입니다.");
   lines.push(`records/events 일치: ${report.recordsAndEventsAgree ? "일치" : "불일치"}`);
   lines.push(`정산된 예약: ${report.settledReservations}건 / 해제된 예약: ${report.releasedReservations}건`);
-  lines.push(`미해결 예약: ${report.openReservations.length}건, 합계 ${money(report.unresolvedUsd)}`);
+  lines.push(`미해결 예약: ${report.openReservations.length}건`);
   for (const open of report.openReservations) {
     lines.push(`  - ${open.correlationId}`);
     lines.push(`      예약액 $${open.reservedUsd.toFixed(6)} / 상태 ${open.outcome}`);

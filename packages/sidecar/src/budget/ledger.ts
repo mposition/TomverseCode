@@ -59,6 +59,14 @@ export type BudgetEventType =
   | "reservation_opened"
   | "reservation_released"
   | "reservation_settled"
+  /**
+   * 확정된 비용과 **불확실한 attempt가 함께** 있는 예약의 종결 (§2.7).
+   *
+   * 한 기록이 executor는 성공(과금 확정)하고 reviewer는 5xx로 실패한 경우가 그렇다. 전액
+   * 해제하면 쓴 돈이 사라지고 전액 정산하면 불확실한 과금이 사라지므로, 확정분은 누적하고
+   * 나머지는 미해결로 남긴다. **terminal이지만 재개를 막는다** — 사람이 청구 내역으로 확인해야 한다.
+   */
+  | "reservation_partially_settled"
   | "provider_usage_recorded"
   | "budget_estimate_breached"
   | "run_blocked"
@@ -105,6 +113,8 @@ export interface BudgetEvent {
   reason?: string;
   /** 정산 이벤트에 함께 담는 사용량. 이벤트 사이 crash window를 없애기 위한 것이다. */
   usage?: { inputTokens: number; outputTokens: number };
+  /** 부분 정산에서 미해결로 남긴 금액. `reservedUsd = actualUsd + unresolvedUsd`다. */
+  unresolvedUsd?: number;
   /** 우리가 요청한 모델 ID. */
   requestedModelId?: string;
   /** **공급자 응답 envelope이 실어 온** 모델 ID. 조용한 대체를 사후에 감사할 근거다. */
@@ -243,6 +253,19 @@ export interface Reservation {
    * 그 경우 "해제"는 쓴 돈을 안 쓴 것으로 만드는 것이므로, 미해결로 남기고 멈춘다.
    */
   markUnresolved(grounds: { dispatchState: DispatchState; reason: string }): void;
+  /**
+   * **확정분은 반영하고 나머지는 미해결로 남긴다** (§2.7).
+   *
+   * 한 기록 안에서 어떤 호출은 usage까지 받았고 어떤 호출은 응답을 못 받은 경우가 있다.
+   * 그때 `settle`은 불확실한 과금 가능성을 지우고 `markUnresolved`는 이미 확정된 지출을
+   * 감춘다. 둘 다 사실과 다르므로 세 번째 종결 방식을 둔다.
+   *
+   * 확정분이 예약액을 넘으면 `settle`과 같은 이유로 추정 초과다.
+   */
+  settlePartial(input: {
+    measured: Settlement;
+    unresolved: { dispatchState: DispatchState; reason: string };
+  }): SettleOutcome;
   /** 이미 정산/해제됐는가 — 이중 정산을 막는다. */
   readonly settled: boolean;
 }
@@ -557,6 +580,64 @@ export function createBudgetLedger(approvedLimitUsd: number, options: LedgerOpti
                 `이후 유료 호출을 차단합니다.`,
             });
           }
+          return { ok: true, committedUsd: historical + session };
+        },
+        settlePartial(input) {
+          if (done) throw new Error(`예약 ${id}이(가) 이미 정산되었습니다`);
+          const validated = validateSettlement(input.measured);
+          if (!validated.ok) {
+            // 확정분조차 검증을 통과하지 못하면 아무것도 확정할 수 없다 — 전액 미해결이다.
+            done = true;
+            unresolvedCount += 1;
+            reserved -= amount;
+            unresolved += amount;
+            emit({
+              type: "reservation_unresolved",
+              correlationId: id,
+              reservedUsd: amount,
+              reason: `${input.unresolved.reason} / 확정분 검증 실패: ${validated.reason}`,
+              dispatchState: input.unresolved.dispatchState,
+            });
+            block("BUDGET_LEDGER_INVALID", id, validated.reason);
+            return { ok: false, state: "BUDGET_LEDGER_INVALID", reason: validated.reason };
+          }
+
+          done = true;
+          settledCount += 1;
+          unresolvedCount += 1;
+          reserved -= amount;
+          const actual = validated.usd;
+          session += actual;
+          // 예약액에서 확정분을 뺀 나머지가 "과금됐을 수 있는데 금액을 모르는" 부분이다.
+          // 확정분이 예약액을 넘으면 남길 것이 없다(그 경우는 아래 추정 초과로 잡힌다).
+          const leftover = Math.max(0, amount - actual);
+          unresolved += leftover;
+          emit({
+            type: "reservation_partially_settled",
+            correlationId: id,
+            reservedUsd: amount,
+            actualUsd: actual,
+            unresolvedUsd: leftover,
+            usage: { inputTokens: validated.inputTokens, outputTokens: validated.outputTokens },
+            ...(input.measured.requestedModelId ? { requestedModelId: input.measured.requestedModelId } : {}),
+            ...(input.measured.providerReportedModelId
+              ? { providerReportedModelId: input.measured.providerReportedModelId }
+              : {}),
+            reason: input.unresolved.reason,
+            dispatchState: input.unresolved.dispatchState,
+          });
+          if (actual > amount) {
+            ledgerState = "BUDGET_ESTIMATE_BREACH";
+            emit({
+              type: "budget_estimate_breached",
+              correlationId: id,
+              reservedUsd: amount,
+              actualUsd: actual,
+              reason: `부분 정산의 확정 비용 $${actual.toFixed(4)}이 예약액 $${amount.toFixed(4)}을 초과했습니다.`,
+            });
+            return { ok: true, committedUsd: historical + session };
+          }
+          block("UNRESOLVED_RESERVATION", id, input.unresolved.reason);
           return { ok: true, committedUsd: historical + session };
         },
         release(grounds) {

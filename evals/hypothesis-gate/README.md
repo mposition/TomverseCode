@@ -373,6 +373,58 @@ P1 카드의 선행 조건은 문장이 아니라 **파일**이다. `attest-p0`�
 경로가 이 모델과 구조화 출력까지 동작하는가**다. 요청 **전에** 예약하고, 비용을 잴 수 없으면
 중단하며, 결과는 `records.jsonl`이 아닌 `model-probe/`에 쓴다.
 
+### 승인 아티팩트는 immutable하다 (M0.1)
+
+```text
+<output-root>/
+  approvals/
+    cards/<cardId>.json              ← 승인 근거. 같은 id에 다른 내용을 쓸 수 없다.
+    evidence/<evidenceId>.json
+    attestations/<attestationId>.json
+  p0-smoke/
+    p0-run-card.pointer.json         ← **안내용.** 카드가 아니므로 --run-card에 넘길 수 없다.
+    execution-authorizations.jsonl   ← 실행 승인 receipt (append-only)
+    records.jsonl
+    budget-events.jsonl
+  p1-pilot/
+    ...
+```
+
+`plan-pilot`을 다시 돌리면 **새 id의 새 카드**가 생기고 기존 카드는 바이트까지 그대로 남는다.
+이미 실행이 근거로 삼은 카드가 조용히 바뀌면 "이것을 승인했다"는 말이 성립하지 않기 때문이다.
+
+카드는 자기 immutable 경로를 기록하고, 다른 경로에서 읽힌 카드는 **사본으로 보고 거부한다.**
+
+### 실행 승인 receipt
+
+`pilot`/`run`은 **어댑터를 만들기 전에** receipt를 append한다. 저장에 실패하면 유료 호출을
+시작하지 않는다. 모든 기록이 `receiptId`/`receiptHash`를 달고 나오므로, `attest-p0`는
+명령 인자로 받은 카드가 아니라 **기록이 가리키는 receipt**를 따라 카드와 evidence를 찾는다.
+
+재개는 조건 해시가 같을 때만 기존 receipt를 이어받는다. 예산을 올렸든 fixture 내용이 바뀌었든
+조건이 다르면 새 승인이며, 새 카드와 새 `--output`을 요구한다.
+
+### 실행 명령은 카드가 만든 것을 그대로 쓴다
+
+카드의 `runArgv`에는 `--stage --fixtures --arms --repetitions --max-concurrency --seed --output
+--max-cost-usd --executor-model --reviewer-model --run-card --probe-evidence`(P1은 `--p0-attestation`까지)가
+**전부** 들어 있다. 카드를 만든 코드와 실행을 검증하는 코드가 같은 생성기를 쓰므로,
+카드가 출력한 명령은 언제나 그 카드의 authorization을 통과한다.
+
+예전에는 모델 override와 evidence 경로가 argv에 없어서, override로 만든 카드의 명령을 그대로
+실행하면 그 카드의 검증에서 거부됐다 — 승인 절차가 자기 자신을 통과하지 못하는 상태였다.
+
+### 알려진 지출과 최대 미해결 노출은 다른 숫자다
+
+`gate:g:budget-status`는 둘을 분리해서 보여준다.
+
+- **알려진 지출(known spend)**: 이미 확정된 돈.
+- **최대 미해결 노출(maximum unresolved exposure)**: 과금됐을 **수 있는** 금액.
+  그만큼 과금됐다는 뜻이 아니며, 실제 여부는 공급자 청구 내역으로만 확인된다.
+
+한 기록에서 executor가 성공(과금 확정)하고 reviewer가 5xx로 실패하면 **전액 해제도 전액 정산도
+옳지 않다.** 확정분은 누적하고 나머지는 미해결로 남기며, 그 디렉터리는 자동 재개가 불가능해진다.
+
 ## 사전 등록된 판정 기준
 
 **결과를 보기 전에 고정됐다.** 바꾸려면 `PROTOCOL_VERSION`을 올리고 새 실험으로 다시 돌려야 하며,

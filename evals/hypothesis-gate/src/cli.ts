@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createBudgetLedger } from "@tomverse/sidecar/budget";
-import { BUILTIN_MODELS, ModelRegistry } from "@tomverse/sidecar/registry";
+import { BUILTIN_MODELS, ModelRegistry, providerModelIdAccepted } from "@tomverse/sidecar/registry";
 import {
   approvalCoversHistorical,
   budgetEventsPath,
@@ -24,11 +25,26 @@ import { OptionError, parseArgs, requireCostLimitForPaidRun, type CliOptions } f
 import {
   attestP0,
   loadP0Attestation,
-  p0AttestationPath,
   renderAttestation,
   validateP0Attestation,
   writeP0Attestation,
 } from "./p0Attestation.js";
+import { approvalPaths, artifactPath, storeApprovalArtifact } from "./approvalStore.js";
+import {
+  appendExecutionReceipt,
+  buildCredentialBinding,
+  buildExecutionReceipt,
+  factsOf,
+  readExecutionReceipts,
+  renderReceipt,
+  credentialBindingMatchesResolved,
+  RECEIPT_CREDENTIAL_PURPOSE,
+  reuseOrConflict,
+  type ExecutionAuthorizationReceipt,
+  type ReceiptFacts,
+  type ResolvedProviderCredential,
+} from "./receipt.js";
+import { executionArgv, type ExecutionRequestSpec } from "./executionRequest.js";
 import {
   loadProbeEvidence,
   probeEvidencePath,
@@ -41,6 +57,7 @@ import {
   PROBE_BUDGET_EVENTS_FILE,
   probeModels,
   renderProbeSummary,
+  resolveRoleCredentials,
   writeProbeResults,
 } from "./probeModels.js";
 import { ADAPTER_CONTRACT_VERSION, createAdapterProbeTransport } from "./probeTransport.js";
@@ -48,14 +65,15 @@ import { openRecordStore } from "./records.js";
 import {
   authorizeRunCard,
   buildStagedCards,
-  cardFileFor,
   loadRunCard,
   renderRunCard,
   writeRunCard,
-  type Stage,
+  type RequestFixture,
+  type RunCard,
 } from "./runCard.js";
+import type { Stage } from "./stage.js";
 import { checkCompatibility, META_VERSION, readMeta, runDirPaths, withApproval, writeMeta } from "./runDir.js";
-import { ARMS } from "./arms.js";
+import { ARMS, modelForRole } from "./arms.js";
 import { writeReports } from "./report.js";
 import { fillReviewerContributions, runExperiment } from "./runner.js";
 import { evaluateGate } from "./stats.js";
@@ -88,6 +106,51 @@ const REPORTS_ROOT = path.join(PACKAGE_ROOT, "reports");
 
 function log(message: string): void {
   process.stdout.write(`${message}\n`);
+}
+
+/**
+ * 두 역할이 쓰는 자격증명을 **공용 resolver로** 해석한다 (§2.10).
+ *
+ * preflight·evidence binding·receipt binding·어댑터 factory가 전부 같은 규칙을 지나야 한다.
+ * 여기서 레지스트리 엔트리를 거치는 이유: 환경변수 이름의 정본은 Model Registry이고,
+ * 그 이름을 CLI가 따로 적으면 세 번째 진실의 원천이 생긴다.
+ */
+function resolveCredentialsFor(
+  executorModelId: string,
+  reviewerModelId: string
+): { ok: true; credentials: ResolvedProviderCredential[] } | { ok: false; reasons: string[] } {
+  const entries = [lookupModel(executorModelId), lookupModel(reviewerModelId)];
+  const missing = entries
+    .map((entry, i) => (entry ? undefined : `레지스트리에 ${[executorModelId, reviewerModelId][i]!} 엔트리가 없습니다`))
+    .filter((m): m is string => m !== undefined);
+  if (missing.length > 0) return { ok: false, reasons: missing };
+  return resolveRoleCredentials(
+    entries.filter((e): e is NonNullable<typeof e> => e !== undefined).map((entry) => ({ entry })),
+    process.env
+  );
+}
+
+/** 재개할 때 그때와 같은 키를 쓰고 있는가. 다르면 같은 실험이 아니다. */
+function credentialBindingMatchesReceipt(
+  receipt: ExecutionAuthorizationReceipt,
+  credentials: readonly ResolvedProviderCredential[]
+): { ok: true } | { ok: false; reason: string } {
+  return credentialBindingMatchesResolved(receipt.credentialBinding, credentials);
+}
+
+/**
+ * 승인 번들에서 **가장 최근** attestation의 경로.
+ *
+ * 이건 편의 기능이며 승인 근거가 아니다 — P1 카드는 여기서 고른 경로가 아니라 그때 검증을
+ * 통과한 attestation의 id/hash/경로를 기록하고, 실행 직전에 그 파일을 다시 확인한다.
+ */
+function newestAttestationPath(attestationsDir: string): string | undefined {
+  if (!existsSync(attestationsDir)) return undefined;
+  const files = readdirSync(attestationsDir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => path.join(attestationsDir, f))
+    .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs);
+  return files[files.length - 1];
 }
 
 async function main(): Promise<number> {
@@ -231,6 +294,19 @@ async function main(): Promise<number> {
     // **판정하지 않는다.** 이건 사람이 교환비를 정하기 위한 표이지 게이트가 아니다.
     return 0;
   }
+  // ---- 공용 헬퍼 ----
+  // 승인 번들은 `--output`(P0/P1의 부모)의 형제로 둔다. P0와 P1이 같은 evidence와 같은
+  // attestation을 가리켜야 하므로 단계별 디렉터리 안에 두면 체인이 갈라진다.
+  const approvals = approvalPaths(options.output);
+
+  /** 지금 디스크에 있는 fixture 사실. 카드/receipt/기록 비교의 기준이다. */
+  const currentFixtures = (): RequestFixture[] =>
+    fixtures.map((f) => ({
+      fixtureId: f.manifest.fixtureId,
+      category: f.manifest.category,
+      language: f.manifest.language,
+      hash: f.fixtureHash,
+    }));
 
   // ---- plan-pilot ----
   // **실제 API를 부르지 않는다.** 사용자가 승인할 수 있는 실행 계획서를 만든다.
@@ -259,44 +335,60 @@ async function main(): Promise<number> {
     } else if (loaded.raw === undefined) {
       evidenceProblems.push(`probe evidence를 읽을 수 없습니다: ${loaded.parseError ?? "알 수 없는 오류"}`);
     } else if (isModelPlan(models)) {
-      const verdict = validateProbeEvidence(loaded.raw, {
-        now,
-        protocolVersion: CRITERIA.protocolVersion,
-        criteriaHash: criteriaHash(),
-        registrySnapshotHash: new ModelRegistry(BUILTIN_MODELS).snapshotHash(),
-        adapterContractVersion: ADAPTER_CONTRACT_VERSION,
-        executorModelId: models.executor.modelId,
-        reviewerModelId: models.reviewer.modelId,
-        env: process.env,
-      });
-      if (verdict.ok) evidence = verdict.evidence;
-      else evidenceProblems.push(...verdict.reasons);
+      const credentials = resolveCredentialsFor(models.executor.modelId, models.reviewer.modelId);
+      if (!credentials.ok) {
+        evidenceProblems.push(...credentials.reasons);
+      } else {
+        const verdict = validateProbeEvidence(loaded.raw, {
+          now,
+          protocolVersion: CRITERIA.protocolVersion,
+          criteriaHash: criteriaHash(),
+          registrySnapshotHash: new ModelRegistry(BUILTIN_MODELS).snapshotHash(),
+          adapterContractVersion: ADAPTER_CONTRACT_VERSION,
+          executorModelId: models.executor.modelId,
+          reviewerModelId: models.reviewer.modelId,
+          credentials: credentials.credentials,
+        });
+        if (verdict.ok) evidence = verdict.evidence;
+        else evidenceProblems.push(...verdict.reasons);
+      }
+    }
+
+    // **evidence를 immutable 번들에 넣는다** (§2.2). 카드가 가리키는 경로가 덮어쓰이는
+    // 파일이면 승인 대상이 시간에 따라 달라진다.
+    if (evidence) {
+      const stored = storeApprovalArtifact(approvals.evidence, evidence.evidenceId, evidence);
+      log(`probe evidence(immutable): ${stored.file}${stored.created ? "" : " (이미 같은 내용으로 있었습니다)"}`);
     }
 
     // ---- P0 attestation 읽기 (§5) ----
-    const attestationFile = p0AttestationPath(path.join(options.output, "p0-smoke"));
-    const attestationLoad = loadP0Attestation(attestationFile);
-    let p0Attestation: { attestationId: string; attestationHash: string } | undefined;
+    // 명령 인자로 주어졌으면 그것을, 아니면 immutable 번들에서 찾는다.
+    const attestationFile = options.p0Attestation ?? newestAttestationPath(approvals.attestations);
+    let p0Attestation: { attestationId: string; attestationHash: string; path: string } | undefined;
     const p0Problems: string[] = [];
-    if (attestationLoad.found && attestationLoad.raw !== undefined && evidence && isModelPlan(models)) {
-      const verdict = validateP0Attestation(attestationLoad.raw, {
-        probeEvidenceId: evidence.evidenceId,
-        probeEvidenceHash: evidence.evidencePayloadHash,
-        criteriaHash: criteriaHash(),
-        protocolVersion: CRITERIA.protocolVersion,
-        executorModelId: models.executor.modelId,
-        reviewerModelId: models.reviewer.modelId,
-      });
-      if (verdict.ok) {
-        p0Attestation = {
-          attestationId: verdict.attestation.attestationId,
-          attestationHash: verdict.attestation.attestationHash,
-        };
-      } else {
-        p0Problems.push(...verdict.reasons);
+    if (attestationFile !== undefined) {
+      const attestationLoad = loadP0Attestation(attestationFile);
+      if (attestationLoad.found && attestationLoad.raw !== undefined && evidence && isModelPlan(models)) {
+        const verdict = validateP0Attestation(attestationLoad.raw, {
+          probeEvidenceId: evidence.evidenceId,
+          probeEvidenceHash: evidence.evidencePayloadHash,
+          criteriaHash: criteriaHash(),
+          protocolVersion: CRITERIA.protocolVersion,
+          executorModelId: models.executor.modelId,
+          reviewerModelId: models.reviewer.modelId,
+        });
+        if (verdict.ok) {
+          p0Attestation = {
+            attestationId: verdict.attestation.attestationId,
+            attestationHash: verdict.attestation.attestationHash,
+            path: attestationFile,
+          };
+        } else {
+          p0Problems.push(...verdict.reasons);
+        }
+      } else if (attestationLoad.found && attestationLoad.parseError) {
+        p0Problems.push(`P0 attestation을 읽을 수 없습니다: ${attestationLoad.parseError}`);
       }
-    } else if (attestationLoad.found && attestationLoad.parseError) {
-      p0Problems.push(`P0 attestation을 읽을 수 없습니다: ${attestationLoad.parseError}`);
     }
 
     const credentialsPresent = isModelPlan(models)
@@ -326,11 +418,12 @@ async function main(): Promise<number> {
 
     for (const card of [cards.p0, cards.p1]) {
       for (const line of renderRunCard(card)) log(line);
-      // **카드를 파일로 남긴다.** 실행이 이 파일을 요구하므로, 출력만 하고 끝나면
-      // 승인 절차가 강제되지 않는다.
-      const file = writeRunCard(card);
+      // **카드를 immutable 번들에 남긴다.** 실행이 이 파일을 요구하므로, 출력만 하고 끝나면
+      // 승인 절차가 강제되지 않는다. 같은 id에 다른 내용을 쓰려 하면 예외로 멈춘다.
+      const written = writeRunCard(card);
       log("");
-      log(`카드 파일: ${file}`);
+      log(`카드 파일(immutable, 승인 근거): ${written.cardFile}`);
+      log(`안내용 포인터: ${written.pointerFile}`);
       log("");
       log("─".repeat(72));
       log("");
@@ -343,6 +436,7 @@ async function main(): Promise<number> {
     }
     log("진행 순서: probe-models → P0 카드 승인 → P0 실행 → P0 attestation → P1 카드 승인 → P1 실행");
     log("유료 실행에는 --run-card가 필수입니다 (우회 옵션 없음).");
+    log("카드가 출력한 명령을 **그대로** 쓰세요 — 모델·evidence·attestation 경로가 모두 들어 있습니다.");
     // 승인 대상이므로 blocker가 있어도 카드는 출력한다. 종료 코드로 상태를 구별한다.
     const approvable = ["READY_FOR_P0_APPROVAL", "READY_FOR_P1_APPROVAL"];
     const bothReady = [cards.p0, cards.p1].every((c) => approvable.includes(c.status));
@@ -436,33 +530,121 @@ async function main(): Promise<number> {
 
   // ---- attest-p0 ----
   // P0 실행 결과를 검사해 attestation을 만든다. **API를 부르지 않는다.**
+  //
+  // # 무엇을 고쳤나 (§2.4)
+  //
+  // 예전에는 "명령 시점에 넘겨받은 Run Card 파일"을 읽었다. 그 파일은 `plan-pilot` 재실행으로
+  // 덮어쓰일 수 있었으므로, **실제로 실행된 것과 다른 카드로 attestation을 만드는 것**이
+  // 가능했다. 이제 정본은 기록이 가리키는 **실행 승인 receipt**다 — 명령 인자로 카드를
+  // 지정하는 경로 자체를 없앤다.
   if (options.command === "attest-p0") {
-    const cardFile = options.runCard ?? path.join(options.output, cardFileFor("smoke"));
-    const loadedCard = loadRunCard(cardFile);
+    const store = openRecordStore(runDirPaths(options.output).records);
+    const records = store.all();
+    if (records.length === 0) {
+      log(`기록이 없습니다: ${runDirPaths(options.output).records}`);
+      log("→ 상태: BLOCKED_P0_INCOMPLETE");
+      return 2;
+    }
+
+    const receiptRead = readExecutionReceipts(options.output);
+    if (!receiptRead.ok) {
+      log("실행 승인 receipt를 해석할 수 없어 attestation을 만들지 않았습니다:");
+      for (const reason of receiptRead.reasons) log(`  - ${reason}`);
+      return 2;
+    }
+    if (receiptRead.truncatedLastLine) {
+      log("실행 승인 receipt 파일의 마지막 줄이 잘려 있습니다 — 어느 승인으로 실행됐는지 확정할 수 없습니다.");
+      return 2;
+    }
+
+    // 기록이 가리키는 receipt가 정본이다. 여러 개면 한 디렉터리에 두 승인의 결과가 섞인 것이다.
+    const referenced = new Set(records.map((r) => String(r.receiptId)));
+    if (referenced.size !== 1) {
+      log(`기록이 서로 다른 실행 승인을 가리킵니다 (${[...referenced].join(", ")}).`);
+      log("한 디렉터리에 두 승인의 결과가 섞이면 attestation이 무엇을 증명하는지 말할 수 없습니다.");
+      log("→ 상태: BLOCKED_P0_FAILED");
+      return 2;
+    }
+    const receiptId = [...referenced][0]!;
+    const receipt = receiptRead.receipts.find((r) => r.receiptId === receiptId);
+    if (!receipt) {
+      log(`기록이 가리키는 실행 승인을 찾을 수 없습니다: ${receiptId}`);
+      log("→ 상태: BLOCKED_P0_FAILED");
+      return 2;
+    }
+
+    // ---- 체인: receipt → card → evidence ----
+    const loadedCard = loadRunCard(receipt.immutableCardPath);
     if (!loadedCard.ok) {
-      log(`P0 Run Card를 읽을 수 없습니다: ${cardFile}`);
+      log(`실행 승인이 가리키는 Run Card를 쓸 수 없습니다: ${receipt.immutableCardPath}`);
       for (const reason of loadedCard.reasons) log(`  - ${reason}`);
       return 2;
     }
-    const evidenceFile = options.probeEvidence ?? probeEvidencePath(path.join(path.dirname(options.output), "model-probe"));
-    const loadedEvidence = loadProbeEvidence(evidenceFile);
-    if (!loadedEvidence.found || loadedEvidence.raw === undefined) {
-      log(`probe evidence를 읽을 수 없습니다: ${evidenceFile}`);
+    const models = planModels({
+      executorModel: receipt.executor.modelId,
+      reviewerModel: receipt.reviewer.modelId,
+      credentialPresence: credentialPresent,
+    });
+    if (!isModelPlan(models)) {
+      log("모델 계획을 확정할 수 없어 attestation을 만들지 않았습니다:");
+      for (const blocker of models.blockers) log(`  - ${blocker}`);
+      return 2;
+    }
+    const credentials = resolveCredentialsFor(models.executor.modelId, models.reviewer.modelId);
+    if (!credentials.ok) {
+      log("자격증명을 해석할 수 없어 attestation을 만들지 않았습니다:");
+      for (const reason of credentials.reasons) log(`  - ${reason}`);
+      return 2;
+    }
+    const evidenceLoad = loadProbeEvidence(receipt.immutableEvidencePath);
+    if (!evidenceLoad.found || evidenceLoad.raw === undefined) {
+      log(`실행 승인이 가리키는 probe evidence를 읽을 수 없습니다: ${receipt.immutableEvidencePath}`);
       log("→ 상태: BLOCKED_INVALID_PROBE_EVIDENCE");
       return 2;
     }
-    const store = openRecordStore(runDirPaths(options.output).records);
+    // **raw cast로 넘기지 않는다** (§2.5). 예전에는 `loadedEvidence.raw as ProbeEvidence`가
+    // 곧바로 attestP0로 들어갔고, 그러면 해시·TTL·자격증명 binding이 한 번도 확인되지 않았다.
+    const evidenceVerdict = validateProbeEvidence(evidenceLoad.raw, {
+      now: new Date().toISOString(),
+      protocolVersion: CRITERIA.protocolVersion,
+      criteriaHash: criteriaHash(),
+      registrySnapshotHash: new ModelRegistry(BUILTIN_MODELS).snapshotHash(),
+      adapterContractVersion: ADAPTER_CONTRACT_VERSION,
+      executorModelId: models.executor.modelId,
+      reviewerModelId: models.reviewer.modelId,
+      credentials: credentials.credentials,
+    });
+    if (!evidenceVerdict.ok) {
+      log("probe evidence가 이 attestation의 근거가 되지 못합니다:");
+      for (const reason of evidenceVerdict.reasons) log(`  - ${reason}`);
+      log(`→ 상태: ${evidenceVerdict.status}`);
+      return 2;
+    }
+
     const events = readBudgetEvents(options.output);
     if (!events.ok) {
       log("예산 이벤트를 해석할 수 없어 attestation을 만들지 않았습니다:");
       for (const reason of events.reasons) log(`  - ${reason}`);
       return 2;
     }
+
     const outcome = attestP0({
       card: loadedCard.card,
-      evidence: loadedEvidence.raw as ProbeEvidence,
-      records: store.all(),
+      receipt,
+      evidence: evidenceVerdict.evidence,
+      records,
       budgetEvents: events.events,
+      currentFixtureHashes: new Map(fixtures.map((f) => [f.manifest.fixtureId, f.fixtureHash])),
+      expectedModelFor: (arm, role) =>
+        modelForRole(arm, role, {
+          executorModelId: models.executor.modelId,
+          reviewerModelId: models.reviewer.modelId,
+        }),
+      modelIdAccepted: (modelId, reported) => {
+        const entry = lookupModel(modelId);
+        if (!entry) return { ok: false, reason: `레지스트리에 ${modelId} 엔트리가 없습니다` };
+        return providerModelIdAccepted(entry, reported);
+      },
       createdAt: new Date().toISOString(),
     });
     for (const line of renderAttestation(outcome)) log(line);
@@ -471,9 +653,10 @@ async function main(): Promise<number> {
       log(`→ 상태: ${outcome.status}`);
       return 2;
     }
-    const file = writeP0Attestation(options.output, outcome.attestation);
+    const written = writeP0Attestation(approvals.root, options.output, outcome.attestation);
     log("");
-    log(`attestation: ${file}`);
+    log(`attestation(immutable): ${written.file}`);
+    log(`안내용 포인터: ${written.pointerFile}`);
     log("이제 plan-pilot이 이 attestation을 읽어 P1 승인 카드를 만듭니다.");
     return 0;
   }
@@ -554,9 +737,10 @@ async function main(): Promise<number> {
   const runId = `${isPilot ? "pilot" : "run"}-${randomUUID()}`;
   const requestedStage: Stage = options.stage ?? (isPilot ? "pilot" : "confirmatory");
 
-  // ---- Run Card 게이트 (§4) ----
-  // **어댑터를 만들기 전에** 확인한다. fake 실행은 면제한다 — 단가 0이고 승인 대상이 아니다.
+  // ---- Run Card 게이트 + 실행 승인 receipt (§4, §2.3~2.5) ----
+  // **어댑터를 만들기 전에** 전부 확인한다. fake 실행은 면제한다 — 단가 0이고 승인 대상이 아니다.
   // 우회 플래그는 없다: 유료 실행은 카드 없이 시작할 수 없다.
+  let authorizedReceipt: ExecutionAuthorizationReceipt | undefined;
   if (!usingFake) {
     if (options.runCard === undefined) {
       log(`${options.command}는 실제 공급자를 호출하므로 --run-card가 필수입니다 (우회 옵션 없음).`);
@@ -574,6 +758,8 @@ async function main(): Promise<number> {
       log("→ 상태: BLOCKED_INVALID_RUN_CARD / 실제 API 호출: 0건");
       return 2;
     }
+    const card: RunCard = loadedCard.card;
+
     const plannedModels = planModels({
       ...(options.executorModel ? { executorModel: options.executorModel } : {}),
       ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
@@ -584,45 +770,61 @@ async function main(): Promise<number> {
       for (const blocker of plannedModels.blockers) log(`  - ${blocker}`);
       return 2;
     }
-    const verdict = authorizeRunCard(loadedCard.card, {
+
+    // ---- 카드가 이 실행을 승인하는가 ----
+    // fixture는 id가 아니라 **현재 내용 해시**까지 비교한다(§2.4).
+    const verdict = authorizeRunCard(card, {
       stage: requestedStage,
       outputDir: options.output,
-      fixtureIds: fixtures.map((f) => f.manifest.fixtureId),
+      fixtures: currentFixtures(),
       arms: options.arms,
       repetitions: isPilot ? 1 : options.repetitions,
+      maxConcurrency: options.maxConcurrency,
       seed: options.seed,
       ...(options.maxCostUsd !== undefined ? { maxCostUsd: options.maxCostUsd } : {}),
       executorModelId: plannedModels.executor.modelId,
       reviewerModelId: plannedModels.reviewer.modelId,
+      runCardPath: options.runCard,
+      probeEvidencePath: options.probeEvidence ?? "(지정되지 않음)",
+      ...(options.p0Attestation !== undefined ? { p0AttestationPath: options.p0Attestation } : {}),
       now: new Date().toISOString(),
     });
     if (!verdict.ok) {
       log(`Run Card가 이 실행을 승인하지 않습니다: ${options.runCard}`);
       for (const reason of verdict.reasons) log(`  - ${reason}`);
       log("");
-      log("카드와 다른 조건으로 실행하지 않습니다. 카드를 다시 만들거나 인수를 카드에 맞추세요.");
+      log("카드와 다른 조건으로 실행하지 않습니다. 카드가 출력한 명령을 그대로 쓰세요.");
       log(`→ 상태: ${verdict.status} / 실제 API 호출: 0건`);
       return 2;
     }
-    // evidence의 자격증명 binding까지 여기서 확인한다 — 카드가 가리키는 evidence가
-    // **지금 쓰는 키**로 얻어진 것이어야 한다.
-    const evidenceFile =
-      options.probeEvidence ?? probeEvidencePath(path.join(path.dirname(options.output), "model-probe"));
+
+    // ---- 자격증명 해석 (§2.10) ----
+    const credentials = resolveCredentialsFor(plannedModels.executor.modelId, plannedModels.reviewer.modelId);
+    if (!credentials.ok) {
+      log("자격증명을 해석할 수 없어 유료 실행을 시작하지 않습니다:");
+      for (const reason of credentials.reasons) log(`  - ${reason}`);
+      log("→ 상태: BLOCKED_MISSING_CREDENTIALS / 실제 API 호출: 0건");
+      return 2;
+    }
+
+    // ---- evidence가 이 실행을 보증하는가 ----
+    const evidenceFile = options.probeEvidence!;
     const loadedEvidence = loadProbeEvidence(evidenceFile);
     if (!loadedEvidence.found || loadedEvidence.raw === undefined) {
       log(`카드가 가리키는 probe evidence를 읽을 수 없습니다: ${evidenceFile}`);
       log("→ 상태: BLOCKED_INVALID_PROBE_EVIDENCE / 실제 API 호출: 0건");
       return 2;
     }
+    const registry = new ModelRegistry(BUILTIN_MODELS);
     const evidenceVerdict = validateProbeEvidence(loadedEvidence.raw, {
       now: new Date().toISOString(),
       protocolVersion: CRITERIA.protocolVersion,
       criteriaHash: criteriaHash(),
-      registrySnapshotHash: new ModelRegistry(BUILTIN_MODELS).snapshotHash(),
+      registrySnapshotHash: registry.snapshotHash(),
       adapterContractVersion: ADAPTER_CONTRACT_VERSION,
       executorModelId: plannedModels.executor.modelId,
       reviewerModelId: plannedModels.reviewer.modelId,
-      env: process.env,
+      credentials: credentials.credentials,
     });
     if (!evidenceVerdict.ok) {
       log("probe evidence가 이 실행을 보증하지 않습니다:");
@@ -631,15 +833,144 @@ async function main(): Promise<number> {
       return 2;
     }
     if (
-      loadedCard.card.probeEvidenceId !== evidenceVerdict.evidence.evidenceId ||
-      loadedCard.card.probeEvidenceHash !== evidenceVerdict.evidence.evidencePayloadHash
+      card.probeEvidenceId !== evidenceVerdict.evidence.evidenceId ||
+      card.probeEvidenceHash !== evidenceVerdict.evidence.evidencePayloadHash
     ) {
-      log("Run Card가 가리키는 evidence와 현재 evidence 파일이 다릅니다 — 카드를 다시 만드세요.");
+      log("Run Card가 가리키는 evidence와 실제 파일이 다릅니다 — 카드를 다시 만드세요.");
       log("→ 상태: BLOCKED_INVALID_PROBE_EVIDENCE / 실제 API 호출: 0건");
       return 2;
     }
-    log(`Run Card 승인 확인: ${loadedCard.card.cardId} (${loadedCard.card.cardHash})`);
-    log(`probe evidence 확인: ${evidenceVerdict.evidence.evidenceId}`);
+
+    // ---- P1은 attestation을 **실행 직전에 다시** 확인한다 (§2.5) ----
+    // 카드를 만든 뒤 파일이 지워지거나 바뀌었을 수 있고, 그 사실은 카드 해시로는 드러나지 않는다.
+    let p0ReceiptLink: { receiptId: string; receiptHash: string } | undefined;
+    if (card.requiresP0Attestation) {
+      const attestationFile = options.p0Attestation!;
+      const attestationLoad = loadP0Attestation(attestationFile);
+      if (!attestationLoad.found || attestationLoad.raw === undefined) {
+        log(`P1 카드가 가리키는 P0 attestation을 읽을 수 없습니다: ${attestationFile}`);
+        log(`  (${attestationLoad.parseError ?? "파일이 없습니다"})`);
+        log("→ 상태: BLOCKED_PENDING_P0_RESULT / 실제 API 호출: 0건");
+        return 2;
+      }
+      const attestationVerdict = validateP0Attestation(attestationLoad.raw, {
+        probeEvidenceId: evidenceVerdict.evidence.evidenceId,
+        probeEvidenceHash: evidenceVerdict.evidence.evidencePayloadHash,
+        criteriaHash: criteriaHash(),
+        protocolVersion: CRITERIA.protocolVersion,
+        executorModelId: plannedModels.executor.modelId,
+        reviewerModelId: plannedModels.reviewer.modelId,
+        attestationId: card.p0AttestationId!,
+        attestationHash: card.p0AttestationHash!,
+      });
+      if (!attestationVerdict.ok) {
+        log("P0 attestation이 이 실행을 보증하지 않습니다:");
+        for (const reason of attestationVerdict.reasons) log(`  - ${reason}`);
+        log(`→ 상태: ${attestationVerdict.status} / 실제 API 호출: 0건`);
+        return 2;
+      }
+      p0ReceiptLink = {
+        receiptId: attestationVerdict.attestation.receiptId,
+        receiptHash: attestationVerdict.attestation.receiptHash,
+      };
+    }
+
+    // ---- 실행 승인 receipt (§2.3) ----
+    // **adapter를 만들기 전에 디스크에 못 박는다.** 저장에 실패하면 유료 호출을 시작하지 않는다.
+    const facts: ReceiptFacts = {
+      cardId: card.cardId,
+      cardHash: card.cardHash,
+      immutableCardPath: card.immutableCardPath,
+      probeEvidenceId: evidenceVerdict.evidence.evidenceId,
+      probeEvidenceHash: evidenceVerdict.evidence.evidencePayloadHash,
+      immutableEvidencePath: evidenceFile,
+      requiresP0Attestation: card.requiresP0Attestation,
+      ...(card.p0AttestationId ? { p0AttestationId: card.p0AttestationId } : {}),
+      ...(card.p0AttestationHash ? { p0AttestationHash: card.p0AttestationHash } : {}),
+      ...(options.p0Attestation ? { immutableAttestationPath: options.p0Attestation } : {}),
+      protocolVersion: CRITERIA.protocolVersion,
+      criteriaHash: criteriaHash(),
+      registrySnapshotHash: registry.snapshotHash(),
+      adapterContractVersion: ADAPTER_CONTRACT_VERSION,
+      stage: requestedStage,
+      outputDir: options.output,
+      fixtures: currentFixtures()
+        .map((f) => ({ fixtureId: f.fixtureId, category: f.category, language: f.language, hash: f.hash }))
+        .sort((a, b) => (a.fixtureId < b.fixtureId ? -1 : 1)),
+      arms: [...options.arms].sort(),
+      repetitions: isPilot ? 1 : options.repetitions,
+      seed: options.seed,
+      maxConcurrency: options.maxConcurrency,
+      executor: { providerId: plannedModels.executor.providerId, modelId: plannedModels.executor.modelId },
+      reviewer: { providerId: plannedModels.reviewer.providerId, modelId: plannedModels.reviewer.modelId },
+      approvedLimitUsd: options.maxCostUsd!,
+      credentialBinding: buildCredentialBinding(RECEIPT_CREDENTIAL_PURPOSE, credentials.credentials),
+    };
+
+    const existing = readExecutionReceipts(options.output);
+    if (!existing.ok) {
+      log("기존 실행 승인 receipt를 해석할 수 없습니다:");
+      for (const reason of existing.reasons) log(`  - ${reason}`);
+      log("→ 상태: BLOCKED / 실제 API 호출: 0건");
+      return 2;
+    }
+    if (existing.truncatedLastLine) {
+      log("실행 승인 receipt 파일의 마지막 줄이 잘려 있습니다 — 어느 승인으로 시작됐는지 확정할 수 없습니다.");
+      log("→ 상태: BLOCKED / 실제 API 호출: 0건");
+      return 2;
+    }
+
+    // `credentialBinding.salt`가 매번 달라지므로 조건 비교에서 제외한 뒤 비교한다 —
+    // salt는 승인 조건이 아니라 다이제스트를 만드는 재료다.
+    const comparable = (f: ReceiptFacts): ReceiptFacts => ({
+      ...f,
+      credentialBinding: {
+        ...f.credentialBinding,
+        salt: "(비교 제외)",
+        providers: f.credentialBinding.providers.map((p) => ({ ...p, digest: "(비교 제외)" })),
+      },
+    });
+    const reuse = reuseOrConflict(existing.receipts.map((r) => ({ ...r, ...comparable(factsOf(r)) })), comparable(facts));
+    if (reuse.kind === "conflict") {
+      for (const reason of reuse.reasons) log(reason);
+      log("→ 상태: BLOCKED_RECEIPT_CONFLICT / 실제 API 호출: 0건");
+      return 2;
+    }
+    if (reuse.kind === "reuse") {
+      // 재개다. **자격증명이 그때와 같은지도 확인한다** — 다른 키로 이어붙이면 같은 실험이 아니다.
+      const original = existing.receipts.find((r) => r.receiptId === reuse.receipt.receiptId)!;
+      const bindingOk = credentialBindingMatchesReceipt(original, credentials.credentials);
+      if (!bindingOk.ok) {
+        log(`재개하려는 실행 승인과 자격증명이 다릅니다: ${bindingOk.reason}`);
+        log("→ 상태: BLOCKED_RECEIPT_CONFLICT / 실제 API 호출: 0건");
+        return 2;
+      }
+      authorizedReceipt = original;
+      log(`기존 실행 승인을 이어받습니다: ${original.receiptId}`);
+    } else {
+      const spec: ExecutionRequestSpec = {
+        stage: requestedStage,
+        fixtureIds: currentFixtures().map((f) => f.fixtureId),
+        arms: [...options.arms],
+        repetitions: isPilot ? 1 : options.repetitions,
+        maxConcurrency: options.maxConcurrency,
+        seed: options.seed,
+        outputDir: options.output,
+        approvedLimitUsd: options.maxCostUsd!,
+        executorModelId: plannedModels.executor.modelId,
+        reviewerModelId: plannedModels.reviewer.modelId,
+        runCardPath: options.runCard,
+        probeEvidencePath: evidenceFile,
+        ...(options.p0Attestation ? { p0AttestationPath: options.p0Attestation } : {}),
+      };
+      const receipt = buildExecutionReceipt({ facts, spec, createdAt: new Date().toISOString() });
+      const file = appendExecutionReceipt(options.output, receipt);
+      authorizedReceipt = receipt;
+      log(`실행 승인 receipt: ${file}`);
+    }
+
+    for (const line of renderReceipt(authorizedReceipt)) log(line);
+    if (p0ReceiptLink) log(`P0 실행 승인: ${p0ReceiptLink.receiptId} (attestation이 가리키는 값)`);
     log("");
   }
 
@@ -836,6 +1167,8 @@ async function main(): Promise<number> {
     realProvider: !usingFake,
     ...(options.executorModel ? { executorModel: options.executorModel } : {}),
     ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
+    // 모든 기록이 이 승인을 달고 나온다 — attestation이 "무엇을 증명하는가"의 근거다(§2.3).
+    ...(authorizedReceipt ? { receiptId: authorizedReceipt.receiptId, receiptHash: authorizedReceipt.receiptHash } : {}),
     onProgress: log,
   });
 

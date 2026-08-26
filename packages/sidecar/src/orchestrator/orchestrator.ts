@@ -33,8 +33,10 @@ import { ValidationError } from "@tomverse/protocol";
 import { ContextEngine } from "../context/engine.js";
 import type { NdjsonTransport } from "../ipc/transport.js";
 import { createRoleAdapters, MissingCredentialError, type AdapterFactoryOptions, type RoleAdapters } from "../providers/factory.js";
+import { normalizeProviderError } from "../providers/errors.js";
 import {
   asTimeoutError,
+  attemptFacts,
   callWithRetry,
   DEFAULT_RETRY_POLICY,
   ProviderCallFailed,
@@ -103,6 +105,7 @@ const BUDGET_EVENT_NAMES: Record<BudgetEventType, TaskEventType> = {
   reservation_opened: "BUDGET_RESERVATION_OPENED",
   reservation_released: "BUDGET_RESERVATION_RELEASED",
   reservation_settled: "BUDGET_RESERVATION_SETTLED",
+  reservation_partially_settled: "BUDGET_RESERVATION_PARTIALLY_SETTLED",
   reservation_unresolved: "BUDGET_RESERVATION_UNRESOLVED",
   provider_usage_recorded: "BUDGET_PROVIDER_USAGE_RECORDED",
   budget_estimate_breached: "BUDGET_ESTIMATE_BREACHED",
@@ -1894,6 +1897,18 @@ export class Orchestrator {
           const scoped = withTimeout(this.abort.signal, timeoutMs);
           // 요청이 실제로 나갔는가 — 나간 뒤의 실패는 과금됐을 수 있으므로 예약을 풀지 않는다.
           let dispatched = false;
+          // **호출 직전에 개시를 남긴다** (§2.6). 여기와 terminal 이벤트 사이에서 프로세스가
+          // 죽으면 `PROVIDER_CALL_STARTED`만 남고, 그건 "요청이 나갔는지 모른다"는 뜻이다 —
+          // 그 상태의 예약을 해제하면 과금됐을 수 있는 돈을 안 쓴 것으로 만든다.
+          await this.emit("PROVIDER_CALL_STARTED", {
+            taskId: this.taskId,
+            callId,
+            role,
+            attempt,
+            providerId: adapter.providerId,
+            requestedModelId: adapter.modelId,
+            startedAt: new Date().toISOString(),
+          });
           try {
             dispatched = true;
             const response = await call({ taskId: this.taskId, callId, signal: scoped.signal, timeoutMs });
@@ -1913,8 +1928,9 @@ export class Orchestrator {
             this.budget?.abandon(reserved.reservation, dispatched, errorMessage(error));
             // SDK는 타임아웃과 사용자 취소를 모두 AbortError로 던진다. 둘의 처리가 다르므로
             // (타임아웃은 재시도 후 FAILED, 취소는 즉시 CANCELLED) 신호를 만든 쪽에서 되살린다.
-            if (scoped.timedOut()) throw asTimeoutError(error, timeoutMs);
-            throw error;
+            const raised = scoped.timedOut() ? asTimeoutError(error, timeoutMs) : error;
+            await this.recordCallFailure(adapter, role, callId, attempt, error, raised);
+            throw raised;
           } finally {
             scoped.dispose();
           }
@@ -1984,6 +2000,45 @@ export class Orchestrator {
       // 분류하므로 위의 ProviderCallFailed 분기에서 처리된다 — 여기까지 오는 것은 예상치 못한 오류다.
       throw error;
     }
+  }
+
+  /**
+   * 실패한 호출의 **보존 가능한 사실**을 남긴다 (§2.6).
+   *
+   * 여기서 남기는 것이 없으면, 실패한 실행에서 "요청이 나갔는가"를 사후에 판단할 근거가
+   * 사라진다. 그러면 예약을 해제하는 쪽으로 기울고, 그건 과금됐을 수 있는 돈을 안 쓴 것으로
+   * 만드는 것이다.
+   *
+   * `ProviderCallFailure`가 실어 온 dispatch 상태·usage·응답 모델 ID를 그대로 옮긴다.
+   * 평범한 `Error`면 dispatch를 **모르므로 `dispatched_no_response`가 기본이다** —
+   * 어댑터 안쪽에서 난 오류는 요청이 나간 뒤일 수 있다.
+   */
+  private async recordCallFailure(
+    adapter: ProviderAdapter,
+    role: "executor" | "reviewer",
+    callId: string,
+    attempt: number,
+    original: unknown,
+    raised: unknown
+  ): Promise<void> {
+    const normalized = normalizeProviderError(raised);
+    const facts = attemptFacts(attempt, original, normalized.kind);
+    await this.emit("PROVIDER_CALL_FAILED", {
+      taskId: this.taskId,
+      callId,
+      role,
+      attempt,
+      providerId: adapter.providerId,
+      requestedModelId: adapter.modelId,
+      ...(facts.providerReportedModelId ? { providerReportedModelId: facts.providerReportedModelId } : {}),
+      ...(facts.providerRequestId ? { providerRequestId: facts.providerRequestId } : {}),
+      dispatchState: facts.dispatchState,
+      errorKind: normalized.kind,
+      ...(facts.usage ? { usage: facts.usage } : {}),
+      // 오류 메시지는 남기지만 응답 원문은 남기지 않는다 (작업 지침 4.6절).
+      message: normalized.message,
+      at: new Date().toISOString(),
+    });
   }
 
   private async recordUsage<T>(

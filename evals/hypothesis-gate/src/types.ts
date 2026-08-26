@@ -1,3 +1,5 @@
+import type { DispatchState } from "@tomverse/sidecar/budget";
+
 /**
  * 가설 게이트의 데이터 형태.
  *
@@ -117,6 +119,44 @@ export function isInfrastructureFailure(failureClass: string | undefined): boole
   return failureClass !== undefined && (INFRA_FAILURE_CLASSES as readonly string[]).includes(failureClass);
 }
 
+/**
+ * **호출 하나의 사실** (§2.6).
+ *
+ * # 왜 record 하나에 `returnedModelId` 하나로는 부족한가
+ *
+ * 한 기록은 executor·reviewer·재시도·revise·fix-loop을 합쳐 여러 번 공급자를 부른다.
+ * 그런데 `GateRunRecord`는 `returnedModelId`를 **하나만** 갖고 있었고, 그 값은
+ * `DRAFT_RECEIVED.model`(= 어댑터가 자기 요청 ID를 채운 자기보고 값)이었다. 그래서
+ *
+ *  - reviewer가 다른 모델로 조용히 대체돼도 보이지 않고,
+ *  - 재시도한 attempt가 몇 번 나갔는지, 그중 무엇이 과금됐는지 알 수 없고,
+ *  - exact-model 검증이 **항상 통과**했다(요청 ID와 요청 ID를 비교하므로).
+ *
+ * 그래서 호출마다 사실을 남긴다. **응답 원문과 프롬프트는 담지 않는다** — 여기 들어가는 것은
+ * 식별자·상태·토큰 수·비용뿐이다.
+ */
+export interface ProviderCallFact {
+  /** 오케스트레이터의 호출 키 ("draft:1", "review:2", "fix:1"). */
+  callId: string;
+  role: "executor" | "reviewer" | "unknown";
+  /** 재시도 번호. 같은 callId의 attempt가 여러 개일 수 있다. */
+  attempt: number;
+  providerId: string;
+  requestedModelId: string;
+  /** **응답 envelope이 실어 온** 모델 ID. 없으면 exact-model 검증이 실패한다. */
+  providerReportedModelId?: string;
+  providerRequestId?: string;
+  /** 요청이 실제로 나갔는가 — 과금 가능성 판정의 근거다. */
+  dispatchState: DispatchState;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  errorKind?: string;
+  status: "succeeded" | "failed" | "unknown";
+  startedAt: string;
+  completedAt?: string;
+}
+
 /** 한 (fixture, arm, repetition) 실행의 기록. 완료 직후 JSONL로 append된다. */
 export interface GateRunRecord {
   schemaVersion: number;
@@ -131,6 +171,12 @@ export interface GateRunRecord {
   taskId: string;
   providerId: string;
   requestedModelId: string;
+  /**
+   * `DRAFT_RECEIVED.model` — **품질 출력 메타데이터일 뿐이다** (§2.8).
+   *
+   * 어댑터가 `this.modelId`를 채운 자기보고 값이므로 exact-model 검증의 근거가 되지 못한다.
+   * 근거는 `providerCalls[*].providerReportedModelId`(응답 envelope)다.
+   */
   returnedModelId?: string;
   reviewMode?: "blind" | "informed";
   /** 초안을 새로 만들었는지 재생했는지 — arm C/D의 paired 비교가 성립하는 근거다. */
@@ -170,9 +216,32 @@ export interface GateRunRecord {
   providerKind: "real" | "fake";
   /** 기록 시점의 판정 기준 해시 — 다른 기준으로 만든 기록과 섞이지 않게 한다. */
   criteriaHash: string;
+
+  /**
+   * 이 기록이 **어느 실행 승인으로** 만들어졌는가 (§2.3).
+   *
+   * 없으면 attestation이 "무엇을 증명하는가"를 말할 수 없다 — 명령 시점에 넘겨받은 카드가
+   * 실제로 실행된 카드라는 보장이 어디에도 없기 때문이다. fake 실행에는 receipt가 없다.
+   */
+  receiptId?: string;
+  receiptHash?: string;
+
+  /** 이 기록이 실제로 만든 provider 호출 전부. 이벤트를 읽지 못했으면 비어 있다. */
+  providerCalls: ProviderCallFact[];
+  /**
+   * DB 이벤트를 읽을 수 있었는가 (§2.7).
+   *
+   * **읽지 못한 것 자체가 과금 불확실 상태다** — 호출이 나갔는지 알 수 없으므로 예약을
+   * 해제하지 않는다. `false`를 "호출 0회"로 읽으면 안 되므로 별도 축으로 남긴다.
+   */
+  eventsReadable: boolean;
 }
 
-export const RECORD_SCHEMA_VERSION = 1;
+/**
+ * 2: `providerCalls`/`eventsReadable`/`receiptId`가 필수가 됐다 (§2.3, §2.6, §2.7).
+ * v1 기록은 호출별 사실이 없으므로 exact-model 검증을 할 수 없다.
+ */
+export const RECORD_SCHEMA_VERSION = 2;
 
 export type GateVerdict = "PASS" | "FAIL" | "INCONCLUSIVE";
 

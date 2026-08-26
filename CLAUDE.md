@@ -161,7 +161,7 @@ npm run gate:g:dry-run    # preflight + 실행 계획 (API 호출 없음)
 npm run gate:g:plan-pilot # 단계별(P0/P1) 승인 카드 (API 호출 없음)
 npm run gate:g:probe-models  # 역할당 최소 요청 1회로 모델 실제 확인. --max-cost-usd 필수
 npm run gate:g:budget-status # 예산 상태 읽기 전용 조회 (열린 예약). 고치지 않는다
-npm run gate:g:attest-p0     # P0 결과 검사 → p0-attestation.json (API 호출 없음)
+npm run gate:g:attest-p0     # P0 결과 검사 → approvals/attestations/<id>.json (API 호출 없음)
 npm run gate:g:pilot      # 반복 1회 — 하네스/비용/실패 분류 확인용. PASS를 내지 않는다
 npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가 필요하다
 ```
@@ -182,9 +182,23 @@ npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가
 열린 예약이 있으면 `BLOCKED_UNRESOLVED_RESERVATION`으로 멈춘다. **자동 정리 명령을 만들지 말 것** —
 실제 과금 여부는 공급자 청구 내역으로만 확인된다. 근거: multi-engine-routing.md 10.7절.
 
+**승인 아티팩트는 immutable하고, 실행은 receipt로 승인에 묶인다.** 카드·evidence·attestation은
+`<output>/approvals/{cards,evidence,attestations}/<id>.json`에 살고 **같은 id에 다른 내용을 쓸 수
+없다.** `plan-pilot`을 다시 돌리면 새 id의 새 카드가 생기고 기존 카드는 그대로 남는다.
+`pilot`/`run`은 **어댑터를 만들기 전에** `execution-authorizations.jsonl`에 receipt를 append하고,
+모든 기록이 `receiptId`를 달고 나온다. 그래서 `attest-p0`는 명령 인자로 받은 카드가 아니라
+**기록이 가리키는 receipt**를 정본으로 삼는다. 근거: multi-engine-routing.md 10.10절.
+
 **유료 실행은 Run Card 없이 시작할 수 없다.** `pilot`/`run`은 `--run-card`를 필수로 받고,
 어댑터를 만들기 전에 카드 해시·단계·경로·인자·예산·probe evidence·자격증명 binding·만료를
 확인한다. 우회 플래그를 추가하지 말 것.
+
+**exact-model 검증은 호출별 응답 envelope만 본다.** `DraftProposal.model`/`ReviewDecision.model`은
+어댑터가 `this.modelId`를 넣은 값이라 비교하면 항상 통과한다 — 조용한 대체를 잡지 못한다.
+기록의 `providerCalls[*].providerReportedModelId`를 쓰고, alias는 prefix 비교가 아니라
+`ModelEntry.acceptedProviderModelIds` 목록으로 다룬다(10.8절). 역할 배정은 arm마다 다르므로
+(Arm B는 anthropic 하나뿐이라 reviewer 모델이 executor 자리에 앉는다) 배정 규칙은
+`arms.ts`의 `modelForRole` 하나에만 둔다.
 
 **exact-model 검증은 응답 envelope만 본다.** `DraftProposal.model`/`ReviewDecision.model`은
 어댑터가 `this.modelId`를 넣은 값이라 비교하면 항상 통과한다 — 조용한 대체를 잡지 못한다.
@@ -339,6 +353,23 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 - **`ToolStatus::Ok`은 "명령이 성공했다"가 아니다.** `run_command`는 0이 아닌 종료 코드를 "도구 실행 실패"가 아니라 **"명령이 실패했다"는 사실**로 다뤄 `status`를 `Ok`로 두고 `exitCode`만 남긴다(검증 러너가 그 구분을 필요로 하기 때문이다). `status`만 보고 성공을 판정하면 **실패한 명령이 성공으로 읽힌다** — `revert_commit`이 실제로 그랬고, "tip 커밋만 되돌린다"는 우연한 조건이 그 결함을 가리고 있었다. git 호출은 `git_try`가 `(성공, stdout, stderr)`로 감싸고 성공 판정은 `exitCode == 0`이다.
 - **소스에 리터럴 NUL 문자를 박으면 그 파일이 검색에서 통째로 사라진다.** `join("\0")`처럼 구분자로 쓸 일이 있는데, grep·ripgrep 계열이 그 파일을 **바이너리로 분류해 결과에서 빼기** 때문에 파일을 찾는 사람에게는 없는 것과 같다. git은 텍스트로 다루므로 diff에서는 드러나지 않아 더 오래 남는다. `\u0000` 이스케이프를 쓸 것 — 의미는 같고 소스는 ASCII로 남는다.
 - **Windows 전용 코드를 이 환경에서 타입 검증할 수는 있지만, `tomverse-core` 전체는 안 된다.** `rustup target add x86_64-pc-windows-msvc` 뒤 `cargo check --target x86_64-pc-windows-msvc`는 순수 Rust 크레이트(`windows-sys` 등)에는 통하지만, core는 `rusqlite`의 bundled SQLite가 `lib.exe`를 요구해 `failed to find tool "lib.exe"`로 멈춘다. Windows 코드 조각을 검증하려면 그 조각만 담은 별도 크레이트에서 검사할 것. **그리고 타입 검증은 동작 검증이 아니다** — Win32에서 컴파일되는 코드가 틀리는 흔한 방식은 핸들 수명이고, 그건 실행해야만 드러난다.
+- **`JSON.stringify(v, Object.keys(v).sort())`는 중첩 객체를 통째로 지운다.** array replacer는
+  property whitelist이고 그 whitelist가 **모든 깊이에** 적용되므로, 최상위 key만 넣으면 중첩
+  객체가 전부 `{}`가 된다. 승인 아티팩트의 해시가 이 방식이었고, 그래서 `models.executor.modelId`,
+  `stage.fixtureIds`, `fixtureHashes[*].hash`, attestation의 `checks[*]`를 **아무리 바꿔도 해시가
+  그대로였다.** 증상이 고약한 이유: 검증은 통과하고 아무 오류도 나지 않으므로, 해시가 있다는
+  사실이 곧 "지켜진다"로 읽힌다. 정규 직렬화는 `evals/hypothesis-gate/src/canonical.ts` 하나를 쓴다.
+- **HTTP 상태 분류(429/5xx/auth)는 dispatch 사실이 아니다.** 429나 5xx를 받았다는 것은 요청이
+  공급자에게 **도달했다**는 뜻이므로 "요청이 나가지 않았다"의 근거가 되지 못한다. 실측 시나리오:
+  executor가 성공해 과금된 뒤 reviewer가 5xx로 죽으면, 실패 분류를 먼저 하고 DB를 읽지 않는
+  순서 때문에 `providerCallCount=0`이 되고 → `not_dispatched` → **예약 전액 해제**로 이미 쓴 돈이
+  승인 예산에서 사라졌다. host가 실패했든 아니든 **DB 이벤트를 먼저 읽는다.**
+- **`readEvents`가 실패를 빈 배열로 돌려주면 "이벤트가 없다"와 "못 읽었다"가 같아진다.** 앞은
+  호출이 없었다는 뜻이고 뒤는 모른다는 뜻인데, 뒤를 앞으로 읽으면 예약을 해제하게 된다.
+  `eventsReadable`을 별도 축으로 남긴다.
+- **HMAC은 비밀값을 키로 써야 의미가 있다.** credential binding이 salt를 HMAC 키로, API 키를
+  메시지로 쓰고 있었다. salt는 공개값이므로 그 배치에서는 "키를 모르면 다이제스트를 만들 수 없다"가
+  성립하지 않는다. 키를 HMAC 키로, 나머지를 메시지로 쓴다.
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트

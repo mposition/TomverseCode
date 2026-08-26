@@ -624,6 +624,16 @@ CREATE INDEX idx_file_mutations_request ON file_mutations(request_id);
 
 `task_events.event_type` 값: `TASK_CREATED`, `SNAPSHOT_CREATED`, `DRAFT_RECEIVED`, `REVIEW_RECEIVED`, `PLAN_CREATED`, `APPROVAL_REQUESTED`, `APPROVAL_GRANTED`, `APPROVAL_DENIED`, `TOOL_REQUESTED`, `TOOL_COMPLETED`, `VERIFICATION_COMPLETED`, `FIX_LOOP_STARTED`, `PHASE_CHANGED`, `USER_MESSAGE_RECEIVED`, `TASK_COMPLETED`, `TASK_FAILED`, `TASK_CANCELLED`, `TASK_REJECTED`, `DISAGREEMENT_DETECTED`, `USER_DECISION_RECORDED`(17.3절).
 
+공급자 호출의 생애주기는 세 이벤트로 남는다: `PROVIDER_CALL_STARTED`(adapter 호출 **직전**),
+`PROVIDER_USAGE`(usage를 받은 성공), `PROVIDER_CALL_FAILED`(실패 + 어댑터가 아는 dispatch 사실).
+재시도는 `PROVIDER_RETRY`가 별도로 센다.
+
+**개시 이벤트가 필요한 이유는 crash window다.** 개시만 있고 terminal이 없으면 요청이 나갔는지도
+과금됐는지도 알 수 없고, 그 상태의 예약은 해제하지 않는다. 개시 이벤트가 없으면 그 구간이
+"호출이 없었다"와 구별되지 않으므로, 실패한 실행에서 이미 발생한 비용을 잃는다.
+키는 `(callId, attempt)`다 — 재시도한 attempt마다 사실이 따로 남아야 "몇 번 나갔고 그중 무엇이
+과금됐는가"를 말할 수 있다. 자세한 규칙은 `docs/design/multi-engine-routing.md` 10.10절.
+
 재시작 복구 절차: 앱 기동 시 `final_status IS NULL`인 `tasks` 행을 찾고, 각각의 최신 `task_events` 행 하나를 읽어 `phase`/`counters_json`이 이벤트 로그와 일치하는지 검증한다(불일치 시 이벤트 로그가 우선하며 `tasks` 행을 재계산). `EXECUTING` 중 크래시난 태스크는 재개하지 않고 `FAILED`(사유: "앱 재시작으로 중단됨")로 확정한 뒤 사용자에게 재시도를 맡긴다 — 부분 실행된 `ToolRequest`의 실행 재개는 멱등성 보장이 안 되면 위험하므로 MVP 범위에서는 자동 재개를 하지 않는다.
 
 ## 8. Context Engine 스크립트 인덱싱
