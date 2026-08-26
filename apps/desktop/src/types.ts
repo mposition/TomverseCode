@@ -203,7 +203,21 @@ export interface VerificationReport {
   attemptNumber: number;
   checks: VerificationCheck[];
   newlyFailing?: string[];
+  /**
+   * baseline에서도 실패하던 체크.
+   *
+   * **`newlyFailing`과 배타가 아니다**(state-machine 54절). 한 체크 안에 원래 실패하던
+   * 테스트와 이번 변경이 깨뜨린 테스트가 함께 있으면 **양쪽에 다 나온다** — 두 목록은
+   * 각자 참인 사실이고, 그 안을 가르는 것은 `testAttribution`이다.
+   */
   preexistingFailures?: string[];
+  /** 체크 안을 테스트 이름 단위로 가른 결과 (54절). 가르지 못했으면 없다. */
+  testAttribution?: {
+    kind: string;
+    newlyFailing: string[];
+    preexisting: string[];
+    fixed: string[];
+  }[];
   overall: "pass" | "fail" | "not_configured" | "could_not_run";
 }
 

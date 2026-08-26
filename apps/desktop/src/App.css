@@ -1031,3 +1031,27 @@ button.tiny {
   flex: 1;
   min-width: 0;
 }
+
+/* ---- 검증 실패의 귀속 (state-machine 54절, ui-wireframes 3.28절) ---- */
+
+/*
+ * 세 갈래를 **들여쓰기로** 나눈다. 색만으로 나누면 색약 사용자에게 "새로 깨진 것"과
+ * "원래 실패하던 것"이 같은 목록으로 보이는데, 이 화면에서 그 구별은 장식이 아니라
+ * 사용자가 무엇을 자기 책임으로 볼지를 정한다.
+ */
+.attribution {
+  margin-top: 0.6rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.6rem;
+}
+
+.attribution-group {
+  margin-left: 1rem;
+}
+
+/* 섞인 체크는 한 덩어리로 보여야 한다 — 두 목록이 같은 체크의 안쪽이라는 사실이 배치로 남는다. */
+.attribution-mixed {
+  border-left: 2px solid var(--error);
+  padding-left: 0.6rem;
+  margin: 0.4rem 0;
+}

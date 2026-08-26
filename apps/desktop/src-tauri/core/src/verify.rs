@@ -834,6 +834,40 @@ mod tests {
         assert!(post.preexisting_failures.as_ref().unwrap().contains(&VerificationKind::Test));
     }
 
+    /// **이름 단위 귀속이 화면까지 간다** — 이벤트 페이로드가 리포트 전체를 직렬화한다.
+    ///
+    /// 그 사실에 기대고 있으므로 검사로 고정한다. 필드가 직렬화되지 않으면 화면은 이 값이
+    /// **없는 것과 구별할 수 없고**, 그러면 3.28절이 "가르지 못했다"고 말한다 — 값은 있는데.
+    #[test]
+    fn the_attribution_survives_serialization() {
+        let (_d, _a, root, artifacts) = setup(&python_project());
+        let runner = VerificationRunner::new(&root, &artifacts);
+        let py = root.path().join(".venv/bin/python").to_string_lossy().to_string();
+
+        let mut base_exec = FakeExecutor {
+            responses: vec![(format!("{py} -m pytest"), 0, "ok".to_string())],
+            calls: vec![],
+        };
+        let baseline = runner.run("task-1", VerificationPhase::Baseline, 0, &mut base_exec, None);
+        let mut post_exec = FakeExecutor {
+            responses: vec![(format!("{py} -m pytest"), 1, "FAILED tests/a.py::one - x".to_string())],
+            calls: vec![],
+        };
+        let post = runner.run("task-1", VerificationPhase::Post, 1, &mut post_exec, Some(&baseline));
+
+        let payload = serde_json::to_value(&post).unwrap();
+        let attribution = payload
+            .get("testAttribution")
+            .and_then(|v| v.as_array())
+            .expect("직렬화된 리포트에 testAttribution이 없습니다");
+        assert_eq!(attribution.len(), 1, "{payload}");
+        assert_eq!(attribution[0]["newlyFailing"][0], "tests/a.py::one", "{payload}");
+        // 그리고 **없을 때는 키 자체가 없어야 한다** — 빈 배열이면 화면이 "가른 결과가
+        // 없다"로 읽고, 그건 "가르지 못했다"와 다른 사실이다.
+        let base_payload = serde_json::to_value(&baseline).unwrap();
+        assert!(base_payload.get("testAttribution").is_none(), "{base_payload}");
+    }
+
     /// **고쳐진 것도 센다.** 이 값이 없으면 화면이 새 실패만 보여 주고, 사용자는 변경이
     /// 순전히 나빴다고 읽는다.
     #[test]

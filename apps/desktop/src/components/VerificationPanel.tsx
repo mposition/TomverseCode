@@ -1,3 +1,4 @@
+import { attributionView, mixedLabel } from "../lib/verifyAttribution";
 import type { VerificationCheck, VerificationReport, VerificationStatus } from "../types";
 
 /**
@@ -39,16 +40,99 @@ export function VerificationPanel({ reports }: { reports: VerificationReport[] }
             <OverallBadge overall={post.overall} />
           </h3>
           <CheckList checks={post.checks} />
-          {(post.newlyFailing?.length ?? 0) > 0 && (
-            <p className="error small">이번 변경으로 새로 실패: {post.newlyFailing!.join(", ")}</p>
-          )}
-          {(post.preexistingFailures?.length ?? 0) > 0 && (
-            <p className="warn small">변경 전부터 실패 중이던 항목: {post.preexistingFailures!.join(", ")}</p>
-          )}
+          <Attribution report={post} />
         </section>
       ) : (
         <p className="muted small">작업 후 검증은 아직 실행되지 않았습니다.</p>
       )}
+    </div>
+  );
+}
+
+/**
+ * 실패의 귀속 — state-machine 54절, ui-wireframes 3.28절.
+ *
+ * 종전에는 두 줄이었고 둘 다 **체크 이름**만 실었다. 그래서 원래 실패하는 테스트가 하나 있는
+ * 체크에서 이번 변경이 셋을 더 깨뜨리면 사용자는 그 체크가 "변경 전부터 실패 중"이라고만
+ * 읽었다 — 54절이 모델에게 하던 거짓말과 같고, 청중만 다르다.
+ *
+ * 판정은 여기서 하지 않는다: `lib/verifyAttribution.ts`가 갈라 준다.
+ */
+function Attribution({ report }: { report: VerificationReport }) {
+  const view = attributionView(report);
+  if (!view.show) return null;
+
+  return (
+    <div className="attribution">
+      {view.brokeOnly.length > 0 && (
+        <>
+          <p className="error small">이번 변경으로 새로 실패</p>
+          {view.brokeOnly.map((g) => (
+            <TestGroup key={g.kind} kind={g.kind} tests={g.newTests} split={g.split} tone="error" />
+          ))}
+        </>
+      )}
+
+      {/* **여기가 종전에 사라지던 자리다.** 섞인 체크를 따로 묶지 않으면 두 줄에 다 나와
+          자기모순으로 읽히고, 이름을 보여 주지 않으면 어느 쪽이 내 책임인지 알 수 없다. */}
+      {view.mixed.map((g) => (
+        <div key={g.kind} className="attribution-mixed">
+          <p className="error small">{mixedLabel(g)}</p>
+          {g.split && (
+            <>
+              <TestGroup kind="이번 변경이 깨뜨림" tests={g.newTests} split tone="error" />
+              <TestGroup kind="변경 전부터 실패" tests={g.oldTests} split tone="warn" />
+            </>
+          )}
+        </div>
+      ))}
+
+      {view.oldOnly.length > 0 && (
+        <>
+          <p className="warn small">변경 전부터 실패 중이던 항목 — 이번 변경과 무관합니다</p>
+          {view.oldOnly.map((g) => (
+            <TestGroup key={g.kind} kind={g.kind} tests={g.oldTests} split={g.split} tone="warn" />
+          ))}
+        </>
+      )}
+
+      {/* **고친 것도 말한다**(54.4절). 새 실패만 보여 주면 사용자는 변경이 순전히 나빴다고 읽는다. */}
+      {view.fixed.map((f) => (
+        <TestGroup key={`fixed-${f.kind}`} kind={`${f.kind} — 이번 변경으로 통과로 바뀜`} tests={f.tests} split tone="muted" />
+      ))}
+
+      {view.unsplitNote && <p className="muted small">{view.unsplitNote}</p>}
+    </div>
+  );
+}
+
+/** 이름 목록 한 묶음. **가르지 못했으면 목록 자체를 그리지 않는다** — 빈 목록은 "없다"로 읽힌다. */
+function TestGroup({
+  kind,
+  tests,
+  split,
+  tone,
+}: {
+  kind: string;
+  tests: string[];
+  split: boolean;
+  tone: "error" | "warn" | "muted";
+}) {
+  if (!split || tests.length === 0) {
+    return <p className={`${tone} small`}>{kind}</p>;
+  }
+  return (
+    <div className="attribution-group">
+      <p className={`${tone} small`}>
+        {kind} ({tests.length})
+      </p>
+      <ul className="transmission-files">
+        {tests.map((name) => (
+          <li key={name}>
+            <code>{name}</code>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
