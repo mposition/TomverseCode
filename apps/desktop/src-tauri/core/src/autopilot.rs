@@ -480,6 +480,112 @@ mod tests {
         assert!(seen_lever_does_not_free, "`leverDoesNotFree`가 붙은 정지가 하나도 없습니다");
     }
 
+    /// **이 스위치가 넓히는 것은 되돌릴 수 있는 쓰기뿐이다** (63절).
+    ///
+    /// `--auto-approve-writes`를 화면에 올리기로 한 결정의 근거가 이것이다. 근거를 산문으로
+    /// 적어 두면 게이트가 바뀔 때 조용히 거짓이 되므로, **게이트에 물어서 세운다.**
+    ///
+    /// # 재는 것은 절대량이 아니라 **차이**다
+    ///
+    /// 처음에는 "무인에서 사람 없이 지나가는 것은 전부 되돌릴 수 있는 것"으로 적었는데
+    /// 그건 틀린 명제였다 — 스위치를 다 끈 기본 설정에서도 `git status`가 지나간다
+    /// (allowlist의 `auto` 규칙이고, 그건 **워크스페이스 정책**이 넓혀 둔 것이지 이 스위치가
+    /// 아니다). 절대량으로 재면 남의 결정을 이 스위치의 책임으로 세게 되고, 그 검사는
+    /// 언젠가 무관한 이유로 실패해 약해진다.
+    ///
+    /// 그래서 **같은 설정에서 이 스위치만 켜 보고 늘어난 것**을 본다. 늘어난 것이
+    /// `create_file`/`apply_patch`뿐이면 이 스위치가 넓힌 자리는 전부 `capture_pre_image`가
+    /// 이전 내용을 남기는 자리다(19절) — 되돌리기가 복원할 수 있다.
+    #[test]
+    fn the_write_switch_widens_nothing_but_undoable_writes() {
+        let dir = workspace_with_manifest();
+        let hooks = HookRegistry::default();
+        // **pre-image가 남는 쓰기 도구.** 이 목록이 늘면 `tools/mod.rs`의 `capture_pre_image`
+        // 호출도 함께 늘어야 한다 — 늘리지 않으면 되돌릴 수 없는 것이 여기 통과한다.
+        let undoable_writes = [ToolName::CreateFile.as_str(), ToolName::ApplyPatch.as_str()];
+        let mut total_newly_allowed = 0;
+
+        for commit in [false, true] {
+            for verification in [false, true] {
+                let base = TaskPolicy {
+                    unattended: true,
+                    allow_git_commit: commit,
+                    auto_approve_verification: verification,
+                    ..TaskPolicy::default()
+                };
+                let with_writes = TaskPolicy { auto_approve_workspace_writes: true, ..base.clone() };
+                let before = preview(&root(dir.path()), &profile(dir.path(), base), &hooks);
+                let after = preview(&root(dir.path()), &profile(dir.path(), with_writes), &hooks);
+
+                let was: Vec<&str> = before.proceeds.iter().map(|p| p.probe).collect();
+                for done in after.proceeds.iter().filter(|p| !was.contains(&p.probe)) {
+                    total_newly_allowed += 1;
+                    assert!(
+                        undoable_writes.contains(&done.tool.as_str()),
+                        "이 스위치가 되돌릴 수 없는 자리를 열었습니다: {} ({}) — commit={commit} verification={verification}",
+                        done.probe,
+                        done.tool
+                    );
+                }
+                // **켜서 좁아지는 일은 없어야 한다.** 좁아졌다면 위 차집합이 그 사실을
+                // 놓치므로, 반대 방향도 함께 본다.
+                let now: Vec<&str> = after.proceeds.iter().map(|p| p.probe).collect();
+                let lost: Vec<&str> = was.iter().copied().filter(|p| !now.contains(p)).collect();
+                assert!(lost.is_empty(), "스위치를 켰는데 지나가던 것이 막혔습니다: {lost:?}");
+            }
+        }
+        // **빈 집합에 대한 전칭 명제는 언제나 참이다.** 늘어난 것이 하나도 없다면 위 반복은
+        // 아무것도 검사하지 않았고, 그건 이 스위치가 아무 일도 하지 않는다는 뜻이기도 하다.
+        assert!(
+            total_newly_allowed > 0,
+            "이 스위치를 켜도 새로 지나가는 것이 없습니다 — 위 단언이 공허합니다"
+        );
+    }
+
+    /// **되돌리기가 비싸지는 자리는 어떤 조합으로도 사람 없이 지나가지 않는다** (63절).
+    ///
+    /// 48.6절은 쓰기 자동 승인의 조건을 *"`git commit`이 꺼져 있어야 되돌리기가 싸다"* 로
+    /// 적고 **두 스위치의 조합이 결정의 대상**이라고 했다. 그런데 그 조건은 화면이 지킬
+    /// 것이 아니라 **게이트가 이미 지키고 있었다** — 47.6절이 찾아 둔 사실이 그것이다:
+    /// `--allow-git-commit`을 켜도 `git commit`은 무인에서 여전히 멈춘다.
+    ///
+    /// 그래서 화면에 두 스위치를 묶는 규칙을 만들지 않았다. 만들면 게이트가 가진 규칙의
+    /// **두 번째 사본**이 되고, 두 벌은 갈라진다(47절이 미리보기를 만든 이유와 같다).
+    /// 대신 그 사실을 여기서 고정한다.
+    #[test]
+    fn a_commit_never_proceeds_unattended_under_any_switch_combination() {
+        let dir = workspace_with_manifest();
+        let hooks = HookRegistry::default();
+        const COMMIT: &str = "git commit 만들기";
+        let mut seen = 0;
+
+        for writes in [false, true] {
+            for commit in [false, true] {
+                for verification in [false, true] {
+                    let policy = TaskPolicy {
+                        unattended: true,
+                        auto_approve_workspace_writes: writes,
+                        allow_git_commit: commit,
+                        auto_approve_verification: verification,
+                        ..TaskPolicy::default()
+                    };
+                    let p = preview(&root(dir.path()), &profile(dir.path(), policy), &hooks);
+                    assert!(
+                        !p.proceeds.iter().any(|x| x.probe == COMMIT),
+                        "writes={writes} commit={commit} verification={verification}에서 커밋이 사람 없이 지나갑니다"
+                    );
+                    // 탐침이 사라지면 위 단언은 공허해진다 — 어느 칸엔가는 있어야 한다.
+                    assert!(
+                        p.stops.iter().chain(p.denied.iter()).any(|x| x.probe == COMMIT),
+                        "커밋 탐침이 어느 칸에도 없습니다"
+                    );
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 8, "조합을 다 돌지 않았습니다");
+    }
+
     /// **틀린 조언을 하나 찾았고, 그것을 지우지 않고 사실로 남긴다** (47.6절).
     ///
     /// 게이트는 `git commit` 정지의 `unblockedBy`를 `AllowGitCommit`이라고 말한다. 그런데 그

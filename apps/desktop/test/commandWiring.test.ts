@@ -263,6 +263,78 @@ test("정지 패널이 이어서 돌리기를 스스로 시작하지 않는다",
   assert.ok(panel.includes("onFollowUp("), "정지 패널이 이어서 돌리기를 넘기지 않습니다");
 });
 
+/**
+ * **미리보기와 실행이 같은 값을 넣는다** — state-machine 63절.
+ *
+ * 47절이 둘을 같은 함수(`task_policy_from`)로 묶었지만, **같은 함수를 쓰는 것으로는
+ * 부족했다.** 그 함수는 위치 인자 일곱 개를 받았고 그중 넷이 `bool`/`&str`이었는데,
+ * 미리보기가 `kind` 자리에 `false`를 넣고 있었다 — 타입 오류이고, 이 크레이트가 이
+ * 환경에서 컴파일되지 않으므로 `npm run verify`가 아무 말도 하지 않았다.
+ *
+ * 구조체로 바꿔서 그 자리에 잘못된 값을 **적을 수 없게** 했다. 여기서 재는 것은 남은 절반,
+ * 즉 **두 호출부가 같은 필드를 다 채우는가**다. 빠뜨리면 Windows에서는 컴파일 오류지만
+ * 여기서는 아무 일도 일어나지 않으므로, Linux가 할 수 있는 유일한 검사가 이것이다.
+ *
+ * 판정 기준은 손으로 적은 목록이 아니라 **구조체 정의 자신**이다.
+ */
+function screenSwitchFields(source: string): string[] {
+  const marker = "pub struct ScreenSwitches" + "<";
+  const at = source.indexOf(marker);
+  assert.notEqual(at, -1, "session.rs에 ScreenSwitches 정의가 없습니다");
+  const body = source.slice(at, source.indexOf("\n}", at));
+  return [...body.matchAll(/^\s*pub ([a-z_]+):/gm)].map((m) => m[1] as string);
+}
+
+test("정책을 만드는 두 호출부가 화면 스위치를 빠짐없이 채운다", () => {
+  const source = readFileSync(SESSION_RS, "utf8");
+  const fields = screenSwitchFields(source);
+  // 0개면 아래 비교가 빈 집합에 대한 전칭 명제가 된다 — 정의 형식이 바뀐 경우다.
+  assert.ok(fields.length >= 6, `필드를 ${fields.length}개만 읽었습니다: ${fields.join(", ")}`);
+
+  const call = "task_policy_from(&ScreenSwitches" + " {";
+  const sites: string[] = [];
+  let at = source.indexOf(call);
+  while (at !== -1) {
+    sites.push(source.slice(at, source.indexOf("\n        });", at)));
+    at = source.indexOf(call, at + call.length);
+  }
+  // **둘이어야 한다.** 하나면 한쪽이 다른 길로 정책을 만들고 있다는 뜻이고, 그게 47절이
+  // 없애려던 상태다.
+  assert.equal(sites.length, 2, `정책 조립 호출부가 ${sites.length}곳입니다`);
+
+  for (const [index, site] of sites.entries()) {
+    const missing = fields.filter((field) => !site.includes(field));
+    assert.deepEqual(missing, [], `${index}번째 호출부가 빠뜨린 필드: ${missing.join(", ")}`);
+  }
+});
+
+/** 화면이 그 값들을 **보내야** 한다 — 안 보내면 토글도 종류도 아무것도 하지 않는다. */
+test("화면이 쓰기 자동 승인과 종류를 양쪽 명령에 보낸다", () => {
+  const root = findUp("src-tauri", path.dirname(fileURLToPath(import.meta.url)));
+  const app = readFileSync(path.join(root, "src", "App.tsx"), "utf8");
+  // **`start_task` 인자 블록만 본다.** 파일 전체에서 이름을 찾으면 `useState` 선언
+  // (`const [autoApproveWrites, setAutoApproveWrites]`)이 걸려 검사가 언제나 통과한다 —
+  // 실측으로 프로브가 잡히지 않았고, 그때 이 검사가 재고 있던 것은 "그 값을 보내는가"가
+  // 아니라 "그 이름이 파일 어딘가에 있는가"였다.
+  const invokeStart = 'invoke<FinalResult>("start_' + 'task"';
+  const at = app.indexOf(invokeStart);
+  assert.notEqual(at, -1, "App.tsx에서 태스크 시작 호출을 찾지 못했습니다");
+  const args = app.slice(at, app.indexOf("\n      });", at));
+  assert.ok(args.includes("autoApproveWrites,"), "App.tsx가 start_task에 쓰기 승인을 보내지 않습니다");
+  assert.ok(args.includes("kind: taskKind"), "App.tsx가 start_task에 종류를 보내지 않습니다");
+
+  // 미리보기 패널은 **같은 값을 받아 같은 이름으로 보낸다.** 하나라도 빠지면 예고가 실행과
+  // 다른 설정에 대한 답이 된다.
+  const panel = readFileSync(path.join(root, "src", "components", "AutopilotPreviewPanel.tsx"), "utf8");
+  for (const key of ["autoApproveWrites,", "kind,"]) {
+    assert.ok(panel.includes(key), `미리보기 패널이 ${key}를 보내지 않습니다`);
+  }
+  // 그리고 화면이 그 값들을 패널에 **넘겨야** 한다.
+  for (const prop of ["autoApproveWrites={autoApproveWrites}", "kind={taskKind}"]) {
+    assert.ok(app.includes(prop), `App.tsx가 미리보기 패널에 ${prop}를 넘기지 않습니다`);
+  }
+});
+
 /** 그 연결이 **감사 기록에 남아야** 한다 — 재개가 아니라는 것이 기록에서도 읽혀야 한다. */
 test("화면이 start_task에 followsUp을 보낸다", () => {
   const app = readFileSync(

@@ -25,15 +25,22 @@ export function AutopilotPreviewPanel(props: {
   mode: string;
   allowGitCommit: boolean;
   autoApproveVerification: boolean;
+  autoApproveWrites: boolean;
   skillPath: string | null;
   deadlineSecs: number | null;
+  /**
+   * 이 요청의 종류 (63절). **`start_task`에 보내는 것과 같은 값이어야 한다** — 종류가
+   * 빠져 있던 동안 질문 태스크를 쓰는 사용자가 받는 예고는 변경 태스크의 답이었다.
+   */
+  kind: string;
   /** 워크스페이스가 열려 있는가. 닫혀 있으면 물을 곳이 없다. */
   ready: boolean;
 }) {
   const [preview, setPreview] = useState<AutopilotPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const { unattended, mode, allowGitCommit, autoApproveVerification, skillPath, deadlineSecs, ready } = props;
+  const { unattended, mode, allowGitCommit, autoApproveVerification, autoApproveWrites, skillPath, deadlineSecs, kind, ready } =
+    props;
 
   useEffect(() => {
     if (!unattended || !ready) {
@@ -48,8 +55,10 @@ export function AutopilotPreviewPanel(props: {
       allowGitCommit,
       unattended,
       autoApproveVerification,
+      autoApproveWrites,
       skillPath,
       deadlineSecs,
+      kind,
     })
       .then((value) => {
         if (cancelled) return;
@@ -66,7 +75,7 @@ export function AutopilotPreviewPanel(props: {
     return () => {
       cancelled = true;
     };
-  }, [unattended, mode, allowGitCommit, autoApproveVerification, skillPath, deadlineSecs, ready]);
+  }, [unattended, mode, allowGitCommit, autoApproveVerification, autoApproveWrites, skillPath, deadlineSecs, kind, ready]);
 
   const summary = summarizePreview(preview);
 

@@ -4759,6 +4759,41 @@ mod tests {
         );
     }
 
+    /// **스위치가 승인한 쓰기도 되돌아간다** (63절).
+    ///
+    /// 쓰기 자동 승인을 화면에 올리기로 한 결정의 셋째 근거다(48.6절). 아래
+    /// `rollback_restores_files_through_the_normal_tool_path`와 다른 것은 **승인 게이트웨이**다:
+    /// 저쪽은 `AutoApprove`라 사람이 눌렀을 수도 있는 경로를 함께 덮지만, 여기서는 모든
+    /// 승인을 거부한다. 그래도 쓰기가 일어났다면 그것을 통과시킨 것은 **오직 정책**이고,
+    /// 그 쓰기가 되돌아간다는 것이 여기서 재는 사실이다.
+    #[test]
+    fn a_write_the_switch_approved_is_still_undoable() {
+        let (ws, _a, host) = host(
+            TaskPolicy {
+                auto_approve_workspace_writes: true,
+                ..TaskPolicy::default()
+            },
+            // **사람은 아무것도 승인하지 않는다.** 이래야 통과의 원인이 정책 하나로 좁혀진다.
+            Arc::new(AlwaysDeny),
+        );
+        let original = fs::read_to_string(ws.path().join("src/app.ts")).unwrap();
+
+        host.execute_tool(&req(
+            ToolName::CreateFile,
+            json!({ "path": "src/app.ts", "content": "REPLACED\n" }),
+        ))
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.path().join("src/app.ts")).unwrap(),
+            "REPLACED\n",
+            "정책이 승인했는데 쓰기가 일어나지 않았습니다 — 아래 되돌리기 단언이 공허합니다"
+        );
+
+        let result = host.rollback("task-1").unwrap();
+        assert_eq!(result["failed"].as_array().unwrap().len(), 0, "{result}");
+        assert_eq!(fs::read_to_string(ws.path().join("src/app.ts")).unwrap(), original);
+    }
+
     #[test]
     fn rollback_restores_files_through_the_normal_tool_path() {
         let (ws, _a, host) = host(

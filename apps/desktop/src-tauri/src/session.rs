@@ -170,32 +170,53 @@ fn is_read_only_kind(kind: &str) -> bool {
     matches!(kind, "question" | "plan")
 }
 
+/// 화면의 스위치 한 벌 — `start_task`와 `autopilot_preview`가 **같은 값**을 넣는다.
+///
+/// # 왜 위치 인자가 아니라 구조체인가 (63절)
+///
+/// 종전에는 이 값들이 `task_policy_from`의 위치 인자 일곱 개였고 그중 넷이 `bool`/`&str`
+/// 이었다. 그 줄에서 미리보기가 **`kind` 자리에 `false`를 넣고 있었다.** 타입 오류인데,
+/// 이 크레이트는 이 환경에서 컴파일되지 않으므로(GUI 시스템 라이브러리 부재 — CLAUDE.md)
+/// `npm run verify`가 잡지 못했고, 소스를 읽는 검사는 **글자가 남아 있는지**만 본다.
+///
+/// 이름 붙은 필드로 바꾸면 그 자리에 잘못된 값을 **적을 수 없다.** 스위치가 하나 더 늘 때
+/// (여기서는 `auto_approve_workspace_writes`가 그랬다) 불리언 행렬이 길어지는 것도 막는다.
+pub struct ScreenSwitches<'a> {
+    pub mode: ExecutionMode,
+    pub allow_git_commit: bool,
+    pub unattended: bool,
+    pub auto_approve_verification: bool,
+    /// 워크스페이스 안의 파일 쓰기를 묻지 않고 승인한다 (63절).
+    ///
+    /// **넓히는 방향이고, 근거는 게이트에 물어서 세웠다** — 워크스페이스 밖은 여전히 거부,
+    /// 비밀값 파일은 `HumanOnly`, 쓴 것은 pre-image로 되돌아가고, 무인에서 `git commit`은
+    /// 어떤 조합으로도 지나가지 않는다. 넷 다 `tomverse-core`의 단위 테스트가 고정한다.
+    pub auto_approve_workspace_writes: bool,
+    pub skill: Option<&'a tomverse_core::skills::Skill>,
+    pub deadline_secs: Option<u64>,
+    /// 이 요청의 종류(`change`/`question`/`plan`). 읽기 전용 종류면 도구를 좁힌다.
+    pub kind: &'a str,
+}
+
 /// 화면의 스위치에서 이 태스크의 정책을 만든다.
 ///
 /// **`start_task`와 `autopilot_preview`가 같은 함수를 쓴다**(47절). 두 벌로 두면 미리보기가
 /// 실행과 다른 정책에 대해 답하게 되고, 그 어긋남은 "미리보기가 틀렸다"가 아니라
 /// "도구가 거짓말했다"로 읽힌다. 헤드리스 CLI도 같은 이유로 정책 조립을 한 함수에 둔다.
 ///
-/// **`auto_approve_workspace_writes`가 여기 없다**(48.3절). 화면에 그 스위치가 없기 때문이고,
-/// 그 사실은 실수가 아니라 아직 내리지 않은 결정이다 — 미리보기가 그것을 드러낸다.
-#[allow(clippy::too_many_arguments)]
-fn task_policy_from(
-    mode: ExecutionMode,
-    allow_git_commit: bool,
-    unattended: bool,
-    auto_approve_verification: bool,
-    skill: Option<&tomverse_core::skills::Skill>,
-    deadline_secs: Option<u64>,
-    kind: &str,
-) -> TaskPolicy {
+/// **같은 함수를 쓰는 것으로는 부족하다 — 같은 값을 넣어야 한다**(63절). 미리보기는
+/// `kind`를 넣지 않고 있었고, 그래서 질문 태스크를 쓰던 사용자가 받는 예고는 **변경
+/// 태스크에 대한 답**이었다.
+fn task_policy_from(switches: &ScreenSwitches<'_>) -> TaskPolicy {
     TaskPolicy {
-        execution_mode: mode,
-        allow_git_commit,
-        unattended,
-        auto_approve_verification,
-        allowed_tools: allowed_tools_for(kind, skill),
+        execution_mode: switches.mode,
+        allow_git_commit: switches.allow_git_commit,
+        unattended: switches.unattended,
+        auto_approve_verification: switches.auto_approve_verification,
+        auto_approve_workspace_writes: switches.auto_approve_workspace_writes,
+        allowed_tools: allowed_tools_for(switches.kind, switches.skill),
         // **sidecar로 가지 않는다**(39.1절). 시계도 판정도 Rust가 갖는다.
-        deadline_ms: deadline_secs.map(|s| s * 1_000),
+        deadline_ms: switches.deadline_secs.map(|s| s * 1_000),
         ..TaskPolicy::default()
     }
 }
@@ -533,8 +554,13 @@ impl SessionState {
         allow_git_commit: bool,
         unattended: bool,
         auto_approve_verification: bool,
+        auto_approve_workspace_writes: bool,
         skill_path: Option<&str>,
         deadline_secs: Option<u64>,
+        /// **미리보기도 종류를 받아야 한다**(63절). 질문·계획 태스크는 도구가 읽기 전용으로
+        /// 좁혀지므로 멈추는 자리가 다르다 — 종류를 넣지 않으면 화면이 질문을 쓰는 사용자에게
+        /// **변경 태스크의 예고**를 보여준다.
+        kind: &str,
     ) -> Result<Value, String> {
         let host = self.with_active(|active| Ok(active.host.clone()))?;
         // 스킬은 도구를 **좁힐** 수 있으므로 미리보기도 그것을 반영해야 한다 — 반영하지 않으면
@@ -546,15 +572,16 @@ impl SessionState {
                     .map_err(|e| e.to_string())?,
             ),
         };
-        let policy = task_policy_from(
+        let policy = task_policy_from(&ScreenSwitches {
             mode,
             allow_git_commit,
             unattended,
             auto_approve_verification,
-            skill.as_ref(),
+            auto_approve_workspace_writes,
+            skill: skill.as_ref(),
             deadline_secs,
-            false,
-        );
+            kind,
+        });
         serde_json::to_value(host.autopilot_preview(policy)).map_err(|e| format!("직렬화: {e}"))
     }
 
@@ -971,9 +998,14 @@ impl SessionState {
     ///  - `unattended`(Autopilot)는 넓히지도 좁히지도 않는다 — 승인을 *묻지 않고 멈춘다*(24.2절).
     ///  - `auto_approve_verification`은 **넓힌다.** 그런데도 받는 이유는 대상 집합을
     ///    **Rust가 매니페스트에서 유도해 태스크 시작 시점에 고정**하기 때문이다(24.5절).
+    ///  - `auto_approve_workspace_writes`도 **넓힌다**(63절). 통과하는 이유는 넓어진 자리가
+    ///    **되돌릴 수 있는 것뿐**이기 때문이고, 그 사실은 산문이 아니라 게이트에 물어서
+    ///    세웠다: 워크스페이스 밖은 거부, 비밀값 파일은 `HumanOnly`, 삭제·이동은 정책과
+    ///    무관하게 승인, 쓴 것은 pre-image로 되돌아가고, **무인에서 `git commit`은 어떤
+    ///    스위치 조합으로도 지나가지 않는다**(47.6절이 이미 찾아 둔 사실).
     ///
-    /// **넓히는 방향은 이것이 마지막이어야 한다.** 위 셋이 통과하는 이유는 각각 다르고,
-    /// 그 이유가 없는 필드는 통과하지 못한다.
+    /// **넓히는 방향은 이 넷이 전부다.** 각각 통과하는 이유가 다르고, 그 이유가 없는 필드는
+    /// 통과하지 못한다 — "이미 넷이나 있으니 하나 더"는 이유가 아니다.
     /// `budget_usd`가 `None`이면 **상한 없이** 실행한다 — 사용자가 명시적으로 고른 경우이거나
     /// (가격을 모르는 모델) 화면이 그렇게 보낸 경우다. 값을 우리가 대신 채워 넣지 않는다:
     /// 상한은 사용자의 승인이고, 코드가 만들어낸 승인은 승인이 아니다.
@@ -989,6 +1021,8 @@ impl SessionState {
         unattended: bool,
         /// 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
         auto_approve_verification: bool,
+        /// 워크스페이스 안의 파일 쓰기를 묻지 않고 승인한다 (63절). 위 주석의 근거 참조.
+        auto_approve_workspace_writes: bool,
         /// 스킬 파일 경로 (26절). **Rust가 읽는다** — 도구 허용목록의 출처가 UI가 되면
         /// 장악당한 UI가 "허용목록은 전부입니다"라고 말할 수 있다.
         skill_path: Option<&str>,
@@ -1048,15 +1082,16 @@ impl SessionState {
 
         // **이 태스크의 정책을 여기서 정하고, 여기서만 정한다.** 등록은 한 번뿐이므로
         // 진행 중에 바뀌지 않는다(3.16.2절).
-        let task_policy = task_policy_from(
+        let task_policy = task_policy_from(&ScreenSwitches {
             mode,
             allow_git_commit,
             unattended,
             auto_approve_verification,
-            skill.as_ref(),
+            auto_approve_workspace_writes,
+            skill: skill.as_ref(),
             deadline_secs,
             kind,
-        );
+        });
         host.begin_task(&task_id, task_policy, skill.as_ref())?;
 
         // 스킬의 모델 지정은 화면이 명시한 지정에 **진다** — 우선순위를 한 곳에서 정한다(26.1절).
@@ -1102,6 +1137,10 @@ impl SessionState {
                 "modelPins": model_pins,
                 "unattended": unattended,
                 "autoApproveVerification": auto_approve_verification,
+                // **게이트에 꽂힌 값과 같은 값을 보낸다**(63절). Node가 이 값을 지키는 것은
+                // 아니지만(지키는 것은 Rust다), 보내지 않으면 sidecar가 보는 정책이 언제나
+                // "꺼짐"이라 기록과 화면이 서로 다른 설정을 말하게 된다.
+                "autoApproveWorkspaceWrites": auto_approve_workspace_writes,
                 // 화면은 이 목록을 **지키지 않는다** — 지키는 것은 Rust의 게이트다(26.1절).
                 // **게이트에 꽂힌 값을 그대로 보낸다**(51절) — 여기서 다시 계산하면 화면이
                 // 말하는 허용목록과 실제로 좁혀진 목록이 갈릴 수 있다.

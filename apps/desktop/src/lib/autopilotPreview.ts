@@ -17,9 +17,13 @@
  * 할 일은 그것을 **지우지 않는 것**이다. 지우면 그 정지에 대해 사용자가 아무 설명도 못 받는다.
  *
  * **③ 이 화면에 없는 스위치를 "켜세요"라고 말하는 것.** 미리보기는 게이트가 아는 레버를
- * 전부 말하는데, 그중 일부는 **화면에 토글이 없다**(`--auto-approve-writes`가 지금 그렇다 —
- * 48.3절). 켤 수 없는 것을 켜라고 하는 것은 ①과 같은 종류의 거짓말이고, 사용자는 없는
- * 체크박스를 찾다가 도구를 의심한다. 그래서 **화면이 실제로 가진 토글 집합을 받아** 구별한다.
+ * 전부 말하는데, 그중 일부는 **화면에 토글이 없을 수 있다**(48.3절). 켤 수 없는 것을 켜라고
+ * 하는 것은 ①과 같은 종류의 거짓말이고, 사용자는 없는 체크박스를 찾다가 도구를 의심한다.
+ * 그래서 **화면이 실제로 가진 토글 집합을 받아** 구별한다.
+ *
+ * 이 거짓말의 유일한 실례였던 `--auto-approve-writes`는 63절에서 화면에 올라왔다.
+ * 그래서 지금 `CLI_ONLY_FLAGS`는 비어 있고, **그래도 갈래는 남긴다** — 다음 레버가
+ * 생기는 날 이 거짓말이 되살아나는 자리이기 때문이다.
  */
 
 export interface AutopilotPermission {
@@ -74,11 +78,31 @@ export interface PreviewSummary {
 /**
  * 이 화면에서 실제로 켤 수 있는 스위치들.
  *
- * **`--auto-approve-writes`가 없다.** 화면에 그 토글이 없기 때문이고, 그건 실수가 아니라
- * 아직 내리지 않은 결정이다(48.3절). 목록에 없으면 미리보기가 "이 화면에서는 켤 수 없다"고
- * 말하므로, 토글이 생기는 날 여기 한 줄만 늘면 문장이 따라온다.
+ * **게이트가 아는 레버 셋이 전부 여기 있다**(63절). 종전에는 `--auto-approve-writes`가
+ * 빠져 있었고, 그건 실수가 아니라 아직 내리지 않은 결정이었다(48.3절) — 넓히는 방향이라
+ * 근거가 필요했고, 63절이 그 근거를 **게이트에 물어서** 세웠다.
+ *
+ * 목록이 손으로 적혀 있으므로 레버가 늘면 낡는다. 그래서 `CLI_ONLY_FLAGS`와 짝을 이루고,
+ * 둘의 합집합이 Rust의 `PolicyLever::rerun_flag`와 같은지를
+ * `apps/desktop/test/autopilotPreview.test.ts`가 소스에서 유도해 대조한다 — 새 레버가
+ * 생기면 **둘 중 어디에 넣을지 고르지 않고는 지나갈 수 없다.**
  */
-export const SCREEN_FLAGS: readonly string[] = ["--auto-approve-verification", "--allow-git-commit"];
+export const SCREEN_FLAGS: readonly string[] = [
+  "--auto-approve-verification",
+  "--allow-git-commit",
+  "--auto-approve-writes",
+];
+
+/**
+ * 게이트는 아는데 **이 화면에는 토글이 없는** 스위치들.
+ *
+ * **지금은 비어 있다.** 비어 있다는 것은 `cli_only` 갈래가 지금 실행 경로에서 나오지
+ * 않는다는 뜻이고, 그래도 갈래를 지우지 않는다 — 지우면 다음 레버가 생기는 날 화면이
+ * **켤 수 없는 것을 켜라고 말하게** 되고, 그건 48.3절이 고친 거짓말이 되살아나는 것이다.
+ *
+ * 비어 있다는 사실 자체는 주장이 아니라 위 대조 검사의 결과다.
+ */
+export const CLI_ONLY_FLAGS: readonly string[] = [];
 
 /** 사용자가 지금 할 수 있는 일 순서. **`human_only`가 마지막인 이유는 할 일이 없어서다.** */
 const ORDER: StopKind[] = ["toggle_here", "cli_only", "lever_does_not_free", "human_only"];

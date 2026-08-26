@@ -199,6 +199,10 @@ export default function App() {
    */
   const [deadlineText, setDeadlineText] = useState("");
   const [autoApproveVerification, setAutoApproveVerification] = useState(false);
+  // **넓히는 스위치이므로 기본값은 꺼짐이고, 실행이 끝나도 저절로 꺼지지 않는다**(63절).
+  // 그 사실은 라벨이 말한다 — 사용자는 "이 patch 하나" 때문에 켜는데 적용은 그 다음
+  // 실행들까지다(62.3절이 이어서 돌리기 버튼에서 배운 것과 같은 함정이다).
+  const [autoApproveWrites, setAutoApproveWrites] = useState(false);
   /** 스킬 파일 경로 (26절). **Rust가 읽는다** — 화면은 경로만 넘긴다. */
   const [skillPath, setSkillPath] = useState("");
   /**
@@ -613,6 +617,9 @@ export default function App() {
         modelPins: modelPins(pinExecutor, pinReviewer),
         unattended,
         autoApproveVerification,
+        // **워크스페이스 안의 쓰기를 묻지 않는다**(63절). 넓히는 방향이고, 근거는 게이트에
+        // 물어서 세웠다 — 넓어지는 자리가 되돌릴 수 있는 것뿐이다.
+        autoApproveWrites,
         // 빈 문자열은 "경로 없음"이지 "빈 경로"가 아니다.
         skillPath: skillPath.trim() === "" ? null : skillPath.trim(),
         // **질문인가**(51절). 이 값이 정하는 것은 경로만이 아니다 — Rust가 이걸 보고 도구를
@@ -1157,6 +1164,32 @@ export default function App() {
                   )
                 )}
               </fieldset>
+              {/* 파일 쓰기 자동 승인 (63절). **무인 실행 칸에 두지 않는다** — 이 스위치는
+                  사람이 보고 있는 실행에도 적용되고, 무인 칸에 있으면 "무인일 때만"으로 읽힌다.
+
+                  넓히는 방향이라 근거가 필요했고, 그 근거는 산문이 아니라 게이트에 물어서
+                  세웠다: 워크스페이스 밖은 여전히 거부, 비밀값 파일은 어떤 스위치로도 못 열고,
+                  삭제·이동은 정책과 무관하게 승인이며, 쓴 것은 pre-image로 되돌아간다. 그리고
+                  **무인에서 `git commit`은 어떤 조합으로도 지나가지 않으므로**(47.6절) 이
+                  스위치가 되돌리기를 비싸게 만들지 못한다. 넷 다 core의 단위 테스트가 고정한다. */}
+              <fieldset className="modes" disabled={running}>
+                <legend>파일 쓰기</legend>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={autoApproveWrites}
+                    onChange={(e) => setAutoApproveWrites(e.target.checked)}
+                  />
+                  워크스페이스 안의 파일 변경을 묻지 않고 적용
+                </label>
+                {/* **무엇이 넓어지는지와 무엇이 안 넓어지는지를 함께 적는다.** 넓어지는 쪽만
+                    적으면 과하게 무섭고, 안 넓어지는 쪽만 적으면 안심시키는 문장이 된다. */}
+                <p className="muted small">
+                  이번 실행의 <strong>모든</strong> 파일 변경에 적용되고, 끄기 전까지 다음
+                  실행에도 남습니다. 비밀값 파일·삭제·이동·커밋은 이 스위치로 열리지 않고,
+                  적용된 변경은 되돌리기로 원래 내용으로 돌아갑니다.
+                </p>
+              </fieldset>
               {/* 커밋은 **되돌리기가 파일만 복원하고 커밋은 남기는** 유일한 단계라 별도 스위치다.
                   켜도 승인 없이 커밋되지 않는다 — 승인 모달이 실제 argv를 그대로 보여준다. */}
               <fieldset className="modes" disabled={running}>
@@ -1206,8 +1239,13 @@ export default function App() {
                   mode={mode}
                   allowGitCommit={allowGitCommit}
                   autoApproveVerification={autoApproveVerification}
+                  autoApproveWrites={autoApproveWrites}
                   skillPath={skillPath.trim() === "" ? null : skillPath.trim()}
                   deadlineSecs={deadline.secs}
+                  // **`start_task`에 보내는 것과 같은 값이다**(63절). 종류가 빠져 있던 동안
+                  // 질문 태스크의 예고는 변경 태스크의 답이었다 — 같은 함수를 쓰는 것만으로는
+                  // 부족하고 같은 값을 넣어야 한다.
+                  kind={taskKind}
                   ready={Boolean(workspace)}
                 />
 

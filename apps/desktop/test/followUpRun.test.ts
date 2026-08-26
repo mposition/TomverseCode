@@ -64,17 +64,34 @@ test("스위치가 실행 전체에 적용된다고 말한다", () => {
 /**
  * **이 화면에 없는 스위치를 "켜고"라고 말하지 않는다** — 48.3절이 미리보기에서 잡은 것과
  * 같은 거짓말이 버튼 쪽에서 되살아나는 자리다.
+ *
+ * `--auto-approve-writes`가 이 갈래의 유일한 실례였고 63절에서 화면에 올라왔으므로, 화면
+ * 토글 집합을 **명시적으로 넘겨서** 잰다. 갈래가 사라진 것이 아니라 실례가 사라진 것이다 —
+ * 게이트에 레버가 늘고 화면이 따라가지 않는 날 이 문장이 다시 필요하다.
  */
 test("화면에 토글이 없는 스위치를 갈라낸다", () => {
   const plan = planFollowUp(
-    report({ rerunFlags: ["--auto-approve-verification", "--auto-approve-writes"] })
+    report({ rerunFlags: ["--auto-approve-verification", "--not-on-this-screen"] }),
+    ["--auto-approve-verification"]
   );
   assert.deepEqual(plan.grant, ["--auto-approve-verification"]);
-  assert.deepEqual(plan.cliOnly, ["--auto-approve-writes"]);
+  assert.deepEqual(plan.cliOnly, ["--not-on-this-screen"]);
   assert.match(plan.scopeWarning, /이 화면에 없는 스위치/);
   assert.match(plan.scopeWarning, /명령줄에서만/);
-  // 화면 토글 목록과 실제로 대조하고 있다는 것.
-  assert.ok(!SCREEN_FLAGS.includes("--auto-approve-writes"));
+});
+
+/**
+ * **그리고 지금은 쓰기 스위치를 여기서 켤 수 있다** (63절).
+ *
+ * 위 검사가 넘겨 준 목록으로만 돌면 기본값이 낡아도 드러나지 않는다 — 기본값을 쓰는 경로를
+ * 함께 잰다.
+ */
+test("쓰기 자동 승인은 이제 이 화면에서 켤 수 있다", () => {
+  const plan = planFollowUp(report({ rerunFlags: ["--auto-approve-writes"] }));
+  assert.deepEqual(plan.grant, ["--auto-approve-writes"]);
+  assert.deepEqual(plan.cliOnly, []);
+  assert.equal(plan.canRerun, true);
+  assert.ok(SCREEN_FLAGS.includes("--auto-approve-writes"));
 });
 
 /**
@@ -89,7 +106,7 @@ test("켤 것이 없으면 다시 돌릴 수 없다고 말한다", () => {
 
 /** 명령줄에서만 켤 수 있는 것만 남아도 **이 화면에서는** 돌릴 수 없다. */
 test("명령줄 전용 스위치만 남으면 이 화면에서는 못 돌린다", () => {
-  const plan = planFollowUp(report({ rerunFlags: ["--auto-approve-writes"] }));
+  const plan = planFollowUp(report({ rerunFlags: ["--not-on-this-screen"] }), []);
   assert.equal(plan.canRerun, false);
   assert.deepEqual(plan.grant, []);
   assert.match(plan.scopeWarning, /이 화면에서 켤 수 있는 스위치가 없습니다/);

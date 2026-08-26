@@ -93,6 +93,11 @@ async fn start_task(
     unattended: Option<bool>,
     /// 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
     auto_approve_verification: Option<bool>,
+    /// 워크스페이스 안의 파일 쓰기를 묻지 않고 승인한다 (63절).
+    ///
+    /// **넓히는 방향이라 기본값이 `false`다.** 화면이 인자를 빠뜨리면 켜지는 것이 아니라
+    /// 꺼진다 — 넓히는 스위치의 기본값은 언제나 좁은 쪽이어야 한다.
+    auto_approve_writes: Option<bool>,
     /// 스킬 파일 경로 (26절). **Rust가 읽는다.**
     skill_path: Option<String>,
     /// 이 요청이 **질문인가** (state-machine 51절). 참이면 파일을 바꾸지 않는 경로를 탄다.
@@ -119,6 +124,7 @@ async fn start_task(
             model_pins.unwrap_or(Value::Null),
             unattended.unwrap_or(false),
             auto_approve_verification.unwrap_or(false),
+            auto_approve_writes.unwrap_or(false),
             skill_path.as_deref(),
             kind.as_deref().unwrap_or("change"),
             follows_up.as_deref(),
@@ -360,16 +366,22 @@ fn autopilot_preview(
     allow_git_commit: Option<bool>,
     unattended: Option<bool>,
     auto_approve_verification: Option<bool>,
+    auto_approve_writes: Option<bool>,
     skill_path: Option<String>,
     deadline_secs: Option<u64>,
+    /// **`start_task`와 같은 값을 받아야 한다**(63절). 종류가 빠져 있던 동안 질문 태스크의
+    /// 예고는 변경 태스크의 답이었다 — 같은 함수를 쓰는 것만으로는 부족하다.
+    kind: Option<String>,
 ) -> Result<Value, String> {
     state.autopilot_preview(
         parse_mode(&mode)?,
         allow_git_commit.unwrap_or(false),
         unattended.unwrap_or(false),
         auto_approve_verification.unwrap_or(false),
+        auto_approve_writes.unwrap_or(false),
         skill_path.as_deref(),
         deadline_secs,
+        kind.as_deref().unwrap_or("change"),
     )
 }
 
