@@ -240,3 +240,38 @@ test("고정 정책 미리보기 명령이 등록돼 있다", () => {
   assert.ok(registeredCommands().includes("task_autopilot_preview"), registeredCommands().join(", "));
   assert.ok(declaredCommands().includes("task_autopilot_preview"), declaredCommands().join(", "));
 });
+
+/**
+ * **이어서 돌리기는 여기서 시작하지 않는다** — state-machine 62절.
+ *
+ * 한 번의 클릭이 무엇을 넓히는지를 사용자가 읽어야 하고, 그 문장은 시작 화면의 스위치 옆에
+ * 있다. 정지 패널에서 바로 시작하면 **경고를 읽지 않은 채 넓어진다.**
+ */
+test("정지 패널이 이어서 돌리기를 스스로 시작하지 않는다", () => {
+  const panel = readFileSync(
+    path.join(
+      findUp("src-tauri", path.dirname(fileURLToPath(import.meta.url))),
+      "src",
+      "components",
+      "BlockedPanel.tsx"
+    ),
+    "utf8"
+  );
+  const start = '"start_task"';
+  assert.ok(!panel.includes(start), "정지 패널이 태스크를 직접 시작합니다");
+  // 대신 위로 넘긴다.
+  assert.ok(panel.includes("onFollowUp("), "정지 패널이 이어서 돌리기를 넘기지 않습니다");
+});
+
+/** 그 연결이 **감사 기록에 남아야** 한다 — 재개가 아니라는 것이 기록에서도 읽혀야 한다. */
+test("화면이 start_task에 followsUp을 보낸다", () => {
+  const app = readFileSync(
+    path.join(findUp("src-tauri", path.dirname(fileURLToPath(import.meta.url))), "src", "App.tsx"),
+    "utf8"
+  );
+  assert.ok(app.includes("followsUp: followsUp"), "App.tsx가 followsUp을 보내지 않습니다");
+
+  const session = readFileSync(SESSION_RS, "utf8");
+  const needle = '"followsUp"' + ":";
+  assert.ok(session.includes(needle), "session.rs가 taskRequest에 followsUp을 넣지 않습니다");
+});

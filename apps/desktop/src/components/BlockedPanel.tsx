@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { unwrap, type Envelope } from "../lib/envelope";
 import { adviseOnBlocked, type BlockedReport } from "../lib/blockedAdvice";
 import { joinPreviewAndBlocked } from "../lib/previewVsBlocked";
+import { planFollowUp } from "../lib/followUpRun";
 import type { AutopilotPreview } from "../lib/autopilotPreview";
 
 /**
@@ -19,7 +20,19 @@ import type { AutopilotPreview } from "../lib/autopilotPreview";
  * `humanOnly` 정지를 "스위치를 켜세요"로 뭉개지 않는 규칙은 `blockedAdvice.ts`에 있다.
  * 계산이 화면 안에 있으면 DOM 없이 검증할 수 없다.
  */
-export function BlockedPanel({ taskId }: { taskId: string }) {
+export function BlockedPanel({
+  taskId,
+  onFollowUp,
+}: {
+  taskId: string;
+  /**
+   * 이어서 돌릴 준비를 시작 화면에 넘긴다 (62절).
+   *
+   * **여기서 바로 시작하지 않는다.** 한 번의 클릭이 무엇을 넓히는지를 사용자가 읽어야 하고,
+   * 그 문장은 시작 화면의 스위치 옆에 있다. 여기서 시작하면 경고를 읽지 않은 채 넓어진다.
+   */
+  onFollowUp?: (grant: readonly string[], previousTaskId: string) => void;
+}) {
   const [report, setReport] = useState<BlockedReport | null>(null);
   const [preview, setPreview] = useState<AutopilotPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -29,6 +42,7 @@ export function BlockedPanel({ taskId }: { taskId: string }) {
   // **예고와 실제를 잇는다**(59절). 둘 다 있어야 이으므로, 미리보기를 못 받으면 이 영역은
   // 그리지 않고 아래 처방만 남는다 — 반쪽을 그리면 이어 본 척이 된다.
   const joined = joinPreviewAndBlocked(preview, report);
+  const followUp = planFollowUp(report);
 
   return (
     <div className="panel">
@@ -122,6 +136,25 @@ export function BlockedPanel({ taskId }: { taskId: string }) {
                 </p>
               ))}
             </>
+          )}
+
+          {/* **이어서 다시 돌리기**(62절). "재개"라고 부르지 않는 이유를 함께 말한다. */}
+          {followUp.show && onFollowUp && (
+            <div className="follow-up">
+              <h4>이어서 다시 돌리기</h4>
+              <p className="muted small">{followUp.notAResume}</p>
+              <p className="muted small">{followUp.workspaceNote}</p>
+              <p className={followUp.blockedByHumanOnly ? "warn small" : "muted small"}>{followUp.scopeWarning}</p>
+              {followUp.canRerun ? (
+                <button type="button" onClick={() => onFollowUp(followUp.grant, taskId)}>
+                  이 스위치를 켜고 시작 화면으로 ({followUp.grant.join(", ")})
+                </button>
+              ) : (
+                // **버튼을 주지 않는다.** 같은 설정으로 다시 돌리면 같은 자리에서 또 멈추고,
+                // 그건 사용자의 시간과 토큰을 쓰는 것 말고는 하는 일이 없다.
+                <p className="error small">이어서 돌릴 방법이 없습니다 — 사람이 있는 실행이 필요합니다.</p>
+              )}
+            </div>
           )}
 
           <h4>막힌 지점</h4>

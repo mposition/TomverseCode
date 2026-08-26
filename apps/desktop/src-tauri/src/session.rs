@@ -997,6 +997,7 @@ impl SessionState {
         /// 참이면 파일을 바꾸지 않는 경로를 탄다. 그 보장은 두 겹이다 — sidecar의 경로가
         /// `EXECUTING`을 지나지 않고, 여기서 도구를 읽기 전용으로 좁혀 게이트에 꽂는다.
         kind: &str,
+        follows_up: Option<&str>,
         /// 무인 실행의 **시한**(초) — state-machine 39절. `None`이면 상한이 없다.
         ///
         /// `timeout`과 다른 값이다: 저쪽은 이 호출이 기다리기를 그만두는 시각이고, 이쪽은
@@ -1084,6 +1085,10 @@ impl SessionState {
                 // 알 수 없는 값은 `change`로 접는다 — 모르는 값을 읽기 전용으로 접으면
                 // 오타 하나가 실행을 조용히 막고, 사용자는 도구가 고장 났다고 읽는다.
                 "kind": if is_read_only_kind(kind) { kind } else { "change" },
+                // **어느 정지에서 이어졌는가**(62절). 연결일 뿐이고, 앞선 태스크의 무엇도
+                // 이 태스크의 근거로 쓰지 않는다 — 쓰면 "재개했다"는 주장이 성립하는
+                // 것처럼 보인다.
+                "followsUp": follows_up,
                 "createdAt": tomverse_core::time::now_iso(),
             },
             "policy": {

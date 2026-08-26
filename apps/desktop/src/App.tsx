@@ -179,6 +179,13 @@ export default function App() {
    */
   const [taskKind, setTaskKind] = useState<TaskKind>("change");
   /**
+   * 이 실행이 이어받는 앞선 정지의 태스크 id (62절).
+   *
+   * **재개가 아니다** — 새 실행이고, 이 값은 감사 기록이 "어느 정지에서 이어졌나"에
+   * 답할 수 있게 하는 연결이다.
+   */
+  const [followsUp, setFollowsUp] = useState<string | null>(null);
+  /**
    * 무인 실행 (state-machine 24절)과 그 짝인 검증 명령 자동 승인(24.5절).
    *
    * **두 스위치를 따로 둔다.** 무인 실행만 켜면 태스크는 검증 명령 승인에서 멈추고, 그건
@@ -611,6 +618,8 @@ export default function App() {
         // **질문인가**(51절). 이 값이 정하는 것은 경로만이 아니다 — Rust가 이걸 보고 도구를
         // 읽기 전용으로 좁혀 게이트에 꽂는다(51.2절).
         kind: taskKind,
+        // **어느 정지에서 이어졌는가**(62절). 재개가 아니라 연결이다.
+        followsUp: followsUp,
         // 시한의 판정은 화면 밖(src/lib)에 있다 — 계산이 화면 안에 있으면 검증할 방법이 없다.
         deadlineSecs: readDeadline(deadlineText, unattended).secs,
       });
@@ -1607,7 +1616,19 @@ export default function App() {
               {finalResult && <AuditExportPanel taskId={finalResult.taskId} />}
               {/* 무인 정지의 처방(24.8절)과 PR 올리기(28절). 둘 다 **끝난 작업에 대한 질문**이라
                   결과 옆에 둔다 — 진행 중에는 답이 아직 없다. */}
-              {finalResult && <BlockedPanel taskId={finalResult.taskId} />}
+              {finalResult && (
+                <BlockedPanel
+                  taskId={finalResult.taskId}
+                  onFollowUp={(grant, previousTaskId) => {
+                    // **스위치를 켜 두고 시작 화면으로 보낸다** — 여기서 시작하지 않는다(62절).
+                    // 한 번의 클릭이 무엇을 넓히는지를 사용자가 읽어야 한다.
+                    if (grant.includes("--auto-approve-verification")) setAutoApproveVerification(true);
+                    if (grant.includes("--allow-git-commit")) setAllowGitCommit(true);
+                    setUnattended(true);
+                    setFollowsUp(previousTaskId);
+                  }}
+                />
+              )}
               {finalResult && <PullRequestPanel taskId={finalResult.taskId} />}
             </div>
 

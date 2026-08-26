@@ -97,6 +97,7 @@ async fn start_task(
     skill_path: Option<String>,
     /// 이 요청이 **질문인가** (state-machine 51절). 참이면 파일을 바꾸지 않는 경로를 탄다.
     kind: Option<String>,
+    follows_up: Option<String>,
     /// 무인 실행의 시한(초) — state-machine 39절. 지나면 **태스크가 멈춘다.**
     /// `timeout_secs`와 다르다: 저쪽은 기다리기를 그만두는 시각이다(39.2절).
     deadline_secs: Option<u64>,
@@ -120,6 +121,7 @@ async fn start_task(
             auto_approve_verification.unwrap_or(false),
             skill_path.as_deref(),
             kind.as_deref().unwrap_or("change"),
+            follows_up.as_deref(),
             // 0은 받지 않는다 — "즉시 멈춘다"를 시한으로 적을 이유가 없고, 받으면 시작하자마자
             // 멈추는 실행이 정상 동작처럼 보인다.
             deadline_secs.filter(|s| *s > 0),
