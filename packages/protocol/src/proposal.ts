@@ -147,6 +147,60 @@ export interface SingleModelFixResult {
 }
 
 /**
+ * 계획 — state-machine 53절.
+ *
+ * **`ExecutionPlan`이 아니다.** 그쪽은 patch를 도구 호출로 쪼갠 결과이고, 이건 patch를 만들기
+ * **전에** 나오는 서술이다. 둘을 한 타입으로 합치면 "실행할 수 있는 것"과 "아직 아무것도
+ * 만들지 않은 것"이 같은 모양이 되고, 그러면 실행 경로가 이것을 받아 도는 길이 열린다.
+ *
+ * **그리고 `patch` 자리가 없다.** 없앤 것이 아니라 처음부터 두지 않았다 — 있으면 모델이 채우고,
+ * 채워진 것은 언젠가 누군가 쓴다. 계획 모드가 아끼려는 것이 바로 그 토큰이다.
+ */
+export interface PlanOutline {
+  taskId: string;
+  /** 한 줄 요약 — 목록 화면이 쓴다. */
+  summary: string;
+  /**
+   * 무엇을 어떤 순서로 할 것인가.
+   *
+   * `PlanStep`을 쓰지 않는다. 그쪽은 초안에 딸린 서술이고 `toolHint`를 갖는데(45절에서
+   * 실행 근거가 아니라고 못박았다), 여기서는 그 필드가 있다는 사실만으로 "이대로 실행하면
+   * 된다"고 읽힌다.
+   */
+  steps: PlanOutlineStep[];
+  /**
+   * 이 계획이 건드릴 것으로 **보이는** 파일들.
+   *
+   * 확정이 아니다 — 모델은 예산이 고른 부분집합만 봤고(context-engine 8·15절), 창 밖에
+   * 관련 지점이 남아 있을 수 있다. 화면이 이것을 "바뀔 파일"로 그리면 안 되는 이유다.
+   */
+  filesToChange: string[];
+  /**
+   * 이 계획이 틀릴 수 있는 자리.
+   *
+   * **산문이 아니라 값으로 받는다** — `QuestionAnswer.missingContext`와 같은 이유다.
+   * 이 경로에도 결정론적 판정자가 없으므로(만든 것이 없다) 이 목록이 사용자가 가진 방어다.
+   */
+  risks: string[];
+  /**
+   * 계획을 확정하려면 사용자에게 물어야 하는 것.
+   *
+   * `AWAITING_USER_INPUT`으로 가지 않고 **값으로 실어 끝낸다**(53.3절). 계획 모드에서
+   * 되묻기 루프를 도는 것은 이 모드가 아끼려는 토큰을 도로 쓰는 일이다.
+   */
+  openQuestions: string[];
+  model: string;
+  createdAt: ISODateTime;
+}
+
+export interface PlanOutlineStep {
+  /** 무엇을 하는가. */
+  intent: string;
+  /** 그 단계가 건드릴 것으로 보이는 파일들. 비어 있을 수 있다(조사 단계 등). */
+  files: string[];
+}
+
+/**
  * 질문에 대한 답 — state-machine 51절.
  *
  * **`DraftProposal`과 나란히 두지만 다른 타입이다.** 초안은 "이렇게 바꾸자"는 제안이고 이건

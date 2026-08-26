@@ -4,12 +4,14 @@ import type {
   NormalizedProviderError,
   ProviderCapabilitiesView,
   ReviewDecision,
+  PlanOutline,
   QuestionAnswer,
   SingleModelFixResult,
   TokenUsage,
 } from "@tomverse/protocol";
 import {
   validateDraftProposal,
+  validatePlanOutline,
   validateQuestionAnswer,
   validateReviewDecision,
   validateSingleModelFixResult,
@@ -22,8 +24,10 @@ import {
   buildFixPrompt,
   buildReviewPrompt,
   buildSingleModelFixPrompt,
+  buildPlanPrompt,
   buildQuestionPrompt,
   DRAFT_SCHEMA,
+  PLAN_SCHEMA,
   QUESTION_SCHEMA,
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
@@ -204,6 +208,20 @@ export class GeminiAdapter implements ProviderAdapter {
     const { parsed, usage, latencyMs, meta } = await this.structuredCall(buildQuestionPrompt(input), QUESTION_SCHEMA, ctx);
     return {
       value: validateQuestionAnswer(parsed, {
+        taskId: ctx.taskId,
+        model: this.modelId,
+        createdAt: new Date().toISOString(),
+      }),
+      usage,
+      latencyMs,
+      meta,
+    };
+  }
+
+  async outlinePlan(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<PlanOutline>> {
+    const { parsed, usage, latencyMs, meta } = await this.structuredCall(buildPlanPrompt(input), PLAN_SCHEMA, ctx);
+    return {
+      value: validatePlanOutline(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),

@@ -9,9 +9,11 @@ import { AnthropicAdapter } from "../src/providers/anthropic.js";
 import {
   buildDraftPrompt,
   buildFixPrompt,
+  buildPlanPrompt,
   buildQuestionPrompt,
   buildReviewPrompt,
   DRAFT_SCHEMA,
+  PLAN_SCHEMA,
   QUESTION_SCHEMA,
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
@@ -447,6 +449,30 @@ function rulesSectionOf(prompt: string, heading: string): string {
   return prompt.slice(at);
 }
 
+/**
+ * 스키마에 나오는 **모든** 속성 이름 — 중첩된 객체와 배열 item까지.
+ *
+ * 얕게 보면 배열 안의 속성을 "스키마에 없다"고 읽는다. 그 오판의 방향이 나쁘다: 검사가
+ * 없는 결함을 보고하면 사람이 검사를 고치는 대신 **검사를 약하게 만든다.**
+ */
+function allPropertyNames(schema: unknown): string[] {
+  const out = new Set<string>();
+  const walk = (node: unknown) => {
+    if (node === null || typeof node !== "object") return;
+    const obj = node as Record<string, unknown>;
+    const props = obj.properties;
+    if (props !== null && typeof props === "object") {
+      for (const [name, child] of Object.entries(props as Record<string, unknown>)) {
+        out.add(name);
+        walk(child);
+      }
+    }
+    if (obj.items !== undefined) walk(obj.items);
+  };
+  walk(schema);
+  return [...out];
+}
+
 test("프롬프트가 채우라고 말하는 필드는 전부 응답 스키마에 있다", () => {
   const snapshot = makeSnapshot();
   const draft = {
@@ -483,6 +509,11 @@ test("프롬프트가 채우라고 말하는 필드는 전부 응답 스키마�
       schema: QUESTION_SCHEMA,
     },
     {
+      what: "plan",
+      rules: rulesSectionOf(buildPlanPrompt({ snapshot, userMessage: "리팩터링하고 싶습니다" }), "Plan rules"),
+      schema: PLAN_SCHEMA,
+    },
+    {
       what: "fix",
       rules: rulesSectionOf(
         buildFixPrompt({
@@ -507,7 +538,11 @@ test("프롬프트가 채우라고 말하는 필드는 전부 응답 스키마�
     const mentioned = fieldNamesMentionedIn(c.rules);
     // **빈 집합에 대한 전칭 명제는 언제나 참이다** — 무엇을 셌는지 먼저 확인한다.
     assert.ok(mentioned.length >= 2, `${c.what}: 규칙에서 필드 이름을 ${mentioned.length}개만 찾았습니다`);
-    const properties = Object.keys(c.schema.properties as Record<string, unknown>);
+    // **중첩된 스키마까지 훑는다**(53절). 종전에는 최상위 `properties`만 봤고, 그래서
+    // 배열 item 안의 속성을 규칙이 이름으로 부르면 "스키마에 없다"고 거짓 실패했다 —
+    // 계획 스키마의 `steps[].intent`가 첫 사례다. 얕게 보는 검사는 스키마가 깊어지는 순간
+    // **틀린 쪽으로** 틀린다: 있는 것을 없다고 한다.
+    const properties = allPropertyNames(c.schema);
     const missing = mentioned.filter((name) => !properties.includes(name));
     assert.deepEqual(
       missing,
@@ -627,4 +662,36 @@ test("질문 프롬프트가 컨텍스트의 한계를 말한다", () => {
   assert.ok(prompt.includes("budgeted SUBSET"), prompt);
   assert.ok(prompt.includes("truncated to a slice"), prompt);
   assert.ok(prompt.includes("say so instead of guessing"), prompt);
+});
+
+/**
+ * **계획 프롬프트는 diff를 요구하지 않는다** — state-machine 53절.
+ *
+ * 이 모드가 존재하는 이유가 **patch를 만들기 전에 멈추는 것**이므로, 규칙에 diff 이야기가
+ * 있으면 모델이 계획과 함께 diff를 쓰고 그 순간 이 모드가 아끼려던 토큰이 나간다.
+ *
+ * 프로브로 확인했다: 금지 문장을 지워도 **아무 검사도 실패하지 않았다.** 모드의 핵심 규칙이
+ * 아무 데서도 확인되지 않고 있었다.
+ */
+test("계획 프롬프트가 diff를 요구하지도 허용하지도 않는다", () => {
+  const prompt = buildPlanPrompt({ snapshot: makeSnapshot(), userMessage: "리팩터링하고 싶습니다" });
+  assert.ok(!prompt.includes("unified diff"), prompt);
+  assert.ok(!prompt.includes("`patch`"), prompt);
+  assert.ok(prompt.includes("Do NOT write a diff"), prompt);
+  // 만들지 않는다는 것을 **첫 줄에서** 말한다.
+  assert.ok(prompt.startsWith("You are producing a PLAN"), prompt.slice(0, 80));
+});
+
+/**
+ * **계획에도 컨텍스트의 한계를 말한다** — 답변보다 더 필요하다.
+ *
+ * 답변은 최소한 기댄 파일을 대지만, 계획은 **아직 존재하지 않는 코드**에 대한 서술이라
+ * 대조할 것이 아무것도 없다. 그래서 위험을 값으로 요구하고, 빈 목록이 주장이라는 것까지
+ * 말한다 — 말하지 않으면 빈 `risks`가 기본값처럼 돌아온다.
+ */
+test("계획 프롬프트가 컨텍스트의 한계와 빈 위험 목록의 뜻을 말한다", () => {
+  const prompt = buildPlanPrompt({ snapshot: makeSnapshot(), userMessage: "리팩터링하고 싶습니다" });
+  assert.ok(prompt.includes("budgeted SUBSET"), prompt);
+  assert.ok(prompt.includes("outside what you were shown"), prompt);
+  assert.ok(prompt.includes("An empty `risks` list is a claim"), prompt);
 });

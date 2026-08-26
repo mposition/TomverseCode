@@ -12,7 +12,7 @@
  */
 
 import type { ReviewMode, Verdict } from "./common.js";
-import type { DraftProposal, PlanStep, QuestionAnswer, ReviewDecision, SingleModelFixResult } from "./proposal.js";
+import type { DraftProposal, PlanOutline, PlanStep, QuestionAnswer, ReviewDecision, SingleModelFixResult } from "./proposal.js";
 import type { RunCommandArgs } from "./tools.js";
 
 export class ValidationError extends Error {
@@ -368,6 +368,48 @@ export function assertRelativeWorkspacePath(value: unknown, path = "path"): stri
  * **빈 답을 받지 않는다.** 빈 문자열을 통과시키면 화면이 빈 카드를 그리고, 사용자는 그것을
  * "답이 없다"가 아니라 "도구가 깨졌다"로 읽는다.
  */
+/**
+ * 계획을 검증한다 — state-machine 53절.
+ *
+ * # `patch`를 받지 않는다
+ *
+ * 스키마에 자리가 없으므로 모델이 넣어도 여기서 사라진다. **조용히 버리는 것이 옳다** —
+ * 오류로 만들면 계획 하나가 통째로 실패하고, 사용자는 계획 대신 오류를 받는다. 반대로
+ * 통과시키면 patch가 계획에 딸려 다니고 언젠가 누군가 그것을 실행한다.
+ *
+ * # 빈 단계 목록은 오류다
+ *
+ * "계획했는데 할 일이 없다"는 답이 아니라 실패다. 통과시키면 화면이 빈 목록을 그리고
+ * 사용자는 우리가 계획을 잃어버렸다고 읽는다 — 모델이 아무것도 못 냈다는 사실과 다르다.
+ */
+export function validatePlanOutline(
+  raw: unknown,
+  ctx: { taskId: string; model: string; createdAt: string }
+): PlanOutline {
+  const o = requireObject(raw, "planOutline");
+  const rawSteps = o.steps;
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0) {
+    throw new ValidationError("planOutline.steps", "expected a non-empty array");
+  }
+  const steps = rawSteps.map((step, i) => {
+    const stepObj = requireObject(step, `planOutline.steps[${i}]`);
+    return {
+      intent: requireNonEmptyString(stepObj.intent, `planOutline.steps[${i}].intent`),
+      files: optionalStringArray(stepObj.files, `planOutline.steps[${i}].files`) ?? [],
+    };
+  });
+  return {
+    taskId: ctx.taskId,
+    summary: requireNonEmptyString(o.summary, "planOutline.summary"),
+    steps,
+    filesToChange: optionalStringArray(o.filesToChange, "planOutline.filesToChange") ?? [],
+    risks: optionalStringArray(o.risks, "planOutline.risks") ?? [],
+    openQuestions: optionalStringArray(o.openQuestions, "planOutline.openQuestions") ?? [],
+    model: ctx.model,
+    createdAt: ctx.createdAt,
+  };
+}
+
 export function validateQuestionAnswer(
   raw: unknown,
   ctx: { taskId: string; model: string; createdAt: string }

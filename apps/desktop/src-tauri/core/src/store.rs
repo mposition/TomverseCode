@@ -1573,7 +1573,7 @@ impl Store {
 pub fn is_terminal_phase(phase: &str) -> bool {
     matches!(
         phase,
-        "COMPLETED" | "FAILED" | "CANCELLED" | "REJECTED" | "INTERRUPTED" | "ANSWERED"
+        "COMPLETED" | "FAILED" | "CANCELLED" | "REJECTED" | "INTERRUPTED" | "ANSWERED" | "OUTLINED"
     )
 }
 

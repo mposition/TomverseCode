@@ -31,7 +31,11 @@ export type TaskPhase =
   /** 질문에 답하는 중 (state-machine 51절). */
   | "ANSWERING"
   /** 질문에 답했다 — **완료가 아니다** (51절). */
-  | "ANSWERED";
+  | "ANSWERED"
+  /** 계획을 세우는 중 (53절). `PLANNING`과 다르다 — 저쪽은 patch를 쪼갠다. */
+  | "OUTLINING"
+  /** 계획을 냈다 — **완료도 답변도 아니다** (53절). */
+  | "OUTLINED";
 
 /**
  * **이 목록은 세 번째 사본이다** (3.26.4절).
@@ -48,6 +52,7 @@ export const TERMINAL_PHASES: TaskPhase[] = [
   "INTERRUPTED",
   "REJECTED",
   "ANSWERED",
+  "OUTLINED",
 ];
 
 /** ui-wireframes.md 2절 — 내부 14 phase를 사용자에게 보이는 단계로 압축한다. */
@@ -70,7 +75,17 @@ export type UserStage =
    * 하는 것으로는 부족하다: 같은 단어를 쓰면 사용자는 같은 것으로 읽고, 색은 나중에 누군가
    * 통일한다.
    */
-  | "답변함";
+  | "답변함"
+  /** 계획 경로 (53절). */
+  | "계획"
+  /**
+   * 계획 경로의 종착 — **"완료"도 "답변함"도 아니다** (53절).
+   *
+   * 답변과 나누는 이유는 **다음 걸음이 다르기 때문**이다. 답을 읽은 사용자는 대개 거기서
+   * 끝내지만, 계획을 읽은 사용자는 "그럼 해 줘"라고 말한다. 같은 단어로 그리면 그 걸음이
+   * 어디 있는지 화면에서 사라진다.
+   */
+  | "계획 나옴";
 
 export const STAGE_ORDER: UserStage[] = ["준비 중", "분석", "검수", "승인 대기", "실행", "검증", "완료"];
 
@@ -82,13 +97,18 @@ export const STAGE_ORDER: UserStage[] = ["준비 중", "분석", "검수", "승�
  */
 export const QUESTION_STAGE_ORDER: UserStage[] = ["준비 중", "답변", "답변함"];
 
+/** 계획 경로의 단계 (53절). 질문과 같은 모양이고, 같은 이유로 변경 경로를 빌리지 않는다. */
+export const PLAN_STAGE_ORDER: UserStage[] = ["준비 중", "계획", "계획 나옴"];
+
 /** 이 태스크가 밟는 단계들. `kind`가 정한다 — phase로 추측하면 시작 시점에 알 수 없다. */
 export function stagesFor(kind: TaskKind): UserStage[] {
-  return kind === "question" ? QUESTION_STAGE_ORDER : STAGE_ORDER;
+  if (kind === "question") return QUESTION_STAGE_ORDER;
+  if (kind === "plan") return PLAN_STAGE_ORDER;
+  return STAGE_ORDER;
 }
 
 /** 바꿔 달라는 것인가 물어보는 것인가 (state-machine 51절). */
-export type TaskKind = "change" | "question";
+export type TaskKind = "change" | "question" | "plan";
 
 export function phaseToStage(phase: TaskPhase): UserStage {
   switch (phase) {
@@ -120,6 +140,11 @@ export function phaseToStage(phase: TaskPhase): UserStage {
     // **"완료"로 접지 않는다.** 51절이 종착지를 나눈 이유가 여기서 사라진다.
     case "ANSWERED":
       return "답변함";
+    case "OUTLINING":
+      return "계획";
+    // **"완료"로도 "답변함"으로도 접지 않는다** (53절).
+    case "OUTLINED":
+      return "계획 나옴";
     default:
       return "완료";
   }
@@ -286,7 +311,7 @@ export interface CriterionEvaluation {
 export interface FinalResult {
   taskId: string;
   /** `answered`는 **완료가 아니다** (state-machine 51절). */
-  status: "completed" | "failed" | "cancelled" | "rejected" | "answered";
+  status: "completed" | "failed" | "cancelled" | "rejected" | "answered" | "planned";
   failureReason?: string;
   summary: string;
   verificationReport?: VerificationReport;
@@ -311,6 +336,20 @@ export interface FinalResult {
     answer: string;
     citedFiles: string[];
     missingContext: string[];
+    model: string;
+  };
+  /**
+   * 계획 (53절). `status === "planned"`일 때만 있다.
+   *
+   * `answer`와 나란히 두되 다른 필드다 — 같은 자리에 넣으면 화면이 "읽고 끝"과
+   * "그럼 해 줘"를 구별하지 못한다.
+   */
+  plan?: {
+    summary: string;
+    steps: { intent: string; files: string[] }[];
+    filesToChange: string[];
+    risks: string[];
+    openQuestions: string[];
     model: string;
   };
 }

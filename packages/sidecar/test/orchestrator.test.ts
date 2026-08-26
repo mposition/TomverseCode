@@ -1674,3 +1674,135 @@ test("kind가 없으면 종전 경로를 그대로 탄다", async () => {
   assert.equal(result.status, "completed", result.summary);
   assert.ok(host.phaseSequence().includes("VERIFYING"));
 });
+
+// ---- 계획 경로 (state-machine 53절) ----
+
+/**
+ * **계획 모드가 존재하는 이유는 patch를 만들기 전에 멈추는 것이다** — state-machine 53절.
+ *
+ * 종전에도 계획은 실행 전에 보이고 승인을 지났지만(42절) **patch를 만든 뒤**였다. 계획만
+ * 보고 되돌리려면 토큰이 이미 나갔다는 뜻이다.
+ */
+test("계획은 patch를 만들지 않고 계획으로 끝난다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }] },
+    {
+      script: [
+        {
+          kind: "plan",
+          payload: {
+            summary: "예산 원장을 두 단계로 나눈다",
+            steps: [
+              { intent: "원장 인터페이스를 뽑는다", files: ["src/app.ts"] },
+              { intent: "호출부를 옮긴다", files: ["src/app.ts"] },
+            ],
+            filesToChange: ["src/app.ts"],
+            risks: ["호출부가 컨텍스트 밖에 더 있을 수 있다"],
+            openQuestions: ["기존 원장을 남길 것인가"],
+          },
+        },
+      ],
+    },
+    { message: "예산 원장을 리팩터링하고 싶습니다", kind: "plan" }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "planned", result.summary);
+  assert.equal(result.plan?.steps.length, 2);
+  assert.deepEqual(result.plan?.risks, ["호출부가 컨텍스트 밖에 더 있을 수 있다"]);
+
+  const phases = host.phaseSequence();
+  assert.deepEqual(phases, ["SNAPSHOTTING", "OUTLINING", "OUTLINED"], phases.join(" → "));
+  // **파일을 바꾸지 않는다.** 그리고 `PLANNING`도 지나지 않는다 — 쪼갤 patch가 없다.
+  assert.ok(!phases.includes("PLANNING"), phases.join(" → "));
+  assert.deepEqual(
+    host.toolRequests.filter((r) => ["apply_patch", "create_file", "delete_file", "move_file"].includes(r.tool)),
+    []
+  );
+  // 검증도 돌리지 않는다 — baseline조차.
+  assert.deepEqual(host.verifyCalls, [], JSON.stringify(host.verifyCalls));
+});
+
+/**
+ * **계획은 완료도 답변도 아니다.** 감사 기록에서 셋이 같은 이벤트로 남으면 "이 변경은 어떤
+ * 계획에서 나왔나"를 나중에 되짚을 수 없다.
+ */
+test("계획은 TASK_COMPLETED로도 QUESTION_ANSWERED로도 기록되지 않는다", async () => {
+  const { orchestrator, host } = build({}, { script: [{ kind: "plan" }] }, { message: "어떻게 할까요", kind: "plan" });
+  await orchestrator.run();
+
+  const types = host.eventTypes();
+  assert.ok(types.includes("PLAN_OUTLINED"), types.join(", "));
+  assert.ok(!types.includes("TASK_COMPLETED"), types.join(", "));
+  assert.ok(!types.includes("QUESTION_ANSWERED"), types.join(", "));
+});
+
+/**
+ * **모델이 patch를 내밀어도 받지 않는다.** 스키마에 자리가 없으므로 검증에서 사라진다 —
+ * 통과시키면 patch가 계획에 딸려 다니고 언젠가 누군가 그것을 실행한다.
+ */
+test("계획에 딸려 온 patch는 결과에 남지 않는다", async () => {
+  const { orchestrator } = build(
+    {},
+    {
+      script: [
+        {
+          kind: "plan",
+          payload: {
+            summary: "고친다",
+            steps: [{ intent: "고친다", files: ["src/app.ts"] }],
+            // 모델이 규칙을 어기고 넣은 경우.
+            patch: "--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1 @@\n-a\n+b\n",
+          },
+        },
+      ],
+    },
+    { message: "고쳐 주세요", kind: "plan" }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "planned");
+  assert.equal(JSON.stringify(result.plan).includes("+++ b/"), false, JSON.stringify(result.plan));
+});
+
+/**
+ * **"위험 없음"과 "말하지 않음"을 구별할 수 있어야 한다.** 이 경로에는 결정론적 판정자가
+ * 없으므로(만든 것이 없다) 모델이 스스로 말한 위험이 사용자가 가진 유일한 방어다.
+ */
+test("모델이 밝힌 위험과 열린 질문이 이벤트에 남는다", async () => {
+  const { orchestrator, host } = build(
+    {},
+    {
+      script: [
+        {
+          kind: "plan",
+          payload: {
+            summary: "고친다",
+            steps: [{ intent: "고친다", files: [] }],
+            risks: ["a", "b"],
+            openQuestions: ["c"],
+          },
+        },
+      ],
+    },
+    { message: "고쳐 주세요", kind: "plan" }
+  );
+  await orchestrator.run();
+
+  const received = host.events.find((e) => e.type === "DRAFT_RECEIVED");
+  const payload = received?.payload as { riskCount?: number; openQuestionCount?: number; kind?: string };
+  assert.equal(payload.kind, "plan_outline");
+  assert.equal(payload.riskCount, 2);
+  assert.equal(payload.openQuestionCount, 1);
+});
+
+/** 단계가 하나도 없는 계획은 **실패**다 — 빈 목록을 통과시키면 화면이 우리 손실로 읽힌다. */
+test("단계가 없는 계획은 통과하지 않는다", async () => {
+  const { orchestrator } = build(
+    {},
+    { script: [{ kind: "plan", payload: { summary: "고친다", steps: [] } }] },
+    { message: "고쳐 주세요", kind: "plan" }
+  );
+  const result = await orchestrator.run();
+  assert.notEqual(result.status, "planned", result.summary);
+});

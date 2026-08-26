@@ -703,6 +703,25 @@ pre.diff {
   line-height: 1.6;
 }
 
+/*
+ * 계획도 완료와 다르고 **답변과도 다르다** — ui-wireframes 3.27.1절.
+ *
+ * 셋을 색으로 나누는 것이 목적은 아니다(레이블이 이미 다르다). 여기서 `--warn`을 쓰는 이유는
+ * 계획이 "아직 아무것도 하지 않았다"는 상태이기 때문이다 — 초록은 끝났다고 말하고, 파랑은
+ * 답을 줬다고 말한다. 계획은 둘 다 아니다.
+ */
+.result-planned {
+  border-color: var(--warn);
+}
+
+.plan-steps {
+  line-height: 1.7;
+}
+
+.plan-steps > li {
+  margin-bottom: 0.4rem;
+}
+
 /* ---- 취소 / 중단 상태 ---- */
 
 .event-cancel .event-type {

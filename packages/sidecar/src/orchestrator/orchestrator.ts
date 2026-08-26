@@ -12,6 +12,7 @@ import type {
   FileMove,
   FinalResult,
   McpCallRequest,
+  PlanOutline,
   QuestionAnswer,
   ReviewDecision,
   RoutingDecision,
@@ -70,6 +71,32 @@ import type { BudgetEventType } from "../budget/ledger.js";
  * 이 표는 양쪽으로 컴파일러가 지킨다: `Record`가 원장 타입 전부를 요구하고, 값은
  * `TaskEventType`이어야 한다.
  */
+/**
+ * 결말 하나가 정하는 것 둘: 어떤 phase로 가고 어떤 이벤트를 남기는가 — state-machine 53절.
+ *
+ * # 왜 표인가
+ *
+ * 종전에는 삼항 사슬이 **둘** 있었다(phase용, 이벤트용). 51절이 `answered`를 더할 때 두 곳을
+ * 함께 고쳤는데, 그건 사람이 기억해서 한 일이다 — 한쪽만 고치면 답변이 `ANSWERED`로 가면서
+ * `TASK_REJECTED`를 남기고, 그 어긋남은 감사 기록을 나중에 읽는 사람에게만 보인다.
+ *
+ * `Record<FinalResult["status"], …>`라 새 결말을 더하면 **컴파일이 막는다.** 사람이 기억할
+ * 일을 타입이 대신한다.
+ *
+ * # 왜 `TASK_COMPLETED`를 나눠 쓰는가
+ *
+ * 답변도 계획도 감사 기록에서 완료와 구별돼야 한다(51·53절). 같은 이벤트로 남으면
+ * "검증을 통과한 변경"과 "아무것도 바꾸지 않은 것"을 사후에 구별할 수 없다.
+ */
+const TERMINAL_OF: Record<FinalResult["status"], { phase: TaskPhase; event: TaskEventType }> = {
+  completed: { phase: "COMPLETED", event: "TASK_COMPLETED" },
+  failed: { phase: "FAILED", event: "TASK_FAILED" },
+  cancelled: { phase: "CANCELLED", event: "TASK_CANCELLED" },
+  rejected: { phase: "REJECTED", event: "TASK_REJECTED" },
+  answered: { phase: "ANSWERED", event: "QUESTION_ANSWERED" },
+  planned: { phase: "OUTLINED", event: "PLAN_OUTLINED" },
+};
+
 const BUDGET_EVENT_NAMES: Record<BudgetEventType, TaskEventType> = {
   approval_created: "BUDGET_APPROVAL_CREATED",
   approval_raised: "BUDGET_APPROVAL_RAISED",
@@ -203,6 +230,7 @@ export class Orchestrator {
   private lastReport: VerificationReport | null = null;
   /** 질문 경로의 답 — `finish`가 결과에 실어 보낸다 (51절). */
   private pendingAnswer: QuestionAnswer | null = null;
+  private pendingPlan: PlanOutline | null = null;
   /**
    * 적용된 변경에 대해 **우리가 실제로 아는 것** — 경로와 크기. diff가 아니다.
    *
@@ -488,6 +516,11 @@ export class Orchestrator {
     // 산출물이 없으므로 그 판정에 답이 없다.
     if (this.input.taskRequest.kind === "question") {
       return this.answerQuestion();
+    }
+    // 계획 모드도 같은 자리에서 갈린다(53절). 이유도 같다 — patch를 만들지 않으므로 baseline도
+    // TRIAGE도 답할 것이 없다.
+    if (this.input.taskRequest.kind === "plan") {
+      return this.outlinePlan();
     }
 
     // ---- baseline 검증 ----
@@ -2296,7 +2329,7 @@ export class Orchestrator {
    * 다른 종착지를 만들었다** — `ANSWERED`.
    */
   private async answerQuestion(): Promise<FinalResult> {
-    const routed = await this.routeForQuestion();
+    const routed = await this.routeForReadOnly("question_path");
     if (routed.kind === "final") return routed.result;
 
     await this.transition("ANSWERING");
@@ -2330,10 +2363,15 @@ export class Orchestrator {
   }
 
   /**
-   * 질문 경로의 라우팅. 변경 경로와 **같은 라우터**를 쓰되 tier는 `simple`로 고정한다 —
-   * 교차검증을 할 이유가 없고, TRIAGE를 돌리면 없는 질문에 답을 만들게 된다.
+   * 읽기 전용 경로(질문·계획)의 라우팅. 변경 경로와 **같은 라우터**를 쓰되 tier는 `simple`로
+   * 고정한다 — 교차검증을 할 이유가 없고, TRIAGE를 돌리면 없는 질문에 답을 만들게 된다.
+   *
+   * **두 경로가 한 함수를 쓴다**(53절). 복사해 두면 한쪽만 tier가 바뀌거나 한쪽만 정책 이름을
+   * 잃고, 그 어긋남은 라우팅 기록을 나중에 읽는 사람에게만 보인다.
    */
-  private async routeForQuestion(): Promise<{ kind: "ok" } | { kind: "final"; result: FinalResult }> {
+  private async routeForReadOnly(
+    appliedPolicy: string
+  ): Promise<{ kind: "ok" } | { kind: "final"; result: FinalResult }> {
     try {
       const routerOptions: RouterOptions = {
         ...this.deps.routerOptions,
@@ -2343,7 +2381,7 @@ export class Orchestrator {
         taskId: this.taskId,
         complexityTier: "simple",
         availableProviders: this.input.availableProviders,
-        appliedPolicies: ["question_path"],
+        appliedPolicies: [appliedPolicy],
         contrast: false,
       });
     } catch (error) {
@@ -2368,6 +2406,54 @@ export class Orchestrator {
       throw error;
     }
     return { kind: "ok" };
+  }
+
+  /**
+   * 계획 경로 — state-machine 53절.
+   *
+   * `answerQuestion`과 **같은 모양이고, 같아야 한다.** 두 경로가 갈라지면 "파일을 바꾸지
+   * 않는다"는 보장이 한쪽에만 있게 되고, 어느 쪽이 보장을 잃었는지는 코드를 읽어야만 안다.
+   *
+   * # 왜 `AWAITING_USER_INPUT`으로 가지 않는가
+   *
+   * 모델이 물을 것이 있으면 `openQuestions`로 **값으로 싣고 끝낸다.** 되묻기 루프를 돌면
+   * 이 모드가 아끼려는 토큰을 도로 쓰고, 사용자는 "계획을 보려 했는데 심문을 당한" 셈이 된다.
+   * 물음은 계획의 일부이지 계획을 막는 관문이 아니다.
+   */
+  private async outlinePlan(): Promise<FinalResult> {
+    const routed = await this.routeForReadOnly("plan_path");
+    if (routed.kind === "final") return routed.result;
+
+    await this.transition("OUTLINING");
+    if (await this.cancelledHere()) return this.finish("cancelled", "OUTLINING 중 취소됨");
+
+    const executor = this.adapters!.executor;
+    const response = await this.callProvider(executor, "executor", "plan:1", (ctx) =>
+      executor.outlinePlan(
+        {
+          snapshot: this.snapshot!,
+          userMessage: this.input.taskRequest.userMessage,
+          ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
+        },
+        ctx
+      )
+    );
+    if (response.kind === "final") return response.result;
+
+    const plan = response.value;
+    await this.emit("DRAFT_RECEIVED", {
+      model: plan.model,
+      kind: "plan_outline",
+      stepCount: plan.steps.length,
+      filesToChange: plan.filesToChange,
+      // **"틀릴 수 있다"를 세는 자리.** 이 경로에는 결정론적 판정자가 없으므로(만든 것이
+      // 없다) 모델이 스스로 말한 위험이 사용자가 가진 유일한 방어다.
+      riskCount: plan.risks.length,
+      openQuestionCount: plan.openQuestions.length,
+    });
+
+    this.pendingPlan = plan;
+    return this.finish("planned", plan.summary);
   }
 
   /** 답을 실어 종료한다. `finish`를 지나므로 "정확히 한 번" 규칙과 취소 경쟁 처리를 공유한다. */
@@ -2414,16 +2500,7 @@ export class Orchestrator {
       await this.transition("CANCELLING");
     }
 
-    const targetPhase: TaskPhase =
-      status === "completed"
-        ? "COMPLETED"
-        : status === "failed"
-          ? "FAILED"
-          : status === "cancelled"
-            ? "CANCELLED"
-            : status === "answered"
-              ? "ANSWERED"
-              : "REJECTED";
+    const targetPhase: TaskPhase = TERMINAL_OF[status].phase;
 
     // 터미널 전이가 표에 없는 상태에서 끝나는 경우(예: AWAITING_APPROVAL에서 REJECTED)를
     // 조용히 넘기지 않고 이벤트로 남긴다. 전이가 불가능하면 phase는 그대로 두고
@@ -2438,19 +2515,7 @@ export class Orchestrator {
       this.state.phase = targetPhase;
     }
 
-    const eventType =
-      status === "completed"
-        ? "TASK_COMPLETED"
-        : status === "failed"
-          ? "TASK_FAILED"
-          : status === "cancelled"
-            ? "TASK_CANCELLED"
-            : status === "answered"
-              ? // **`TASK_COMPLETED`를 쓰지 않는다**(51절). 감사 기록에서 답변과 완료가 같은
-                // 이벤트로 남으면, "검증을 통과한 변경"과 "아무것도 바꾸지 않은 답변"을
-                // 사후에 구별할 수 없다.
-                "QUESTION_ANSWERED"
-              : "TASK_REJECTED";
+    const eventType = TERMINAL_OF[status].event;
 
     const result: FinalResult = {
       taskId: this.taskId,
@@ -2461,6 +2526,7 @@ export class Orchestrator {
       // **답변은 여기 실린다.** `summary`에만 두면 화면이 요약과 답을 구별하지 못하고,
       // 긴 답이 요약 자리에 들어가 목록이 망가진다.
       ...(this.pendingAnswer ? { answer: this.pendingAnswer } : {}),
+      ...(this.pendingPlan ? { plan: this.pendingPlan } : {}),
       auditTrailEventIds: this.eventIds,
       // 성공/실패/취소를 가리지 않고 담는다 — 사용자가 무엇을 결정했는지는 결과와 무관한 사실이고,
       // 실패한 태스크야말로 "무엇을 요구했는지"를 다시 보게 되는 자리다.

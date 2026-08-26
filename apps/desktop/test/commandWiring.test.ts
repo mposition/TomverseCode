@@ -154,8 +154,11 @@ test("두 진입점 모두 질문 태스크의 좁히기를 코어에 맡긴다"
     // "부르는가" 하나뿐이다.
     const call = "skills::tools_for_question" + "(";
     assert.ok(body.includes(call), `${path.basename(file)}: 코어의 좁히기를 부르지 않습니다`);
+    // needle은 "읽기 전용 필터"가 아니라 **도구 목록을 여기서 다시 훑는가**다.
+    // `is_read_only`로 찾으면 종류 판정 함수 이름(`is_read_only_kind`)에 걸린다 — 검사가
+    // 이름의 부분 문자열에 기대면 무관한 이름 하나로 거짓 실패가 난다.
     assert.ok(
-      !body.includes("is_read_only"),
+      !body.includes("ALL_TOOLS"),
       `${path.basename(file)}: 좁히기를 여기서 다시 구현했습니다 — 검사할 수 없는 자리입니다`
     );
 
@@ -169,10 +172,38 @@ test("두 진입점 모두 질문 태스크의 좁히기를 코어에 맡긴다"
 });
 
 /** 화면이 그 값을 **보내야** 한다 — 안 보내면 토글이 아무것도 하지 않는다. */
-test("화면이 start_task에 question을 보낸다", () => {
+test("화면이 start_task에 종류를 보낸다", () => {
   const app = readFileSync(
     path.join(findUp("src-tauri", path.dirname(fileURLToPath(import.meta.url))), "src", "App.tsx"),
     "utf8"
   );
-  assert.ok(app.includes('question: taskKind === "question"'), "App.tsx가 question을 보내지 않습니다");
+  // **불리언이 아니라 종류다**(53절). 종류가 셋이 되면서 `question: boolean`으로는 표현할 수
+  // 없어졌다 — 불리언을 하나 더 붙이면 둘 다 true인 상태를 타입이 허용한다.
+  assert.ok(app.includes("kind: taskKind"), "App.tsx가 태스크 종류를 보내지 않습니다");
+});
+
+/**
+ * **읽기 전용 종류의 판정이 한 자리에 있어야 한다** — state-machine 53절.
+ *
+ * 도구 좁히기와 sidecar로 보내는 값이 각자 `== "question"`을 적으면, 새 읽기 전용 종류가
+ * 늘 때 한쪽만 갱신된다. 그리고 **갱신되지 않은 쪽이 좁히지 않는 쪽이면** 계획 태스크가
+ * 쓰기 도구를 들고 돈다 — 그 어긋남은 컴파일도 통과하고 이 환경에서는 실행도 되지 않는다.
+ */
+test("두 진입점 모두 읽기 전용 종류를 한 함수로 판정한다", () => {
+  for (const [file, fn] of [
+    [SESSION_RS, "is_read_only_kind"],
+    [HOST_BIN_RS, "is_read_only_command"],
+  ] as const) {
+    const source = readFileSync(file, "utf8");
+    const marker = `fn ${fn}` + "(";
+    const at = source.indexOf(marker);
+    assert.notEqual(at, -1, `${path.basename(file)}에 ${fn}이 없습니다`);
+    const body = source.slice(at, source.indexOf("\n}", at));
+    assert.ok(body.includes("plan"), `${path.basename(file)}: ${fn}이 계획을 읽기 전용으로 보지 않습니다`);
+
+    // 그리고 **그 함수 밖에서** 종류를 다시 비교하지 않는다 — 비교가 두 곳이면 갈라진다.
+    const outside = source.slice(0, at) + source.slice(source.indexOf("\n}", at));
+    const needle = '== "question"';
+    assert.ok(!outside.includes(needle), `${path.basename(file)}: 종류 비교가 ${fn} 밖에도 있습니다`);
+  }
 });

@@ -4,6 +4,7 @@ import type {
   ModelEntry,
   NormalizedProviderError,
   ProviderCapabilitiesView,
+  PlanOutline,
   QuestionAnswer,
   ReviewDecision,
   SingleModelFixResult,
@@ -253,6 +254,15 @@ export interface ProviderAdapter {
    * 싣는다"에 기대고 있다(transmission.rs).
    */
   answerQuestion(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<QuestionAnswer>>;
+
+  /**
+   * OUTLINING — 계획을 낸다 (state-machine 53절).
+   *
+   * `answerQuestion`과 같은 자리다. **출력에 patch가 없는 것이 이 역할의 정의**이며,
+   * 그래서 `generateDraft`와 한 함수로 합치지 않는다 — 합치면 "patch를 만들지 않는다"가
+   * 호출자의 약속이 되고, 약속은 코드보다 먼저 낡는다.
+   */
+  outlinePlan(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<PlanOutline>>;
 
   /**
    * FIX_LOOP — VerificationReport(정확히는 digest)만을 근거로 수정한다.

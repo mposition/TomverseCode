@@ -2,7 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { TaskPhase } from "@tomverse/protocol";
 import { isTerminalPhase } from "@tomverse/protocol";
-import { canReachAnsweredThroughMutation, canReachCompletedWithoutVerifying, isValidTransition, TRANSITIONS } from "../src/orchestrator/machine.js";
+import {
+  canReachAnsweredThroughMutation,
+  canReachCompletedWithoutVerifying,
+  canReachThroughMutation,
+  CHANGE_TERMINALS,
+  isValidTransition,
+  READ_ONLY_TERMINALS,
+  TRANSITIONS,
+} from "../src/orchestrator/machine.js";
+import { TERMINAL_PHASES } from "@tomverse/protocol";
 
 test("문서 2절의 유효한 전이를 허용한다", () => {
   const valid: [TaskPhase, TaskPhase][] = [
@@ -115,4 +124,52 @@ test("ANSWERING은 COMPLETED로 가지 않는다", () => {
 test("ANSWERED는 터미널이다", () => {
   assert.equal(isTerminalPhase("ANSWERED" as TaskPhase), true);
   assert.deepEqual([...TRANSITIONS.ANSWERED], []);
+});
+
+/**
+ * **읽기 전용 종착지는 전부 실행을 지나지 않는다** — state-machine 51·53절.
+ *
+ * 위 검사(`ANSWERED`)의 일반형이다. 53절이 두 번째 종착지를 만들면서, 같은 불변식을 손으로
+ * 한 번 더 적을 뻔했다 — 두 벌이 되면 나중에 한쪽만 고쳐진다.
+ */
+test("읽기 전용 종착지에 도달하는 경로는 실행을 지나지 않는다", () => {
+  assert.ok(READ_ONLY_TERMINALS.length >= 2, "목록이 하나뿐이면 이 일반화가 공허하다");
+  for (const terminal of READ_ONLY_TERMINALS) {
+    assert.equal(canReachThroughMutation(terminal), false, `${terminal}에 실행을 지나 도달할 수 있습니다`);
+  }
+  // **대조군.** 변경 종착지는 실행을 지나 도달할 수 있어야 한다 — 아니면 위 전칭 명제가
+  // "아무 경로도 실행을 지나지 않는다"는 뜻이 되어 아무것도 지키지 않는다.
+  assert.equal(canReachThroughMutation("COMPLETED"), true, "완료 경로가 실행을 지나지 않습니다");
+});
+
+/**
+ * **새 종착지를 만들면 분류하기 전까지 실패한다.**
+ *
+ * `READ_ONLY_TERMINALS`는 손으로 적은 목록이고, 그래서 낡을 수 있다. 낡으면 그 경로에 대해
+ * 위 불변식이 **아무 말도 하지 않으면서** 검사는 통과한다 — 51절이 `ANSWERED`를 만들 때
+ * 화면 쪽 사본이 그렇게 낡았다(ui-wireframes 3.26.4절).
+ */
+test("모든 터미널 phase가 둘 중 하나로 분류돼 있다", () => {
+  const classified = [...READ_ONLY_TERMINALS, ...CHANGE_TERMINALS].sort();
+  assert.deepEqual(
+    classified,
+    [...TERMINAL_PHASES].sort(),
+    "분류되지 않은 종착지가 있습니다 — 읽기 전용인지 변경 경로인지 정해야 합니다"
+  );
+  // 겹치면 안 된다 — 겹친 것은 위 전칭 명제와 대조군 양쪽에 들어가 서로 모순된다.
+  assert.equal(new Set(classified).size, classified.length, "두 목록이 겹칩니다");
+});
+
+/** 계획 경로도 답변 경로와 같은 모양이다 — 갈라지면 한쪽만 보장을 잃는다. */
+test("OUTLINING은 COMPLETED로도 EXECUTING으로도 가지 않는다", () => {
+  assert.ok(!TRANSITIONS.OUTLINING.includes("COMPLETED"), TRANSITIONS.OUTLINING.join(", "));
+  assert.ok(!TRANSITIONS.OUTLINING.includes("EXECUTING"), TRANSITIONS.OUTLINING.join(", "));
+  assert.equal(isValidTransition("OUTLINING", "OUTLINED"), true);
+  assert.equal(isValidTransition("SNAPSHOTTING", "OUTLINING"), true);
+  assert.equal(canReachCompletedWithoutVerifying(), false);
+});
+
+/** 종전 이름이 일반형과 같은 답을 낸다 — 갈라지면 51절의 검사가 다른 것을 지키게 된다. */
+test("canReachAnsweredThroughMutation은 일반형의 별칭이다", () => {
+  assert.equal(canReachAnsweredThroughMutation(), canReachThroughMutation("ANSWERED"));
 });

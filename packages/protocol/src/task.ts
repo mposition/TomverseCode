@@ -1,6 +1,6 @@
 import type { ComplexityTier, ISODateTime } from "./common.js";
 import type { AcceptanceCriterion, CriterionEvaluation } from "./decision.js";
-import type { QuestionAnswer } from "./proposal.js";
+import type { PlanOutline, QuestionAnswer } from "./proposal.js";
 import type { RoutingDecision } from "./registry.js";
 import type { CommandPolicy } from "./tools.js";
 import type { VerificationReport } from "./verification.js";
@@ -19,8 +19,12 @@ export interface TaskRequest {
    * **모드가 아니라 요청의 종류다.** `executionMode`(fast/verified)는 같은 일을 얼마나
    * 신중하게 할지를 정하지만 이건 **하는 일이 다르다**: 질문은 patch를 만들지 않고
    * 검증하지 않으며 `COMPLETED`에 도달하지 않는다.
+   *
+   * `plan`은 세 번째 종류다(53절). 질문과 마찬가지로 파일을 바꾸지 않지만 **답이 아니라
+   * 제안**을 내고, 그래서 종착지도 다르다 — 사용자의 다음 행동이 "읽고 끝"이 아니라
+   * "그럼 해 줘"이기 때문이다.
    */
-  kind?: "change" | "question";
+  kind?: "change" | "question" | "plan";
   createdAt: ISODateTime;
 }
 
@@ -205,6 +209,14 @@ export type TaskPhase =
    * **파일을 바꾸지 않는 경로다.** 스냅샷을 만들고 모델을 한 번 부르고 끝난다.
    */
   | "ANSWERING"
+  /**
+   * 계획을 세우는 중 — state-machine 53절.
+   *
+   * **`PLANNING`이 아니다.** 그 이름은 이미 "patch를 도구 호출로 쪼개는" 단계가 쓰고 있고,
+   * 이 경로는 patch를 만들지 **않는다.** 비슷한 이름을 재활용하면 둘 중 하나를 읽는 사람이
+   * 다른 쪽 의미로 읽는다 — 그리고 그 오해의 방향이 하필 "이건 실행할 수 있는 계획이다"다.
+   */
+  | "OUTLINING"
   | "COMPLETED"
   | "FAILED"
   | "CANCELLED"
@@ -226,7 +238,17 @@ export type TaskPhase =
    * 그 덕분에 배지 규칙(product-strategy 11절)도 따로 손볼 것이 없다: 답변은 애초에
    * "완료된 변경"으로 읽히지 않는다.
    */
-  | "ANSWERED";
+  | "ANSWERED"
+  /**
+   * 계획을 냈다 — **완료도 답변도 아니다** (53절).
+   *
+   * `ANSWERED`와 나누는 이유는 **사용자의 다음 행동이 다르기 때문**이다. 답변을 읽은 사용자는
+   * 대개 거기서 끝내지만, 계획을 읽은 사용자는 "그럼 해 줘"라고 말한다 — 그 후속은 새
+   * 태스크이고, 화면이 둘을 같은 종착지로 그리면 그 다음 걸음이 어디 있는지 사라진다.
+   *
+   * `COMPLETED`가 아닌 이유는 `ANSWERED`와 같다: 검증을 지나지 않았고 바꾼 것이 없다.
+   */
+  | "OUTLINED";
 
 export const TERMINAL_PHASES: readonly TaskPhase[] = [
   "COMPLETED",
@@ -235,6 +257,7 @@ export const TERMINAL_PHASES: readonly TaskPhase[] = [
   "REJECTED",
   "INTERRUPTED",
   "ANSWERED",
+  "OUTLINED",
 ];
 
 export function isTerminalPhase(phase: TaskPhase): boolean {
@@ -350,7 +373,7 @@ export interface FinalResult {
    * `answered`가 따로 있는 이유는 `TaskPhase.ANSWERED`와 같다 — **답변은 완료가 아니다**(51절).
    * 하나로 뭉치면 "검증을 통과한 변경"과 "아무것도 바꾸지 않은 답변"이 같은 값이 된다.
    */
-  status: "completed" | "failed" | "cancelled" | "rejected" | "answered";
+  status: "completed" | "failed" | "cancelled" | "rejected" | "answered" | "planned";
   failureReason?: FailureReason;
   summary: string;
   /**
@@ -370,6 +393,13 @@ export interface FinalResult {
    * 목록의 한 줄 자리에 들어간다.
    */
   answer?: QuestionAnswer;
+  /**
+   * 계획 (53절). `status === "planned"`일 때만 있다.
+   *
+   * `answer`와 나란히 두되 다른 필드다 — 같은 자리에 넣으면 화면이 "읽고 끝"과
+   * "그럼 해 줘"를 구별하지 못한다.
+   */
+  plan?: PlanOutline;
   auditTrailEventIds: string[];
   /** 이 태스크가 변경한 파일 목록 (롤백 UX가 쓴다 — state-machine-and-protocol.md 10절) */
   mutatedPaths?: string[];

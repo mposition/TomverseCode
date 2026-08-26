@@ -4,12 +4,14 @@ import type {
   NormalizedProviderError,
   ProviderCapabilitiesView,
   ReviewDecision,
+  PlanOutline,
   QuestionAnswer,
   SingleModelFixResult,
   TokenUsage,
 } from "@tomverse/protocol";
 import {
   validateDraftProposal,
+  validatePlanOutline,
   validateQuestionAnswer,
   validateReviewDecision,
   validateSingleModelFixResult,
@@ -20,6 +22,7 @@ import {
   buildDraftPrompt,
   buildFixPrompt,
   buildReviewPrompt,
+  buildPlanPrompt,
   buildQuestionPrompt,
   buildSingleModelFixPrompt,
 } from "./prompts.js";
@@ -53,7 +56,7 @@ import type {
 
 export interface FakeScriptStep {
   /** 어떤 호출에 응답할지 */
-  kind: "draft" | "review" | "singleFix" | "fix" | "answer";
+  kind: "draft" | "review" | "singleFix" | "fix" | "answer" | "plan";
   /**
    * 이 스텝이 던질 오류 (재시도/타임아웃 경로 테스트용).
    *
@@ -304,6 +307,37 @@ export class FakeProviderAdapter implements ProviderAdapter {
       // **프롬프트를 실제로 만든다.** fake가 조립을 건너뛰면 그 경로의 결함(예: 스냅샷을 싣지
       // 않는 빌더)이 fake를 쓰는 검사 전부에서 보이지 않는다 — 전송 집계도 이 기록을 본다.
       meta: this.metaFor(step, this.record("answer", buildQuestionPrompt(input))),
+    };
+  }
+
+  async outlinePlan(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<PlanOutline>> {
+    const step = await this.consume("plan", ctx);
+    // **기본 payload가 게으르면 검사도 게을러진다.** 단계를 하나만 내면 "여러 단계를
+    // 그린다"는 화면 검사가 fake로는 언제나 한 줄만 보게 된다.
+    const targets = input.snapshot.relevantFiles.slice(0, 2);
+    // 스냅샷에 파일이 하나도 없어도 **단계는 비지 않는다** — 빈 목록은 검증이 거부하므로
+    // (계획했는데 할 일이 없다는 것은 답이 아니라 실패다) fake가 그 실패를 내면 스냅샷이
+    // 빈 검사들이 전부 "계획 실패"로 죽는다.
+    const steps =
+      targets.length > 0
+        ? targets.map((f, i) => ({ intent: `(fake) ${i + 1}단계 — ${f.path}를 고친다`, files: [f.path] }))
+        : [{ intent: "(fake) 계획 단계", files: [] }];
+    const payload = step?.payload ?? {
+      summary: `(fake) ${input.userMessage}에 대한 계획`,
+      steps,
+      filesToChange: targets.map((f) => f.path),
+      risks: [],
+      openQuestions: [],
+    };
+    return {
+      value: validatePlanOutline(payload, {
+        taskId: ctx.taskId,
+        model: this.modelId,
+        createdAt: new Date().toISOString(),
+      }),
+      usage: step?.usage ?? DEFAULT_USAGE,
+      latencyMs: step?.delayMs ?? 1,
+      meta: this.metaFor(step, this.record("plan", buildPlanPrompt(input))),
     };
   }
 

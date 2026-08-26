@@ -19,7 +19,7 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
   CREATED: ["SNAPSHOTTING", "CANCELLING", "CANCELLED", "FAILED"],
   // **질문은 TRIAGE로 가지 않는다**(51절). TRIAGE가 정하는 것은 "교차검증을 할 것인가"이고,
   // 질문에는 검증할 산출물이 없으므로 그 판정에 답이 없다.
-  SNAPSHOTTING: ["TRIAGE", "ANSWERING", "CANCELLING", "CANCELLED", "FAILED"],
+  SNAPSHOTTING: ["TRIAGE", "ANSWERING", "OUTLINING", "CANCELLING", "CANCELLED", "FAILED"],
   // TRIAGE는 complexityTier에 따라 갈린다.
   TRIAGE: ["DRAFTING", "SINGLE_MODEL_FIX", "CANCELLING", "CANCELLED", "FAILED"],
   /**
@@ -108,6 +108,11 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
    * 생긴다. `EXECUTING`도 없다: 질문은 파일을 바꾸지 않는다.
    */
   ANSWERING: ["ANSWERED", "CANCELLING", "CANCELLED", "FAILED"],
+  /**
+   * 계획 경로 — `ANSWERING`과 같은 모양이다(53절). `EXECUTING`도 `PLANNING`도 없다:
+   * 계획 모드는 patch를 만들지 않으므로 쪼갤 것도 적용할 것도 없다.
+   */
+  OUTLINING: ["OUTLINED", "CANCELLING", "CANCELLED", "FAILED"],
   COMPLETED: [],
   FAILED: [],
   CANCELLED: [],
@@ -115,7 +120,41 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
   // Node는 이 상태로 전이하지 않는다 — 호스트가 앱 시작 시 확정한다(store.rs).
   INTERRUPTED: [],
   ANSWERED: [],
+  OUTLINED: [],
 };
+
+/**
+ * 파일을 건드릴 수 있는 phase들. `canReachThroughMutation`이 이 목록을 쓴다.
+ *
+ * **`VERIFYING`이 들어 있는 이유**: 검증은 워크스페이스에서 명령을 돌리고, 그 명령이 파일을
+ * 남길 수 있다. "읽기만 하는 경로"라는 주장은 그것까지 포함해야 참이다.
+ */
+export const MUTATING_PHASES: readonly TaskPhase[] = [
+  "EXECUTING",
+  "PLANNING",
+  "AWAITING_APPROVAL",
+  "FIX_LOOP",
+  "VERIFYING",
+];
+
+/**
+ * 아무것도 바꾸지 않고 끝나는 종착지들 (51·53절).
+ *
+ * **손으로 적은 목록이고, 그래서 낡을 수 있다.** 새 종착지를 더하면서 여기 빠뜨리면 그
+ * 경로에 대해 아래 불변식이 **아무 말도 하지 않는다** — 그리고 검사는 통과한다. 그래서
+ * `machine.test.ts`가 `TERMINAL_PHASES` 전체를 이 목록과 `CHANGE_TERMINALS`로 나눠 덮는지
+ * 확인한다: 새 종착지를 만들면 **분류하기 전까지 실패한다.**
+ */
+export const READ_ONLY_TERMINALS: readonly TaskPhase[] = ["ANSWERED", "OUTLINED"];
+
+/** 변경 경로의 종착지들. 위 목록과 합쳐 `TERMINAL_PHASES` 전체가 되어야 한다. */
+export const CHANGE_TERMINALS: readonly TaskPhase[] = [
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+  "REJECTED",
+  "INTERRUPTED",
+];
 
 export function isValidTransition(from: TaskPhase, to: TaskPhase): boolean {
   return TRANSITIONS[from].includes(to);
@@ -133,29 +172,38 @@ export class InvalidTransitionError extends Error {
  * 테스트가 이걸 직접 검증한다 — 나중에 전이 표를 고칠 때 실수로 우회로가 생기면 실패한다.
  */
 /**
- * **답변 경로는 파일을 바꾸지 않는다**는 불변식의 명시적 표현 (51절).
+ * **읽기 전용 경로는 파일을 바꾸지 않는다**는 불변식의 명시적 표현 (51·53절).
  *
  * `canReachCompletedWithoutVerifying`의 거울이다. 저쪽은 "검증 없이 완료할 수 없다"를 지키고
- * 이쪽은 "답변한다면서 실행하지 않는다"를 지킨다 — 둘 다 전이 표에서 유도하므로, 나중에 표를
- * 고치다 우회로가 생기면 테스트가 실패한다.
+ * 이쪽은 "답변/계획한다면서 실행하지 않는다"를 지킨다 — 둘 다 전이 표에서 유도하므로, 나중에
+ * 표를 고치다 우회로가 생기면 테스트가 실패한다.
  *
  * 도구 허용목록(26절)이 Rust 쪽에서 같은 것을 한 겹 더 막는다. 여기는 **경로**의 보장이고
  * 그쪽은 **권한**의 보장이다 — 뭉치면 한쪽이 뚫렸을 때 다른 쪽도 없는 것으로 여기게 된다.
  */
-export function canReachAnsweredThroughMutation(): boolean {
-  const mutating: readonly TaskPhase[] = ["EXECUTING", "PLANNING", "AWAITING_APPROVAL", "FIX_LOOP", "VERIFYING"];
-  const visited = new Set<TaskPhase>();
+export function canReachThroughMutation(target: TaskPhase): boolean {
+  const visited = new Set<string>();
   const stack: { phase: TaskPhase; touched: boolean }[] = [{ phase: "CREATED", touched: false }];
   while (stack.length > 0) {
     const { phase, touched } = stack.pop()!;
-    const key = `${phase}:${touched}` as TaskPhase;
+    const key = `${phase}:${touched}`;
     if (visited.has(key)) continue;
     visited.add(key);
-    if (phase === "ANSWERED" && touched) return true;
-    const nextTouched = touched || mutating.includes(phase);
+    if (phase === target && touched) return true;
+    const nextTouched = touched || MUTATING_PHASES.includes(phase);
     for (const next of TRANSITIONS[phase]) stack.push({ phase: next, touched: nextTouched });
   }
   return false;
+}
+
+/**
+ * 종전 이름 — `ANSWERED` 하나만 보던 시절의 것이다(51절).
+ *
+ * **일반화한 이유**: 53절이 두 번째 읽기 전용 종착지를 만들면서, 같은 불변식을 손으로 한 번
+ * 더 적을 뻔했다. 두 벌이 되면 나중에 한쪽만 고쳐진다.
+ */
+export function canReachAnsweredThroughMutation(): boolean {
+  return canReachThroughMutation("ANSWERED");
 }
 
 export function canReachCompletedWithoutVerifying(): boolean {

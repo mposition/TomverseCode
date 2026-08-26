@@ -5,6 +5,7 @@ import type {
   NormalizedProviderError,
   ProviderCapabilitiesView,
   ReviewDecision,
+  PlanOutline,
   QuestionAnswer,
   SingleModelFixResult,
   TokenUsage,
@@ -12,6 +13,7 @@ import type {
 import { effectiveMaxOutputTokens } from "../budget/ledger.js";
 import {
   validateDraftProposal,
+  validatePlanOutline,
   validateQuestionAnswer,
   validateReviewDecision,
   validateSingleModelFixResult,
@@ -24,8 +26,10 @@ import {
   buildFixPrompt,
   buildReviewPrompt,
   buildSingleModelFixPrompt,
+  buildPlanPrompt,
   buildQuestionPrompt,
   DRAFT_SCHEMA,
+  PLAN_SCHEMA,
   QUESTION_SCHEMA,
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
@@ -204,6 +208,24 @@ export class AnthropicAdapter implements ProviderAdapter {
     );
     return {
       value: validateQuestionAnswer(parsed, {
+        taskId: ctx.taskId,
+        model: this.modelId,
+        createdAt: new Date().toISOString(),
+      }),
+      usage,
+      latencyMs,
+      meta,
+    };
+  }
+
+  async outlinePlan(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<PlanOutline>> {
+    const { parsed, usage, latencyMs, meta } = await this.forcedToolCall(
+      buildPlanPrompt(input),
+      { name: "submit_answer", description: "Answer the question about this repository.", schema: PLAN_SCHEMA },
+      ctx
+    );
+    return {
+      value: validatePlanOutline(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),

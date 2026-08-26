@@ -52,6 +52,7 @@ import { CarriedDecisionsPanel } from "./components/CarriedDecisionsPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
 import { AutopilotPreviewPanel } from "./components/AutopilotPreviewPanel";
 import { AnswerPanel } from "./components/AnswerPanel";
+import { PlanPanel } from "./components/PlanPanel";
 import { SkillLibraryPicker } from "./components/SkillLibraryPicker";
 import { EffectiveConfigPanel } from "./components/EffectiveConfigPanel";
 import { PullRequestPanel } from "./components/PullRequestPanel";
@@ -609,7 +610,7 @@ export default function App() {
         skillPath: skillPath.trim() === "" ? null : skillPath.trim(),
         // **질문인가**(51절). 이 값이 정하는 것은 경로만이 아니다 — Rust가 이걸 보고 도구를
         // 읽기 전용으로 좁혀 게이트에 꽂는다(51.2절).
-        question: taskKind === "question",
+        kind: taskKind,
         // 시한의 판정은 화면 밖(src/lib)에 있다 — 계산이 화면 안에 있으면 검증할 방법이 없다.
         deadlineSecs: readDeadline(deadlineText, unattended).secs,
       });
@@ -1106,6 +1107,18 @@ export default function App() {
                   <input type="radio" checked={taskKind === "question"} onChange={() => setTaskKind("question")} />
                   물어보기 — 파일을 바꾸지 않고 답만 합니다
                 </label>
+                <label>
+                  <input type="radio" checked={taskKind === "plan"} onChange={() => setTaskKind("plan")} />
+                  계획 세우기 — patch를 만들기 전에 멈춥니다
+                </label>
+                {taskKind === "plan" && (
+                  // **여기서 멈춘다는 것을 미리 말한다.** 계획을 받고 나서 "실행은요?"를
+                  // 묻게 되면, 그건 도구가 숨긴 것으로 읽힌다(53절).
+                  <p className="muted small">
+                    계획만 내고 <strong>끝납니다</strong>. 실행은 새 작업으로 시작하며, 그래야 승인한 것과
+                    적용되는 것이 어긋나지 않습니다.
+                  </p>
+                )}
                 {taskKind === "question" && (
                   // **검증되지 않는다는 사실을 미리 말한다.** 답을 받은 뒤에 알면 그건
                   // 도구가 숨긴 것으로 읽힌다(51.4절 — 이 경로에는 판정자가 없다).
@@ -1114,7 +1127,7 @@ export default function App() {
                   </p>
                 )}
               </fieldset>
-              <fieldset className="modes" disabled={running || taskKind === "question"}>
+              <fieldset className="modes" disabled={running || taskKind !== "change"}>
                 <legend>실행 정책</legend>
                 <label>
                   <input type="radio" checked={mode === "fast"} onChange={() => setMode("fast")} />
@@ -1494,8 +1507,10 @@ export default function App() {
 
               {/* 답변은 완료가 아니다 — 다른 패널로 그린다(51절, ui-wireframes 3.26절). */}
               <AnswerPanel answer={finalResult?.answer} />
+              {/* 계획도 완료가 아니다 — 또 다른 패널로 그린다(53절, ui-wireframes 3.27절). */}
+              <PlanPanel plan={finalResult?.plan} />
 
-              {finalResult && finalResult.status !== "answered" && (
+              {finalResult && finalResult.status !== "answered" && finalResult.status !== "planned" && (
                 <div className={`panel result result-${finalResult.status}`}>
                   <h2>{statusLabel(finalResult.status)}</h2>
                   {/* **무엇이 이 결과를 뒷받침하는가** — product-strategy.md 11절·16.5절.
@@ -1704,6 +1719,8 @@ function statusLabel(status: FinalResult["status"]): string {
     // 나중에 이 함수를 다른 자리에서 쓰면 그때 기본값이 "완료"가 되기 때문이다.
     case "answered":
       return "답변함";
+    case "planned":
+      return "계획 나옴";
   }
 }
 

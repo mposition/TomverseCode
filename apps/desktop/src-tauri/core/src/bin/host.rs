@@ -480,6 +480,10 @@ fn usage() -> String {
                  하지 않고 모델을 한 번 부른다. 도구는 읽기 전용으로 좁혀 게이트에 꽂히므로,\n\
                  sidecar가 장악당해도 이 태스크는 파일을 바꿀 수 없다. `COMPLETED`가 아니라\n\
                  `ANSWERED`로 끝난다 — 답변은 완료가 아니다(51절)\n\
+     plan    — 계획만 낸다(--message). **파일도 patch도 만들지 않는다** — `ask`와 같은 자리이고\n\
+                 도구도 같이 읽기 전용으로 좁힌다. `COMPLETED`가 아니라 `OUTLINED`로 끝나며\n\
+                 `ANSWERED`와도 다르다: 계획을 읽은 사용자의 다음 걸음은 \"그럼 해 줘\"이고\n\
+                 그건 새 태스크다(53절)\n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
      pr      — 현재 브랜치를 remote로 올리고 **PR 생성 폼 URL**을 낸다. [--remote origin]\n\
                  [--base main]. **우리는 GitHub에 요청을 보내지 않는다** — 폼을 여는 것은\n\
@@ -705,11 +709,19 @@ fn allowed_tools_for(
     skill: Option<&tomverse_core::skills::Skill>,
 ) -> Option<Vec<tomverse_core::types::ToolName>> {
     let from_skill = skill.and_then(|s| s.allowed_tools.clone());
-    if args.command != "ask" {
+    if !is_read_only_command(&args.command) {
         return from_skill;
     }
     // 좁히기 자체는 코어에 있다 — 화면과 이 CLI가 **같은 함수**를 쓴다.
     tomverse_core::skills::tools_for_question(from_skill)
+}
+
+/// 파일을 바꾸지 않는 하위 명령들 (51·53절).
+///
+/// **한 자리에서 판정한다.** 도구 좁히기와 sidecar에 보내는 `kind`가 각자 명령 이름을 직접
+/// 비교하면, 새 읽기 전용 명령이 늘 때 한쪽만 갱신되고 **좁혀지지 않은 쪽이 이긴다.**
+fn is_read_only_command(command: &str) -> bool {
+    matches!(command, "ask" | "plan")
 }
 
 /// 스킬을 **Rust가 읽는다**(26.1절). sidecar가 읽으면 도구 허용목록의 출처가 sidecar가 되고,
@@ -787,7 +799,7 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
         // 도구 허용목록은 **읽기 전용으로 좁혀서** 보낸다(아래 `policy`). 경로가 파일을 바꾸지
         // 않는다는 것은 Node의 성질이고, 게이트가 막는다는 것은 Rust의 성질이다 — 둘을
         // 뭉치면 한쪽이 뚫렸을 때 다른 쪽도 없는 것으로 여기게 된다.
-        "run" | "ask" => {
+        "run" | "ask" | "plan" => {
             if args.message.trim().is_empty() {
                 return Err(format!("{}에는 --message가 필요합니다", args.command));
             }
@@ -1362,7 +1374,11 @@ fn run_task(
             "workspaceId": workspace_id,
             "userMessage": args.message,
             // **바꿔 달라는 것인가 물어보는 것인가**(51절). 값이 없으면 종전과 같다.
-            "kind": if args.command == "ask" { "question" } else { "change" },
+            "kind": match args.command.as_str() {
+                "ask" => "question",
+                "plan" => "plan",
+                _ => "change",
+            },
             "createdAt": tomverse_core::time::now_iso(),
         },
         "policy": {

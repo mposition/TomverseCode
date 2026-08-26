@@ -145,17 +145,29 @@ pub struct SessionState {
 /// `apps/desktop/test/commandWiring.test.ts`. 판정의 세부(어떤 도구가 읽기 전용인가)는
 /// `bin/host.rs`의 Rust 단위 테스트가 본다.
 fn allowed_tools_for(
-    question: bool,
+    kind: &str,
     skill: Option<&tomverse_core::skills::Skill>,
 ) -> Option<Vec<tomverse_core::types::ToolName>> {
     let from_skill = skill.and_then(|s| s.allowed_tools.clone());
-    if !question {
+    if !is_read_only_kind(kind) {
         return from_skill;
     }
     // **좁히기 자체는 코어에 있다**(skills.rs `tools_for_question`). 이 크레이트는 이 환경에서
     // 컴파일되지 않아 여기 로직을 두면 검사할 수단이 소스 문자열뿐이고, 그 검사는 좁히기가
     // 살아 있는지가 아니라 글자가 남아 있는지만 본다.
     tomverse_core::skills::tools_for_question(from_skill)
+}
+
+/// 파일을 바꾸지 않는 요청 종류 (51·53절).
+///
+/// **한 자리에서 판정한다.** 도구 좁히기와 sidecar로 보내는 값이 각자 종류를 직접 비교하면,
+/// 새 읽기 전용 종류가 늘 때 한쪽만 갱신되고 **좁혀지지 않은 쪽이 이긴다.**
+/// 헤드리스 CLI의 `is_read_only_command`가 같은 일을 한다.
+///
+/// (주석에 그 비교식을 리터럴로 적지 말 것 — `commandWiring.test.ts`가 소스에서 그것을
+///  찾으므로 주석이 자기 자신을 세게 된다. 42절에서 같은 함정을 밟았다.)
+fn is_read_only_kind(kind: &str) -> bool {
+    matches!(kind, "question" | "plan")
 }
 
 /// 화면의 스위치에서 이 태스크의 정책을 만든다.
@@ -174,14 +186,14 @@ fn task_policy_from(
     auto_approve_verification: bool,
     skill: Option<&tomverse_core::skills::Skill>,
     deadline_secs: Option<u64>,
-    question: bool,
+    kind: &str,
 ) -> TaskPolicy {
     TaskPolicy {
         execution_mode: mode,
         allow_git_commit,
         unattended,
         auto_approve_verification,
-        allowed_tools: allowed_tools_for(question, skill),
+        allowed_tools: allowed_tools_for(kind, skill),
         // **sidecar로 가지 않는다**(39.1절). 시계도 판정도 Rust가 갖는다.
         deadline_ms: deadline_secs.map(|s| s * 1_000),
         ..TaskPolicy::default()
@@ -968,7 +980,7 @@ impl SessionState {
         ///
         /// 참이면 파일을 바꾸지 않는 경로를 탄다. 그 보장은 두 겹이다 — sidecar의 경로가
         /// `EXECUTING`을 지나지 않고, 여기서 도구를 읽기 전용으로 좁혀 게이트에 꽂는다.
-        question: bool,
+        kind: &str,
         /// 무인 실행의 **시한**(초) — state-machine 39절. `None`이면 상한이 없다.
         ///
         /// `timeout`과 다른 값이다: 저쪽은 이 호출이 기다리기를 그만두는 시각이고, 이쪽은
@@ -1026,7 +1038,7 @@ impl SessionState {
             auto_approve_verification,
             skill.as_ref(),
             deadline_secs,
-            question,
+            kind,
         );
         host.begin_task(&task_id, task_policy, skill.as_ref())?;
 
@@ -1052,7 +1064,10 @@ impl SessionState {
                 "userMessage": message,
                 // **바꿔 달라는 것인가 물어보는 것인가**(51절). 화면이 정한다 — 사용자의
                 // 문장을 보고 우리가 추측하면 "고쳐 달라"에 답만 하거나 그 반대가 된다.
-                "kind": if question { "question" } else { "change" },
+                // **종류를 화면이 정한다**(51.7절). 우리가 사용자의 문장을 보고 추측하지 않는다.
+                // 알 수 없는 값은 `change`로 접는다 — 모르는 값을 읽기 전용으로 접으면
+                // 오타 하나가 실행을 조용히 막고, 사용자는 도구가 고장 났다고 읽는다.
+                "kind": if is_read_only_kind(kind) { kind } else { "change" },
                 "createdAt": tomverse_core::time::now_iso(),
             },
             "policy": {
@@ -1069,7 +1084,7 @@ impl SessionState {
                 // 화면은 이 목록을 **지키지 않는다** — 지키는 것은 Rust의 게이트다(26.1절).
                 // **게이트에 꽂힌 값을 그대로 보낸다**(51절) — 여기서 다시 계산하면 화면이
                 // 말하는 허용목록과 실제로 좁혀진 목록이 갈릴 수 있다.
-                "allowedTools": allowed_tools_for(question, skill.as_ref())
+                "allowedTools": allowed_tools_for(kind, skill.as_ref())
                     .as_ref()
                     .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
             },

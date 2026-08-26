@@ -179,6 +179,13 @@ export type TaskEventType =
    * "검증을 통과한 변경"과 "아무것도 바꾸지 않은 답변"을 사후에 구별할 수 없다.
    */
   | "QUESTION_ANSWERED"
+  /**
+   * 계획을 냈다 — state-machine 53절.
+   *
+   * `QUESTION_ANSWERED`와도 나눈다. 감사 기록에서 "물어서 답했다"와 "제안을 냈다"가 같은
+   * 이벤트면, 나중에 "이 변경은 어떤 계획에서 나왔나"를 되짚을 수 없다.
+   */
+  | "PLAN_OUTLINED"
   | "ROLLBACK_STARTED"
   | "ROLLBACK_COMPLETED"
   /**

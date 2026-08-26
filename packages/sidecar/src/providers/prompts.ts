@@ -554,6 +554,99 @@ export const QUESTION_SCHEMA = {
   required: ["answer"],
 } as const;
 
+/**
+ * 계획 모드 프롬프트 — state-machine 53절.
+ *
+ * # `PATCH_RULES`가 없다
+ *
+ * 질문 프롬프트와 같은 이유이고, 이유의 무게는 더 크다. 계획 모드가 존재하는 이유가
+ * **patch를 만들기 전에 멈추는 것**이므로, 규칙에 diff 이야기가 있으면 모델이 계획과 함께
+ * diff를 쓰고 그 순간 이 모드가 아끼려던 토큰이 나간다.
+ *
+ * # 그리고 "다 아는 척하지 말라"고 말한다
+ *
+ * 이 경로에도 결정론적 판정자가 없다 — 아니, 질문보다 더 없다. 답변은 최소한 기댄 파일을
+ * 대지만 계획은 **아직 존재하지 않는 코드**에 대한 서술이라 대조할 것이 아무것도 없다.
+ * 그래서 `risks`와 `openQuestions`를 값으로 요구하고, 컨텍스트가 부분집합이라는 사실을
+ * 명시한다(context-engine 15절 — 관련 지점이 창 밖에 남았을 수 있다).
+ */
+export function buildPlanPrompt(input: {
+  userMessage: string;
+  snapshot: WorkspaceSnapshot;
+  userAnswers?: { question: string; answer: string }[];
+}): string {
+  const parts = [
+    "You are producing a PLAN for a change to this repository. You are NOT writing the change — " +
+      "no patch will be produced or applied from this response.",
+    "",
+    `## Request\n${input.userMessage}`,
+  ];
+
+  if (input.userAnswers && input.userAnswers.length > 0) {
+    parts.push(
+      "## Clarifications already provided by the user\n" +
+        input.userAnswers.map((a) => `Q: ${a.question}\nA: ${a.answer}`).join("\n\n")
+    );
+  }
+
+  parts.push(renderSnapshot(input.snapshot));
+  parts.push(
+    [
+      "## Plan rules",
+      "Write in the language the request was written in.",
+      "Give an ordered list of `steps`. Each step says what it does (`intent`) and which files it would touch (`files`).",
+      "List every file you expect to change in `filesToChange`.",
+      // **여기가 이 프롬프트의 핵심이다.** 계획에는 대조할 산출물이 없으므로, 모델이 스스로
+      // 불확실을 말하지 않으면 사용자에게 그것을 알 방법이 없다.
+      "The Files section is a budgeted SUBSET and some files may be truncated to a contiguous slice — " +
+        "matching code can exist outside what you were shown.",
+      "Put what could make this plan wrong in `risks`. Put what you would need the user to decide in `openQuestions`.",
+      "An empty `risks` list is a claim that nothing can go wrong. Only make it if you mean it.",
+      "Do NOT write a diff, a patch, or file contents. The plan is the deliverable.",
+    ].join("\n")
+  );
+  return parts.join("\n\n");
+}
+
+export const PLAN_SCHEMA = {
+  type: "object",
+  properties: {
+    summary: { type: "string", description: "One-line summary of the plan, in the request's language." },
+    steps: {
+      type: "array",
+      description: "Ordered steps. At least one.",
+      items: {
+        type: "object",
+        properties: {
+          intent: { type: "string", description: "What this step does." },
+          files: {
+            type: "array",
+            description: "Workspace-relative paths this step would touch. May be empty for investigation steps.",
+            items: { type: "string" },
+          },
+        },
+        required: ["intent"],
+      },
+    },
+    filesToChange: {
+      type: "array",
+      description: "Every workspace-relative path you expect the change to touch.",
+      items: { type: "string" },
+    },
+    risks: {
+      type: "array",
+      description: "What could make this plan wrong — including code you were not shown.",
+      items: { type: "string" },
+    },
+    openQuestions: {
+      type: "array",
+      description: "What the user must decide before this plan is final. Empty if nothing.",
+      items: { type: "string" },
+    },
+  },
+  required: ["summary", "steps"],
+} as const;
+
 export const DRAFT_SCHEMA = {
   type: "object",
   properties: {
