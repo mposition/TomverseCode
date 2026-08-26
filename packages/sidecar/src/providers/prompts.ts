@@ -72,9 +72,16 @@ export function renderSnapshot(snapshot: WorkspaceSnapshot): string {
 
   parts.push("## Files");
   for (const file of snapshot.relevantFiles) {
-    const header = `### ${file.path}\n(selected because: ${file.reasonDetail})${
-      file.truncated ? "\n(NOTE: this file is TRUNCATED — do not assume the omitted part is absent)" : ""
-    }`;
+    // **어디를 실었는지 머리글이 말한다**(context-engine 14절). 본문에 `… 생략 …` 표시를
+    // 넣지 않는 이유는 그것이 파일 내용처럼 보이기 때문이다 — 모델이 patch context로 복사하면
+    // `apply_patch`가 실패하고, 그 실패는 "모델이 잘못된 patch를 냈다"로 보인다.
+    const range = file.includedRange;
+    const truncationNote = !file.truncated
+      ? ""
+      : range
+        ? `\n(NOTE: TRUNCATED — this is lines ${range.startLine}-${range.endLine} of ${range.totalLines}, a contiguous slice. Do not assume the omitted lines are absent.)`
+        : "\n(NOTE: this file is TRUNCATED — do not assume the omitted part is absent)";
+    const header = `### ${file.path}\n(selected because: ${file.reasonDetail})${truncationNote}`;
     parts.push(`${header}\n\`\`\`\n${file.content}\n\`\`\``);
   }
 

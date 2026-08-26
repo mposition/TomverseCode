@@ -10,7 +10,12 @@ import {
   parseNpmScripts,
 } from "../src/context/engine.js";
 import { classifyFile, MAX_INDEXED_FILE_BYTES } from "../src/context/exclude.js";
-import { estimateTokensUpperBound, packageFiles, truncateToTokens } from "../src/context/budget.js";
+import {
+  estimateTokensUpperBound,
+  packageFiles,
+  truncateToTokens,
+  windowAroundLines,
+} from "../src/context/budget.js";
 import { FakeHost } from "./helpers/fakeHost.js";
 import { ToolBridge } from "../src/tools/bridge.js";
 import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
@@ -705,4 +710,140 @@ test("검색 키워드는 정규식으로 escape된다", () => {
   assert.equal(escapeRegExp("a.b"), "a\\.b");
   assert.equal(escapeRegExp("x(y)"), "x\\(y\\)");
   assert.equal(escapeRegExp("plain"), "plain");
+});
+
+// ---- 앵커 주변 창 (context-engine 14절) ----
+
+/** 100줄짜리 파일에서 `target`번째 줄에만 표식을 둔다. */
+function numbered(lines: number, marker: number, text = "MARKER"): string {
+  return Array.from({ length: lines }, (_unused, i) => (i + 1 === marker ? text : `line ${i + 1}`)).join("\n");
+}
+
+/**
+ * **찾아 놓고 잘라 버리지 않는다** — context-engine 14절.
+ *
+ * 13절이 본문 검색으로 파일을 고르게 만들었는데 자르기는 여전히 접두사였다. 그러면 파일
+ * 뒤쪽에 있는 정의는 찾아 놓고도 잘려 나가고, **찾은 값어치가 거기서 사라진다.**
+ */
+test("앵커가 파일 뒤쪽에 있어도 그 자리가 실린다", () => {
+  const content = numbered(400, 380);
+  const window = windowAroundLines(content, [380], 300);
+  assert.ok(window.text.includes("MARKER"), `앵커가 잘려 나갔습니다: ${window.startLine}~${window.endLine}`);
+  assert.ok(window.startLine > 1, "앞에서부터 잘랐습니다");
+  assert.equal(window.totalLines, 400);
+});
+
+/** 앵커가 없으면 종전대로 앞에서부터다 — 그 경우 파일 앞부분이 구조를 가장 잘 말해 준다. */
+test("앵커가 없으면 앞에서부터 자른다", () => {
+  const content = numbered(400, 380);
+  const window = windowAroundLines(content, [], 300);
+  assert.equal(window.startLine, 1);
+  assert.ok(!window.text.includes("MARKER"));
+});
+
+/** **범위 밖 앵커는 버린다.** 검색과 읽기 사이에 파일이 바뀔 수 있다. */
+test("파일 끝 너머를 가리키는 앵커는 무시된다", () => {
+  const content = numbered(20, 5);
+  const window = windowAroundLines(content, [9999, -3, 1.5], 300);
+  assert.equal(window.startLine, 1);
+  assert.equal(window.totalLines, 20);
+});
+
+/**
+ * **창은 연속된 하나다.** 조각을 이어 붙이면 본문에 구멍이 생기고, 그 구멍은 표시하지 않으면
+ * 거짓이고 표시하면 모델이 그 표시를 patch context로 복사한다.
+ */
+test("실린 본문은 원본의 연속된 조각 그대로다", () => {
+  const content = numbered(200, 150);
+  const window = windowAroundLines(content, [150], 400);
+  const expected = content.split("\n").slice(window.startLine - 1, window.endLine).join("\n");
+  assert.equal(window.text, expected);
+});
+
+/** 앵커 **앞쪽**도 남긴다 — import·타입·주석이 없으면 모델이 이름을 지어낸다. */
+test("앵커보다 앞도 조금 남는다", () => {
+  const content = numbered(400, 300);
+  const window = windowAroundLines(content, [300], 400);
+  assert.ok(window.startLine < 300, `앵커 앞이 하나도 없습니다: ${window.startLine}`);
+  assert.ok(window.endLine >= 300);
+});
+
+/** 예산이 한 줄도 못 담을 만큼 작아도 **빈 창을 내지 않는다.** */
+test("예산이 아주 작아도 앵커 줄은 실린다", () => {
+  const content = numbered(100, 50, "M".repeat(400));
+  const window = windowAroundLines(content, [50], 5);
+  assert.ok(window.text.length > 0, "빈 창이 나왔습니다");
+});
+
+/**
+ * **어디를 실었는지 값으로 남는다.** 본문에 표시를 넣지 않는 대신 이 값이 프롬프트 머리글로
+ * 간다 — 표시를 본문에 넣으면 모델이 그것을 patch context로 복사한다.
+ */
+test("packageFiles가 실린 줄 범위를 값으로 남긴다", () => {
+  const content = numbered(400, 380);
+  const packaged = packageFiles(
+    [
+      {
+        path: "src/ledger.ts",
+        reason: "content-match",
+        reasonDetail: "본문에서 찾음",
+        content,
+        truncated: false,
+        sizeBytes: content.length,
+        anchorLines: [380],
+      },
+    ],
+    600
+  );
+  const file = packaged.files[0]!;
+  assert.equal(file.truncated, true);
+  assert.ok(file.includedRange, "실린 범위가 없습니다");
+  assert.equal(file.includedRange.totalLines, 400);
+  assert.ok(file.includedRange.startLine > 1);
+  assert.ok(file.content.includes("MARKER"));
+  // 사람이 읽는 근거에도 남는다 — 자릿수가 아니라 줄 번호로.
+  assert.match(file.reasonDetail, /줄만 포함/);
+});
+
+/**
+ * **검색이 찾은 줄이 실제로 실린다** — context-engine 14절, 끝에서 끝까지.
+ *
+ * 위 단위 검사들은 `windowAroundLines`가 앵커를 존중한다는 것과 `packageFiles`가 범위를
+ * 남긴다는 것을 각각 본다. 그런데 그 둘 사이에 **배선**이 있다: 검색 결과의 줄 번호가
+ * 후보를 거쳐 파일까지 와야 한다.
+ *
+ * 프로브로 그 배선을 끊어 보니 **아무 검사도 실패하지 않았다.** 조각마다 검사가 있어도
+ * 이어지지 않으면 기능은 없는 것이다 — 이 절이 고치려던 것과 같은 모양의 결함이다.
+ */
+test("검색이 찾은 줄이 예산에 쫓겨도 컨텍스트에 남는다", async () => {
+  // 정의는 파일 **뒤쪽**에 있다. 앞에서부터 자르면 이 줄이 사라진다.
+  const lines = Array.from({ length: 600 }, (_unused, i) =>
+    i === 560 ? "export function resolveBudget(limit) { return limit; }" : `const filler${i} = ${i};`
+  );
+  const content = lines.join("\n");
+
+  const host = new FakeHost({
+    files: [
+      { path: "src/ledger.ts", isDir: false, sizeBytes: content.length },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: { "src/ledger.ts": content, "package.json": "{}" },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 음수를 받으면 터집니다",
+    // 파일 전체를 담기에는 모자란 예산 — 잘라야만 한다.
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 1_200 }],
+  });
+
+  const ledger = snapshot.relevantFiles.find((f) => f.path === "src/ledger.ts");
+  assert.ok(ledger, "파일이 아예 빠졌습니다");
+  assert.equal(ledger.truncated, true, "이 검사는 잘리는 상황을 봐야 합니다");
+  assert.ok(
+    ledger.content.includes("resolveBudget(limit)"),
+    `찾아 놓고 잘라 버렸습니다: ${ledger.includedRange?.startLine}~${ledger.includedRange?.endLine}`
+  );
+  assert.ok(ledger.includedRange && ledger.includedRange.startLine > 1, "앞에서부터 잘랐습니다");
 });

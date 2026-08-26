@@ -110,6 +110,84 @@ export function truncateToTokens(text: string, maxTokens: number): string {
   return text.slice(0, end);
 }
 
+/**
+ * 앵커 주변의 **연속된** 줄 창 — context-engine 14절.
+ *
+ * # 왜 앞에서부터 자르면 안 되는가
+ *
+ * 13절이 본문 검색으로 파일을 고르게 만들었다. 그런데 자르기는 여전히 **접두사**였다 —
+ * `resolveBudget`이 800번째 줄에 정의돼 있으면, 우리는 그 파일을 찾아 놓고 그 정의를 잘라
+ * 버린 채 모델에게 보낸다. 찾은 값어치가 거기서 사라진다.
+ *
+ * # 창은 하나다
+ *
+ * 앵커마다 조각을 떼어 이어 붙이면 본문에 **구멍**이 생기고, 그 구멍은 표시하지 않으면
+ * 거짓이고 표시하면 모델이 그 표시를 patch context로 복사한다. 그래서 조각을 잇지 않고
+ * **연속된 창 하나**만 낸다 — 그러면 실린 본문은 원본의 조각 그대로다.
+ *
+ * # 앵커보다 앞을 조금 남긴다
+ *
+ * 정의는 아래로 읽히지만 그 위에 import·타입·주석이 있고, 그것이 없으면 모델이 이름을
+ * 지어낸다. 그래서 예산의 일부를 앞쪽에 쓴다.
+ */
+export interface Window {
+  text: string;
+  /** 1-base, 양끝 포함. */
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+}
+
+/** 창의 앞쪽(앵커 이전)에 쓰는 예산 비율. 나머지는 뒤로 간다. */
+const LEAD_SHARE = 0.25;
+
+export function windowAroundLines(text: string, anchors: readonly number[], maxTokens: number): Window {
+  const lines = text.split("\n");
+  const totalLines = lines.length;
+
+  // **범위 밖 앵커는 버린다.** 검색과 읽기 사이에 파일이 바뀔 수 있고, 그때 앵커를 그대로
+  // 믿으면 창이 파일 끝 너머를 가리킨다.
+  const valid = anchors.filter((n) => Number.isInteger(n) && n >= 1 && n <= totalLines).sort((a, b) => a - b);
+  if (valid.length === 0 || maxTokens <= 0) {
+    const head = truncateToTokens(text, maxTokens);
+    return {
+      text: head,
+      startLine: 1,
+      endLine: head.length === 0 ? 0 : head.split("\n").length,
+      totalLines,
+    };
+  }
+
+  const first = valid[0] as number;
+  const leadBudget = Math.floor(maxTokens * LEAD_SHARE);
+
+  // 앵커에서 **위로** 올라가며 lead 예산을 쓴다.
+  let start = first;
+  let leadUsed = 0;
+  while (start > 1) {
+    const cost = estimateTokensUpperBound(`${lines[start - 2] as string}\n`);
+    if (leadUsed + cost > leadBudget) break;
+    leadUsed += cost;
+    start -= 1;
+  }
+
+  // 남은 예산으로 **아래로** 내려간다. 앵커 줄 자체가 예산을 넘으면 그 줄만 잘라 넣는다 —
+  // 빈 창을 내면 "찾았는데 아무것도 안 실었다"가 된다.
+  let end = start - 1;
+  let used = leadUsed;
+  while (end < totalLines) {
+    const cost = estimateTokensUpperBound(`${lines[end] as string}\n`);
+    if (used + cost > maxTokens && end >= start) break;
+    used += cost;
+    end += 1;
+  }
+  if (end < start) end = start;
+
+  const slice = lines.slice(start - 1, end).join("\n");
+  const fitted = estimateTokensUpperBound(slice) > maxTokens ? truncateToTokens(slice, maxTokens) : slice;
+  return { text: fitted, startLine: start, endLine: end, totalLines };
+}
+
 export interface TokenBudget {
   modelId: string;
   maxTokens: number;
@@ -153,15 +231,22 @@ export function packageFiles(files: RelevantFile[], maxTokens: number): Packaged
       continue;
     }
 
-    const truncatedContent = truncateToTokens(file.content, allowance);
+    // **앵커가 있으면 그 주변을 남긴다**(14절). 없으면 종전대로 앞에서부터다 —
+    // 그 경우 파일의 앞부분이 구조를 가장 잘 말해 준다.
+    const window = windowAroundLines(file.content, file.anchorLines ?? [], allowance);
     out.push({
       ...file,
-      content: truncatedContent,
+      content: window.text,
       truncated: true,
-      includedBytes: truncatedContent.length,
-      reasonDetail: `${file.reasonDetail} (토큰 예산으로 ${file.content.length}자 중 ${truncatedContent.length}자만 포함)`,
+      includedBytes: window.text.length,
+      includedRange: {
+        startLine: window.startLine,
+        endLine: window.endLine,
+        totalLines: window.totalLines,
+      },
+      reasonDetail: `${file.reasonDetail} (토큰 예산으로 ${window.totalLines}줄 중 ${window.startLine}~${window.endLine}줄만 포함)`,
     });
-    used += estimateTokensUpperBound(truncatedContent);
+    used += estimateTokensUpperBound(window.text);
   }
 
   return { files: out, dropped };

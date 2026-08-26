@@ -15,7 +15,7 @@ import {
   SINGLE_FIX_SCHEMA,
 } from "../src/providers/prompts.js";
 import { BUILTIN_MODELS, ModelRegistry } from "../src/routing/registry.js";
-import { makeSnapshot } from "./helpers/fixtures.js";
+import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
 import type { ProviderCallContext } from "../src/providers/types.js";
 
 const registry = new ModelRegistry();
@@ -549,4 +549,46 @@ test("검수 프롬프트가 초안의 이동과 삭제를 보여준다", () => 
   const plain = buildReviewPrompt({ snapshot, userMessage: "고쳐줘", draft: base });
   assert.ok(plain.includes("File operations requested outside the patch"), plain);
   assert.ok(plain.includes("(none — the patch is the whole change)"), plain);
+});
+
+/**
+ * **잘라 넣었으면 어디를 실었는지 모델에게 말한다** — context-engine 14절.
+ *
+ * 종전 문구는 "이 파일은 잘렸다"뿐이었다. 창 방식으로 바뀌면 그 문장이 부족하다 — 모델은
+ * 자기가 파일의 **앞부분**을 보고 있다고 가정하고, 없는 import를 있다고 여기거나 파일 앞쪽에
+ * 대한 patch를 쓴다.
+ *
+ * 그리고 그 사실은 **머리글에만** 있어야 한다. 본문에 `… 생략 …`을 넣으면 모델이 그것을
+ * patch context로 복사하고, `apply_patch`가 실패하며, 그 실패는 "모델이 잘못된 patch를 냈다"로
+ * 보인다.
+ */
+test("잘린 파일의 머리글이 실린 줄 범위를 말한다", () => {
+  const body = "line a\nline b\nline c\n";
+  const snapshot = makeSnapshot({
+    relevantFiles: [
+      makeRelevantFile({
+        path: "src/ledger.ts",
+        content: body,
+        truncated: true,
+        includedRange: { startLine: 740, endLine: 920, totalLines: 1400 },
+      }),
+    ],
+  });
+  const prompt = buildDraftPrompt({ snapshot, userMessage: "고쳐주세요" });
+
+  assert.ok(prompt.includes("lines 740-920 of 1400"), prompt);
+  // **연속된 조각이라는 사실**도 말한다 — 구멍이 있다고 오해하면 모델이 방어적으로 쓴다.
+  assert.ok(prompt.includes("contiguous slice"), prompt);
+  // 본문에는 생략 표시가 없다.
+  assert.ok(!prompt.includes("생략"), prompt);
+});
+
+/** 범위가 없는 잘림(앵커 없는 접두사 자르기)은 종전 문구 그대로다 — 없는 정보를 지어내지 않는다. */
+test("범위를 모르면 종전 문구를 쓴다", () => {
+  const snapshot = makeSnapshot({
+    relevantFiles: [makeRelevantFile({ content: "x\n", truncated: true })],
+  });
+  const prompt = buildDraftPrompt({ snapshot, userMessage: "고쳐주세요" });
+  assert.ok(prompt.includes("this file is TRUNCATED"), prompt);
+  assert.ok(!prompt.includes("contiguous slice"), prompt);
 });

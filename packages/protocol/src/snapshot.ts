@@ -31,6 +31,26 @@ export interface RelevantFile {
   sizeBytes: number;
   /** truncated일 때 실제로 포함된 바이트 수 */
   includedBytes?: number;
+  /**
+   * 이 파일을 고르게 만든 **줄 번호들** (1-base) — context-engine 13·14절.
+   *
+   * 본문 검색이 찾은 자리다. 잘라 넣어야 할 때 **어디를 남길지**가 여기 걸려 있다:
+   * 앞에서부터 자르면 파일 뒤쪽에 있는 정의는 찾아 놓고도 잘려 나간다.
+   */
+  anchorLines?: number[];
+  /**
+   * 잘라 넣었을 때 **실제로 실린 줄 범위** (1-base, 양끝 포함).
+   *
+   * # 왜 본문에 표시를 넣지 않는가
+   *
+   * `… N줄 생략 …` 같은 표시를 본문에 넣으면 그 줄이 **파일 내용처럼 보인다.** 모델이 그것을
+   * patch의 context 줄로 복사하면 `apply_patch`가 실패하는데, 그 실패는 "모델이 잘못된 patch를
+   * 냈다"로 보인다(44.6절과 같은 종류의 오해).
+   *
+   * 그래서 본문은 **원본의 연속된 조각 그대로** 두고, 어디를 실었는지는 이 값으로 따로 말한다.
+   * 프롬프트의 파일 머리글이 그것을 읽어 적는다.
+   */
+  includedRange?: { startLine: number; endLine: number; totalLines: number };
 }
 
 /**

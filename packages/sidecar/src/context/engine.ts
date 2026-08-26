@@ -54,6 +54,14 @@ function isWorkspaceIndex(value: unknown): value is WorkspaceIndex {
 /** 프로젝트 규칙 파일 — 우선순위 순서대로 찾아 항상 스냅샷에 포함한다 (4절). */
 const PROJECT_RULE_FILES = ["CLAUDE.md", "AGENTS.md", ".cursorrules", "CONTRIBUTING.md", "README.md"];
 
+/** 선정된 후보 하나. `anchorLines`는 잘라 넣을 때 **어디를 남길지**를 정한다(14절). */
+interface Candidate {
+  path: string;
+  reason: RelevanceReason;
+  reasonDetail: string;
+  anchorLines?: number[];
+}
+
 /** 본문 검색을 돌릴 키워드 수 상한 (원칙 5). 검색은 저장소 크기에 비례한다. */
 const MAX_SEARCHED_KEYWORDS = 4;
 /** 키워드 하나가 넣을 수 있는 후보 수 상한. 흔한 이름 하나가 예산을 다 먹는 것을 막는다. */
@@ -271,6 +279,9 @@ export class ContextEngine {
         path: candidate.path,
         reason: candidate.reason,
         reasonDetail: candidate.reasonDetail,
+        ...(candidate.anchorLines && candidate.anchorLines.length > 0
+          ? { anchorLines: candidate.anchorLines }
+          : {}),
         content: file.content,
         truncated: file.truncated,
         sizeBytes: file.sizeBytes,
@@ -459,12 +470,12 @@ export class ContextEngine {
     index: WorkspaceIndex,
     userMessage: string,
     notes: { path: string; reason: string }[]
-  ): Promise<{ path: string; reason: RelevanceReason; reasonDetail: string }[]> {
-    const selected = new Map<string, { path: string; reason: RelevanceReason; reasonDetail: string }>();
+  ): Promise<Candidate[]> {
+    const selected = new Map<string, Candidate>();
 
-    const add = (path: string, reason: RelevanceReason, reasonDetail: string) => {
+    const add = (path: string, reason: RelevanceReason, reasonDetail: string, anchorLines?: number[]) => {
       if (!selected.has(path) && selected.size < this.maxRelevantFiles) {
-        selected.set(path, { path, reason, reasonDetail });
+        selected.set(path, { path, reason, reasonDetail, anchorLines });
       }
     };
 
@@ -554,7 +565,7 @@ export class ContextEngine {
     bridge: ToolBridge,
     index: WorkspaceIndex,
     keywords: string[],
-    add: (path: string, reason: RelevanceReason, reasonDetail: string) => void,
+    add: (path: string, reason: RelevanceReason, reasonDetail: string, anchorLines?: number[]) => void,
     notes: { path: string; reason: string }[]
   ): Promise<void> {
     const indexed = new Set(index.fileTree.map((f) => f.path));
@@ -573,7 +584,7 @@ export class ContextEngine {
       ];
 
       for (const attempt of attempts) {
-        let hits: { path: string }[];
+        let hits: { path: string; line: number }[];
         try {
           hits = await bridge.searchText(attempt.pattern);
         } catch (error) {
@@ -591,7 +602,10 @@ export class ContextEngine {
         const paths = [...new Set(hits.map((h) => h.path))].filter((p) => indexed.has(p));
         if (paths.length === 0) continue;
         for (const path of paths.slice(0, MAX_MATCHES_PER_KEYWORD)) {
-          add(path, "content-match", attempt.detail(path));
+          // **줄 번호를 함께 나른다**(14절). 잘라 넣어야 할 때 어디를 남길지가 여기 걸려 있다 —
+          // 없으면 앞에서부터 자르고, 파일 뒤쪽에 있는 정의는 찾아 놓고도 잘려 나간다.
+          const lines = hits.filter((h) => h.path === path).map((h) => h.line);
+          add(path, "content-match", attempt.detail(path), lines);
         }
         // 정의를 찾았으면 넓은 검색은 하지 않는다 — 부르는 곳까지 다 넣으면 예산만 먹는다.
         break;
