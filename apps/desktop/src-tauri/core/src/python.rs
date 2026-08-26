@@ -152,20 +152,34 @@ pub fn interpreter(probe: &Probe) -> Option<Interpreter> {
 }
 
 /// 한 도구가 **선언된 근거**. 문자열은 사용자에게 그대로 보여준다.
-fn declared_by(probe: &Probe, files: &[&str], sections: &[(&str, &str)]) -> Option<String> {
+fn declared_by(probe: &Probe, files: &[&str], sections: &[(&str, &str)]) -> Option<Declaration> {
     for file in files {
         if (probe.is_file)(file) {
-            return Some((*file).to_string());
+            return Some(Declaration { path: (*file).to_string(), describe: (*file).to_string() });
         }
     }
     for (file, section) in sections {
         if let Some(text) = (probe.read)(file) {
             if has_section(&text, section) {
-                return Some(format!("{file} {section}"));
+                return Some(Declaration {
+                    path: (*file).to_string(),
+                    describe: format!("{file} {section}"),
+                });
             }
         }
     }
     None
+}
+
+/// 선언을 **두 값으로** 돌려준다.
+///
+/// `describe`는 사람이 읽는 근거이고 `path`는 **기계가 다시 읽어야 할 파일**이다. 한 문자열로
+/// 뭉치면 나중에 경로를 되찾으려고 `"pyproject.toml [tool.mypy]"`를 파싱하게 되고, 그 파싱은
+/// 문구를 다듬는 순간 조용히 깨진다(50절).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    pub path: String,
+    pub describe: String,
 }
 
 /// TOML/INI 섹션 헤더가 있는가.
@@ -191,6 +205,8 @@ pub struct Check {
     pub args: Vec<String>,
     /// 무엇을 보고 이 명령을 만들었는가. 사용자에게 그대로 보여준다.
     pub source: String,
+    /// 그 근거가 **사는 파일**. 지문이 다시 읽어야 하므로 문장과 따로 둔다(50절).
+    pub evidence: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -236,7 +252,7 @@ pub fn detect(probe: &Probe) -> Detection {
             // pytest는 인자 없이 자기 설정에서 대상을 찾는다. ruff·mypy는 대상을 요구한다.
             args.push(".".to_string());
         }
-        checks.push(Check { key, args, source });
+        checks.push(Check { key, args, source: source.describe, evidence: source.path });
     }
 
     // **선언이 하나도 없으면 인터프리터도 찾지 않는다.** 찾아 두면 "python은 있는데 아무것도

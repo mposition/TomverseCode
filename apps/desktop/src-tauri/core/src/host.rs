@@ -159,13 +159,14 @@ impl TaskProfile {
         let gate = PolicyGate::new(&policy).with_mcp(mcp);
         // 아직 아무것도 고치지 않은 시점의 매니페스트를 읽는다. 이 호출이 뒤로 밀리면
         // 고정의 의미가 사라진다.
-        let verification_pin: Vec<(String, Vec<String>)> = crate::verify::detect_commands(root)
+        let detected = crate::verify::detect_commands(root);
+        let verification_pin: Vec<(String, Vec<String>)> = detected
             .commands
             .values()
             .map(|(_, cmd, _)| (cmd.program.clone(), cmd.args.clone()))
             .collect();
-        // **지문은 고정 집합을 보고 만든다**(49.5절). 워크스페이스 안에 있는 프로그램은
-        // 모델이 덮어쓸 수 있으므로 그 내용도 함께 센다.
+        // **지문의 파일 목록은 `detect_commands`가 유도한다**(50절). 그리고 워크스페이스 안에
+        // 있는 프로그램은 모델이 덮어쓸 수 있으므로 그 내용도 함께 센다(49.5절).
         let manifest_fingerprint = manifest_fingerprint(root, &verification_pin);
         Self {
             policy,
@@ -183,10 +184,18 @@ impl TaskProfile {
 fn manifest_fingerprint(root: &WorkspaceRoot, pin: &[(String, Vec<String>)]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    // **목록을 손으로 적는다.** `detect_commands`가 읽는 것과 같아야 하는데, 거기서 유도하려면
-    // 그 함수가 경로를 돌려줘야 하고 그건 지금 하는 일이 아니다. 대신 새 매니페스트를 지원할 때
-    // 이 목록도 함께 늘려야 한다는 것을 `manifest_fingerprint_covers_what_detect_reads`가 지킨다.
-    for name in ["package.json", "Cargo.toml"] {
+
+    // **목록을 `detect_commands`에서 유도한다**(50절).
+    //
+    // 종전에는 여기 `["package.json", "Cargo.toml"]`이 손으로 적혀 있었고, 그래서 `.csproj`도
+    // `pyproject.toml`도 빠져 있었다 — dotnet·Python 프로젝트에서는 **매니페스트를 고쳐도
+    // 사전 승인이 살아 있었다.** 29.3절이 npm에 대해 닫은 구멍이 나머지 갈래에는 열려 있었던 것이다.
+    //
+    // **지금 감지가 읽는 목록만 보면 충분하다.** 한때 여기에 고정 시점의 목록을 합쳐 두고
+    // "한쪽만 보면 사라진 매니페스트를 놓친다"고 적어 두었는데, **프로브가 그 문장을
+    // 반증했다**: 목록 자체가 해시에 들어가므로 파일이 사라지면 **집합이 달라져서** 해시가
+    // 바뀐다. 생기는 쪽도 같다. 고정 목록을 합치는 것은 아무것도 더 잡지 못했다(50.4절).
+    for name in &crate::verify::detect_commands(root).evidence {
         hasher.update(name.as_bytes());
         match std::fs::read(root.path().join(name)) {
             Ok(bytes) => {
@@ -3634,22 +3643,167 @@ mod tests {
         ));
     }
 
-    /// 지문이 **읽는 파일 목록**은 손으로 적혀 있다. `detect_commands`가 새 매니페스트를
-    /// 지원하면 여기도 함께 늘어야 하고, 늘지 않으면 그 매니페스트의 본문 변경이 보이지 않는다.
+    /// **지문이 읽는 목록을 `detect_commands`에서 유도한다** (50절).
+    ///
+    /// 종전에는 이 목록이 손으로 적혀 있었고(`package.json`·`Cargo.toml`), 그래서 `.csproj`와
+    /// Python 선언 파일이 빠져 있었다 — 그 프로젝트들에서는 **매니페스트를 고쳐도 사전 승인이
+    /// 살아 있었다.** 29.3절이 npm에 대해 닫은 구멍이 나머지 갈래에는 열려 있었던 것이다.
+    ///
+    /// 그래서 판정 기준을 손으로 적은 목록이 아니라 **감지가 실제로 읽은 파일**로 둔다:
+    /// 갈래마다 픽스처를 만들고, `detect_commands`가 근거로 든 파일을 **전부** 바꿔 보며
+    /// 지문이 따라 바뀌는지 확인한다.
     #[test]
     fn manifest_fingerprint_covers_what_detect_reads() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = WorkspaceRoot::new(dir.path()).unwrap();
-        let empty = manifest_fingerprint(&root, &[]);
+        let fixtures: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("npm", vec![("package.json", r#"{"scripts":{"test":"x"}}"#)]),
+            ("cargo", vec![("Cargo.toml", "[package]\nname = \"x\"\n")]),
+            ("dotnet", vec![("app.csproj", "<Project/>")]),
+            ("python", vec![("pyproject.toml", "[tool.pytest.ini_options]\n")]),
+        ];
 
-        // `detect_commands`가 읽는 매니페스트마다 지문이 달라져야 한다.
-        for name in ["package.json", "Cargo.toml"] {
-            fs::write(dir.path().join(name), "x").unwrap();
-            assert_ne!(manifest_fingerprint(&root, &[]), empty, "{name}의 변화가 지문에 없습니다");
-            fs::remove_file(dir.path().join(name)).unwrap();
+        let mut checked = 0;
+        for (label, files) in fixtures {
+            let dir = tempfile::tempdir().unwrap();
+            for (name, body) in &files {
+                fs::write(dir.path().join(name), body).unwrap();
+            }
+            let root = WorkspaceRoot::new(dir.path()).unwrap();
+            let evidence = crate::verify::detect_commands(&root).evidence;
+
+            // 이 갈래의 매니페스트가 근거 목록에 실제로 들어 있어야 한다 — 안 들어 있으면
+            // 아래 반복이 그 파일을 건드리지 않고, 검사는 공허하게 통과한다.
+            for (name, _) in &files {
+                assert!(evidence.contains(*name), "{label}: {name}이 근거 목록에 없습니다: {evidence:?}");
+            }
+
+            let before = manifest_fingerprint(&root, &[]);
+            for name in &evidence {
+                let path = dir.path().join(name);
+                let original = fs::read(&path).ok();
+                fs::write(&path, "CHANGED").unwrap();
+                assert_ne!(
+                    manifest_fingerprint(&root, &[]),
+                    before,
+                    "{label}: {name}의 변화가 지문에 없습니다"
+                );
+                match original {
+                    Some(bytes) => fs::write(&path, bytes).unwrap(),
+                    None => fs::remove_file(&path).unwrap(),
+                }
+                checked += 1;
+            }
+            // 되돌렸으면 지문도 되돌아온다 — 존재 여부도 지문에 들어간다.
+            assert_eq!(manifest_fingerprint(&root, &[]), before, "{label}");
         }
-        // 지웠으면 원래대로 — 존재 여부도 지문에 들어간다.
-        assert_eq!(manifest_fingerprint(&root, &[]), empty);
+        assert!(checked >= 4, "근거 파일을 {checked}개만 검사했습니다");
+    }
+
+    /// **고정 이후에 생긴 매니페스트도 지문이 본다** (50절).
+    ///
+    /// 이 방향은 "지금 감지가 읽는 목록"을 해시하기 때문에 성립한다 — 고정 시점의 목록만
+    /// 보면 새로 생긴 파일이 들어가지 않는다. 프로브로 그쪽을 만들어 보면 이 검사가 실패한다.
+    #[test]
+    fn a_manifest_that_appears_after_pinning_still_changes_the_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"scripts":{"test":"x"}}"#).unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let before = manifest_fingerprint(&root, &[]);
+
+        // 고정 시점에 없던 파일이 생긴다. 근거 목록도 커진다.
+        fs::write(dir.path().join("pytest.ini"), "[pytest]\n").unwrap();
+        assert_ne!(
+            manifest_fingerprint(&root, &[]),
+            before,
+            "새로 생긴 매니페스트가 지문에 없습니다"
+        );
+    }
+
+    /// **고정 이후에 사라진 매니페스트도 지문이 본다.**
+    ///
+    /// 한때 이 방향을 위해 고정 시점의 목록을 함께 해시했는데, **필요 없었다**: 목록 자체가
+    /// 해시에 들어가므로 파일이 사라지면 집합이 달라져 해시가 바뀐다(50.4절).
+    #[test]
+    fn a_manifest_that_disappears_after_pinning_still_changes_the_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pytest.ini"), "[pytest]\n").unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        // 그 파일이 실제로 근거 목록에 있는지 먼저 본다 — 없으면 아래 단언이 공허하다.
+        assert!(crate::verify::detect_commands(&root).evidence.contains("pytest.ini"));
+        let before = manifest_fingerprint(&root, &[]);
+
+        fs::remove_file(dir.path().join("pytest.ini")).unwrap();
+        assert_ne!(
+            manifest_fingerprint(&root, &[]),
+            before,
+            "사라진 매니페스트가 지문에 없습니다"
+        );
+    }
+
+    /// **npm 밖의 갈래에도 29.3절이 적용된다** (50절).
+    ///
+    /// 종전에는 지문이 `package.json`과 `Cargo.toml`만 읽었다. 그래서 Python 프로젝트에서는
+    /// 모델이 `pyproject.toml`을 고쳐도 사전 승인이 **살아 있었다** — 예를 들어
+    /// `[tool.pytest.ini_options]`에 `addopts = "-p evil_plugin"`을 넣으면 고정된 argv 그대로
+    /// 다른 것이 돈다. `.csproj`도 같은 상태였다(pre-build 타깃).
+    ///
+    /// 24.5절이 자동 승인의 근거로 삼은 것은 "프로젝트가 **미리** 선언했다"이고, 미리가
+    /// 깨지면 그 근거도 깨진다.
+    #[test]
+    fn a_changed_python_declaration_also_withdraws_the_pre_approval() {
+        let (ws, _a, host) = host_with_manifest(
+            TaskPolicy {
+                auto_approve_verification: true,
+                ..TaskPolicy::default()
+            },
+            Arc::new(AlwaysDeny),
+            None,
+        );
+        fs::write(ws.path().join("pyproject.toml"), "[tool.pytest.ini_options]\n").unwrap();
+        let venv = ws.path().join(".venv").join("bin");
+        fs::create_dir_all(&venv).unwrap();
+        fs::write(venv.join("python"), "").unwrap();
+
+        host.begin_task(
+            "task-1",
+            TaskPolicy {
+                auto_approve_verification: true,
+                ..TaskPolicy::default()
+            },
+            None,
+        )
+        .unwrap();
+        let profile = host.profile("task-1");
+        let request = req(
+            ToolName::RunTests,
+            json!({
+                "program": venv.join("python").to_string_lossy(),
+                "args": ["-m", "pytest"],
+                "cwd": "."
+            }),
+        );
+        let fate = |host: &TaskHost, profile: &Arc<TaskProfile>| {
+            let decision = profile.gate().evaluate(&request, &host.root, &profile.policy);
+            fate_of(&host.root, profile, &host.hooks, &request, &decision)
+        };
+
+        // 바뀌기 전에는 사전 승인이 성립한다 — 아래 단언이 공허하지 않다는 증거다.
+        assert!(
+            matches!(fate(&host, &profile), Fate::PreApproved { .. }),
+            "{:?}",
+            fate(&host, &profile)
+        );
+
+        // **argv는 한 글자도 바뀌지 않는다.** 바뀌는 것은 그 argv가 읽을 설정이다.
+        fs::write(
+            ws.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\naddopts = \"-p evil_plugin\"\n",
+        )
+        .unwrap();
+        assert!(
+            matches!(fate(&host, &profile), Fate::AsksUser { withdrawn: Some(_) }),
+            "선언이 바뀌었는데 사전 승인이 그대로입니다: {:?}",
+            fate(&host, &profile)
+        );
     }
 
     /// **워크스페이스 안에 있는 프로그램은 내용이 바뀌면 지문이 바뀐다** (49.5절).

@@ -29,11 +29,27 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Default)]
 pub struct DetectedCommands {
     pub commands: BTreeMap<&'static str, (VerificationKind, RunCommandArgs, String)>,
+    /// 이 판정의 **근거가 사는 파일들**(워크스페이스 상대경로).
+    ///
+    /// # 왜 명령과 따로 모으는가 (50절)
+    ///
+    /// 사전 승인의 지문은 "이 파일들의 내용이 그대로인가"를 물어야 한다(24.5·29.3절). 종전에는
+    /// 그 목록이 `host.rs`에 **손으로 적혀 있었고**, 그래서 `.csproj`도 `pyproject.toml`도
+    /// 빠져 있었다 — dotnet·Python 프로젝트에서는 매니페스트를 고쳐도 사전 승인이 살아 있었다.
+    ///
+    /// **명령이 없어도 근거는 남는다.** 파일을 읽었는데 선언이 없었다는 것도 사실이고,
+    /// 나중에 그 파일에 선언이 **생기면** 판정이 달라진다 — 그것도 지문이 봐야 하는 변화다.
+    pub evidence: std::collections::BTreeSet<String>,
 }
 
 impl DetectedCommands {
     fn insert(&mut self, key: &'static str, kind: VerificationKind, cmd: RunCommandArgs, source: &str) {
         self.commands.entry(key).or_insert((kind, cmd, source.to_string()));
+    }
+
+    /// 이 파일을 근거로 읽었다. **판정 결과와 무관하게 부른다.**
+    fn read_evidence(&mut self, path: &str) {
+        self.evidence.insert(path.to_string());
     }
 }
 
@@ -54,6 +70,7 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
 
     // ---- Node / npm ----
     let package_json = root.path().join("package.json");
+    detected.read_evidence("package.json");
     if let Ok(text) = std::fs::read_to_string(&package_json) {
         if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) {
             let scripts = manifest
@@ -99,6 +116,7 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
     }
 
     // ---- Rust / Cargo ----
+    detected.read_evidence("Cargo.toml");
     if root.path().join("Cargo.toml").exists() {
         detected.insert(
             "test",
@@ -117,22 +135,30 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
     // ---- .NET ----
     // .sln이 있으면 그것을, 없으면 .csproj를 찾는다. dotnet은 인자 없이도 디렉터리를 탐색하므로
     // 파일명을 인자로 붙이지 않는다 — 파일명을 인자로 넘기면 경로 하드 체크와 얽힌다.
-    let has_dotnet = std::fs::read_dir(root.path())
+    // **프로젝트 파일 이름을 근거로 기록한다**(50절). `.sln/.csproj` 같은 요약 문자열이 아니라
+    // 실제 파일이어야 지문이 그 내용을 다시 읽을 수 있다.
+    let dotnet_projects: Vec<String> = std::fs::read_dir(root.path())
         .map(|entries| {
-            entries.filter_map(|e| e.ok()).any(|e| {
-                let name = e.file_name().to_string_lossy().to_lowercase();
-                name.ends_with(".sln") || name.ends_with(".csproj") || name.ends_with(".fsproj")
-            })
+            let mut found: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|name| {
+                    let lower = name.to_lowercase();
+                    lower.ends_with(".sln") || lower.ends_with(".csproj") || lower.ends_with(".fsproj")
+                })
+                .collect();
+            // 순서를 고정한다 — 디렉터리 순회 순서는 파일시스템마다 다르고, 그러면 근거 문자열이
+            // 같은 워크스페이스에서 실행마다 달라진다.
+            found.sort();
+            found
         })
-        .unwrap_or(false);
-    if has_dotnet {
-        detected.insert("test", VerificationKind::Test, cmd("dotnet", &["test"]), ".sln/.csproj");
-        detected.insert(
-            "build",
-            VerificationKind::Build,
-            cmd("dotnet", &["build"]),
-            ".sln/.csproj",
-        );
+        .unwrap_or_default();
+    for project in &dotnet_projects {
+        detected.read_evidence(project);
+    }
+    if let Some(first) = dotnet_projects.first() {
+        detected.insert("test", VerificationKind::Test, cmd("dotnet", &["test"]), first);
+        detected.insert("build", VerificationKind::Build, cmd("dotnet", &["build"]), first);
     }
 
     // ---- Python ----
@@ -166,6 +192,11 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
         },
     };
     let py = crate::python::detect(&py_probe);
+    // **선언 파일은 명령이 만들어지지 않아도 근거다**(50절). 인터프리터를 못 찾아 명령이
+    // 비어도 그 파일의 변화는 판정을 바꿀 수 있다.
+    for check in &py.checks {
+        detected.read_evidence(&check.evidence);
+    }
     if let Some(interpreter) = &py.interpreter {
         // **워크스페이스 안의 인터프리터는 절대경로로 바꾼다.** 상대 프로그램 경로는
         // 플랫폼마다 다르게 풀린다 — Unix는 자식이 `chdir` 뒤에 찾지만 Windows는 부모의
