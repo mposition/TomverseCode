@@ -16,8 +16,9 @@ import {
   truncateToTokens,
   windowAroundLines,
 } from "../src/context/budget.js";
-import { FakeHost } from "./helpers/fakeHost.js";
+import { FAKE_MAX_SEARCH_MATCHES, FakeHost } from "./helpers/fakeHost.js";
 import { ToolBridge } from "../src/tools/bridge.js";
+import type { NdjsonTransport } from "../src/ipc/transport.js";
 import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
 import { renderSnapshot } from "../src/providers/prompts.js";
 
@@ -1079,4 +1080,113 @@ test("여러 키워드가 같은 파일을 찾으면 앵커가 합쳐진다", as
   assert.ok(anchors.includes(521), `settleReservation의 줄이 없습니다: ${anchors.join(",")}`);
   assert.ok(ledger.anchorCoverage, "앵커 덮개가 없습니다");
   assert.equal(ledger.anchorCoverage.total, anchors.length);
+});
+
+// ---- 검색이 못 본 것 (state-machine 58절) ----
+
+/**
+ * **"검색했는데 없다"와 "검색하지 않았다"를 구별한다** — state-machine 58절.
+ *
+ * 실제 `search_text`는 비밀값 파일을 **읽기 전에** 건너뛰고 그 개수를 `skippedSecretFiles`로
+ * 돌려준다. `tools/mod.rs`의 주석이 그 값의 목적을 이렇게 적어 두었다:
+ * *"오케스트레이터가 '여기 없으니 없다'고 결론 내리는 것을 막고."*
+ *
+ * 그런데 **Node 쪽에서 그 값을 읽는 코드가 하나도 없었다.** 문은 있고 걸어 들어가는 길이
+ * 없는 자리이며, 13절이 검색 *실패*에 대해 세운 규율("실패를 없음으로 읽지 않는다")이
+ * *일부러 안 본* 경우에는 서 있지 않았던 것이다.
+ */
+test("검색이 건너뛴 비밀값 파일이 스냅샷 노트에 남는다", async () => {
+  const host = new FakeHost({
+    files: [
+      { path: "src/ledger.ts", isDir: false, sizeBytes: 40 },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: {
+      "src/ledger.ts": "export const other = 1;\n",
+      "package.json": "{}",
+      // 인덱스에는 없지만 fake의 검색은 이 파일을 **읽기 전에 건너뛴다** — 실제 도구와 같다.
+      ".env": "resolveBudget=secret\n",
+    },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 이상합니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+
+  const note = (snapshot.excludedNotes ?? []).find((n) => n.reason.includes("검색하지 않았습니다"));
+  assert.ok(note, JSON.stringify(snapshot.excludedNotes));
+  assert.match(note.reason, /비밀값 파일 1개/);
+  // **"찾지 못했습니다"로 끝나지 않는다** — 거기 있었을 수도 있다는 사실이 남아야 한다.
+  assert.match(note.reason, /거기 있었다면/);
+});
+
+/** 건너뛴 것이 없으면 **그 노트도 없다** — 언제나 붙으면 신호가 아니라 배경이 된다. */
+test("건너뛴 것이 없으면 그 노트가 없다", async () => {
+  const host = new FakeHost({
+    files: [{ path: "src/ledger.ts", isDir: false, sizeBytes: 40 }],
+    contents: { "src/ledger.ts": "export function resolveBudget() {}\n" },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 이상합니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+  assert.ok(
+    !(snapshot.excludedNotes ?? []).some((n) => n.reason.includes("검색하지 않았습니다")),
+    JSON.stringify(snapshot.excludedNotes)
+  );
+});
+
+/**
+ * **결과가 잘렸으면 "여기 없다"는 결론이 성립하지 않는다.**
+ *
+ * 상한에 걸린 검색은 찾은 것이 전부가 아니고, 그 사실을 말하지 않으면 그 위의 판단이
+ * 조용히 틀린다 — 비밀값 건너뛰기와 같은 모양이다.
+ */
+test("검색 결과가 잘렸다는 사실이 노트에 남는다", async () => {
+  const files = Array.from({ length: FAKE_MAX_SEARCH_MATCHES + 2 }, (_u, i) => `src/f${i}.ts`);
+  const host = new FakeHost({
+    files: files.map((path) => ({ path, isDir: false, sizeBytes: 40 })),
+    contents: Object.fromEntries(files.map((path) => [path, "resolveBudget();\n"])),
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 이상합니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+  const note = (snapshot.excludedNotes ?? []).find((n) => n.reason.includes("상한에서 잘렸습니다"));
+  assert.ok(note, JSON.stringify(snapshot.excludedNotes));
+  assert.match(note.reason, /전부가 아닙니다/);
+});
+
+/**
+ * **`null`과 `0`을 뭉개지 않는다** — 호스트가 이 사실을 말하지 않은 것과 "건너뛴 것이 없다"는
+ * 다른 사실이다. 뭉개면 옛 호스트나 게으른 fake가 조용히 "건너뛴 것 없음"을 주장한다.
+ */
+test("호스트가 말하지 않으면 건너뛴 수는 null이다", async () => {
+  // **옛 호스트를 흉내낸다**: `matches`만 내고 나머지 필드를 아예 내지 않는다.
+  // FakeHost로는 이걸 만들 수 없다 — 그쪽은 이제 세 값을 모두 내기 때문이다(58절).
+  const transport = {
+    request: async () => ({
+      result: {
+        requestId: "r",
+        status: "ok",
+        output: { matches: [] },
+        durationMs: 1,
+        completedAt: "now",
+      },
+      policy: { decision: "auto_approve", riskLevel: "none", reason: "", matchedRule: "", normalizedTarget: "" },
+    }),
+  } as unknown as NdjsonTransport;
+
+  const found = await new ToolBridge(transport, "task-1").searchText("x");
+  assert.equal(found.skippedSecretFiles, null, "필드가 없는데 0으로 위장했습니다");
+  assert.equal(found.truncated, false);
 });

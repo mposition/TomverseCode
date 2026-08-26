@@ -1,5 +1,32 @@
 import type { VerificationReport, VerificationStatus, VerificationKind, ToolRequest } from "@tomverse/protocol";
 import type { NdjsonTransport } from "../../src/ipc/transport.js";
+import { classifyFile } from "../../src/context/exclude.js";
+
+/**
+ * fake의 검색 결과 상한 — 실제 도구의 `MAX_SEARCH_MATCHES`에 대응한다 (58절).
+ *
+ * **값을 맞추지 않는다.** 실제는 200이고 여기는 3이다: 상한이 **있다**는 사실을 검사하려면
+ * fixture로 200개를 만들어야 하는데, 그건 검사를 읽을 수 없게 만든다. 맞춰야 하는 것은
+ * 숫자가 아니라 **`truncated`가 참이 되는 경로가 존재한다**는 사실이다.
+ */
+export const FAKE_MAX_SEARCH_MATCHES = 3;
+
+/**
+ * 비밀값처럼 보이는 경로인가 — **`classifyFile`이 쓰는 것과 같은 규칙**을 지난다 (58절).
+ *
+ * 손으로 다시 적으면 실제 규칙이 늘 때 fake만 뒤처지고, 그러면 검사가 실제보다 넓은
+ * 세계를 지킨다(13.6절). 크기는 여기서 판정하지 않으므로 0을 넘긴다 — 크기 제외는
+ * 인덱싱의 일이고 검색 도구가 하는 일이 아니다.
+ */
+function isSecretLike(path: string): boolean {
+  const verdict = classifyFile(path, 0);
+  return verdict.excluded && (verdict.reason ?? "").includes("시크릿");
+}
+
+function isBinaryLike(path: string): boolean {
+  const verdict = classifyFile(path, 0);
+  return verdict.excluded && (verdict.reason ?? "").includes("바이너리");
+}
 
 /**
  * Orchestrator 단위 테스트용 인-프로세스 Rust 호스트 대역.
@@ -264,14 +291,33 @@ export class FakeHost {
         }
         const pattern = new RegExp(String(request.args.pattern));
         const matches: { path: string; line: number; text: string }[] = [];
+        // **실제 도구가 내는 세 값을 모두 낸다**(58절). fake가 게으르면 검사도 게을러진다:
+        // `skippedSecretFiles`를 내지 않으면 "건너뛴 것이 있다"는 경로가 fake로는 검증되지
+        // 않고, 그러면 그 사실을 읽는 코드를 지워도 아무 검사도 실패하지 않는다.
+        let skippedSecretFiles = 0;
+        let truncated = false;
         for (const [path, content] of Object.entries(this.options.contents ?? {})) {
           // 비밀값 파일은 **읽기 전에** 건너뛴다 — 실제 도구가 그렇게 한다(tools/mod.rs).
-          if (/(^|\/)\.env($|\.)/.test(path)) continue;
-          content.split("\n").forEach((text, i) => {
-            if (pattern.test(text)) matches.push({ path, line: i + 1, text });
-          });
+          //
+          // **판정을 여기서 다시 적지 않는다.** 종전에는 `.env`만 보는 정규식이 손으로
+          // 적혀 있었고, 그러면 실제 규칙이 늘 때 fake만 뒤처져 **검사가 실제보다 넓은
+          // 세계를 지키게 된다**(13.6절이 적어 둔 갈림).
+          if (isSecretLike(path)) {
+            skippedSecretFiles += 1;
+            continue;
+          }
+          if (isBinaryLike(path)) continue;
+          for (const [i, text] of content.split("\n").entries()) {
+            if (!pattern.test(text)) continue;
+            if (matches.length >= FAKE_MAX_SEARCH_MATCHES) {
+              truncated = true;
+              break;
+            }
+            matches.push({ path, line: i + 1, text: text.slice(0, 400) });
+          }
+          if (truncated) break;
         }
-        return ok({ matches, truncated: false });
+        return ok({ matches, truncated, skippedSecretFiles });
       }
       case "git_status":
         return ok({ stdout: this.options.gitStatus ?? "## main", exitCode: 0 });

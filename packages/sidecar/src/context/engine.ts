@@ -605,9 +605,9 @@ export class ContextEngine {
       ];
 
       for (const attempt of attempts) {
-        let hits: { path: string; line: number }[];
+        let found: Awaited<ReturnType<ToolBridge["searchText"]>>;
         try {
-          hits = await bridge.searchText(attempt.pattern);
+          found = await bridge.searchText(attempt.pattern);
         } catch (error) {
           // **실패를 "없음"으로 읽지 않는다.** 읽지 못한 것과 없는 것은 다른 사실이고,
           // 뭉개면 컨텍스트가 조용히 좁아진 채 모델이 불린다.
@@ -616,6 +616,27 @@ export class ContextEngine {
             reason: `본문 검색이 실패해 이 키워드로는 후보를 찾지 못했습니다: ${String(error)}`,
           });
           break;
+        }
+
+        const hits = found.matches;
+
+        // **검색이 못 본 것을 기록한다**(58절). 실제 도구는 비밀값 파일을 읽기 전에 건너뛰고
+        // 그 개수를 돌려주는데, 종전에는 그 값을 아무도 읽지 않았다 — 그래서 "검색했는데
+        // 없다"와 "검색하지 않았다"가 호출부에서 같은 빈 배열이었다.
+        //
+        // 13절이 검색 **실패**를 "없음"으로 읽지 않게 만든 것과 같은 규율이고, 이쪽은
+        // **일부러 안 본** 경우다.
+        if (found.skippedSecretFiles !== null && found.skippedSecretFiles > 0) {
+          notes.push({
+            path: `(search: ${keyword})`,
+            reason: `비밀값 파일 ${found.skippedSecretFiles}개는 검색하지 않았습니다 — 거기 있었다면 찾지 못했습니다.`,
+          });
+        }
+        if (found.truncated) {
+          notes.push({
+            path: `(search: ${keyword})`,
+            reason: "검색 결과가 상한에서 잘렸습니다 — 이 키워드로 찾은 것이 전부가 아닙니다.",
+          });
         }
 
         // **인덱스에 있는 파일만 받는다.** 검색은 제외 규칙(비밀값·크기·gitignore)을 우리와

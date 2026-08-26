@@ -180,11 +180,38 @@ export class ToolBridge {
     }
   }
 
-  async searchText(pattern: string, path = "."): Promise<{ path: string; line: number; text: string }[]> {
+  /**
+   * 본문 검색 — **무엇을 못 봤는지도 함께 돌려준다** (state-machine 58절).
+   *
+   * # 왜 배열이 아닌가
+   *
+   * 종전에는 `matches` 배열만 돌려줬다. 그런데 실제 도구는 `skippedSecretFiles`와 `truncated`를
+   * 함께 내고, **그 값들의 목적이 정확히 이 자리에 있다** — `tools/mod.rs`의 주석이 그렇게
+   * 적어 두었다: *"오케스트레이터가 '여기 없으니 없다'고 결론 내리는 것을 막고."*
+   *
+   * 배열만 받으면 그 목적이 성립할 수 없다. 검색이 비밀값 파일 열 개를 건너뛰었어도
+   * 호출부가 보는 것은 빈 배열이고, 빈 배열은 "없다"로 읽힌다.
+   *
+   * 13절이 검색 **실패**를 "없음"으로 읽지 않게 만든 것과 같은 규율이다. 저쪽은 못 읽은
+   * 경우이고 이쪽은 **일부러 안 본** 경우이며, 둘 다 "없다"와 다른 사실이다.
+   */
+  async searchText(pattern: string, path = "."): Promise<SearchResult> {
     const { result } = await this.execute("search_text", { pattern, path });
-    const output = expectOk(result, "search_text");
-    const matches = (output as { matches?: unknown }).matches;
-    return Array.isArray(matches) ? (matches as { path: string; line: number; text: string }[]) : [];
+    const output = expectOk(result, "search_text") as {
+      matches?: unknown;
+      truncated?: unknown;
+      skippedSecretFiles?: unknown;
+    };
+    const matches = Array.isArray(output.matches)
+      ? (output.matches as { path: string; line: number; text: string }[])
+      : [];
+    return {
+      matches,
+      truncated: output.truncated === true,
+      // **없는 것과 0은 다르다.** 필드를 내지 않는 구현(옛 호스트)에서 0으로 위장하면
+      // "건너뛴 것이 없다"가 되고, 그건 우리가 아는 사실이 아니다.
+      skippedSecretFiles: typeof output.skippedSecretFiles === "number" ? output.skippedSecretFiles : null,
+    };
   }
 
   async gitStatus(): Promise<{ stdout: string; exitCode: number | null }> {
@@ -198,6 +225,20 @@ export class ToolBridge {
     const output = (result.output ?? {}) as { stdout?: string };
     return output.stdout ?? "";
   }
+}
+
+/** `search_text`의 결과 — 찾은 것과 **못 본 것**을 함께 담는다 (58절). */
+export interface SearchResult {
+  matches: { path: string; line: number; text: string }[];
+  /** 결과가 상한에서 잘렸는가. 잘렸으면 "여기 없다"는 결론이 성립하지 않는다. */
+  truncated: boolean;
+  /**
+   * 검색이 **읽지 않고 건너뛴** 비밀값 파일 수.
+   *
+   * `null`은 "호스트가 이 사실을 말하지 않았다"이고 `0`은 "건너뛴 것이 없다"이다.
+   * 뭉개면 옛 호스트나 fake가 조용히 "건너뛴 것 없음"을 주장하게 된다.
+   */
+  skippedSecretFiles: number | null;
 }
 
 function expectOk(result: ToolResult, tool: string): unknown {
