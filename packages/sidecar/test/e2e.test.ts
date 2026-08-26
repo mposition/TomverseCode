@@ -37,6 +37,8 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..", "..", "..");
 // 세 파일에 복사해 두었다가 두 곳만 틀렸던 것이 `@tomverse/toolchain`이 생긴 이유다.
 const HOST_BIN = hostBinaryPath(REPO_ROOT, process.platform);
 const SIDECAR_ENTRY = sidecarEntryPath(REPO_ROOT);
+/** 최소 MCP 서버 fixture. argv[2]를 주면 그 경로에 "띄워졌다"는 표식을 남긴다(64절). */
+const ECHO_SERVER = path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "examples", "fixtures", "echo-server.js");
 
 interface HostRun {
   exitCode: number;
@@ -1215,6 +1217,70 @@ test("세션을 이어도 모델 제안은 다음 태스크로 넘어가지 않�
  * fixture 서버는 `tools/list`에 이름만 있는 도구 하나를 주고 stdout에 로그를 섞는다 —
  * 설명도 스키마도 없는 서버가 흔하고, 그때 목록이 깨지지 않아야 한다.
  */
+/**
+ * **CLI 미리보기가 등록을 반영한다** — state-machine 64절.
+ *
+ * 47.9절이 남겨 둔 절반이다. 화면 경로는 호스트에 붙은 풀을 쓰는데 CLI는 아무것도 붙이지
+ * 않아서, 서버를 등록해 둔 사용자가 `autopilot-preview`에서 받는 답은 언제나 "등록 밖
+ * 거부"였다 — **틀린 규칙 이름이다.**
+ *
+ * 그리고 여기서 재는 것이 하나 더 있다: 미리보기는 **DB를 만들지 않고 서버도 띄우지
+ * 않는다.** 등록을 반영하려고 풀을 만들게 됐으므로, 그 풀이 프로세스를 띄우지 않는다는
+ * 것을 실제 실행으로 확인한다.
+ */
+test("CLI 미리보기가 등록된 MCP 서버를 반영하고, 아무것도 띄우지 않는다", () => {
+  withRepo((repo, stateDir) => {
+    const artifacts = checkArtifacts(REPO_ROOT, process.platform);
+    assert.ok(artifacts.ok, artifacts.detail);
+    const dbPath = path.join(stateDir, "state.db");
+    // fixture 서버는 argv[2]를 받으면 그 경로에 표식을 남긴다 — "띄우지 않았다"를 밖에서
+    // 관측할 유일한 방법이다(핸드셰이크가 실패하면 세션이 남지 않으므로 내부 상태로는
+    // "띄우려다 실패"와 "안 띄움"이 같은 모양이다).
+    const marker = path.join(stateDir, "mcp-spawned");
+    const server = `echo=node,${ECHO_SERVER},${marker}`;
+
+    const raw = execFileSync(
+      HOST_BIN,
+      [
+        "autopilot-preview",
+        "--workspace",
+        repo.root,
+        "--approve",
+        "autopilot",
+        "--mcp-server",
+        server,
+        "--mcp-tools",
+        "echo=echo",
+      ],
+      { encoding: "utf8" }
+    );
+    const report = JSON.parse(raw.trim().split("\n").pop() as string) as {
+      stops: { tool: string; probe: string; matchedRule: string }[];
+      denied: { tool: string; probe: string; matchedRule: string }[];
+      proceeds: { tool: string; probe: string }[];
+    };
+
+    const mcp = [...report.stops, ...report.denied].filter((p) => p.tool === "mcp_call");
+    // **탐침이 둘이다.** 등록 밖 호출과 등록된 호출은 사용자가 다음에 할 일이 다르다.
+    assert.equal(mcp.length, 2, raw);
+    const inside = mcp.find((p) => p.probe === "등록된 MCP 도구 부르기");
+    const outside = mcp.find((p) => p.probe === "등록되지 않은 MCP 도구 부르기");
+    assert.ok(inside, raw);
+    assert.ok(outside, raw);
+    // 등록을 반영하지 않으면 이 둘의 규칙 이름이 같아진다 — 그게 종전 상태다.
+    assert.equal(inside.matchedRule, "mcp_always_requires_approval", raw);
+    assert.notEqual(outside.matchedRule, inside.matchedRule, raw);
+    // 어느 쪽도 사람 없이 지나가지 않는다(23.3절).
+    assert.ok(!report.proceeds.some((p) => p.tool === "mcp_call"), raw);
+
+    // **아무것도 쓰지 않았다.** DB를 열면 없던 state.db가 생긴다(47절).
+    assert.equal(existsSync(dbPath), false, `미리보기가 ${dbPath}를 만들었습니다`);
+    // **서버도 띄우지 않았다.** 이 단언이 공허하지 않다는 것은 아래 실행 시나리오가
+    // 같은 표식으로 확인한다 — 거기서는 남아야 한다.
+    assert.equal(existsSync(marker), false, `미리보기가 MCP 서버를 띄웠습니다 (${marker})`);
+  });
+});
+
 test("등록한 MCP 서버의 도구를 모델이 알고, 요청하면 실행되고 결과가 다음 프롬프트로 간다", () => {
   withRepo((repo, stateDir) => {
     const askForTool = {
@@ -1231,7 +1297,7 @@ test("등록한 MCP 서버의 도구를 모델이 알고, 요청하면 실행되
       // **교차검증 경로로 고정한다.** `fast`는 TRIAGE가 단일 모델로 보낼 수 있고, 그러면
       // 이 시나리오가 무엇을 태웠는지가 실행마다 달라진다.
       mode: "verified",
-      mcpServers: [`echo=node,${path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "examples", "fixtures", "echo-server.js")}`],
+      mcpServers: [`echo=node,${ECHO_SERVER},${path.join(stateDir, "mcp-spawned")}`],
       // 첫 초안만 도구를 요청한다. 두 번째 초안이 실제 patch를 낸다.
       script: [
         { kind: "draft", payload: askForTool },
@@ -1285,6 +1351,14 @@ test("등록한 MCP 서버의 도구를 모델이 알고, 요청하면 실행되
     const results = snapshot.mcpResults as { text: string } | null;
     assert.ok(results, "마지막 스냅샷에 MCP 결과가 없습니다");
     assert.ok(results!.text.includes("MCP_E2E_MARKER"), results!.text);
+
+    // ④ **표식이 남았다.** 미리보기 쪽에서 "띄우지 않았다"를 재는 단언이 공허하지 않다는
+    //    것을 여기서 확인한다 — 같은 fixture, 같은 인자, 이쪽에서는 실제로 띄운다(64절).
+    assert.equal(
+      existsSync(path.join(stateDir, "mcp-spawned")),
+      true,
+      "서버를 띄웠는데 표식이 없습니다 — 미리보기 쪽 단언이 공허해집니다"
+    );
   });
 });
 

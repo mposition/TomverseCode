@@ -64,6 +64,15 @@ impl PolicyGate {
         self
     }
 
+    /// 이 게이트가 아는 등록 — **읽기 전용 뷰**다 (state-machine 64절).
+    ///
+    /// 미리보기가 "등록된 서버를 부르면 어떻게 되는가"를 물으려면 서버 이름을 알아야 한다.
+    /// 풀 자체를 내주면 받는 쪽이 `catalog()`로 서버를 띄울 수 있으므로 뷰만 내준다 —
+    /// 그 타입에는 띄우는 길이 없다.
+    pub fn mcp_registration(&self) -> Option<crate::mcp::Registration<'_>> {
+        self.mcp.as_ref().map(|pool| pool.registration())
+    }
+
     /// 모든 도구 실행이 반드시 통과하는 단일 지점.
     pub fn evaluate(&self, request: &ToolRequest, root: &WorkspaceRoot, task_policy: &TaskPolicy) -> PolicyDecision {
         let outcome = self.classify(request, root, task_policy);
