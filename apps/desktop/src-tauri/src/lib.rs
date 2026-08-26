@@ -337,6 +337,16 @@ fn task_blocked(state: tauri::State<'_, SessionState>, task_id: String) -> Resul
     Ok(envelope(state.task_blocked(&task_id)))
 }
 
+/// **그 태스크가 돈 정책**으로 만든 미리보기 (state-machine 59절). **읽기 전용이다.**
+///
+/// `autopilot_preview`와 나란히 두되 다른 명령이다 — 저쪽은 "지금 스위치로 돌리면"이고
+/// 이쪽은 "그 태스크는 어떤 예고를 받았나"다. 섞으면 `blocked`와의 비교가 다른 질문에
+/// 대한 답을 나란히 놓는다.
+#[tauri::command]
+fn task_autopilot_preview(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
+    state.task_autopilot_preview(&task_id)
+}
+
 /// 무인 실행이 지금 스위치로 무엇을 허용하는지 (state-machine 47·48절).
 ///
 /// **아무것도 쓰지 않는다.** 화면이 스위치를 바꿀 때마다 다시 물으므로 자주 불린다 —
@@ -559,6 +569,7 @@ pub fn run() {
             skill_path,
             set_workspace_settings,
             open_pull_request,
+            task_autopilot_preview,
             task_export,
             list_models,
             set_allowed_providers,

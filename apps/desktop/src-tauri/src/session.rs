@@ -564,6 +564,23 @@ impl SessionState {
         serde_json::to_value(out).map_err(|e| StoreIssue::new(StoreOp::ReadBlocked, format!("직렬화: {e}")).ui())
     }
 
+    /// **그 태스크가 돈 정책**으로 만든 무인 실행 미리보기 (state-machine 59절).
+    ///
+    /// `autopilot_preview`(화면의 지금 스위치)와 **다른 명령이다.** 이쪽은 `blocked`와
+    /// 나란히 놓기 위한 것이므로, 비교 대상이 그 태스크가 실제로 돈 정책이어야 한다 —
+    /// 지금 스위치로 만들면 다른 질문에 대한 답을 나란히 놓게 되고, 그 상태에서
+    /// "예고가 어긋났다"고 말하는 것은 우리가 만든 거짓 신호다.
+    ///
+    /// 태스크를 모르면 `null`이다. 기본 프로필로 대신하지 않는다 — 대신하면 그 사실이
+    /// 어디에도 나타나지 않은 채 비교가 성립한 것처럼 보인다.
+    pub fn task_autopilot_preview(&self, task_id: &str) -> Result<Value, String> {
+        let host = self.with_active(|active| Ok(active.host.clone()))?;
+        match host.autopilot_preview_for_task(task_id) {
+            None => Ok(Value::Null),
+            Some(preview) => serde_json::to_value(preview).map_err(|e| format!("직렬화: {e}")),
+        }
+    }
+
     /// 브랜치를 remote로 올리고 PR 폼 URL을 만든다 (state-machine 28절).
     ///
     /// **읽기 전용이 아니다** — push가 일어난다. 그래서 다른 조회들과 달리 `read_store`가 아니라

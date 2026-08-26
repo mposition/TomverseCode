@@ -207,3 +207,36 @@ test("두 진입점 모두 읽기 전용 종류를 한 함수로 판정한다", 
     assert.ok(!outside.includes(needle), `${path.basename(file)}: 종류 비교가 ${fn} 밖에도 있습니다`);
   }
 });
+
+/**
+ * **이어 보기는 그 태스크가 돈 정책으로 물어야 한다** — state-machine 59절.
+ *
+ * 화면의 지금 스위치로 미리보기를 만들면 **다른 질문에 대한 답**을 `blocked`와 나란히 놓는
+ * 셈이다. 사용자가 실행 뒤에 스위치를 하나 껐다면 그 미리보기는 그 태스크가 돈 정책이
+ * 아니고, 그 상태에서 "예고가 어긋났다"고 말하는 것은 **우리가 만든 거짓 신호**다.
+ *
+ * 그래서 명령이 둘이다: `autopilot_preview`(지금 스위치)와 `task_autopilot_preview`(고정된
+ * 정책). 화면이 잇는 자리에서는 후자를 불러야 한다.
+ */
+test("이어 보기 패널이 태스크 고정 정책의 미리보기를 부른다", () => {
+  const panel = readFileSync(
+    path.join(
+      findUp("src-tauri", path.dirname(fileURLToPath(import.meta.url))),
+      "src",
+      "components",
+      "BlockedPanel.tsx"
+    ),
+    "utf8"
+  );
+  const pinned = "task_autopilot_preview" + '"';
+  assert.ok(panel.includes(pinned), "BlockedPanel이 고정 정책 미리보기를 부르지 않습니다");
+  // **지금 스위치용 명령을 부르면 안 된다.** 그쪽은 시작 화면의 것이다.
+  const live = '"autopilot_preview"';
+  assert.ok(!panel.includes(live), "BlockedPanel이 화면의 지금 스위치로 미리보기를 부릅니다");
+});
+
+/** 그 명령이 **등록**돼 있어야 한다 — 붙이기만 하면 런타임에 없다(이 파일 첫 주석). */
+test("고정 정책 미리보기 명령이 등록돼 있다", () => {
+  assert.ok(registeredCommands().includes("task_autopilot_preview"), registeredCommands().join(", "));
+  assert.ok(declaredCommands().includes("task_autopilot_preview"), declaredCommands().join(", "));
+});

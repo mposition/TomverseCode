@@ -509,6 +509,25 @@ impl TaskHost {
         crate::autopilot::preview(&self.root, &profile, &self.hooks)
     }
 
+    /// **그 태스크의 고정된 정책**으로 미리보기를 만든다 — state-machine 59절.
+    ///
+    /// # 왜 화면의 지금 스위치로 하면 안 되는가
+    ///
+    /// 이 미리보기의 쓸모는 `blocked`(24.8절)와 **나란히 놓는 것**이다: 예고와 실제를 이으면
+    /// "예고는 지나간다고 했는데 멈췄다"를 말할 수 있다.
+    ///
+    /// 그런데 화면의 지금 스위치로 미리보기를 만들면 **다른 질문에 대한 답**을 나란히 놓는
+    /// 셈이다. 사용자가 실행 뒤에 스위치를 하나 껐다면, 그 미리보기는 그 태스크가 돈 정책이
+    /// 아니다 — 그 상태에서 "예고가 어긋났다"고 말하는 것은 우리가 만든 거짓 신호다.
+    ///
+    /// 태스크의 정책은 `begin_task`가 고정했고(`profiles`) 그 프로필을 그대로 쓴다.
+    /// 태스크를 모르면 **기본 프로필로 대신하지 않는다** — 대신하면 그 사실이 어디에도
+    /// 나타나지 않은 채 비교가 성립한 것처럼 보인다.
+    pub fn autopilot_preview_for_task(&self, task_id: &str) -> Option<crate::autopilot::Preview> {
+        let profile = self.profiles.lock().unwrap().get(task_id).cloned()?;
+        Some(crate::autopilot::preview(&self.root, &profile, &self.hooks))
+    }
+
     pub fn root(&self) -> &WorkspaceRoot {
         &self.root
     }
@@ -3604,6 +3623,49 @@ mod tests {
             "{:?}",
             profile.verification_pin
         );
+    }
+
+    /// **태스크를 모르면 기본 프로필로 대신하지 않는다** — state-machine 59절.
+    ///
+    /// 대신하면 그 사실이 어디에도 나타나지 않은 채 비교가 성립한 것처럼 보인다 —
+    /// 그리고 그 비교로 "예고가 어긋났다"고 말하면 우리가 만든 거짓 신호다.
+    #[test]
+    fn a_preview_for_an_unknown_task_is_none_not_the_default() {
+        let (_ws, _a, host) = host_with_manifest(TaskPolicy::default(), Arc::new(AlwaysDeny), None);
+        assert!(host.autopilot_preview_for_task("no-such-task").is_none());
+
+        host.begin_task("task-1", TaskPolicy { unattended: true, ..TaskPolicy::default() }, None)
+            .unwrap();
+        assert!(host.autopilot_preview_for_task("task-1").is_some());
+    }
+
+    /// **그 태스크가 돈 정책으로 답한다.** 화면의 지금 스위치로 만들면 다른 질문에 대한
+    /// 답을 `blocked`와 나란히 놓게 된다.
+    #[test]
+    fn a_task_preview_uses_the_pinned_policy_not_the_workspace_default() {
+        let (_ws, _a, host) = host_with_manifest(
+            // 워크스페이스 기본값은 무인이 아니다.
+            TaskPolicy::default(),
+            Arc::new(AlwaysDeny),
+            None,
+        );
+        host.begin_task(
+            "task-1",
+            TaskPolicy {
+                unattended: true,
+                auto_approve_workspace_writes: true,
+                ..TaskPolicy::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let preview = host.autopilot_preview_for_task("task-1").expect("미리보기가 없습니다");
+        // 고정된 정책이 반영됐다 — 기본값으로 만들었다면 둘 다 false다.
+        assert!(preview.switches.unattended, "{:?}", preview.switches);
+        assert!(preview.switches.auto_approve_workspace_writes, "{:?}", preview.switches);
+        // 워크스페이스 기본값과 실제로 다르다는 것 — 아니면 위 단언이 공허하다.
+        assert!(!host.policy().unattended);
     }
 
     /// **`begin_task`를 지나지 않는 경로의 프로필도 훅을 알아야 한다** — 52절.
