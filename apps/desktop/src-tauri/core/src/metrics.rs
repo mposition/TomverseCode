@@ -812,6 +812,65 @@ pub struct PreviewAccuracy {
     pub not_probed: u64,
 }
 
+/// 앵커 창 하나가 **얼마나 자주 모자랐는가** — context-engine 15.3·15.6절.
+///
+/// # 분모가 "잘린 파일"이 아니다
+///
+/// 15절은 창을 하나만 낸다(조각을 이으면 본문에 구멍이 생긴다). 그래서 앵커가 흩어져 있으면
+/// 일부는 창 밖에 남고, 15.6절은 그 대가를 재봐야 한다고 적어 두었다.
+///
+/// **앵커가 하나뿐인 파일은 분모에서 뺀다.** 거기서는 놓치는 일이 **구조적으로 불가능**하고,
+/// 넣으면 "우리는 거의 놓치지 않는다"가 참이 되도록 분모를 부풀리는 셈이다 — 60.2절이
+/// 말한 "잘못된 분모가 표본 부족보다 나쁘다"의 교과서적인 예다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct AnchorWindows {
+    /// 잘려 들어간 파일 중 **앵커가 둘 이상이었던** 것의 수. 비율의 분모다.
+    #[serde(rename = "filesWithMultipleAnchors")]
+    pub files_with_multiple_anchors: u64,
+    /// 그중 창 하나가 앵커를 **전부** 덮은 파일 수.
+    #[serde(rename = "fullyCovered")]
+    pub fully_covered: u64,
+    /// 창 밖에 남은 앵커의 총수. **창을 둘로 늘릴 근거는 이 숫자다.**
+    #[serde(rename = "anchorsMissed")]
+    pub anchors_missed: u64,
+    /// 분모에서 뺀 파일 수(앵커가 하나뿐이라 놓칠 수 없었던 것). **뺀 사실을 남긴다** —
+    /// 조용히 빼면 분모가 왜 작은지 알 수 없다.
+    #[serde(rename = "singleAnchorFiles")]
+    pub single_anchor_files: u64,
+}
+
+/// 실패한 테스트 **이름을 갈랐는가**, 그리고 갈라 보니 섞여 있었는가 — state-machine 54·55절.
+///
+/// # 두 질문이 한 집계에 있다
+///
+/// **① 파서 커버리지**(55절): 실패한 테스트 체크 중 이름을 가르지 못한 비율. 크면 러너를
+/// 더 붙일 근거다. 분모는 *"실패한 테스트 체크가 있는 post 리포트"* 다 — 실패가 없는 리포트를
+/// 넣으면 "대개 가른다"가 참이 되도록 분모가 부풀려진다.
+///
+/// **② 섞임 빈도**(54절): 가른 리포트 중 원래 실패와 새 실패가 **함께 있던** 비율. 54절이
+/// 고친 거짓말이 얼마나 자주 일어났는지이고, 분모는 *"가른 리포트"* 다 — 못 가른 것에
+/// 대해서는 섞였는지 알 수 없으므로 그쪽 분모에 넣을 수 없다.
+///
+/// 분모가 다르므로 한 비율로 합칠 수 없다. 합치면 둘 중 하나는 반드시 틀린 분모로 읽힌다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct TestAttributionCoverage {
+    /// 실패한 테스트 체크가 있는 post 리포트 수. **① 의 분모다.**
+    #[serde(rename = "reportsWithFailingTests")]
+    pub reports_with_failing_tests: u64,
+    /// 그중 이름을 가른 리포트 수. **② 의 분모이기도 하다.**
+    #[serde(rename = "reportsSplit")]
+    pub reports_split: u64,
+    /// 가른 리포트 중 원래 실패와 새 실패가 **함께 있던** 수 — 54절이 고친 그 상황이다.
+    #[serde(rename = "reportsMixed")]
+    pub reports_mixed: u64,
+    /// 새로 실패한 테스트의 총수.
+    #[serde(rename = "newlyFailingTests")]
+    pub newly_failing_tests: u64,
+    /// 이번 변경으로 통과로 바뀐 테스트의 총수 (54.4절).
+    #[serde(rename = "fixedTests")]
+    pub fixed_tests: u64,
+}
+
 /// 예약이 실제 비용의 몇 배였는가 — multi-engine-routing.md 10.6절.
 ///
 /// # 문서가 "측정할 수 있다"고 적어둔 것이 측정되지 않고 있었다
@@ -1092,6 +1151,12 @@ pub struct Metrics {
     /// 무인 예고가 얼마나 맞았는가 (state-machine 59.6절).
     #[serde(rename = "previewAccuracy")]
     pub preview_accuracy: PreviewAccuracy,
+    /// 앵커 창 하나가 얼마나 자주 모자랐는가 (context-engine 15.6절).
+    #[serde(rename = "anchorWindows")]
+    pub anchor_windows: AnchorWindows,
+    /// 실패한 테스트 이름을 갈랐는가, 갈라 보니 섞여 있었는가 (state-machine 54·55절).
+    #[serde(rename = "testAttribution")]
+    pub test_attribution: TestAttributionCoverage,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
@@ -1285,6 +1350,22 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "예고가 기록된 무인 태스크 수",
             m.preview_accuracy.tasks_with_preview,
             "contradicted가 0이 아니면 미리보기가 47절의 약속을 지키지 못하는 것이고, 화면이 그것을 크게 말하는 것만으로는 부족하다 — 게이트 판정과 probe의 어긋남을 찾아야 한다. **notProbed는 다른 축이다**: probe 집합이 좁다는 뜻이므로 47.9절의 probe 목록을 넓히는 근거이지 예고가 틀렸다는 뜻이 아니다",
+        ),
+        open_question(
+            "anchorWindows",
+            "anchorWindows",
+            "창 하나로 충분한가 — 앵커가 얼마나 자주 창 밖에 남는가 (context-engine 15.6절)",
+            "앵커가 둘 이상이었던 잘린 파일 수",
+            m.anchor_windows.files_with_multiple_anchors,
+            "anchorsMissed가 크면 창을 둘로 늘릴 근거다. **그 대가는 본문의 구멍이고**(14절), 구멍은 표시하지 않으면 거짓이고 표시하면 모델이 patch context로 복사한다 — 그래서 늘리기 전에 '구멍을 어떻게 말할 것인가'가 먼저 풀려야 한다. singleAnchorFiles가 압도적이면 이 질문 자체가 드문 경우에 대한 것이다",
+        ),
+        open_question(
+            "testAttributionCoverage",
+            "testAttribution",
+            "러너 파서가 실제 프로젝트를 덮는가, 그리고 새 회귀가 원래 실패에 얼마나 자주 숨는가 (state-machine 54·55절)",
+            "실패한 테스트 체크가 있는 post 리포트 수",
+            m.test_attribution.reports_with_failing_tests,
+            "reportsSplit이 분모에 한참 못 미치면 55절의 러너 목록을 넓힌다 — 그때 실제 출력 없이 모양을 적으면 55.1절이 피하려던 것을 다시 만든다. reportsMixed가 크면 54절이 고친 거짓말이 흔했다는 뜻이고, 그건 체크 단위 귀속을 쓰는 다른 자리도 다시 봐야 한다는 신호다",
         ),
         open_question(
             "conflictOutcomes",
@@ -1822,6 +1903,12 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
         // ---- 무인 예고가 맞았는가 (59.6절) ----
         collect_preview_accuracy(&events, &mut metrics.preview_accuracy);
 
+        // ---- 앵커 창이 모자랐는가 (context-engine 15.6절) ----
+        collect_anchor_windows(&events, &mut metrics.anchor_windows);
+
+        // ---- 실패한 테스트 이름을 갈랐는가 (54·55절) ----
+        collect_test_attribution(&events, &mut metrics.test_attribution);
+
         // ---- 취소 소요: CANCELLATION_REQUESTED → 그 뒤 첫 터미널 ----
         collect_cancellation(&events, &mut metrics.cancellation, &mut latencies);
 
@@ -1896,6 +1983,91 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
 ///
 /// **분모는 답변·계획 태스크다.** 라운드를 돈 태스크만 세면 "라운드를 돌면 대개 돈다"는
 /// 동어반복이 나온다.
+/// 앵커 창이 모자랐는가 — context-engine 15.6절.
+///
+/// **앵커가 하나뿐인 파일은 분모에서 뺀다.** 거기서는 놓치는 일이 구조적으로 불가능하다.
+fn collect_anchor_windows(events: &[crate::store::StoredEvent], out: &mut AnchorWindows) {
+    for event in events.iter().filter(|e| e.event_type == "SNAPSHOT_CREATED") {
+        let Some(files) = event.payload.get("relevantFiles").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for file in files {
+            // **`null`을 "덮개가 있다"로 읽지 않는다.** 기록하는 쪽이 없을 때 키를 빼는 것이
+            // 규칙이지만(61절), 규칙을 어긴 기록이 오면 여기서 `total: 0`이 되어 **잘리지도
+            // 않은 파일이 전부 `singleAnchorFiles`로 세어진다** — 분모에서 뺀 수가 부풀려져
+            // "이 질문은 드문 경우에 대한 것"이라는 잘못된 결론이 나온다.
+            // **`null`을 "덮개가 있다"로 읽지 않는다.** 기록하는 쪽이 없을 때 키를 빼는 것이
+            // 규칙이지만(61절), 규칙을 어긴 기록이 오면 여기서 `total: 0`이 되어 **잘리지도
+            // 않은 파일이 전부 `singleAnchorFiles`로 세어진다** — 분모에서 뺀 수가 부풀려져
+            // "이 질문은 드문 경우에 대한 것"이라는 잘못된 결론이 나온다.
+            let coverage = match file.get("anchorCoverage") {
+                Some(v) if !v.is_null() => v,
+                _ => continue,
+            };
+            let total = coverage.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+            let covered = coverage.get("covered").and_then(|v| v.as_u64()).unwrap_or(0);
+            if total < 2 {
+                out.single_anchor_files += 1;
+                continue;
+            }
+            out.files_with_multiple_anchors += 1;
+            if covered >= total {
+                out.fully_covered += 1;
+            } else {
+                out.anchors_missed += total - covered;
+            }
+        }
+    }
+}
+
+/// 실패한 테스트 이름을 갈랐는가, 갈라 보니 섞여 있었는가 — state-machine 54·55절.
+///
+/// **두 질문의 분모가 다르다.** ①은 "실패한 테스트 체크가 있는 리포트", ②는 "가른 리포트"다 —
+/// 못 가른 리포트에 대해서는 섞였는지 알 수 없으므로 ②의 분모에 넣을 수 없다.
+fn collect_test_attribution(events: &[crate::store::StoredEvent], out: &mut TestAttributionCoverage) {
+    for event in events.iter().filter(|e| e.event_type == "VERIFICATION_COMPLETED") {
+        let report = &event.payload;
+        if report.get("phase").and_then(|v| v.as_str()) != Some("post") {
+            continue;
+        }
+        let failing_test_check = report
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .map(|checks| {
+                checks.iter().any(|c| {
+                    c.get("kind").and_then(|v| v.as_str()) == Some("test")
+                        && matches!(c.get("status").and_then(|v| v.as_str()), Some("FAILED") | Some("TIMED_OUT"))
+                })
+            })
+            .unwrap_or(false);
+        if !failing_test_check {
+            continue;
+        }
+        out.reports_with_failing_tests += 1;
+
+        let Some(attribution) = report.get("testAttribution").and_then(|v| v.as_array()) else {
+            // 가르지 못했다 — ②의 분모에 넣지 않는다.
+            continue;
+        };
+        out.reports_split += 1;
+
+        let mut mixed = false;
+        for entry in attribution {
+            let len = |key: &str| entry.get(key).and_then(|v| v.as_array()).map(|a| a.len() as u64).unwrap_or(0);
+            let newly = len("newlyFailing");
+            let pre = len("preexisting");
+            out.newly_failing_tests += newly;
+            out.fixed_tests += len("fixed");
+            if newly > 0 && pre > 0 {
+                mixed = true;
+            }
+        }
+        if mixed {
+            out.reports_mixed += 1;
+        }
+    }
+}
+
 fn collect_context_rounds(events: &[crate::store::StoredEvent], out: &mut ContextRounds) {
     let read_only = events
         .iter()
@@ -3258,6 +3430,173 @@ mod tests {
         let m = collect(&store, None).unwrap();
         assert_eq!(m.preview_accuracy.tasks_with_preview, 1);
         assert_eq!(m.preview_accuracy.tasks_that_stopped, 0);
+    }
+
+    // ---- 앵커 창 (context-engine 15.6절) ----
+
+    fn snapshot_with(files: Value) -> Value {
+        json!({ "snapshotId": "s-1", "relevantFiles": files })
+    }
+
+    /// **앵커가 하나뿐인 파일은 분모에서 뺀다.** 거기서는 놓치는 일이 **구조적으로
+    /// 불가능**하고, 넣으면 "우리는 거의 놓치지 않는다"가 참이 되도록 분모를 부풀린다.
+    #[test]
+    fn a_single_anchor_file_is_not_in_the_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with(json!([{ "path": "a.ts", "anchorCoverage": { "covered": 1, "total": 1 } }])),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.anchor_windows.files_with_multiple_anchors, 0);
+        // **뺀 사실은 남긴다** — 조용히 빼면 분모가 왜 작은지 알 수 없다.
+        assert_eq!(m.anchor_windows.single_anchor_files, 1);
+    }
+
+    #[test]
+    fn missed_anchors_are_counted() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with(json!([
+                    { "path": "a.ts", "anchorCoverage": { "covered": 2, "total": 4 } },
+                    { "path": "b.ts", "anchorCoverage": { "covered": 3, "total": 3 } },
+                ])),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.anchor_windows.files_with_multiple_anchors, 2);
+        assert_eq!(m.anchor_windows.fully_covered, 1);
+        assert_eq!(m.anchor_windows.anchors_missed, 2, "{:?}", m.anchor_windows);
+    }
+
+    /// **`null`을 "덮개가 있다"로 읽지 않는다.**
+    ///
+    /// 기록하는 쪽은 없을 때 키를 뺀다(61절). 그런데 규칙을 어긴 기록이 오면 `total: 0`이
+    /// 되어 **잘리지도 않은 파일이 전부 `singleAnchorFiles`로 세어진다** — 분모에서 뺀 수가
+    /// 부풀려져 "이 질문은 드문 경우에 대한 것"이라는 잘못된 결론이 나온다.
+    ///
+    /// 프로브로 찾았다: 기록 쪽을 `null`을 싣도록 바꿔도 아무 검사도 실패하지 않았다.
+    #[test]
+    fn an_explicit_null_coverage_is_not_a_single_anchor_file() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with(json!([{ "path": "a.ts", "anchorCoverage": Value::Null }])),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.anchor_windows.single_anchor_files, 0, "{:?}", m.anchor_windows);
+        assert_eq!(m.anchor_windows.files_with_multiple_anchors, 0);
+    }
+
+    /// 잘리지 않은 파일에는 이 값이 없다 — 없는 것을 0으로 세면 "덮었다"가 부풀려진다.
+    #[test]
+    fn a_file_without_coverage_is_ignored_entirely() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "SNAPSHOT_CREATED", &snapshot_with(json!([{ "path": "a.ts" }])))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.anchor_windows.files_with_multiple_anchors, 0);
+        assert_eq!(m.anchor_windows.single_anchor_files, 0);
+        assert_eq!(m.anchor_windows.fully_covered, 0);
+    }
+
+    // ---- 테스트 이름 귀속 (state-machine 54·55절) ----
+
+    fn post_report(test_status: &str, attribution: Option<Value>) -> Value {
+        let mut report = json!({
+            "phase": "post",
+            "checks": [{ "kind": "test", "status": test_status }],
+        });
+        if let Some(a) = attribution {
+            report["testAttribution"] = a;
+        }
+        report
+    }
+
+    /// **분모는 "실패한 테스트 체크가 있는 리포트"다.** 실패가 없는 리포트를 넣으면
+    /// "대개 가른다"가 참이 되도록 분모가 부풀려진다.
+    #[test]
+    fn a_passing_report_is_not_in_the_parser_coverage_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "VERIFICATION_COMPLETED", &post_report("PASSED", None))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_with_failing_tests, 0);
+    }
+
+    /// **가르지 못한 리포트는 ② 의 분모에 넣지 않는다** — 섞였는지 알 수 없기 때문이다.
+    #[test]
+    fn an_unsplit_report_counts_for_coverage_but_not_for_mixing() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "VERIFICATION_COMPLETED", &post_report("FAILED", None))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_with_failing_tests, 1);
+        assert_eq!(m.test_attribution.reports_split, 0);
+        assert_eq!(m.test_attribution.reports_mixed, 0);
+    }
+
+    /// 54절이 고친 그 상황 — 원래 실패와 새 실패가 **함께** 있는 체크.
+    #[test]
+    fn a_mixed_report_is_counted_as_mixed() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "VERIFICATION_COMPLETED",
+                &post_report(
+                    "FAILED",
+                    Some(json!([{ "kind": "test", "newlyFailing": ["a", "b"], "preexisting": ["c"], "fixed": ["d"] }])),
+                ),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_split, 1);
+        assert_eq!(m.test_attribution.reports_mixed, 1);
+        assert_eq!(m.test_attribution.newly_failing_tests, 2);
+        assert_eq!(m.test_attribution.fixed_tests, 1);
+    }
+
+    /// 순수한 새 실패는 **섞임이 아니다** — 뭉치면 54절이 물으려는 것이 사라진다.
+    #[test]
+    fn a_purely_new_failure_is_not_mixed() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "VERIFICATION_COMPLETED",
+                &post_report(
+                    "FAILED",
+                    Some(json!([{ "kind": "test", "newlyFailing": ["a"], "preexisting": [], "fixed": [] }])),
+                ),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_split, 1);
+        assert_eq!(m.test_attribution.reports_mixed, 0);
+    }
+
+    /// baseline 리포트는 세지 않는다 — 대조할 것이 없으므로 귀속이라는 개념이 없다.
+    #[test]
+    fn a_baseline_report_is_not_counted() {
+        let (_d, mut store) = seeded();
+        let mut report = post_report("FAILED", None);
+        report["phase"] = json!("baseline");
+        store.append_event("task-1", "VERIFICATION_COMPLETED", &report).unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_with_failing_tests, 0);
     }
 
     #[test]

@@ -18,7 +18,12 @@ import {
 } from "../src/context/budget.js";
 import { FAKE_MAX_SEARCH_MATCHES, FakeHost } from "./helpers/fakeHost.js";
 import { ToolBridge } from "../src/tools/bridge.js";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { NdjsonTransport } from "../src/ipc/transport.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
 import { renderSnapshot } from "../src/providers/prompts.js";
 
@@ -1189,4 +1194,52 @@ test("호스트가 말하지 않으면 건너뛴 수는 null이다", async () =>
   const found = await new ToolBridge(transport, "task-1").searchText("x");
   assert.equal(found.skippedSecretFiles, null, "필드가 없는데 0으로 위장했습니다");
   assert.equal(found.truncated, false);
+});
+
+/**
+ * **재는 장치의 값이 기록에 닿아야 한다** — state-machine 61절.
+ *
+ * 15.3절이 `anchorCoverage`를 만든 이유는 "앵커 분포를 잰 적이 없다"였다. 그런데 그 값이
+ * 스냅샷에만 있고 이벤트에 없으면 **여전히 잰 적이 없다** — 값이 메모리에서 태어나 기록에
+ * 닿지 못한 채 사라진다.
+ *
+ * 16.1절이 본 것("값은 있는데 읽는 사람이 없다")보다 한 단계 앞이고, 증상은 더 조용하다:
+ * 읽는 코드를 나중에 만들어도 읽을 것이 없다.
+ */
+test("앵커 덮개가 SNAPSHOT_CREATED에 실린다", async () => {
+  const lines = Array.from({ length: 600 }, (_u, i) => {
+    if (i === 100) return "export function resolveBudget(limit) { return limit; }";
+    if (i === 520) return "export function resolveBudget2(id) { return id; }";
+    return `const filler${i} = ${i};`;
+  });
+  const content = lines.join("\n");
+
+  const host = new FakeHost({
+    files: [
+      { path: "src/ledger.ts", isDir: false, sizeBytes: content.length },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: { "src/ledger.ts": content, "package.json": "{}" },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 이상합니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 1_200 }],
+  });
+
+  const ledger = snapshot.relevantFiles.find((f) => f.path === "src/ledger.ts");
+  assert.ok(ledger?.anchorCoverage, "스냅샷에 앵커 덮개가 없습니다 — 이 검사가 공허합니다");
+
+  // 그리고 그 값이 **이벤트 payload 모양**으로 살아남아야 한다. payload를 만드는 코드는
+  // 오케스트레이터에 있으므로 여기서는 그 모양을 소스에서 확인한다.
+  const orchestrator = readFileSync(
+    path.resolve(__dirname, "..", "..", "..", "..", "packages", "sidecar", "src", "orchestrator", "orchestrator.ts"),
+    "utf8"
+  );
+  const payloadAt = orchestrator.indexOf("private snapshotPayload(");
+  assert.notEqual(payloadAt, -1, "snapshotPayload를 찾지 못했습니다");
+  const body = orchestrator.slice(payloadAt, orchestrator.indexOf("\n  }", payloadAt));
+  assert.ok(body.includes("anchorCoverage"), "SNAPSHOT_CREATED payload가 앵커 덮개를 싣지 않습니다");
 });

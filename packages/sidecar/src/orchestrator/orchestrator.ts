@@ -2845,6 +2845,16 @@ export class Orchestrator {
         reason: f.reason,
         reasonDetail: f.reasonDetail,
         truncated: f.truncated,
+        // **재는 장치의 값이 기록에 닿아야 한다**(state-machine 61절).
+        //
+        // context-engine 15.3절이 이 값을 만든 이유는 "앵커 분포를 잰 적이 없다"였는데,
+        // 스냅샷에만 있고 이벤트에 없으면 **여전히 잰 적이 없다.** 값이 메모리에서 태어나
+        // 기록에 닿지 못한 채 사라지는 자리이고, 16.1절이 본 것("값은 있는데 읽는 사람이
+        // 없다")보다 한 단계 앞이다.
+        //
+        // 없으면 키를 두지 않는다 — 잘리지 않은 파일에 `null`을 실으면 "가른 결과가 없다"와
+        // "가를 것이 없었다"가 같은 모양이 된다.
+        ...(f.anchorCoverage ? { anchorCoverage: f.anchorCoverage } : {}),
       })),
       excludedNotes: snapshot.excludedNotes ?? [],
       projectMeta: snapshot.projectMeta,
