@@ -35,9 +35,37 @@ const DOC = path.join(REPO_ROOT, "docs", "design", "product-strategy.md");
 
 interface StatusRow {
   label: string;
+  /** 상태를 적은 칸의 원문. 부정 주장을 여기서 찾는다(아래 `NEGATIVE_CLAIMS`). */
+  status: string;
   present: string[];
   absent: string[];
 }
+
+/**
+ * **판정어의 닫힌 집합** — product-strategy 8.2절, state-machine 56절.
+ *
+ * 상태 칸의 **첫 굵은 글씨**가 그 행의 판정이다(`**부분**(M3) — …`). 나머지는 산문이다.
+ *
+ * # 왜 산문을 보지 않는가 — 실측
+ *
+ * 처음에는 산문에서 부정 어휘("없다", "미확인" 등)를 찾았다. **일곱 행이 걸렸고 그중 다섯이
+ * 오탐이었다** — "우리는 GitHub에 요청을 보내지 않는다", "정책으로 낮출 수 없다"처럼 완료된
+ * 기능을 설명하는 문장에 같은 단어가 들어 있기 때문이다. 검사가 없는 결함을 보고하면 사람은
+ * 검사를 고치는 대신 **검사를 약하게 만든다**(53.7절에서 같은 것을 배웠다).
+ *
+ * 판정어는 산문이 아니라 **값**이다. 닫힌 집합으로 두면 새 판정어를 쓸 때 여기서 막히고,
+ * 막히는 자리에서 "이건 긍정인가 부정인가"를 정하게 된다.
+ *
+ * # 이 검사가 못 잡는 것
+ *
+ * 판정은 긍정인데 **산문 안에 부정 주장이 있는 경우**는 못 잡는다(Google 행의 "실측
+ * 미확인"이 그렇다). 그건 문장을 읽어야 아는 일이고, 이 파일 위쪽 주석이 이미 같은 한계를
+ * 적어 두었다 — 목적은 판정을 대신하는 것이 아니라 가장 자주 일어나는 낡는 방식을 막는 것이다.
+ */
+const KNOWN_VERDICTS = ["구현 완료", "충족", "부분", "미착수"];
+
+/** 이 판정어들은 **만들면 낡는다.** 반증할 파일을 함께 적어야 한다. */
+const NEGATIVE_VERDICTS = ["부분", "미착수"];
 
 /**
  * 마커를 뽑는다. **`|`로 시작하고 `§`가 붙은 행만** 본다 — 같은 문서의 산문에도 마커 형식이
@@ -49,9 +77,67 @@ function readStatusRows(): StatusRow[] {
   for (const line of source.split("\n")) {
     if (!line.startsWith("| §")) continue;
     const label = line.slice(1).split("|")[0]!.trim();
-    rows.push({ label, present: markerPaths(line, "present"), absent: markerPaths(line, "absent") });
+    rows.push({
+      label,
+      status: statusCellOf(line),
+      present: markerPaths(line, "present"),
+      absent: markerPaths(line, "absent"),
+    });
   }
   return rows;
+}
+
+/**
+ * 8.2절 **출시 기준 표**의 상태 행들 — state-machine 56절.
+ *
+ * # 왜 따로 읽는가
+ *
+ * 이 표는 3.1절 표와 형식이 다르다(행 머리가 `§`가 아니라 `↳ 위 행의 현재 상태`다).
+ * 그래서 위 검사 밖에 있었고, **밖에 있는 동안 낡았다** — 세 행이 "UI 미배선"이라고
+ * 적혀 있었는데 셋 다 화면이 붙어 있었다. 낡은 방향은 이 파일 위쪽 주석이 예언한 그대로다:
+ * 있는 것을 없다고 말하는 쪽.
+ *
+ * # 왜 한 함수로 합치지 않는가
+ *
+ * 행 머리 판정이 다르므로 합치면 "둘 중 하나로 시작하면"이 되고, 그러면 **어느 표를 몇 행
+ * 읽었는지** 알 수 없다. 표 하나가 통째로 사라져도 다른 쪽 행 수로 최소 개수를 넘길 수 있다.
+ */
+function readReleaseRows(): StatusRow[] {
+  const source = readFileSync(DOC, "utf8");
+  const rows: StatusRow[] = [];
+  const head = "|" + " ↳ 위 행의 현재 상태";
+  for (const line of source.split("\n")) {
+    if (!line.startsWith(head)) continue;
+    rows.push({
+      label: line.slice(1).split("|")[0]!.trim(),
+      status: statusCellOf(line),
+      present: markerPaths(line, "present"),
+      absent: markerPaths(line, "absent"),
+    });
+  }
+  return rows;
+}
+
+/** 표 행의 **두 번째 칸**(상태 원문). 마커는 주석이므로 그대로 남지만 판정에 영향이 없다. */
+function statusCellOf(line: string): string {
+  const cells = line.slice(1).split("|");
+  return (cells[1] ?? "").trim();
+}
+
+/**
+ * 상태 칸의 **첫 굵은 글씨** = 그 행의 판정. 없으면 `null`.
+ *
+ * 굵은 글씨가 아예 없는 행이 있을 수 있고(Google 행이 그렇다 — 판정이 문장 중간에 있다),
+ * 그 경우 `null`을 주고 아래 검사가 그 사실을 따로 다룬다. 첫 굵은 글씨를 **판정이 아닌
+ * 것으로 채우면** 이 검사가 조용히 빗나가므로, 알 수 없는 값은 실패로 만든다.
+ */
+function verdictOf(status: string): string | null {
+  const mark = "*" + "*";
+  const open = status.indexOf(mark);
+  if (open !== 0) return null;
+  const close = status.indexOf(mark, open + mark.length);
+  if (close === -1) return null;
+  return status.slice(open + mark.length, close).trim();
 }
 
 /** needle을 런타임에 조립한다 — 리터럴로 적으면 이 파일 자체가 검사 대상처럼 보인다. */
@@ -110,4 +196,95 @@ test("두 방향 모두 실제로 검사되고 있다", () => {
   // 위 두 테스트가 아무것도 확인하지 못한 채 통과한다.
   assert.equal(existsSync(path.join(REPO_ROOT, "package.json")), true);
   assert.equal(existsSync(path.join(REPO_ROOT, "package.json.nonexistent")), false);
+});
+
+// ---- 출시 기준 표 (8.2절) — state-machine 56절 ----
+
+test("출시 기준 표의 상태 행도 반증할 파일을 적는다", () => {
+  const rows = readReleaseRows();
+  // 표를 못 찾았는데 통과하는 것을 막는다.
+  assert.ok(rows.length >= 10, `출시 기준 표의 상태 행을 ${rows.length}개만 읽었습니다. 형식이 바뀌었습니까?`);
+  for (const row of rows) {
+    assert.ok(
+      row.present.length + row.absent.length > 0,
+      `출시 기준 표에 근거 없는 상태 행이 있습니다: "${row.status.slice(0, 40)}…". ` +
+        `근거 없이 상태만 적는 행은 처음부터 검사 밖에 있습니다`
+    );
+  }
+});
+
+test("출시 기준 표도 있다/없다가 실제와 같다", () => {
+  for (const row of readReleaseRows()) {
+    for (const rel of row.present) {
+      assert.ok(
+        existsSync(path.join(REPO_ROOT, rel)),
+        `"${row.status.slice(0, 40)}…"이 있다고 적었는데 ${rel}가 없습니다`
+      );
+    }
+    for (const rel of row.absent) {
+      assert.ok(
+        !existsSync(path.join(REPO_ROOT, rel)),
+        `"${row.status.slice(0, 40)}…"을 없다고 적었는데 ${rel}가 생겼습니다. 만들었으면 표를 고칠 것`
+      );
+    }
+  }
+});
+
+/**
+ * **부정 판정에는 반증할 파일이 붙어야 한다** — state-machine 56절.
+ *
+ * 이 검사가 없는 동안 8.2절 표의 세 행이 "UI 미배선"이라고 말했고 셋 다 화면이 붙어 있었다.
+ * `present:` 마커는 그 드리프트를 잡지 못한다 — 그 마커가 가리키는 것은 **코어 파일**이고,
+ * 코어는 UI가 생기든 말든 그대로 있기 때문이다.
+ *
+ * 부정 판정은 **만들면 낡는다.** 그래서 "무엇이 생기면 이 판정이 거짓이 되는가"를 함께
+ * 적게 한다. 그 파일이 생기는 순간 위 검사가 실패한다.
+ */
+test("부분·미착수 행은 무엇이 생기면 거짓이 되는지 함께 적는다", () => {
+  const rows = readReleaseRows();
+  const negative = rows.filter((row) => {
+    const verdict = verdictOf(row.status);
+    return verdict !== null && NEGATIVE_VERDICTS.includes(verdict);
+  });
+  // **빈 집합에 대한 전칭 명제는 언제나 참이다.** 하나도 안 걸리면 이 검사는 공허하다.
+  assert.ok(negative.length > 0, "부정 판정 행을 하나도 찾지 못했습니다 — 판정어가 문서와 갈라졌습니까?");
+
+  for (const row of negative) {
+    assert.ok(
+      row.absent.length > 0,
+      `"${verdictOf(row.status)}" 행에 반증할 파일이 없습니다: "${row.status.slice(0, 60)}…". ` +
+        `부정 판정은 만들면 조용히 낡습니다 — 무엇이 생기면 이 판정이 거짓이 되는지 적을 것`
+    );
+  }
+});
+
+/**
+ * **판정어는 닫힌 집합이다.** 새 판정어를 쓰면 여기서 막히고, 막히는 자리에서
+ * "이건 긍정인가 부정인가"를 정하게 된다 — 정하지 않으면 위 검사가 그 행을 그냥 지나친다.
+ */
+test("모르는 판정어를 쓰면 막힌다", () => {
+  const rows = readReleaseRows();
+  const unknown = rows
+    .map((row) => ({ row, verdict: verdictOf(row.status) }))
+    .filter(({ verdict }) => verdict !== null && !KNOWN_VERDICTS.includes(verdict));
+  assert.deepEqual(
+    unknown.map(({ verdict }) => verdict),
+    [],
+    `모르는 판정어가 있습니다. 긍정인지 부정인지 정하고 KNOWN_VERDICTS에 넣을 것 — ` +
+      `분류되지 않은 판정어는 "부정 판정에 반증할 파일" 검사를 조용히 지나칩니다`
+  );
+
+  // 그리고 **판정어를 실제로 읽고 있다는 것.** 전부 null이면 위 비교가 빈 집합끼리다.
+  assert.ok(
+    rows.filter((row) => verdictOf(row.status) !== null).length >= 5,
+    "판정어를 읽은 행이 너무 적습니다 — 형식이 바뀌었습니까?"
+  );
+});
+
+/** 판정어 추출이 두 답을 낼 수 있는지 — 언제나 null이면 위 검사들이 공허하다. */
+test("판정어 추출이 실제로 값을 가른다", () => {
+  const mark = "*" + "*";
+  assert.equal(verdictOf(`${mark}부분${mark}(M3) — 어쩌고`), "부분");
+  assert.equal(verdictOf("3사 어댑터 " + mark + "구현 완료" + mark), null);
+  assert.equal(verdictOf("굵은 글씨가 없는 행"), null);
 });
