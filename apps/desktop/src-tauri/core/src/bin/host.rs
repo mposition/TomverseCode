@@ -172,8 +172,82 @@ struct Args {
     apply: bool,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tomverse_core::types::{TaskPolicy, ToolName, ToolRequest};
+
+    /// 파싱을 거치지 않고 만드는 최소 `Args`. **`parse_args`의 기본값을 복사하지 않는다** —
+    /// 여기서 보는 것은 `command`와 `skill` 둘뿐이고, 나머지를 베껴 두면 기본값이 바뀔 때
+    /// 이 사본만 낡는다.
+    fn args_for(command: &str) -> Args {
+        parse_args_from(vec![command.to_string()].into_iter()).expect("args")
+    }
+
+    /// **질문은 읽기 전용으로 좁혀진다** — 51절.
+    ///
+    /// 경로가 `EXECUTING`을 지나지 않는다는 것은 Node의 성질이고, 장악당한 Node는 그 경로를
+    /// 우회할 수 있다. 게이트에 꽂히는 목록이 그때의 보장이다(원칙 2).
+    #[test]
+    fn a_question_is_narrowed_to_read_only_tools() {
+        let allowed = allowed_tools_for(&args_for("ask"), None).expect("좁혀지지 않았습니다");
+        assert!(!allowed.is_empty());
+        for tool in &allowed {
+            assert!(tool.is_read_only(), "{}가 읽기 전용이 아닙니다", tool.as_str());
+            assert!(!tool.mutates_files(), "{}가 파일을 바꿉니다", tool.as_str());
+        }
+        // **`run_tests`를 남기지 않는다.** 스킬 파싱은 검증 명령을 강제로 남기지만(26절),
+        // 질문 경로에는 `VERIFYING`이 아예 없으므로 남기면 답 하나에 사용자의 테스트가 돈다.
+        assert!(!allowed.contains(&ToolName::RunTests), "{allowed:?}");
+    }
+
+    /// 그리고 그 목록이 **게이트에서 실제로 막는다.** 목록만 만들고 꽂지 않으면 아무 일도 없다.
+    #[test]
+    fn the_gate_denies_a_write_under_a_question_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "x").unwrap();
+        let root = tomverse_core::paths::WorkspaceRoot::new(dir.path()).unwrap();
+        let policy = TaskPolicy {
+            allowed_tools: allowed_tools_for(&args_for("ask"), None),
+            ..TaskPolicy::default()
+        };
+        let gate = tomverse_core::policy::PolicyGate::new(&policy);
+        let request = ToolRequest {
+            request_id: "r".to_string(),
+            task_id: "t".to_string(),
+            tool: ToolName::ApplyPatch,
+            args: serde_json::json!({ "path": "a.ts", "patch": "" }),
+            risk_tier: None,
+            requested_by: serde_json::json!({}),
+            created_at: None,
+            injected_env: Default::default(),
+        };
+        let decision = gate.evaluate(&request, &root, &policy);
+        assert_eq!(decision.matched_rule, "tool_not_in_skill_allowlist", "{decision:?}");
+
+        // 읽기는 지난다 — 위 단언이 "전부 막는다"가 아니라는 증거다.
+        let read = ToolRequest { tool: ToolName::ReadFile, args: serde_json::json!({ "path": "a.ts" }), ..request };
+        assert_ne!(
+            gate.evaluate(&read, &root, &policy).matched_rule,
+            "tool_not_in_skill_allowlist"
+        );
+    }
+
+    /// `run`은 종전과 한 글자도 다르지 않다 — 기본값이 동작을 바꾸지 않는다.
+    #[test]
+    fn a_change_task_is_not_narrowed() {
+        assert_eq!(allowed_tools_for(&args_for("run"), None), None);
+    }
+}
+
 fn parse_args() -> Result<Args, String> {
-    let mut raw = std::env::args().skip(1);
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// **인자원을 받는다.** `std::env::args()`를 직접 읽으면 이 파서를 테스트할 방법이 없고,
+/// 그러면 기본값이 조용히 바뀌어도 드러나지 않는다.
+fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut raw = raw;
     let command = raw.next().ok_or_else(usage)?;
 
     let mut args = Args {
@@ -362,7 +436,7 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|pr|recover|tasks|show|blocked|autopilot-preview|decisions|withdraw|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|ask|rollback|revert|pr|recover|tasks|show|blocked|autopilot-preview|decisions|withdraw|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--skill <파일.json>] [--session <id>]\n\
      [--auto-approve-writes] [--auto-approve-verification]\n\
@@ -402,6 +476,10 @@ fn usage() -> String {
                  저쪽은 호스트가 **기다리기를 그만두는** 시각이지 태스크가 멈추는 시각이 아니다\n\
      worktree — 격리 트리 목록(JSON). [--worktree <branch>]를 주면 그 트리를 정리한다.\n\
                  커밋되지 않은 변경이 있으면 지우지 않고 사유를 낸다 — 버리려면 [--force]\n\
+     ask     — 질문에 답한다(--message). **파일을 바꾸지 않는다** — 계획도 실행도 검증도\n\
+                 하지 않고 모델을 한 번 부른다. 도구는 읽기 전용으로 좁혀 게이트에 꽂히므로,\n\
+                 sidecar가 장악당해도 이 태스크는 파일을 바꿀 수 없다. `COMPLETED`가 아니라\n\
+                 `ANSWERED`로 끝난다 — 답변은 완료가 아니다(51절)\n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
      pr      — 현재 브랜치를 remote로 올리고 **PR 생성 폼 URL**을 낸다. [--remote origin]\n\
                  [--base main]. **우리는 GitHub에 요청을 보내지 않는다** — 폼을 여는 것은\n\
@@ -608,6 +686,37 @@ fn real_main() -> Result<i32, String> {
     }
 }
 
+/// 이 태스크가 쓸 수 있는 도구.
+///
+/// **좁히기만 한다.** 스킬이 좁힌 것과 질문 경로가 좁힌 것을 **교집합**으로 놓는다 —
+/// 둘 중 하나라도 막으면 막힌다. 합집합으로 두면 질문이 스킬보다 넓어지거나 그 반대가 된다.
+///
+/// # 질문은 파일을 바꾸지 않는다 — 그 보장이 여기 있다 (51절)
+///
+/// sidecar의 경로가 `EXECUTING`을 지나지 않는다는 것은 **Node의 성질**이고, 장악당한 Node는
+/// 그 경로를 우회할 수 있다. 게이트에 읽기 전용 목록을 꽂으면 그때도 파일이 바뀌지 않는다 —
+/// 원칙 2가 요구하는 것이 정확히 이 이중화다.
+///
+/// **`run_tests`를 남기지 않는다.** 스킬 파싱은 검증 명령을 강제로 남기지만(26절), 그건
+/// "`VERIFYING`이 스킬 파일 한 줄로 꺼지지 않게" 하려는 것이다. 질문 경로에는 `VERIFYING`이
+/// 아예 없으므로 남길 이유가 없고, 남기면 답 하나 얻자고 사용자의 테스트가 돈다.
+fn allowed_tools_for(
+    args: &Args,
+    skill: Option<&tomverse_core::skills::Skill>,
+) -> Option<Vec<tomverse_core::types::ToolName>> {
+    let from_skill = skill.and_then(|s| s.allowed_tools.clone());
+    if args.command != "ask" {
+        return from_skill;
+    }
+    let read_only: Vec<tomverse_core::types::ToolName> = tomverse_core::skills::ALL_TOOLS
+        .iter()
+        .copied()
+        .filter(|t| t.is_read_only())
+        .filter(|t| from_skill.as_ref().is_none_or(|s| s.contains(t)))
+        .collect();
+    Some(read_only)
+}
+
 /// 스킬을 **Rust가 읽는다**(26.1절). sidecar가 읽으면 도구 허용목록의 출처가 sidecar가 되고,
 /// 장악당한 sidecar가 "허용목록은 전부입니다"라고 말할 수 있다.
 fn load_skill(args: &Args, root: &WorkspaceRoot) -> Result<Option<tomverse_core::skills::Skill>, String> {
@@ -629,7 +738,7 @@ fn load_skill(args: &Args, root: &WorkspaceRoot) -> Result<Option<tomverse_core:
 fn task_policy_from(args: &Args, skill: Option<&tomverse_core::skills::Skill>) -> TaskPolicy {
     TaskPolicy {
         // 도구 허용목록은 **게이트에 꽂힌다.** sidecar에 알려 주기는 하지만 지키는 것은 여기다.
-        allowed_tools: skill.and_then(|s| s.allowed_tools.clone()),
+        allowed_tools: allowed_tools_for(args, skill),
         auto_approve_workspace_writes: args.auto_approve_writes,
         auto_approve_verification: args.auto_approve_verification,
         allow_git_commit: args.allow_git_commit,
@@ -677,9 +786,15 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
     let sink = Arc::new(StderrSink { verbose: args.verbose });
 
     match args.command.as_str() {
-        "run" => {
+        // **`ask`는 `run`과 같은 경로를 탄다.** 스냅샷·라우팅·예산·전송 기록이 모두 같은
+        // 자리를 지나야 하고, 다른 것은 sidecar가 갈라지는 지점 하나뿐이다(51절).
+        //
+        // 도구 허용목록은 **읽기 전용으로 좁혀서** 보낸다(아래 `policy`). 경로가 파일을 바꾸지
+        // 않는다는 것은 Node의 성질이고, 게이트가 막는다는 것은 Rust의 성질이다 — 둘을
+        // 뭉치면 한쪽이 뚫렸을 때 다른 쪽도 없는 것으로 여기게 된다.
+        "run" | "ask" => {
             if args.message.trim().is_empty() {
-                return Err("run에는 --message가 필요합니다".to_string());
+                return Err(format!("{}에는 --message가 필요합니다", args.command));
             }
             // **세션을 명시하면 그 세션에 붙는다.** 매번 새 세션을 만들면 세션 메모리는
             // 영원히 비어 있고, 그러면 그 기능이 동작하는지 확인할 방법이 없다(27절).
@@ -1251,6 +1366,8 @@ fn run_task(
             "sessionId": session_id,
             "workspaceId": workspace_id,
             "userMessage": args.message,
+            // **바꿔 달라는 것인가 물어보는 것인가**(51절). 값이 없으면 종전과 같다.
+            "kind": if args.command == "ask" { "question" } else { "change" },
             "createdAt": tomverse_core::time::now_iso(),
         },
         "policy": {
@@ -1268,9 +1385,10 @@ fn run_task(
             "unattended": args.approve == "autopilot",
             // sidecar는 이 목록을 **지키지 않는다** — 지키는 것은 Rust의 게이트다. 보내는
             // 이유는 화면이 "이 스킬이 무엇을 좁혔는가"를 말할 수 있어야 하기 때문이다.
-            "allowedTools": skill
+            // **게이트에 꽂힌 값을 그대로 보낸다**(51절). 여기서 다시 계산하면 화면이 말하는
+            // 허용목록과 실제로 좁혀진 목록이 갈릴 수 있고, 갈리면 화면이 거짓말한다.
+            "allowedTools": allowed_tools_for(args, skill)
                 .as_ref()
-                .and_then(|s| s.allowed_tools.as_ref())
                 .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
         },
         // 프롬프트 프리셋과 모델 지정만 sidecar로 간다 — 도구 허용목록은 policy로 갔고

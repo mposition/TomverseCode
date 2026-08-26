@@ -12,7 +12,7 @@
  */
 
 import type { ReviewMode, Verdict } from "./common.js";
-import type { DraftProposal, PlanStep, ReviewDecision, SingleModelFixResult } from "./proposal.js";
+import type { DraftProposal, PlanStep, QuestionAnswer, ReviewDecision, SingleModelFixResult } from "./proposal.js";
 import type { RunCommandArgs } from "./tools.js";
 
 export class ValidationError extends Error {
@@ -360,4 +360,25 @@ export function assertRelativeWorkspacePath(value: unknown, path = "path"): stri
     throw new ValidationError(path, `path must be relative to the workspace root (got ${JSON.stringify(p)})`);
   }
   return normalized;
+}
+
+/**
+ * 질문에 대한 답 — state-machine 51절.
+ *
+ * **빈 답을 받지 않는다.** 빈 문자열을 통과시키면 화면이 빈 카드를 그리고, 사용자는 그것을
+ * "답이 없다"가 아니라 "도구가 깨졌다"로 읽는다.
+ */
+export function validateQuestionAnswer(
+  raw: unknown,
+  ctx: { taskId: string; model: string; createdAt: string }
+): QuestionAnswer {
+  const o = requireObject(raw, "questionAnswer");
+  return {
+    taskId: ctx.taskId,
+    answer: requireNonEmptyString(o.answer, "questionAnswer.answer"),
+    citedFiles: optionalStringArray(o.citedFiles, "questionAnswer.citedFiles") ?? [],
+    missingContext: optionalStringArray(o.missingContext, "questionAnswer.missingContext") ?? [],
+    model: ctx.model,
+    createdAt: ctx.createdAt,
+  };
 }

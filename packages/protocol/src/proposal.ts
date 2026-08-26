@@ -145,3 +145,27 @@ export interface SingleModelFixResult {
   model: string;
   createdAt: ISODateTime;
 }
+
+/**
+ * 질문에 대한 답 — state-machine 51절.
+ *
+ * **`DraftProposal`과 나란히 두지만 다른 타입이다.** 초안은 "이렇게 바꾸자"는 제안이고 이건
+ * "이렇다"는 서술이다. 한 타입으로 합치면 patch가 비어 있는 초안과 답변이 같은 모양이 되고,
+ * 그러면 화면과 감사 기록이 둘을 구별하지 못한다.
+ */
+export interface QuestionAnswer {
+  taskId: string;
+  answer: string;
+  /** 답이 기댄 파일들. 비어 있으면 파일에 기대지 않았다는 뜻이다. */
+  citedFiles: string[];
+  /**
+   * 더 확신하려면 무엇을 봐야 하는가.
+   *
+   * **산문이 아니라 값으로 받는다.** 답변 안에 섞여 있으면 화면이 읽을 수 없고, 사용자는
+   * 확신에 찬 문단과 조심스러운 문단을 같은 무게로 읽는다. 이 경로에는 결정론적 판정자가
+   * 없으므로(검증할 결과가 없다) 그 구별이 사용자가 가진 유일한 방어다.
+   */
+  missingContext: string[];
+  model: string;
+  createdAt: ISODateTime;
+}

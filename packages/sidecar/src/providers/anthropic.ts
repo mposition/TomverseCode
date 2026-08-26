@@ -5,11 +5,17 @@ import type {
   NormalizedProviderError,
   ProviderCapabilitiesView,
   ReviewDecision,
+  QuestionAnswer,
   SingleModelFixResult,
   TokenUsage,
 } from "@tomverse/protocol";
 import { effectiveMaxOutputTokens } from "../budget/ledger.js";
-import { validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
+import {
+  validateDraftProposal,
+  validateQuestionAnswer,
+  validateReviewDecision,
+  validateSingleModelFixResult,
+} from "@tomverse/protocol";
 import { estimateTokensUpperBound } from "../context/budget.js";
 import { envelopeIdentity } from "./envelope.js";
 import { normalizeProviderError } from "./errors.js";
@@ -18,7 +24,9 @@ import {
   buildFixPrompt,
   buildReviewPrompt,
   buildSingleModelFixPrompt,
+  buildQuestionPrompt,
   DRAFT_SCHEMA,
+  QUESTION_SCHEMA,
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
 } from "./prompts.js";
@@ -178,6 +186,24 @@ export class AnthropicAdapter implements ProviderAdapter {
     );
     return {
       value: validateSingleModelFixResult(parsed, {
+        taskId: ctx.taskId,
+        model: this.modelId,
+        createdAt: new Date().toISOString(),
+      }),
+      usage,
+      latencyMs,
+      meta,
+    };
+  }
+
+  async answerQuestion(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<QuestionAnswer>> {
+    const { parsed, usage, latencyMs, meta } = await this.forcedToolCall(
+      buildQuestionPrompt(input),
+      { name: "submit_answer", description: "Answer the question about this repository.", schema: QUESTION_SCHEMA },
+      ctx
+    );
+    return {
+      value: validateQuestionAnswer(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),

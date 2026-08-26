@@ -17,7 +17,9 @@ import { isTerminalPhase } from "@tomverse/protocol";
  */
 export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
   CREATED: ["SNAPSHOTTING", "CANCELLING", "CANCELLED", "FAILED"],
-  SNAPSHOTTING: ["TRIAGE", "CANCELLING", "CANCELLED", "FAILED"],
+  // **질문은 TRIAGE로 가지 않는다**(51절). TRIAGE가 정하는 것은 "교차검증을 할 것인가"이고,
+  // 질문에는 검증할 산출물이 없으므로 그 판정에 답이 없다.
+  SNAPSHOTTING: ["TRIAGE", "ANSWERING", "CANCELLING", "CANCELLED", "FAILED"],
   // TRIAGE는 complexityTier에 따라 갈린다.
   TRIAGE: ["DRAFTING", "SINGLE_MODEL_FIX", "CANCELLING", "CANCELLED", "FAILED"],
   /**
@@ -98,12 +100,21 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
   // 정리만 하고 CANCELLED로 간다. 여기서 COMPLETED로 갈 수 없다 —
   // 취소를 요청한 뒤 성공으로 끝나면 사용자는 취소가 무시됐다고 느낀다.
   CANCELLING: ["CANCELLED", "FAILED"],
+  /**
+   * 질문에 답하는 중 (51절).
+   *
+   * **`COMPLETED`가 여기 없다.** 답변은 완료가 아니고, 그 구별이 `canReachCompletedWithoutVerifying`
+   * 불변식을 지킨다 — 답변 경로가 `COMPLETED`에 닿을 수 있으면 검증 없이 완료에 도달하는 길이
+   * 생긴다. `EXECUTING`도 없다: 질문은 파일을 바꾸지 않는다.
+   */
+  ANSWERING: ["ANSWERED", "CANCELLING", "CANCELLED", "FAILED"],
   COMPLETED: [],
   FAILED: [],
   CANCELLED: [],
   REJECTED: [],
   // Node는 이 상태로 전이하지 않는다 — 호스트가 앱 시작 시 확정한다(store.rs).
   INTERRUPTED: [],
+  ANSWERED: [],
 };
 
 export function isValidTransition(from: TaskPhase, to: TaskPhase): boolean {
@@ -121,6 +132,32 @@ export class InvalidTransitionError extends Error {
  * COMPLETED에 도달하기 위해 반드시 VERIFYING을 지나야 한다는 불변식의 명시적 표현.
  * 테스트가 이걸 직접 검증한다 — 나중에 전이 표를 고칠 때 실수로 우회로가 생기면 실패한다.
  */
+/**
+ * **답변 경로는 파일을 바꾸지 않는다**는 불변식의 명시적 표현 (51절).
+ *
+ * `canReachCompletedWithoutVerifying`의 거울이다. 저쪽은 "검증 없이 완료할 수 없다"를 지키고
+ * 이쪽은 "답변한다면서 실행하지 않는다"를 지킨다 — 둘 다 전이 표에서 유도하므로, 나중에 표를
+ * 고치다 우회로가 생기면 테스트가 실패한다.
+ *
+ * 도구 허용목록(26절)이 Rust 쪽에서 같은 것을 한 겹 더 막는다. 여기는 **경로**의 보장이고
+ * 그쪽은 **권한**의 보장이다 — 뭉치면 한쪽이 뚫렸을 때 다른 쪽도 없는 것으로 여기게 된다.
+ */
+export function canReachAnsweredThroughMutation(): boolean {
+  const mutating: readonly TaskPhase[] = ["EXECUTING", "PLANNING", "AWAITING_APPROVAL", "FIX_LOOP", "VERIFYING"];
+  const visited = new Set<TaskPhase>();
+  const stack: { phase: TaskPhase; touched: boolean }[] = [{ phase: "CREATED", touched: false }];
+  while (stack.length > 0) {
+    const { phase, touched } = stack.pop()!;
+    const key = `${phase}:${touched}` as TaskPhase;
+    if (visited.has(key)) continue;
+    visited.add(key);
+    if (phase === "ANSWERED" && touched) return true;
+    const nextTouched = touched || mutating.includes(phase);
+    for (const next of TRANSITIONS[phase]) stack.push({ phase: next, touched: nextTouched });
+  }
+  return false;
+}
+
 export function canReachCompletedWithoutVerifying(): boolean {
   const visited = new Set<TaskPhase>();
   const stack: TaskPhase[] = ["CREATED"];

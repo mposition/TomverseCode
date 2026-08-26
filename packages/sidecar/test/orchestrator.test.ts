@@ -19,12 +19,13 @@ const WORKSPACE_FILES: FakeHostOptions = {
   gitStatus: "## main",
 };
 
-function taskRequest(userMessage = "src/app.ts 의 상수를 2로 고쳐줘"): TaskRequest {
+function taskRequest(userMessage = "src/app.ts 의 상수를 2로 고쳐줘", kind?: TaskRequest["kind"]): TaskRequest {
   return {
     taskId: "task-1",
     sessionId: "sess-1",
     workspaceId: "ws-1",
     userMessage,
+    ...(kind ? { kind } : {}),
     createdAt: new Date().toISOString(),
   };
 }
@@ -39,13 +40,14 @@ function build(
     retry?: typeof DEFAULT_RETRY_POLICY;
     providerTimeoutMs?: number;
     sessionMemory?: { text: string; decisionCount: number; truncated: boolean };
+    kind?: TaskRequest["kind"];
     mcpTools?: { text: string; serverCount: number; toolCount: number; truncated: boolean };
   } = {}
 ): { orchestrator: Orchestrator; host: FakeHost } {
   const host = new FakeHost({ ...WORKSPACE_FILES, ...hostOptions });
   const orchestrator = new Orchestrator(
     {
-      taskRequest: taskRequest(overrides.message),
+      taskRequest: taskRequest(overrides.message, overrides.kind),
       policy: makePolicy(overrides.policy),
       availableProviders: overrides.providers ?? ["fake-a", "fake-b"],
       sessionMemory: overrides.sessionMemory,
@@ -1588,4 +1590,87 @@ test("한 라운드의 MCP 호출 개수에 상한이 있고, 버린 것을 말�
   assert.equal(calls.length, MAX_MCP_CALLS_PER_ROUND, `${calls.length}건이 실행됐습니다`);
   const later = prompts.filter((p) => p.kind === "draft").at(-1)!;
   assert.ok(later.text.includes("not run"), "실행하지 않은 요청을 말하지 않습니다");
+});
+
+// ---- 질문 경로 (state-machine 51절) ----
+
+/**
+ * **질문에는 patch가 아니라 답을 준다** — state-machine 51절.
+ *
+ * 종전에는 모든 태스크가 patch로 끝났다. "이 코드 왜 이래?"를 물으면 파이프라인이 억지
+ * 수정안을 만들고, 사용자는 답 대신 diff를 읽는다.
+ */
+test("질문은 계획도 실행도 검증도 하지 않고 답으로 끝난다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }] },
+    { script: [{ kind: "answer", payload: { answer: "a는 1로 초기화됩니다.", citedFiles: ["src/app.ts"] } }] },
+    { message: "src/app.ts 의 a는 왜 1입니까?", kind: "question" }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "answered", result.summary);
+  assert.equal(result.answer?.answer, "a는 1로 초기화됩니다.");
+
+  const phases = host.phaseSequence();
+  assert.deepEqual(phases, ["SNAPSHOTTING", "ANSWERING", "ANSWERED"], phases.join(" → "));
+  // **파일을 바꾸지 않는다.** 경로가 지나지 않는다는 것이 이 검사의 요점이다.
+  assert.deepEqual(
+    host.toolRequests.filter((r) => ["apply_patch", "create_file", "delete_file", "move_file"].includes(r.tool)),
+    []
+  );
+  // **검증도 돌리지 않는다.** baseline조차 돌지 않아야 한다 — 답 하나에 사용자의 테스트를
+  // 몇 분씩 돌릴 이유가 없다.
+  assert.deepEqual(host.verifyCalls, [], JSON.stringify(host.verifyCalls));
+});
+
+/**
+ * **완료가 아니다.** 감사 기록에서 답변과 완료가 같은 이벤트로 남으면, "검증을 통과한 변경"과
+ * "아무것도 바꾸지 않은 답변"을 사후에 구별할 수 없다.
+ */
+test("답변은 TASK_COMPLETED로 기록되지 않는다", async () => {
+  const { orchestrator, host } = build(
+    {},
+    { script: [{ kind: "answer", payload: { answer: "그렇습니다." } }] },
+    { message: "이게 맞습니까?", kind: "question" }
+  );
+  await orchestrator.run();
+
+  const types = host.eventTypes();
+  assert.ok(types.includes("QUESTION_ANSWERED"), types.join(", "));
+  assert.ok(!types.includes("TASK_COMPLETED"), types.join(", "));
+});
+
+/**
+ * **"모른다"를 값으로 센다.** 이 경로에는 결정론적 판정자가 없으므로(검증할 결과가 없다),
+ * 모델이 못 본 것을 말했는지가 사용자가 가진 유일한 방어다.
+ */
+test("모델이 밝힌 모자란 컨텍스트가 이벤트에 남는다", async () => {
+  const { orchestrator, host } = build(
+    {},
+    {
+      script: [
+        {
+          kind: "answer",
+          payload: { answer: "확실하지 않습니다.", missingContext: ["src/hidden.ts", "테스트 파일"] },
+        },
+      ],
+    },
+    { message: "이게 맞습니까?", kind: "question" }
+  );
+  const result = await orchestrator.run();
+
+  assert.deepEqual(result.answer?.missingContext, ["src/hidden.ts", "테스트 파일"]);
+  const received = host.events.find((e) => e.type === "DRAFT_RECEIVED");
+  assert.equal((received?.payload as { missingContextCount?: number }).missingContextCount, 2);
+});
+
+/** `kind`가 없으면 종전과 한 글자도 다르지 않다 — 기본값이 동작을 바꾸지 않는다. */
+test("kind가 없으면 종전 경로를 그대로 탄다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    { defaultPatch: VALID_PATCH }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+  assert.ok(host.phaseSequence().includes("VERIFYING"));
 });

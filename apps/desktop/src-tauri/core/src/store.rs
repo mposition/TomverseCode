@@ -1571,7 +1571,10 @@ impl Store {
 /// `INTERRUPTED`는 M0.1에서 추가됐다: 앱이 비정상 종료된 태스크는 완료도 실패도 취소도 아니고,
 /// **사용자가 되돌릴지 재실행할지 결정해야 하는 상태**다. 다른 터미널로 뭉뚱그리면 그 구별이 사라진다.
 pub fn is_terminal_phase(phase: &str) -> bool {
-    matches!(phase, "COMPLETED" | "FAILED" | "CANCELLED" | "REJECTED" | "INTERRUPTED")
+    matches!(
+        phase,
+        "COMPLETED" | "FAILED" | "CANCELLED" | "REJECTED" | "INTERRUPTED" | "ANSWERED"
+    )
 }
 
 fn map_task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {

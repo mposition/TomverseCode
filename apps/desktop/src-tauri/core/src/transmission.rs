@@ -133,7 +133,7 @@ pub const REPORTED_SECTIONS: &[&str] = &[
 
 /// **우리가 모델에게 주는 지시문.** 사용자 데이터가 들어 있지 않으므로 전송 목록에 올리지
 /// 않는다 — 올리면 진짜 데이터가 지시문 사이에 묻힌다.
-pub const INSTRUCTION_SECTIONS: &[&str] = &["Output rules", "Verdict rules"];
+pub const INSTRUCTION_SECTIONS: &[&str] = &["Output rules", "Verdict rules", "Answer rules"];
 
 /// **나가지만 아직 세지 않는 것** (7.2절의 남은 과제).
 ///
@@ -143,6 +143,9 @@ pub const INSTRUCTION_SECTIONS: &[&str] = &["Output rules", "Verdict rules"];
 /// 적지 않으면 위 `REPORTED_SECTIONS`가 "전부"로 읽히기 때문이다.
 pub const UNREPORTED_SECTIONS: &[&str] = &[
     "Task",
+    // 질문 경로의 사용자 요청(51절). 바로 위 항목과 **같은 것이다** — 사용자가 쓴 문장이
+    // 그대로 나간다. 제목만 다른 이유는 그 프롬프트가 하는 일이 다르기 때문이다.
+    "Question",
     "Acceptance criteria",
     "Clarifications already provided by the user",
     "Draft author's interpretation",

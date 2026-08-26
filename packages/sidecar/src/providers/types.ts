@@ -4,6 +4,7 @@ import type {
   ModelEntry,
   NormalizedProviderError,
   ProviderCapabilitiesView,
+  QuestionAnswer,
   ReviewDecision,
   SingleModelFixResult,
   TokenUsage,
@@ -243,6 +244,15 @@ export interface ProviderAdapter {
    * DraftProposal과 달리 verdict를 갖는다(state-machine-and-protocol.md 4b절, 14.1절).
    */
   singleModelFix(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<SingleModelFixResult>>;
+
+  /**
+   * ANSWERING — 질문에 답한다 (state-machine 51절).
+   *
+   * **`generateDraft`와 입력이 같고 출력이 다르다.** 같은 스냅샷을 보되 patch가 아니라 답을
+   * 낸다. 입력을 공유하는 것이 중요하다 — 전송 투명성 집계가 "모든 프롬프트가 같은 스냅샷을
+   * 싣는다"에 기대고 있다(transmission.rs).
+   */
+  answerQuestion(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<QuestionAnswer>>;
 
   /**
    * FIX_LOOP — VerificationReport(정확히는 digest)만을 근거로 수정한다.

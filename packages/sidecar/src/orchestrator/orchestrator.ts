@@ -12,6 +12,7 @@ import type {
   FileMove,
   FinalResult,
   McpCallRequest,
+  QuestionAnswer,
   ReviewDecision,
   RoutingDecision,
   SingleModelFixResult,
@@ -200,6 +201,8 @@ export class Orchestrator {
   private bridge: ToolBridge | null = null;
   private baselineReport: VerificationReport | null = null;
   private lastReport: VerificationReport | null = null;
+  /** 질문 경로의 답 — `finish`가 결과에 실어 보낸다 (51절). */
+  private pendingAnswer: QuestionAnswer | null = null;
   /**
    * 적용된 변경에 대해 **우리가 실제로 아는 것** — 경로와 크기. diff가 아니다.
    *
@@ -474,6 +477,18 @@ export class Orchestrator {
       this.snapshot.mcpTools = this.input.mcpTools;
     }
     await this.emit("SNAPSHOT_CREATED", this.snapshotPayload(this.snapshot));
+
+    // ---- 질문이면 여기서 갈라진다 (state-machine 51절) ----
+    //
+    // **baseline 검증보다 앞이다.** 질문은 파일을 바꾸지 않으므로 "원래 깨져 있던 것"과
+    // "이번 변경이 깨뜨린 것"을 구별할 필요가 없고, 그 구별을 위해 사용자의 테스트를 돌리는
+    // 것은 답 하나를 얻자고 몇 분을 쓰는 일이다.
+    //
+    // TRIAGE보다도 앞이다. TRIAGE가 정하는 것은 "교차검증을 할 것인가"인데, 질문에는 검증할
+    // 산출물이 없으므로 그 판정에 답이 없다.
+    if (this.input.taskRequest.kind === "question") {
+      return this.answerQuestion();
+    }
 
     // ---- baseline 검증 ----
     // 작업 전 상태를 먼저 측정한다. 이걸 하지 않으면 "원래 깨져 있던 것"과
@@ -2264,6 +2279,103 @@ export class Orchestrator {
     return this.cancelRequested || this.abort.signal.aborted;
   }
 
+  /**
+   * 질문에 답한다 — state-machine 51절.
+   *
+   * # 이 경로가 하지 않는 것
+   *
+   * TRIAGE·검수·계획·실행·검증을 하지 않는다. 모델을 **한 번** 부르고 끝난다.
+   *
+   * 라우팅은 한다 — 어느 모델에게 물을지는 정해야 하고, 그 판정과 기록은 나머지 경로와
+   * 같은 자리에 있어야 전송 집계가 성립한다(7.1절).
+   *
+   * # 왜 `COMPLETED`가 아닌가
+   *
+   * 상태 머신에 *"`COMPLETED`에 도달하려면 반드시 `VERIFYING`을 지나야 한다"*는 불변식이
+   * 있다(원칙 1의 구조적 표현). 답변에는 검증할 것이 없으므로 그 불변식을 **약화시키는 대신
+   * 다른 종착지를 만들었다** — `ANSWERED`.
+   */
+  private async answerQuestion(): Promise<FinalResult> {
+    const routed = await this.routeForQuestion();
+    if (routed.kind === "final") return routed.result;
+
+    await this.transition("ANSWERING");
+    if (await this.cancelledHere()) return this.finish("cancelled", "ANSWERING 중 취소됨");
+
+    const executor = this.adapters!.executor;
+    const response = await this.callProvider(executor, "executor", "answer:1", (ctx) =>
+      executor.answerQuestion(
+        {
+          snapshot: this.snapshot!,
+          userMessage: this.input.taskRequest.userMessage,
+          ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
+        },
+        ctx
+      )
+    );
+    if (response.kind === "final") return response.result;
+
+    const answer = response.value;
+    await this.emit("DRAFT_RECEIVED", {
+      model: answer.model,
+      // 초안이 아니라는 것을 페이로드가 말한다 — 같은 이벤트 이름을 쓰되 모양이 다르다.
+      kind: "question_answer",
+      citedFiles: answer.citedFiles,
+      // **"모른다"를 세는 자리.** 이 경로에는 결정론적 판정자가 없으므로, 모델이 못 본 것을
+      // 말했는지가 사용자가 가진 유일한 방어다(16.1절 — 결과의 오라클이 없다).
+      missingContextCount: answer.missingContext.length,
+    });
+
+    return this.finishAnswered(answer);
+  }
+
+  /**
+   * 질문 경로의 라우팅. 변경 경로와 **같은 라우터**를 쓰되 tier는 `simple`로 고정한다 —
+   * 교차검증을 할 이유가 없고, TRIAGE를 돌리면 없는 질문에 답을 만들게 된다.
+   */
+  private async routeForQuestion(): Promise<{ kind: "ok" } | { kind: "final"; result: FinalResult }> {
+    try {
+      const routerOptions: RouterOptions = {
+        ...this.deps.routerOptions,
+        ...(this.policy.modelPins ? { pinned: this.policy.modelPins } : {}),
+      };
+      this.routing = new Router(this.registry, routerOptions).decide({
+        taskId: this.taskId,
+        complexityTier: "simple",
+        availableProviders: this.input.availableProviders,
+        appliedPolicies: ["question_path"],
+        contrast: false,
+      });
+    } catch (error) {
+      if (error instanceof RoutingError) {
+        return { kind: "final", result: await this.finish("failed", error.message, "provider_config_error") };
+      }
+      throw error;
+    }
+    this.state.routing = this.routing;
+    await this.emit("ROUTING_DECIDED", this.routing);
+
+    try {
+      this.adapters = createRoleAdapters(
+        this.routing.assignments,
+        (modelId) => this.registry.get(modelId),
+        this.deps.adapterOptions
+      );
+    } catch (error) {
+      if (error instanceof MissingCredentialError) {
+        return { kind: "final", result: await this.finish("failed", error.message, "provider_config_error") };
+      }
+      throw error;
+    }
+    return { kind: "ok" };
+  }
+
+  /** 답을 실어 종료한다. `finish`를 지나므로 "정확히 한 번" 규칙과 취소 경쟁 처리를 공유한다. */
+  private async finishAnswered(answer: QuestionAnswer): Promise<FinalResult> {
+    this.pendingAnswer = answer;
+    return this.finish("answered", answer.answer);
+  }
+
   private async finish(
     status: FinalResult["status"],
     summary: string,
@@ -2303,7 +2415,15 @@ export class Orchestrator {
     }
 
     const targetPhase: TaskPhase =
-      status === "completed" ? "COMPLETED" : status === "failed" ? "FAILED" : status === "cancelled" ? "CANCELLED" : "REJECTED";
+      status === "completed"
+        ? "COMPLETED"
+        : status === "failed"
+          ? "FAILED"
+          : status === "cancelled"
+            ? "CANCELLED"
+            : status === "answered"
+              ? "ANSWERED"
+              : "REJECTED";
 
     // 터미널 전이가 표에 없는 상태에서 끝나는 경우(예: AWAITING_APPROVAL에서 REJECTED)를
     // 조용히 넘기지 않고 이벤트로 남긴다. 전이가 불가능하면 phase는 그대로 두고
@@ -2325,7 +2445,12 @@ export class Orchestrator {
           ? "TASK_FAILED"
           : status === "cancelled"
             ? "TASK_CANCELLED"
-            : "TASK_REJECTED";
+            : status === "answered"
+              ? // **`TASK_COMPLETED`를 쓰지 않는다**(51절). 감사 기록에서 답변과 완료가 같은
+                // 이벤트로 남으면, "검증을 통과한 변경"과 "아무것도 바꾸지 않은 답변"을
+                // 사후에 구별할 수 없다.
+                "QUESTION_ANSWERED"
+              : "TASK_REJECTED";
 
     const result: FinalResult = {
       taskId: this.taskId,
@@ -2333,6 +2458,9 @@ export class Orchestrator {
       failureReason,
       summary,
       verificationReport: this.lastReport ?? undefined,
+      // **답변은 여기 실린다.** `summary`에만 두면 화면이 요약과 답을 구별하지 못하고,
+      // 긴 답이 요약 자리에 들어가 목록이 망가진다.
+      ...(this.pendingAnswer ? { answer: this.pendingAnswer } : {}),
       auditTrailEventIds: this.eventIds,
       // 성공/실패/취소를 가리지 않고 담는다 — 사용자가 무엇을 결정했는지는 결과와 무관한 사실이고,
       // 실패한 태스크야말로 "무엇을 요구했는지"를 다시 보게 되는 자리다.

@@ -4,16 +4,23 @@ import type {
   NormalizedProviderError,
   ProviderCapabilitiesView,
   ReviewDecision,
+  QuestionAnswer,
   SingleModelFixResult,
   TokenUsage,
 } from "@tomverse/protocol";
-import { validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
+import {
+  validateDraftProposal,
+  validateQuestionAnswer,
+  validateReviewDecision,
+  validateSingleModelFixResult,
+} from "@tomverse/protocol";
 import type { DispatchState } from "../budget/ledger.js";
 import { estimateTokensUpperBound } from "../context/budget.js";
 import {
   buildDraftPrompt,
   buildFixPrompt,
   buildReviewPrompt,
+  buildQuestionPrompt,
   buildSingleModelFixPrompt,
 } from "./prompts.js";
 import { normalizeProviderError } from "./errors.js";
@@ -46,7 +53,7 @@ import type {
 
 export interface FakeScriptStep {
   /** 어떤 호출에 응답할지 */
-  kind: "draft" | "review" | "singleFix" | "fix";
+  kind: "draft" | "review" | "singleFix" | "fix" | "answer";
   /**
    * 이 스텝이 던질 오류 (재시도/타임아웃 경로 테스트용).
    *
@@ -276,6 +283,27 @@ export class FakeProviderAdapter implements ProviderAdapter {
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,
       meta: this.metaFor(step, this.record("singleFix", buildSingleModelFixPrompt(input))),
+    };
+  }
+
+  async answerQuestion(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<QuestionAnswer>> {
+    const step = await this.consume("answer", ctx);
+    const payload = step?.payload ?? {
+      answer: `(fake) ${input.userMessage}에 대한 답`,
+      citedFiles: input.snapshot.relevantFiles.map((f) => f.path),
+      missingContext: [],
+    };
+    return {
+      value: validateQuestionAnswer(payload, {
+        taskId: ctx.taskId,
+        model: this.modelId,
+        createdAt: new Date().toISOString(),
+      }),
+      usage: step?.usage ?? DEFAULT_USAGE,
+      latencyMs: step?.delayMs ?? 1,
+      // **프롬프트를 실제로 만든다.** fake가 조립을 건너뛰면 그 경로의 결함(예: 스냅샷을 싣지
+      // 않는 빌더)이 fake를 쓰는 검사 전부에서 보이지 않는다 — 전송 집계도 이 기록을 본다.
+      meta: this.metaFor(step, this.record("answer", buildQuestionPrompt(input))),
     };
   }
 

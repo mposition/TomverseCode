@@ -9,8 +9,10 @@ import { AnthropicAdapter } from "../src/providers/anthropic.js";
 import {
   buildDraftPrompt,
   buildFixPrompt,
+  buildQuestionPrompt,
   buildReviewPrompt,
   DRAFT_SCHEMA,
+  QUESTION_SCHEMA,
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
 } from "../src/providers/prompts.js";
@@ -476,6 +478,11 @@ test("프롬프트가 채우라고 말하는 필드는 전부 응답 스키마�
       schema: REVIEW_SCHEMA,
     },
     {
+      what: "question",
+      rules: rulesSectionOf(buildQuestionPrompt({ snapshot, userMessage: "왜 이렇습니까?" }), "Answer rules"),
+      schema: QUESTION_SCHEMA,
+    },
+    {
       what: "fix",
       rules: rulesSectionOf(
         buildFixPrompt({
@@ -591,4 +598,33 @@ test("범위를 모르면 종전 문구를 쓴다", () => {
   const prompt = buildDraftPrompt({ snapshot, userMessage: "고쳐주세요" });
   assert.ok(prompt.includes("this file is TRUNCATED"), prompt);
   assert.ok(!prompt.includes("contiguous slice"), prompt);
+});
+
+/**
+ * **질문 프롬프트는 patch를 요구하지 않는다** — state-machine 51절.
+ *
+ * 출력 규칙(`PATCH_RULES`)을 붙이면 모델이 묻지도 않은 수정안을 내놓고, 그것은 어디로도 가지
+ * 않으므로 토큰만 쓰고 버려진다 — 그리고 사용자는 답 대신 diff를 읽는다.
+ */
+test("질문 프롬프트가 patch를 요구하지 않는다", () => {
+  const prompt = buildQuestionPrompt({ snapshot: makeSnapshot(), userMessage: "왜 이렇습니까?" });
+  assert.ok(!prompt.includes("unified diff"), prompt);
+  assert.ok(!prompt.includes("`moves`"), prompt);
+  assert.ok(prompt.includes("Do not propose a diff"), prompt);
+  // 바꾸지 않는다는 것을 **첫 줄에서** 말한다.
+  assert.ok(prompt.startsWith("You are answering a question"), prompt.slice(0, 80));
+});
+
+/**
+ * **모르면 모른다고 하라고 말한다.** 이 경로에는 결정론적 판정자가 없으므로(검증할 결과가
+ * 없다) 틀린 답을 잡아낼 것이 사용자뿐이고, 모델이 자기가 못 본 것을 말할 수 있어야 한다.
+ *
+ * 그리고 컨텍스트가 **잘린 조각**일 수 있다는 사실도 말한다(context-engine 14절) — 말해 주지
+ * 않으면 모델은 보지 못한 코드에 대해 자신 있게 답한다.
+ */
+test("질문 프롬프트가 컨텍스트의 한계를 말한다", () => {
+  const prompt = buildQuestionPrompt({ snapshot: makeSnapshot(), userMessage: "왜 이렇습니까?" });
+  assert.ok(prompt.includes("budgeted SUBSET"), prompt);
+  assert.ok(prompt.includes("truncated to a slice"), prompt);
+  assert.ok(prompt.includes("say so instead of guessing"), prompt);
 });

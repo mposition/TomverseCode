@@ -475,6 +475,77 @@ export function buildFixPrompt(input: {
 
 // ---- 구조화 출력 스키마 (두 어댑터가 공유) ----
 
+/**
+ * 질문에 답하는 프롬프트 — state-machine 51절.
+ *
+ * # 여기에 출력 규칙(`PATCH_RULES`)이 없다
+ *
+ * 질문 경로는 patch를 만들지 않는다. 규칙을 붙이면 모델이 **묻지도 않은 수정안**을 내놓고,
+ * 그것은 어디로도 가지 않으므로 토큰만 쓰고 버려진다 — 그리고 사용자는 답 대신 diff를 읽는다.
+ *
+ * # 모르면 모른다고 하라고 말한다
+ *
+ * 컨텍스트는 예산이 고른 **부분집합**이고 잘려 있을 수도 있다(context-engine 14절). 그 사실을
+ * 말해 주지 않으면 모델은 보지 못한 코드에 대해 자신 있게 답한다 — 그 답은 검증되지 않으므로
+ * (검증할 것이 없다) 아무도 잡아내지 못한다.
+ */
+export function buildQuestionPrompt(input: {
+  userMessage: string;
+  snapshot: WorkspaceSnapshot;
+  userAnswers?: { question: string; answer: string }[];
+}): string {
+  const parts = [
+    "You are answering a question about this repository. You are NOT making changes — no patch will be applied.",
+    "",
+    `## Question\n${input.userMessage}`,
+  ];
+
+  if (input.userAnswers && input.userAnswers.length > 0) {
+    parts.push(
+      "## Clarifications already provided by the user\n" +
+        input.userAnswers.map((a) => `Q: ${a.question}\nA: ${a.answer}`).join("\n\n")
+    );
+  }
+
+  parts.push(renderSnapshot(input.snapshot));
+  parts.push(
+    [
+      "## Answer rules",
+      "Answer in the language the question was asked in.",
+      "Put the answer in the `answer` field. Cite the files you relied on in `citedFiles`.",
+      // **가장 중요한 줄이다.** 이 경로에는 결정론적 판정자가 없다(원칙 1이 판정하는 것은
+      // 결과이고, 여기에는 결과가 없다). 틀린 답을 잡아낼 것이 사용자뿐이므로, 모델이
+      // 자기가 못 본 것을 말할 수 있어야 한다.
+      "The Files section is a budgeted SUBSET and some files may be truncated to a slice.",
+      "If the answer depends on code you were not shown, say so instead of guessing — name what you would need to see.",
+      "Do not propose a diff. If the user wants a change, they will ask for one.",
+    ].join("\n")
+  );
+  return parts.join("\n\n");
+}
+
+export const QUESTION_SCHEMA = {
+  type: "object",
+  properties: {
+    answer: { type: "string", description: "The answer, in the language the question was asked in." },
+    citedFiles: {
+      type: "array",
+      description: "Workspace-relative paths you relied on. Empty if the answer did not depend on any file.",
+      items: { type: "string" },
+    },
+    /**
+     * **"모른다"를 값으로 받는다.** 산문 안에 섞여 있으면 화면이 그것을 읽을 수 없고,
+     * 사용자는 확신에 찬 문단과 조심스러운 문단을 같은 무게로 읽는다.
+     */
+    missingContext: {
+      type: "array",
+      description: "What you would need to see to answer more confidently. Empty if nothing is missing.",
+      items: { type: "string" },
+    },
+  },
+  required: ["answer"],
+} as const;
+
 export const DRAFT_SCHEMA = {
   type: "object",
   properties: {

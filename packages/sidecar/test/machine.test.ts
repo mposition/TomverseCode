@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { TaskPhase } from "@tomverse/protocol";
 import { isTerminalPhase } from "@tomverse/protocol";
-import { canReachCompletedWithoutVerifying, isValidTransition, TRANSITIONS } from "../src/orchestrator/machine.js";
+import { canReachAnsweredThroughMutation, canReachCompletedWithoutVerifying, isValidTransition, TRANSITIONS } from "../src/orchestrator/machine.js";
 
 test("문서 2절의 유효한 전이를 허용한다", () => {
   const valid: [TaskPhase, TaskPhase][] = [
@@ -87,4 +87,32 @@ test("모든 비터미널 상태에서 FAILED로 갈 수 있다", () => {
     if (isTerminalPhase(phase)) continue;
     assert.ok(TRANSITIONS[phase].includes("FAILED"), `${phase}에서 FAILED로 갈 수 없습니다`);
   }
+});
+
+/**
+ * **답변 경로는 파일을 바꾸지 않는다** — state-machine 51절.
+ *
+ * `canReachCompletedWithoutVerifying`의 거울이다. 저쪽은 "검증 없이 완료할 수 없다"를 지키고
+ * 이쪽은 "답변한다면서 실행하지 않는다"를 지킨다. 둘 다 전이 표에서 유도하므로, 나중에 표를
+ * 고치다 우회로가 생기면 여기서 실패한다.
+ */
+test("ANSWERED에 도달하는 경로는 실행을 지나지 않는다", () => {
+  assert.equal(canReachAnsweredThroughMutation(), false);
+});
+
+/**
+ * **답변은 완료가 아니다.** `ANSWERING`에서 `COMPLETED`로 가는 길이 생기면 원칙 1의 구조적
+ * 표현(`canReachCompletedWithoutVerifying`)에 우회로가 뚫린다.
+ */
+test("ANSWERING은 COMPLETED로 가지 않는다", () => {
+  assert.ok(!TRANSITIONS.ANSWERING.includes("COMPLETED"), TRANSITIONS.ANSWERING.join(", "));
+  assert.equal(isValidTransition("ANSWERING", "ANSWERED"), true);
+  // 검증 없이 완료할 수 없다는 불변식은 답변 경로가 생겨도 그대로다.
+  assert.equal(canReachCompletedWithoutVerifying(), false);
+});
+
+/** `ANSWERED`는 터미널이다 — 답한 뒤에 이어서 무언가 하지 않는다. */
+test("ANSWERED는 터미널이다", () => {
+  assert.equal(isTerminalPhase("ANSWERED" as TaskPhase), true);
+  assert.deepEqual([...TRANSITIONS.ANSWERED], []);
 });

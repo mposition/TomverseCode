@@ -1,5 +1,6 @@
 import type { ComplexityTier, ISODateTime } from "./common.js";
 import type { AcceptanceCriterion, CriterionEvaluation } from "./decision.js";
+import type { QuestionAnswer } from "./proposal.js";
 import type { RoutingDecision } from "./registry.js";
 import type { CommandPolicy } from "./tools.js";
 import type { VerificationReport } from "./verification.js";
@@ -10,6 +11,16 @@ export interface TaskRequest {
   workspaceId: string;
   userMessage: string;
   attachments?: { path: string; note?: string }[];
+  /**
+   * 이 요청이 **바꿔 달라는 것인가 물어보는 것인가** (state-machine 51절).
+   *
+   * 기본값은 `change`다 — 값이 없으면 종전과 한 글자도 다르지 않게 동작한다.
+   *
+   * **모드가 아니라 요청의 종류다.** `executionMode`(fast/verified)는 같은 일을 얼마나
+   * 신중하게 할지를 정하지만 이건 **하는 일이 다르다**: 질문은 patch를 만들지 않고
+   * 검증하지 않으며 `COMPLETED`에 도달하지 않는다.
+   */
+  kind?: "change" | "question";
   createdAt: ISODateTime;
 }
 
@@ -188,6 +199,12 @@ export type TaskPhase =
    * 취소 버튼이 동작하지 않았다고 생각하고 다시 누른다.
    */
   | "CANCELLING"
+  /**
+   * 질문에 답하는 중 — state-machine-and-protocol.md 51절.
+   *
+   * **파일을 바꾸지 않는 경로다.** 스냅샷을 만들고 모델을 한 번 부르고 끝난다.
+   */
+  | "ANSWERING"
   | "COMPLETED"
   | "FAILED"
   | "CANCELLED"
@@ -197,7 +214,19 @@ export type TaskPhase =
    * 호스트(Rust)가 앱 시작 시 터미널이 아닌 태스크를 발견해 확정한다.
    * 완료도 실패도 취소도 아니고, 사용자가 되돌릴지 재실행할지 결정해야 하는 상태다.
    */
-  | "INTERRUPTED";
+  | "INTERRUPTED"
+  /**
+   * 질문에 답했다 — **완료가 아니다** (51절).
+   *
+   * `COMPLETED`를 쓰지 않는 것이 이 상태의 존재 이유다. 상태 머신에는
+   * *"`COMPLETED`에 도달하려면 반드시 `VERIFYING`을 지나야 한다"*는 불변식이 있고
+   * (`canReachCompletedWithoutVerifying`), 그건 CLAUDE.md 원칙 1의 구조적 표현이다.
+   * 답변에는 검증할 것이 없으므로 그 불변식을 **약화시키는 대신 다른 종착지를 만들었다.**
+   *
+   * 그 덕분에 배지 규칙(product-strategy 11절)도 따로 손볼 것이 없다: 답변은 애초에
+   * "완료된 변경"으로 읽히지 않는다.
+   */
+  | "ANSWERED";
 
 export const TERMINAL_PHASES: readonly TaskPhase[] = [
   "COMPLETED",
@@ -205,6 +234,7 @@ export const TERMINAL_PHASES: readonly TaskPhase[] = [
   "CANCELLED",
   "REJECTED",
   "INTERRUPTED",
+  "ANSWERED",
 ];
 
 export function isTerminalPhase(phase: TaskPhase): boolean {
@@ -316,7 +346,11 @@ export type TaskBudgetState =
 
 export interface FinalResult {
   taskId: string;
-  status: "completed" | "failed" | "cancelled" | "rejected";
+  /**
+   * `answered`가 따로 있는 이유는 `TaskPhase.ANSWERED`와 같다 — **답변은 완료가 아니다**(51절).
+   * 하나로 뭉치면 "검증을 통과한 변경"과 "아무것도 바꾸지 않은 답변"이 같은 값이 된다.
+   */
+  status: "completed" | "failed" | "cancelled" | "rejected" | "answered";
   failureReason?: FailureReason;
   summary: string;
   /**
@@ -329,6 +363,13 @@ export interface FinalResult {
    * 모든 patch를 이어 붙인 문자열이 NDJSON 한 줄에 실린다.
    */
   verificationReport?: VerificationReport;
+  /**
+   * 질문에 대한 답 (51절). `status === "answered"`일 때만 있다.
+   *
+   * **`summary`와 따로 둔다.** 요약 자리에 넣으면 화면이 둘을 구별하지 못하고, 긴 답이
+   * 목록의 한 줄 자리에 들어간다.
+   */
+  answer?: QuestionAnswer;
   auditTrailEventIds: string[];
   /** 이 태스크가 변경한 파일 목록 (롤백 UX가 쓴다 — state-machine-and-protocol.md 10절) */
   mutatedPaths?: string[];

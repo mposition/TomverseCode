@@ -172,6 +172,13 @@ export type TaskEventType =
   | "TASK_FAILED"
   | "TASK_CANCELLED"
   | "TASK_REJECTED"
+  /**
+   * 질문에 답했다 — state-machine 51절.
+   *
+   * **`TASK_COMPLETED`를 쓰지 않는다.** 감사 기록에서 답변과 완료가 같은 이벤트로 남으면,
+   * "검증을 통과한 변경"과 "아무것도 바꾸지 않은 답변"을 사후에 구별할 수 없다.
+   */
+  | "QUESTION_ANSWERED"
   | "ROLLBACK_STARTED"
   | "ROLLBACK_COMPLETED"
   /**
