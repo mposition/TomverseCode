@@ -695,3 +695,52 @@ test("계획 프롬프트가 컨텍스트의 한계와 빈 위험 목록의 뜻�
   assert.ok(prompt.includes("outside what you were shown"), prompt);
   assert.ok(prompt.includes("An empty `risks` list is a claim"), prompt);
 });
+
+/**
+ * **이름이 프롬프트까지 가야 한다** — state-machine 54절, 끝에서 끝까지.
+ *
+ * 리포트가 이름 단위로 갈라도, 프롬프트가 그것을 싣지 않으면 모델은 긴 출력에서 "무엇이 내
+ * 책임인가"를 스스로 골라야 한다 — 원래 실패하던 테스트가 섞여 있으면 대개 틀린다.
+ * 값을 만들어 놓고 아무도 읽지 않는 것은 이 저장소가 여러 번 밟은 모양이다.
+ */
+test("FIX_LOOP 프롬프트가 새로 깨진 테스트를 이름으로 말한다", () => {
+  const prompt = buildFixPrompt({
+    snapshot: makeSnapshot(),
+    userMessage: "고쳐주세요",
+    appliedChanges: "src/app.ts (12 bytes)",
+    digest: {
+      taskId: "t",
+      reportId: "r",
+      attemptNumber: 1,
+      failingChecks: [
+        {
+          kind: "test",
+          excerpt: "3 failed",
+          fileReferences: [],
+          newlyFailingTests: ["tests/new.py::a", "tests/new.py::b"],
+        },
+      ],
+      passingChecksSummary: "build ok",
+    },
+  });
+  assert.ok(prompt.includes("NEWLY failing"), prompt);
+  assert.ok(prompt.includes("tests/new.py::a"), prompt);
+  assert.ok(prompt.includes("fix these first"), prompt);
+});
+
+/** **없으면 아무 말도 하지 않는다.** "새로 깨진 것 없음"은 우리가 아는 사실이 아니다. */
+test("가르지 못했으면 프롬프트가 새 실패를 말하지 않는다", () => {
+  const prompt = buildFixPrompt({
+    snapshot: makeSnapshot(),
+    userMessage: "고쳐주세요",
+    appliedChanges: "src/app.ts (12 bytes)",
+    digest: {
+      taskId: "t",
+      reportId: "r",
+      attemptNumber: 1,
+      failingChecks: [{ kind: "test", excerpt: "3 failed", fileReferences: [] }],
+      passingChecksSummary: "build ok",
+    },
+  });
+  assert.ok(!prompt.includes("NEWLY failing"), prompt);
+});

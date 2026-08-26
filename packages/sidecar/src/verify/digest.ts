@@ -23,6 +23,13 @@ export function buildDigest(report: VerificationReport, options: DigestOptions =
   const maxChars = options.maxChars ?? 12_000;
 
   const preexisting = new Set((report.preexistingFailures ?? []).map(String));
+  // **체크 단위 이름표는 틀릴 수 있다**(state-machine 54절). 원래 실패하던 테스트가 하나만
+  // 있어도 그 체크는 `preexisting`에 들어가고, 이번 변경이 깨뜨린 테스트가 그 안에 숨는다.
+  // 이름 단위로 갈린 것이 있으면 그쪽이 정본이다.
+  const newTestsByKind = new Map<string, string[]>();
+  for (const entry of report.testAttribution ?? []) {
+    if (entry.newlyFailing.length > 0) newTestsByKind.set(String(entry.kind), entry.newlyFailing);
+  }
 
   // 실패한 체크는 pre-existing 여부와 무관하게 모두 전달한다.
   //
@@ -34,8 +41,11 @@ export function buildDigest(report: VerificationReport, options: DigestOptions =
     .filter((c) => c.status === "FAILED" || c.status === "TIMED_OUT")
     .sort((a, b) => {
       // 새로 깨진 것을 먼저 — 이번 변경이 유발한 회귀가 가장 시급하다.
-      const aNew = preexisting.has(String(a.kind)) ? 1 : 0;
-      const bNew = preexisting.has(String(b.kind)) ? 1 : 0;
+      // **이름 단위로 새 실패가 있으면 그 체크는 뒤로 밀지 않는다.** 체크 이름표만 보면
+      // 회귀가 든 체크가 맨 뒤로 가고, 예산이 모자랄 때 가장 먼저 깎인다.
+      const isOld = (k: string) => (preexisting.has(k) && !newTestsByKind.has(k) ? 1 : 0);
+      const aNew = isOld(String(a.kind));
+      const bNew = isOld(String(b.kind));
       if (aNew !== bNew) return aNew - bNew;
       return (PRIORITY[a.kind] ?? 9) - (PRIORITY[b.kind] ?? 9);
     });
@@ -52,12 +62,16 @@ export function buildDigest(report: VerificationReport, options: DigestOptions =
     const trimmed = excerpt.length > allowed ? headTail(excerpt, 10, 10).slice(0, allowed) : excerpt;
     budget -= trimmed.length;
 
+    const newTests = newTestsByKind.get(String(check.kind));
     failingChecks.push({
       kind: check.kind,
       command: check.command ? [check.command.program, ...check.command.args].join(" ") : undefined,
       exitCode: check.exitCode,
       excerpt: trimmed,
       fileReferences: extractFileReferences(detail),
+      // **없으면 키를 두지 않는다.** 빈 배열을 실으면 "새로 깨진 것이 없다"로 읽히는데,
+      // 실제로는 "가르지 못했다"일 수 있다(54절).
+      ...(newTests ? { newlyFailingTests: newTests } : {}),
     });
   }
 
@@ -66,11 +80,27 @@ export function buildDigest(report: VerificationReport, options: DigestOptions =
     .filter((c) => c.status === "NOT_CONFIGURED")
     .map((c) => `${c.kind}: not configured`);
 
-  const preexistingSummary =
-    (report.preexistingFailures ?? []).length > 0
-      ? `${(report.preexistingFailures ?? []).join(", ")} — 이 체크들은 변경 전에도 실패하고 있었다. ` +
+  // **"손대지 말 것"을 조건 없이 말하지 않는다**(54절).
+  //
+  // 종전 문장은 체크 단위 이름표만 보고 나왔다. 그래서 원래 실패하던 테스트가 하나 있는
+  // 체크에서 이번 변경이 세 개를 더 깨뜨리면, 모델은 **자기가 깨뜨린 세 개를 건드리지
+  // 말라고 지시받았다.** 이름 단위로 갈린 것이 있으면 그 사실을 먼저 말한다.
+  const stillOld = (report.preexistingFailures ?? []).filter((k) => !newTestsByKind.has(String(k)));
+  const mixed = (report.preexistingFailures ?? []).filter((k) => newTestsByKind.has(String(k)));
+  const preexistingParts: string[] = [];
+  if (stillOld.length > 0) {
+    preexistingParts.push(
+      `${stillOld.join(", ")} — 이 체크들은 변경 전에도 실패하고 있었다. ` +
         "태스크가 이걸 고치는 것이었다면 고쳐야 하고, 무관하다면 손대지 말 것."
-      : undefined;
+    );
+  }
+  for (const kind of mixed) {
+    preexistingParts.push(
+      `${kind} — 변경 전에도 실패하던 것이 있지만, 이번 변경이 새로 깨뜨린 것도 있다: ` +
+        `${(newTestsByKind.get(String(kind)) ?? []).join(", ")}. 그 쪽을 먼저 고칠 것.`
+    );
+  }
+  const preexistingSummary = preexistingParts.length > 0 ? preexistingParts.join("\n") : undefined;
 
   return {
     taskId: report.taskId,

@@ -40,6 +40,7 @@ pub mod sidecar;
 pub mod shell_habits;
 pub mod skills;
 pub mod store;
+pub mod testnames;
 pub mod time;
 pub mod tools;
 pub mod transmission;

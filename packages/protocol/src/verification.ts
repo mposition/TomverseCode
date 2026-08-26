@@ -47,8 +47,31 @@ export interface VerificationReport {
    * baseline이 없으면(=처음부터 실패 여부를 모름) 빈 배열이 아니라 undefined다.
    */
   newlyFailing?: VerificationKind[];
-  /** baseline에서도 실패하던 체크 — 이번 변경의 책임이 아니다. */
+  /**
+   * baseline에서도 실패하던 체크.
+   *
+   * **"이번 변경의 책임이 아니다"라고 읽으면 안 된다** — 54절 이전에는 그렇게 적혀 있었고,
+   * 그 문장이 틀렸다. 원래 실패하던 테스트가 하나만 있어도 그 체크는 통째로 여기 들어가고,
+   * 이번 변경이 새로 깨뜨린 테스트는 **그 안에 숨는다.** 그 안을 가르는 것이
+   * `testAttribution`이고, 새 실패가 있으면 그 체크는 `newlyFailing`에도 **함께** 들어간다.
+   * 두 목록은 배타가 아니라 각자 참인 사실이다.
+   */
   preexistingFailures?: VerificationKind[];
+  /**
+   * 체크보다 한 칸 더 들어간 귀속 — state-machine 54절.
+   *
+   * 러너 출력에서 실패한 테스트 **이름**을 뽑아 baseline과 대조한 결과다. 양쪽을 모두
+   * 해석했을 때만 채워진다 — 해석하지 못한 것을 "새 실패 없음"으로 적지 않는다.
+   */
+  testAttribution?: {
+    kind: VerificationKind;
+    /** 이번 변경으로 새로 실패한 테스트들. */
+    newlyFailing: string[];
+    /** 변경 전에도 실패하던 테스트들. */
+    preexisting: string[];
+    /** 변경 전에는 실패했는데 지금은 실패하지 않는 것 — **고쳐진 것**이다. */
+    fixed: string[];
+  }[];
   /**
    * 종합 판정. 실행할 검증이 없었다는 사실을 통과로 위장하지 않는다.
    *
@@ -84,9 +107,23 @@ export interface VerificationDigest {
     exitCode?: number;
     excerpt: string; // head N줄 + tail M줄 (기본 40/40), 중간 생략 표시
     fileReferences: { path: string; line?: number }[];
+    /**
+     * 이 체크 안에서 **이번 변경이 새로 깨뜨린** 테스트 이름들 (54절).
+     *
+     * 비어 있는 것은 "없다"가 아니라 "가르지 못했다"일 수 있다 — 그 구별은
+     * `VerificationReport.testAttribution`이 갖고 있고, 여기서는 **있는 것만** 싣는다.
+     * 프롬프트가 이 목록을 우선순위로 쓴다.
+     */
+    newlyFailingTests?: string[];
   }[];
   passingChecksSummary: string;
-  /** baseline에서도 실패하던 항목 — 모델이 이걸 고치려 시도하지 않도록 명시적으로 알린다. */
+  /**
+   * baseline에서도 실패하던 항목.
+   *
+   * **"손대지 말라"고 말하지 않는다** — 54절 이전에는 그렇게 말했고, 그 체크 안에 이번
+   * 변경이 깨뜨린 테스트가 있으면 모델은 **자기가 깨뜨린 것을 건드리지 말라고 지시받았다.**
+   * 이제 이름 단위로 갈린 것이 있으면 그것을 함께 말한다.
+   */
   preexistingFailuresSummary?: string;
 }
 

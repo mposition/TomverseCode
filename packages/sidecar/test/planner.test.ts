@@ -160,6 +160,90 @@ test("다이제스트는 새로 깨진 체크를 먼저 두고 pre-existing도 �
   assert.ok(digest.preexistingFailuresSummary?.includes("무관하다면"));
 });
 
+/**
+ * **모델에게 "네가 깨뜨린 것을 손대지 말라"고 말하지 않는다** — state-machine 54절.
+ *
+ * 원래 실패하던 테스트가 하나 있는 체크에서 이번 변경이 두 개를 더 깨뜨렸다. 체크 단위
+ * 이름표만 보면 `test`는 `preexisting`이고, 종전 다이제스트는 그 이름을 그대로 실어
+ * "무관하다면 손대지 말 것"이라고 말했다 — **자기가 깨뜨린 두 테스트에 대해.**
+ */
+function mixedReport() {
+  return {
+    taskId: "t",
+    reportId: "r",
+    phase: "post" as const,
+    attemptNumber: 1,
+    overall: "fail" as const,
+    preexistingFailures: ["test" as const],
+    newlyFailing: ["test" as const],
+    createdAt: "now",
+    testAttribution: [
+      {
+        kind: "test" as const,
+        newlyFailing: ["tests/new.py::a", "tests/new.py::b"],
+        preexisting: ["tests/old.py::broken"],
+        fixed: [],
+      },
+    ],
+    checks: [{ kind: "test" as const, status: "FAILED" as const, summary: "실패", detail: "3 failed" }],
+  };
+}
+
+test("섞인 체크에서는 새로 깨진 테스트를 이름으로 말한다", () => {
+  const digest = buildDigest(mixedReport());
+
+  assert.deepEqual(digest.failingChecks[0]!.newlyFailingTests, ["tests/new.py::a", "tests/new.py::b"]);
+  // **"손대지 말 것"이 이 체크에 붙으면 안 된다.**
+  assert.ok(!digest.preexistingFailuresSummary?.includes("무관하다면"), digest.preexistingFailuresSummary);
+  assert.ok(digest.preexistingFailuresSummary?.includes("새로 깨뜨린 것도 있다"), digest.preexistingFailuresSummary);
+  assert.ok(digest.preexistingFailuresSummary?.includes("tests/new.py::a"), digest.preexistingFailuresSummary);
+});
+
+/** 순수하게 원래 실패하던 체크에는 **종전 문장이 그대로** 붙어야 한다 — 그게 여전히 참이다. */
+test("원래 실패만 있는 체크에는 손대지 말라는 안내가 남는다", () => {
+  const report = mixedReport();
+  const digest = buildDigest({
+    ...report,
+    preexistingFailures: ["test", "lint"],
+    checks: [...report.checks, { kind: "lint" as const, status: "FAILED" as const, summary: "실패", detail: "원래" }],
+  });
+  assert.ok(digest.preexistingFailuresSummary?.includes("무관하다면"), digest.preexistingFailuresSummary);
+  assert.ok(digest.preexistingFailuresSummary?.includes("lint"), digest.preexistingFailuresSummary);
+});
+
+/**
+ * **가르지 못한 것을 "새로 깨진 것 없음"으로 싣지 않는다.** 빈 배열을 실으면 프롬프트가
+ * 그것을 "네 변경은 아무것도 깨뜨리지 않았다"로 말하게 된다.
+ */
+test("귀속이 없으면 새 실패 목록 자체가 없다", () => {
+  const report = mixedReport();
+  const { testAttribution: _dropped, ...withoutAttribution } = report;
+  const digest = buildDigest(withoutAttribution);
+  assert.equal(digest.failingChecks[0]!.newlyFailingTests, undefined);
+  assert.ok(digest.preexistingFailuresSummary?.includes("무관하다면"), digest.preexistingFailuresSummary);
+});
+
+/**
+ * **새 회귀가 든 체크는 예산이 모자랄 때 먼저 깎이면 안 된다.** 체크 이름표만 보면
+ * `preexisting`이라 맨 뒤로 밀리는데, 그 안에 이번 변경의 회귀가 들어 있다.
+ */
+test("새 회귀가 든 체크가 앞에 온다", () => {
+  const report = mixedReport();
+  const digest = buildDigest({
+    ...report,
+    preexistingFailures: ["build", "test"],
+    checks: [
+      { kind: "build" as const, status: "FAILED" as const, summary: "실패", detail: "원래 실패" },
+      ...report.checks,
+    ],
+  });
+  // build가 우선순위 표에서는 앞이지만(PRIORITY.build = 0), 회귀가 든 test가 먼저다.
+  assert.deepEqual(
+    digest.failingChecks.map((c) => c.kind),
+    ["test", "build"]
+  );
+});
+
 test("컴파일러 출력에서 파일 참조를 뽑는다", () => {
   const refs = extractFileReferences(
     ["src/app.ts(12,5): error TS2345: bad type", "at Object.<anonymous> (test/a.test.js:44:9)", "  --> src/main.rs:7:1"].join("\n")

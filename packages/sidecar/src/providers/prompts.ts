@@ -432,6 +432,14 @@ export function buildFixPrompt(input: {
         `### ${check.kind}${check.command ? ` — ${check.command}` : ""}${
           check.exitCode !== undefined ? ` (exit ${check.exitCode})` : ""
         }`,
+        // **이번 변경이 깨뜨린 테스트를 이름으로 말한다**(state-machine 54절).
+        //
+        // 이게 없으면 모델이 긴 출력에서 "무엇이 내 책임인가"를 스스로 골라야 하고, 원래
+        // 실패하던 테스트가 섞여 있으면 대개 틀린다. 목록이 **없을 수도 있다** — 그건
+        // "새로 깨진 것이 없다"가 아니라 "가르지 못했다"이므로, 없을 때는 아무 말도 하지 않는다.
+        check.newlyFailingTests && check.newlyFailingTests.length > 0
+          ? `NEWLY failing (caused by your change — fix these first): ${check.newlyFailingTests.join(", ")}`
+          : "",
         "```",
         check.excerpt,
         "```",

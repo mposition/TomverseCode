@@ -502,6 +502,13 @@ pub struct VerificationCheck {
     pub exit_code: Option<i32>,
     #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// 이 체크의 출력에서 뽑은 **실패한 테스트 이름들** (state-machine 54절).
+    ///
+    /// **`None`은 "해석하지 못했다"이고 빈 배열은 "이름이 없다"이다.** 뭉개면 파서가 러너를
+    /// 못 알아본 순간 "새로 실패한 테스트 없음"이 되어, 54절이 고치려는 거짓말이 더 조용한
+    /// 모양으로 돌아온다.
+    #[serde(rename = "failedTests", skip_serializing_if = "Option::is_none")]
+    pub failed_tests: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -523,6 +530,22 @@ pub enum Overall {
     CouldNotRun,
 }
 
+/// 한 체크 안에서 테스트 이름 단위로 가른 결과 (state-machine 54절).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestAttribution {
+    pub kind: VerificationKind,
+    /// **이번 변경으로 새로 실패한** 테스트들.
+    #[serde(rename = "newlyFailing")]
+    pub newly_failing: Vec<String>,
+    /// 변경 전에도 실패하던 테스트들.
+    pub preexisting: Vec<String>,
+    /// 변경 전에는 실패했는데 지금은 실패하지 않는 테스트들 — **고쳐진 것**이다.
+    ///
+    /// 세는 이유: 이 값이 있어야 "고친 것도 있고 깨뜨린 것도 있다"를 말할 수 있다.
+    /// 없으면 화면이 새 실패만 보여 주고, 사용자는 변경이 순전히 나빴다고 읽는다.
+    pub fixed: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationReport {
     #[serde(rename = "taskId")]
@@ -537,6 +560,16 @@ pub struct VerificationReport {
     pub newly_failing: Option<Vec<VerificationKind>>,
     #[serde(rename = "preexistingFailures", skip_serializing_if = "Option::is_none")]
     pub preexisting_failures: Option<Vec<VerificationKind>>,
+    /// 체크보다 **한 칸 더 들어간 귀속** (state-machine 54절).
+    ///
+    /// `newlyFailing`/`preexistingFailures`는 체크 단위라, 원래 실패하던 테스트가 하나라도
+    /// 있으면 그 체크는 통째로 "원래 실패하던 것"이 된다 — **이번 변경이 깨뜨린 테스트가
+    /// 그 안에 숨는다.** 여기서는 이름 단위로 가른다.
+    ///
+    /// 비어 있는 것과 없는 것은 다르다: baseline이 없거나 어느 쪽 출력도 해석하지 못했으면
+    /// `None`이다.
+    #[serde(rename = "testAttribution", skip_serializing_if = "Option::is_none")]
+    pub test_attribution: Option<Vec<TestAttribution>>,
     pub overall: Overall,
     #[serde(rename = "createdAt")]
     pub created_at: String,

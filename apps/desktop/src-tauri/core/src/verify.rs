@@ -279,6 +279,7 @@ impl<'a> VerificationRunner<'a> {
                     detail_ref: None,
                     exit_code: None,
                     duration_ms: None,
+                    failed_tests: None,
                 }),
                 Some((kind, command, source)) => {
                     checks.push(self.run_one(task_id, *kind, command, source, executor));
@@ -313,6 +314,19 @@ impl<'a> VerificationRunner<'a> {
             _ => (None, None),
         };
 
+        let test_attribution = match (phase, baseline) {
+            (VerificationPhase::Post, Some(base)) => attribute_tests(&checks, base),
+            _ => None,
+        };
+
+        // **체크 단위 귀속을 이름 단위 결과로 고친다**(54절).
+        //
+        // 종전에는 baseline에서 실패하던 체크가 통째로 `preexisting`에 들어갔고, 그 안에서
+        // 이번 변경이 새로 깨뜨린 테스트는 보이지 않았다. 그러면 FIX_LOOP 다이제스트가
+        // 모델에게 "무관하다면 손대지 말 것"이라고 말한다 — **자기가 깨뜨린 테스트에 대해.**
+        let (newly_failing, preexisting) =
+            refine_attribution(newly_failing, preexisting, test_attribution.as_deref());
+
         let overall = compute_overall(&checks, newly_failing.as_deref());
 
         VerificationReport {
@@ -323,6 +337,7 @@ impl<'a> VerificationRunner<'a> {
             checks,
             newly_failing,
             preexisting_failures: preexisting,
+            test_attribution,
             overall,
             created_at: now_iso(),
         }
@@ -412,6 +427,17 @@ impl<'a> VerificationRunner<'a> {
             (Some(combined.clone()), None)
         };
 
+        // **전체 출력에서 뽑는다** — `detail`은 발췌라 긴 실행에서는 실패 목록이 잘려 나간다.
+        // 그리고 실패한 체크에 대해서만 센다: 통과한 체크의 출력에서 이름을 뽑아 봐야
+        // 대조에 쓸 것이 없고, 러너가 "실패했던 것" 요약을 내면 오히려 잘못 센다.
+        let failed_tests = match status {
+            VerificationStatus::Failed | VerificationStatus::TimedOut => {
+                crate::testnames::failed_tests(&command.program, &command.args, &combined)
+                    .map(|set| set.into_iter().collect::<Vec<_>>())
+            }
+            _ => None,
+        };
+
         VerificationCheck {
             kind,
             command: Some(command.clone()),
@@ -421,8 +447,96 @@ impl<'a> VerificationRunner<'a> {
             detail_ref,
             exit_code,
             duration_ms: duration,
+            failed_tests,
         }
     }
+}
+
+/// 실패한 체크를 **테스트 이름 단위로** 가른다 — state-machine 54절.
+///
+/// 양쪽(baseline·post)의 이름 집합을 모두 해석했을 때만 판정한다. 한쪽이라도 `None`이면
+/// 그 체크는 결과에 넣지 않는다 — **모르는 것을 "새 실패 없음"으로 적지 않는다.**
+fn attribute_tests(
+    checks: &[VerificationCheck],
+    baseline: &VerificationReport,
+) -> Option<Vec<crate::types::TestAttribution>> {
+    let mut out: Vec<crate::types::TestAttribution> = Vec::new();
+    for check in checks {
+        let Some(now) = check.failed_tests.as_ref() else {
+            continue;
+        };
+        let Some(base_check) = baseline.checks.iter().find(|c| c.kind == check.kind) else {
+            continue;
+        };
+        // baseline에서 **통과했다면** 그 체크의 실패는 전부 새 것이다. 그런데 그때
+        // `failed_tests`는 `None`이므로(통과한 체크는 세지 않는다) 여기서 갈라야 한다 —
+        // 없는 것을 "해석 실패"로 읽으면 이 흔한 경우가 통째로 빠진다.
+        let base: std::collections::BTreeSet<String> = match base_check.status {
+            VerificationStatus::Passed => std::collections::BTreeSet::new(),
+            VerificationStatus::Failed | VerificationStatus::TimedOut => match &base_check.failed_tests {
+                Some(list) => list.iter().cloned().collect(),
+                // 실패했는데 해석하지 못했다 — 무엇이 원래 실패였는지 모른다.
+                None => continue,
+            },
+            // 돌지 않았거나 명령이 없었다. 대조할 것이 없다.
+            _ => continue,
+        };
+        let now_set: std::collections::BTreeSet<String> = now.iter().cloned().collect();
+        out.push(crate::types::TestAttribution {
+            kind: check.kind,
+            newly_failing: now_set.difference(&base).cloned().collect(),
+            preexisting: now_set.intersection(&base).cloned().collect(),
+            fixed: base.difference(&now_set).cloned().collect(),
+        });
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// 체크 단위 귀속을 이름 단위 결과로 **고친다** — state-machine 54절.
+///
+/// # 무엇이 틀렸었나
+///
+/// 종전에는 baseline에서 실패하던 체크가 통째로 `preexisting`에 들어갔다. 그래서 원래
+/// 실패하는 테스트가 하나만 있어도, 이번 변경이 새로 깨뜨린 테스트가 **그 체크 안에 숨었다.**
+/// FIX_LOOP 다이제스트는 그 목록을 읽고 모델에게 "무관하다면 손대지 말 것"이라고 말한다 —
+/// 자기가 깨뜨린 테스트에 대해.
+///
+/// # 고치는 방향은 한쪽뿐이다
+///
+/// **새 실패를 더하기만 하고 빼지 않는다.** 이름 단위로 새 실패가 있으면 그 체크를
+/// `newlyFailing`으로 올리되, 이름 단위로 새 실패가 없다고 해서 종전에 `newlyFailing`이던
+/// 체크를 내리지는 않는다. 내리려면 "이름을 전부 정확히 셌다"를 신뢰해야 하는데, 파서는
+/// 러너 출력의 모양에 기대므로 그만큼 신뢰할 수 없다 — 틀릴 때 **놓치는 쪽이 아니라
+/// 과하게 보고하는 쪽으로** 틀려야 한다.
+fn refine_attribution(
+    newly: Option<Vec<VerificationKind>>,
+    preexisting: Option<Vec<VerificationKind>>,
+    attribution: Option<&[crate::types::TestAttribution]>,
+) -> (Option<Vec<VerificationKind>>, Option<Vec<VerificationKind>>) {
+    let (Some(mut newly), Some(mut pre)) = (newly, preexisting) else {
+        // 한쪽이라도 없으면 baseline이 없다는 뜻이다 — 고칠 것이 없다.
+        return (None, None);
+    };
+    let Some(attribution) = attribution else {
+        return (Some(newly), Some(pre));
+    };
+    for entry in attribution {
+        if entry.newly_failing.is_empty() || newly.contains(&entry.kind) {
+            continue;
+        }
+        newly.push(entry.kind);
+        // **`preexisting`에서 빼지 않는다.** 그 체크에는 원래 실패하던 테스트도 남아 있고,
+        // 빼면 "이건 당신 변경 때문이 아니다"라는 사실이 사라진다. 두 목록은 배타가 아니라
+        // 각자 참인 사실이며, 이름 단위 목록이 그 안을 다시 가른다.
+    }
+    // 순서를 고정한다 — 실행 순서에 기대면 같은 상태가 다른 리포트를 낸다.
+    newly.sort_by_key(|k| k.as_str());
+    pre.sort_by_key(|k| k.as_str());
+    (Some(newly), Some(pre))
 }
 
 /// 종합 판정.
@@ -655,6 +769,167 @@ mod tests {
         let artifacts = ArtifactStore::new(art_dir.path()).unwrap();
         let root = WorkspaceRoot::new(dir.path()).unwrap();
         (dir, art_dir, root, artifacts)
+    }
+
+    /// pytest 출력을 그대로 낸다. **`cargo test`를 쓸 수 없다** — 이 워크스페이스에는
+    /// `Cargo.toml`이 있으므로 감지가 cargo를 고르는데, 그러면 fixture 하나에 러너 둘이
+    /// 얽혀 무엇을 검증하는지 흐려진다.
+    fn python_project() -> Vec<(&'static str, &'static str)> {
+        vec![("pyproject.toml", "[tool.pytest.ini_options]\n"), (".venv/bin/python", "#!/bin/sh\n")]
+    }
+
+    /// **체크 단위 귀속이 새 회귀를 숨겼다** — state-machine 54절.
+    ///
+    /// 원래 실패하던 테스트가 하나 있는 저장소에서 이번 변경이 두 개를 더 깨뜨린다.
+    /// 종전에는 `test` 체크가 통째로 `preexisting`에 들어가고 `newlyFailing`은 비었다 —
+    /// 그리고 FIX_LOOP 다이제스트가 모델에게 "무관하다면 손대지 말 것"이라고 말했다.
+    #[test]
+    fn a_new_regression_inside_an_already_failing_check_is_not_hidden() {
+        let (_d, _a, root, artifacts) = setup(&python_project());
+        let runner = VerificationRunner::new(&root, &artifacts);
+        let py = root.path().join(".venv/bin/python").to_string_lossy().to_string();
+
+        let mut base_exec = FakeExecutor {
+            responses: vec![(
+                format!("{py} -m pytest"),
+                1,
+                "FAILED tests/test_old.py::test_broken - boom\n1 failed".to_string(),
+            )],
+            calls: vec![],
+        };
+        let baseline = runner.run("task-1", VerificationPhase::Baseline, 0, &mut base_exec, None);
+        assert_eq!(baseline.overall, Overall::Fail, "{:?}", baseline.checks);
+
+        let mut post_exec = FakeExecutor {
+            responses: vec![(
+                format!("{py} -m pytest"),
+                1,
+                "FAILED tests/test_old.py::test_broken - boom\n                 FAILED tests/test_new.py::test_a - regression\n                 FAILED tests/test_new.py::test_b - regression\n3 failed"
+                    .to_string(),
+            )],
+            calls: vec![],
+        };
+        let post = runner.run("task-1", VerificationPhase::Post, 1, &mut post_exec, Some(&baseline));
+
+        // **이름 단위로 갈렸다.**
+        let attribution = post.test_attribution.as_ref().expect("귀속이 없습니다");
+        let test = attribution
+            .iter()
+            .find(|a| a.kind == VerificationKind::Test)
+            .expect("test 체크의 귀속이 없습니다");
+        assert_eq!(
+            test.newly_failing,
+            vec!["tests/test_new.py::test_a", "tests/test_new.py::test_b"],
+            "{test:?}"
+        );
+        assert_eq!(test.preexisting, vec!["tests/test_old.py::test_broken"], "{test:?}");
+
+        // **그리고 체크 단위 이름표가 고쳐졌다.** 여기가 종전에 틀렸던 자리다.
+        assert!(
+            post.newly_failing.as_ref().unwrap().contains(&VerificationKind::Test),
+            "새 회귀가 있는데 newlyFailing에 없습니다: {:?}",
+            post.newly_failing
+        );
+        // 그래도 `preexisting`에서 빼지는 않는다 — 원래 실패하던 것도 여전히 참이다.
+        assert!(post.preexisting_failures.as_ref().unwrap().contains(&VerificationKind::Test));
+    }
+
+    /// **고쳐진 것도 센다.** 이 값이 없으면 화면이 새 실패만 보여 주고, 사용자는 변경이
+    /// 순전히 나빴다고 읽는다.
+    #[test]
+    fn fixed_tests_are_counted_too() {
+        let (_d, _a, root, artifacts) = setup(&python_project());
+        let runner = VerificationRunner::new(&root, &artifacts);
+        let py = root.path().join(".venv/bin/python").to_string_lossy().to_string();
+
+        let mut base_exec = FakeExecutor {
+            responses: vec![(
+                format!("{py} -m pytest"),
+                1,
+                "FAILED tests/a.py::one - x\nFAILED tests/a.py::two - x".to_string(),
+            )],
+            calls: vec![],
+        };
+        let baseline = runner.run("task-1", VerificationPhase::Baseline, 0, &mut base_exec, None);
+
+        let mut post_exec = FakeExecutor {
+            responses: vec![(format!("{py} -m pytest"), 1, "FAILED tests/a.py::two - x".to_string())],
+            calls: vec![],
+        };
+        let post = runner.run("task-1", VerificationPhase::Post, 1, &mut post_exec, Some(&baseline));
+        let test = post
+            .test_attribution
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|a| a.kind == VerificationKind::Test)
+            .unwrap();
+        assert_eq!(test.fixed, vec!["tests/a.py::one"], "{test:?}");
+        assert!(test.newly_failing.is_empty(), "{test:?}");
+    }
+
+    /// **해석하지 못한 것을 "새 실패 없음"으로 적지 않는다.**
+    ///
+    /// `npm test`는 매니페스트가 무엇을 돌리는지 argv만 보고는 알 수 없으므로 파서가
+    /// 러너를 고르지 못한다. 그때 이름 단위 귀속은 **없어야** 하고, 체크 단위 판정이
+    /// 종전 그대로 남아야 한다 — 조용히 "새 실패 없음"이 되면 이 절이 고치려는 거짓말이
+    /// 더 조용한 모양으로 돌아온다.
+    #[test]
+    fn an_unparsable_runner_leaves_the_check_level_verdict_alone() {
+        let (_d, _a, root, artifacts) = setup(&[("package.json", r#"{ "scripts": { "test": "vitest" } }"#)]);
+        let runner = VerificationRunner::new(&root, &artifacts);
+
+        let mut base_exec = FakeExecutor {
+            responses: vec![("npm test".to_string(), 1, "1 test failed".to_string())],
+            calls: vec![],
+        };
+        let baseline = runner.run("task-1", VerificationPhase::Baseline, 0, &mut base_exec, None);
+        let mut post_exec = FakeExecutor {
+            responses: vec![("npm test".to_string(), 1, "3 tests failed".to_string())],
+            calls: vec![],
+        };
+        let post = runner.run("task-1", VerificationPhase::Post, 1, &mut post_exec, Some(&baseline));
+
+        assert!(post.test_attribution.is_none(), "{:?}", post.test_attribution);
+        // 종전과 같다: 체크 단위로는 원래 실패하던 것이다.
+        assert!(post.preexisting_failures.as_ref().unwrap().contains(&VerificationKind::Test));
+        assert!(!post.newly_failing.as_ref().unwrap().contains(&VerificationKind::Test));
+        // 그리고 체크에도 이름이 남지 않는다 — 빈 배열이 아니라 없음이다.
+        let check = post.checks.iter().find(|c| c.kind == VerificationKind::Test).unwrap();
+        assert!(check.failed_tests.is_none(), "{:?}", check.failed_tests);
+    }
+
+    /// **baseline에서 통과했다면 지금의 실패는 전부 새 것이다.**
+    ///
+    /// 통과한 체크는 이름을 세지 않으므로 `failed_tests`가 `None`인데, 그것을 "해석 실패"로
+    /// 읽으면 이 흔한 경우가 통째로 빠진다.
+    #[test]
+    fn everything_is_new_when_the_baseline_passed() {
+        let (_d, _a, root, artifacts) = setup(&python_project());
+        let runner = VerificationRunner::new(&root, &artifacts);
+        let py = root.path().join(".venv/bin/python").to_string_lossy().to_string();
+
+        let mut base_exec = FakeExecutor {
+            responses: vec![(format!("{py} -m pytest"), 0, "2 passed".to_string())],
+            calls: vec![],
+        };
+        let baseline = runner.run("task-1", VerificationPhase::Baseline, 0, &mut base_exec, None);
+        assert_eq!(baseline.overall, Overall::Pass);
+
+        let mut post_exec = FakeExecutor {
+            responses: vec![(format!("{py} -m pytest"), 1, "FAILED tests/a.py::one - x".to_string())],
+            calls: vec![],
+        };
+        let post = runner.run("task-1", VerificationPhase::Post, 1, &mut post_exec, Some(&baseline));
+        let test = post
+            .test_attribution
+            .as_ref()
+            .expect("baseline이 통과했는데 귀속이 없습니다")
+            .iter()
+            .find(|a| a.kind == VerificationKind::Test)
+            .unwrap();
+        assert_eq!(test.newly_failing, vec!["tests/a.py::one"], "{test:?}");
+        assert!(test.preexisting.is_empty(), "{test:?}");
     }
 
     #[test]
@@ -926,6 +1201,7 @@ mod tests {
             kind,
             command: None,
             status,
+            failed_tests: None,
             summary: String::new(),
             detail: None,
             detail_ref: None,
