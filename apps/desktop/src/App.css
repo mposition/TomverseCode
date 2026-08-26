@@ -687,6 +687,22 @@ pre.diff {
   border-color: var(--warn);
 }
 
+/*
+ * 답변은 완료와 **다른 테두리**다 — ui-wireframes 3.26.1절.
+ *
+ * 색은 구별의 근거가 아니라 그 위의 장식이다(레이블이 "답변함"이므로 색이 통일돼도 구별이
+ * 남는다). 그래도 `--ok`를 쓰지 않는 이유는, 초록으로 그리는 순간 화면이 "검증을 통과했다"고
+ * 말하는 셈이기 때문이다 — 이 경로에는 통과할 검증이 없다.
+ */
+.result-answered {
+  border-color: var(--accent);
+}
+
+.answer-body {
+  white-space: pre-wrap;
+  line-height: 1.6;
+}
+
 /* ---- 취소 / 중단 상태 ---- */
 
 .event-cancel .event-type {

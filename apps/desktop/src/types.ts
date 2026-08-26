@@ -27,14 +27,68 @@ export type TaskPhase =
   | "FAILED"
   | "CANCELLED"
   | "INTERRUPTED"
-  | "REJECTED";
+  | "REJECTED"
+  /** 질문에 답하는 중 (state-machine 51절). */
+  | "ANSWERING"
+  /** 질문에 답했다 — **완료가 아니다** (51절). */
+  | "ANSWERED";
 
-export const TERMINAL_PHASES: TaskPhase[] = ["COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "REJECTED"];
+/**
+ * **이 목록은 세 번째 사본이다** (3.26.4절).
+ *
+ * `packages/protocol`과 `core/src/store.rs`에 같은 목록이 있고, 그 둘은 서로 대조된다
+ * (`terminalPhases.test.ts`). 화면 쪽 사본은 그 대조에 **없었고**, 그래서 51절이 `ANSWERED`를
+ * 더했을 때 여기만 낡은 채로 남았다 — 끝난 태스크를 화면이 "진행 중"으로 그리는 상태다.
+ * 이제 같은 검사가 셋을 함께 본다.
+ */
+export const TERMINAL_PHASES: TaskPhase[] = [
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+  "INTERRUPTED",
+  "REJECTED",
+  "ANSWERED",
+];
 
 /** ui-wireframes.md 2절 — 내부 14 phase를 사용자에게 보이는 단계로 압축한다. */
-export type UserStage = "준비 중" | "분석" | "검수" | "확인 필요" | "승인 대기" | "실행" | "검증" | "취소 중" | "완료";
+export type UserStage =
+  | "준비 중"
+  | "분석"
+  | "검수"
+  | "확인 필요"
+  | "승인 대기"
+  | "실행"
+  | "검증"
+  | "취소 중"
+  | "완료"
+  /** 질문 경로 (51절). */
+  | "답변"
+  /**
+   * 질문 경로의 종착 — **"완료"라고 쓰지 않는다** (3.26.1절).
+   *
+   * 51절이 `COMPLETED`와 `ANSWERED`를 나눈 이유가 화면에서 사라지면 안 된다. 색만 다르게
+   * 하는 것으로는 부족하다: 같은 단어를 쓰면 사용자는 같은 것으로 읽고, 색은 나중에 누군가
+   * 통일한다.
+   */
+  | "답변함";
 
 export const STAGE_ORDER: UserStage[] = ["준비 중", "분석", "검수", "승인 대기", "실행", "검증", "완료"];
+
+/**
+ * 질문 경로의 단계 (51절).
+ *
+ * **변경 경로의 단계를 빌려 쓰지 않는다.** 승인 대기·실행·검증을 회색으로 늘어놓으면 화면이
+ * "아직 거기까지 안 갔다"고 말하는 셈인데, 질문은 **거기 갈 일이 없다.**
+ */
+export const QUESTION_STAGE_ORDER: UserStage[] = ["준비 중", "답변", "답변함"];
+
+/** 이 태스크가 밟는 단계들. `kind`가 정한다 — phase로 추측하면 시작 시점에 알 수 없다. */
+export function stagesFor(kind: TaskKind): UserStage[] {
+  return kind === "question" ? QUESTION_STAGE_ORDER : STAGE_ORDER;
+}
+
+/** 바꿔 달라는 것인가 물어보는 것인가 (state-machine 51절). */
+export type TaskKind = "change" | "question";
 
 export function phaseToStage(phase: TaskPhase): UserStage {
   switch (phase) {
@@ -61,6 +115,11 @@ export function phaseToStage(phase: TaskPhase): UserStage {
     // "완료"로 접어버리면 아직 프로세스가 살아 있는 동안 끝난 것처럼 보인다.
     case "CANCELLING":
       return "취소 중";
+    case "ANSWERING":
+      return "답변";
+    // **"완료"로 접지 않는다.** 51절이 종착지를 나눈 이유가 여기서 사라진다.
+    case "ANSWERED":
+      return "답변함";
     default:
       return "완료";
   }
@@ -226,7 +285,8 @@ export interface CriterionEvaluation {
 
 export interface FinalResult {
   taskId: string;
-  status: "completed" | "failed" | "cancelled" | "rejected";
+  /** `answered`는 **완료가 아니다** (state-machine 51절). */
+  status: "completed" | "failed" | "cancelled" | "rejected" | "answered";
   failureReason?: string;
   summary: string;
   verificationReport?: VerificationReport;
@@ -242,6 +302,17 @@ export interface FinalResult {
   criterionEvaluations?: CriterionEvaluation[];
   /** 예산 결말. 성공·실패를 가리지 않고 온다 — 돈은 결과와 무관하게 나갔다. */
   budget?: TaskBudgetOutcome;
+  /**
+   * 질문에 대한 답 (51절). `status === "answered"`일 때만 있다.
+   *
+   * `summary`와 따로 둔다 — 요약 자리에 넣으면 긴 답이 목록의 한 줄 자리에 들어간다.
+   */
+  answer?: {
+    answer: string;
+    citedFiles: string[];
+    missingContext: string[];
+    model: string;
+  };
 }
 
 /**

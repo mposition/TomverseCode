@@ -708,13 +708,8 @@ fn allowed_tools_for(
     if args.command != "ask" {
         return from_skill;
     }
-    let read_only: Vec<tomverse_core::types::ToolName> = tomverse_core::skills::ALL_TOOLS
-        .iter()
-        .copied()
-        .filter(|t| t.is_read_only())
-        .filter(|t| from_skill.as_ref().is_none_or(|s| s.contains(t)))
-        .collect();
-    Some(read_only)
+    // 좁히기 자체는 코어에 있다 — 화면과 이 CLI가 **같은 함수**를 쓴다.
+    tomverse_core::skills::tools_for_question(from_skill)
 }
 
 /// 스킬을 **Rust가 읽는다**(26.1절). sidecar가 읽으면 도구 허용목록의 출처가 sidecar가 되고,

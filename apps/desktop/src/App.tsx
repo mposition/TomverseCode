@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 import {
   phaseToStage,
-  STAGE_ORDER,
+  stagesFor,
   type AcceptanceCriterion,
   type ApprovalRequest,
   type CriterionEvaluation,
@@ -28,6 +28,7 @@ import {
   type TaskRow,
   type UserDecisionInput,
   type UsageTotals,
+  type TaskKind,
   type UserStage,
   type VerificationReport,
   type WorkspaceInfo,
@@ -50,6 +51,7 @@ import { WorkspaceSettingsPanel } from "./components/WorkspaceSettingsPanel";
 import { CarriedDecisionsPanel } from "./components/CarriedDecisionsPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
 import { AutopilotPreviewPanel } from "./components/AutopilotPreviewPanel";
+import { AnswerPanel } from "./components/AnswerPanel";
 import { SkillLibraryPicker } from "./components/SkillLibraryPicker";
 import { EffectiveConfigPanel } from "./components/EffectiveConfigPanel";
 import { PullRequestPanel } from "./components/PullRequestPanel";
@@ -168,6 +170,13 @@ export default function App() {
    * 대상으로 다룬다. 토글이 정하는 것은 "매 태스크마다 커밋 승인 모달을 띄울 것인가"뿐이다.
    */
   const [allowGitCommit, setAllowGitCommit] = useState(false);
+  /**
+   * 바꿔 달라는 것인가 물어보는 것인가 (state-machine 51절).
+   *
+   * **사용자의 문장을 보고 우리가 추측하지 않는다.** 추측하면 "고쳐 달라"는 요청에 답만 하거나
+   * 그 반대가 되고, 둘 다 사용자가 원한 것이 아니다.
+   */
+  const [taskKind, setTaskKind] = useState<TaskKind>("change");
   /**
    * 무인 실행 (state-machine 24절)과 그 짝인 검증 명령 자동 승인(24.5절).
    *
@@ -598,6 +607,9 @@ export default function App() {
         autoApproveVerification,
         // 빈 문자열은 "경로 없음"이지 "빈 경로"가 아니다.
         skillPath: skillPath.trim() === "" ? null : skillPath.trim(),
+        // **질문인가**(51절). 이 값이 정하는 것은 경로만이 아니다 — Rust가 이걸 보고 도구를
+        // 읽기 전용으로 좁혀 게이트에 꽂는다(51.2절).
+        question: taskKind === "question",
         // 시한의 판정은 화면 밖(src/lib)에 있다 — 계산이 화면 안에 있으면 검증할 방법이 없다.
         deadlineSecs: readDeadline(deadlineText, unattended).secs,
       });
@@ -889,7 +901,11 @@ export default function App() {
   const usage = useMemo(() => sumUsage(events), [events]);
   const reports = useMemo(() => findReports(events), [events]);
   const diffs = useMemo(() => finalResult?.diffs ?? [], [finalResult]);
-  const stage: UserStage = finalResult ? "완료" : phaseToStage(phase);
+  // **끝난 태스크의 단계도 phase에서 읽는다.** 종전에는 결과가 있으면 무조건 "완료"였는데,
+  // 답변은 완료가 아니다(51절) — 그 구별이 여기서 사라지면 종착지를 나눈 이유도 사라진다.
+  // 그래서 결과 유무로 갈라지 않는다: phase 하나가 답한다.
+  const stage: UserStage = phaseToStage(phase);
+  const stages = stagesFor(taskKind);
 
   const noProviders = providerStatus?.providers.every((p) => !p.configured) ?? false;
 
@@ -1077,7 +1093,28 @@ export default function App() {
             />
             <SecretShapeWarning hits={messageSecrets} />
             <div className="row">
+              {/* **바꿔 달라는 것인가 물어보는 것인가** (state-machine 51절).
+                  사용자의 문장을 보고 우리가 추측하지 않는다 — 추측하면 "고쳐 달라"는 요청에
+                  답만 하거나 그 반대가 되고, 둘 다 사용자가 원한 것이 아니다. */}
               <fieldset className="modes" disabled={running}>
+                <legend>무엇을 할까요</legend>
+                <label>
+                  <input type="radio" checked={taskKind === "change"} onChange={() => setTaskKind("change")} />
+                  고치기 — 계획하고 실행하고 검증합니다
+                </label>
+                <label>
+                  <input type="radio" checked={taskKind === "question"} onChange={() => setTaskKind("question")} />
+                  물어보기 — 파일을 바꾸지 않고 답만 합니다
+                </label>
+                {taskKind === "question" && (
+                  // **검증되지 않는다는 사실을 미리 말한다.** 답을 받은 뒤에 알면 그건
+                  // 도구가 숨긴 것으로 읽힌다(51.4절 — 이 경로에는 판정자가 없다).
+                  <p className="muted small">
+                    질문에는 실행할 것도 검사할 것도 없으므로 <strong>build/test가 판정하지 않습니다</strong>.
+                  </p>
+                )}
+              </fieldset>
+              <fieldset className="modes" disabled={running || taskKind === "question"}>
                 <legend>실행 정책</legend>
                 <label>
                   <input type="radio" checked={mode === "fast"} onChange={() => setMode("fast")} />
@@ -1365,7 +1402,7 @@ export default function App() {
             </div>
           )}
 
-          <StageBar current={stage} stages={STAGE_ORDER} phase={phase} devMode={devMode} />
+          <StageBar current={stage} stages={stages} phase={phase} devMode={devMode} />
           {notice && <p className="notice">{notice}</p>}
 
           <section className="grid">
@@ -1455,7 +1492,10 @@ export default function App() {
                 </div>
               )}
 
-              {finalResult && (
+              {/* 답변은 완료가 아니다 — 다른 패널로 그린다(51절, ui-wireframes 3.26절). */}
+              <AnswerPanel answer={finalResult?.answer} />
+
+              {finalResult && finalResult.status !== "answered" && (
                 <div className={`panel result result-${finalResult.status}`}>
                   <h2>{statusLabel(finalResult.status)}</h2>
                   {/* **무엇이 이 결과를 뒷받침하는가** — product-strategy.md 11절·16.5절.
@@ -1659,6 +1699,11 @@ function statusLabel(status: FinalResult["status"]): string {
       return "취소됨";
     case "rejected":
       return "거부됨";
+    // **"완료"라고 쓰지 않는다** — 51절이 종착지를 나눈 이유가 화면에서 사라진다.
+    // 이 자리는 실제로는 쓰이지 않는다(답변은 `AnswerPanel`이 그린다) — 그래도 적어 둔다:
+    // 나중에 이 함수를 다른 자리에서 쓰면 그때 기본값이 "완료"가 되기 때문이다.
+    case "answered":
+      return "답변함";
   }
 }
 

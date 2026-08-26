@@ -127,6 +127,37 @@ pub struct SessionState {
 ///
 /// **우선순위를 한 곳에서 정한다**(26.1절). 두 값을 sidecar로 각각 보내면 거기서 다시 정하게
 /// 되고, 그러면 규칙이 둘이 된다.
+/// 이 태스크가 쓸 수 있는 도구.
+///
+/// **좁히기만 한다.** 스킬이 좁힌 것과 질문 경로가 좁힌 것의 **교집합**이다 — 둘 중 하나라도
+/// 막으면 막힌다.
+///
+/// # 질문이 파일을 바꾸지 않는다는 보장이 여기 있다 (51.2절)
+///
+/// sidecar의 경로가 `EXECUTING`을 지나지 않는다는 것은 **Node의 성질**이고, 장악당한 Node는
+/// 그 경로를 우회할 수 있다. 게이트에 읽기 전용 목록을 꽂으면 그때도 파일이 바뀌지 않는다.
+///
+/// 헤드리스 CLI에도 같은 함수가 있다(`bin/host.rs`). 한 곳에 두지 못하는 이유는 그쪽이
+/// `Args`를 보고 여기가 화면의 토글을 보기 때문인데, **판정은 같아야 한다.**
+///
+/// **이 크레이트는 이 환경에서 컴파일되지 않는다**(tauri가 GUI 시스템 라이브러리를 요구한다).
+/// 그래서 여기에는 단위 테스트를 둘 수 없고, 배선이 끊겼는지는 소스를 읽는 검사가 본다 —
+/// `apps/desktop/test/commandWiring.test.ts`. 판정의 세부(어떤 도구가 읽기 전용인가)는
+/// `bin/host.rs`의 Rust 단위 테스트가 본다.
+fn allowed_tools_for(
+    question: bool,
+    skill: Option<&tomverse_core::skills::Skill>,
+) -> Option<Vec<tomverse_core::types::ToolName>> {
+    let from_skill = skill.and_then(|s| s.allowed_tools.clone());
+    if !question {
+        return from_skill;
+    }
+    // **좁히기 자체는 코어에 있다**(skills.rs `tools_for_question`). 이 크레이트는 이 환경에서
+    // 컴파일되지 않아 여기 로직을 두면 검사할 수단이 소스 문자열뿐이고, 그 검사는 좁히기가
+    // 살아 있는지가 아니라 글자가 남아 있는지만 본다.
+    tomverse_core::skills::tools_for_question(from_skill)
+}
+
 /// 화면의 스위치에서 이 태스크의 정책을 만든다.
 ///
 /// **`start_task`와 `autopilot_preview`가 같은 함수를 쓴다**(47절). 두 벌로 두면 미리보기가
@@ -135,6 +166,7 @@ pub struct SessionState {
 ///
 /// **`auto_approve_workspace_writes`가 여기 없다**(48.3절). 화면에 그 스위치가 없기 때문이고,
 /// 그 사실은 실수가 아니라 아직 내리지 않은 결정이다 — 미리보기가 그것을 드러낸다.
+#[allow(clippy::too_many_arguments)]
 fn task_policy_from(
     mode: ExecutionMode,
     allow_git_commit: bool,
@@ -142,13 +174,14 @@ fn task_policy_from(
     auto_approve_verification: bool,
     skill: Option<&tomverse_core::skills::Skill>,
     deadline_secs: Option<u64>,
+    question: bool,
 ) -> TaskPolicy {
     TaskPolicy {
         execution_mode: mode,
         allow_git_commit,
         unattended,
         auto_approve_verification,
-        allowed_tools: skill.and_then(|s| s.allowed_tools.clone()),
+        allowed_tools: allowed_tools_for(question, skill),
         // **sidecar로 가지 않는다**(39.1절). 시계도 판정도 Rust가 갖는다.
         deadline_ms: deadline_secs.map(|s| s * 1_000),
         ..TaskPolicy::default()
@@ -508,6 +541,7 @@ impl SessionState {
             auto_approve_verification,
             skill.as_ref(),
             deadline_secs,
+            false,
         );
         serde_json::to_value(host.autopilot_preview(policy)).map_err(|e| format!("직렬화: {e}"))
     }
@@ -930,6 +964,11 @@ impl SessionState {
         /// 스킬 파일 경로 (26절). **Rust가 읽는다** — 도구 허용목록의 출처가 UI가 되면
         /// 장악당한 UI가 "허용목록은 전부입니다"라고 말할 수 있다.
         skill_path: Option<&str>,
+        /// 이 요청이 **질문인가** (state-machine 51절).
+        ///
+        /// 참이면 파일을 바꾸지 않는 경로를 탄다. 그 보장은 두 겹이다 — sidecar의 경로가
+        /// `EXECUTING`을 지나지 않고, 여기서 도구를 읽기 전용으로 좁혀 게이트에 꽂는다.
+        question: bool,
         /// 무인 실행의 **시한**(초) — state-machine 39절. `None`이면 상한이 없다.
         ///
         /// `timeout`과 다른 값이다: 저쪽은 이 호출이 기다리기를 그만두는 시각이고, 이쪽은
@@ -987,6 +1026,7 @@ impl SessionState {
             auto_approve_verification,
             skill.as_ref(),
             deadline_secs,
+            question,
         );
         host.begin_task(&task_id, task_policy, skill.as_ref())?;
 
@@ -1010,6 +1050,9 @@ impl SessionState {
                 "sessionId": session_id,
                 "workspaceId": workspace_id,
                 "userMessage": message,
+                // **바꿔 달라는 것인가 물어보는 것인가**(51절). 화면이 정한다 — 사용자의
+                // 문장을 보고 우리가 추측하면 "고쳐 달라"에 답만 하거나 그 반대가 된다.
+                "kind": if question { "question" } else { "change" },
                 "createdAt": tomverse_core::time::now_iso(),
             },
             "policy": {
@@ -1024,9 +1067,10 @@ impl SessionState {
                 "unattended": unattended,
                 "autoApproveVerification": auto_approve_verification,
                 // 화면은 이 목록을 **지키지 않는다** — 지키는 것은 Rust의 게이트다(26.1절).
-                "allowedTools": skill
+                // **게이트에 꽂힌 값을 그대로 보낸다**(51절) — 여기서 다시 계산하면 화면이
+                // 말하는 허용목록과 실제로 좁혀진 목록이 갈릴 수 있다.
+                "allowedTools": allowed_tools_for(question, skill.as_ref())
                     .as_ref()
-                    .and_then(|s| s.allowed_tools.as_ref())
                     .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
             },
             "skill": skill.as_ref().map(|s| json!({ "name": s.name, "instructions": s.instructions })),

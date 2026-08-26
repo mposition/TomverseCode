@@ -61,6 +61,49 @@ test("터미널 phase 목록이 Rust와 TypeScript에서 같다", () => {
   );
 });
 
+/**
+ * **사본은 셋이었다** — ui-wireframes 3.26절.
+ *
+ * 위 두 검사는 프로토콜과 Rust를 대조한다. 그런데 화면(`apps/desktop/src/types.ts`)에도
+ * 같은 목록이 있고, 그것은 어느 대조에도 없었다 — 51절이 `ANSWERED`를 더했을 때 **화면
+ * 쪽만 낡은 채로 남았다.** 그 상태에서 화면은 끝난 태스크를 "진행 중"으로 그린다.
+ *
+ * 화면이 자기 사본을 갖는 이유는 있다(프런트엔드가 프로토콜 패키지를 번들에 넣지 않는다).
+ * 사본을 없앨 수 없으면 **대조에 넣는 것**이 남은 방법이다.
+ */
+const DESKTOP_TYPES = path.resolve(
+  __dirname,
+  "..","..","..","..",
+  "apps","desktop","src","types.ts"
+);
+
+function desktopTerminalPhases(): string[] {
+  const source = readFileSync(DESKTOP_TYPES, "utf8");
+  const marker = "TERMINAL_PHASES" + ": TaskPhase[] = [";
+  const at = source.indexOf(marker);
+  assert.notEqual(at, -1, `${DESKTOP_TYPES}에서 TERMINAL_PHASES를 찾지 못했습니다`);
+  // **여는 대괄호 다음부터** 자른다. `at`부터 자르면 `TaskPhase[]`의 `]`에서 끊긴다 —
+  // 그러면 목록이 0개로 읽히고, 위 공허성 단언이 없었다면 "빈 집합끼리 같다"로 통과한다.
+  const open = at + marker.length;
+  const body = source.slice(open, source.indexOf("]", open));
+  return [...body.matchAll(/"([A-Z_]+)"/g)].map((m) => m[1] as string);
+}
+
+test("화면 쪽 터미널 목록을 소스에서 읽을 수 있다", () => {
+  const found = desktopTerminalPhases();
+  assert.ok(found.length >= 4, `화면에서 터미널 phase를 ${found.length}개밖에 못 읽었습니다`);
+});
+
+test("터미널 phase 목록이 세 곳에서 모두 같다", () => {
+  const ts = [...TERMINAL_PHASES].sort();
+  assert.deepEqual(
+    [...desktopTerminalPhases()].sort(),
+    ts,
+    "화면 쪽 터미널 목록이 갈라졌습니다. 갈라지면 화면이 끝난 태스크를 진행 중으로 그리거나 " +
+      "그 반대가 됩니다 — 그리고 그 어긋남은 앱을 띄워야만 보입니다."
+  );
+});
+
 test("Rust 주석이 가리키는 위치가 실제 위치와 같다", () => {
   // 이 검사가 없으면 위 두 검사는 통과하면서 주석만 낡는다 — 실제로 그렇게 낡아 있었다.
   const source = readFileSync(STORE_RS, "utf8");

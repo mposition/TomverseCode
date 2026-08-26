@@ -120,6 +120,31 @@ pub const ALL_TOOLS: &[ToolName] = &[
     ToolName::GitPush,
 ];
 
+/// 질문 태스크의 허용 도구를 구한다 — 스킬이 준 목록을 **읽기 전용으로 좁힌다**(51절).
+///
+/// **왜 여기 있는가.** 이 좁히기는 화면(`session.rs`)과 헤드리스 CLI(`bin/host.rs`) 양쪽에
+/// 필요한데, 두 곳 모두 이 환경에서 컴파일되지 않는 크레이트다 — 거기 두면 동작을 검사할
+/// 방법이 소스 문자열 검사밖에 없고, 그 검사는 **좁히기가 살아 있는지**가 아니라 **글자가
+/// 남아 있는지**만 본다. 실제로 이른 return 하나로 좁히기를 죽여도 소스 검사는 통과했다.
+/// 로직을 코어로 옮기면 아래 테스트가 진짜 값을 비교하고, 두 진입점에 남는 것은 호출 한 줄뿐이라
+/// 소스 검사가 정직하게 할 수 있는 일(부르는가)만 맡는다.
+///
+/// **교집합이지 합집합이 아니다.** 스킬이 이미 좁혀둔 것을 질문이 넓히면, 사용자가 스킬로
+/// 정한 경계가 질문 한 번에 사라진다.
+///
+/// `run_tests`는 읽기 전용에 들어 있지 않고, 일부러 되살리지 않는다 — 질문에 답하려고
+/// 테스트를 돌리는 것은 워크스페이스에서 명령을 실행하는 일이고, 질문 경로는 그걸 하지 않는다.
+pub fn tools_for_question(from_skill: Option<Vec<ToolName>>) -> Option<Vec<ToolName>> {
+    Some(
+        ALL_TOOLS
+            .iter()
+            .copied()
+            .filter(|t| t.is_read_only())
+            .filter(|t| from_skill.as_ref().is_none_or(|s| s.contains(t)))
+            .collect(),
+    )
+}
+
 /// 스킬 파일을 읽고 검증한다.
 /// 위치를 묻지 않고 파일 하나를 읽어 검증한다.
 ///
@@ -715,5 +740,48 @@ mod tests {
         let skill = file(r#"{"name":"s","allowedTools":["read_file","read_file"]}"#).unwrap();
         let tools = skill.allowed_tools.unwrap();
         assert_eq!(tools.iter().filter(|t| **t == ToolName::ReadFile).count(), 1);
+    }
+
+    /// 스킬이 좁히지 않았어도 질문은 **읽기 전용만** 받는다.
+    #[test]
+    fn a_question_gets_only_read_only_tools() {
+        let tools = tools_for_question(None).unwrap();
+        assert!(!tools.is_empty(), "빈 목록이면 아래 전칭 명제가 공허하다");
+        for tool in &tools {
+            assert!(tool.is_read_only(), "{tool:?}가 읽기 전용이 아닌데 질문에 허용됐습니다");
+        }
+        assert!(tools.contains(&ToolName::ReadFile));
+        assert!(tools.contains(&ToolName::SearchText));
+    }
+
+    /// **파일을 바꾸는 도구는 하나도 남지 않는다.** 51절이 질문 경로에서 변이를 막은 것을
+    /// 도구 목록도 지켜야 한다 — 상태 머신만 막으면 도구 쪽 문이 열린 채 남는다.
+    #[test]
+    fn a_question_can_reach_no_mutating_tool() {
+        let tools = tools_for_question(None).unwrap();
+        for tool in ALL_TOOLS.iter().filter(|t| t.mutates_files()) {
+            assert!(!tools.contains(tool), "{tool:?}가 질문 경로에 남아 있습니다");
+        }
+        assert!(!tools.contains(&ToolName::RunCommand));
+    }
+
+    /// **`run_tests`도 되살리지 않는다.** `validate`가 스킬 허용목록에 검증 명령을 자동으로
+    /// 남기므로(원칙 1) 교집합의 입력에는 늘 들어 있는데, 질문에는 검증할 변경이 없다.
+    /// 질문 경로는 `VERIFYING`을 지나지 않으므로 여기서 빼는 것이 원칙 1과 충돌하지 않는다.
+    #[test]
+    fn a_question_does_not_get_run_tests_back() {
+        let from_skill = Some(vec![ToolName::ReadFile, ToolName::RunTests]);
+        let tools = tools_for_question(from_skill).unwrap();
+        assert!(!tools.contains(&ToolName::RunTests), "{tools:?}");
+    }
+
+    /// **교집합이지 합집합이 아니다.** 스킬이 이미 좁혀둔 것을 질문이 넓히면 안 된다.
+    #[test]
+    fn a_question_never_widens_what_the_skill_narrowed() {
+        let from_skill = Some(vec![ToolName::ReadFile, ToolName::RunTests]);
+        let tools = tools_for_question(from_skill).unwrap();
+        assert_eq!(tools, vec![ToolName::ReadFile], "{tools:?}");
+        // 스킬이 허용하지 않은 읽기 전용 도구까지 주면 그건 넓히기다.
+        assert!(!tools.contains(&ToolName::SearchText));
     }
 }

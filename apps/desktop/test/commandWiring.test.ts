@@ -102,3 +102,77 @@ test("등록된 이름은 전부 실제 명령이다", () => {
   const unknown = registeredCommands().filter((name) => !declared.has(name));
   assert.deepEqual(unknown, [], `명령이 아닌 이름이 등록되어 있습니다: ${unknown.join(", ")}`);
 });
+
+/**
+ * **질문 경로의 도구 좁히기를 두 진입점이 지난다** — state-machine 51.2절, ui-wireframes 3.26절.
+ *
+ * 헤드리스 CLI(`bin/host.rs`)와 화면(`session.rs`)이 각자 `allowed_tools_for`를 갖는다.
+ * 한 곳에 두지 못하는 이유는 그쪽이 `Args`를 보고 이쪽이 화면의 토글을 보기 때문인데,
+ * **판정은 같아야 한다.** 그래서 판정 자체는 코어의 `skills::tools_for_question` 하나이고,
+ * 두 진입점에 남는 것은 "질문인가"를 읽어 그 함수를 부르는 배선뿐이다.
+ *
+ * # 이 검사가 할 수 있는 일과 할 수 없는 일
+ *
+ * 이 저장소에서 `session.rs`는 **컴파일되지 않고**(tauri가 GUI 시스템 라이브러리를 요구한다 —
+ * CLAUDE.md), `bin/host.rs`는 컴파일되지만 여기서는 소스로만 본다. 소스 문자열 검사는
+ * **글자가 남아 있는지**만 알 수 있지 **그 글자가 살아 있는지**는 모른다 — 실제로 좁히기가
+ * 이 두 파일 안에 있던 동안, 이른 return 하나(`if !question || question`)로 좁히기를 죽여도
+ * 이 검사는 통과했다.
+ *
+ * 그래서 좁히기를 값 비교가 가능한 자리로 옮겼다. 판정의 내용(어떤 도구가 남는가, 스킬과
+ * 교집합인가, `run_tests`가 되살아나지 않는가)은 `skills.rs`의 Rust 단위 테스트가 실제 값으로
+ * 본다. 여기 남은 것은 소스 검사가 정직하게 할 수 있는 일뿐이다: **부르는가, 그리고
+ * 여기서 다시 구현하지 않았는가.**
+ */
+const SESSION_RS = path.join(
+  findUp("src-tauri", path.dirname(fileURLToPath(import.meta.url))),
+  "src-tauri",
+  "src",
+  "session.rs"
+);
+const HOST_BIN_RS = path.join(
+  findUp("src-tauri", path.dirname(fileURLToPath(import.meta.url))),
+  "src-tauri",
+  "core",
+  "src",
+  "bin",
+  "host.rs"
+);
+
+test("두 진입점 모두 질문 태스크의 좁히기를 코어에 맡긴다", () => {
+  for (const file of [SESSION_RS, HOST_BIN_RS]) {
+    const source = readFileSync(file, "utf8");
+    const marker = "fn allowed_tools_for" + "(";
+    const at = source.indexOf(marker);
+    assert.notEqual(at, -1, `${path.basename(file)}에 allowed_tools_for가 없습니다`);
+
+    const body = source.slice(at, source.indexOf("\n}", at));
+    // **좁히기 로직이 여기 있으면 안 된다.** 두 크레이트 모두 이 환경에서 컴파일되지 않으므로
+    // 여기 두면 검사 수단이 소스 문자열뿐이고, 그건 좁히기가 **살아 있는지**가 아니라
+    // **글자가 남아 있는지**만 본다 — 이른 return 하나로 죽여도 통과한다(실측).
+    // 그래서 값 비교가 가능한 코어(skills.rs)로 옮겼고, 소스 검사가 정직하게 할 수 있는 일은
+    // "부르는가" 하나뿐이다.
+    const call = "skills::tools_for_question" + "(";
+    assert.ok(body.includes(call), `${path.basename(file)}: 코어의 좁히기를 부르지 않습니다`);
+    assert.ok(
+      !body.includes("is_read_only"),
+      `${path.basename(file)}: 좁히기를 여기서 다시 구현했습니다 — 검사할 수 없는 자리입니다`
+    );
+
+    // 그리고 정책 조립이 실제로 이 함수를 지나야 한다 — 함수만 있고 부르지 않으면 아무 일도 없다.
+    const policy = source.slice(source.indexOf("fn task_policy_from"));
+    assert.ok(
+      policy.includes("allowed_tools: allowed_tools_for("),
+      `${path.basename(file)}: task_policy_from이 좁히기를 지나지 않습니다`
+    );
+  }
+});
+
+/** 화면이 그 값을 **보내야** 한다 — 안 보내면 토글이 아무것도 하지 않는다. */
+test("화면이 start_task에 question을 보낸다", () => {
+  const app = readFileSync(
+    path.join(findUp("src-tauri", path.dirname(fileURLToPath(import.meta.url))), "src", "App.tsx"),
+    "utf8"
+  );
+  assert.ok(app.includes('question: taskKind === "question"'), "App.tsx가 question을 보내지 않습니다");
+});
