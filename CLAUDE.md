@@ -73,7 +73,7 @@ apps/desktop/        Tauri 2 + React
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
                      `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`/`windows-landing`.
                      `windows-landing`은 **Windows에서만 검증되는 동작의 착지 판정을 사람 머릿속에서 꺼낸 것**이다 —
-                     Job Object·sidecar 번들·Credential Store·명령 해석(npm shim)·프로세스 그룹·경로 정규화·개발자 환경(MSVC) 일곱 묶음이고,
+                     Job Object·sidecar 번들·Credential Store·명령 해석(npm shim)·프로세스 그룹·경로 정규화·개발자 환경(MSVC)·Python 가상환경 여덟 묶음이고,
                      `cfg(windows)`/`Platform::Windows`를 쓰는 파일이 그 목록에 없으면 테스트가 실패한다.
                      `metrics`는 저장된 이벤트에서 계측을 집계한다 — 기준 커버리지·충돌 결말과
                      **취소 소요 분포**(강제 포기 탈출구가 뜨는 시점의 근거), 그리고 **모델 정면

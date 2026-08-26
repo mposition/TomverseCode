@@ -193,7 +193,24 @@ pub fn default_command_policy() -> CommandPolicy {
             allow("pnpm", &["test", "**"], RuleEffect::Conditional),
             allow("yarn", &["test", "**"], RuleEffect::Conditional),
             allow("node", &["--test", "**"], RuleEffect::Conditional),
+            // **`pytest`를 그대로 부르는 길은 남겨 두되, 우리가 만드는 명령은 이쪽이 아니다**
+            // (49절). 가상환경을 활성화하지 않으면 `pytest`는 PATH에 없고, 활성화를 흉내 내려면
+            // 셸을 거쳐야 해서 argv 계약이 깨진다. 그래서 `verify.rs`는 인터프리터를 직접 부른다.
             allow("pytest", &["**"], RuleEffect::Conditional),
+            // `<python> -m <도구>` — 활성화가 하는 일을 구조적으로 재현한 모양(49.2절).
+            //
+            // **`-m` 뒤를 열어 두지 않는다.** `python -m **`을 허용하면 `-m http.server`도
+            // `-m pip`도 지나가고, 그건 "테스트 러너 허용"이 아니라 "임의 파이썬 실행 허용"이다.
+            // 세 도구만 적는다 — 새 도구는 `verify.rs`가 만들 때 여기도 함께 는다.
+            //
+            // `python`과 `python3`를 둘 다 적는 이유: `program_basename`은 확장자만 벗기므로
+            // 두 이름이 다른 프로그램으로 매치된다. Unix PATH 폴백이 `python3`를 고를 수 있다.
+            allow("python", &["-m", "pytest", "**"], RuleEffect::Conditional),
+            allow("python", &["-m", "ruff", "**"], RuleEffect::Conditional),
+            allow("python", &["-m", "mypy", "**"], RuleEffect::Conditional),
+            allow("python3", &["-m", "pytest", "**"], RuleEffect::Conditional),
+            allow("python3", &["-m", "ruff", "**"], RuleEffect::Conditional),
+            allow("python3", &["-m", "mypy", "**"], RuleEffect::Conditional),
             allow("cargo", &["build", "**"], RuleEffect::Conditional),
             allow("cargo", &["test", "**"], RuleEffect::Conditional),
             allow("cargo", &["check", "**"], RuleEffect::Conditional),
@@ -215,6 +232,13 @@ pub fn is_network_capable(cmd: &RunCommandArgs) -> bool {
         "npm" | "pnpm" | "yarn" => matches!(first, "install" | "i" | "ci" | "add" | "update" | "publish" | "audit"),
         "cargo" => matches!(first, "publish" | "install" | "update" | "fetch" | "add"),
         "pip" | "pip3" => matches!(first, "install" | "download" | "uninstall"),
+        // **`python -m pip install`도 네트워크를 탄다**(49절). allowlist가 `-m pip`를 열어 두지
+        // 않으므로 지금은 여기 닿지 않지만, 위 `git push` 주석과 같은 이유로 적어 둔다 —
+        // 나중에 그 규칙을 넓히는 사람이 있으면 네트워크 분류가 함께 따라와야 한다.
+        "python" | "python3" | "py" => {
+            cmd.args.first().map(String::as_str) == Some("-m")
+                && matches!(cmd.args.get(1).map(String::as_str), Some("pip") | Some("ensurepip") | Some("venv"))
+        }
         "dotnet" => matches!(first, "restore" | "nuget"),
         // `push`는 `run_command`에서 deny라 이 분류에 닿지 않는다. **그래도 적어 둔다** —
         // 나중에 그 deny를 푸는 사람이 있으면 네트워크 분류가 함께 따라와야 하고, 여기 없으면

@@ -135,6 +135,64 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
         );
     }
 
+    // ---- Python ----
+    //
+    // **마지막에 온다.** `insert`가 먼저 넣은 것을 이기지 않으므로(`or_insert`), 다국어
+    // 저장소에서 이 순서가 곧 우선순위다. Python을 끝에 두는 이유는 이 갈래만 인터프리터
+    // 해석을 요구해서 실패할 여지가 넓기 때문이다 — 다른 갈래가 답할 수 있으면 그쪽이 낫다.
+    //
+    // 선언이 없으면 아무것도 넣지 않는다. 자세한 근거는 `python.rs`에 있다.
+    let py_probe = crate::python::Probe {
+        platform: crate::tools::program::Platform::current(),
+        is_file: &|rel| root.path().join(rel).is_file(),
+        read: &|rel| std::fs::read_to_string(root.path().join(rel)).ok(),
+        env: &|key| std::env::var(key).ok(),
+        // **실행 경로가 쓰는 것과 같은 해석기를 쓴다.** 여기서 따로 PATH를 뒤지면 "찾았다고
+        // 해 놓고 실행에서 못 찾는" 갈림이 생긴다 — Windows의 `PATHEXT`가 정확히 그 자리다.
+        on_path: &|name| {
+            let path = std::env::var("PATH").unwrap_or_default();
+            let pathext = std::env::var("PATHEXT").unwrap_or_default();
+            let is_file = |p: &std::path::Path| p.is_file();
+            crate::tools::program::find_executable(
+                name,
+                &crate::tools::program::ResolveEnv {
+                    platform: crate::tools::program::Platform::current(),
+                    path: &path,
+                    pathext: &pathext,
+                    is_file: &is_file,
+                },
+            )
+            .is_some()
+        },
+    };
+    let py = crate::python::detect(&py_probe);
+    if let Some(interpreter) = &py.interpreter {
+        // **워크스페이스 안의 인터프리터는 절대경로로 바꾼다.** 상대 프로그램 경로는
+        // 플랫폼마다 다르게 풀린다 — Unix는 자식이 `chdir` 뒤에 찾지만 Windows는 부모의
+        // cwd 기준으로 먼저 찾으므로, 같은 값이 한쪽에서만 동작한다.
+        let program = if interpreter.workspace_relative {
+            root.path().join(&interpreter.program).to_string_lossy().to_string()
+        } else {
+            interpreter.program.clone()
+        };
+        for check in &py.checks {
+            let kind = match check.key {
+                "test" => VerificationKind::Test,
+                "lint" => VerificationKind::Lint,
+                _ => VerificationKind::Typecheck,
+            };
+            let args: Vec<&str> = check.args.iter().map(String::as_str).collect();
+            detected.insert(
+                check.key,
+                kind,
+                cmd(&program, &args),
+                // **어느 인터프리터를 왜 골랐는지도 근거에 넣는다.** 검증이 이상하게 실패했을 때
+                // 사용자가 가장 먼저 묻는 것이 그것이다.
+                &format!("{} (interpreter: {:?})", check.source, interpreter.how),
+            );
+        }
+    }
+
     detected
 }
 
@@ -417,6 +475,100 @@ fn first_meaningful_line(text: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// **우리가 만든 검증 명령을 우리 게이트가 거부하지 않는다** (49.4절).
+    ///
+    /// 이 둘은 다른 파일에 있고 서로를 모른다. 어긋나면 증상이 고약하다 — 검증이 정책 거부로
+    /// 끝나고, 그건 `SKIPPED_WITH_REASON` → `could_not_run`이 되어 **정상 수정 작업이 검증 없이
+    /// 완료로 보고된다**(CLAUDE.md가 npm shim에서 겪은 그 실패 모드다).
+    ///
+    /// 그리고 반대 방향의 어긋남도 실제로 있었다: allowlist에 `pytest`가 **처음부터 있었는데**
+    /// `detect_commands`가 그것을 한 번도 만들지 않았다. 문만 있고 길이 없었던 것이다.
+    ///
+    /// 판정 기준을 손으로 적지 않는다 — 픽스처 워크스페이스를 만들어 **실제로 만들어진 명령**을
+    /// 게이트에 태운다.
+    #[test]
+    fn every_command_we_detect_passes_the_default_gate() {
+        use crate::policy::command::{default_command_policy, match_command, CommandMatch};
+
+        let fixtures: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("npm", vec![("package.json", r#"{"scripts":{"test":"x","build":"x","lint":"x","typecheck":"x"}}"#)]),
+            ("cargo", vec![("Cargo.toml", "[package]\nname = \"x\"\n")]),
+            ("dotnet", vec![("app.csproj", "<Project/>")]),
+            (
+                "python",
+                vec![("pyproject.toml", "[tool.pytest.ini_options]\n[tool.ruff]\n[tool.mypy]\n")],
+            ),
+        ];
+
+        let policy = default_command_policy();
+        let mut checked = 0;
+        for (label, files) in fixtures {
+            let dir = tempfile::tempdir().unwrap();
+            for (name, body) in files {
+                fs::write(dir.path().join(name), body).unwrap();
+            }
+            // Python 갈래는 인터프리터를 찾아야 명령이 나온다. 워크스페이스 안에 가상환경을
+            // 만들어 **PATH에 의존하지 않게** 한다 — CI에 python이 없어도 이 검사는 성립해야 한다.
+            let venv = dir.path().join(".venv").join("bin");
+            fs::create_dir_all(&venv).unwrap();
+            fs::write(venv.join("python"), "").unwrap();
+
+            let root = WorkspaceRoot::new(dir.path()).unwrap();
+            let detected = detect_commands(&root);
+            for (key, (_, cmd, source)) in &detected.commands {
+                checked += 1;
+                match match_command(&policy, cmd, true) {
+                    CommandMatch::Denied { rule } => panic!(
+                        "{label}의 {key} 명령이 게이트에서 거부됩니다: {} {} (규칙 {rule}, 근거 {source})",
+                        cmd.program,
+                        cmd.args.join(" ")
+                    ),
+                    CommandMatch::NoMatch => panic!(
+                        "{label}의 {key} 명령이 allowlist에 없습니다: {} {} (근거 {source})",
+                        cmd.program,
+                        cmd.args.join(" ")
+                    ),
+                    CommandMatch::Allowed { .. } => {}
+                }
+            }
+        }
+        // **빈 집합에 대한 전칭 명제는 언제나 참이다.**
+        assert!(checked >= 10, "검사한 명령이 {checked}개뿐입니다");
+    }
+
+    /// Python 갈래가 **인터프리터를 직접 부른다**(49.2절) — `pytest`를 PATH에서 찾지 않는다.
+    #[test]
+    fn a_declared_python_project_runs_through_its_venv_interpreter() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pytest.ini"), "[pytest]\n").unwrap();
+        let venv = dir.path().join(".venv").join("bin");
+        fs::create_dir_all(&venv).unwrap();
+        fs::write(venv.join("python"), "").unwrap();
+
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let detected = detect_commands(&root);
+        let (_, cmd, source) = detected.commands.get("test").expect("test 명령이 없습니다");
+        assert!(cmd.program.ends_with(".venv/bin/python"), "{}", cmd.program);
+        assert_eq!(cmd.args, vec!["-m", "pytest"]);
+        // 근거에 **어느 인터프리터를 왜 골랐는지**가 남는다.
+        assert!(source.contains("pytest.ini"), "{source}");
+        assert!(source.contains("DotVenv"), "{source}");
+    }
+
+    /// **선언이 없으면 아무것도 만들지 않는다.** `tests/`만 있는 프로젝트는 pytest 프로젝트가 아니다.
+    #[test]
+    fn a_python_project_without_a_declaration_gets_no_command() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(dir.path().join("tests").join("test_x.py"), "").unwrap();
+        let venv = dir.path().join(".venv").join("bin");
+        fs::create_dir_all(&venv).unwrap();
+        fs::write(venv.join("python"), "").unwrap();
+
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        assert!(detect_commands(&root).commands.is_empty());
+    }
 
     struct FakeExecutor {
         /// program+args → (exitCode, stdout)

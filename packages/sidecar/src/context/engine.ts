@@ -569,8 +569,60 @@ export class ContextEngine {
       meta.buildCommand ??= { program: "dotnet", args: ["build"], cwd: ".", source: dotnetProject };
     }
 
+    // ---- Python (state-machine 49절) ----
+    //
+    // **인터프리터를 여기서 정하지 않는다.** 어느 python으로 도는지는 Rust가 가상환경을 보고
+    // 정하고(`python.rs`), 그 판정이 Node에도 있으면 **검증 명령의 출처가 Node가 된다** —
+    // 24.5절이 자동 승인의 근거로 삼은 "프로젝트가 선언했고 Rust가 유도했다"가 무너진다.
+    //
+    // 그래도 여기서 침묵하면 안 된다. 침묵하면 프롬프트가 `(none detected)`라고 적는데,
+    // Rust는 실제로 pytest를 돌리므로 **그건 거짓말**이다. 그래서 선언만 옮긴다:
+    // 프로그램 이름은 일반형(`python`)이고, 실제로 도는 것은 Rust가 고른 인터프리터다.
+    const pytestDeclaration = await detectPytestDeclaration(bridge, paths);
+    if (pytestDeclaration) {
+      meta.testCommand ??= { program: "python", args: ["-m", "pytest"], cwd: ".", source: pytestDeclaration };
+    }
+
     return meta;
   }
+}
+
+/**
+ * 이 프로젝트가 pytest를 **선언했는가** — state-machine 49.1절.
+ *
+ * 판정 규칙은 Rust의 `python.rs`와 같아야 한다. 두 곳에 있는 이유는 24.5절이다: Rust는
+ * 실행할 명령을 정하고(그게 자동 승인의 근거다), 여기는 프롬프트에 실을 사실을 정한다.
+ * **갈리면 프롬프트가 없는 테스트를 있다고 하거나 있는 테스트를 없다고 한다** —
+ * `contextClaim` 검사가 두 목록을 소스에서 유도해 대조한다.
+ *
+ * `tests/` 디렉터리는 근거가 아니다. unittest·tox를 쓰는 프로젝트에도 있다.
+ */
+async function detectPytestDeclaration(
+  bridge: { tryReadFile(path: string): Promise<string | null> },
+  paths: Set<string>
+): Promise<string | null> {
+  if (paths.has("pytest.ini")) return "pytest.ini";
+  for (const [file, section] of PYTEST_SECTIONS) {
+    if (!paths.has(file)) continue;
+    const raw = await bridge.tryReadFile(file);
+    if (raw && declaresSection(raw, section)) return `${file} ${section}`;
+  }
+  return null;
+}
+
+/** `python.rs`의 같은 목록과 대조된다. 순서까지 같아야 한다 — 근거 문자열이 달라지면 안 된다. */
+export const PYTEST_SECTIONS: readonly (readonly [string, string])[] = [
+  ["pyproject.toml", "[tool.pytest.ini_options]"],
+  ["setup.cfg", "[tool:pytest]"],
+  ["tox.ini", "[pytest]"],
+];
+
+/** 주석 처리된 줄은 선언이 아니다 — 꺼 둔 도구를 우리가 켜게 된다. */
+export function declaresSection(text: string, section: string): boolean {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .some((line) => !line.startsWith("#") && !line.startsWith(";") && line.startsWith(section));
 }
 
 // ---- 순수 함수 (단위 테스트 대상) ----

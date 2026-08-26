@@ -159,16 +159,19 @@ impl TaskProfile {
         let gate = PolicyGate::new(&policy).with_mcp(mcp);
         // 아직 아무것도 고치지 않은 시점의 매니페스트를 읽는다. 이 호출이 뒤로 밀리면
         // 고정의 의미가 사라진다.
-        let verification_pin = crate::verify::detect_commands(root)
+        let verification_pin: Vec<(String, Vec<String>)> = crate::verify::detect_commands(root)
             .commands
             .values()
             .map(|(_, cmd, _)| (cmd.program.clone(), cmd.args.clone()))
             .collect();
+        // **지문은 고정 집합을 보고 만든다**(49.5절). 워크스페이스 안에 있는 프로그램은
+        // 모델이 덮어쓸 수 있으므로 그 내용도 함께 센다.
+        let manifest_fingerprint = manifest_fingerprint(root, &verification_pin);
         Self {
             policy,
             gate,
             verification_pin,
-            manifest_fingerprint: manifest_fingerprint(root),
+            manifest_fingerprint,
         }
     }
 }
@@ -177,7 +180,7 @@ impl TaskProfile {
 ///
 /// 이름이 아니라 내용을 센다. 없는 파일과 빈 파일을 구별하기 위해 존재 여부도 함께 넣는다 —
 /// 뭉개면 파일이 새로 생긴 것을 못 본다.
-fn manifest_fingerprint(root: &WorkspaceRoot) -> String {
+fn manifest_fingerprint(root: &WorkspaceRoot, pin: &[(String, Vec<String>)]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     // **목록을 손으로 적는다.** `detect_commands`가 읽는 것과 같아야 하는데, 거기서 유도하려면
@@ -186,6 +189,30 @@ fn manifest_fingerprint(root: &WorkspaceRoot) -> String {
     for name in ["package.json", "Cargo.toml"] {
         hasher.update(name.as_bytes());
         match std::fs::read(root.path().join(name)) {
+            Ok(bytes) => {
+                hasher.update([1u8]);
+                hasher.update(&bytes);
+            }
+            Err(_) => hasher.update([0u8]),
+        }
+    }
+
+    // **워크스페이스 안에 있는 프로그램은 그 내용도 센다** (49.5절).
+    //
+    // 29.3절이 막은 것은 "argv는 그대로인데 매니페스트의 본문이 바뀌는" 경우였다. Python
+    // 갈래에서는 한 겹 더 나쁜 일이 가능하다 — 고정된 argv가 가리키는 **프로그램 자체**가
+    // 워크스페이스 안에 있어서(`.venv/bin/python`) 모델이 `apply_patch`로 덮어쓸 수 있다.
+    // 그러면 사전 승인이 승인한 것과 실제로 도는 것이 완전히 다른 프로그램이 된다.
+    //
+    // **목록이 아니라 고정 집합에서 유도한다.** 어떤 프로그램이 워크스페이스 안인지는
+    // `detect_commands`가 정하므로, 여기서 이름을 다시 적으면 두 곳이 갈린다.
+    for (program, _) in pin {
+        let path = std::path::Path::new(program);
+        let Ok(inside) = path.strip_prefix(root.path()) else {
+            continue;
+        };
+        hasher.update(inside.to_string_lossy().as_bytes());
+        match std::fs::read(path) {
             Ok(bytes) => {
                 hasher.update([1u8]);
                 hasher.update(&bytes);
@@ -1914,7 +1941,7 @@ fn pre_approval_candidate(
     // **매니페스트가 바뀌었으면 사전 승인이 성립하지 않는다**(29.3절). argv는 그대로인데
     // 그 argv가 돌리는 본문이 달라졌을 수 있고, 그러면 사용자가 승인한 것과 실제로 도는
     // 것이 다르다. 막는 것이 아니라 **사람에게 되돌린다.**
-    if manifest_fingerprint(root) != profile.manifest_fingerprint {
+    if manifest_fingerprint(root, &profile.verification_pin) != profile.manifest_fingerprint {
         return PreApprovalCandidate::Withdrawn(candidate);
     }
     PreApprovalCandidate::Granted(candidate)
@@ -3613,16 +3640,58 @@ mod tests {
     fn manifest_fingerprint_covers_what_detect_reads() {
         let dir = tempfile::tempdir().unwrap();
         let root = WorkspaceRoot::new(dir.path()).unwrap();
-        let empty = manifest_fingerprint(&root);
+        let empty = manifest_fingerprint(&root, &[]);
 
         // `detect_commands`가 읽는 매니페스트마다 지문이 달라져야 한다.
         for name in ["package.json", "Cargo.toml"] {
             fs::write(dir.path().join(name), "x").unwrap();
-            assert_ne!(manifest_fingerprint(&root), empty, "{name}의 변화가 지문에 없습니다");
+            assert_ne!(manifest_fingerprint(&root, &[]), empty, "{name}의 변화가 지문에 없습니다");
             fs::remove_file(dir.path().join(name)).unwrap();
         }
         // 지웠으면 원래대로 — 존재 여부도 지문에 들어간다.
-        assert_eq!(manifest_fingerprint(&root), empty);
+        assert_eq!(manifest_fingerprint(&root, &[]), empty);
+    }
+
+    /// **워크스페이스 안에 있는 프로그램은 내용이 바뀌면 지문이 바뀐다** (49.5절).
+    ///
+    /// 29.3절이 막은 것은 "argv는 그대로인데 매니페스트의 본문이 바뀌는" 경우였다. Python
+    /// 갈래에서는 한 겹 더 나쁜 일이 가능하다 — 고정된 argv가 가리키는 **프로그램 자체**가
+    /// 워크스페이스 안에 있어서(`.venv/bin/python`) 모델이 `apply_patch`로 덮어쓸 수 있다.
+    /// 그러면 사전 승인이 승인한 것과 실제로 도는 것이 완전히 다른 프로그램이 된다.
+    #[test]
+    fn the_fingerprint_covers_a_program_that_lives_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let venv = dir.path().join(".venv").join("bin");
+        fs::create_dir_all(&venv).unwrap();
+        let interpreter = venv.join("python");
+        fs::write(&interpreter, "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n").unwrap();
+
+        let pin = vec![(
+            interpreter.to_string_lossy().to_string(),
+            vec!["-m".to_string(), "pytest".to_string()],
+        )];
+        let before = manifest_fingerprint(&root, &pin);
+
+        // **argv는 한 글자도 바뀌지 않는다.** 바뀌는 것은 그 argv가 가리키는 프로그램이다.
+        fs::write(&interpreter, "#!/bin/sh\nexec /bin/evil\n").unwrap();
+        assert_ne!(manifest_fingerprint(&root, &pin), before, "프로그램 내용의 변화가 지문에 없습니다");
+    }
+
+    /// **워크스페이스 밖의 프로그램은 세지 않는다.** `npm`이나 `dotnet`은 PATH에서 오고
+    /// 모델이 고칠 수 없다 — 셀 수 있다고 세면 지문이 사용자의 시스템 업데이트에 흔들린다.
+    #[test]
+    fn the_fingerprint_ignores_programs_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let program = outside.path().join("python");
+        fs::write(&program, "a").unwrap();
+
+        let pin = vec![(program.to_string_lossy().to_string(), vec!["-m".to_string()])];
+        let before = manifest_fingerprint(&root, &pin);
+        fs::write(&program, "b").unwrap();
+        assert_eq!(manifest_fingerprint(&root, &pin), before);
     }
 
     /// 고정 집합은 매니페스트가 **선언한 것만** 담는다. 없는 스크립트를 담으면 자동 승인이

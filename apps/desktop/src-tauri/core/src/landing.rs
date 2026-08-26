@@ -425,6 +425,48 @@ fn path_normalization_checks(obs: &Observations) -> Vec<Check> {
     ]
 }
 
+/// Python 가상환경 해석 (`python.rs`, state-machine 49절).
+///
+/// `msvc.rs`와 같은 자리다: **판정 로직은 여기서 검증되지만**(바깥 세계를 전부 인자로 받는다)
+/// **그 경로가 실제로 실행되는지는 Windows에서만 확인된다.** 가상환경의 인터프리터 자리가
+/// 플랫폼마다 다르고(bin/python vs Scripts/python.exe), 그 차이가 이 기능의 전부다.
+fn python_env_checks(obs: &Observations) -> Vec<Check> {
+    let (status, detail) = if obs.os == "windows" {
+        (CheckStatus::NeedsHuman, "Windows에서 사람이 확인해야 한다.".to_string())
+    } else {
+        (
+            CheckStatus::NotCheckableHere,
+            format!("여기는 {} — Scripts/python.exe 레이아웃이 이 플랫폼에 없다.", obs.os),
+        )
+    };
+    vec![
+        check(
+            "venvInterpreterRunsWithoutActivation",
+            "활성화하지 않은 .venv의 Scripts/python.exe가 -m pytest를 실제로 돌린다.",
+            status.clone(),
+            format!(
+                "{detail} 이 기능의 전제가 그것이다 — 활성화가 하는 일은 PATH 조작뿐이므로                  인터프리터를 직접 부르면 같은 결과가 나온다는 것. 틀리면 증상은                  `No module named pytest`이고, 그 문장은 사용자의 설치 문제로 읽힌다."
+            ),
+        ),
+        check(
+            "pythonOnPathIsNotTheStoreAlias",
+            "PATH의 python이 Microsoft Store 별칭이 아니다.",
+            status.clone(),
+            format!(
+                "{detail} Windows는 `python`/`python3`를 Store 설치 별칭으로 두는 경우가 있고,                  그것을 실행하면 프로그램이 아니라 **스토어 창이 뜬다** — 명령은 걸린 채로 끝나지 않는다.                  그래서 PATH 후보에서 `python3`를 뺐지만, `python` 쪽은 같은 위험이 남는다."
+            ),
+        ),
+        check(
+            "venvPathWithSpacesOrDriveLetterSurvives",
+            "공백이나 드라이브 문자가 든 가상환경 경로가 그대로 실행된다.",
+            status,
+            format!(
+                "{detail} C:/Users/내 문서/proj/.venv 처럼 공백이 든 경로가 흔하고,                  argv로 넘기므로 인용이 필요 없지만 **그 사실이 실제로 성립하는지는 실행해야 안다**."
+            ),
+        ),
+    ]
+}
+
 /// 개발자 환경 준비 (`msvc.rs`, product-strategy 12.4절).
 ///
 /// **이 묶음은 그물이 놓친 자리에서 왔다.** 위 검사(`windows_only_code_has_a_landing_check`)는
@@ -540,6 +582,15 @@ pub fn assess(obs: &Observations) -> LandingReport {
             Group {
                 id: "developerEnv",
                 documented_at: "product-strategy.md 12.4절 (`msvc.rs`)",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+        {
+            let checks = python_env_checks(obs);
+            Group {
+                id: "pythonEnv",
+                documented_at: "state-machine-and-protocol.md 49절 (`python.rs`)",
                 verdict: verdict_of(&checks),
                 checks,
             }

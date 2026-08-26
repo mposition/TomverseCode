@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod msvc;
 pub mod paths;
 pub mod policy;
+pub mod python;
 pub mod pr;
 pub mod proctree;
 pub mod reproduce;
