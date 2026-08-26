@@ -186,6 +186,15 @@ export type TaskEventType =
    * 이벤트면, 나중에 "이 변경은 어떤 계획에서 나왔나"를 되짚을 수 없다.
    */
   | "PLAN_OUTLINED"
+  /**
+   * 모델의 요청으로 파일을 더 읽고 다시 물었다 — state-machine 57절.
+   *
+   * **무엇을 가져왔고 무엇을 거절했는지 함께 남긴다.** 거절을 기록하지 않으면, 나중에
+   * "왜 그 파일을 안 봤나"에 답할 수 없다 — 못 찾은 것과 일부러 뺀 것은 다른 사실이다.
+   */
+  | "CONTEXT_ROUND_COMPLETED"
+  /** 라운드를 돌지 않았다. **사유가 붙는다** — 상한인지, 가져올 것이 없었는지. */
+  | "CONTEXT_ROUND_SKIPPED"
   | "ROLLBACK_STARTED"
   | "ROLLBACK_COMPLETED"
   /**

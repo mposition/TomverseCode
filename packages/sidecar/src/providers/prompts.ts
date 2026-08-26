@@ -509,6 +509,8 @@ export function buildQuestionPrompt(input: {
   userMessage: string;
   snapshot: WorkspaceSnapshot;
   userAnswers?: { question: string; answer: string }[];
+  /** 직전 라운드에서 들어주지 못한 컨텍스트 요청 (57절). */
+  contextNote?: string;
 }): string {
   const parts = [
     "You are answering a question about this repository. You are NOT making changes — no patch will be applied.",
@@ -521,6 +523,12 @@ export function buildQuestionPrompt(input: {
       "## Clarifications already provided by the user\n" +
         input.userAnswers.map((a) => `Q: ${a.question}\nA: ${a.answer}`).join("\n\n")
     );
+  }
+
+  // **들어주지 못한 요청을 말한다**(57절). 스냅샷 **앞**에 둔다 — 뒤에 두면 파일 목록을
+  // 읽은 뒤라 "이미 봤다"는 인상이 먼저 생긴다.
+  if (input.contextNote) {
+    parts.push(input.contextNote);
   }
 
   parts.push(renderSnapshot(input.snapshot));
@@ -582,6 +590,8 @@ export function buildPlanPrompt(input: {
   userMessage: string;
   snapshot: WorkspaceSnapshot;
   userAnswers?: { question: string; answer: string }[];
+  /** 직전 라운드에서 들어주지 못한 컨텍스트 요청 (57절). */
+  contextNote?: string;
 }): string {
   const parts = [
     "You are producing a PLAN for a change to this repository. You are NOT writing the change — " +
@@ -597,6 +607,12 @@ export function buildPlanPrompt(input: {
     );
   }
 
+  // **들어주지 못한 요청을 말한다**(57절). 스냅샷 **앞**에 둔다 — 뒤에 두면 파일 목록을
+  // 읽은 뒤라 "이미 봤다"는 인상이 먼저 생긴다.
+  if (input.contextNote) {
+    parts.push(input.contextNote);
+  }
+
   parts.push(renderSnapshot(input.snapshot));
   parts.push(
     [
@@ -609,6 +625,9 @@ export function buildPlanPrompt(input: {
       "The Files section is a budgeted SUBSET and some files may be truncated to a contiguous slice — " +
         "matching code can exist outside what you were shown.",
       "Put what could make this plan wrong in `risks`. Put what you would need the user to decide in `openQuestions`.",
+      // **우리에게 하는 말과 사용자에게 하는 말을 나눈다**(57절).
+      "If you need to READ a file before this plan is reliable, put its workspace-relative path in " +
+        "`needsContext` — we will fetch it and ask you again. Paths only; a description cannot be fetched.",
       "An empty `risks` list is a claim that nothing can go wrong. Only make it if you mean it.",
       "Do NOT write a diff, a patch, or file contents. The plan is the deliverable.",
     ].join("\n")
@@ -649,6 +668,13 @@ export const PLAN_SCHEMA = {
     openQuestions: {
       type: "array",
       description: "What the user must decide before this plan is final. Empty if nothing.",
+      items: { type: "string" },
+    },
+    needsContext: {
+      type: "array",
+      description:
+        "Workspace-relative paths you need to see before this plan is reliable. " +
+        "Paths only — a description is not a path and cannot be fetched.",
       items: { type: "string" },
     },
   },

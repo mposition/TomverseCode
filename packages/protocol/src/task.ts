@@ -46,6 +46,15 @@ export interface TaskLoopLimits {
    * 곱셈을 걸지 않는다.
    */
   mcpRounds: number; // 기본 1
+  /**
+   * 질문·계획 경로가 **모델이 요청한 파일을 읽고 다시 묻는** 라운드 수 (state-machine 57절).
+   * 기본 1.
+   *
+   * `mcpRounds`와 같은 이유로 1이다: 라운드마다 답 하나가 버려지므로 비용과 지연이 라운드
+   * 수만큼 늘고, **이 기능의 이득은 아직 측정되지 않았다.** 측정되지 않은 이득에 곱셈을
+   * 걸지 않는다.
+   */
+  contextRounds: number; // 기본 1
 }
 
 export const DEFAULT_LOOP_LIMITS: TaskLoopLimits = {
@@ -55,6 +64,7 @@ export const DEFAULT_LOOP_LIMITS: TaskLoopLimits = {
   toolRetries: 2,
   providerRetries: 3,
   mcpRounds: 1,
+  contextRounds: 1,
 };
 
 /**
@@ -270,6 +280,8 @@ export interface TaskCounters {
   fixLoopRounds: number;
   /** 초안의 요청으로 MCP 도구를 실행한 라운드 수 (state-machine 31절). */
   mcpRounds: number;
+  /** 모델의 요청으로 파일을 더 읽고 다시 물은 라운드 수 (state-machine 57절). */
+  contextRounds: number;
   toolRetries: Record<string, number>;
   providerRetries: Record<string, number>;
 }

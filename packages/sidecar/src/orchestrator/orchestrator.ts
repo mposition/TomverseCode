@@ -14,6 +14,7 @@ import type {
   McpCallRequest,
   PlanOutline,
   QuestionAnswer,
+  RelevantFile,
   ReviewDecision,
   RoutingDecision,
   SingleModelFixResult,
@@ -56,6 +57,7 @@ import {
 } from "./criteria.js";
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
 import { buildCommitMessage, buildCommitPlan, buildExecutionPlan, planPaths, PlanningError } from "./planner.js";
+import { refusalNote, resolveRequests } from "../context/followUp.js";
 import { triage, type TriagePolicy, type TriageResult } from "../triage.js";
 import { BudgetRefused, TaskBudget } from "./budget.js";
 import type { BudgetEventType } from "../budget/ledger.js";
@@ -353,6 +355,7 @@ export class Orchestrator {
       counters: {
         clarificationRounds: 0,
         mcpRounds: 0,
+        contextRounds: 0,
         reviseRounds: 0,
         fixLoopRounds: 0,
         toolRetries: {},
@@ -2336,19 +2339,30 @@ export class Orchestrator {
     if (await this.cancelledHere()) return this.finish("cancelled", "ANSWERING 중 취소됨");
 
     const executor = this.adapters!.executor;
-    const response = await this.callProvider(executor, "executor", "answer:1", (ctx) =>
-      executor.answerQuestion(
-        {
-          snapshot: this.snapshot!,
-          userMessage: this.input.taskRequest.userMessage,
-          ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
-        },
-        ctx
-      )
-    );
-    if (response.kind === "final") return response.result;
+    let round = 0;
+    let answer: QuestionAnswer;
+    let refusalNote = "";
+    for (;;) {
+      const response = await this.callProvider(executor, "executor", `answer:${round + 1}`, (ctx) =>
+        executor.answerQuestion(
+          {
+            snapshot: this.snapshot!,
+            userMessage: this.input.taskRequest.userMessage,
+            ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
+            ...(refusalNote ? { contextNote: refusalNote } : {}),
+          },
+          ctx
+        )
+      );
+      if (response.kind === "final") return response.result;
+      answer = response.value;
 
-    const answer = response.value;
+      // **모델이 요청한 것을 읽고 다시 묻는다**(57절). 상한 안에서만.
+      const more = await this.fetchRequestedContext(answer.missingContext, round);
+      if (more === null) break;
+      refusalNote = more;
+      round += 1;
+    }
     await this.emit("DRAFT_RECEIVED", {
       model: answer.model,
       // 초안이 아니라는 것을 페이로드가 말한다 — 같은 이벤트 이름을 쓰되 모양이 다르다.
@@ -2409,6 +2423,101 @@ export class Orchestrator {
   }
 
   /**
+   * 모델이 요청한 파일을 읽어 스냅샷에 더한다 — state-machine 57절.
+   *
+   * 다음 라운드를 **돌아야 하면** 프롬프트에 붙일 거절 목록을 돌려주고, 돌 필요가 없거나
+   * 돌 수 없으면 `null`을 돌려준다. 반환형이 그 판정을 담는 이유는 호출부가 그것을 다시
+   * 계산하지 않게 하기 위해서다 — 두 곳에서 계산하면 상한이 한쪽에서만 지켜진다.
+   *
+   * # 우리가 판정한다
+   *
+   * `missingContext`는 자유 문장이므로 무엇이든 들어온다. `context/followUp.ts`가 인덱스와
+   * 대조해 **가져올 수 있는 것만** 고르고, 나머지는 사유와 함께 거절한다. 제외 규칙(7절)이
+   * 이 경로에서 우회되면 안 되기 때문이다 — 그게 이 함수가 존재하는 이유의 절반이다.
+   *
+   * # 왜 승인을 따로 묻지 않는가
+   *
+   * 읽기는 `read_file`이고 그것은 게이트를 그대로 지난다(도구는 이미 읽기 전용으로
+   * 좁혀져 있다 — 51.2절). 게이트가 승인을 요구하면 평소 경로로 승인을 묻고, 무인이면
+   * 거기서 멈춘다. **이 경로에 별도 승인 규칙을 만들지 않는다**: 만들면 같은 동작에 대한
+   * 규칙이 둘이 되고, 둘 중 느슨한 쪽이 우회로가 된다.
+   */
+  private async fetchRequestedContext(requests: readonly string[], round: number): Promise<string | null> {
+    if (requests.length === 0) return null;
+    if (round >= this.policy.limits.contextRounds) {
+      await this.emit("CONTEXT_ROUND_SKIPPED", {
+        reason: "limit_reached",
+        limit: this.policy.limits.contextRounds,
+        requested: requests.length,
+      });
+      return null;
+    }
+
+    const index = await this.contextEngine.ensureIndex(this.bridge!, this.input.taskRequest.workspaceId);
+    const resolution = resolveRequests(index, requests);
+    if (resolution.fetch.length === 0) {
+      // **가져올 것이 하나도 없으면 라운드를 쓰지 않는다.** 같은 스냅샷으로 다시 물으면
+      // 같은 답이 나오고 비용만 는다.
+      await this.emit("CONTEXT_ROUND_SKIPPED", {
+        reason: "nothing_fetchable",
+        refused: resolution.refused,
+      });
+      return null;
+    }
+
+    const added: RelevantFile[] = [];
+    for (const item of resolution.fetch) {
+      const read = await this.bridge!.readFile(item.path).catch(() => null);
+      if (read === null || read.content === null) {
+        resolution.refused.push({ request: item.request, reason: "파일을 읽지 못했습니다." });
+        continue;
+      }
+      added.push({
+        path: item.path,
+        reason: "mentioned",
+        reasonDetail: `모델이 ${JSON.stringify(item.request)}로 요청함 (57절)`,
+        content: read.content,
+        truncated: read.truncated,
+        sizeBytes: read.sizeBytes,
+      });
+    }
+    if (added.length === 0) {
+      await this.emit("CONTEXT_ROUND_SKIPPED", { reason: "nothing_readable", refused: resolution.refused });
+      return null;
+    }
+
+    // **이미 있는 파일은 덮지 않는다.** 선정이 고른 것에는 앵커와 창이 붙어 있고(15절),
+    // 여기서 통째로 갈아끼우면 그 정보를 잃는다.
+    const have = new Set(this.snapshot!.relevantFiles.map((f) => f.path));
+    const fresh = added.filter((f) => !have.has(f.path));
+    if (fresh.length === 0) {
+      // **새로 실린 것이 없으면 라운드를 쓰지 않는다.** 모델이 이미 갖고 있던 파일을
+      // 요청한 경우인데, 같은 스냅샷으로 다시 물으면 같은 답이 나오고 비용만 든다.
+      // 그리고 그 낭비는 기록에서 "라운드를 돌았다"로만 보여 원인이 드러나지 않는다.
+      await this.emit("CONTEXT_ROUND_SKIPPED", {
+        reason: "already_in_context",
+        requested: resolution.fetch.map((f) => f.path),
+        refused: resolution.refused,
+      });
+      return null;
+    }
+    this.snapshot = {
+      ...this.snapshot!,
+      relevantFiles: [...this.snapshot!.relevantFiles, ...fresh],
+    };
+    this.state.counters.contextRounds += 1;
+
+    await this.emit("CONTEXT_ROUND_COMPLETED", {
+      round: this.state.counters.contextRounds,
+      limit: this.policy.limits.contextRounds,
+      fetched: fresh.map((f) => f.path),
+      refused: resolution.refused,
+    });
+
+    return refusalNote(resolution.refused);
+  }
+
+  /**
    * 계획 경로 — state-machine 53절.
    *
    * `answerQuestion`과 **같은 모양이고, 같아야 한다.** 두 경로가 갈라지면 "파일을 바꾸지
@@ -2428,19 +2537,32 @@ export class Orchestrator {
     if (await this.cancelledHere()) return this.finish("cancelled", "OUTLINING 중 취소됨");
 
     const executor = this.adapters!.executor;
-    const response = await this.callProvider(executor, "executor", "plan:1", (ctx) =>
-      executor.outlinePlan(
-        {
-          snapshot: this.snapshot!,
-          userMessage: this.input.taskRequest.userMessage,
-          ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
-        },
-        ctx
-      )
-    );
-    if (response.kind === "final") return response.result;
+    let round = 0;
+    let plan: PlanOutline;
+    let refusal = "";
+    for (;;) {
+      const response = await this.callProvider(executor, "executor", `plan:${round + 1}`, (ctx) =>
+        executor.outlinePlan(
+          {
+            snapshot: this.snapshot!,
+            userMessage: this.input.taskRequest.userMessage,
+            ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
+            ...(refusal ? { contextNote: refusal } : {}),
+          },
+          ctx
+        )
+      );
+      if (response.kind === "final") return response.result;
+      plan = response.value;
 
-    const plan = response.value;
+      // **계획도 같은 길을 쓴다**(57절). 두 경로가 갈라지면 한쪽만 상한을 잃는다.
+      // 계획에서 "더 봐야 할 것"은 `risks`가 아니라 `openQuestions`도 아니다 — 그 둘은
+      // 사용자에게 하는 말이고, 컨텍스트 요청은 우리에게 하는 말이라 자리가 다르다.
+      const more = await this.fetchRequestedContext(plan.needsContext ?? [], round);
+      if (more === null) break;
+      refusal = more;
+      round += 1;
+    }
     await this.emit("DRAFT_RECEIVED", {
       model: plan.model,
       kind: "plan_outline",

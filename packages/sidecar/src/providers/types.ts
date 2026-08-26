@@ -46,6 +46,13 @@ export interface DraftInput {
    */
   acceptanceCriteria?: AcceptanceCriterion[];
   /**
+   * 직전 라운드에서 모델이 요청했으나 **들어주지 못한 것**들 (state-machine 57절).
+   *
+   * 말하지 않으면 모델은 같은 것을 다시 요청하고 라운드 상한이 그것으로 소진된다. 그리고
+   * 더 나쁘게는, 우리가 읽어 줬다고 가정한 채 답할 수 있다.
+   */
+  contextNote?: string;
+  /**
    * 직전 계획이 기준과 충돌해 다시 요청하는 경우의 사유.
    *
    * 검증 실패가 아니라 **실행 전** 사유이므로 FIX_LOOP digest와 섞지 않는다 —

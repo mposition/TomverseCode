@@ -1806,3 +1806,208 @@ test("단계가 없는 계획은 통과하지 않는다", async () => {
   const result = await orchestrator.run();
   assert.notEqual(result.status, "planned", result.summary);
 });
+
+// ---- 컨텍스트 라운드 (state-machine 57절) ----
+
+/**
+ * `src/hidden.ts`가 **인덱스에는 있지만 선정에는 안 걸리는** 워크스페이스.
+ *
+ * 이름이 요청과 무관해야 13절의 본문 검색이 그것을 미리 넣지 않는다 — 미리 들어가면
+ * 이 검사가 "요청해서 받았다"가 아니라 "원래 있었다"를 보게 된다.
+ */
+const WITH_HIDDEN: FakeHostOptions = {
+  files: [
+    { path: "package.json", isDir: false, sizeBytes: 40 },
+    { path: "src/app.ts", isDir: false, sizeBytes: 30 },
+    { path: "src/hidden.ts", isDir: false, sizeBytes: 40 },
+  ],
+  contents: {
+    "package.json": '{"scripts":{"test":"node --test"}}',
+    "src/app.ts": "export const a = 1;\n",
+    "src/hidden.ts": "export const HIDDEN_ANSWER = 1;\n",
+  },
+  gitStatus: "## main",
+};
+
+
+/**
+ * **모델이 요청한 파일을 읽고 다시 묻는다** — state-machine 57절.
+ *
+ * 51절까지 답은 스냅샷만 보고 나왔다. 모델이 "이 파일도 봐야 한다"고 말할 수는 있었지만
+ * (`missingContext`) 스스로 읽을 수는 없었고, 그래서 그 문장은 **사용자에게 하는 경고**로만
+ * 남았다 — 우리가 할 수 있는 일이 있는데 하지 않은 것이다.
+ */
+test("모델이 요청한 파일을 읽고 다시 묻는다", async () => {
+  const { orchestrator, host } = build(
+    WITH_HIDDEN,
+    {
+      script: [
+        { kind: "answer", payload: { answer: "잘 모르겠습니다.", missingContext: ["src/hidden.ts"] } },
+        { kind: "answer", payload: { answer: "hidden이 답입니다.", citedFiles: ["src/hidden.ts"] } },
+      ],
+      onPrompt: (kind, text) => prompts.push({ kind, text }),
+    },
+    { message: "src/app.ts 의 a는 왜 1입니까?", kind: "question" }
+  );
+  const prompts: { kind: string; text: string }[] = [];
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "answered", result.summary);
+  assert.equal(result.answer?.answer, "hidden이 답입니다.");
+
+  // **두 번째 프롬프트가 그 파일을 실제로 담고 있다.** 읽어 놓고 안 실으면 아무 일도 안 한 것이다.
+  const second = prompts.filter((p) => p.kind === "answer").at(-1)!;
+  assert.ok(second.text.includes("src/hidden.ts"), "요청한 파일이 두 번째 프롬프트에 없습니다");
+
+  const done = host.events.find((e) => e.type === "CONTEXT_ROUND_COMPLETED");
+  assert.ok(done, host.eventTypes().join(", "));
+  assert.deepEqual((done.payload as { fetched?: string[] }).fetched, ["src/hidden.ts"]);
+});
+
+/** **상한이 있다**(원칙 5). 계속 요청하면 상한에서 멈추고, 멈춘 사실이 사유와 함께 남는다. */
+test("컨텍스트 라운드에 상한이 있다", async () => {
+  const { orchestrator, host } = build(
+    WITH_HIDDEN,
+    {
+      script: [
+        { kind: "answer", payload: { answer: "모릅니다 1", missingContext: ["src/hidden.ts"] } },
+        { kind: "answer", payload: { answer: "모릅니다 2", missingContext: ["src/other.ts"] } },
+        { kind: "answer", payload: { answer: "여기까지 오면 안 됩니다" } },
+      ],
+    },
+    { message: "src/app.ts 는 왜?", kind: "question" }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.answer?.answer, "모릅니다 2", "상한을 넘어 한 번 더 물었습니다");
+  const skipped = host.events.find((e) => e.type === "CONTEXT_ROUND_SKIPPED");
+  assert.equal((skipped?.payload as { reason?: string }).reason, "limit_reached");
+});
+
+/**
+ * **가져올 것이 하나도 없으면 라운드를 쓰지 않는다.** 같은 스냅샷으로 다시 물으면 같은 답이
+ * 나오고 비용만 는다 — 그리고 그 낭비는 "모델이 두 번 답했다"로만 보인다.
+ */
+test("경로가 아닌 요청만 있으면 다시 묻지 않는다", async () => {
+  const { orchestrator, host } = build(
+    {},
+    {
+      script: [
+        { kind: "answer", payload: { answer: "모릅니다", missingContext: ["테스트 파일 전체"] } },
+        { kind: "answer", payload: { answer: "두 번째는 없어야 합니다" } },
+      ],
+    },
+    { message: "왜?", kind: "question" }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.answer?.answer, "모릅니다");
+  const skipped = host.events.find((e) => e.type === "CONTEXT_ROUND_SKIPPED");
+  assert.equal((skipped?.payload as { reason?: string }).reason, "nothing_fetchable");
+});
+
+/**
+ * **들어주지 못한 요청을 다음 프롬프트가 말한다** — state-machine 57절.
+ *
+ * 말하지 않으면 모델은 같은 것을 다시 요청하고 라운드 상한이 그것으로 소진된다. 더 나쁘게는,
+ * **우리가 읽어 줬다고 가정한 채 답한다** — 그러면 답이 보지 않은 파일에 근거하게 된다.
+ *
+ * 프로브로 확인했다: 프롬프트에서 그 문단을 지워도 **아무 검사도 실패하지 않았다.**
+ * 값을 만들어 놓고 아무도 읽지 않는 자리가 또 하나 있었던 것이다.
+ */
+test("들어주지 못한 요청이 다음 프롬프트에 실린다", async () => {
+  const prompts: { kind: string; text: string }[] = [];
+  const { orchestrator } = build(
+    WITH_HIDDEN,
+    {
+      script: [
+        {
+          kind: "answer",
+          // 하나는 가져올 수 있고 하나는 경로가 아니다 — 라운드는 돌되 거절이 남는다.
+          payload: { answer: "모릅니다", missingContext: ["src/hidden.ts", "테스트 파일 전체"] },
+        },
+        { kind: "answer", payload: { answer: "이제 압니다." } },
+      ],
+      onPrompt: (kind, text) => prompts.push({ kind, text }),
+    },
+    { message: "src/app.ts 는 왜?", kind: "question" }
+  );
+  await orchestrator.run();
+
+  const second = prompts.filter((p) => p.kind === "answer").at(-1)!;
+  assert.ok(second.text.includes("NOT fulfilled"), "거절을 말하지 않았습니다");
+  assert.ok(second.text.includes("테스트 파일 전체"), "무엇을 거절했는지 말하지 않았습니다");
+  // 그리고 **가져온 것은 거절 목록에 없어야 한다** — 있으면 모델이 본 파일을 못 봤다고 믿는다.
+  const note = second.text.slice(second.text.indexOf("NOT fulfilled"));
+  assert.ok(!note.slice(0, 400).includes("src/hidden.ts"), note.slice(0, 400));
+});
+
+/**
+ * **이미 갖고 있던 파일을 요청하면 라운드를 쓰지 않는다.**
+ *
+ * 같은 스냅샷으로 다시 물으면 같은 답이 나오고 비용만 든다. 그리고 그 낭비는 기록에서
+ * "라운드를 돌았다"로만 보여 원인이 드러나지 않는다 — 검사를 만들다 실제로 그 상태를 밟았다.
+ */
+test("이미 컨텍스트에 있는 파일을 요청하면 다시 묻지 않는다", async () => {
+  const { orchestrator, host } = build(
+    WITH_HIDDEN,
+    {
+      script: [
+        { kind: "answer", payload: { answer: "모릅니다", missingContext: ["src/app.ts"] } },
+        { kind: "answer", payload: { answer: "두 번째는 없어야 합니다" } },
+      ],
+    },
+    { message: "src/app.ts 는 왜?", kind: "question" }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.answer?.answer, "모릅니다");
+  const skipped = host.events.find((e) => e.type === "CONTEXT_ROUND_SKIPPED");
+  assert.equal((skipped?.payload as { reason?: string }).reason, "already_in_context");
+});
+
+/** 요청이 아예 없으면 종전과 한 번도 다르지 않다 — 기본 경로가 바뀌지 않는다. */
+test("요청이 없으면 한 번만 묻는다", async () => {
+  const { orchestrator, host } = build(
+    {},
+    { script: [{ kind: "answer", payload: { answer: "압니다." } }] },
+    { message: "왜?", kind: "question" }
+  );
+  await orchestrator.run();
+  assert.ok(!host.eventTypes().includes("CONTEXT_ROUND_COMPLETED"), host.eventTypes().join(", "));
+  assert.ok(!host.eventTypes().includes("CONTEXT_ROUND_SKIPPED"), host.eventTypes().join(", "));
+});
+
+/**
+ * **계획도 같은 길을 쓴다**(57절). 두 경로가 갈라지면 한쪽만 상한을 잃는다.
+ *
+ * 계획의 요청은 `needsContext`다 — `risks`·`openQuestions`와 자리가 다르다. 그 둘은
+ * 사용자에게 하는 말이고 이건 우리에게 하는 말이다.
+ */
+test("계획도 요청한 파일을 읽고 다시 묻는다", async () => {
+  const { orchestrator, host } = build(
+    WITH_HIDDEN,
+    {
+      script: [
+        {
+          kind: "plan",
+          payload: {
+            summary: "모르겠다",
+            steps: [{ intent: "먼저 읽어야 한다", files: [] }],
+            needsContext: ["src/hidden.ts"],
+          },
+        },
+        {
+          kind: "plan",
+          payload: { summary: "이제 알겠다", steps: [{ intent: "고친다", files: ["src/hidden.ts"] }] },
+        },
+      ],
+    },
+    { message: "src/app.ts 리팩터링", kind: "plan" }
+  );
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "planned", result.summary);
+  assert.equal(result.plan?.summary, "이제 알겠다");
+  assert.ok(host.eventTypes().includes("CONTEXT_ROUND_COMPLETED"), host.eventTypes().join(", "));
+});
