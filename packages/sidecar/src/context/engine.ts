@@ -20,9 +20,14 @@ import { packageFiles, type TokenBudget } from "./budget.js";
  *  - `WorkspaceIndex`: **세션 스코프**. 파일 트리 + 프로젝트 메타. 비싼 작업을 여기서 1회.
  *  - `WorkspaceSnapshot`: **태스크 스코프**. 인덱스에서 관련 파일을 고르고 예산에 맞춰 패키징.
  *
- * M0에서 하지 않는 것: Tree-sitter 심볼 그래프(9절). 그래서 `symbols`/`dependencyEdges`는
- * 비어 있고 `symbol-match`/`dependency` 선정은 동작하지 않는다. 두 타입을 분리해 둔 덕분에
- * 나중에 심볼 인덱스를 채워도 스냅샷 생성 쪽 계약은 바뀌지 않는다.
+ * 아직 하지 않은 것: Tree-sitter 심볼 그래프(9절). 그래서 `symbols`/`dependencyEdges`는
+ * 비어 있고 `symbol-match` 선정은 동작하지 않는다. 두 타입을 분리해 둔 덕분에 나중에 심볼
+ * 인덱스를 채워도 스냅샷 생성 쪽 계약은 바뀌지 않는다.
+ *
+ * **그 대신 본문 검색을 쓴다**(51절). 종전에는 선정이 파일 **이름**만 봤고, 그래서
+ * `resolveBudget`을 고쳐 달라는 요청에서 그 함수가 `ledger.ts`에 있으면 우리는 그 파일을
+ * 영원히 고르지 못했다. `content-match`가 그 자리를 메우되, 근거가 정규식이라는 사실은
+ * 이름에 남는다.
  *
  * **모든 파일 접근이 `ToolBridge`(= Rust Tool Runtime)를 지난다.** 이 모듈에 `node:fs`
  * import가 없는 것은 실수가 아니라 신뢰 경계 원칙이다.
@@ -48,6 +53,26 @@ function isWorkspaceIndex(value: unknown): value is WorkspaceIndex {
 
 /** 프로젝트 규칙 파일 — 우선순위 순서대로 찾아 항상 스냅샷에 포함한다 (4절). */
 const PROJECT_RULE_FILES = ["CLAUDE.md", "AGENTS.md", ".cursorrules", "CONTRIBUTING.md", "README.md"];
+
+/** 본문 검색을 돌릴 키워드 수 상한 (원칙 5). 검색은 저장소 크기에 비례한다. */
+const MAX_SEARCHED_KEYWORDS = 4;
+/** 키워드 하나가 넣을 수 있는 후보 수 상한. 흔한 이름 하나가 예산을 다 먹는 것을 막는다. */
+const MAX_MATCHES_PER_KEYWORD = 3;
+
+/**
+ * "정의처럼 보이는 자리"의 앞부분.
+ *
+ * 언어마다 다르지만 **한 정규식으로 묶는다** — 파일 확장자별로 갈래를 만들면 그 목록이
+ * 또 하나의 손으로 지키는 규칙이 되고, 틀려도 조용히 후보가 줄 뿐이라 드러나지 않는다.
+ * 여기서 틀리는 대가는 "정의를 못 찾아 넓은 검색으로 내려간다"이며, 그건 실패가 아니다.
+ */
+const DEFINITION_PREFIX =
+  "\\b(function|class|const|let|var|def|fn|struct|enum|interface|type|impl|trait|async)\\s+";
+
+/** 키워드를 정규식에 넣기 전에 escape한다. 하지 않으면 `a.b` 같은 토큰이 다른 것을 찾는다. */
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 const MANIFEST_FILES = ["package.json", "Cargo.toml", "pyproject.toml", "go.mod", "pom.xml", "build.gradle"];
 
@@ -226,10 +251,10 @@ export class ContextEngine {
     const gitStatus = await bridge.gitStatus().catch(() => ({ stdout: "", exitCode: null }));
     const diffSummary = await bridge.gitDiff({ statOnly: true }).catch(() => "");
 
-    const candidates = this.selectRelevantFiles(index, input.userMessage);
-
     // 명시 지목됐지만 제외 규칙에 걸린 파일은 사용자에게 알린다 (7절 마지막 문단).
     const excludedNotes = this.notesForMentionedButExcluded(index, input.userMessage);
+
+    const candidates = await this.selectRelevantFiles(bridge, index, input.userMessage, excludedNotes);
 
     // 기본값은 **비용 추정과 같은 상수**를 읽는다. 여기에 숫자를 직접 적으면 예산 원장의
     // 보수적 추정이 실제 요청과 조용히 어긋난다 — 예약이 실제 청구를 감당하지 못하는 상태다.
@@ -426,13 +451,15 @@ export class ContextEngine {
 
   /**
    * 관련 파일 선정 — 4절 표의 우선순위 순서(mentioned > recently-changed > dependency).
-   * `symbol-match`는 심볼 인덱스가 없어 M0에서 동작하지 않으므로 아예 생성하지 않는다
+   * `symbol-match`는 심볼 인덱스가 없어 아직 동작하지 않으므로 아예 생성하지 않는다
    * (빈 결과를 만들어 "구현했다"고 보이게 하지 않는다).
    */
-  private selectRelevantFiles(
+  private async selectRelevantFiles(
+    bridge: ToolBridge,
     index: WorkspaceIndex,
-    userMessage: string
-  ): { path: string; reason: RelevanceReason; reasonDetail: string }[] {
+    userMessage: string,
+    notes: { path: string; reason: string }[]
+  ): Promise<{ path: string; reason: RelevanceReason; reasonDetail: string }[]> {
     const selected = new Map<string, { path: string; reason: RelevanceReason; reasonDetail: string }>();
 
     const add = (path: string, reason: RelevanceReason, reasonDetail: string) => {
@@ -468,7 +495,17 @@ export class ContextEngine {
       }
     }
 
-    // 4) 소스로 보이는 파일이 하나도 안 잡혔으면, 최소한 진입점 후보를 넣는다.
+    // 4) **본문을 본다** — state-machine 51절.
+    //
+    //    여기까지는 파일 **이름**만 봤다. 그래서 `resolveBudget`을 고쳐 달라는 요청에서 그
+    //    함수가 `ledger.ts`에 있으면 우리는 그 파일을 영원히 고르지 못하고, 모델은 엉뚱한
+    //    컨텍스트로 초안을 쓴다. 그 실패는 "모델이 잘못했다"로 보인다.
+    //
+    //    `search_text` 도구는 처음부터 있었고 Rust가 구현하고 있었는데 **선정이 한 번도 부르지
+    //    않았다.** 문은 있고 길이 없었다.
+    await this.addContentMatches(bridge, index, keywords, add, notes);
+
+    // 5) 소스로 보이는 파일이 하나도 안 잡혔으면, 최소한 진입점 후보를 넣는다.
     //    빈 컨텍스트로 모델을 부르면 확실히 실패하므로, 못 골랐다는 사실보다 후보를 주는 편이 낫다.
     if ([...selected.values()].every((f) => f.reason === "project-meta")) {
       const sourceFiles = index.fileTree
@@ -484,10 +521,82 @@ export class ContextEngine {
       "project-meta": 0,
       mentioned: 1,
       "symbol-match": 2,
-      "recently-changed": 3,
-      dependency: 4,
+      // 본문 검색은 이름 지목보다 약하고 심볼 그래프보다도 약하다. 그런데 **이번 태스크가
+      // 방금 고친 파일보다는 앞**이다 — fix loop에서 그 파일들은 이미 컨텍스트에 있었고,
+      // 여기서 새로 찾은 것은 아직 한 번도 실리지 않았을 수 있다.
+      "content-match": 3,
+      "recently-changed": 4,
+      dependency: 5,
     };
     return [...selected.values()].sort((a, b) => rank[a.reason] - rank[b.reason]);
+  }
+
+  /**
+   * 본문 검색으로 후보를 더한다 — state-machine 51절.
+   *
+   * # 왜 정의 모양을 먼저 찾는가
+   *
+   * `resolveBudget`을 그냥 찾으면 **부르는 곳이 전부** 걸린다. 그중 고쳐야 할 곳은 대개
+   * 정의가 있는 파일 하나이고, 나머지는 예산만 먹는다. 그래서 두 번 찾는다: 정의처럼 보이는
+   * 자리를 먼저, 그것이 없을 때만 아무 등장이나.
+   *
+   * # 근거의 강도를 이름으로 말한다
+   *
+   * `symbol-match`로 적지 않는다. 그건 심볼 그래프가 있을 때의 근거이고, 여기서 한 것은
+   * 정규식이다. 이름이 근거보다 강하면 화면과 감사 기록이 "파서가 확인했다"고 말하게 된다.
+   *
+   * # 상한
+   *
+   * 키워드 개수와 키워드당 후보 수 둘 다 묶는다(원칙 5). 검색은 저장소 크기에 비례하고,
+   * 상한이 없으면 큰 저장소에서 스냅샷 한 번이 수십 번의 전체 훑기가 된다.
+   */
+  private async addContentMatches(
+    bridge: ToolBridge,
+    index: WorkspaceIndex,
+    keywords: string[],
+    add: (path: string, reason: RelevanceReason, reasonDetail: string) => void,
+    notes: { path: string; reason: string }[]
+  ): Promise<void> {
+    const indexed = new Set(index.fileTree.map((f) => f.path));
+
+    for (const keyword of keywords.slice(0, MAX_SEARCHED_KEYWORDS)) {
+      const escaped = escapeRegExp(keyword);
+      const attempts: { pattern: string; detail: (path: string) => string }[] = [
+        {
+          pattern: `${DEFINITION_PREFIX}${escaped}\\b`,
+          detail: () => `본문에서 ${JSON.stringify(keyword)}의 정의처럼 보이는 자리를 찾음 (정규식 — 심볼 그래프 아님)`,
+        },
+        {
+          pattern: `\\b${escaped}\\b`,
+          detail: () => `본문에 ${JSON.stringify(keyword)}가 나타남 (정규식 — 심볼 그래프 아님)`,
+        },
+      ];
+
+      for (const attempt of attempts) {
+        let hits: { path: string }[];
+        try {
+          hits = await bridge.searchText(attempt.pattern);
+        } catch (error) {
+          // **실패를 "없음"으로 읽지 않는다.** 읽지 못한 것과 없는 것은 다른 사실이고,
+          // 뭉개면 컨텍스트가 조용히 좁아진 채 모델이 불린다.
+          notes.push({
+            path: `(search: ${keyword})`,
+            reason: `본문 검색이 실패해 이 키워드로는 후보를 찾지 못했습니다: ${String(error)}`,
+          });
+          break;
+        }
+
+        // **인덱스에 있는 파일만 받는다.** 검색은 제외 규칙(비밀값·크기·gitignore)을 우리와
+        // 똑같이 적용하지 않으므로, 여기서 거르지 않으면 제외했던 파일이 옆문으로 들어온다.
+        const paths = [...new Set(hits.map((h) => h.path))].filter((p) => indexed.has(p));
+        if (paths.length === 0) continue;
+        for (const path of paths.slice(0, MAX_MATCHES_PER_KEYWORD)) {
+          add(path, "content-match", attempt.detail(path));
+        }
+        // 정의를 찾았으면 넓은 검색은 하지 않는다 — 부르는 곳까지 다 넣으면 예산만 먹는다.
+        break;
+      }
+    }
   }
 
   private notesForMentionedButExcluded(index: WorkspaceIndex, userMessage: string): { path: string; reason: string }[] {

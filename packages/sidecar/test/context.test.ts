@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ContextEngine, extractKeywords, extractMentions, hasUncommittedChanges, parseBranch, parseNpmScripts } from "../src/context/engine.js";
+import {
+  ContextEngine,
+  escapeRegExp,
+  extractKeywords,
+  extractMentions,
+  hasUncommittedChanges,
+  parseBranch,
+  parseNpmScripts,
+} from "../src/context/engine.js";
 import { classifyFile, MAX_INDEXED_FILE_BYTES } from "../src/context/exclude.js";
 import { estimateTokensUpperBound, packageFiles, truncateToTokens } from "../src/context/budget.js";
 import { FakeHost } from "./helpers/fakeHost.js";
@@ -547,4 +555,154 @@ test("변경이 지운 파일은 빠지고, 건드린 적 없는데 못 읽는 �
     ["src/untouched.ts"]
   );
   assert.equal(refreshed.snapshot.relevantFiles[0]!.content, "그대로일 것\n");
+});
+
+/**
+ * **선정이 파일 내용을 본다** — state-machine 51절.
+ *
+ * 종전에는 파일 **이름**만 봤다. 그래서 `resolveBudget`을 고쳐 달라는 요청에서 그 함수가
+ * `ledger.ts`에 있으면 그 파일은 영원히 선정되지 않았고, 모델은 엉뚱한 컨텍스트로 초안을
+ * 썼다 — 그 실패는 "모델이 잘못했다"로 보인다.
+ *
+ * `search_text` 도구는 처음부터 있었고 Rust가 구현하고 있었는데 **선정이 한 번도 부르지
+ * 않았다.** 문은 있고 길이 없었다.
+ */
+test("이름이 안 맞아도 본문에 정의가 있으면 선정된다", async () => {
+  const host = new FakeHost({
+    files: [
+      { path: "src/ledger.ts", isDir: false, sizeBytes: 80 },
+      { path: "src/unrelated.ts", isDir: false, sizeBytes: 40 },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: {
+      "src/ledger.ts": "export function resolveBudget(limit: number) {\n  return limit;\n}\n",
+      "src/unrelated.ts": "export const other = 1;\n",
+      "package.json": '{"scripts":{"test":"node --test"}}',
+    },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 음수를 받으면 터집니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 50_000 }],
+  });
+
+  const ledger = snapshot.relevantFiles.find((f) => f.path === "src/ledger.ts");
+  assert.ok(ledger, `본문에 정의가 있는 파일이 빠졌습니다: ${snapshot.relevantFiles.map((f) => f.path).join(", ")}`);
+  assert.equal(ledger.reason, "content-match");
+  // **근거의 강도가 이름에 남는다.** `symbol-match`로 적으면 "파서가 확인했다"로 읽힌다.
+  assert.match(ledger.reasonDetail, /정규식 — 심볼 그래프 아님/);
+  assert.match(ledger.reasonDetail, /정의처럼 보이는/);
+  // 무관한 파일까지 쓸어담지 않는다 — 그러면 예산만 먹는다.
+  assert.ok(!snapshot.relevantFiles.some((f) => f.path === "src/unrelated.ts"));
+});
+
+/**
+ * **정의가 없으면 넓게 찾되, 그 사실을 근거가 말한다.** 부르는 곳만 있는 경우에도 아무것도
+ * 못 고르는 것보다는 낫지만, 사용자가 근거의 강도를 판단할 수 있어야 한다.
+ */
+test("정의를 못 찾으면 등장 위치로 내려가고 근거가 달라진다", async () => {
+  const host = new FakeHost({
+    files: [
+      { path: "src/caller.ts", isDir: false, sizeBytes: 60 },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: {
+      "src/caller.ts": "import { helper } from './x';\nhelper(applyDiscount);\n",
+      "package.json": '{"scripts":{"test":"node --test"}}',
+    },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "applyDiscount 호출이 잘못됐습니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 50_000 }],
+  });
+
+  const caller = snapshot.relevantFiles.find((f) => f.path === "src/caller.ts");
+  assert.ok(caller, "본문에 등장하는 파일이 빠졌습니다");
+  assert.equal(caller.reason, "content-match");
+  assert.match(caller.reasonDetail, /나타남/);
+  assert.ok(!caller.reasonDetail.includes("정의처럼"), caller.reasonDetail);
+});
+
+/**
+ * **제외 규칙이 옆문으로 뚫리지 않는다.**
+ *
+ * 검색은 우리 인덱스의 제외를 똑같이 적용하지 않는다. 비밀값 파일은 실제 도구도 건너뛰지만
+ * (`tools/mod.rs`), **크기 제한은 우리 인덱스만의 규칙**이라 검색은 큰 파일도 그대로 돌려준다.
+ * 그래서 인덱스에 없는 경로는 받지 않는다 — 이 검사가 겨냥하는 것이 그 자리다.
+ *
+ * (처음에는 `.env`로 이 검사를 썼는데, fake가 실제 도구처럼 비밀값을 건너뛰므로 **필터를
+ * 지워도 통과했다.** 프로브가 그걸 잡았고, 검사가 겨냥한 것과 실제로 지키는 것이 달랐다.)
+ */
+test("본문 검색이 인덱스에서 제외된 파일을 되살리지 않는다", async () => {
+  const huge = MAX_INDEXED_FILE_BYTES + 1;
+  const host = new FakeHost({
+    files: [
+      { path: "src/app.ts", isDir: false, sizeBytes: 40 },
+      { path: "src/generated.ts", isDir: false, sizeBytes: huge },
+      { path: ".env", isDir: false, sizeBytes: 40 },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: {
+      "src/app.ts": "export const a = 1;\n",
+      // 크기 때문에 인덱스에서 빠진 파일. **검색은 이걸 그대로 돌려준다.**
+      "src/generated.ts": "export function applyDiscount() {}\n",
+      ".env": "DISCOUNT_TOKEN=sk-secret-applyDiscount\n",
+      "package.json": '{"scripts":{"test":"node --test"}}',
+    },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "applyDiscount 설정이 잘못됐습니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 50_000 }],
+  });
+
+  const paths = snapshot.relevantFiles.map((f) => f.path);
+  assert.ok(
+    !paths.includes("src/generated.ts"),
+    `크기로 제외된 파일이 본문 검색으로 들어왔습니다: ${paths.join(", ")}`
+  );
+  assert.ok(!paths.includes(".env"), `secret이 본문 검색으로 들어왔습니다: ${paths.join(", ")}`);
+  const allContent = snapshot.relevantFiles.map((f) => f.content).join("\n");
+  assert.ok(!allContent.includes("sk-secret-applyDiscount"));
+});
+
+/**
+ * **검색 실패를 "없음"으로 읽지 않는다.** 읽지 못한 것과 없는 것은 다른 사실이고, 뭉개면
+ * 컨텍스트가 조용히 좁아진 채 모델이 불린다.
+ */
+test("본문 검색이 실패하면 그 사실이 제외 목록에 남는다", async () => {
+  const host = new FakeHost({
+    files: [
+      { path: "src/app.ts", isDir: false, sizeBytes: 40 },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: { "src/app.ts": "export const a = 1;\n", "package.json": "{}" },
+    gitStatus: "## main",
+    failSearchText: true,
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 음수를 받으면 터집니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 50_000 }],
+  });
+
+  assert.ok(
+    snapshot.excludedNotes?.some((n) => n.reason.includes("본문 검색이 실패")),
+    JSON.stringify(snapshot.excludedNotes)
+  );
+});
+
+/** 키워드를 정규식에 그대로 넣지 않는다 — `a.b` 같은 토큰이 다른 것을 찾는다. */
+test("검색 키워드는 정규식으로 escape된다", () => {
+  assert.equal(escapeRegExp("a.b"), "a\\.b");
+  assert.equal(escapeRegExp("x(y)"), "x\\(y\\)");
+  assert.equal(escapeRegExp("plain"), "plain");
 });

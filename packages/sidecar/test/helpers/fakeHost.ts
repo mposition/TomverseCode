@@ -19,6 +19,13 @@ export interface FakeHostOptions {
   contents?: Record<string, string>;
   gitStatus?: string;
   gitDiff?: string;
+  /**
+   * `search_text`가 실패하게 만든다 (51절).
+   *
+   * **"찾지 못했다"와 "찾지 못한 것이 아니라 못 찾았다"는 다른 사실**이고, 그 구별을 검사하려면
+   * 실패를 만들 수 있어야 한다.
+   */
+  failSearchText?: boolean;
   /** verify.run 응답을 순서대로 소비한다. 첫 호출은 baseline이다. */
   verifyResults?: VerifyStub[];
   /**
@@ -239,8 +246,33 @@ export class FakeHost {
         }
         return ok({ path, binary: false, content, sizeBytes: content.length, truncated: false });
       }
-      case "search_text":
-        return ok({ matches: [], truncated: false });
+      // **진짜로 찾는다**(51절). 빈 배열을 돌려주면 본문 기반 선정이 "찾지 못했다"로 돌고,
+      // 그 검사는 무엇도 검사하지 못한 채 통과한다 — fake가 게으르면 검사도 게을러진다.
+      case "search_text": {
+        // 검색 자체가 실패하는 경우 — "찾지 못했다"와 구별되어야 한다.
+        if (this.options.failSearchText) {
+          return {
+            result: {
+              requestId: request.requestId,
+              status: "error" as const,
+              error: "fake search failure",
+              durationMs: 1,
+              completedAt: new Date().toISOString(),
+            },
+            policy: { decision: "auto_approve", riskLevel: "none", reason: "", matchedRule: "", normalizedTarget: "" },
+          };
+        }
+        const pattern = new RegExp(String(request.args.pattern));
+        const matches: { path: string; line: number; text: string }[] = [];
+        for (const [path, content] of Object.entries(this.options.contents ?? {})) {
+          // 비밀값 파일은 **읽기 전에** 건너뛴다 — 실제 도구가 그렇게 한다(tools/mod.rs).
+          if (/(^|\/)\.env($|\.)/.test(path)) continue;
+          content.split("\n").forEach((text, i) => {
+            if (pattern.test(text)) matches.push({ path, line: i + 1, text });
+          });
+        }
+        return ok({ matches, truncated: false });
+      }
       case "git_status":
         return ok({ stdout: this.options.gitStatus ?? "## main", exitCode: 0 });
       case "git_diff":

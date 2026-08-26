@@ -1,7 +1,25 @@
 import type { ISODateTime, ModelId } from "./common.js";
 
 /** docs/design/context-engine.md 4절 — 이 파일이 왜 선택됐는지. */
-export type RelevanceReason = "mentioned" | "symbol-match" | "recently-changed" | "dependency" | "project-meta";
+/**
+ * 이 파일이 왜 골렸는가.
+ *
+ * # `symbol-match`와 `content-match`를 나눠 두는 이유 (context-engine 9절, state-machine 51절)
+ *
+ * `symbol-match`는 **심볼 그래프**가 있을 때의 근거다 — "이 식별자가 여기 정의돼 있다"를
+ * 파서가 안다. 지금은 그 그래프가 없다.
+ *
+ * `content-match`는 **본문 검색**이 찾은 것이다. 정의처럼 보이는 자리를 정규식으로 맞춘 것이라
+ * 훨씬 약한 근거이고, 그 약함이 이름에 남아야 한다 — `symbol-match`로 적으면 화면과 감사
+ * 기록이 "파서가 확인했다"고 말하게 된다.
+ */
+export type RelevanceReason =
+  | "mentioned"
+  | "symbol-match"
+  | "content-match"
+  | "recently-changed"
+  | "dependency"
+  | "project-meta";
 
 export interface RelevantFile {
   path: string;
