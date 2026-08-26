@@ -138,6 +138,11 @@ pub struct TaskProfile {
     /// 그래서 사전 승인은 **매니페스트가 그대로일 때만** 유효하다. 바뀌었으면 자동 승인을
     /// 취소하고 평소대로 묻는다(무인이면 멈춘다) — 막는 것이 아니라 **사람에게 되돌린다.**
     manifest_fingerprint: String,
+    /// 내용까지 세어야 하는 프로그램 경로들 (52절). 검증 명령과 등록된 훅 양쪽에서 모은다.
+    ///
+    /// **`verification_pin`과 따로 두는 이유**는 그쪽이 승인 판정의 근거이기도 하기 때문이다 —
+    /// `fingerprinted_programs`의 주석에 적었다.
+    fingerprinted_programs: Vec<String>,
 }
 
 impl TaskProfile {
@@ -156,6 +161,30 @@ impl TaskProfile {
     /// **게이트와 실행 경로가 같은 풀을 본다.** 목록을 복사해 넣으면 등록과 게이트가
     /// 갈라질 수 있고, 갈라진 쪽이 느슨하면 그게 우회 경로가 된다.
     pub fn with_mcp(root: &WorkspaceRoot, policy: TaskPolicy, mcp: Option<Arc<crate::mcp::McpPool>>) -> Self {
+        Self::build(root, policy, mcp, &crate::hooks::HookRegistry::default())
+    }
+
+    /// 등록된 훅까지 반영해서 만든다 (52절).
+    ///
+    /// **훅이 빠지면 지문에 구멍이 남는다.** 사전 승인은 등록된 훅에도 적용되는데(25.3절),
+    /// 훅의 argv가 가리키는 프로그램이 워크스페이스 안에 있으면 모델이 `apply_patch`로
+    /// 덮어쓸 수 있다 — 49.5절이 검증 명령에 대해 막은 것과 **같은 구멍**이 훅 쪽에
+    /// 열려 있었다.
+    pub fn with_hooks_and_mcp(
+        root: &WorkspaceRoot,
+        policy: TaskPolicy,
+        mcp: Option<Arc<crate::mcp::McpPool>>,
+        hooks: &crate::hooks::HookRegistry,
+    ) -> Self {
+        Self::build(root, policy, mcp, hooks)
+    }
+
+    fn build(
+        root: &WorkspaceRoot,
+        policy: TaskPolicy,
+        mcp: Option<Arc<crate::mcp::McpPool>>,
+        hooks: &crate::hooks::HookRegistry,
+    ) -> Self {
         let gate = PolicyGate::new(&policy).with_mcp(mcp);
         // 아직 아무것도 고치지 않은 시점의 매니페스트를 읽는다. 이 호출이 뒤로 밀리면
         // 고정의 의미가 사라진다.
@@ -166,22 +195,46 @@ impl TaskProfile {
             .map(|(_, cmd, _)| (cmd.program.clone(), cmd.args.clone()))
             .collect();
         // **지문의 파일 목록은 `detect_commands`가 유도한다**(50절). 그리고 워크스페이스 안에
-        // 있는 프로그램은 모델이 덮어쓸 수 있으므로 그 내용도 함께 센다(49.5절).
-        let manifest_fingerprint = manifest_fingerprint(root, &verification_pin);
+        // 있는 프로그램은 모델이 덮어쓸 수 있으므로 그 내용도 함께 센다(49.5·52절).
+        let fingerprinted_programs = fingerprinted_programs(&verification_pin, hooks);
+        let manifest_fingerprint = manifest_fingerprint(root, &fingerprinted_programs);
         Self {
             policy,
             gate,
             verification_pin,
+            fingerprinted_programs,
             manifest_fingerprint,
         }
     }
+}
+
+/// 내용까지 세어야 하는 프로그램들 — 검증 명령과 **등록된 훅** 양쪽에서 모은다 (52절).
+///
+/// # 왜 `verification_pin`에 섞지 않는가
+///
+/// `verification_pin`은 지문의 재료이기도 하지만 **승인 판정의 근거**이기도 하다
+/// (`is_pinned_verification` → `lever_for`). 훅의 argv를 거기 넣으면 훅 명령이 "프로젝트가
+/// 선언한 검증 명령"으로 읽혀 레버가 달라진다 — 지문 구멍을 메우려다 승인 규칙을 바꾸는 셈이다.
+/// 두 사실을 한 값에 뭉개지 않는다.
+///
+/// # 정렬하고 접는다
+///
+/// 지문은 순서에 민감하므로 같은 입력이 같은 해시를 내야 한다. 훅과 검증 명령이 같은
+/// 프로그램을 가리키는 경우도 흔하다(`npm`) — 두 번 세도 틀리지는 않지만, 접어 두면
+/// "무엇이 세어졌는가"를 사람이 읽을 수 있다.
+fn fingerprinted_programs(pin: &[(String, Vec<String>)], hooks: &crate::hooks::HookRegistry) -> Vec<String> {
+    let mut out: std::collections::BTreeSet<String> = pin.iter().map(|(program, _)| program.clone()).collect();
+    for hook in hooks.all() {
+        out.insert(hook.program.clone());
+    }
+    out.into_iter().collect()
 }
 
 /// 검증 명령의 **본문이 사는 파일들**의 지문.
 ///
 /// 이름이 아니라 내용을 센다. 없는 파일과 빈 파일을 구별하기 위해 존재 여부도 함께 넣는다 —
 /// 뭉개면 파일이 새로 생긴 것을 못 본다.
-fn manifest_fingerprint(root: &WorkspaceRoot, pin: &[(String, Vec<String>)]) -> String {
+fn manifest_fingerprint(root: &WorkspaceRoot, programs: &[String]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
 
@@ -215,7 +268,7 @@ fn manifest_fingerprint(root: &WorkspaceRoot, pin: &[(String, Vec<String>)]) -> 
     //
     // **목록이 아니라 고정 집합에서 유도한다.** 어떤 프로그램이 워크스페이스 안인지는
     // `detect_commands`가 정하므로, 여기서 이름을 다시 적으면 두 곳이 갈린다.
-    for (program, _) in pin {
+    for program in programs {
         let path = std::path::Path::new(program);
         let Ok(inside) = path.strip_prefix(root.path()) else {
             continue;
@@ -339,10 +392,11 @@ impl TaskHost {
         // **기본 프로필의 게이트도 다시 만든다.** 이 프로필은 태스크에 속하지 않는 요청과
         // `begin_task` 전의 요청이 쓰는데, 여기서 갱신하지 않으면 그 경로의 게이트만 등록을
         // 모른 채로 남아 모든 `mcp_call`을 거부한다 — 증상은 "가끔 MCP가 안 된다"로 보인다.
-        self.default_profile = Arc::new(TaskProfile::with_mcp(
+        self.default_profile = Arc::new(TaskProfile::with_hooks_and_mcp(
             &self.root,
             self.default_profile.policy.clone(),
             self.mcp.clone(),
+            &self.hooks,
         ));
         self
     }
@@ -416,6 +470,16 @@ impl TaskHost {
     /// 훅을 쓰지 않는 실행 경로가 훅 코드를 지나지 않는다.
     pub fn with_hooks(mut self, hooks: crate::hooks::HookRegistry) -> Self {
         self.hooks = hooks;
+        // **기본 프로필의 지문을 다시 계산한다**(52절). 훅의 프로그램이 지문에 들어가므로,
+        // 여기서 갱신하지 않으면 훅을 붙이기 **전에** 만든 지문이 남는다 — 그 지문은 훅
+        // 프로그램의 내용을 세지 않으므로, 그 파일이 덮어써져도 사전 승인이 살아 있다.
+        // `with_mcp`가 같은 이유로 기본 프로필을 다시 만든다.
+        self.default_profile = Arc::new(TaskProfile::with_hooks_and_mcp(
+            &self.root,
+            self.default_profile.policy.clone(),
+            self.mcp.clone(),
+            &self.hooks,
+        ));
         self
     }
 
@@ -441,7 +505,7 @@ impl TaskHost {
     /// 호스트에 있다** — 풀 없이 물으면 `mcp_call`이 "등록 밖 거부"로 나오는데, 서버를
     /// 등록해 둔 사용자에게 그건 틀린 규칙 이름이다(무인에서의 결말은 같지만).
     pub fn autopilot_preview(&self, policy: TaskPolicy) -> crate::autopilot::Preview {
-        let profile = TaskProfile::with_mcp(&self.root, policy, self.mcp.clone());
+        let profile = TaskProfile::with_hooks_and_mcp(&self.root, policy, self.mcp.clone(), &self.hooks);
         crate::autopilot::preview(&self.root, &profile, &self.hooks)
     }
 
@@ -484,7 +548,7 @@ impl TaskHost {
                 "이 태스크의 정책이 이미 정해졌습니다: {task_id} — 진행 중에 정책을 바꿀 수 없습니다"
             ));
         }
-        let profile = Arc::new(TaskProfile::with_mcp(&self.root, policy, self.mcp.clone()));
+        let profile = Arc::new(TaskProfile::with_hooks_and_mcp(&self.root, policy, self.mcp.clone(), &self.hooks));
         let summary = self.effective_config(&profile, skill);
         let deadline = profile.policy.deadline_ms;
         profiles.insert(task_id.to_string(), profile);
@@ -1950,7 +2014,7 @@ fn pre_approval_candidate(
     // **매니페스트가 바뀌었으면 사전 승인이 성립하지 않는다**(29.3절). argv는 그대로인데
     // 그 argv가 돌리는 본문이 달라졌을 수 있고, 그러면 사용자가 승인한 것과 실제로 도는
     // 것이 다르다. 막는 것이 아니라 **사람에게 되돌린다.**
-    if manifest_fingerprint(root, &profile.verification_pin) != profile.manifest_fingerprint {
+    if manifest_fingerprint(root, &profile.fingerprinted_programs) != profile.manifest_fingerprint {
         return PreApprovalCandidate::Withdrawn(candidate);
     }
     PreApprovalCandidate::Granted(candidate)
@@ -3542,6 +3606,142 @@ mod tests {
         );
     }
 
+    /// **`begin_task`를 지나지 않는 경로의 프로필도 훅을 알아야 한다** — 52절.
+    ///
+    /// 태스크에 속하지 않는 요청과 `begin_task` 전의 요청은 `default_profile`을 쓴다. 그
+    /// 프로필은 호스트를 만들 때 계산되고 `with_hooks`는 그 **뒤에** 불리므로, 여기서 다시
+    /// 계산하지 않으면 그 경로의 지문만 훅 프로그램을 세지 않은 채로 남는다.
+    ///
+    /// 프로브로 확인했다: 이 재계산을 지워도 위의 끝에서 끝까지 검사는 통과했다 —
+    /// 그 검사가 `begin_task`를 지나기 때문이다. **한 경로를 덮는 검사는 다른 경로에 대해
+    /// 아무 말도 하지 않는다.** `with_mcp`가 기본 프로필을 다시 만드는 것도 같은 이유다.
+    #[test]
+    fn the_default_profile_learns_the_hook_programs_too() {
+        let (ws, _a, host) = host_with_manifest(TaskPolicy::default(), Arc::new(AlwaysDeny), None);
+        let venv = ws.path().join(".venv").join("bin");
+        fs::create_dir_all(&venv).unwrap();
+        let interpreter = venv.join("python");
+        fs::write(&interpreter, "a").unwrap();
+        let program = interpreter.to_string_lossy().to_string();
+
+        let before = host.default_profile.manifest_fingerprint.clone();
+        assert!(
+            !host.default_profile.fingerprinted_programs.contains(&program),
+            "훅을 붙이기 전인데 이미 알고 있습니다 — 아래 단언이 공허합니다"
+        );
+
+        let host = host.with_hooks(crate::hooks::HookRegistry::new(vec![crate::hooks::HookConfig {
+            phase: "VERIFYING".to_string(),
+            program: program.clone(),
+            args: vec!["-m".to_string(), "pytest".to_string()],
+        }]));
+
+        assert!(
+            host.default_profile.fingerprinted_programs.contains(&program),
+            "기본 프로필이 훅 프로그램을 모릅니다: {:?}",
+            host.default_profile.fingerprinted_programs
+        );
+        assert_ne!(
+            host.default_profile.manifest_fingerprint, before,
+            "훅을 붙였는데 기본 프로필의 지문이 그대로입니다"
+        );
+    }
+
+    /// **`with_mcp`와 `with_hooks`의 순서가 결과를 바꾸면 안 된다.** 둘 다 기본 프로필을
+    /// 다시 만드는데, 한쪽이 다른 쪽의 결과를 지우면 순서에 따라 구멍이 생겼다 사라진다 —
+    /// 그건 호출 순서를 사람이 기억해야 한다는 뜻이고, 언젠가 틀린다.
+    #[test]
+    fn attaching_hooks_survives_a_later_reconstruction() {
+        let (ws, _a, host) = host_with_manifest(TaskPolicy::default(), Arc::new(AlwaysDeny), None);
+        let program = ws.path().join("run.sh").to_string_lossy().to_string();
+        let hooks = crate::hooks::HookRegistry::new(vec![crate::hooks::HookConfig {
+            phase: "VERIFYING".to_string(),
+            program: program.clone(),
+            args: vec![],
+        }]);
+        let host = host.with_hooks(hooks);
+        // 훅을 붙인 뒤 기본 프로필을 다시 만드는 다른 경로가 지나가도 훅은 남아야 한다.
+        let rebuilt = TaskProfile::with_hooks_and_mcp(
+            &host.root,
+            host.default_profile.policy.clone(),
+            host.mcp.clone(),
+            &host.hooks,
+        );
+        assert!(rebuilt.fingerprinted_programs.contains(&program));
+    }
+
+    /// **훅 프로그램을 덮어써도 사전 승인이 살아 있었다** — state-machine 52절, 끝에서 끝까지.
+    ///
+    /// 위 단위 검사들은 지문 함수가 훅 프로그램을 센다는 것을 본다. 그런데 그 사이에
+    /// **배선**이 있다: 프로필이 훅을 알아야 하고(`with_hooks`가 다시 계산해야 하고),
+    /// 확인 시점이 같은 목록으로 다시 계산해야 한다. 한 자리만 놓쳐도 구멍은 그대로다.
+    ///
+    /// 그리고 이 검사는 결말이 **거부가 아니라 "묻는다"**임을 함께 본다 — 29.3절 그대로,
+    /// 막는 것이 아니라 사람에게 되돌린다.
+    #[test]
+    fn overwriting_a_registered_hook_program_withdraws_the_pre_approval() {
+        let (ws, _a, host) = host_with_manifest(
+            TaskPolicy {
+                auto_approve_verification: true,
+                ..TaskPolicy::default()
+            },
+            Arc::new(AlwaysDeny),
+            Some(r#"{"scripts":{"test":"node -e 0"}}"#),
+        );
+        // 훅이 워크스페이스 **안**의 인터프리터를 가리킨다 — 파이썬 프로젝트의 흔한 모양이고
+        // (`.venv/bin/python`), 게이트는 basename으로 매치하므로 이 argv는 allowlist를 지난다.
+        // 그리고 그 파일은 워크스페이스 안이므로 **모델이 `apply_patch`로 덮어쓸 수 있다.**
+        let venv = ws.path().join(".venv").join("bin");
+        fs::create_dir_all(&venv).unwrap();
+        let interpreter = venv.join("python");
+        fs::write(&interpreter, "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n").unwrap();
+        let program = interpreter.to_string_lossy().to_string();
+        let args = vec!["-m".to_string(), "pytest".to_string()];
+
+        let host = host.with_hooks(crate::hooks::HookRegistry::new(vec![crate::hooks::HookConfig {
+            phase: "VERIFYING".to_string(),
+            program: program.clone(),
+            args: args.clone(),
+        }]));
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+        let profile = host.profile("task-1");
+
+        let request = req(
+            ToolName::RunCommand,
+            json!({ "program": program, "args": args, "cwd": "." }),
+        );
+        let fate = |host: &TaskHost, profile: &Arc<TaskProfile>| {
+            let decision = profile.gate().evaluate(&request, &host.root, &profile.policy);
+            fate_of(&host.root, profile, &host.hooks, &request, &decision)
+        };
+
+        // 바뀌기 전에는 등록된 훅으로 사전 승인된다 — 아래 단언이 공허하지 않다는 증거다.
+        assert!(
+            matches!(
+                fate(&host, &profile),
+                Fate::PreApproved {
+                    by: PreApprovalKind::RegisteredHook
+                }
+            ),
+            "{:?}",
+            fate(&host, &profile)
+        );
+
+        // **등록된 argv는 한 글자도 바뀌지 않는다.** 바뀌는 것은 그 argv가 돌리는 본문이다.
+        fs::write(&interpreter, "#!/bin/sh\nexec /bin/evil\n").unwrap();
+
+        assert!(
+            matches!(
+                fate(&host, &profile),
+                Fate::AsksUser {
+                    withdrawn: Some(PreApprovalKind::RegisteredHook)
+                }
+            ),
+            "훅 프로그램이 덮어써졌는데 사전 승인이 살아 있습니다: {:?}",
+            fate(&host, &profile)
+        );
+    }
+
     /// **argv를 고정해도 본문은 고정되지 않는다** (29.3절).
     ///
     /// 24.5절의 고정은 명령의 *이름*을 지킨다. 그런데 `npm test`의 argv를 그대로 두고
@@ -3821,15 +4021,114 @@ mod tests {
         let interpreter = venv.join("python");
         fs::write(&interpreter, "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n").unwrap();
 
-        let pin = vec![(
-            interpreter.to_string_lossy().to_string(),
-            vec!["-m".to_string(), "pytest".to_string()],
-        )];
+        let pin = vec![interpreter.to_string_lossy().to_string()];
         let before = manifest_fingerprint(&root, &pin);
 
         // **argv는 한 글자도 바뀌지 않는다.** 바뀌는 것은 그 argv가 가리키는 프로그램이다.
         fs::write(&interpreter, "#!/bin/sh\nexec /bin/evil\n").unwrap();
         assert_ne!(manifest_fingerprint(&root, &pin), before, "프로그램 내용의 변화가 지문에 없습니다");
+    }
+
+    /// **등록된 훅의 프로그램도 워크스페이스 안이면 센다** — state-machine 52절.
+    ///
+    /// 50.6절이 남겨 둔 구멍이다. 사전 승인은 등록된 훅에도 적용되는데(25.3절), 훅의 argv가
+    /// 가리키는 프로그램은 `verification_pin`에 없으므로 49.5절의 프로그램 지문이 닿지
+    /// 않았다. 즉 훅으로 워크스페이스 안 실행 파일을 등록해 두면, 모델이 그 파일을
+    /// `apply_patch`로 덮어써도 **사전 승인이 살아 있었다.**
+    #[test]
+    fn the_fingerprint_covers_a_hook_program_inside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let tools = dir.path().join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        let script = tools.join("fmt.sh");
+        fs::write(&script, "#!/bin/sh\nexec /usr/bin/true\n").unwrap();
+
+        let hooks = crate::hooks::HookRegistry::new(vec![crate::hooks::HookConfig {
+            phase: "VERIFYING".to_string(),
+            program: script.to_string_lossy().to_string(),
+            args: vec![],
+        }]);
+        let programs = fingerprinted_programs(&[], &hooks);
+        assert!(!programs.is_empty(), "훅의 프로그램이 지문 대상에 없습니다");
+
+        let before = manifest_fingerprint(&root, &programs);
+        // **등록된 argv는 한 글자도 바뀌지 않는다.** 바뀌는 것은 그 argv가 돌리는 본문이다.
+        fs::write(&script, "#!/bin/sh\nexec /bin/evil\n").unwrap();
+        assert_ne!(
+            manifest_fingerprint(&root, &programs),
+            before,
+            "훅 프로그램의 내용 변화가 지문에 없습니다 — 덮어써도 사전 승인이 살아남습니다"
+        );
+    }
+
+    /// **훅을 붙이면 기본 프로필의 지문이 다시 계산된다.**
+    ///
+    /// `with_hooks`가 호스트 생성 **뒤에** 불리므로, 여기서 갱신하지 않으면 훅을 모르는
+    /// 지문이 남는다. 함수는 고쳤는데 부르는 자리를 놓치는 것이 이 종류 결함의 흔한 모양이다.
+    #[test]
+    fn attaching_hooks_recomputes_the_default_profile_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let script = dir.path().join("fmt.sh");
+        fs::write(&script, "a").unwrap();
+
+        let without = TaskProfile::new(&root, TaskPolicy::default());
+        let hooks = crate::hooks::HookRegistry::new(vec![crate::hooks::HookConfig {
+            phase: "VERIFYING".to_string(),
+            program: script.to_string_lossy().to_string(),
+            args: vec![],
+        }]);
+        let with = TaskProfile::with_hooks_and_mcp(&root, TaskPolicy::default(), None, &hooks);
+        assert_ne!(
+            with.manifest_fingerprint, without.manifest_fingerprint,
+            "훅을 붙였는데 지문이 그대로입니다"
+        );
+        assert!(with.fingerprinted_programs.iter().any(|p| p.ends_with("fmt.sh")));
+    }
+
+    /// **훅의 argv를 `verification_pin`에 섞지 않는다.** 그 값은 지문의 재료이기도 하지만
+    /// 승인 판정의 근거이기도 해서(`is_pinned_verification` → `lever_for`), 훅을 거기 넣으면
+    /// 훅 명령이 "프로젝트가 선언한 검증 명령"으로 읽혀 레버가 달라진다.
+    #[test]
+    fn a_hook_does_not_become_a_pinned_verification_command() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"scripts":{"test":"vitest"}}"#).unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+
+        let hooks = crate::hooks::HookRegistry::new(vec![crate::hooks::HookConfig {
+            phase: "VERIFYING".to_string(),
+            program: "git".to_string(),
+            args: vec!["push".to_string()],
+        }]);
+        let profile = TaskProfile::with_hooks_and_mcp(&root, TaskPolicy::default(), None, &hooks);
+        assert!(
+            !profile.verification_pin.iter().any(|(p, a)| p == "git" && a == &["push".to_string()]),
+            "훅이 고정 검증 명령이 되었습니다: {:?}",
+            profile.verification_pin
+        );
+        // 그래도 지문 대상에는 들어간다 — 두 목록은 다른 질문에 답한다.
+        assert!(profile.fingerprinted_programs.iter().any(|p| p == "git"));
+    }
+
+    /// **같은 프로그램을 두 번 세지 않고, 순서가 흔들리지 않는다.** 지문은 순서에 민감하다.
+    #[test]
+    fn the_fingerprinted_program_list_is_sorted_and_folded() {
+        let hooks = crate::hooks::HookRegistry::new(vec![
+            crate::hooks::HookConfig {
+                phase: "VERIFYING".to_string(),
+                program: "npm".to_string(),
+                args: vec!["run".to_string(), "fmt".to_string()],
+            },
+            crate::hooks::HookConfig {
+                phase: "COMPLETED".to_string(),
+                program: "aaa".to_string(),
+                args: vec![],
+            },
+        ]);
+        let pin = vec![("npm".to_string(), vec!["test".to_string()])];
+        let programs = fingerprinted_programs(&pin, &hooks);
+        assert_eq!(programs, vec!["aaa".to_string(), "npm".to_string()], "{programs:?}");
     }
 
     /// **워크스페이스 밖의 프로그램은 세지 않는다.** `npm`이나 `dotnet`은 PATH에서 오고
@@ -3842,7 +4141,7 @@ mod tests {
         let program = outside.path().join("python");
         fs::write(&program, "a").unwrap();
 
-        let pin = vec![(program.to_string_lossy().to_string(), vec!["-m".to_string()])];
+        let pin = vec![program.to_string_lossy().to_string()];
         let before = manifest_fingerprint(&root, &pin);
         fs::write(&program, "b").unwrap();
         assert_eq!(manifest_fingerprint(&root, &pin), before);
