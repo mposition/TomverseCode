@@ -655,6 +655,77 @@ test("fix loop가 같은 삭제를 두 번 시키지 않는다", async () => {
 });
 
 /**
+ * **검수자가 삭제를 거부할 수 있다** — state-machine 46절.
+ *
+ * 44·45절까지 검수자는 이동과 삭제를 **보지도 못했고** 거부할 자리도 없었다. REVISE는
+ * 검수자의 patch를 싣고 초안의 조작을 그대로 실행했다 — 검수자의 반대가 "그건 지우지
+ * 마라"였다면 그 반대는 아무 데도 닿지 않았다.
+ */
+test("검수자가 빈 배열을 보내면 초안의 삭제가 실행되지 않는다", async () => {
+  const revised = VALID_PATCH.replace("export const a = 2;", "export const a = 3;");
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [
+        { kind: "draft", payload: { ...DELETE_DRAFT, deletions: ["package.json"], patch: VALID_PATCH } },
+        {
+          kind: "review",
+          payload: {
+            verdict: "REVISE",
+            rationale: "고치는 건 맞지만 그 파일은 지우면 안 된다",
+            revisedPatch: revised,
+            // **빈 배열 = 명시적으로 비웠다.** 생략과 다르다.
+            revisedDeletions: [],
+          },
+        },
+      ],
+    },
+    { message: "정리하고 고쳐줘" }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+  // 대조 경로를 실제로 탔는지 먼저 본다 — 단일 모델 경로였다면 검수자가 없었고,
+  // "삭제가 없다"는 검수자의 거부가 아니라 초안이 안 실린 것이다.
+  assert.ok(host.phaseSequence().includes("REVIEWING"), host.phaseSequence().join(" → "));
+
+  // 검수자의 patch는 실렸는데
+  const applied = host.toolRequests.find((r) => r.tool === "apply_patch")!;
+  assert.ok(String(applied.args.patch).includes("+export const a = 3;"));
+  // 초안의 삭제는 실리지 않았다.
+  assert.deepEqual(host.toolRequests.filter((r) => r.tool === "delete_file"), []);
+});
+
+/**
+ * **생략은 "말하지 않았다"이지 "하지 마라"가 아니다**(46절).
+ *
+ * 둘을 한 값으로 뭉개면 아무 말도 하지 않은 검수자가 초안의 삭제를 취소한 것이 되고,
+ * **사용자가 요청한 삭제가 조용히 사라진다.**
+ */
+test("검수자가 말하지 않으면 초안의 삭제가 그대로 실행된다", async () => {
+  const revised = VALID_PATCH.replace("export const a = 2;", "export const a = 3;");
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    {
+      defaultPatch: VALID_PATCH,
+      script: [
+        { kind: "draft", payload: { ...DELETE_DRAFT, deletions: ["package.json"], patch: VALID_PATCH } },
+        // `revisedDeletions`가 아예 없다.
+        { kind: "review", payload: { verdict: "REVISE", rationale: "값만 틀렸다", revisedPatch: revised } },
+      ],
+    },
+    { message: "정리하고 고쳐줘" }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  assert.ok(host.phaseSequence().includes("REVIEWING"), host.phaseSequence().join(" → "));
+  const deletes = host.toolRequests.filter((r) => r.tool === "delete_file");
+  assert.equal(deletes.length, 1, host.toolRequests.map((r) => r.tool).join(", "));
+  assert.equal(deletes[0]?.args.path, "package.json");
+});
+
+/**
  * **계획을 실행하기 전에 게이트에 태워 본다** — state-machine 42절.
  *
  * 이게 없으면 계획의 세 번째 요청이 거부될 때 앞의 둘은 **이미 적용된 채로** 태스크가 끝난다.

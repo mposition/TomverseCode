@@ -6,7 +6,14 @@ import { normalizeProviderError } from "../src/providers/errors.js";
 import { backoffDelayMs, callWithRetry, DEFAULT_RETRY_POLICY, ProviderCallFailed, withTimeout } from "../src/providers/retry.js";
 import { OpenAIAdapter } from "../src/providers/openai.js";
 import { AnthropicAdapter } from "../src/providers/anthropic.js";
-import { buildDraftPrompt } from "../src/providers/prompts.js";
+import {
+  buildDraftPrompt,
+  buildFixPrompt,
+  buildReviewPrompt,
+  DRAFT_SCHEMA,
+  REVIEW_SCHEMA,
+  SINGLE_FIX_SCHEMA,
+} from "../src/providers/prompts.js";
 import { BUILTIN_MODELS, ModelRegistry } from "../src/routing/registry.js";
 import { makeSnapshot } from "./helpers/fixtures.js";
 import type { ProviderCallContext } from "../src/providers/types.js";
@@ -403,4 +410,143 @@ test("프롬프트가 파일 삭제를 요청하는 방법을 말한다", () => 
   assert.ok(prompt.includes("Deletions run first"), prompt);
   // **patch가 비어도 된다**는 것을 말하지 않으면 삭제만 하는 요구에 모델이 억지 patch를 짓는다.
   assert.ok(prompt.includes("leave `patch` empty"), prompt);
+});
+
+/**
+ * **스키마가 진짜 문이다** — state-machine 46절.
+ *
+ * 44·45절은 `moves`/`deletions` 필드를 만들고 프롬프트에 쓰는 법까지 적었는데
+ * `DRAFT_SCHEMA`에 넣지 않았다. 그 스키마는 `strict: true` + `additionalProperties: false`로
+ * 세 어댑터(OpenAI/Anthropic/Gemini) 모두가 쓰므로, **그 이름의 속성은 아예 나올 수
+ * 없었다.** 프롬프트가 "`moves` 배열에 넣어라"고 말하는 동안 스키마는 그것을 금지하고 있었다.
+ *
+ * fake 공급자는 스키마를 지나지 않으므로 340개 테스트가 전부 통과했다.
+ *
+ * # 판정 기준은 손으로 적은 필드 목록이 아니다
+ *
+ * 목록을 여기 적으면 다음 필드가 늘 때 같은 일이 반복된다. **프롬프트가 실제로 말하는
+ * 필드 이름**(규칙 문단의 백틱 안 식별자)을 뽑아 스키마 속성과 대조한다.
+ */
+
+/** 규칙 문단에서 백틱으로 감싼 **식별자**만 뽑는다. `@@ …`나 `{from, to}`는 이름이 아니다. */
+function fieldNamesMentionedIn(rules: string): string[] {
+  const names = new Set<string>();
+  for (const m of rules.matchAll(/`([^`]+)`/g)) {
+    const token = (m[1] ?? "").trim();
+    if (/^[a-z][A-Za-z0-9]*$/.test(token)) names.add(token);
+  }
+  return [...names];
+}
+
+/** 프롬프트에서 규칙 문단만 잘라낸다 — 스냅샷 본문의 백틱을 세지 않기 위해서다. */
+function rulesSectionOf(prompt: string, heading: string): string {
+  const at = prompt.indexOf(`## ${heading}`);
+  assert.notEqual(at, -1, `${heading} 문단을 찾지 못했습니다`);
+  return prompt.slice(at);
+}
+
+test("프롬프트가 채우라고 말하는 필드는 전부 응답 스키마에 있다", () => {
+  const snapshot = makeSnapshot();
+  const draft = {
+    taskId: "t",
+    proposalId: "p",
+    interpretation: "고친다",
+    relevantFiles: [],
+    plan: [],
+    patch: "--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1,1 +1,1 @@\n-1\n+2\n",
+    moves: [{ from: "src/app.ts", to: "src/renamed.ts" }],
+    deletions: ["src/gone.ts"],
+    risks: [],
+    requiredTests: [],
+    uncertainties: [],
+    doneCriteria: [],
+    model: "m",
+    createdAt: "now",
+  };
+
+  const cases = [
+    {
+      what: "draft",
+      rules: rulesSectionOf(buildDraftPrompt({ snapshot, userMessage: "고쳐주세요" }), "Output rules"),
+      schema: DRAFT_SCHEMA,
+    },
+    {
+      what: "review",
+      rules: rulesSectionOf(buildReviewPrompt({ snapshot, userMessage: "고쳐주세요", draft }), "Verdict rules"),
+      schema: REVIEW_SCHEMA,
+    },
+    {
+      what: "fix",
+      rules: rulesSectionOf(
+        buildFixPrompt({
+          snapshot,
+          userMessage: "고쳐주세요",
+          appliedChanges: "src/app.ts (12 bytes)",
+          digest: {
+            taskId: "t",
+            reportId: "r",
+            attemptNumber: 1,
+            failingChecks: [{ kind: "test", excerpt: "1 failing", fileReferences: [] }],
+            passingChecksSummary: "build ok",
+          },
+        }),
+        "Output rules"
+      ),
+      schema: SINGLE_FIX_SCHEMA,
+    },
+  ];
+
+  for (const c of cases) {
+    const mentioned = fieldNamesMentionedIn(c.rules);
+    // **빈 집합에 대한 전칭 명제는 언제나 참이다** — 무엇을 셌는지 먼저 확인한다.
+    assert.ok(mentioned.length >= 2, `${c.what}: 규칙에서 필드 이름을 ${mentioned.length}개만 찾았습니다`);
+    const properties = Object.keys(c.schema.properties as Record<string, unknown>);
+    const missing = mentioned.filter((name) => !properties.includes(name));
+    assert.deepEqual(
+      missing,
+      [],
+      `${c.what} 프롬프트가 채우라고 말하지만 스키마에 없는 필드: ${missing.join(", ")}. ` +
+        `strict 스키마에서는 그 이름의 속성이 아예 나올 수 없습니다.`
+    );
+  }
+});
+
+/**
+ * **검수자는 실행될 것을 본다** — 46절.
+ *
+ * 종전 검수 프롬프트는 `patch`만 보여줬다. 이동과 삭제는 검수자가 보지 못한 채 실행됐고,
+ * 그래서 `REVIEW_RECEIVED`의 "검수자가 수락했다"는 **다른 제안에 대한 수락**이었다.
+ */
+test("검수 프롬프트가 초안의 이동과 삭제를 보여준다", () => {
+  const snapshot = makeSnapshot();
+  const base = {
+    taskId: "t",
+    proposalId: "p",
+    interpretation: "이름을 바꾼다",
+    relevantFiles: [],
+    plan: [],
+    patch: "--- a/src/renamed.ts\n+++ b/src/renamed.ts\n@@ -1,1 +1,1 @@\n-1\n+2\n",
+    risks: [],
+    requiredTests: [],
+    uncertainties: [],
+    doneCriteria: [],
+    model: "m",
+    createdAt: "now",
+  };
+  const draft = { ...base, moves: [{ from: "src/app.ts", to: "src/renamed.ts" }], deletions: ["src/gone.ts"] };
+
+  for (const blind of [false, true]) {
+    // **blind에서도 숨기지 않는다.** Blind가 숨기는 것은 작성자의 자기설명이지 제안 자체가 아니다.
+    const prompt = buildReviewPrompt({ snapshot, userMessage: "정리해줘", draft, blind });
+    assert.ok(prompt.includes("src/app.ts → src/renamed.ts"), `blind=${blind}: ${prompt}`);
+    assert.ok(prompt.includes("delete: src/gone.ts"), `blind=${blind}`);
+    // **옳은 초안을 엉뚱한 이유로 거부하지 않게 하는 문장.** patch가 가리키는 새 경로는
+    // Files 섹션에 없는데, 출력 규칙은 "Files 섹션에 있는 파일만"이라고 말한다.
+    assert.ok(prompt.includes("that is expected, not an error"), `blind=${blind}`);
+  }
+
+  // 조작이 없으면 **없다고 말한다.** 섹션을 빼면 "없다"와 "안 보여줬다"가 같아진다.
+  const plain = buildReviewPrompt({ snapshot, userMessage: "고쳐줘", draft: base });
+  assert.ok(plain.includes("File operations requested outside the patch"), plain);
+  assert.ok(plain.includes("(none — the patch is the whole change)"), plain);
 });

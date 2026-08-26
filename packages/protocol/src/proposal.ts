@@ -101,10 +101,27 @@ export interface ReviewDecision {
   rationale: string;
   revisedPlan?: PlanStep[];
   revisedPatch?: string;
+  /**
+   * 검수자가 고친 **초안의 이동** (state-machine 46절).
+   *
+   * **생략과 빈 배열이 다르다.** `undefined`는 "말하지 않았다"이고 초안의 이동이 그대로
+   * 실린다. `[]`는 "전부 하지 마라"다. 하나로 뭉개면 아무 말도 하지 않은 검수자가 초안의
+   * 이동을 취소한 것이 되고, 그 반대도 마찬가지다.
+   *
+   * `moves`라는 이름을 쓰지 않는 이유: 그건 "검수자가 새 이동을 제안한다"로 읽히는데,
+   * 검수자가 하는 일은 **초안의 조작을 고치는 것**이다.
+   */
+  revisedMoves?: FileMove[];
+  /** 검수자가 고친 **초안의 삭제** (state-machine 46절). 생략과 빈 배열의 뜻은 위와 같다. */
+  revisedDeletions?: string[];
   questionsForUser?: string[]; // verdict = NEED_USER_INPUT
   rejectionReason?: string; // verdict = REJECT
-  /** 대조 경로의 `DraftProposal.mcpCalls`와 같은 자리 (state-machine 31절). */
-  mcpCalls?: McpCallRequest[];
+  //
+  // **`mcpCalls`가 여기 있었다.** 검증기가 채우지 않고 소비하는 쪽도 없어 **언제나
+  // undefined**였다 — 즉 "검수자도 도구를 요청할 수 있다"는 타입의 주장이 거짓이었다(46.5절).
+  // 45.5절에서 `SingleModelFixResult.moves`가 같은 상태였고 거기서는 배선을 이었지만,
+  // 여기는 이을 소비처 자체가 없으므로 **필드를 없애는 것이 정직한 쪽**이다.
+  //
   model: string;
   createdAt: ISODateTime;
 }

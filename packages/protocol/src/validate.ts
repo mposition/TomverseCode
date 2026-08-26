@@ -130,8 +130,8 @@ export function validateDraftProposal(
     uncertainties: optionalStringArray(o.uncertainties, "draftProposal.uncertainties") ?? [],
     doneCriteria: optionalStringArray(o.doneCriteria, "draftProposal.doneCriteria") ?? [],
     mcpCalls: validateMcpCalls(o.mcpCalls),
-    moves: validateMoves(o.moves),
-    deletions: validateDeletions(o.deletions, "draftProposal"),
+    moves: validateMoves(o.moves, "draftProposal.moves"),
+    deletions: validateDeletions(o.deletions, "draftProposal.deletions"),
     model: ctx.model,
     createdAt: ctx.createdAt,
   };
@@ -146,16 +146,16 @@ export function validateDraftProposal(
  *
  * 두 경로가 같은 것도 여기서 거부한다 — 그건 이동이 아니고, 게이트까지 갈 이유가 없다.
  */
-function validateMoves(raw: unknown, path = "draftProposal"): DraftProposal["moves"] {
+function validateMoves(raw: unknown, path: string): DraftProposal["moves"] {
   if (raw === undefined || raw === null) return undefined;
-  if (!Array.isArray(raw)) throw new ValidationError(`${path}.moves`, "expected an array");
+  if (!Array.isArray(raw)) throw new ValidationError(path, "expected an array");
   if (raw.length === 0) return [];
   return raw.map((item, i) => {
-    const move = requireObject(item, `${path}.moves[${i}]`);
-    const from = requireNonEmptyString(move.from, `${path}.moves[${i}].from`);
-    const to = requireNonEmptyString(move.to, `${path}.moves[${i}].to`);
+    const move = requireObject(item, `${path}[${i}]`);
+    const from = requireNonEmptyString(move.from, `${path}[${i}].from`);
+    const to = requireNonEmptyString(move.to, `${path}[${i}].to`);
     if (from === to) {
-      throw new ValidationError(`${path}.moves[${i}]`, "from and to are the same path");
+      throw new ValidationError(`${path}[${i}]`, "from and to are the same path");
     }
     return { from, to };
   });
@@ -171,12 +171,12 @@ function validateMoves(raw: unknown, path = "draftProposal"): DraftProposal["mov
  */
 function validateDeletions(raw: unknown, path: string): string[] | undefined {
   if (raw === undefined || raw === null) return undefined;
-  if (!Array.isArray(raw)) throw new ValidationError(`${path}.deletions`, "expected an array");
+  if (!Array.isArray(raw)) throw new ValidationError(path, "expected an array");
   const seen = new Set<string>();
   return raw.map((item, i) => {
-    const value = requireNonEmptyString(item, `${path}.deletions[${i}]`);
+    const value = requireNonEmptyString(item, `${path}[${i}]`);
     if (seen.has(value)) {
-      throw new ValidationError(`${path}.deletions[${i}]`, `duplicate path: ${value}`);
+      throw new ValidationError(`${path}[${i}]`, `duplicate path: ${value}`);
     }
     seen.add(value);
     return value;
@@ -236,6 +236,10 @@ export function validateReviewDecision(
       ? undefined
       : validatePlanSteps(o.revisedPlan, "reviewDecision.revisedPlan"),
     revisedPatch: optionalString(o.revisedPatch, "reviewDecision.revisedPatch"),
+    // **생략과 빈 배열을 여기서 뭉개면 안 된다**(46절). `validateMoves`/`validateDeletions`가
+    // `undefined`는 `undefined`로, `[]`는 `[]`로 돌려주는 것에 이 구별이 걸려 있다.
+    revisedMoves: validateMoves(o.revisedMoves, "reviewDecision.revisedMoves"),
+    revisedDeletions: validateDeletions(o.revisedDeletions, "reviewDecision.revisedDeletions"),
     questionsForUser: optionalStringArray(o.questionsForUser, "reviewDecision.questionsForUser"),
     rejectionReason: optionalString(o.rejectionReason, "reviewDecision.rejectionReason"),
     model: ctx.model,
@@ -269,8 +273,8 @@ export function validateSingleModelFixResult(
     // "단일 모델 경로에도 같은 자리를 둔다"고 적어두고 이 줄을 빠뜨렸다 — 타입에는 `moves`가
     // 있고 소비하는 쪽도 읽고 있었지만, 검증기가 채우지 않으니 **언제나 undefined**였다.
     // 대조 경로만 쓰는 테스트는 그 사실을 보지 못한다(45.5절).
-    moves: validateMoves(o.moves, "singleModelFixResult"),
-    deletions: validateDeletions(o.deletions, "singleModelFixResult"),
+    moves: validateMoves(o.moves, "singleModelFixResult.moves"),
+    deletions: validateDeletions(o.deletions, "singleModelFixResult.deletions"),
     model: ctx.model,
     createdAt: ctx.createdAt,
   };

@@ -12,6 +12,7 @@ import type {
   FileMove,
   FinalResult,
   McpCallRequest,
+  ReviewDecision,
   RoutingDecision,
   SingleModelFixResult,
   TaskCounters,
@@ -799,10 +800,10 @@ export class Orchestrator {
           const revised = decision.revisedPatch;
           if (revised && revised.trim().length > 0) {
             // 검수자가 수정본을 직접 제시했으면 그것을 쓴다 (문서 4절 revisedPatch).
-            // 검수자가 고친 것은 patch다. 이동과 삭제는 실행자의 초안 그대로 실린다 —
-            // 수정본이 옮긴 뒤/지운 뒤를 기준으로 쓰여 있을 수 있으므로 여기서 떨어뜨리면
-            // 그 patch가 깨진다.
-            return { kind: "patch", patch: revised, ops: fileOps(proposal) };
+            // **검수자가 조작을 고쳤으면 그것을 쓴다**(46절). 말하지 않았으면 초안의 것을
+            // 그대로 싣는다 — 수정본이 옮긴 뒤/지운 뒤를 기준으로 쓰여 있을 수 있으므로
+            // 여기서 떨어뜨리면 그 patch가 깨진다.
+            return { kind: "patch", patch: revised, ops: reviewedFileOps(proposal, decision) };
           }
           // 수정본 없이 REVISE만 왔으면 초안을 다시 검토시킬 근거가 없다 — 초안을 그대로
           // 재검토해도 같은 결과가 나오므로 루프를 태우지 않고 실패로 확정한다.
@@ -2798,6 +2799,24 @@ export interface FileOps {
 /** 조작이 하나라도 있는가. patch 없는 초안이 성립하는지 판정하는 유일한 자리다. */
 function hasFileOps(ops: FileOps): boolean {
   return (ops.moves ?? []).length > 0 || (ops.deletions ?? []).length > 0;
+}
+
+/**
+ * 검수자의 수정을 반영한 조작 (46절).
+ *
+ * **`undefined`와 `[]`가 다르다.** 검수자가 말하지 않았으면(`undefined`) 초안의 것을 그대로
+ * 싣고, 빈 배열을 보냈으면 하지 않는다. 하나로 뭉개면 아무 말도 하지 않은 검수자가 초안의
+ * 삭제를 취소한 것이 되고 — 그러면 사용자가 요청한 삭제가 조용히 사라진다 — 그 반대도 같다.
+ *
+ * `??`가 그 구별을 그대로 표현한다는 것이 이 함수가 짧은 이유다. 짧다고 인라인하지 않는
+ * 이유는, 이 구별을 아는 곳이 하나여야 다음에 조작이 하나 더 늘어도 같은 규칙이 적용되기
+ * 때문이다.
+ */
+function reviewedFileOps(proposal: DraftProposal, decision: ReviewDecision): FileOps {
+  return {
+    moves: decision.revisedMoves ?? proposal.moves,
+    deletions: decision.revisedDeletions ?? proposal.deletions,
+  };
 }
 
 /** 초안/수정 결과에서 patch 밖 조작만 꺼낸다. 두 경로가 같은 값을 만들도록 한 곳에 둔다. */

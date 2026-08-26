@@ -93,14 +93,21 @@ function renderCommand(cmd: { program: string; args: string[]; cwd: string }): s
   return `${[cmd.program, ...cmd.args].join(" ")} (in ${cmd.cwd})`;
 }
 
-const PATCH_RULES = [
-  "Return changes as a unified diff in the `patch` field.",
+/**
+ * diff 형식 규칙 — **실행자와 검수자가 공유한다.** 어느 필드에 담기든 같은 사실이기 때문이다.
+ */
+const DIFF_FORMAT_RULES = [
   "The diff MUST apply cleanly with exact context matching — no fuzzy matching is performed.",
   "Use hunk headers of the form `@@ -oldStart,oldCount +newStart,newCount @@`.",
   "Context lines start with a single space, removals with `-`, additions with `+`.",
   "Include at least one line of surrounding context per hunk when the file is non-empty.",
   "Hunks must appear in ascending order of original line number.",
   "Only modify files that appear in the Files section above.",
+];
+
+const PATCH_RULES = [
+  "Return changes as a unified diff in the `patch` field.",
+  ...DIFF_FORMAT_RULES,
   // **문을 만들었으면 걸어 들어가는 길도 만든다**(state-machine 31절의 교훈, 44절에 적용).
   // 이 줄이 없으면 `moves` 필드는 영원히 비어 있고, 모델은 이름 바꾸기를 표현할 방법이 없어
   // 파일 전체를 다시 써 보낸다.
@@ -112,6 +119,23 @@ const PATCH_RULES = [
   "To delete a file, do NOT blank it out with a patch: put its path in the `deletions` array.",
   "Deletions run first, then moves, then the patch. Write the patch as it applies after both.",
   "If the task only needs deletions or moves, leave `patch` empty — that is a valid proposal.",
+].join("\n");
+
+/**
+ * 검수자용 출력 규칙 (46절).
+ *
+ * **실행자의 `PATCH_RULES`를 그대로 쓸 수 없다.** 그 목록은 `patch`·`moves`·`deletions`에
+ * 넣으라고 말하는데 **검수자의 응답에는 그 이름의 자리가 없다** — `revisedPatch`·
+ * `revisedMoves`·`revisedDeletions`다. 있지도 않은 필드를 채우라고 시키면 모델은 스키마가
+ * 받지 않는 응답을 만들거나, 자기가 시킨 대로 했다고 믿고 **아무 데도 닿지 않는 값**을 낸다.
+ *
+ * 종전에는 검수 프롬프트가 `PATCH_RULES`를 그대로 붙이고 있었다.
+ */
+const REVIEWER_PATCH_RULES = [
+  "Return your corrected diff in the `revisedPatch` field.",
+  ...DIFF_FORMAT_RULES,
+  "Write `revisedPatch` as it applies after the file operations that will actually run —",
+  "the draft's, or yours if you send `revisedMoves` / `revisedDeletions`.",
 ].join("\n");
 
 /**
@@ -207,6 +231,46 @@ function renderGateFeedback(reasons: string[] | undefined): string {
   );
 }
 
+/**
+ * 초안이 patch **밖에서** 하려는 일 — 검수자에게 보이는 자리 (46절).
+ *
+ * 제목에 괄호를 쓰지 않는다: 전송 분류 대조가 섹션 이름을 ` (`에서 자르므로(동적 접미사를
+ * 가진 제목들 때문이다) 괄호 안의 말은 분류 목록에 닿지 않는다.
+ *
+ * # 왜 언제나 넣는가
+ *
+ * 비어 있을 때 섹션을 빼면 검수자는 "조작이 없다"와 "조작을 보여주지 않았다"를 구별할 수
+ * 없다. 검수자가 판정하는 대상이 무엇인지가 판정보다 먼저다.
+ *
+ * # 왜 blind에서도 숨기지 않는가
+ *
+ * Blind Review가 숨기는 것은 **초안 작성자의 자기설명**이다(interpretation, risks). 이동과
+ * 삭제는 설명이 아니라 **제안 그 자체**이고, patch를 보여주면서 이것을 숨기면 검수자는
+ * 실행될 것의 일부만 보고 판정하게 된다.
+ */
+function renderDraftFileOps(draft: DraftProposal): string {
+  const lines = ["## File operations requested outside the patch"];
+  const moves = draft.moves ?? [];
+  const deletions = draft.deletions ?? [];
+
+  if (moves.length === 0 && deletions.length === 0) {
+    lines.push("(none — the patch is the whole change)");
+  } else {
+    for (const move of moves) lines.push(`- move: ${move.from} → ${move.to}`);
+    for (const path of deletions) lines.push(`- delete: ${path}`);
+    // **이걸 말하지 않으면 검수자가 옳은 초안을 엉뚱한 이유로 거부한다.** 이름을 바꾸는
+    // 초안의 patch는 새 경로를 가리키는데, 그 경로는 위 Files 섹션에 없다 — 출력 규칙의
+    // "Files 섹션에 있는 파일만 고쳐라"와 정면으로 부딪히는 것처럼 보인다.
+    lines.push(
+      "",
+      "These run BEFORE the patch, in this order: deletions, then moves, then the patch.",
+      "So the patch below is written against the paths as they exist AFTER these operations —",
+      "a path here may not appear in the Files section above, and that is expected, not an error."
+    );
+  }
+  return lines.join("\n");
+}
+
 export function buildReviewPrompt(input: {
   userMessage: string;
   snapshot: WorkspaceSnapshot;
@@ -243,6 +307,7 @@ export function buildReviewPrompt(input: {
     // "blind를 기본값으로"를 **철회**했으므로, 이 주석을 읽고 기본값을 뒤집으면 측정으로 내린
     // 결정을 되돌리는 것이 된다. 실험 플래그로 남겨 계속 잰다.
     parts.push(
+      renderDraftFileOps(input.draft),
       "## Proposed patch (author's own explanation withheld deliberately)\n```diff\n" + (input.draft.patch ?? "(no patch)") + "\n```"
     );
   } else {
@@ -253,6 +318,8 @@ export function buildReviewPrompt(input: {
         "",
         "## Draft author's stated risks",
         input.draft.risks.length > 0 ? input.draft.risks.map((r) => `- ${r}`).join("\n") : "(none stated)",
+        "",
+        renderDraftFileOps(input.draft),
         "",
         "## Proposed patch",
         "```diff",
@@ -265,12 +332,20 @@ export function buildReviewPrompt(input: {
   parts.push(
     [
       "## Verdict rules",
-      "ACCEPT — the patch is correct as-is. Leave `revisedPatch` empty.",
-      "REVISE — the approach is right but the patch needs changes. Provide a complete corrected `revisedPatch`.",
-      "REJECT — the patch is wrong or the request cannot be safely addressed. Give `rejectionReason`.",
+      "You are judging the patch AND the file operations above — both will run if you accept.",
+      "ACCEPT — the change is correct as-is. Leave `revisedPatch` empty.",
+      "REVISE — the approach is right but the change needs correcting. Provide a complete corrected `revisedPatch`.",
+      // **검수자가 조작을 거부하는 유일한 길**(46절). 이 두 줄이 없으면 검수자는 이동과 삭제를
+      // 보고도 "그건 하지 마라"를 말할 수 없고, REVISE는 초안의 조작을 그대로 실은 채 나간다.
+      "  To drop or change the file operations, send `revisedMoves` / `revisedDeletions`.",
+      "  Omitting them keeps the draft's operations; an empty array drops them all.",
+      "  If you change them, write `revisedPatch` against the paths as they exist after YOUR version.",
+      "REJECT — the change is wrong or the request cannot be safely addressed. Give `rejectionReason`.",
       "NEED_USER_INPUT — the request is genuinely ambiguous. Give `questionsForUser`.",
       "",
-      PATCH_RULES,
+      // **실행자의 규칙을 그대로 쓰지 않는다**(46절). 그 목록은 "`moves` 배열에 넣어라"라고
+      // 말하는데 검수자에게는 그런 자리가 없다 — 있지도 않은 필드를 채우라고 시키고 있었다.
+      REVIEWER_PATCH_RULES,
     ].join("\n")
   );
   return parts.join("\n\n");
@@ -411,6 +486,32 @@ export const DRAFT_SCHEMA = {
         additionalProperties: false,
       },
     },
+    // **스키마가 진짜 문이다**(46절). 44·45절이 `moves`/`deletions` 필드를 만들고 프롬프트에
+    // 쓰는 법까지 적었지만 여기 없었다 — 이 스키마는 `strict: true` + `additionalProperties:
+    // false`라 **그 이름의 속성은 아예 나올 수 없다.** 프롬프트가 "`moves` 배열에 넣어라"고
+    // 말하는 동안 스키마는 그 배열을 금지하고 있었다.
+    moves: {
+      type: "array",
+      description:
+        "Files to rename or move, as {from, to}. Empty array in the normal case. " +
+        "Do NOT express a rename as a delete plus a re-create — that resends the whole file.",
+      items: {
+        type: "object",
+        properties: {
+          from: { type: "string", description: "Existing workspace-relative path." },
+          to: { type: "string", description: "New workspace-relative path. Must not already exist." },
+        },
+        required: ["from", "to"],
+        additionalProperties: false,
+      },
+    },
+    deletions: {
+      type: "array",
+      description:
+        "Workspace-relative paths to delete. Empty array in the normal case. " +
+        "Do NOT delete a file by emptying it with the patch — that leaves the file behind.",
+      items: { type: "string" },
+    },
     risks: { type: "array", items: { type: "string" } },
     requiredTests: { type: "array", items: { type: "string" } },
     uncertainties: { type: "array", items: { type: "string" } },
@@ -440,6 +541,10 @@ export const DRAFT_SCHEMA = {
     "interpretation",
     "patch",
     "plan",
+    // strict schema는 모든 속성을 required로 요구한다. 비어 있는 배열이 정상이라는 것은
+    // 위 description이 말한다 — 말하지 않으면 모델이 "채워야 하는 칸"으로 읽고 억지로 만든다.
+    "moves",
+    "deletions",
     "risks",
     "requiredTests",
     "uncertainties",
@@ -455,6 +560,29 @@ export const REVIEW_SCHEMA = {
     verdict: { type: "string", enum: ["ACCEPT", "REVISE", "REJECT", "NEED_USER_INPUT"] },
     rationale: { type: "string" },
     revisedPatch: { type: "string", description: "Required for REVISE: the corrected unified diff." },
+    // **검수자의 자리는 실행자의 자리와 이름이 다르다**(46절). 여기에 `moves`를 두면
+    // "검수자가 새 이동을 제안한다"가 되는데, 검수자가 하는 일은 **초안의 조작을 고치는 것**이다.
+    //
+    // 생략과 빈 배열의 뜻이 다르다: 생략 = 말하지 않았다(초안의 것을 그대로), 빈 배열 =
+    // 명시적으로 비웠다(하지 않는다). 하나로 뭉개면 "말하지 않았다"가 "지우지 마라"가 된다.
+    revisedMoves: {
+      type: "array",
+      description:
+        "REVISE only: replaces the draft's `moves` entirely. Omit to keep the draft's moves as they are; " +
+        "send an empty array to drop them all.",
+      items: {
+        type: "object",
+        properties: { from: { type: "string" }, to: { type: "string" } },
+        required: ["from", "to"],
+      },
+    },
+    revisedDeletions: {
+      type: "array",
+      description:
+        "REVISE only: replaces the draft's `deletions` entirely. Omit to keep them; " +
+        "send an empty array to delete nothing.",
+      items: { type: "string" },
+    },
     questionsForUser: { type: "array", items: { type: "string" } },
     rejectionReason: { type: "string" },
   },
@@ -472,6 +600,21 @@ export const SINGLE_FIX_SCHEMA = {
     patch: { type: "string", description: "Required for ACCEPT: unified diff to apply." },
     questionsForUser: { type: "array", items: { type: "string" } },
     rejectionReason: { type: "string" },
+    // 대조 경로와 같은 자리 (44·45·46절). `fast` 모드에서만 이동·삭제가 사라지지 않게 한다.
+    moves: {
+      type: "array",
+      description: "Files to rename or move, as {from, to}. Omit or leave empty in the normal case.",
+      items: {
+        type: "object",
+        properties: { from: { type: "string" }, to: { type: "string" } },
+        required: ["from", "to"],
+      },
+    },
+    deletions: {
+      type: "array",
+      description: "Workspace-relative paths to delete. Omit or leave empty in the normal case.",
+      items: { type: "string" },
+    },
     // 대조 경로와 같은 자리 (31절). 여기 두지 않으면 `fast` 모드에서만 MCP가 조용히 사라진다.
     // **이 스키마는 strict가 아니므로 required에 넣지 않는다** — 넣으면 REJECT일 때도
     // 억지로 채우게 되고, 그건 13.3절이 이미 겪은 문제다.

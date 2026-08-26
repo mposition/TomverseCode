@@ -148,6 +148,12 @@ pub const UNREPORTED_SECTIONS: &[&str] = &[
     "Draft author's interpretation",
     "Draft author's stated risks",
     "Proposed patch",
+    // 초안이 patch 밖에서 하려는 일(46절). **바로 위 항목과 같은 가족이다** — 제안 자체이고,
+    // 내용은 워크스페이스 경로다. 지시문이 아니므로 위 칸에 넣을 수 없고, 집계가 세지도 않는다.
+    //
+    // (주석에 다른 섹션 이름을 큰따옴표로 적지 말 것. 대조 테스트가 이 목록을 정규식으로
+    //  읽으므로 그 이름이 목록에 한 번 더 들어간 것이 된다 — 42절에서 같은 함정을 밟았다.)
+    "File operations requested outside the patch",
     "Your previous draft was rejected before it was applied",
     // 게이트 거부 사유(42절). 바로 위 항목과 같은 가족이다 — 우리 문장에 게이트의 사유가
     // 붙고, 그 사유에는 **경로가 들어갈 수 있다**(경계 위반이면 그 경로가 문장에 있다).
