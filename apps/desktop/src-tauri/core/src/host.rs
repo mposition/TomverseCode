@@ -523,6 +523,24 @@ impl TaskHost {
     /// 태스크의 정책은 `begin_task`가 고정했고(`profiles`) 그 프로필을 그대로 쓴다.
     /// 태스크를 모르면 **기본 프로필로 대신하지 않는다** — 대신하면 그 사실이 어디에도
     /// 나타나지 않은 채 비교가 성립한 것처럼 보인다.
+    /// **그 태스크가 실제로 받은 예고** — 기록에서 읽는다 (state-machine 60절).
+    ///
+    /// `autopilot_preview_for_task`가 아니라 이쪽이 `blocked`와 나란히 놓을 값이다. 저쪽은
+    /// **지금** 게이트에 묻고, 게이트의 답은 지금의 파일 상태에 달려 있다 — 태스크가 파일을
+    /// 바꿨으므로 끝난 뒤의 답은 그 태스크가 받은 예고가 아니다.
+    ///
+    /// 기록이 없으면 `None`이다. **다시 계산해서 대신하지 않는다**: 대신하면 "그때의 예고"라는
+    /// 이름표가 붙은 다른 값이 나오고, 그 위에서 "예고가 어긋났다"고 말하게 된다.
+    pub fn recorded_autopilot_preview(&self, task_id: &str) -> Result<Option<Value>, String> {
+        let events = self
+            .with_store(|s| s.events_after(task_id, None))
+            .map_err(|e| format!("이벤트 조회 실패: {e}"))?;
+        Ok(events
+            .into_iter()
+            .find(|e| e.event_type == "AUTOPILOT_PREVIEW_PINNED")
+            .map(|e| e.payload))
+    }
+
     pub fn autopilot_preview_for_task(&self, task_id: &str) -> Option<crate::autopilot::Preview> {
         let profile = self.profiles.lock().unwrap().get(task_id).cloned()?;
         Some(crate::autopilot::preview(&self.root, &profile, &self.hooks))
@@ -570,11 +588,36 @@ impl TaskHost {
         let profile = Arc::new(TaskProfile::with_hooks_and_mcp(&self.root, policy, self.mcp.clone(), &self.hooks));
         let summary = self.effective_config(&profile, skill);
         let deadline = profile.policy.deadline_ms;
+        let unattended = profile.policy.unattended;
         profiles.insert(task_id.to_string(), profile);
         // **잠금을 놓고 나서 기록한다.** `append_event`는 훅을 부를 수 있고(PHASE_CHANGED),
         // 훅 경로가 다시 프로필을 읽으면 같은 잠금에서 교착된다.
         drop(profiles);
         let _ = self.append_event(task_id, "TASK_CONFIG_PINNED", summary);
+
+        // **예고를 지금 기록한다** — state-machine 60절.
+        //
+        // # 왜 나중에 다시 계산하면 안 되는가
+        //
+        // 59절은 `blocked`와 나란히 놓을 미리보기를 **태스크의 고정된 정책**으로 만들게 했다.
+        // 정책은 그것으로 맞았는데 **워크스페이스는 아니다**: 미리보기는 게이트에 묻고,
+        // 게이트의 답은 그때의 파일 상태에 달려 있다(검증 명령 감지, 매니페스트, 훅 프로그램).
+        // 태스크가 파일을 바꾸므로, 끝난 뒤에 다시 계산하면 **그 태스크가 받은 예고가 아니다.**
+        //
+        // 그러면 "예고가 어긋났다"는 판정이 우리가 만든 거짓 신호가 된다 — 59.3절이 정책에
+        // 대해 막은 것과 **같은 종류의 오류가 워크스페이스 축에 남아 있었다.**
+        //
+        // # 무인일 때만 기록한다
+        //
+        // 사람이 있는 실행에서는 이 예고가 답하는 질문("물을 사람이 없을 때 어디서 멈추는가")
+        // 자체가 성립하지 않는다. 늘 기록하면 감사 기록에 아무도 읽지 않는 큰 페이로드가
+        // 태스크마다 쌓인다.
+        if unattended {
+            if let Some(preview) = self.autopilot_preview_for_task(task_id) {
+                let payload = serde_json::to_value(&preview).unwrap_or(Value::Null);
+                let _ = self.append_event(task_id, "AUTOPILOT_PREVIEW_PINNED", payload);
+            }
+        }
 
         // **시한 감시를 여기서 건다**(39절). 태스크가 시작하는 자리는 여기 하나이므로, 여기서
         // 걸면 진입점마다 거는 것을 사람이 기억할 필요가 없다 — 그 규칙은 언젠가 한쪽에서
@@ -3623,6 +3666,50 @@ mod tests {
             "{:?}",
             profile.verification_pin
         );
+    }
+
+    /// **예고를 시작 시점에 기록한다** — state-machine 60절.
+    ///
+    /// 59절은 미리보기를 **고정된 정책**으로 만들게 했다. 정책 축은 그것으로 맞았는데
+    /// **워크스페이스 축이 남아 있었다**: 미리보기는 게이트에 묻고 게이트의 답은 그때의 파일
+    /// 상태에 달려 있다(검증 명령 감지, 매니페스트, 훅 프로그램). 태스크가 파일을 바꾸므로
+    /// 끝난 뒤에 다시 계산하면 **그 태스크가 받은 예고가 아니다.**
+    #[test]
+    fn the_preview_is_recorded_when_the_task_starts() {
+        let (_ws, _a, host) = host_with_manifest(TaskPolicy::default(), Arc::new(AlwaysDeny), None);
+        host.begin_task(
+            "task-1",
+            TaskPolicy {
+                unattended: true,
+                ..TaskPolicy::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let recorded = host.recorded_autopilot_preview("task-1").unwrap().expect("예고가 기록되지 않았습니다");
+        assert_eq!(recorded["switches"]["unattended"], serde_json::json!(true), "{recorded}");
+        assert!(recorded.get("stops").and_then(|v| v.as_array()).is_some(), "{recorded}");
+    }
+
+    /// **사람이 있는 실행에서는 기록하지 않는다.** 그 예고가 답하는 질문("물을 사람이 없을 때
+    /// 어디서 멈추는가")이 성립하지 않고, 늘 기록하면 아무도 읽지 않는 큰 페이로드가 쌓인다.
+    #[test]
+    fn an_attended_task_records_no_preview() {
+        let (_ws, _a, host) = host_with_manifest(TaskPolicy::default(), Arc::new(AlwaysDeny), None);
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+        assert!(host.recorded_autopilot_preview("task-1").unwrap().is_none());
+    }
+
+    /// **기록이 없으면 다시 계산해서 대신하지 않는다.** 대신하면 "그때의 예고"라는 이름표가
+    /// 붙은 다른 값이 나오고, 그 위에서 "예고가 어긋났다"고 말하게 된다.
+    #[test]
+    fn a_missing_record_is_none_not_a_fresh_computation() {
+        let (_ws, _a, host) = host_with_manifest(TaskPolicy::default(), Arc::new(AlwaysDeny), None);
+        host.begin_task("task-1", TaskPolicy::default(), None).unwrap();
+        // 프로필은 있으므로 다시 계산할 수는 **있다** — 그런데도 `None`이어야 한다.
+        assert!(host.autopilot_preview_for_task("task-1").is_some());
+        assert!(host.recorded_autopilot_preview("task-1").unwrap().is_none());
     }
 
     /// **태스크를 모르면 기본 프로필로 대신하지 않는다** — state-machine 59절.

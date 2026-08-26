@@ -744,6 +744,74 @@ pub struct OperationalCounts {
     pub policy_denials: u64,
 }
 
+/// 읽기 전용 경로가 **더 읽어 달라고 한 횟수** — state-machine 57.8절.
+///
+/// # 무엇에 답하는가
+///
+/// `contextRounds` 기본값이 1이다. 그 값은 관례가 아니라 판단이었지만(라운드마다 답 하나가
+/// 버려진다) **재본 적은 없다.** 늘려야 하는지는 이 숫자가 답한다.
+///
+/// # 분모가 라운드가 아니라 **답변/계획 태스크**다
+///
+/// 라운드로 세면 라운드를 돈 태스크만 분모에 들어와 "라운드를 돌면 대개 한 번 더 돈다"는
+/// 동어반복이 나온다. 물어야 하는 것은 *"읽기 전용 태스크 중 몇이 더 읽어 달라고 했는가"*다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ContextRounds {
+    /// 답변·계획 태스크 수. **비율의 분모다.**
+    #[serde(rename = "readOnlyTasks")]
+    pub read_only_tasks: u64,
+    /// 그중 라운드를 실제로 돈 태스크 수.
+    #[serde(rename = "tasksWithRound")]
+    pub tasks_with_round: u64,
+    /// 라운드에서 실제로 실은 파일 수의 합.
+    #[serde(rename = "filesFetched")]
+    pub files_fetched: u64,
+    /// 들어주지 못한 요청 수의 합. **크면 모델이 경로가 아닌 것을 요청하고 있다는 뜻이다.**
+    #[serde(rename = "requestsRefused")]
+    pub requests_refused: u64,
+    /// 상한에 걸려 라운드를 못 돈 태스크 수. **이 값이 크면 상한을 올릴 근거가 된다** —
+    /// 그게 이 집계가 존재하는 이유다.
+    #[serde(rename = "stoppedByLimit")]
+    pub stopped_by_limit: u64,
+    /// 돌 이유가 없어 건너뛴 수(가져올 것이 없거나 이미 갖고 있음). 상한과 **구별해야 한다**:
+    /// 이쪽이 크면 상한을 올려도 아무 일도 일어나지 않는다.
+    #[serde(rename = "skippedAsPointless")]
+    pub skipped_as_pointless: u64,
+}
+
+/// 무인 실행 **예고가 얼마나 맞았는가** — state-machine 59.6절.
+///
+/// # 예고와 실제를 기록에서 잇는다
+///
+/// 59절이 화면에서 이었고, 그 판정 규칙(예고대로 / 어긋남 / 다루지 않음)은 거기 있다.
+/// 여기서는 같은 규칙을 **저장된 이벤트**에 적용해 빈도를 낸다 — 화면은 한 태스크를 보고
+/// 이 집계는 여러 태스크를 본다.
+///
+/// # `contradicted`가 이 집계의 목적이다
+///
+/// 미리보기가 "지나간다"고 한 자리에서 멈춘 횟수다. 0이 아니면 미리보기를 그대로 믿을 수
+/// 없다는 뜻이고, 그건 47절 기능의 신뢰도 자체다.
+///
+/// `notProbed`는 **다른 질문에 답한다**: probe 집합이 좁다는 뜻이지 예고가 틀렸다는 뜻이
+/// 아니다(47.9절 — 둘은 짝이지 대체재가 아니다). 뭉치면 어느 쪽으로든 거짓이 된다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct PreviewAccuracy {
+    /// 예고가 기록된 무인 태스크 수. **비율의 분모다.**
+    #[serde(rename = "tasksWithPreview")]
+    pub tasks_with_preview: u64,
+    /// 그중 실제로 멈춘 태스크 수.
+    #[serde(rename = "tasksThatStopped")]
+    pub tasks_that_stopped: u64,
+    /// 예고한 자리에서 멈춘 정지 수.
+    #[serde(rename = "asPreviewed")]
+    pub as_previewed: u64,
+    /// **예고가 "지나간다"고 한 자리에서 멈춘 정지 수.** 이 집계의 목적이다.
+    pub contradicted: u64,
+    /// 미리보기가 다루지 않은 규칙에서 멈춘 정지 수 — probe 집합의 넓이에 대한 값이다.
+    #[serde(rename = "notProbed")]
+    pub not_probed: u64,
+}
+
 /// 예약이 실제 비용의 몇 배였는가 — multi-engine-routing.md 10.6절.
 ///
 /// # 문서가 "측정할 수 있다"고 적어둔 것이 측정되지 않고 있었다
@@ -1018,6 +1086,12 @@ pub struct Metrics {
     /// 14절 보조 지표의 순수 집계.
     #[serde(rename = "operational")]
     pub operational: OperationalCounts,
+    /// 읽기 전용 경로가 더 읽어 달라고 한 횟수 (state-machine 57.8절).
+    #[serde(rename = "contextRounds")]
+    pub context_rounds: ContextRounds,
+    /// 무인 예고가 얼마나 맞았는가 (state-machine 59.6절).
+    #[serde(rename = "previewAccuracy")]
+    pub preview_accuracy: PreviewAccuracy,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
@@ -1195,6 +1269,22 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "판정된 기준 개수",
             m.coverage.criteria,
             "no_test_reference가 압도적이면 (a) 기준을 적을 때 테스트를 함께 적게 하거나 (b) 잇는 규칙을 넓힌다. **(b)를 먼저 하고 싶은 유혹을 경계할 것** — 늘어난 확인이 근거 있는지는 같은 규칙으로 검사할 수 없다. 다만 17.9.1절이 고친 것은 (b)가 아니라 **실재 판정의 오류**였다: 증거의 문턱은 그대로 두고 '이 파일이 있는가'에 잘못 답하던 것을 고쳤으므로, 그 변경 이전 기록과 이후 기록은 같은 축이 아니다",
+        ),
+        open_question(
+            "contextRounds",
+            "contextRounds",
+            "읽기 전용 경로의 라운드 상한 1이 맞는가 (state-machine 57.8절)",
+            "답변·계획 태스크 수",
+            m.context_rounds.read_only_tasks,
+            "stoppedByLimit가 크면 상한을 올릴 근거다. **skippedAsPointless가 크면 아니다** — 그건 돌 이유가 없었다는 뜻이라 상한을 올려도 아무 일도 일어나지 않는다. requestsRefused가 크면 상한이 아니라 프롬프트 문제다: 모델이 경로가 아닌 것을 요청하고 있다",
+        ),
+        open_question(
+            "previewAccuracy",
+            "previewAccuracy",
+            "무인 실행 미리보기를 그대로 믿어도 되는가 (state-machine 59.6절)",
+            "예고가 기록된 무인 태스크 수",
+            m.preview_accuracy.tasks_with_preview,
+            "contradicted가 0이 아니면 미리보기가 47절의 약속을 지키지 못하는 것이고, 화면이 그것을 크게 말하는 것만으로는 부족하다 — 게이트 판정과 probe의 어긋남을 찾아야 한다. **notProbed는 다른 축이다**: probe 집합이 좁다는 뜻이므로 47.9절의 probe 목록을 넓히는 근거이지 예고가 틀렸다는 뜻이 아니다",
         ),
         open_question(
             "conflictOutcomes",
@@ -1726,6 +1816,12 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
         // ---- 카드 답변: 자리별 분포 ----
         collect_card_answers(&events, &mut metrics.card_answers);
 
+        // ---- 읽기 전용 경로의 컨텍스트 라운드 (57.8절) ----
+        collect_context_rounds(&events, &mut metrics.context_rounds);
+
+        // ---- 무인 예고가 맞았는가 (59.6절) ----
+        collect_preview_accuracy(&events, &mut metrics.preview_accuracy);
+
         // ---- 취소 소요: CANCELLATION_REQUESTED → 그 뒤 첫 터미널 ----
         collect_cancellation(&events, &mut metrics.cancellation, &mut latencies);
 
@@ -1796,6 +1892,101 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
 /// 3.4절 확인 필요 카드(모델이 스스로 모호하다고 말한 경우)에는 쟁점도 자리도 없다.
 /// 그건 **다른 화면**이므로 이 집계에 섞지 않는다 — 섞으면 자리 없는 답이 전부 `unknown`으로
 /// 쌓여 분모를 부풀린다.
+/// 읽기 전용 경로의 컨텍스트 라운드를 센다 — state-machine 57.8절.
+///
+/// **분모는 답변·계획 태스크다.** 라운드를 돈 태스크만 세면 "라운드를 돌면 대개 돈다"는
+/// 동어반복이 나온다.
+fn collect_context_rounds(events: &[crate::store::StoredEvent], out: &mut ContextRounds) {
+    let read_only = events
+        .iter()
+        .any(|e| matches!(e.event_type.as_str(), "QUESTION_ANSWERED" | "PLAN_OUTLINED"));
+    if !read_only {
+        return;
+    }
+    out.read_only_tasks += 1;
+
+    let mut ran = false;
+    for event in events {
+        match event.event_type.as_str() {
+            "CONTEXT_ROUND_COMPLETED" => {
+                ran = true;
+                out.files_fetched += array_len(&event.payload, "fetched");
+                out.requests_refused += array_len(&event.payload, "refused");
+            }
+            "CONTEXT_ROUND_SKIPPED" => {
+                let reason = event.payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                // **상한과 "돌 이유가 없음"을 구별한다.** 뭉치면 상한을 올릴 근거가 사라진다:
+                // 후자가 큰 것은 상한을 올려도 아무 일도 일어나지 않는다는 뜻이다.
+                if reason == "limit_reached" {
+                    out.stopped_by_limit += 1;
+                } else {
+                    out.skipped_as_pointless += 1;
+                }
+                out.requests_refused += array_len(&event.payload, "refused");
+            }
+            _ => {}
+        }
+    }
+    if ran {
+        out.tasks_with_round += 1;
+    }
+}
+
+fn array_len(payload: &Value, key: &str) -> u64 {
+    payload.get(key).and_then(|v| v.as_array()).map(|a| a.len() as u64).unwrap_or(0)
+}
+
+/// 예고와 실제를 **기록에서** 잇는다 — state-machine 59.6절.
+///
+/// 판정 규칙은 59.1절과 같다: 예고한 자리 / "지나간다"고 한 자리에서 멈춤 / 다루지 않은 규칙.
+/// **셋을 뭉개지 않는 이유도 같다** — 전부 "예고대로"면 어긋남이 사라지고, 전부 "틀렸다"면
+/// 없는 결함을 만든다.
+fn collect_preview_accuracy(events: &[crate::store::StoredEvent], out: &mut PreviewAccuracy) {
+    let Some(preview) = events
+        .iter()
+        .find(|e| e.event_type == "AUTOPILOT_PREVIEW_PINNED")
+        .map(|e| &e.payload)
+    else {
+        return;
+    };
+    out.tasks_with_preview += 1;
+
+    let rules_of = |key: &str| -> std::collections::BTreeSet<String> {
+        preview
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|p| p.get("matchedRule").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let previewed_stops = rules_of("stops");
+    let previewed_proceeds = rules_of("proceeds");
+
+    let mut stopped = false;
+    for event in events.iter().filter(|e| e.event_type == "APPROVAL_UNATTENDED") {
+        stopped = true;
+        let rule = event
+            .payload
+            .get("matchedRule")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if previewed_stops.contains(rule) {
+            out.as_previewed += 1;
+        } else if previewed_proceeds.contains(rule) {
+            out.contradicted += 1;
+        } else {
+            out.not_probed += 1;
+        }
+    }
+    if stopped {
+        out.tasks_that_stopped += 1;
+    }
+}
+
 fn collect_card_answers(events: &[crate::store::StoredEvent], out: &mut CardAnswers) {
     for event in events {
         if event.event_type != "USER_DECISION_RECORDED" {
@@ -2950,6 +3141,123 @@ mod tests {
 
     fn question<'a>(m: &'a Metrics, id: &str) -> &'a OpenQuestion {
         m.open_questions.iter().find(|q| q.id == id).expect(id)
+    }
+
+    // ---- 컨텍스트 라운드 (state-machine 57.8절) ----
+
+    /// **분모는 답변·계획 태스크다.** 라운드를 돈 태스크만 세면 "라운드를 돌면 대개 돈다"는
+    /// 동어반복이 나온다.
+    #[test]
+    fn a_change_task_is_not_in_the_context_round_denominator() {
+        let (_d, mut store) = seeded();
+        store.append_event("task-1", "TASK_COMPLETED", &json!({})).unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_rounds.read_only_tasks, 0);
+    }
+
+    #[test]
+    fn a_context_round_is_counted_with_what_it_fetched_and_refused() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "CONTEXT_ROUND_COMPLETED",
+                &json!({ "fetched": ["a.ts", "b.ts"], "refused": [{ "request": "설명", "reason": "x" }] }),
+            )
+            .unwrap();
+        store.append_event("task-1", "QUESTION_ANSWERED", &json!({})).unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_rounds.read_only_tasks, 1);
+        assert_eq!(m.context_rounds.tasks_with_round, 1);
+        assert_eq!(m.context_rounds.files_fetched, 2);
+        assert_eq!(m.context_rounds.requests_refused, 1);
+    }
+
+    /// **상한과 "돌 이유가 없음"을 구별한다.** 뭉치면 상한을 올릴 근거가 사라진다 —
+    /// 후자가 큰 것은 상한을 올려도 아무 일도 일어나지 않는다는 뜻이다.
+    #[test]
+    fn the_limit_and_a_pointless_round_are_counted_apart() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "CONTEXT_ROUND_SKIPPED", &json!({ "reason": "limit_reached" }))
+            .unwrap();
+        store
+            .append_event("task-1", "CONTEXT_ROUND_SKIPPED", &json!({ "reason": "nothing_fetchable" }))
+            .unwrap();
+        store
+            .append_event("task-1", "CONTEXT_ROUND_SKIPPED", &json!({ "reason": "already_in_context" }))
+            .unwrap();
+        store.append_event("task-1", "PLAN_OUTLINED", &json!({})).unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_rounds.stopped_by_limit, 1);
+        assert_eq!(m.context_rounds.skipped_as_pointless, 2);
+        // 건너뛰기만 있었으면 "라운드를 돈" 태스크가 아니다.
+        assert_eq!(m.context_rounds.tasks_with_round, 0);
+        assert_eq!(m.context_rounds.read_only_tasks, 1);
+    }
+
+    // ---- 예고가 맞았는가 (state-machine 59.6절) ----
+
+    fn pinned_preview(stops: Vec<&str>, proceeds: Vec<&str>) -> Value {
+        let rule = |r: &str| json!({ "tool": "apply_patch", "probe": r, "decision": "require_user_approval", "matchedRule": r, "fate": { "kind": "unattended_stop" }, "rerunFlag": null });
+        json!({
+            "switches": { "unattended": true },
+            "stops": stops.iter().map(|r| rule(r)).collect::<Vec<_>>(),
+            "proceeds": proceeds.iter().map(|r| rule(r)).collect::<Vec<_>>(),
+            "denied": [],
+            "caveat": "한계",
+        })
+    }
+
+    /// **예고가 없으면 분모에 들어가지 않는다.** 들어가면 "예고가 맞은 비율"의 분모가
+    /// 예고를 받지 않은 태스크로 부풀려진다.
+    #[test]
+    fn a_task_without_a_pinned_preview_is_not_in_the_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "APPROVAL_UNATTENDED", &json!({ "matchedRule": "r" }))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.preview_accuracy.tasks_with_preview, 0);
+        assert_eq!(m.preview_accuracy.not_probed, 0);
+    }
+
+    /// **셋을 뭉개지 않는다**(59.1절). 전부 "예고대로"면 어긋남이 사라지고, 전부 "틀렸다"면
+    /// 없는 결함을 만든다.
+    #[test]
+    fn stops_are_split_three_ways_against_the_pinned_preview() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "AUTOPILOT_PREVIEW_PINNED", &pinned_preview(vec!["a"], vec!["b"]))
+            .unwrap();
+        for rule in ["a", "b", "c"] {
+            store
+                .append_event("task-1", "APPROVAL_UNATTENDED", &json!({ "matchedRule": rule }))
+                .unwrap();
+        }
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.preview_accuracy.tasks_with_preview, 1);
+        assert_eq!(m.preview_accuracy.tasks_that_stopped, 1);
+        assert_eq!(m.preview_accuracy.as_previewed, 1, "{:?}", m.preview_accuracy);
+        // **이 집계의 목적**: 예고가 "지나간다"고 한 자리에서 멈춘 횟수.
+        assert_eq!(m.preview_accuracy.contradicted, 1, "{:?}", m.preview_accuracy);
+        // probe 집합이 좁다는 뜻이지 예고가 틀렸다는 뜻이 아니다.
+        assert_eq!(m.preview_accuracy.not_probed, 1, "{:?}", m.preview_accuracy);
+    }
+
+    /// 예고를 받고 멈추지 않은 태스크도 분모에 남는다 — 그게 "얼마나 자주 어긋나는가"의 분모다.
+    #[test]
+    fn a_previewed_task_that_never_stopped_stays_in_the_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "AUTOPILOT_PREVIEW_PINNED", &pinned_preview(vec!["a"], vec![]))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.preview_accuracy.tasks_with_preview, 1);
+        assert_eq!(m.preview_accuracy.tasks_that_stopped, 0);
     }
 
     #[test]

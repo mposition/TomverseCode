@@ -571,14 +571,13 @@ impl SessionState {
     /// 지금 스위치로 만들면 다른 질문에 대한 답을 나란히 놓게 되고, 그 상태에서
     /// "예고가 어긋났다"고 말하는 것은 우리가 만든 거짓 신호다.
     ///
-    /// 태스크를 모르면 `null`이다. 기본 프로필로 대신하지 않는다 — 대신하면 그 사실이
-    /// 어디에도 나타나지 않은 채 비교가 성립한 것처럼 보인다.
+    /// **기록이 없으면 `null`이다.** 다시 계산해서 대신하지 않는다 — 대신하면 "그때의 예고"라는
+    /// 이름표가 붙은 다른 값이 나오고, 그 위에서 "예고가 어긋났다"고 말하게 된다(60절).
     pub fn task_autopilot_preview(&self, task_id: &str) -> Result<Value, String> {
         let host = self.with_active(|active| Ok(active.host.clone()))?;
-        match host.autopilot_preview_for_task(task_id) {
-            None => Ok(Value::Null),
-            Some(preview) => serde_json::to_value(preview).map_err(|e| format!("직렬화: {e}")),
-        }
+        // **기록에서 읽는다**(60절). 지금 다시 계산하면 정책은 맞아도 **워크스페이스가 다르다** —
+        // 태스크가 파일을 바꿨으므로 그 답은 그 태스크가 받은 예고가 아니다.
+        Ok(host.recorded_autopilot_preview(task_id)?.unwrap_or(Value::Null))
     }
 
     /// 브랜치를 remote로 올리고 PR 폼 URL을 만든다 (state-machine 28절).
