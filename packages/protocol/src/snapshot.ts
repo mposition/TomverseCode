@@ -158,7 +158,26 @@ export interface WorkspaceSnapshot {
    * 말해야 한다(31.5절).
    */
   mcpResults?: { text: string; callCount: number };
+  /**
+   * **내용이 컨텍스트에 들어가지 않은 파일**과 그 사유.
+   *
+   * 경로와 사유는 프롬프트에 실린다 — 모델이 그 파일을 없다고 보고 내용을 추측하는 것을
+   * 막기 위해서다. 그러므로 여기 들어가는 `path`는 **실제 워크스페이스 경로여야 한다**:
+   * 파일이 아닌 것을 여기 넣으면 모델도 화면도 "그런 파일이 있다"고 읽는다(17절).
+   */
   excludedNotes?: { path: string; reason: string }[];
+  /**
+   * **우리가 보지 못한 영역** — context-engine.md 17절.
+   *
+   * `excludedNotes`와 다른 사실이다. 저쪽은 "이 파일의 내용을 넣지 않았다"이고 이쪽은
+   * "이 범위를 확인하지 못했으므로 여기 없다고 없는 것이 아니다"이다. 한동안 검색 쪽 노트가
+   * `excludedNotes`에 섞여 있었고, 그래서 `(search: foo)`가 **파일 이름으로** 프롬프트와
+   * 화면에 나갔다.
+   *
+   * `path`가 아니라 `scope`인 이유가 그것이다 — 이 값은 경로가 아니고, 경로인 척하면
+   * 읽는 쪽이 파일을 찾는다.
+   */
+  coverageNotes?: { scope: string; reason: string }[];
   createdAt: ISODateTime;
 }
 

@@ -601,6 +601,14 @@ export interface Transmission {
   sentFiles: { path: string; reason: string; truncated: boolean }[];
   namedOnlyFiles: { path: string; reason: string }[];
   /**
+   * **우리가 보지 못한 범위** (context-engine 17절). 파일 목록이 아니다.
+   *
+   * 한동안 이 노트들이 `namedOnlyFiles`에 섞여 있었고, 그래서 `(search: foo)`가 "이름만
+   * 나간 파일"로 화면에 떴다 — 그런 파일을 찾으러 간 사용자는 아무것도 찾지 못한다.
+   * 첫 필드가 `path`가 아니라 `scope`인 것이 그 구별이다.
+   */
+  coverageNotes: { scope: string; reason: string }[];
+  /**
    * **파일이 아닌데 함께 나간 것** (7.2절). 프로젝트 규칙 파일의 전문, 커밋되지 않은 변경
    * 요약 등이 여기 온다.
    *

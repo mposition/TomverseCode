@@ -17,6 +17,11 @@ import type { Transmission } from "../types";
  * 화면은 그것들을 말하지 않았고, 그래서 자기 `CLAUDE.md`가 나가지 않았다고 믿게 만들었다
  * (7.2절).
  *
+ * **④ 우리가 보지 못한 범위는 파일이 아니다.** 검색이 비밀값 파일을 건너뛰었다거나 결과가
+ * 상한에서 잘렸다는 사실은 "이 파일의 내용이 안 나갔다"와 **다른 사실**이다. 한동안 그
+ * 노트들이 ①의 목록에 섞여 있었고, 그래서 `(search: foo)` 같은 문자열이 파일 이름으로
+ * 떴다 — 사용자는 없는 파일을 찾으러 간다(context-engine 17절).
+ *
  * **② 마스킹은 저장 기록에만 걸린다.** `secretShapesMaskedInLog`는 DB에 남기기 전에 가린
  * 개수이고, 같은 답변은 프롬프트에 **원문으로** 실려 나갔다(17.11절). 이 숫자를 그냥 올리면
  * "가려져서 안 나갔다"로 읽히는데 정반대다.
@@ -27,7 +32,7 @@ import type { Transmission } from "../types";
  * 않은 것은 다른 사실이고, 화면이 그걸 뭉개면 거짓 안심을 준다.
  */
 export function TransmissionPanel({ transmission }: { transmission: Transmission }) {
-  const { providers, sentFiles, namedOnlyFiles, sentContext } = transmission;
+  const { providers, sentFiles, namedOnlyFiles, sentContext, coverageNotes } = transmission;
 
   if (!transmission.snapshotTaken) {
     return (
@@ -136,6 +141,27 @@ export function TransmissionPanel({ transmission }: { transmission: Transmission
               <li key={f.path}>
                 <code>{f.path}</code>
                 <div className="muted small">{f.reason}</div>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+
+      {coverageNotes.length > 0 && (
+        <>
+          <h3>찾아보지 못한 범위 ({coverageNotes.length}건)</h3>
+          {/* ④ — **이건 파일 목록이 아니다.** 한동안 이 노트들이 위의 "이름만 나간 파일"에
+              섞여 있었고, 그래서 `(search: foo)`가 파일 이름으로 떴다. 사용자는 그런 파일을
+              찾으러 갔다가 아무것도 찾지 못하고, 그 순간 이 화면 전체를 의심하게 된다. */}
+          <p className="muted small">
+            아래는 <strong>파일이 아니라 우리가 확인하지 못한 범위</strong>입니다. 컨텍스트에
+            없다는 것이 저장소에 없다는 뜻이 아니라는 사실을 모델에게도 같이 말했습니다.
+          </p>
+          <ul className="transmission-files">
+            {coverageNotes.map((n) => (
+              <li key={`${n.scope}-${n.reason}`}>
+                <span className="muted">{n.scope}</span>
+                <div className="muted small">{n.reason}</div>
               </li>
             ))}
           </ul>

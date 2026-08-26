@@ -689,7 +689,7 @@ test("본문 검색이 인덱스에서 제외된 파일을 되살리지 않는�
  * **검색 실패를 "없음"으로 읽지 않는다.** 읽지 못한 것과 없는 것은 다른 사실이고, 뭉개면
  * 컨텍스트가 조용히 좁아진 채 모델이 불린다.
  */
-test("본문 검색이 실패하면 그 사실이 제외 목록에 남는다", async () => {
+test("본문 검색이 실패하면 그 사실이 범위 노트에 남는다", async () => {
   const host = new FakeHost({
     files: [
       { path: "src/app.ts", isDir: false, sizeBytes: 40 },
@@ -706,8 +706,14 @@ test("본문 검색이 실패하면 그 사실이 제외 목록에 남는다", a
     tokenBudgets: [{ modelId: "fake-executor", maxTokens: 50_000 }],
   });
 
+  // **파일 노트가 아니다**(17절). 검색이 실패한 것은 파일의 성질이 아니라 우리 시야의 성질이고,
+  // 파일 목록에 넣으면 `(search: foo)`가 파일 이름으로 프롬프트와 화면에 나간다.
   assert.ok(
-    snapshot.excludedNotes?.some((n) => n.reason.includes("본문 검색이 실패")),
+    snapshot.coverageNotes?.some((n) => n.reason.includes("검색이 실패")),
+    JSON.stringify(snapshot.coverageNotes)
+  );
+  assert.ok(
+    !(snapshot.excludedNotes ?? []).some((n) => n.reason.includes("검색이 실패")),
     JSON.stringify(snapshot.excludedNotes)
   );
 });
@@ -961,6 +967,50 @@ test("전부 덮였으면 머리글에 그 문장이 없다", () => {
 });
 
 /**
+ * **모델에게도 두 사실을 갈라서 말한다** — context-engine 17절.
+ *
+ * 한동안 검색 쪽 노트가 `excludedNotes`에 섞여 있었고, 프롬프트는 그 목록을
+ * *"Files deliberately excluded from context"* 라는 제목 아래 내면서 *"필요하면 요청하라"*
+ * 고 덧붙였다. 그래서 모델이 읽은 것은 **`(search: foo)`라는 파일이 제외됐다**는 문장이었고,
+ * 있지도 않은 파일을 요청하라는 지시가 붙어 있었다.
+ *
+ * 두 문단은 하는 말이 다르다: 하나는 "이 파일의 내용을 넣지 않았다", 다른 하나는 "이 범위를
+ * 확인하지 못했으니 없다고 결론 내리지 말라"이다.
+ */
+test("프롬프트가 제외된 파일과 보지 못한 범위를 다른 문단으로 말한다", () => {
+  const rendered = renderSnapshot(
+    makeSnapshot({
+      excludedNotes: [{ path: ".env", reason: "비밀값 파일" }],
+      coverageNotes: [{ scope: "본문 검색: resolveBudget", reason: "비밀값 파일 2개는 검색하지 않았습니다" }],
+    })
+  );
+
+  const excludedAt = rendered.indexOf("Files deliberately excluded");
+  const coverageAt = rendered.indexOf("did NOT cover");
+  assert.notEqual(excludedAt, -1, rendered);
+  assert.notEqual(coverageAt, -1, rendered);
+  assert.notEqual(excludedAt, coverageAt, "두 문단이 하나로 합쳐졌습니다");
+
+  // **파일 문단에 범위가 들어가지 않는다.** 이게 종전 상태다.
+  const excludedBlock = rendered.slice(excludedAt, coverageAt);
+  assert.ok(!excludedBlock.includes("본문 검색"), excludedBlock);
+  assert.ok(excludedBlock.includes(".env"), excludedBlock);
+
+  // 그리고 **지시문이 다르다.** "필요하면 요청하라"는 파일에만 붙는다.
+  const coverageBlock = rendered.slice(coverageAt);
+  assert.ok(excludedBlock.includes("ask instead"), excludedBlock);
+  assert.ok(!coverageBlock.includes("ask instead"), coverageBlock);
+  assert.match(coverageBlock, /not evidence of absence/);
+});
+
+/** 범위 노트가 없으면 **그 문단이 없다** — 언제나 붙으면 신호가 아니라 배경이 된다. */
+test("보지 못한 범위가 없으면 그 문단이 없다", () => {
+  const rendered = renderSnapshot(makeSnapshot({ excludedNotes: [{ path: ".env", reason: "비밀값 파일" }] }));
+  assert.ok(rendered.includes("Files deliberately excluded"), rendered);
+  assert.ok(!rendered.includes("did NOT cover"), rendered);
+});
+
+/**
  * **검색이 찾은 줄이 실제로 실린다** — context-engine 14절, 끝에서 끝까지.
  *
  * 위 단위 검사들은 `windowAroundLines`가 앵커를 존중한다는 것과 `packageFiles`가 범위를
@@ -1105,11 +1155,14 @@ test("검색이 건너뛴 비밀값 파일이 스냅샷 노트에 남는다", as
     files: [
       { path: "src/ledger.ts", isDir: false, sizeBytes: 40 },
       { path: "package.json", isDir: false, sizeBytes: 40 },
+      // **인덱스에도 올린다.** 인덱스가 secret으로 제외하므로 지목하면 파일 노트가 하나
+      // 생기고, 그래야 아래 "파일 노트에는 없다"가 빈 목록에 대한 전칭 명제가 되지 않는다.
+      { path: ".env", isDir: false, sizeBytes: 20 },
     ],
     contents: {
       "src/ledger.ts": "export const other = 1;\n",
       "package.json": "{}",
-      // 인덱스에는 없지만 fake의 검색은 이 파일을 **읽기 전에 건너뛴다** — 실제 도구와 같다.
+      // fake의 검색은 이 파일을 **읽기 전에 건너뛴다** — 실제 도구와 같다.
       ".env": "resolveBudget=secret\n",
     },
     gitStatus: "## main",
@@ -1117,15 +1170,34 @@ test("검색이 건너뛴 비밀값 파일이 스냅샷 노트에 남는다", as
   const bridge = new ToolBridge(host.asTransport(), "task-1");
   const snapshot = await new ContextEngine().createSnapshot(bridge, {
     workspaceId: "ws-1",
-    userMessage: "resolveBudget 이 이상합니다",
+    // **`.env`를 지목한다.** 그래야 파일 노트가 하나 생기고, 아래 "파일 노트에는 없다"와
+    // "파일 노트의 경로는 실재한다"가 빈 목록에 대한 전칭 명제가 되지 않는다.
+    userMessage: "resolveBudget 이 이상합니다 (.env 도 봐주세요)",
     tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
   });
 
-  const note = (snapshot.excludedNotes ?? []).find((n) => n.reason.includes("검색하지 않았습니다"));
-  assert.ok(note, JSON.stringify(snapshot.excludedNotes));
+  // **`coverageNotes`다**(17절). 파일 노트와 같은 목록에 있으면 `(search: foo)`가 파일
+  // 이름으로 프롬프트와 화면에 나간다.
+  const note = (snapshot.coverageNotes ?? []).find((n) => n.reason.includes("검색하지 않았습니다"));
+  assert.ok(note, JSON.stringify(snapshot.coverageNotes));
   assert.match(note.reason, /비밀값 파일 1개/);
   // **"찾지 못했습니다"로 끝나지 않는다** — 거기 있었을 수도 있다는 사실이 남아야 한다.
   assert.match(note.reason, /거기 있었다면/);
+
+  // **파일 노트에는 없다.** 섞이면 화면의 "이름만 나간 파일" 개수가 파일 수가 아니게 된다.
+  assert.ok(
+    !(snapshot.excludedNotes ?? []).some((n) => n.reason.includes("검색하지 않았습니다")),
+    JSON.stringify(snapshot.excludedNotes)
+  );
+  // 그리고 **파일 노트의 경로는 전부 실재한다** — 판정 기준은 손으로 적은 모양이 아니라
+  // 이 워크스페이스가 아는 파일 목록이다. `(search: …)` 같은 것이 다시 섞이면 여기서 걸린다.
+  const known = new Set(["src/ledger.ts", "package.json", ".env"]);
+  assert.ok((snapshot.excludedNotes ?? []).some((n) => n.path === ".env"), JSON.stringify(snapshot.excludedNotes));
+  for (const n of snapshot.excludedNotes ?? []) {
+    assert.ok(known.has(n.path), `파일이 아닌 것이 파일 노트에 있습니다: ${n.path}`);
+  }
+  // 빈 목록이면 위 반복이 공허하다 — 이 시나리오에는 `.env` 노트가 있어야 한다.
+  assert.ok((snapshot.excludedNotes ?? []).length > 0, JSON.stringify(snapshot));
 });
 
 /** 건너뛴 것이 없으면 **그 노트도 없다** — 언제나 붙으면 신호가 아니라 배경이 된다. */
@@ -1142,8 +1214,8 @@ test("건너뛴 것이 없으면 그 노트가 없다", async () => {
     tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
   });
   assert.ok(
-    !(snapshot.excludedNotes ?? []).some((n) => n.reason.includes("검색하지 않았습니다")),
-    JSON.stringify(snapshot.excludedNotes)
+    !(snapshot.coverageNotes ?? []).some((n) => n.reason.includes("검색하지 않았습니다")),
+    JSON.stringify(snapshot.coverageNotes)
   );
 });
 
@@ -1166,9 +1238,11 @@ test("검색 결과가 잘렸다는 사실이 노트에 남는다", async () => 
     userMessage: "resolveBudget 이 이상합니다",
     tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
   });
-  const note = (snapshot.excludedNotes ?? []).find((n) => n.reason.includes("상한에서 잘렸습니다"));
-  assert.ok(note, JSON.stringify(snapshot.excludedNotes));
+  const note = (snapshot.coverageNotes ?? []).find((n) => n.reason.includes("상한에서 잘렸습니다"));
+  assert.ok(note, JSON.stringify(snapshot.coverageNotes));
   assert.match(note.reason, /전부가 아닙니다/);
+  // **범위이지 경로가 아니다.** 필드 이름이 `scope`인 것이 그 구별이다.
+  assert.match(note.scope, /본문 검색/);
 });
 
 /**

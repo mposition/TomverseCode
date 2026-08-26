@@ -101,6 +101,21 @@ export function renderSnapshot(snapshot: WorkspaceSnapshot): string {
     );
   }
 
+  // **파일 목록과 섞지 않는다**(context-engine 17절). 한동안 검색 쪽 노트가 위 목록에
+  // 들어가 있었고, 그래서 모델은 `(search: foo)`라는 **파일이 제외됐다**고 읽었다 —
+  // 그리고 그 아래 붙은 "필요하면 요청하라"는 있지도 않은 파일을 요청하라는 말이 됐다.
+  //
+  // 이쪽이 말하는 것은 다른 사실이다: **우리가 확인하지 못한 범위**가 있으니 여기 없다고
+  // 없는 것으로 결론 내리지 말라는 것. 그래서 지시문도 다르다.
+  if (snapshot.coverageNotes && snapshot.coverageNotes.length > 0) {
+    parts.push(
+      "## What this context search did NOT cover\n" +
+        snapshot.coverageNotes.map((n) => `- ${n.scope}: ${n.reason}`).join("\n") +
+        "\nThese are gaps in our search, not files. Absence from the context above is not evidence of absence" +
+        " in the repository — say so instead of concluding something does not exist."
+    );
+  }
+
   return parts.join("\n\n");
 }
 

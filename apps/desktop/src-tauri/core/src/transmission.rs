@@ -85,6 +85,16 @@ pub struct NamedOnlyFile {
     pub reason: String,
 }
 
+/// **우리가 보지 못한 범위** (context-engine 17절).
+///
+/// `NamedOnlyFile`과 필드 모양이 비슷하지만 첫 필드의 이름이 다르다 — 그게 요점이다.
+/// `path`라고 부르면 읽는 쪽이 파일을 찾고, 찾지 못하면 도구를 의심한다.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CoverageNote {
+    pub scope: String,
+    pub reason: String,
+}
+
 /// **파일이 아닌데 프롬프트에 실려 나가는 것.**
 ///
 /// 이게 없던 동안 화면은 파일 목록만 보여줬고, 그건 "나간 것은 이 파일들뿐"으로 읽혔다.
@@ -129,6 +139,13 @@ pub const REPORTED_SECTIONS: &[&str] = &[
     "MCP tool results",
     "Files",
     "Files deliberately excluded from context",
+    // **파일 문단과 따로다**(context-engine 17절). 한동안 이 내용이 위 문단에 섞여 있었고,
+    // 그래서 화면의 이름만-나간-파일 목록에 파일이 아닌 것이 들어갔다. 화면은 이제
+    // coverageNotes로 따로 설명한다.
+    //
+    // (주석에 큰따옴표를 쓰지 말 것 — 이 목록을 소스에서 읽는 검사가 따옴표 안을 항목으로
+    //  세므로 주석이 자기 자신을 센다. 42·63절에서 같은 함정을 밟았다.)
+    "What this context search did NOT cover",
 ];
 
 /// **우리가 모델에게 주는 지시문.** 사용자 데이터가 들어 있지 않으므로 전송 목록에 올리지
@@ -186,6 +203,14 @@ pub struct Transmission {
     /// **경로와 사유만** 나간 파일 (secret 등으로 내용이 제외된 것). 위 모듈 주석 ①.
     #[serde(rename = "namedOnlyFiles")]
     pub named_only_files: Vec<NamedOnlyFile>,
+    /// **우리가 보지 못한 범위** (context-engine 17절). 파일 목록이 아니다.
+    ///
+    /// 한동안 이 노트들이 `namedOnlyFiles`에 섞여 있었고, 그래서 `(search: foo)`가
+    /// "이름만 나간 파일"로 화면에 떴다 — 개수도 파일 수가 아니게 됐다. **다른 사실이므로
+    /// 다른 목록이다**: 저쪽은 "이 파일의 내용을 안 보냈다"이고 이쪽은 "이 범위를 확인하지
+    /// 못했으니 여기 없다고 없는 것이 아니다"이다.
+    #[serde(rename = "coverageNotes")]
+    pub coverage_notes: Vec<CoverageNote>,
     /// 파일이 아닌데 함께 나간 것 — 프로젝트 규칙 전문, 커밋되지 않은 변경 요약 등(7.2절).
     #[serde(rename = "sentContext")]
     pub sent_context: Vec<SentContext>,
@@ -377,6 +402,21 @@ pub fn collect(store: &Store, task_id: &str) -> Result<Transmission, String> {
             }
         }
         collect_context(payload, &mut out.sent_context);
+        if let Some(coverage) = payload.get("coverageNotes").and_then(Value::as_array) {
+            for note in coverage {
+                let Some(scope) = note.get("scope").and_then(Value::as_str) else {
+                    continue;
+                };
+                out.coverage_notes.push(CoverageNote {
+                    scope: scope.to_string(),
+                    reason: note
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(사유 없음)")
+                        .to_string(),
+                });
+            }
+        }
         if let Some(excluded) = payload.get("excludedNotes").and_then(Value::as_array) {
             for note in excluded {
                 let Some(path) = note.get("path").and_then(Value::as_str) else {
@@ -625,6 +665,52 @@ mod tests {
         assert!(state.bytes > 0);
         // 그 요약이 무엇을 담는지 화면이 말해야 한다 — 크기만으로는 읽는 사람이 알 수 없다.
         assert!(state.detail.contains("선정되지 않은"), "{}", state.detail);
+    }
+
+    /// **보지 못한 범위는 파일 목록에 들어가지 않는다** — context-engine 17절.
+    ///
+    /// 한동안 검색 쪽 노트가 `excludedNotes`에 섞여 왔고, 여기가 그것을 그대로
+    /// `namedOnlyFiles`에 넣었다. 그래서 화면의 "이름만 나간 파일 N개"에 파일이 아닌 것이
+    /// 들어갔고 **N도 파일 수가 아니게 됐다** — 사용자는 없는 파일을 찾으러 간다.
+    #[test]
+    fn coverage_notes_do_not_land_in_the_file_list() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &json!({
+                    "snapshotId": "snap-1",
+                    "relevantFiles": [],
+                    "excludedNotes": [{ "path": ".env", "reason": "비밀값 파일" }],
+                    "coverageNotes": [{ "scope": "본문 검색: resolveBudget", "reason": "비밀값 파일 2개를 건너뜀" }],
+                }),
+            )
+            .unwrap();
+
+        let t = collect(&store, "task-1").unwrap();
+        // 파일 목록에는 파일만 — 개수가 곧 파일 수다.
+        assert_eq!(t.named_only_files.len(), 1, "{:?}", t.named_only_files);
+        assert_eq!(t.named_only_files[0].path, ".env");
+        // 그리고 범위는 사라지지 않는다. 갈라 놓고 한쪽을 버리면 그건 화면이 말하지 않는
+        // 전송이 하나 늘어나는 것이다(7.2절).
+        assert_eq!(t.coverage_notes.len(), 1, "{:?}", t.coverage_notes);
+        assert!(t.coverage_notes[0].scope.contains("본문 검색"), "{:?}", t.coverage_notes[0]);
+    }
+
+    /// 범위 노트가 없으면 **빈 목록이다** — 위 검사가 언제나 하나를 세는 것이 아니다.
+    #[test]
+    fn a_snapshot_without_coverage_notes_reports_none() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &json!({ "snapshotId": "snap-1", "relevantFiles": [], "excludedNotes": [] }),
+            )
+            .unwrap();
+        let t = collect(&store, "task-1").unwrap();
+        assert!(t.coverage_notes.is_empty(), "{:?}", t.coverage_notes);
     }
 
     /// **없는 섹션을 0바이트로 늘어놓지 않는다.** 그러면 화면이 "이것도 나갔다"로 읽히는데

@@ -261,8 +261,17 @@ export class ContextEngine {
 
     // 명시 지목됐지만 제외 규칙에 걸린 파일은 사용자에게 알린다 (7절 마지막 문단).
     const excludedNotes = this.notesForMentionedButExcluded(index, input.userMessage);
+    // **파일에 대한 노트와 따로 모은다**(17절). 검색이 못 본 범위는 파일이 아니고, 같은
+    // 목록에 넣으면 `(search: foo)`가 파일 이름으로 프롬프트와 화면에 나간다.
+    const coverageNotes: { scope: string; reason: string }[] = [];
 
-    const candidates = await this.selectRelevantFiles(bridge, index, input.userMessage, excludedNotes);
+    const candidates = await this.selectRelevantFiles(
+      bridge,
+      index,
+      input.userMessage,
+      excludedNotes,
+      coverageNotes
+    );
 
     // 기본값은 **비용 추정과 같은 상수**를 읽는다. 여기에 숫자를 직접 적으면 예산 원장의
     // 보수적 추정이 실제 요청과 조용히 어긋난다 — 예약이 실제 청구를 감당하지 못하는 상태다.
@@ -306,6 +315,7 @@ export class ContextEngine {
       projectMeta: index.projectMeta,
       tokenBudget: input.tokenBudgets.map((b) => ({ modelId: b.modelId as ModelId, maxTokens: b.maxTokens })),
       excludedNotes: excludedNotes.length > 0 ? excludedNotes : undefined,
+      coverageNotes: coverageNotes.length > 0 ? coverageNotes : undefined,
       createdAt: new Date().toISOString(),
     };
   }
@@ -469,7 +479,8 @@ export class ContextEngine {
     bridge: ToolBridge,
     index: WorkspaceIndex,
     userMessage: string,
-    notes: { path: string; reason: string }[]
+    notes: { path: string; reason: string }[],
+    coverage: { scope: string; reason: string }[]
   ): Promise<Candidate[]> {
     const selected = new Map<string, Candidate>();
 
@@ -535,7 +546,7 @@ export class ContextEngine {
     //
     //    `search_text` 도구는 처음부터 있었고 Rust가 구현하고 있었는데 **선정이 한 번도 부르지
     //    않았다.** 문은 있고 길이 없었다.
-    await this.addContentMatches(bridge, index, keywords, add, notes);
+    await this.addContentMatches(bridge, index, keywords, add, coverage);
 
     // 5) 소스로 보이는 파일이 하나도 안 잡혔으면, 최소한 진입점 후보를 넣는다.
     //    빈 컨텍스트로 모델을 부르면 확실히 실패하므로, 못 골랐다는 사실보다 후보를 주는 편이 낫다.
@@ -587,7 +598,7 @@ export class ContextEngine {
     index: WorkspaceIndex,
     keywords: string[],
     add: (path: string, reason: RelevanceReason, reasonDetail: string, anchorLines?: number[]) => void,
-    notes: { path: string; reason: string }[]
+    coverage: { scope: string; reason: string }[]
   ): Promise<void> {
     const indexed = new Set(index.fileTree.map((f) => f.path));
 
@@ -611,9 +622,9 @@ export class ContextEngine {
         } catch (error) {
           // **실패를 "없음"으로 읽지 않는다.** 읽지 못한 것과 없는 것은 다른 사실이고,
           // 뭉개면 컨텍스트가 조용히 좁아진 채 모델이 불린다.
-          notes.push({
-            path: `(search: ${keyword})`,
-            reason: `본문 검색이 실패해 이 키워드로는 후보를 찾지 못했습니다: ${String(error)}`,
+          coverage.push({
+            scope: `본문 검색: ${keyword}`,
+            reason: `검색이 실패해 이 키워드로는 후보를 찾지 못했습니다: ${String(error)}`,
           });
           break;
         }
@@ -627,14 +638,14 @@ export class ContextEngine {
         // 13절이 검색 **실패**를 "없음"으로 읽지 않게 만든 것과 같은 규율이고, 이쪽은
         // **일부러 안 본** 경우다.
         if (found.skippedSecretFiles !== null && found.skippedSecretFiles > 0) {
-          notes.push({
-            path: `(search: ${keyword})`,
+          coverage.push({
+            scope: `본문 검색: ${keyword}`,
             reason: `비밀값 파일 ${found.skippedSecretFiles}개는 검색하지 않았습니다 — 거기 있었다면 찾지 못했습니다.`,
           });
         }
         if (found.truncated) {
-          notes.push({
-            path: `(search: ${keyword})`,
+          coverage.push({
+            scope: `본문 검색: ${keyword}`,
             reason: "검색 결과가 상한에서 잘렸습니다 — 이 키워드로 찾은 것이 전부가 아닙니다.",
           });
         }

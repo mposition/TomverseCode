@@ -1580,6 +1580,9 @@ export class Orchestrator {
         ...this.contextEngine.knownFilePaths(),
         ...(this.snapshot?.relevantFiles.map((f) => f.path) ?? []),
         ...(this.snapshot?.excludedNotes?.map((n) => n.path) ?? []),
+        // **`coverageNotes`는 여기 들어가지 않는다**(context-engine 17절). 저건 경로가
+        // 아니라 우리가 보지 못한 범위이고, 실재의 증거가 될 수 없다. 한동안 검색 쪽 노트가
+        // `excludedNotes`에 섞여 있었으므로 `(search: foo)`가 **실재하는 경로**로 읽혔다.
         ...this.mutatedPaths,
       ],
     };
@@ -2857,6 +2860,9 @@ export class Orchestrator {
         ...(f.anchorCoverage ? { anchorCoverage: f.anchorCoverage } : {}),
       })),
       excludedNotes: snapshot.excludedNotes ?? [],
+      // **파일이 아닌 노트는 따로 나른다**(context-engine 17절). 한 배열에 실으면 화면의
+      // "이름만 나간 파일" 목록에 파일이 아닌 것이 섞이고, 개수도 파일 수가 아니게 된다.
+      coverageNotes: snapshot.coverageNotes ?? [],
       projectMeta: snapshot.projectMeta,
     };
   }
