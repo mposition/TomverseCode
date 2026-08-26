@@ -473,8 +473,29 @@ export class ContextEngine {
   ): Promise<Candidate[]> {
     const selected = new Map<string, Candidate>();
 
+    /**
+     * 후보를 더한다. **먼저 들어온 근거를 이긴다** — 우선순위 정렬이 그 근거를 읽기 때문이다.
+     *
+     * # 그러나 앵커는 합친다 (context-engine 15절)
+     *
+     * 종전에는 이미 있는 경로면 호출을 통째로 버렸고, 그래서 앵커도 함께 버려졌다. 그 손해가
+     * 가장 큰 경우가 **가장 흔한 경우**였다: 사용자가 이름을 댄 파일(2·3단계, 앵커 없음)을
+     * 본문 검색이 다시 찾으면(5단계, 앵커 있음) 앵커가 버려져 **앞에서부터 잘렸다.** 즉
+     * 사용자가 지목했고 정의도 거기 있는 파일 — 가장 중요한 파일 — 이 14절 이전으로 돌아갔다.
+     *
+     * 그리고 키워드가 여럿일 때 같은 파일의 두 번째 키워드 매치도 같은 이유로 사라졌다.
+     * 앵커를 합치지 않으면 15절의 "가장 많이 덮는 창"은 덮을 것이 하나뿐이라 아무 일도 하지
+     * 않는다 — **문을 만들어 놓고 걸어 들어가는 길을 막는 것**이다.
+     */
     const add = (path: string, reason: RelevanceReason, reasonDetail: string, anchorLines?: number[]) => {
-      if (!selected.has(path) && selected.size < this.maxRelevantFiles) {
+      const existing = selected.get(path);
+      if (existing) {
+        if (anchorLines && anchorLines.length > 0) {
+          existing.anchorLines = [...new Set([...(existing.anchorLines ?? []), ...anchorLines])].sort((a, b) => a - b);
+        }
+        return;
+      }
+      if (selected.size < this.maxRelevantFiles) {
         selected.set(path, { path, reason, reasonDetail, anchorLines });
       }
     };

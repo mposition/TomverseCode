@@ -76,10 +76,18 @@ export function renderSnapshot(snapshot: WorkspaceSnapshot): string {
     // 넣지 않는 이유는 그것이 파일 내용처럼 보이기 때문이다 — 모델이 patch context로 복사하면
     // `apply_patch`가 실패하고, 그 실패는 "모델이 잘못된 patch를 냈다"로 보인다.
     const range = file.includedRange;
+    // **놓친 앵커가 있으면 그것도 말한다**(context-engine 15절). 창이 연속된 한 조각이므로,
+    // 관련 지점이 여럿이면 그중 일부는 창 밖에 남는다 — 그 사실을 숨기면 모델은 자기가 본
+    // 조각이 관련 지점 전부라고 가정하고 patch를 쓴다.
+    const coverage = file.anchorCoverage;
+    const missedNote =
+      coverage && coverage.total > coverage.covered
+        ? ` ${coverage.total - coverage.covered} of ${coverage.total} matching locations in this file fall OUTSIDE this slice.`
+        : "";
     const truncationNote = !file.truncated
       ? ""
       : range
-        ? `\n(NOTE: TRUNCATED — this is lines ${range.startLine}-${range.endLine} of ${range.totalLines}, a contiguous slice. Do not assume the omitted lines are absent.)`
+        ? `\n(NOTE: TRUNCATED — this is lines ${range.startLine}-${range.endLine} of ${range.totalLines}, a contiguous slice. Do not assume the omitted lines are absent.${missedNote})`
         : "\n(NOTE: this file is TRUNCATED — do not assume the omitted part is absent)";
     const header = `### ${file.path}\n(selected because: ${file.reasonDetail})${truncationNote}`;
     parts.push(`${header}\n\`\`\`\n${file.content}\n\`\`\``);

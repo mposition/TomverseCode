@@ -129,6 +129,28 @@ export function truncateToTokens(text: string, maxTokens: number): string {
  *
  * 정의는 아래로 읽히지만 그 위에 import·타입·주석이 있고, 그것이 없으면 모델이 이름을
  * 지어낸다. 그래서 예산의 일부를 앞쪽에 쓴다.
+ *
+ * # 창 하나를 **어디에** 두는가 — 첫 앵커가 아니라 가장 많이 덮는 자리
+ *
+ * 14절은 창을 첫 앵커에 걸었다. 앵커가 하나면 그것으로 충분하지만, 13절의 본문 검색은
+ * 키워드 4개 × 매치 3개까지 내므로 **앵커는 흔히 여럿이다.** 그리고 첫 앵커가 import 줄이고
+ * 정작 정의는 800번째 줄인 경우, 첫 앵커에 창을 걸면 14절이 고치려던 바로 그 실패로 돌아간다 —
+ * 찾아 놓고 잘라 버리는 것. 다른 것은 잘린 자리가 파일 앞이 아니라 첫 매치 근처라는 점뿐이다.
+ *
+ * 그래서 앵커마다 창을 하나씩 놓아 보고 **가장 많은 앵커를 덮는 창**을 고른다. 같은 수를
+ * 덮으면 앞쪽을 쓴다 — 결정적이어야 하고(같은 입력이 같은 스냅샷을 내야 대조가 성립한다),
+ * 앞쪽이 대개 정의 쪽이다.
+ *
+ * 후보를 전부 만들어도 비싸지 않다: 창의 크기는 예산이 정하므로 각 후보는 파일 전체가 아니라
+ * **창 크기**만큼만 훑고, 앵커 수는 12개로 묶여 있다(13절의 상한).
+ *
+ * # 그리고 몇 개를 놓쳤는지 센다
+ *
+ * 14.6절은 이 개선의 근거를 "앵커 분포를 봐야 하는데 잰 적이 없다"로 미뤄 두었다. **재는
+ * 장치가 없으면 고쳐도 나아졌는지 모르고, 틀려도 드러나지 않는다.** 그래서 창은 덮은 앵커
+ * 수와 놓친 수를 함께 낸다. 그 값은 `RelevantFile`에 실려 스냅샷에 남고(=이벤트에 남고),
+ * 프롬프트 머리글이 모델에게도 말한다 — 관련 지점이 창 밖에 있다는 것은 모델이 patch를
+ * 자신 있게 쓰면 안 되는 이유이기 때문이다.
  */
 export interface Window {
   text: string;
@@ -136,6 +158,13 @@ export interface Window {
   startLine: number;
   endLine: number;
   totalLines: number;
+  /**
+   * 이 창이 덮은 앵커 수와 **범위 안에 있던** 앵커 총수.
+   *
+   * `total`은 넘겨받은 앵커가 아니라 **파일 범위 안에 있던** 앵커다 — 범위 밖 앵커는 파일이
+   * 바뀌었다는 뜻이지 우리가 놓친 것이 아니므로, 함께 세면 "놓쳤다"가 부풀려진다.
+   */
+  anchors: { covered: number; total: number };
 }
 
 /** 창의 앞쪽(앵커 이전)에 쓰는 예산 비율. 나머지는 뒤로 간다. */
@@ -155,14 +184,48 @@ export function windowAroundLines(text: string, anchors: readonly number[], maxT
       startLine: 1,
       endLine: head.length === 0 ? 0 : head.split("\n").length,
       totalLines,
+      anchors: { covered: 0, total: valid.length },
     };
   }
 
-  const first = valid[0] as number;
+  // **중복 앵커를 접는다.** 같은 줄을 두 번 세면 덮은 수가 부풀려져 후보 비교가 틀린다.
+  const unique = [...new Set(valid)];
+
+  // 앵커마다 창을 하나씩 놓아 보고 가장 많이 덮는 것을 고른다. 같은 수면 앞쪽(=먼저 나온
+  // 후보)을 남긴다 — `>`이지 `>=`가 아닌 이유다.
+  let best: { start: number; end: number; covered: number } | null = null;
+  for (const anchor of unique) {
+    const span = spanFrom(lines, anchor, maxTokens);
+    const covered = unique.filter((n) => n >= span.start && n <= span.end).length;
+    if (best === null || covered > best.covered) best = { ...span, covered };
+    // 전부 덮었으면 더 볼 것이 없다.
+    if (best.covered === unique.length) break;
+  }
+  const chosen = best as { start: number; end: number; covered: number };
+
+  const slice = lines.slice(chosen.start - 1, chosen.end).join("\n");
+  const fitted = estimateTokensUpperBound(slice) > maxTokens ? truncateToTokens(slice, maxTokens) : slice;
+  return {
+    text: fitted,
+    startLine: chosen.start,
+    endLine: chosen.end,
+    totalLines,
+    anchors: { covered: chosen.covered, total: unique.length },
+  };
+}
+
+/**
+ * 앵커 하나에 창을 걸었을 때의 줄 범위.
+ *
+ * **`windowAroundLines`에서 떼어낸 이유는 후보를 여럿 만들어야 하기 때문이다.** 붙여 두면
+ * "첫 앵커에 건다"가 구조에 박혀서, 고르는 규칙을 바꾸려면 함수를 통째로 다시 써야 한다.
+ */
+function spanFrom(lines: readonly string[], anchor: number, maxTokens: number): { start: number; end: number } {
+  const totalLines = lines.length;
   const leadBudget = Math.floor(maxTokens * LEAD_SHARE);
 
   // 앵커에서 **위로** 올라가며 lead 예산을 쓴다.
-  let start = first;
+  let start = anchor;
   let leadUsed = 0;
   while (start > 1) {
     const cost = estimateTokensUpperBound(`${lines[start - 2] as string}\n`);
@@ -182,10 +245,7 @@ export function windowAroundLines(text: string, anchors: readonly number[], maxT
     end += 1;
   }
   if (end < start) end = start;
-
-  const slice = lines.slice(start - 1, end).join("\n");
-  const fitted = estimateTokensUpperBound(slice) > maxTokens ? truncateToTokens(slice, maxTokens) : slice;
-  return { text: fitted, startLine: start, endLine: end, totalLines };
+  return { start, end };
 }
 
 export interface TokenBudget {
@@ -244,6 +304,7 @@ export function packageFiles(files: RelevantFile[], maxTokens: number): Packaged
         endLine: window.endLine,
         totalLines: window.totalLines,
       },
+      anchorCoverage: window.anchors,
       reasonDetail: `${file.reasonDetail} (토큰 예산으로 ${window.totalLines}줄 중 ${window.startLine}~${window.endLine}줄만 포함)`,
     });
     used += estimateTokensUpperBound(window.text);

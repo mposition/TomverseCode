@@ -19,6 +19,7 @@ import {
 import { FakeHost } from "./helpers/fakeHost.js";
 import { ToolBridge } from "../src/tools/bridge.js";
 import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
+import { renderSnapshot } from "../src/providers/prompts.js";
 
 // ---- 제외 규칙 (secret / binary / 대용량) ----
 
@@ -805,6 +806,154 @@ test("packageFiles가 실린 줄 범위를 값으로 남긴다", () => {
   assert.match(file.reasonDetail, /줄만 포함/);
 });
 
+// ---- 앵커가 여럿일 때 창을 어디에 두는가 (context-engine 15절) ----
+
+/** 여러 줄에 표식을 둔다. `numbered`의 다중 앵커 판. */
+function marked(lines: number, markers: readonly number[]): string {
+  const set = new Set(markers);
+  return Array.from({ length: lines }, (_unused, i) => (set.has(i + 1) ? `MARKER${i + 1}` : `line ${i + 1}`)).join(
+    "\n"
+  );
+}
+
+/**
+ * **첫 앵커가 최선이 아니다** — context-engine 15절.
+ *
+ * 14절은 창을 첫 앵커에 걸었다. 첫 매치가 import 줄이고 정작 정의와 그 호출부가 파일 뒤쪽에
+ * 몰려 있으면, 첫 앵커에 창을 걸어 놓고 나머지를 전부 잘라 버린다 — **14절이 고치려던 바로
+ * 그 실패**이고, 잘린 자리가 파일 앞이 아니라 첫 매치 근처라는 것만 다르다.
+ */
+test("가장 많은 앵커를 덮는 자리에 창이 놓인다", () => {
+  // 앵커 하나는 파일 앞에 외따로, 셋은 뒤쪽에 몰려 있다.
+  const content = marked(400, [3, 300, 305, 310]);
+  const window = windowAroundLines(content, [3, 300, 305, 310], 300);
+
+  assert.ok(window.text.includes("MARKER300"), `뒤쪽 무리를 놓쳤습니다: ${window.startLine}~${window.endLine}`);
+  assert.ok(window.text.includes("MARKER305"));
+  assert.ok(window.text.includes("MARKER310"));
+  assert.equal(window.anchors.covered, 3);
+  assert.equal(window.anchors.total, 4);
+});
+
+/**
+ * **덮은 수가 같으면 앞쪽을 쓴다.** 결정적이어야 하고(같은 입력이 같은 스냅샷을 내야 대조가
+ * 성립한다), 앞쪽이 대개 정의 쪽이다.
+ */
+test("같은 수를 덮으면 앞쪽 창을 고른다", () => {
+  // 두 무리가 대칭이라 어느 쪽을 골라도 2개를 덮는다.
+  const content = marked(400, [50, 55, 340, 345]);
+  const window = windowAroundLines(content, [50, 55, 340, 345], 200);
+  assert.equal(window.anchors.covered, 2);
+  assert.ok(window.text.includes("MARKER50"), `뒤쪽을 골랐습니다: ${window.startLine}~${window.endLine}`);
+  assert.ok(!window.text.includes("MARKER340"));
+});
+
+/** 예산이 넉넉해 전부 덮이면 **놓친 것이 없다**고 나와야 한다 — 그래야 "놓쳤다"가 신호가 된다. */
+test("전부 덮으면 놓친 앵커가 0이다", () => {
+  const content = marked(100, [10, 20, 30]);
+  const window = windowAroundLines(content, [10, 20, 30], 100_000);
+  assert.equal(window.anchors.covered, 3);
+  assert.equal(window.anchors.total, 3);
+});
+
+/**
+ * **범위 밖 앵커를 "놓쳤다"로 세지 않는다.** 그건 파일이 바뀌었다는 뜻이지 우리가 놓친 것이
+ * 아니다 — 함께 세면 머리글이 모델에게 없는 지점을 찾으라고 말한다.
+ */
+test("범위 밖 앵커는 놓친 수에 들어가지 않는다", () => {
+  const content = marked(50, [10]);
+  const window = windowAroundLines(content, [10, 9999, -2], 100_000);
+  assert.equal(window.anchors.total, 1);
+  assert.equal(window.anchors.covered, 1);
+});
+
+/** **같은 줄을 두 번 세지 않는다.** 중복을 접지 않으면 덮은 수가 부풀려져 후보 비교가 틀린다. */
+test("중복 앵커는 접힌다", () => {
+  const content = marked(50, [10]);
+  const window = windowAroundLines(content, [10, 10, 10], 100_000);
+  assert.equal(window.anchors.total, 1);
+});
+
+/**
+ * **놓친 앵커가 스냅샷에 남는다** — 14.6절이 미뤄 둔 이유가 "분포를 잰 적이 없다"였다.
+ * 재는 장치가 없으면 고쳐도 나아졌는지 모른다.
+ */
+test("packageFiles가 앵커 덮개를 값으로 남긴다", () => {
+  const content = marked(400, [3, 300, 305, 310]);
+  const packaged = packageFiles(
+    [
+      {
+        path: "src/ledger.ts",
+        reason: "content-match",
+        reasonDetail: "본문에서 찾음",
+        content,
+        truncated: false,
+        sizeBytes: content.length,
+        anchorLines: [3, 300, 305, 310],
+      },
+    ],
+    600
+  );
+  const file = packaged.files[0]!;
+  assert.ok(file.anchorCoverage, "앵커 덮개가 없습니다");
+  assert.equal(file.anchorCoverage.total, 4);
+  assert.ok(
+    file.anchorCoverage.covered < file.anchorCoverage.total,
+    "이 예산에서 전부 덮였다면 아래 머리글 검사가 공허해집니다"
+  );
+});
+
+/**
+ * **모델에게도 말한다.** 관련 지점이 창 밖에 있다는 것은 모델이 patch를 자신 있게 쓰면 안
+ * 되는 이유다. 값으로만 남기고 프롬프트에 넣지 않으면 모델은 자기가 본 조각이 관련 지점
+ * 전부라고 가정한다.
+ */
+test("머리글이 창 밖에 남은 지점 수를 말한다", () => {
+  const content = marked(400, [3, 300, 305, 310]);
+  const packaged = packageFiles(
+    [
+      {
+        path: "src/ledger.ts",
+        reason: "content-match",
+        reasonDetail: "본문에서 찾음",
+        content,
+        truncated: false,
+        sizeBytes: content.length,
+        anchorLines: [3, 300, 305, 310],
+      },
+    ],
+    600
+  );
+  const rendered = renderSnapshot(makeSnapshot({ relevantFiles: packaged.files }));
+  assert.match(rendered, /fall OUTSIDE this slice/);
+  assert.match(rendered, /1 of 4 matching locations/);
+});
+
+/** 전부 덮였으면 **그 문장이 없어야 한다** — 언제나 붙으면 신호가 아니라 배경이 된다. */
+test("전부 덮였으면 머리글에 그 문장이 없다", () => {
+  const content = marked(400, [300, 302]);
+  const packaged = packageFiles(
+    [
+      {
+        path: "src/ledger.ts",
+        reason: "content-match",
+        reasonDetail: "본문에서 찾음",
+        content,
+        truncated: false,
+        sizeBytes: content.length,
+        anchorLines: [300, 302],
+      },
+    ],
+    600
+  );
+  const file = packaged.files[0]!;
+  assert.equal(file.truncated, true, "잘리지 않았다면 이 검사는 공허합니다");
+  assert.equal(file.anchorCoverage!.covered, file.anchorCoverage!.total);
+  const rendered = renderSnapshot(makeSnapshot({ relevantFiles: packaged.files }));
+  assert.ok(rendered.includes("TRUNCATED"), "잘림 표시 자체는 있어야 합니다");
+  assert.ok(!rendered.includes("fall OUTSIDE"), "놓친 것이 없는데 놓쳤다고 말합니다");
+});
+
 /**
  * **검색이 찾은 줄이 실제로 실린다** — context-engine 14절, 끝에서 끝까지.
  *
@@ -846,4 +995,88 @@ test("검색이 찾은 줄이 예산에 쫓겨도 컨텍스트에 남는다", as
     `찾아 놓고 잘라 버렸습니다: ${ledger.includedRange?.startLine}~${ledger.includedRange?.endLine}`
   );
   assert.ok(ledger.includedRange && ledger.includedRange.startLine > 1, "앞에서부터 잘랐습니다");
+});
+
+/**
+ * **사용자가 이름을 댄 파일이 앵커를 잃었다** — context-engine 15절, 끝에서 끝까지.
+ *
+ * 선정은 여러 단계가 같은 파일을 더할 수 있다. 종전 `add`는 이미 있는 경로면 호출을 통째로
+ * 버렸고, **앵커도 함께 버려졌다.** 그 손해가 가장 큰 경우가 가장 흔한 경우다: 사용자가
+ * `ledger.ts`라고 이름을 대면 2단계가 앵커 없이 먼저 넣고, 5단계의 본문 검색이 정의를
+ * 찾아도 그 줄 번호가 버려진다. 그러면 **지목했고 정의도 거기 있는 파일** — 가장 중요한
+ * 파일 — 이 14절 이전으로 돌아가 앞에서부터 잘린다.
+ *
+ * 위 검사가 이걸 못 잡은 이유는 거기서는 사용자가 파일 이름을 대지 않았기 때문이다.
+ */
+test("이름을 댄 파일도 본문 검색이 찾은 줄을 지킨다", async () => {
+  const lines = Array.from({ length: 600 }, (_unused, i) =>
+    i === 560 ? "export function resolveBudget(limit) { return limit; }" : `const filler${i} = ${i};`
+  );
+  const content = lines.join("\n");
+
+  const host = new FakeHost({
+    files: [
+      { path: "src/ledger.ts", isDir: false, sizeBytes: content.length },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: { "src/ledger.ts": content, "package.json": "{}" },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    // **파일 이름을 직접 댄다** — 이것이 위 검사와의 차이다.
+    userMessage: "src/ledger.ts 의 resolveBudget 이 음수를 받으면 터집니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 1_200 }],
+  });
+
+  const ledger = snapshot.relevantFiles.find((f) => f.path === "src/ledger.ts");
+  assert.ok(ledger, "파일이 아예 빠졌습니다");
+  assert.equal(ledger.truncated, true, "이 검사는 잘리는 상황을 봐야 합니다");
+  assert.ok(
+    ledger.anchorLines && ledger.anchorLines.length > 0,
+    "앵커가 하나도 없습니다 — 지목이 검색 결과를 덮어썼습니다"
+  );
+  assert.ok(
+    ledger.content.includes("resolveBudget(limit)"),
+    `찾아 놓고 잘라 버렸습니다: ${ledger.includedRange?.startLine}~${ledger.includedRange?.endLine}`
+  );
+});
+
+/**
+ * **앵커는 여러 단계에서 모인다.** 합치지 않으면 15절의 "가장 많이 덮는 창"이 덮을 것이
+ * 하나뿐이라 아무 일도 하지 않는다 — 문을 만들고 걸어 들어가는 길을 막는 꼴이다.
+ */
+test("여러 키워드가 같은 파일을 찾으면 앵커가 합쳐진다", async () => {
+  const lines = Array.from({ length: 600 }, (_unused, i) => {
+    if (i === 100) return "export function resolveBudget(limit) { return limit; }";
+    if (i === 520) return "export function settleReservation(id) { return id; }";
+    return `const filler${i} = ${i};`;
+  });
+  const content = lines.join("\n");
+
+  const host = new FakeHost({
+    files: [
+      { path: "src/ledger.ts", isDir: false, sizeBytes: content.length },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: { "src/ledger.ts": content, "package.json": "{}" },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 과 settleReservation 이 서로 어긋납니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 1_200 }],
+  });
+
+  const ledger = snapshot.relevantFiles.find((f) => f.path === "src/ledger.ts");
+  assert.ok(ledger, "파일이 아예 빠졌습니다");
+  const anchors = ledger.anchorLines ?? [];
+  // 두 정의가 멀리 떨어져 있으므로 창 하나로는 둘 다 덮지 못한다 — 그래도 **둘 다 앵커여야**
+  // 15절의 고르기가 일할 거리를 갖는다.
+  assert.ok(anchors.includes(101), `resolveBudget의 줄이 없습니다: ${anchors.join(",")}`);
+  assert.ok(anchors.includes(521), `settleReservation의 줄이 없습니다: ${anchors.join(",")}`);
+  assert.ok(ledger.anchorCoverage, "앵커 덮개가 없습니다");
+  assert.equal(ledger.anchorCoverage.total, anchors.length);
 });
