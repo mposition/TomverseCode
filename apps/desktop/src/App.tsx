@@ -49,6 +49,7 @@ import { BlockedPanel } from "./components/BlockedPanel";
 import { WorkspaceSettingsPanel } from "./components/WorkspaceSettingsPanel";
 import { CarriedDecisionsPanel } from "./components/CarriedDecisionsPanel";
 import { WorktreePanel } from "./components/WorktreePanel";
+import { AutopilotPreviewPanel } from "./components/AutopilotPreviewPanel";
 import { SkillLibraryPicker } from "./components/SkillLibraryPicker";
 import { EffectiveConfigPanel } from "./components/EffectiveConfigPanel";
 import { PullRequestPanel } from "./components/PullRequestPanel";
@@ -1137,13 +1138,19 @@ export default function App() {
                   />
                   프로젝트가 선언한 검증 명령은 묻지 않고 실행
                 </label>
-                {/* 켜지 않으면 무인 실행이 검증에서 멈춘다는 것을 **미리** 말한다 —
-                    멈춘 뒤에 알면 그건 도구의 오작동으로 읽힌다(24.5절). */}
-                {unattended && !autoApproveVerification && (
-                  <p className="muted small">
-                    검증 명령도 승인을 요구하므로, 이 상태의 무인 실행은 <strong>검증에서 멈춥니다</strong>.
-                  </p>
-                )}
+                {/* 무인 실행이 **어디서 멈추는지 미리** 말한다 — 멈춘 뒤에 알면 그건 도구의
+                    오작동으로 읽힌다(24.5절). 종전에는 이 자리에 손으로 적은 문장 하나가
+                    있었고("검증에서 멈춥니다"), 그건 여섯 개 정지 중 하나만 말한 것이었다.
+                    이제 게이트에 물어서 전부 보여준다(47·48절). */}
+                <AutopilotPreviewPanel
+                  unattended={unattended}
+                  mode={mode}
+                  allowGitCommit={allowGitCommit}
+                  autoApproveVerification={autoApproveVerification}
+                  skillPath={skillPath.trim() === "" ? null : skillPath.trim()}
+                  deadlineSecs={deadline.secs}
+                  ready={Boolean(workspace)}
+                />
 
                 {/* 시한 (39절). **여기 두는 이유**: 시한이 필요한 까닭이 "물을 사람이 없다"는
                     것이므로, 무인 실행 스위치와 같은 자리에 있어야 한다. */}

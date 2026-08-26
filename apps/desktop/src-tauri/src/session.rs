@@ -127,6 +127,34 @@ pub struct SessionState {
 ///
 /// **우선순위를 한 곳에서 정한다**(26.1절). 두 값을 sidecar로 각각 보내면 거기서 다시 정하게
 /// 되고, 그러면 규칙이 둘이 된다.
+/// 화면의 스위치에서 이 태스크의 정책을 만든다.
+///
+/// **`start_task`와 `autopilot_preview`가 같은 함수를 쓴다**(47절). 두 벌로 두면 미리보기가
+/// 실행과 다른 정책에 대해 답하게 되고, 그 어긋남은 "미리보기가 틀렸다"가 아니라
+/// "도구가 거짓말했다"로 읽힌다. 헤드리스 CLI도 같은 이유로 정책 조립을 한 함수에 둔다.
+///
+/// **`auto_approve_workspace_writes`가 여기 없다**(48.3절). 화면에 그 스위치가 없기 때문이고,
+/// 그 사실은 실수가 아니라 아직 내리지 않은 결정이다 — 미리보기가 그것을 드러낸다.
+fn task_policy_from(
+    mode: ExecutionMode,
+    allow_git_commit: bool,
+    unattended: bool,
+    auto_approve_verification: bool,
+    skill: Option<&tomverse_core::skills::Skill>,
+    deadline_secs: Option<u64>,
+) -> TaskPolicy {
+    TaskPolicy {
+        execution_mode: mode,
+        allow_git_commit,
+        unattended,
+        auto_approve_verification,
+        allowed_tools: skill.and_then(|s| s.allowed_tools.clone()),
+        // **sidecar로 가지 않는다**(39.1절). 시계도 판정도 Rust가 갖는다.
+        deadline_ms: deadline_secs.map(|s| s * 1_000),
+        ..TaskPolicy::default()
+    }
+}
+
 fn merge_model_pins(skill: Option<&tomverse_core::skills::ModelPins>, explicit: Value) -> Value {
     let mut merged = serde_json::Map::new();
     if let Some(pins) = skill {
@@ -446,6 +474,42 @@ impl SessionState {
         let (host, session_id) =
             self.with_active(|active| Ok((active.host.clone(), active.session_id.clone())))?;
         host.withdraw_decision(&session_id, task_id, criterion_id, reason.as_deref())
+    }
+
+    /// 무인 실행 미리보기 (state-machine 47절). **아무것도 쓰지 않는다.**
+    ///
+    /// 화면의 스위치를 그대로 받아 **`start_task`와 같은 함수로 정책을 만든다.** 두 벌로 두면
+    /// 미리보기가 실행과 다른 정책에 대해 답하게 되고, 그 어긋남은 "미리보기가 틀렸다"가 아니라
+    /// "도구가 거짓말했다"로 읽힌다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn autopilot_preview(
+        &self,
+        mode: ExecutionMode,
+        allow_git_commit: bool,
+        unattended: bool,
+        auto_approve_verification: bool,
+        skill_path: Option<&str>,
+        deadline_secs: Option<u64>,
+    ) -> Result<Value, String> {
+        let host = self.with_active(|active| Ok(active.host.clone()))?;
+        // 스킬은 도구를 **좁힐** 수 있으므로 미리보기도 그것을 반영해야 한다 — 반영하지 않으면
+        // 화면이 "이 도구는 지나갑니다"라고 말한 뒤 스킬이 그것을 막는다.
+        let skill = match skill_path {
+            None => None,
+            Some(path) => Some(
+                tomverse_core::skills::load(std::path::Path::new(path), host.root())
+                    .map_err(|e| e.to_string())?,
+            ),
+        };
+        let policy = task_policy_from(
+            mode,
+            allow_git_commit,
+            unattended,
+            auto_approve_verification,
+            skill.as_ref(),
+            deadline_secs,
+        );
+        serde_json::to_value(host.autopilot_preview(policy)).map_err(|e| format!("직렬화: {e}"))
     }
 
     /// 무인 정지의 처방 (state-machine 24.8절). **읽기 전용이다.**
@@ -916,16 +980,14 @@ impl SessionState {
 
         // **이 태스크의 정책을 여기서 정하고, 여기서만 정한다.** 등록은 한 번뿐이므로
         // 진행 중에 바뀌지 않는다(3.16.2절).
-        let task_policy = TaskPolicy {
-            execution_mode: mode,
+        let task_policy = task_policy_from(
+            mode,
             allow_git_commit,
             unattended,
             auto_approve_verification,
-            allowed_tools: skill.as_ref().and_then(|s| s.allowed_tools.clone()),
-            // **sidecar로 가지 않는다**(39.1절). 시계도 판정도 Rust가 갖는다.
-            deadline_ms: deadline_secs.map(|s| s * 1_000),
-            ..TaskPolicy::default()
-        };
+            skill.as_ref(),
+            deadline_secs,
+        );
         host.begin_task(&task_id, task_policy, skill.as_ref())?;
 
         // 스킬의 모델 지정은 화면이 명시한 지정에 **진다** — 우선순위를 한 곳에서 정한다(26.1절).

@@ -434,6 +434,52 @@ mod tests {
         assert!(missing.is_empty(), "미리보기가 아예 다루지 않는 스위치: {missing:?}");
     }
 
+    /// **`leverDoesNotFree`와 "사람만 지날 수 있음"은 겹치지 않는다** (48절).
+    ///
+    /// 화면은 이 둘에 다른 문장을 붙이므로 겹치면 어느 쪽을 먼저 보느냐가 답을 바꾼다.
+    /// 겹칠 수 없는 이유는 구성에 있다 — `leverDoesNotFree`는 **플래그가 있는 레버**에만
+    /// 붙고 `HumanOnly`에는 플래그가 없다. 그런데 그건 두 함수에 흩어진 사실이라, 한쪽이
+    /// 바뀌면 조용히 겹치기 시작한다. 여기서 고정한다.
+    ///
+    /// 프로브가 이 검사를 요구했다: 화면 쪽에서 두 분기의 순서를 바꿔 봐도 **아무 검사도
+    /// 실패하지 않았다.** 순서에 의미가 있다고 적어 둔 주석이 실제로는 아무것도 지키지
+    /// 않고 있었다는 뜻이다.
+    #[test]
+    fn a_stop_is_never_both_human_only_and_lever_does_not_free() {
+        let dir = workspace_with_manifest();
+        let hooks = HookRegistry::default();
+        let mut seen_lever_does_not_free = false;
+
+        // 스위치 조합을 돌면서 본다 — 한 설정에서만 확인하면 다른 조합의 겹침을 놓친다.
+        for writes in [false, true] {
+            for commit in [false, true] {
+                for verification in [false, true] {
+                    let policy = TaskPolicy {
+                        unattended: true,
+                        auto_approve_workspace_writes: writes,
+                        allow_git_commit: commit,
+                        auto_approve_verification: verification,
+                        ..TaskPolicy::default()
+                    };
+                    let p = preview(&root(dir.path()), &profile(dir.path(), policy), &hooks);
+                    for stop in &p.stops {
+                        if stop.lever_does_not_free.is_some() {
+                            seen_lever_does_not_free = true;
+                            assert_ne!(
+                                stop.fate.lever(),
+                                Some(PolicyLever::HumanOnly),
+                                "{}이 두 갈래에 동시에 들어갑니다",
+                                stop.probe
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // **빈 집합에 대한 전칭 명제는 언제나 참이다.**
+        assert!(seen_lever_does_not_free, "`leverDoesNotFree`가 붙은 정지가 하나도 없습니다");
+    }
+
     /// **틀린 조언을 하나 찾았고, 그것을 지우지 않고 사실로 남긴다** (47.6절).
     ///
     /// 게이트는 `git commit` 정지의 `unblockedBy`를 `AllowGitCommit`이라고 말한다. 그런데 그

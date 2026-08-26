@@ -100,11 +100,7 @@ async fn start_task(
     deadline_secs: Option<u64>,
     timeout_secs: Option<u64>,
 ) -> Result<Value, String> {
-    let execution_mode = match mode.as_str() {
-        "fast" => ExecutionMode::Fast,
-        "verified" => ExecutionMode::Verified,
-        other => return Err(format!("알 수 없는 실행 정책: {other}")),
-    };
+    let execution_mode = parse_mode(&mode)?;
     let budget = tomverse_core::budget::resolve_budget(budget_usd, budget_unlimited)?;
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(900));
 
@@ -322,10 +318,44 @@ fn withdraw_decision(
     state.withdraw_decision(&task_id, &criterion_id, reason)
 }
 
+/// 실행 정책 문자열을 값으로. **모르는 값은 기본값으로 접지 않는다** — 접으면 화면이 보낸
+/// 오타가 조용히 `verified`가 되고, 사용자는 자기가 고른 것과 다른 실행을 본다.
+fn parse_mode(mode: &str) -> Result<ExecutionMode, String> {
+    match mode {
+        "fast" => Ok(ExecutionMode::Fast),
+        "verified" => Ok(ExecutionMode::Verified),
+        other => Err(format!("알 수 없는 실행 정책: {other}")),
+    }
+}
+
 /// 무인 정지의 처방 (state-machine 24.8절). **읽기 전용이다.**
 #[tauri::command]
 fn task_blocked(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
     Ok(envelope(state.task_blocked(&task_id)))
+}
+
+/// 무인 실행이 지금 스위치로 무엇을 허용하는지 (state-machine 47·48절).
+///
+/// **아무것도 쓰지 않는다.** 화면이 스위치를 바꿀 때마다 다시 물으므로 자주 불린다 —
+/// 그래서 저장소도 워크스페이스도 건드리지 않는 것이 이 명령의 성질이다.
+#[tauri::command]
+fn autopilot_preview(
+    state: tauri::State<'_, SessionState>,
+    mode: String,
+    allow_git_commit: Option<bool>,
+    unattended: Option<bool>,
+    auto_approve_verification: Option<bool>,
+    skill_path: Option<String>,
+    deadline_secs: Option<u64>,
+) -> Result<Value, String> {
+    state.autopilot_preview(
+        parse_mode(&mode)?,
+        allow_git_commit.unwrap_or(false),
+        unattended.unwrap_or(false),
+        auto_approve_verification.unwrap_or(false),
+        skill_path.as_deref(),
+        deadline_secs,
+    )
 }
 
 /// 브랜치를 올리고 PR 폼 URL을 만든다 (state-machine 28절).
@@ -513,6 +543,7 @@ pub fn run() {
             derived_thresholds,
             task_transmission,
             task_blocked,
+            autopilot_preview,
             session_decisions,
             withdraw_decision,
             workspace_settings,

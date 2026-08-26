@@ -398,6 +398,17 @@ impl TaskHost {
         self.isolation.as_ref()
     }
 
+    /// 무인 실행이 이 정책으로 무엇을 허용하는지 (47절). **아무것도 쓰지 않는다.**
+    ///
+    /// 프로필을 여기서 만드는 이유는 두 가지다. 검증 명령 고정이 정책에 딸려 있고
+    /// (`auto_approve_verification`은 그 고정이 있어야 뜻이 있다), **등록된 MCP 풀이
+    /// 호스트에 있다** — 풀 없이 물으면 `mcp_call`이 "등록 밖 거부"로 나오는데, 서버를
+    /// 등록해 둔 사용자에게 그건 틀린 규칙 이름이다(무인에서의 결말은 같지만).
+    pub fn autopilot_preview(&self, policy: TaskPolicy) -> crate::autopilot::Preview {
+        let profile = TaskProfile::with_mcp(&self.root, policy, self.mcp.clone());
+        crate::autopilot::preview(&self.root, &profile, &self.hooks)
+    }
+
     pub fn root(&self) -> &WorkspaceRoot {
         &self.root
     }
