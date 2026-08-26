@@ -141,6 +141,12 @@ pub struct TaskProfile {
 }
 
 impl TaskProfile {
+    /// 미리보기가 **같은 게이트**에 묻게 한다(47절). 복사본을 만들어 주면 그 순간
+    /// 미리보기와 실행이 갈라질 수 있다 — 게이트가 MCP 풀을 들고 있는 것과 같은 이유다.
+    pub fn gate(&self) -> &PolicyGate {
+        &self.gate
+    }
+
     pub fn new(root: &WorkspaceRoot, policy: TaskPolicy) -> Self {
         Self::with_mcp(root, policy, None)
     }
@@ -840,104 +846,6 @@ impl TaskHost {
         self.in_hook.store(false, Ordering::SeqCst);
     }
 
-    /// ToolRequest 하나를 끝까지 처리한다. 이 함수가 신뢰 경계의 핵심 경로다.
-    /// 이 요청이 **태스크 시작 전에 프로젝트가 선언해 둔** 검증 명령과 정확히 같은가.
-    ///
-    /// 세 가지를 모두 본다. 하나라도 느슨하게 하면 레버가 검증 밖으로 새어 나간다:
-    ///  - 도구가 `run_tests`인가 — 검증 러너가 쓰는 이름이다. `run_command`로 온 같은 argv는
-    ///    통과하지 못한다.
-    ///  - cwd가 워크스페이스 루트인가 — 탐지된 명령은 전부 루트에서 돈다. 하위 디렉터리에서
-    ///    같은 이름의 스크립트를 돌리는 것은 다른 명령이다.
-    ///  - program과 args가 **완전히** 같은가. prefix 비교를 하면 `npm test --ignore-scripts`
-    ///    같은 변형이 딸려 들어온다.
-    fn is_pinned_verification(&self, request: &ToolRequest, profile: &TaskProfile) -> bool {
-        if request.tool != ToolName::RunTests {
-            return false;
-        }
-        let Ok(cmd) = parse_run_command(&request.args) else {
-            return false;
-        };
-        if cmd.cwd != "." {
-            return false;
-        }
-        profile
-            .verification_pin
-            .iter()
-            .any(|(program, args)| *program == cmd.program && *args == cmd.args)
-    }
-
-    /// 게이트가 정한 레버를 **호스트만 아는 사실로 고쳐 적는다**.
-    ///
-    /// conditional allowlist 명령에 대해 게이트는 `HumanOnly`밖에 말할 수 없다 — 그 명령이
-    /// 프로젝트가 선언해 둔 검증 명령인지는 고정 집합을 든 이 쪽만 안다(24.5절). 게이트에
-    /// 고정 집합을 넘겨 거기서 판단하게 하지 않는 이유는 게이트를 순수하게 두기 위해서다:
-    /// 게이트가 태스크의 시작 시점 상태를 들고 있으면 "args만 보고 처음부터 다시 판정한다"가
-    /// 깨진다.
-    fn lever_for(
-        &self,
-        request: &ToolRequest,
-        decision: &PolicyDecision,
-        profile: &TaskProfile,
-    ) -> crate::types::PolicyLever {
-        use crate::types::PolicyLever;
-        if decision.unblocked_by == PolicyLever::HumanOnly
-            && !profile.policy.auto_approve_verification
-            && self.is_pinned_verification(request, profile)
-        {
-            return PolicyLever::AutoApproveVerification;
-        }
-        decision.unblocked_by
-    }
-
-    /// 사용자가 **미리 적어 둔 것**이 이 요청을 승인하는가.
-    ///
-    /// 둘 다 근거가 같다: 명령의 출처가 모델이 아니라 사용자이고, 그 사실을 이 프로세스가
-    /// 구조적으로 확인할 수 있다. 그러나 **하나의 스위치로 뭉개지 않는다** — 검증 명령을
-    /// 자동 승인하기로 한 것과 훅을 등록한 것은 다른 결정이고, 기록도 달라야 한다.
-    fn pre_approval(&self, request: &ToolRequest, profile: &TaskProfile) -> Option<PreApproval> {
-        let candidate = if profile.policy.auto_approve_verification && self.is_pinned_verification(request, profile) {
-            Some(PreApproval::DeclaredVerification)
-        } else if self.is_registered_hook(request) {
-            Some(PreApproval::RegisteredHook)
-        } else {
-            None
-        };
-        let kind = candidate?;
-
-        // **매니페스트가 바뀌었으면 사전 승인이 성립하지 않는다**(29.3절). argv는 그대로인데
-        // 그 argv가 돌리는 본문이 달라졌을 수 있고, 그러면 사용자가 승인한 것과 실제로 도는
-        // 것이 다르다. 막는 것이 아니라 **사람에게 되돌린다** — 평소대로 묻고, 무인이면 멈춘다.
-        if manifest_fingerprint(&self.root) != profile.manifest_fingerprint {
-            let _ = self.append_event(
-                &request.task_id,
-                "PRE_APPROVAL_WITHDRAWN",
-                json!({
-                    "requestId": request.request_id,
-                    "wouldHaveBeen": kind.event_type(),
-                    "reason": "태스크 시작 이후 매니페스트가 바뀌어 사전 승인이 성립하지 않습니다 —                                같은 명령이라도 그 본문이 달라졌을 수 있습니다",
-                }),
-            );
-            return None;
-        }
-        Some(kind)
-    }
-
-    /// 이 요청이 **사용자가 등록한 훅과 바이트 단위로 같은** 명령인가.
-    ///
-    /// `requested_by`를 보지 않는다 — 그건 IPC로 들어오는 값이라 Node가 지어낼 수 있다.
-    /// 판정 근거는 argv뿐이고, 그래서 모델이 같은 argv를 요청하면 이것도 통과한다.
-    /// **그 사실을 숨기지 않는다**: 사용자가 "이 명령을 매 phase 전환마다 자동으로 돌려라"라고
-    /// 등록한 이상, 같은 명령이 한 번 더 도는 것은 그 승인의 범위 안이다(25.3절).
-    fn is_registered_hook(&self, request: &ToolRequest) -> bool {
-        if request.tool != ToolName::RunCommand {
-            return false;
-        }
-        let Ok(cmd) = parse_run_command(&request.args) else {
-            return false;
-        };
-        // 훅은 언제나 루트에서 돈다(hooks.rs `command()`). cwd가 다르면 등록된 것이 아니다.
-        cmd.cwd == "." && self.hooks.matches_registered(&cmd.program, &cmd.args)
-    }
 
     /// 실행하지 않고 돌려주는 결과. **`cancelled`로 보고한다** — 오케스트레이터가 정책 거부와
     /// 구별해야 하고(재시도 대상이 아니다), 감사 로그에도 남아야 한다: "멈췄는데 뭐가 더
@@ -1025,12 +933,26 @@ impl TaskHost {
         // **기본값이 `NotRequired`다.** 게이트가 승인을 요구하지 않은 요청은 "승인되지 않음"이
         // 아니라 "물을 일이 아니었음"이고, 둘을 같은 값으로 두면 결과 기록이 그 사실을 잃는다.
         let mut approval_state = crate::tools::ApprovalState::NotRequired;
-        let pre_approval = if decision.requires_user_approval {
-            self.pre_approval(request, &profile)
-        } else {
-            None
-        };
-        if let Some(kind) = pre_approval {
+        // **판정은 한 곳에서 나온다**(47절). 미리보기(`autopilot::preview`)가 같은 함수를
+        // 부르므로, 화면이 "여기서 멈춥니다"라고 말한 자리와 실제로 멈추는 자리가 갈라질 수 없다.
+        let fate = fate_of(&self.root, &profile, &self.hooks, request, &decision);
+
+        // 사전 승인의 **철회**는 결말이 아니라 결말에 붙는 사실이다 — 요청은 평소 경로로
+        // 돌아간다(29.3절). 그 사실을 여기서 남긴다.
+        if let Fate::UnattendedStop { withdrawn: Some(kind), .. } | Fate::AsksUser { withdrawn: Some(kind) } = fate {
+            let _ = self.append_event(
+                &request.task_id,
+                "PRE_APPROVAL_WITHDRAWN",
+                json!({
+                    "requestId": request.request_id,
+                    "wouldHaveBeen": PreApproval::from_kind(kind).event_type(),
+                    "reason": "태스크 시작 이후 매니페스트가 바뀌어 사전 승인이 성립하지 않습니다 —                                같은 명령이라도 그 본문이 달라졌을 수 있습니다",
+                }),
+            );
+        }
+
+        if let Fate::PreApproved { by } = fate {
+            let kind = PreApproval::from_kind(by);
             // 사용자가 **미리** 정해 둔 것이 답한다. **게이트 분류는 그대로다** — 바뀐 것은
             // "누가 답하는가"뿐이고, 그 대상은 사용자가 먼저 적어 둔 것으로 한정된다
             // (24.5절 검증 명령 / 25.3절 등록된 훅).
@@ -1047,7 +969,7 @@ impl TaskHost {
                     "riskLevel": decision.risk_level,
                 }),
             );
-        } else if decision.requires_user_approval && profile.policy.unattended {
+        } else if let Fate::UnattendedStop { lever, .. } = fate {
             // **무인 여부는 정책이 정한다.** 종전에는 승인 게이트웨이를 `UnattendedStop`으로
             // 바꿔 끼우는 것으로 표현했는데, 게이트웨이는 호스트 수명이라 **태스크마다 다른
             // 무인 여부**를 표현할 수 없었다(ui-wireframes 3.16.2절).
@@ -1055,7 +977,6 @@ impl TaskHost {
             // 게이트웨이 쪽 `UnattendedStop`을 지우지는 않았다. 이 짧은 길이 어떤 이유로
             // 우회되더라도 그쪽이 같은 답을 내야 하기 때문이다 — 두 규칙이 아니라 같은 답의
             // 두 겹이다.
-            let lever = self.lever_for(request, &decision, &profile);
             let _ = self.append_event(
                 &request.task_id,
                 "APPROVAL_UNATTENDED",
@@ -1070,7 +991,7 @@ impl TaskHost {
                 }),
             );
             approval_state = crate::tools::ApprovalState::Unattended;
-        } else if decision.requires_user_approval {
+        } else if matches!(fate, Fate::AsksUser { .. }) {
             let approval = ApprovalRequest {
                 approval_id: format!("approval-{}", uuid::Uuid::new_v4()),
                 task_id: request.task_id.clone(),
@@ -1117,7 +1038,7 @@ impl TaskHost {
                     // **여기가 무인 정지의 유일한 기록이다.** 사용자가 다음에 물을 것은
                     // "무엇을 바꾸면 지나가는가"이고(24.8절), 그 답을 지금 남기지 않으면
                     // 나중에는 게이트 규칙을 사람이 다시 읽어 추론해야 한다.
-                    let lever = self.lever_for(request, &decision, &profile);
+                    let lever = lever_for(&profile, &self.hooks, request, &decision);
                     let _ = self.append_event(
                         &request.task_id,
                         "APPROVAL_UNATTENDED",
@@ -1858,7 +1779,9 @@ impl TaskHost {
 /// 감사 로그를 읽는 사람에게 "검증 명령이라 통과했다"와 "등록된 훅이라 통과했다"는
 /// 다른 사실이고, 잘못 걸렸을 때 고칠 자리도 다르다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreApproval {
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreApproval {
     DeclaredVerification,
     RegisteredHook,
 }
@@ -1868,6 +1791,191 @@ impl PreApproval {
         match self {
             Self::DeclaredVerification => "APPROVAL_AUTO_VERIFICATION",
             Self::RegisteredHook => "APPROVAL_REGISTERED_HOOK",
+        }
+    }
+}
+
+/// 이 요청이 **승인 단계에서 맞이하는 결말**.
+///
+/// # 왜 값으로 뽑았는가 (47절)
+///
+/// 종전에는 이 판정이 `handle_tool_execute` 안의 `if/else if` 사슬로만 존재했다. 그러면
+/// "무인 실행에서 무엇이 일어나는가"를 **실행하지 않고 묻는 방법이 없다** — 미리보기를
+/// 만들려면 같은 사슬을 한 벌 더 쓰게 되고, 두 벌은 갈라진다. 갈라진 미리보기는 "멈춥니다"라고
+/// 말한 자리에서 멈추지 않는다.
+///
+/// 그래서 판정을 값으로 만들고 **살아 있는 경로가 그 값을 쓴다.** 미리보기는 같은 함수를
+/// 부를 뿐이므로 두 답이 다를 수 있는 자리가 없다.
+///
+/// `PreApprovalWithdrawn`을 별도 결말로 두지 않는 이유: 사전 승인이 철회되면 요청은 **그냥
+/// 평소 경로로 돌아간다**(29.3절 — 막는 것이 아니라 사람에게 되돌린다). 결말로 두면 그 요청이
+/// 거기서 끝나는 것처럼 읽히고, 실제 동작과도 달라진다. 그래서 결말에 **붙는 사실**로 남긴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Fate {
+    /// 게이트가 승인을 요구하지 않았다. **"승인되지 않음"이 아니라 "물을 일이 아니었음"이다.**
+    NotRequired,
+    /// 사용자가 미리 정해 둔 것이 답한다 (24.5절 검증 명령 / 25.3절 등록된 훅).
+    PreApproved { by: PreApprovalKind },
+    /// 무인 실행이라 물을 사람이 없다 — 여기서 멈춘다.
+    UnattendedStop {
+        lever: crate::types::PolicyLever,
+        /// 사전 승인 대상이었으나 매니페스트가 바뀌어 성립하지 않았는가 (29.3절).
+        withdrawn: Option<PreApprovalKind>,
+    },
+    /// 사람에게 묻는다.
+    AsksUser { withdrawn: Option<PreApprovalKind> },
+    /// 게이트가 거부했다. 스위치와 무관하다.
+    Denied,
+}
+
+/// `PreApproval`의 직렬화용 사본. `Copy`가 필요하고 `Fate`가 값 타입이어야 해서 나눠 둔다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreApprovalKind {
+    DeclaredVerification,
+    RegisteredHook,
+}
+
+impl Fate {
+    /// 이 결말을 미리 넓힐 수 있는 레버. 정지가 아니면 `None` — **넓힐 것이 없다는 사실이다.**
+    pub fn lever(self) -> Option<crate::types::PolicyLever> {
+        match self {
+            Self::UnattendedStop { lever, .. } => Some(lever),
+            _ => None,
+        }
+    }
+}
+
+/// 사전 승인 후보와 그 성립 여부 — **이벤트를 남기지 않는다.**
+enum PreApprovalCandidate {
+    None,
+    Granted(PreApproval),
+    /// 후보였으나 매니페스트가 바뀌어 성립하지 않는다.
+    Withdrawn(PreApproval),
+}
+
+/// 이 요청이 승인 단계에서 어떻게 되는가. **아무것도 쓰지 않고 저장소도 보지 않는다.**
+///
+/// 저장소를 받지 않는 것이 이 함수의 성질이다: 승인 판정에 저장소가 필요하지 않으므로
+/// 미리보기가 없던 `state.db`를 만들지 않는다(47절).
+pub fn fate_of(
+    root: &WorkspaceRoot,
+    profile: &TaskProfile,
+    hooks: &crate::hooks::HookRegistry,
+    request: &ToolRequest,
+    decision: &PolicyDecision,
+) -> Fate {
+    if matches!(decision.decision, crate::types::Decision::Deny) {
+        return Fate::Denied;
+    }
+    if !decision.requires_user_approval {
+        return Fate::NotRequired;
+    }
+    let withdrawn = match pre_approval_candidate(root, profile, hooks, request) {
+        PreApprovalCandidate::Granted(kind) => return Fate::PreApproved { by: kind.as_kind() },
+        PreApprovalCandidate::Withdrawn(kind) => Some(kind.as_kind()),
+        PreApprovalCandidate::None => None,
+    };
+    if profile.policy.unattended {
+        Fate::UnattendedStop {
+            lever: lever_for(profile, hooks, request, decision),
+            withdrawn,
+        }
+    } else {
+        Fate::AsksUser { withdrawn }
+    }
+}
+
+fn pre_approval_candidate(
+    root: &WorkspaceRoot,
+    profile: &TaskProfile,
+    hooks: &crate::hooks::HookRegistry,
+    request: &ToolRequest,
+) -> PreApprovalCandidate {
+    let candidate = if profile.policy.auto_approve_verification && is_pinned_verification(profile, request) {
+        PreApproval::DeclaredVerification
+    } else if is_registered_hook(hooks, request) {
+        PreApproval::RegisteredHook
+    } else {
+        return PreApprovalCandidate::None;
+    };
+    // **매니페스트가 바뀌었으면 사전 승인이 성립하지 않는다**(29.3절). argv는 그대로인데
+    // 그 argv가 돌리는 본문이 달라졌을 수 있고, 그러면 사용자가 승인한 것과 실제로 도는
+    // 것이 다르다. 막는 것이 아니라 **사람에게 되돌린다.**
+    if manifest_fingerprint(root) != profile.manifest_fingerprint {
+        return PreApprovalCandidate::Withdrawn(candidate);
+    }
+    PreApprovalCandidate::Granted(candidate)
+}
+
+/// 게이트가 정한 레버를 **호스트만 아는 사실로 고쳐 적는다**.
+///
+/// conditional allowlist 명령에 대해 게이트는 `HumanOnly`밖에 말할 수 없다 — 그 명령이
+/// 프로젝트가 선언해 둔 검증 명령인지는 고정 집합을 든 이 쪽만 안다(24.5절). 게이트에
+/// 고정 집합을 넘겨 거기서 판단하게 하지 않는 이유는 게이트를 순수하게 두기 위해서다:
+/// 게이트가 태스크의 시작 시점 상태를 들고 있으면 "args만 보고 처음부터 다시 판정한다"가
+/// 깨진다.
+fn lever_for(
+    profile: &TaskProfile,
+    hooks: &crate::hooks::HookRegistry,
+    request: &ToolRequest,
+    decision: &PolicyDecision,
+) -> crate::types::PolicyLever {
+    use crate::types::PolicyLever;
+    let _ = hooks;
+    if decision.unblocked_by == PolicyLever::HumanOnly
+        && !profile.policy.auto_approve_verification
+        && is_pinned_verification(profile, request)
+    {
+        return PolicyLever::AutoApproveVerification;
+    }
+    decision.unblocked_by
+}
+
+fn is_pinned_verification(profile: &TaskProfile, request: &ToolRequest) -> bool {
+    if request.tool != ToolName::RunTests {
+        return false;
+    }
+    let Ok(cmd) = parse_run_command(&request.args) else {
+        return false;
+    };
+    if cmd.cwd != "." {
+        return false;
+    }
+    profile
+        .verification_pin
+        .iter()
+        .any(|(program, args)| *program == cmd.program && *args == cmd.args)
+}
+
+/// 이 요청이 **사용자가 등록한 훅과 바이트 단위로 같은** 명령인가.
+///
+/// `requested_by`를 보지 않는다 — 그건 IPC로 들어오는 값이라 Node가 지어낼 수 있다.
+/// 판정 근거는 argv뿐이고, 그래서 모델이 같은 argv를 요청하면 이것도 통과한다.
+fn is_registered_hook(hooks: &crate::hooks::HookRegistry, request: &ToolRequest) -> bool {
+    if request.tool != ToolName::RunCommand {
+        return false;
+    }
+    let Ok(cmd) = parse_run_command(&request.args) else {
+        return false;
+    };
+    // 훅은 언제나 루트에서 돈다(hooks.rs `command()`). cwd가 다르면 등록된 것이 아니다.
+    cmd.cwd == "." && hooks.matches_registered(&cmd.program, &cmd.args)
+}
+
+impl PreApproval {
+    fn from_kind(kind: PreApprovalKind) -> Self {
+        match kind {
+            PreApprovalKind::DeclaredVerification => Self::DeclaredVerification,
+            PreApprovalKind::RegisteredHook => Self::RegisteredHook,
+        }
+    }
+
+    fn as_kind(self) -> PreApprovalKind {
+        match self {
+            Self::DeclaredVerification => PreApprovalKind::DeclaredVerification,
+            Self::RegisteredHook => PreApprovalKind::RegisteredHook,
         }
     }
 }
@@ -2694,6 +2802,49 @@ mod tests {
         );
     }
 
+    /// **무인 정지의 짧은 길이 실제로 답한다** (47절).
+    ///
+    /// 무인 정지에는 답이 두 겹 있다: 정책을 보는 짧은 길(`fate_of`)과 승인 게이트웨이의
+    /// `UnattendedStop`. 두 겹인 것은 의도지만, **짧은 길만 망가져도 아무 검사가 실패하지
+    /// 않는 상태**였다 — 게이트웨이가 같은 이벤트를 남겨 가려 주기 때문이다(프로브로 확인).
+    ///
+    /// 둘은 기록으로 구별된다: 게이트웨이를 지난 정지에는 `approvalId`가 있고 짧은 길에는
+    /// 없다(묻지 않았으므로 승인 요청 자체가 만들어지지 않는다). 그 차이로 어느 쪽이 답했는지
+    /// 고정한다.
+    #[test]
+    fn the_short_path_answers_the_unattended_stop_and_nothing_is_written() {
+        let (ws, _art, host) = host_with_sink(Arc::new(RecordingSink::default()));
+        host.begin_task(
+            "task-1",
+            TaskPolicy { unattended: true, ..TaskPolicy::default() },
+            None,
+        )
+        .unwrap();
+
+        let before = fs::read_to_string(ws.path().join("src/app.ts")).unwrap();
+        let request = req(
+            ToolName::ApplyPatch,
+            json!({ "path": "src/app.ts", "patch": "@@ -1,1 +1,1 @@\n-a\n+z\n" }),
+        );
+        let _ = host.execute_tool(&request);
+
+        let events = host.with_store(|s| s.events_after("task-1", None)).unwrap();
+        let stop = events
+            .iter()
+            .find(|e| e.event_type == "APPROVAL_UNATTENDED")
+            .expect("APPROVAL_UNATTENDED가 없습니다");
+        assert!(
+            stop.payload.get("approvalId").is_none(),
+            "게이트웨이가 답했습니다 — 짧은 길이 지나쳐졌습니다: {}",
+            stop.payload
+        );
+        assert_eq!(stop.payload.get("rerunFlag").and_then(Value::as_str), Some("--auto-approve-writes"));
+
+        // 멈췄으면 **아무것도 쓰지 않았다.** 이벤트만 보고 통과하면 "기록은 남기고 실행은 한"
+        // 상태를 잡지 못한다.
+        assert_eq!(fs::read_to_string(ws.path().join("src/app.ts")).unwrap(), before);
+    }
+
     // ---- 무인 실행의 시한 (39절) ----
 
     /// **시한이 지나면 실제로 멈춘다.** 값을 정책에 담아 두기만 하고 아무도 보지 않으면
@@ -3375,8 +3526,17 @@ mod tests {
             json!({ "program": "npm", "args": ["test"], "cwd": "." }),
         );
 
+        let fate = |host: &TaskHost, profile: &Arc<TaskProfile>| {
+            let decision = profile.gate().evaluate(&request, &host.root, &profile.policy);
+            fate_of(&host.root, profile, &host.hooks, &request, &decision)
+        };
+
         // 바뀌기 전에는 사전 승인이 성립한다 — 아래 단언이 공허하지 않다는 증거다.
-        assert!(host.pre_approval(&request, &profile).is_some());
+        assert!(
+            matches!(fate(&host, &profile), Fate::PreApproved { .. }),
+            "{:?}",
+            fate(&host, &profile)
+        );
 
         // **argv는 그대로이고 본문만 바뀐다.**
         fs::write(
@@ -3385,11 +3545,20 @@ mod tests {
         )
         .unwrap();
 
+        // **막는 것이 아니라 사람에게 되돌린다**(29.3절). 그래서 결말은 "거부"가 아니라
+        // "묻는다"이고, 철회됐다는 사실이 그 결말에 붙어 있다.
         assert!(
-            host.pre_approval(&request, &profile).is_none(),
-            "본문이 바뀌었는데 사전 승인이 그대로입니다"
+            matches!(
+                fate(&host, &profile),
+                Fate::AsksUser { withdrawn: Some(PreApprovalKind::DeclaredVerification) }
+            ),
+            "본문이 바뀌었는데 사전 승인이 그대로입니다: {:?}",
+            fate(&host, &profile)
         );
-        // 막는 것이 아니라 사람에게 되돌린다 — 그 사실이 기록에 남는다.
+
+        // 그 사실이 실제 실행 경로에서 기록으로도 남는다. `AlwaysDeny`가 승인을 거부하므로
+        // 명령은 돌지 않는다 — 여기서 확인하려는 것은 실행이 아니라 기록이다.
+        let _ = host.execute_tool(&request);
         let types = host.with_store(|s| s.event_types("task-1")).unwrap();
         assert!(types.contains(&"PRE_APPROVAL_WITHDRAWN".to_string()), "{types:?}");
     }
@@ -3414,10 +3583,17 @@ mod tests {
             ToolName::RunCommand,
             json!({ "program": "npm", "args": ["run", "fmt"], "cwd": "." }),
         );
-        assert!(host.pre_approval(&request, &profile).is_some());
+        let fate = |host: &TaskHost, profile: &Arc<TaskProfile>| {
+            let decision = profile.gate().evaluate(&request, &host.root, &profile.policy);
+            fate_of(&host.root, profile, &host.hooks, &request, &decision)
+        };
+        assert!(matches!(fate(&host, &profile), Fate::PreApproved { .. }));
 
         fs::write(ws.path().join("package.json"), r#"{"scripts":{"fmt":"node evil.js"}}"#).unwrap();
-        assert!(host.pre_approval(&request, &profile).is_none());
+        assert!(matches!(
+            fate(&host, &profile),
+            Fate::AsksUser { withdrawn: Some(PreApprovalKind::RegisteredHook) }
+        ));
     }
 
     /// 지문이 **읽는 파일 목록**은 손으로 적혀 있다. `detect_commands`가 새 매니페스트를
@@ -3474,9 +3650,9 @@ mod tests {
         );
         // 시작 시점에 선언돼 있던 명령은 매치된다 — 아래 부정 단언이 공허하지 않다는 증거다.
         let profile = host.default_profile.clone();
-        assert!(host.is_pinned_verification(
-            &req(ToolName::RunTests, json!({ "program": "npm", "args": ["test"], "cwd": "." })),
-            &profile
+        assert!(is_pinned_verification(
+            &profile,
+            &req(ToolName::RunTests, json!({ "program": "npm", "args": ["test"], "cwd": "." }))
         ));
 
         fs::write(
@@ -3486,9 +3662,9 @@ mod tests {
         .unwrap();
 
         assert!(
-            !host.is_pinned_verification(
-                &req(ToolName::RunTests, json!({ "program": "npm", "args": ["run", "lint"], "cwd": "." })),
-                &profile
+            !is_pinned_verification(
+                &profile,
+                &req(ToolName::RunTests, json!({ "program": "npm", "args": ["run", "lint"], "cwd": "." }))
             ),
             "실행 중에 추가된 스크립트가 자동 승인 집합에 들어왔습니다"
         );
@@ -3518,7 +3694,7 @@ mod tests {
         ];
         for (tool, args) in cases {
             assert!(
-                !host.is_pinned_verification(&req(tool, args.clone()), &host.default_profile),
+                !is_pinned_verification(&host.default_profile, &req(tool, args.clone())),
                 "고정 집합이 {args}를 검증 명령으로 인정했습니다"
             );
         }

@@ -362,7 +362,7 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|rollback|revert|pr|recover|tasks|show|blocked|decisions|withdraw|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|rollback|revert|pr|recover|tasks|show|blocked|autopilot-preview|decisions|withdraw|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--skill <파일.json>] [--session <id>]\n\
      [--auto-approve-writes] [--auto-approve-verification]\n\
@@ -410,6 +410,10 @@ fn usage() -> String {
      blocked — 무인 정지의 처방(JSON). 무엇이 막았고 **무엇을 켜면 지나가는지**, 그리고\n\
                  어떤 정지는 정책으로 열 수 없는지를 기록에서 유도한다. 아무것도 쓰지 않는다.\n\
                  이번 실행이 도달한 지점까지만 안다 — 켜고 다시 돌리면 더 진행하다 또 멈출 수 있다\n\
+     autopilot-preview — 그 반대 방향(JSON). **돌리기 전에** 지금 스위치로 무엇이 사람 없이\n\
+                 일어나고 무엇이 멈추는지를 게이트에 물어 답한다. 산문이 아니라 판정이므로\n\
+                 게이트가 바뀌면 함께 바뀐다. DB도 워크스페이스도 건드리지 않는다.\n\
+                 위 플래그들을 그대로 받는다 — `run`과 **같은 함수**로 정책을 만든다\n\
      decisions — 이 세션에서 사용자가 정한 것 목록 (읽기 전용, --session 필요). **거둔 것도 나온다** —\n\
                  목록에서까지 지우면 '사라졌다'와 '거뒀다'가 같은 모양이 된다\n\
      withdraw — 앞선 판정을 거둔다 (--session --task --criterion [--reason]). 바뀌는 것은\n\
@@ -587,6 +591,59 @@ fn real_main() -> Result<i32, String> {
         return reproduce_check(&args, &root);
     }
 
+    // **미리보기도 DB를 열지 않는다.** 승인 판정에 저장소가 필요하지 않으므로(47절), 여기서
+    // store를 만들면 "무엇이 허용되는지 물어봤을 뿐"인 명령이 없던 state.db를 남긴다 —
+    // reproduce·windows-landing과 같은 이유로 store를 만들기 전에 갈라진다.
+    if args.command == "autopilot-preview" {
+        let skill = load_skill(&args, &root)?;
+        let profile = tomverse_core::host::TaskProfile::new(&root, task_policy_from(&args, skill.as_ref()));
+        let hooks = tomverse_core::hooks::HookRegistry::new(args.hooks.clone());
+        let report = tomverse_core::autopilot::preview(&root, &profile, &hooks);
+        println!("{}", serde_json::to_string(&report).unwrap_or_default());
+        // **판정을 종료 코드에 싣지 않는다.** "멈추는 곳이 있다"는 실패가 아니라 사실이다 —
+        // reproduce·windows-landing이 같은 이유로 그렇게 한다.
+        Ok(0)
+    } else {
+        run_with_store(args, root, isolated)
+    }
+}
+
+/// 스킬을 **Rust가 읽는다**(26.1절). sidecar가 읽으면 도구 허용목록의 출처가 sidecar가 되고,
+/// 장악당한 sidecar가 "허용목록은 전부입니다"라고 말할 수 있다.
+fn load_skill(args: &Args, root: &WorkspaceRoot) -> Result<Option<tomverse_core::skills::Skill>, String> {
+    match &args.skill {
+        None => Ok(None),
+        Some(path) => {
+            let loaded = tomverse_core::skills::load(path, root).map_err(|e| e.to_string())?;
+            eprintln!("스킬 적용: {}", loaded.describe());
+            Ok(Some(loaded))
+        }
+    }
+}
+
+/// 플래그에서 이 태스크의 정책을 만든다.
+///
+/// **`run`과 `autopilot-preview`가 같은 함수를 쓴다**(47절). 두 벌로 두면 미리보기가 실행과
+/// 다른 정책에 대해 답하게 되고, 그 어긋남은 "미리보기가 틀렸다"가 아니라 "도구가 거짓말했다"로
+/// 읽힌다.
+fn task_policy_from(args: &Args, skill: Option<&tomverse_core::skills::Skill>) -> TaskPolicy {
+    TaskPolicy {
+        // 도구 허용목록은 **게이트에 꽂힌다.** sidecar에 알려 주기는 하지만 지키는 것은 여기다.
+        allowed_tools: skill.and_then(|s| s.allowed_tools.clone()),
+        auto_approve_workspace_writes: args.auto_approve_writes,
+        auto_approve_verification: args.auto_approve_verification,
+        allow_git_commit: args.allow_git_commit,
+        execution_mode: args.mode,
+        // sidecar가 완료 판정에 쓴다 — 무인 실행에서는 "검증되지 않음"을 완료로 보고하지 않는다.
+        unattended: args.approve == "autopilot",
+        // **sidecar로 가지 않는다**(39.1절). Rust가 재고 Rust가 집행한다.
+        deadline_ms: args.deadline_secs.map(|s| s * 1_000),
+        ..TaskPolicy::default()
+    }
+}
+
+fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_core::worktree::Isolation>) -> Result<i32, String> {
+
     let artifacts_root = args.artifacts.clone().unwrap_or_else(ArtifactStore::default_root);
     let artifacts = ArtifactStore::new(&artifacts_root).map_err(|e| format!("artifact 저장소 오류: {e}"))?;
 
@@ -605,30 +662,8 @@ fn real_main() -> Result<i32, String> {
         .upsert_workspace(&workspace_id, &root.display(), workspace_name(&root))
         .map_err(|e| format!("워크스페이스 기록 실패: {e}"))?;
 
-    // 스킬을 **Rust가 읽는다**(26.1절). sidecar가 읽으면 도구 허용목록의 출처가 sidecar가 되고,
-    // 장악당한 sidecar가 "허용목록은 전부입니다"라고 말할 수 있다.
-    let skill = match &args.skill {
-        None => None,
-        Some(path) => {
-            let loaded = tomverse_core::skills::load(path, &root).map_err(|e| e.to_string())?;
-            eprintln!("스킬 적용: {}", loaded.describe());
-            Some(loaded)
-        }
-    };
-
-    let policy_for_task = TaskPolicy {
-        // 도구 허용목록은 **게이트에 꽂힌다.** sidecar에 알려 주기는 하지만 지키는 것은 여기다.
-        allowed_tools: skill.as_ref().and_then(|s| s.allowed_tools.clone()),
-        auto_approve_workspace_writes: args.auto_approve_writes,
-        auto_approve_verification: args.auto_approve_verification,
-        allow_git_commit: args.allow_git_commit,
-        execution_mode: args.mode,
-        // sidecar가 완료 판정에 쓴다 — 무인 실행에서는 "검증되지 않음"을 완료로 보고하지 않는다.
-        unattended: args.approve == "autopilot",
-        // **sidecar로 가지 않는다**(39.1절). Rust가 재고 Rust가 집행한다.
-        deadline_ms: args.deadline_secs.map(|s| s * 1_000),
-        ..TaskPolicy::default()
-    };
+    let skill = load_skill(&args, &root)?;
+    let policy_for_task = task_policy_from(&args, skill.as_ref());
 
     let approvals: Arc<dyn ApprovalGateway> = match args.approve.as_str() {
         // **`auto`는 테스트 전용이며 제품의 Autopilot이 아니다.** 전부 승인하므로 게이트의

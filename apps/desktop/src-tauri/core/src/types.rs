@@ -228,6 +228,23 @@ impl PolicyLever {
             Self::NotApplicable | Self::HumanOnly => None,
         }
     }
+
+    /// 이 레버를 정책에 **실제로 켠다**.
+    ///
+    /// `rerun_flag`의 짝이다. 플래그 이름만 알고 그것이 무엇을 켜는지 모르면, "이 스위치를
+    /// 켜면 지나갑니다"라는 조언이 **맞는지 확인할 방법이 없다** — 47.6절이 그 확인을 하고,
+    /// 실제로 틀린 조언을 하나 찾았다.
+    ///
+    /// 두 함수를 나란히 두는 이유는 컴파일러다: 레버가 늘면 두 `match` 모두가 실패한다.
+    pub fn apply_to(self, policy: &mut TaskPolicy) {
+        match self {
+            Self::AutoApproveWorkspaceWrites => policy.auto_approve_workspace_writes = true,
+            Self::AllowGitCommit => policy.allow_git_commit = true,
+            Self::AutoApproveVerification => policy.auto_approve_verification = true,
+            // 켤 것이 없다. **아무것도 하지 않는 것이 이 변형의 답이다.**
+            Self::NotApplicable | Self::HumanOnly => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

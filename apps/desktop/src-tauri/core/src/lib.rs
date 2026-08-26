@@ -14,6 +14,7 @@
 
 pub mod approvals;
 pub mod artifacts;
+pub mod autopilot;
 pub mod blocked;
 pub mod budget;
 pub mod cancel;
