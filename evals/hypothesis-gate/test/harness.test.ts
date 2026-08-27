@@ -641,3 +641,32 @@ test("artifacts 루트는 DB와 형제 디렉터리다", () => {
   // runHost가 --artifacts로 넘기는 위치와 같아야 한다. 갈라지면 조용히 못 읽는다.
   assert.equal(artifactsRootFor(path.join("C:\tmp", "gate-state-x", "state.db")), path.join("C:\tmp", "gate-state-x", "artifacts"));
 });
+
+test("초안 캐시는 arm별로 나뉜다 — 생성 arm이 둘이기 때문이다", async () => {
+  // A와 B가 **둘 다** draftSource: "generate"다. 키에 arm이 없으면 나중에 도는 B가 A의
+  // 초안을 덮어쓰고, C/D가 B의 초안을 검수하게 된다. 그러면 A↔C 차이가 "검수의 순효과"가
+  // 아니라 초안 모델 차이와 섞인 값이 된다.
+  assert.ok(artifactsPresent().ok);
+  await withDirAsync(async (dir) => {
+    const fixtures = [loadFixture(FIXTURES, "stm-01-loop-bound")];
+    const store = openRecordStore(path.join(dir, "records.jsonl"));
+    await runExperiment({
+      fixtures,
+      arms: ["A", "B", "C"],
+      repetitions: 1,
+      seed: 3,
+      store,
+      runId: "draft-key",
+      // 모델별로 다른 patch를 주어 어느 초안이 재생됐는지 구별한다.
+      fakeScript: { defaultPatch: FIXED_PATCH },
+    });
+
+    const records = store.all();
+    const armA = records.find((r) => r.arm === "A");
+    const armC = records.find((r) => r.arm === "C");
+    assert.ok(armA, "Arm A 기록이 없습니다");
+    assert.ok(armC, "Arm C 기록이 없습니다");
+    // C가 건너뛰어지지 않았어야 한다 — 건너뛰면 fixture_setup_failure로 남는다.
+    assert.notEqual(armC!.failureClass, "fixture_setup_failure", "Arm C가 초안을 받지 못했습니다");
+  });
+});

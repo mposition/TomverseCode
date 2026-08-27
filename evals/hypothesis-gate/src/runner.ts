@@ -230,9 +230,24 @@ function envelopeModelId(record: { providerCalls: readonly ProviderCallFact[] })
   return reported.size === 1 ? [...reported][0] : undefined;
 }
 
-/** 초안 캐시 키 — 같은 fixture/반복이면 같은 초안을 공유한다. */
-function draftKey(fixtureId: string, repetition: number): string {
-  return `${fixtureId}::${repetition}`;
+/**
+ * 초안 캐시 키 — **초안을 만든 arm까지 포함한다.**
+ *
+ * 예전에는 `fixture::repetition`뿐이었다. 그런데 초안을 생성하는 arm은 하나가 아니다 —
+ * A(OpenAI)와 B(Anthropic)가 **둘 다** `draftSource: "generate"`이므로, 나중에 도는 B가
+ * A의 초안을 덮어썼다. 그러면 A의 초안을 재생해야 하는 C/D가 **B의 초안**을 받는다.
+ *
+ * 조용히 실험을 무너뜨리는 종류다. A↔C 차이는 "같은 초안에 검수를 붙인 순효과"여야 하는데,
+ * C가 다른 모델의 초안을 검수하면 그 차이는 초안 모델의 차이와 검수 효과가 섞인 값이 된다.
+ * 게다가 초안 저자가 검수자와 같은 공급자가 되어 라우터의 13.3절 절충이 발동하고, **검수자가
+ * executor 모델로 바뀐다** — 실측(P0, 2026-08-27)에서 `asy-03`의 C/D가 그렇게 됐고
+ * attestation의 "응답 envelope 모델 ID 일치" 검사가 그것을 잡아 P1을 막았다.
+ *
+ * 더 나쁜 것은 **순서 의존이라 절반만 틀린다**는 점이다: A의 초안이 살아남는 fixture와
+ * 덮어써지는 fixture가 섞여 있었다(같은 실행에서 `amb-01`은 A, `asy-03`은 B였다).
+ */
+function draftKey(fixtureId: string, repetition: number, arm: ArmId): string {
+  return `${fixtureId}::${arm}::${repetition}`;
 }
 
 export async function runExperiment(options: RunnerOptions): Promise<RunnerResult> {
@@ -288,9 +303,9 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     if (options.store.isDone(fixtureId, arm, repetition)) {
       skippedResume += 1;
       // 재개 시에도 초안 공유가 성립해야 한다. 이미 저장된 Arm A 기록에서 초안을 복구한다.
-      if (armSpec(arm).draftSource === "generate" && !drafts.has(draftKey(fixtureId, repetition))) {
+      if (armSpec(arm).draftSource === "generate" && !drafts.has(draftKey(fixtureId, repetition, arm))) {
         const restored = restoreDraftFromRecords(options.store, fixtureId, repetition, arm);
-        if (restored) drafts.set(draftKey(fixtureId, repetition), restored);
+        if (restored) drafts.set(draftKey(fixtureId, repetition, arm), restored);
       }
       continue;
     }
@@ -311,7 +326,7 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     let replayDraft: unknown;
     if (spec.draftSource === "replay") {
       const source = spec.draftSourceArm!;
-      replayDraft = drafts.get(draftKey(fixtureId, repetition));
+      replayDraft = drafts.get(draftKey(fixtureId, repetition, source));
       if (replayDraft === undefined) {
         // Arm A가 초안을 만들지 못한 경우(실패/인프라 오류). 새 초안을 만들어 대체하면
         // "같은 초안 공유"라는 전제가 깨지므로 **이 arm은 건너뛴다** — 조용히 다르게 돌리지 않는다.
@@ -449,7 +464,7 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     }
 
     if (spec.draftSource === "generate" && record.draftProposal !== undefined) {
-      drafts.set(draftKey(fixtureId, repetition), record.draftProposal);
+      drafts.set(draftKey(fixtureId, repetition, arm), record.draftProposal);
     }
   }
 
