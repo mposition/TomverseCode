@@ -26,7 +26,8 @@ import type { NdjsonTransport } from "../src/ipc/transport.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
-import { renderSnapshot } from "../src/providers/prompts.js";
+import { extractFileReferences } from "../src/verify/digest.js";
+import { buildFixPrompt, digestSectionSizes, renderSnapshot } from "../src/providers/prompts.js";
 
 // ---- 제외 규칙 (secret / binary / 대용량) ----
 
@@ -1387,4 +1388,65 @@ test("앵커 덮개가 SNAPSHOT_CREATED에 실린다", async () => {
   assert.notEqual(payloadAt, -1, "snapshotPayload를 찾지 못했습니다");
   const body = orchestrator.slice(payloadAt, orchestrator.indexOf("\n  }", payloadAt));
   assert.ok(body.includes("anchorCoverage"), "SNAPSHOT_CREATED payload가 앵커 덮개를 싣지 않습니다");
+});
+
+// ---- 검증 출력의 크기 (state-machine 67절) ----
+
+/**
+ * **재는 값과 나가는 값이 같은 함수에서 나온다.**
+ *
+ * 크기를 따로 계산하면 두 벌이 되고, 두 벌은 갈라진다 — 갈라진 집계는 실제보다 **적게**
+ * 보고하고, 전송 화면에서 적게 보고하는 것은 "안 나갔다"로 읽힌다.
+ */
+test("검증 출력의 크기가 실제 프롬프트에 실린 것과 같다", () => {
+  const digest = {
+    taskId: "task-1",
+    reportId: "r-1",
+    attemptNumber: 2,
+    failingChecks: [
+      {
+        kind: "test" as const,
+        command: "npm test",
+        exitCode: 1,
+        excerpt: "FAIL src/ledger.test.ts\n  at src/deep/helper.ts:41",
+        fileReferences: [{ path: "src/deep/helper.ts", line: 41 }],
+      },
+    ],
+    passingChecksSummary: "lint: pass",
+    preexistingFailuresSummary: undefined,
+  };
+  const applied = "src/ledger.ts (+3 -1)";
+
+  const prompt = buildFixPrompt({
+    userMessage: "고쳐주세요",
+    snapshot: makeSnapshot({}),
+    appliedChanges: applied,
+    digest,
+  });
+  const sizes = digestSectionSizes(digest, applied);
+
+  // 0개면 아래 비교가 공허하다.
+  assert.ok(sizes.length >= 4, `섹션을 ${sizes.length}개만 읽었습니다`);
+  for (const { section, bytes } of sizes) {
+    const head = `## ${section}`;
+    const at = prompt.indexOf(head);
+    assert.notEqual(at, -1, `프롬프트에 ${section} 섹션이 없습니다`);
+    // 그 섹션이 프롬프트에서 차지하는 실제 길이 — 다음 빈 줄 두 개까지.
+    const rest = prompt.slice(at);
+    const end = rest.indexOf("\n\n## ");
+    const actual = (end === -1 ? rest : rest.slice(0, end)).length;
+    assert.equal(bytes, actual, `${section}의 크기가 실제와 다릅니다`);
+  }
+});
+
+/**
+ * **경로 목록은 우리가 알아본 것이다.** 나간 것의 전부가 아니고, 그 사실을 화면이 말한다 —
+ * 여기서는 그 목록이 실제 출력에서 나온다는 것만 고정한다.
+ */
+test("실패 출력의 경로가 검증 출력에서 유도된다", () => {
+  const refs = extractFileReferences("FAIL\n  at src/deep/helper.ts:41\n  at src/other.ts:9");
+  assert.deepEqual(
+    refs.map((r) => r.path).sort(),
+    ["src/deep/helper.ts", "src/other.ts"]
+  );
 });

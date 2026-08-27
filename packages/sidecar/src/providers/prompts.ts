@@ -432,16 +432,28 @@ export function buildSingleModelFixPrompt(input: {
 }
 
 /**
- * FIX_LOOP 프롬프트 — 문서 6절의 재전달 페이로드.
- * 전체 로그가 아니라 digest + 적용된 delta만 보낸다(토큰 누적 팽창 방지).
+ * 검증 출력이 프롬프트에서 차지하는 **섹션들** — product-strategy 7.2절, state-machine 67절.
+ *
+ * # 왜 함수로 뽑았는가
+ *
+ * 이 내용은 공급자로 나가는데 **전송 집계가 세지 못하고 있었다.** 세려면 크기를 알아야 하고,
+ * 크기를 알려면 렌더링해야 한다. 프롬프트 안에서만 조립하면 재는 쪽이 **한 벌 더 조립**하게
+ * 되고, 두 벌은 갈라진다 — 갈라진 집계는 실제보다 적게 보고한다(47절이 미리보기를 게이트에
+ * 묻게 만든 이유와 같다).
+ *
+ * 그래서 `renderSnapshot`과 같은 자리에 둔다: **나가는 값과 재는 값이 같은 함수에서 나온다.**
+ *
+ * # 섹션 단위로 돌려준다
+ *
+ * 전송 화면은 섹션 이름으로 항목을 나열한다(`sentContext`). 하나로 뭉친 문자열을 주면
+ * 화면이 "검증 출력 12000자"라고만 말하는데, 그 안에서 **실패 출력**과 **통과 요약**은
+ * 사용자에게 무게가 다르다.
  */
-export function buildFixPrompt(input: {
-  userMessage: string;
-  snapshot: WorkspaceSnapshot;
-  appliedChanges: string;
-  digest: VerificationDigest;
-}): string {
-  const failing = input.digest.failingChecks
+export function renderDigestSections(
+  digest: VerificationDigest,
+  appliedChanges: string
+): { section: string; text: string }[] {
+  const failing = digest.failingChecks
     .map((check) =>
       [
         `### ${check.kind}${check.command ? ` — ${check.command}` : ""}${
@@ -467,28 +479,61 @@ export function buildFixPrompt(input: {
     )
     .join("\n\n");
 
+  const sections = [
+    { section: "Attempt number", text: String(digest.attemptNumber) },
+    // **```diff 블록이 아니다.** 우리는 diff를 갖고 있지 않다 — 여기 실리는 것은 경로와
+    // 크기뿐이고, 변경 내용 자체는 위 스냅샷이 이미 적용된 상태로 보여준다(6.1절).
+    // 제목과 fence가 diff라고 말하면 모델은 없는 diff를 찾다가 크기 한 줄을 diff로 읽는다.
+    {
+      section: "Files your previous attempt changed",
+      text:
+        `${appliedChanges || "(none recorded)"}\n\n` +
+        "Their current contents are already shown in the workspace snapshot above — that snapshot " +
+        "reflects your change. This section is an index, not a diff.",
+    },
+    { section: "Failing checks", text: failing || "(no failing check detail available)" },
+    { section: "Checks that passed", text: digest.passingChecksSummary || "(none)" },
+  ];
+
+  if (digest.preexistingFailuresSummary) {
+    // 원래 깨져 있던 것을 고치려 시도하면 범위가 번지고 검증도 통과하지 못한다.
+    sections.push({
+      section: "Already failing before your change — DO NOT try to fix these",
+      text: digest.preexistingFailuresSummary,
+    });
+  }
+  return sections;
+}
+
+/** 검증 출력이 프롬프트에서 차지하는 크기. **나가는 것과 같은 함수로 잰다**(67절). */
+export function digestSectionSizes(
+  digest: VerificationDigest,
+  appliedChanges: string
+): { section: string; bytes: number }[] {
+  return renderDigestSections(digest, appliedChanges).map((s) => ({
+    // 프롬프트에 실리는 것은 제목까지다 — 본문만 세면 실제보다 적게 보고한다.
+    section: s.section,
+    bytes: `## ${s.section}\n${s.text}`.length,
+  }));
+}
+
+/**
+ * FIX_LOOP 프롬프트 — 문서 6절의 재전달 페이로드.
+ * 전체 로그가 아니라 digest + 적용된 delta만 보낸다(토큰 누적 팽창 방지).
+ */
+export function buildFixPrompt(input: {
+  userMessage: string;
+  snapshot: WorkspaceSnapshot;
+  appliedChanges: string;
+  digest: VerificationDigest;
+}): string {
   const parts = [
     "Your previous patch was applied and then failed deterministic verification. Fix it.",
     "Base your fix on the verification output below — it is ground truth, not an opinion.",
     "",
     `## Task\n${input.userMessage}`,
-    `## Attempt number\n${input.digest.attemptNumber}`,
-    // **```diff 블록이 아니다.** 우리는 diff를 갖고 있지 않다 — 여기 실리는 것은 경로와
-    // 크기뿐이고, 변경 내용 자체는 위 스냅샷이 이미 적용된 상태로 보여준다(6.1절).
-    // 제목과 fence가 diff라고 말하면 모델은 없는 diff를 찾다가 크기 한 줄을 diff로 읽는다.
-    `## Files your previous attempt changed\n${input.appliedChanges || "(none recorded)"}\n\n` +
-      "Their current contents are already shown in the workspace snapshot above — that snapshot " +
-      "reflects your change. This section is an index, not a diff.",
-    `## Failing checks\n${failing || "(no failing check detail available)"}`,
-    `## Checks that passed\n${input.digest.passingChecksSummary || "(none)"}`,
+    ...renderDigestSections(input.digest, input.appliedChanges).map((s) => `## ${s.section}\n${s.text}`),
   ];
-
-  if (input.digest.preexistingFailuresSummary) {
-    // 원래 깨져 있던 것을 고치려 시도하면 범위가 번지고 검증도 통과하지 못한다.
-    parts.push(
-      `## Already failing before your change — DO NOT try to fix these\n${input.digest.preexistingFailuresSummary}`
-    );
-  }
 
   parts.push(renderSnapshot(input.snapshot));
   parts.push(

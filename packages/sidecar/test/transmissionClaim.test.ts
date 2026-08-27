@@ -116,6 +116,19 @@ function promptSections(): string[] {
     const title = normalizeSection(m[1] ?? m[2] ?? "");
     if (title.length > 0) found.add(title);
   }
+  // **제목이 조립되는 자리도 읽는다** (state-machine 67절).
+  //
+  // 검증 출력 섹션들은 `## <리터럴>`이 아니라 `{ section: "…" }` 목록에서 조립된다 —
+  // 그 값을 **나가는 것과 재는 것이 같은 함수**에서 쓰기 위해서다. 이 스캐너가 문자열 모양
+  // 하나만 알던 동안, 그 리팩터링이 다섯 섹션을 **프롬프트에서 사라진 것처럼** 보이게 했다.
+  //
+  // 검사는 그것을 잡았다(분류 목록에 남은 이름이 프롬프트에 없다고 실패했다). 잡은 것이
+  // 결함이 아니라 **스캐너의 사각지대**였고, 판정 기준을 넓히는 것이 답이다 — 조립 방식이
+  // 바뀔 때마다 분류가 조용히 비는 쪽이 훨씬 나쁘다.
+  for (const m of source.matchAll(/\bsection: "([^"]+)"/g)) {
+    const title = normalizeSection(m[1] ?? "");
+    if (title.length > 0) found.add(title);
+  }
   assert.ok(marker.length > 0);
   return [...found];
 }

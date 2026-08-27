@@ -33,7 +33,8 @@
 //! **DB에 남기기 전에** 가린 개수이고, 같은 답변은 프롬프트에 원문으로 실려 나간다(17.11절).
 //! 이 숫자를 전송 화면에 그냥 올리면 "가려져서 안 나갔다"로 읽히는데 정반대다.
 
-use crate::store::Store;
+use std::collections::{BTreeMap, BTreeSet};
+use crate::store::{Store, StoredEvent};
 use serde_json::Value;
 
 /// 한 공급자에게 나간 것.
@@ -145,6 +146,13 @@ pub const REPORTED_SECTIONS: &[&str] = &[
     "MCP tool results",
     "Files",
     "Files deliberately excluded from context",
+    // 검증 출력 (67절). 오래 UNREPORTED에 있었고, 그 칸의 주석이 **왜 위험한지를 이미
+    // 적어 두고 있었다** — 스택 트레이스에 컨텍스트 밖 파일의 조각이 들어간다.
+    "Attempt number",
+    "Files your previous attempt changed",
+    "Failing checks",
+    "Checks that passed",
+    "Already failing before your change — DO NOT try to fix these",
     // **파일 문단과 따로다**(context-engine 17절). 한동안 이 내용이 위 문단에 섞여 있었고,
     // 그래서 화면의 이름만-나간-파일 목록에 파일이 아닌 것이 들어갔다. 화면은 이제
     // coverageNotes로 따로 설명한다.
@@ -187,11 +195,6 @@ pub const UNREPORTED_SECTIONS: &[&str] = &[
     // 붙고, 그 사유에는 **경로가 들어갈 수 있다**(경계 위반이면 그 경로가 문장에 있다).
     // 그래서 우리 지시문으로 접지 않고 여기 둔다.
     "Your previous plan was refused by the policy gate before anything ran",
-    "Attempt number",
-    "Failing checks",
-    "Checks that passed",
-    "Already failing before your change — DO NOT try to fix these",
-    "Files your previous attempt changed",
 ];
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -226,6 +229,72 @@ pub struct Transmission {
     /// 사용자가 자유 텍스트로 답한 횟수. 그 원문은 프롬프트에 그대로 실린다(17.11절).
     #[serde(rename = "freeTextAnswers")]
     pub free_text_answers: u64,
+}
+
+/// **검증 출력도 나간다** — product-strategy 7.2절, state-machine 67절.
+///
+/// `UNREPORTED_SECTIONS`가 오래 적어 두고 있던 것이다: *"검증 출력에는 실패한 테스트의 스택
+/// 트레이스와 소스 조각이 그대로 들어가고, 그건 `relevantFiles`에 없던 파일의 내용일 수
+/// 있다. 지금 화면은 그것을 말하지 않는다."*
+///
+/// # 라운드를 합친다
+///
+/// fix loop는 상한까지 돈다. 라운드마다 다이제스트가 한 벌씩 나가므로 **합계**가 이 태스크에서
+/// 나간 양이다. 마지막 것만 세면(스냅샷이 그렇게 한다) 실제보다 적게 보고한다 — 스냅샷은
+/// 매번 **대체**되지만 다이제스트는 매번 **추가로** 나가기 때문이다.
+fn collect_verification_output(events: &[StoredEvent], out: &mut Vec<SentContext>) {
+    let mut bytes: BTreeMap<String, u64> = BTreeMap::new();
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    let mut rounds = 0u64;
+
+    for event in events.iter().filter(|e| e.event_type == "VERIFICATION_DIGEST_SENT") {
+        rounds += 1;
+        if let Some(sections) = event.payload.get("sections").and_then(Value::as_array) {
+            for section in sections {
+                let Some(name) = section.get("section").and_then(Value::as_str) else {
+                    continue;
+                };
+                let size = section.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                *bytes.entry(name.to_string()).or_insert(0) += size;
+            }
+        }
+        if let Some(list) = event.payload.get("recognizedPaths").and_then(Value::as_array) {
+            paths.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+    }
+
+    if rounds == 0 {
+        return;
+    }
+
+    let recognized: Vec<String> = paths.into_iter().collect();
+    for (section, size) in bytes {
+        // **0바이트 섹션은 넣지 않는다.** 프롬프트에 없던 것을 "이것도 나갔다"로 읽히게 한다.
+        if size == 0 {
+            continue;
+        }
+        // 경로 목록은 **실패 출력에만** 붙인다 — 그 섹션에서 뽑은 것이기 때문이다. 다른
+        // 섹션에 같은 목록을 붙이면 거기서도 그 파일들이 언급된 것처럼 읽힌다.
+        let is_failing_output = section.starts_with("Failing checks");
+        let detail = if is_failing_output {
+            // **한계를 detail에 적는다.** 이 목록은 우리가 정규식으로 알아본 것이고, 나간
+            // 것의 전부가 아니다 — 그렇게 읽히면 "여기 없으니 안 나갔다"가 되는데 그건
+            // 우리가 보장할 수 없는 주장이다.
+            format!(
+                "검증 명령의 출력 일부({rounds}회 전달). 실패한 테스트의 스택 트레이스와 소스 조각이 \
+                 들어가며, **컨텍스트로 선정되지 않은 파일의 내용일 수 있습니다.** 아래 경로는 \
+                 그 출력에서 우리가 알아본 것이고 나간 것의 전부는 아닙니다"
+            )
+        } else {
+            format!("검증 결과 요약({rounds}회 전달)")
+        };
+        out.push(SentContext {
+            section,
+            detail,
+            bytes: size,
+            sources: if is_failing_output { recognized.clone() } else { Vec::new() },
+        });
+    }
 }
 
 /// 파일이 아닌 전송 내용을 스냅샷 이벤트에서 뽑는다.
@@ -440,6 +509,8 @@ pub fn collect(store: &Store, task_id: &str) -> Result<Transmission, String> {
             }
         }
     }
+
+    collect_verification_output(&events, &mut out.sent_context);
 
     for event in &events {
         if event.event_type != "USER_DECISION_RECORDED" {
@@ -672,6 +743,90 @@ mod tests {
         assert!(state.bytes > 0);
         // 그 요약이 무엇을 담는지 화면이 말해야 한다 — 크기만으로는 읽는 사람이 알 수 없다.
         assert!(state.detail.contains("선정되지 않은"), "{}", state.detail);
+    }
+
+    /// **검증 출력도 나간다** — product-strategy 7.2절, state-machine 67절.
+    ///
+    /// 이 내용은 공급자로 가는데 전송 집계가 세지 못하고 있었다. 그리고 그 출력에는 실패한
+    /// 테스트의 스택 트레이스와 **컨텍스트에 선정되지 않은 파일의 조각**이 들어간다 —
+    /// `UNREPORTED_SECTIONS`의 주석이 그 위험을 오래 적어 두고 있었다.
+    #[test]
+    fn verification_output_is_counted_and_its_limits_are_stated() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "VERIFICATION_DIGEST_SENT",
+                &json!({
+                    "reportId": "r-1",
+                    "attemptNumber": 1,
+                    "sections": [
+                        { "section": "Failing checks", "bytes": 900 },
+                        { "section": "Checks that passed", "bytes": 40 },
+                    ],
+                    "recognizedPaths": ["src/deep/helper.ts"],
+                }),
+            )
+            .unwrap();
+
+        let t = collect(&store, "task-1").unwrap();
+        let failing = t
+            .sent_context
+            .iter()
+            .find(|c| c.section == "Failing checks")
+            .expect("검증 출력이 전송 목록에 없습니다");
+        assert_eq!(failing.bytes, 900);
+        // **경로는 그 섹션에만 붙는다** — 거기서 뽑은 것이기 때문이다.
+        assert_eq!(failing.sources, vec!["src/deep/helper.ts".to_string()]);
+        let passed = t.sent_context.iter().find(|c| c.section == "Checks that passed").unwrap();
+        assert!(passed.sources.is_empty(), "{:?}", passed.sources);
+
+        // **한계를 화면이 읽는 자리에 적는다.** 주석은 이 JSON을 먹는 쪽에 도달하지 않는다.
+        assert!(failing.detail.contains("선정되지 않은"), "{}", failing.detail);
+        assert!(failing.detail.contains("전부는 아닙니다"), "{}", failing.detail);
+    }
+
+    /// **라운드를 합친다.** 스냅샷은 매번 대체되지만 다이제스트는 매번 **추가로** 나간다 —
+    /// 마지막 것만 세면 실제보다 적게 보고한다.
+    #[test]
+    fn every_fix_loop_round_adds_to_what_went_out() {
+        let (_d, mut store) = seeded();
+        for (attempt, path) in [(1, "src/a.ts"), (2, "src/b.ts")] {
+            store
+                .append_event(
+                    "task-1",
+                    "VERIFICATION_DIGEST_SENT",
+                    &json!({
+                        "reportId": format!("r-{attempt}"),
+                        "attemptNumber": attempt,
+                        "sections": [{ "section": "Failing checks", "bytes": 500 }],
+                        "recognizedPaths": [path],
+                    }),
+                )
+                .unwrap();
+        }
+
+        let t = collect(&store, "task-1").unwrap();
+        let failing = t.sent_context.iter().find(|c| c.section == "Failing checks").unwrap();
+        assert_eq!(failing.bytes, 1_000, "라운드를 합치지 않았습니다");
+        // 경로도 합집합이다 — 라운드마다 다른 파일이 언급될 수 있다.
+        assert_eq!(failing.sources, vec!["src/a.ts".to_string(), "src/b.ts".to_string()]);
+        assert!(failing.detail.contains("2회"), "{}", failing.detail);
+    }
+
+    /// fix loop를 돌지 않았으면 **그 항목이 없다** — 0바이트 항목은 "이것도 나갔다"로 읽힌다.
+    #[test]
+    fn a_task_without_a_fix_loop_reports_no_verification_output() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "SNAPSHOT_CREATED", &json!({ "snapshotId": "s-1", "relevantFiles": [] }))
+            .unwrap();
+        let t = collect(&store, "task-1").unwrap();
+        assert!(
+            !t.sent_context.iter().any(|c| c.section == "Failing checks"),
+            "{:?}",
+            t.sent_context.iter().map(|c| &c.section).collect::<Vec<_>>()
+        );
     }
 
     /// **보지 못한 범위는 파일 목록에 들어가지 않는다** — context-engine 17절.

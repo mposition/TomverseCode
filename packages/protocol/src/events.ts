@@ -44,6 +44,18 @@ export type TaskEventType =
   | "POLICY_DECIDED"
   | "FILE_MUTATED"
   | "VERIFICATION_COMPLETED"
+  /**
+   * 검증 출력이 **프롬프트로 나갔다** (product-strategy 7.2절, state-machine 67절).
+   *
+   * 이 내용은 공급자로 가는데 전송 집계가 세지 못하고 있었다 — 값이 메모리에서 태어나
+   * 프롬프트로 들어갔다가 사라졌기 때문이다. 그리고 그 출력에는 실패한 테스트의 스택
+   * 트레이스와 **컨텍스트에 선정되지 않은 파일의 조각**이 들어간다.
+   *
+   * payload는 크기(섹션별)와 **우리가 알아본 경로**다. 내용 자체는 싣지 않는다 — 이벤트는
+   * 화면과 감사 기록으로 흐르고, 거기에 원문을 한 벌 더 두면 이미 artifact에 있는 것을
+   * 복제하는 것이다.
+   */
+  | "VERIFICATION_DIGEST_SENT"
   | "FIX_LOOP_STARTED"
   | "PROVIDER_USAGE"
   | "PROVIDER_RETRY"

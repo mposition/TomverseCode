@@ -47,6 +47,7 @@ import { ModelRegistry, providerKindOf } from "../routing/registry.js";
 import { Router, RoutingError, type RouterOptions } from "../routing/router.js";
 import { ToolBridge } from "../tools/bridge.js";
 import { buildDigest } from "../verify/digest.js";
+import { digestSectionSizes } from "../providers/prompts.js";
 import { canonicalText, contrastDrafts, fieldLabel, planQuestionRound } from "./contrast.js";
 import {
   describeEvaluations,
@@ -1716,6 +1717,26 @@ export class Orchestrator {
   private async requestFix(report: VerificationReport): Promise<{ kind: "patch"; patch: string } | { kind: "final"; result: FinalResult }> {
     const adapters = this.requireAdapters();
     const digest = buildDigest(report);
+
+    // **나가는 것을 기록에 남긴다**(state-machine 67절, product-strategy 7.2절).
+    //
+    // 이 내용은 공급자로 나가는데 전송 집계가 세지 못하고 있었다 — 값이 메모리에서 태어나
+    // 프롬프트로 들어갔다가 사라졌기 때문이다(61절이 `anchorCoverage`에서 본 것과 같다).
+    // 그래서 화면의 "무엇이 나갔는가"는 검증 출력에 대해 **아무 말도 하지 않았고**, 그
+    // 출력에는 실패한 테스트의 스택 트레이스와 **컨텍스트에 없던 파일의 조각**이 들어간다.
+    //
+    // **호출 전에** 낸다: 호출이 실패해도 그 내용은 이미 나갔다.
+    await this.emit("VERIFICATION_DIGEST_SENT", {
+      reportId: digest.reportId,
+      attemptNumber: digest.attemptNumber,
+      // 재는 값과 나가는 값이 **같은 함수**에서 나온다.
+      sections: digestSectionSizes(digest, this.appliedChangeNotes.join("\n")),
+      // **우리가 알아본 경로다.** 나간 것의 전부가 아니다 — 출력은 텍스트이고 추출은
+      // 정규식이다. 그 한계를 화면이 함께 말한다.
+      recognizedPaths: [
+        ...new Set(digest.failingChecks.flatMap((c) => c.fileReferences.map((f) => f.path))),
+      ].sort(),
+    });
 
     // 여기가 결함이 실제로 나타나던 자리다 — 프롬프트가 "당신의 변경이 이미 반영되어 있다"고
     // 말하는 그 스냅샷이 패치 이전이었다.
