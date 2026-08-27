@@ -1789,13 +1789,33 @@ test("allowGitCommit이 꺼져 있으면 저장소가 있어도 커밋하지 않
   }
 });
 
-test("gitignore된 파일은 컨텍스트 후보에 들어가지 않는다", () => {
+test("gitignore된 파일은 목록에도 검색에도 걸리지 않는다", () => {
+  // **이 fixture에는 `.git`이 없다** — 그리고 거기가 결함이 살던 자리였다(context-engine 20절).
+  // `ignore` 크레이트의 기본값(`require_git=true`)은 저장소가 아니면 제외 규칙을 조용히 끄고,
+  // `search_text`가 그 기본값을 쓰고 있었다. 무시된 파일에 검색 키워드를 둔 것이 그래서다 —
+  // 종전 fixture의 내용으로는 검색이 아예 후보로 올리지 않아 **이 검사가 절반만 돌았다.**
   withRepo((repo, stateDir) => {
     const run = runHost(repo, stateDir);
-    const snapshotLine = run.stderr.split("\n").find((l) => l.includes("SNAPSHOT_CREATED"));
-    if (snapshotLine) {
-      assert.ok(!snapshotLine.includes("ignored/junk.js"), ".gitignore된 파일이 컨텍스트에 들어갔습니다");
-    }
+    // **stderr가 아니라 기록을 본다.** 종전에는 stderr에서 `SNAPSHOT_CREATED` 줄을 찾고
+    // `if (snapshotLine)`으로 감쌌는데, 그 줄이 stderr에 아예 없었다 — 그래서 이 검사는
+    // 지금까지 **아무것도 단언하지 않고** 통과해 왔다. 진실의 원천은 `task_events`다(원칙 7).
+    const detail = hostQuery(stateDir, ["show", "--workspace", repo.root, "--task", run.taskId]) as {
+      events: { type: string; payload: Record<string, unknown> }[];
+    };
+    const snapshot = detail.events.find((e) => e.type === "SNAPSHOT_CREATED");
+    assert.ok(snapshot, `SNAPSHOT_CREATED가 없습니다: ${detail.events.map((e) => e.type).join(", ")}`);
+    const paths = ((snapshot.payload.relevantFiles as { path: string }[] | undefined) ?? []).map(
+      (f) => f.path
+    );
+    // 있어야 할 것이 있어야 "없다"가 뜻을 갖는다 — 빈 스냅샷도 "없다"를 만족한다.
+    assert.ok(
+      paths.some((p) => p.endsWith("paginate.js")),
+      `스냅샷이 비어 보입니다: ${JSON.stringify(paths)}`
+    );
+    assert.ok(
+      !paths.some((p) => p.startsWith("ignored")),
+      `.gitignore된 파일이 컨텍스트에 들어갔습니다: ${JSON.stringify(paths)}`
+    );
   });
 });
 

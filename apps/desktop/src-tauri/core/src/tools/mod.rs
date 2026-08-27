@@ -265,24 +265,7 @@ impl ToolRuntime {
     fn list_files(&self, request: &ToolRequest, start: Instant) -> Result<ToolOutcome, String> {
         let sub = request.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let base = self.root.resolve_existing(sub).map_err(|e| e.to_string())?;
-        let include_ignored = request
-            .args
-            .get("includeIgnored")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let mut builder = ignore::WalkBuilder::new(base.absolute());
-        builder
-            .hidden(false) // .github 등 dot 디렉터리도 보여준다
-            .git_ignore(!include_ignored)
-            .git_global(!include_ignored)
-            .git_exclude(!include_ignored)
-            // .git 디렉터리가 없어도 .gitignore를 적용한다. 기본값(require_git=true)이면
-            // git 저장소가 아닌 워크스페이스에서 제외 규칙이 조용히 무시된다.
-            .require_git(false)
-            .parents(!include_ignored);
-        // .git 자체는 .gitignore에 없어도 항상 제외한다 (context-engine.md 7절 하드 제외 목록).
-        builder.filter_entry(|entry| entry.file_name() != ".git");
+        let builder = workspace_walker(base.absolute());
 
         let mut entries: Vec<serde_json::Value> = Vec::new();
         let mut truncated = false;
@@ -339,11 +322,7 @@ impl ToolRuntime {
         // 건너뛴 비밀값 파일 수 — 조용히 빼면 "검색했는데 없다"와 구별되지 않는다.
         let mut skipped_secret_files = 0usize;
 
-        let mut builder = ignore::WalkBuilder::new(base.absolute());
-        // `.env`처럼 점으로 시작하는 파일도 검색 대상이어야 하므로 hidden 필터를 끈다.
-        // 그 대가로 **비밀값 파일이 그물에 걸리므로** 아래에서 명시적으로 제외해야 한다.
-        builder.hidden(false);
-        builder.filter_entry(|entry| entry.file_name() != ".git");
+        let builder = workspace_walker(base.absolute());
 
         'outer: for item in builder.build() {
             let Ok(entry) = item else { continue };
@@ -1446,6 +1425,43 @@ pub fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8 * 1024).any(|b| *b == 0)
 }
 
+/// 워크스페이스를 훑는 **단 하나의** walker 설정 — context-engine 20절.
+///
+/// `list_files`와 `search_text`는 같은 워크스페이스에 대해 같은 파일 집합을 봐야 한다.
+/// 컨텍스트 엔진이 둘의 결과를 합치기 때문이다: 목록이 말하지 않은 파일에서 검색이 맞으면,
+/// 스냅샷은 **인덱스에 없는 경로**를 근거로 답하게 된다.
+///
+/// **그런데 두 벌로 두었더니 갈렸다.** `list_files`만 `require_git(false)`를 불렀고
+/// `search_text`는 부르지 않았다 — 그래서 `.git`이 없는 워크스페이스에서 목록은 `.gitignore`를
+/// 지키는데 검색은 무시했다(실측: 같은 파일에 대해 `listed=false`, `matches=1`).
+/// `ignore` 크레이트의 기본값이 `require_git(true)`이고, 그 기본값은 **저장소가 아니면 제외
+/// 규칙을 조용히 끈다.** `list_files` 쪽 주석은 바로 그 위험을 적어 두고 있었는데도 그랬다.
+///
+/// 갈린 이유는 설정 축이 하나 더 있었기 때문이다. `list_files`에는 `includeIgnored`라는
+/// 인자가 있어서 다섯 축이 그 값으로 조립됐고, `search_text`는 두 축만 손으로 세웠다.
+/// **두 벌이 달라 보이는 이유를 그 인자가 설명해 버려서**, 빠진 축이 그 뒤에 숨었다.
+/// 그 인자는 호출자가 하나도 없었다 — 브리지도 컨텍스트 엔진도 넘기지 않고, 모델에게 도구
+/// 스키마로 노출되지도 않는다. 그래서 함께 지웠다. 없는 문을 열쇠로 지키느라 자물쇠가
+/// 갈라진 셈이었다. 무시된 파일이 필요한 호출자가 생기면 **이 함수에** 축을 더한다 —
+/// 그러면 두 도구가 동시에 받는다.
+fn workspace_walker(base: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(base);
+    builder
+        // dot 파일도 대상이다 — 목록은 `.github` 같은 디렉터리를 보여줘야 하고, 검색은
+        // `.env`를 **훑은 뒤 비밀값으로 걸러낸다**(16절). 걸러내는 자리는 여기가 아니다.
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        // .git 디렉터리가 없어도 .gitignore를 적용한다. 기본값(require_git=true)이면
+        // git 저장소가 아닌 워크스페이스에서 제외 규칙이 조용히 무시된다.
+        .require_git(false)
+        .parents(true);
+    // .git 자체는 .gitignore에 없어도 항상 제외한다 (context-engine.md 7절 하드 제외 목록).
+    builder.filter_entry(|entry| entry.file_name() != ".git");
+    builder
+}
+
 fn to_forward_slashes(path: &Path) -> String {
     path.components()
         .map(|c| c.as_os_str().to_string_lossy().to_string())
@@ -1882,6 +1898,121 @@ mod tests {
             !paths.iter().any(|p| p.starts_with("ignored")),
             ".gitignore should exclude it, got {paths:?}"
         );
+    }
+
+    /// **검색도 `.gitignore`를 지킨다 — `.git` 디렉터리가 없어도**(context-engine 20절).
+    ///
+    /// 여기가 실제로 갈려 있던 자리다. `list_files`만 `require_git(false)`를 불렀고 검색은
+    /// 부르지 않아서, `ignore` 크레이트의 기본값(`require_git=true`)이 **저장소가 아닌
+    /// 워크스페이스에서 제외 규칙을 조용히 껐다.** 하네스에 `.git`이 없다는 것이 이 결함을
+    /// 계속 살려둔 조건이었고, 동시에 드러낼 수 있는 조건이기도 하다.
+    ///
+    /// 대조가 없으면 이 테스트는 "검색이 고장 나서 0건"으로도 통과한다 — 그래서 무시되지
+    /// 않는 파일에 **같은 토큰**을 둔다.
+    #[test]
+    fn search_applies_gitignore_even_without_a_git_directory() {
+        const TOKEN: &str = "tomverse-gitignore-divergence-token";
+        let h = harness();
+        assert!(
+            !h.root_path.join(".git").exists(),
+            "이 테스트는 .git이 없는 상태를 봅니다"
+        );
+        std::fs::write(h.root_path.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir_all(h.root_path.join("ignored")).unwrap();
+        std::fs::write(h.root_path.join("ignored/gen.ts"), format!("// {TOKEN}\n")).unwrap();
+        std::fs::write(h.root_path.join("src/keep.ts"), format!("// {TOKEN}\n")).unwrap();
+
+        let out = h.run(&req(ToolName::SearchText, json!({ "pattern": TOKEN, "path": "." })));
+        assert_eq!(out.result.status, ToolStatus::Ok);
+        let matched: Vec<String> = out.result.output.unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["path"].as_str().unwrap().to_string())
+            .collect();
+
+        assert!(
+            matched.iter().any(|p| p.ends_with("keep.ts")),
+            "대조가 안 잡혔습니다 — 0건이 '제외했다'의 증거가 되지 못합니다: {matched:?}"
+        );
+        assert!(
+            !matched.iter().any(|p| p.starts_with("ignored")),
+            "무시된 파일이 검색에 걸렸습니다: {matched:?}"
+        );
+    }
+
+    /// **검색이 볼 수 있는 파일은 목록이 말한 파일의 부분집합이다**(context-engine 20절).
+    ///
+    /// 두 도구의 결과는 컨텍스트 엔진에서 합쳐진다. 목록에 없는 경로에서 검색이 맞으면
+    /// 스냅샷은 **인덱스에 없는 파일**을 근거로 답하게 되고, 그건 "못 찾았다"보다 나쁘다.
+    ///
+    /// 판정 기준을 손으로 적지 않는다 — 두 도구를 **같은 워크스페이스에 실제로 돌려** 나온
+    /// 두 집합을 비교한다. 그래서 나중에 축이 하나 더 갈려도 이 비교가 잡는다.
+    ///
+    /// 검사가 공허해지는 두 가지 길을 막는다: 두 집합이 비어 있으면 부분집합은 언제나 참이고,
+    /// **아무것도 제외되지 않아도** 언제나 참이다. 그래서 비어 있지 않음과 "실제로 무언가
+    /// 빠졌음"을 함께 단언한다.
+    #[test]
+    fn search_never_sees_a_file_the_listing_did_not_report() {
+        const TOKEN: &str = "tomverse-walker-parity-token";
+        for with_git in [false, true] {
+            let h = harness();
+            std::fs::write(h.root_path.join(".gitignore"), "ignored/\n").unwrap();
+            std::fs::create_dir_all(h.root_path.join("ignored")).unwrap();
+            std::fs::write(h.root_path.join("ignored/gen.ts"), format!("// {TOKEN}\n")).unwrap();
+            std::fs::write(h.root_path.join("keep.ts"), format!("// {TOKEN}\n")).unwrap();
+            // dot 파일도 양쪽이 같게 봐야 한다 — `hidden(false)`가 두 도구에 함께 걸리는지.
+            std::fs::create_dir_all(h.root_path.join(".github")).unwrap();
+            std::fs::write(h.root_path.join(".github/ci.yml"), format!("# {TOKEN}\n")).unwrap();
+            if with_git {
+                // `.git/info/exclude`는 `.gitignore`와 **다른 축**이다(`git_exclude`).
+                std::fs::create_dir_all(h.root_path.join(".git/info")).unwrap();
+                std::fs::write(h.root_path.join(".git/info/exclude"), "excluded.ts\n").unwrap();
+                std::fs::write(h.root_path.join("excluded.ts"), format!("// {TOKEN}\n")).unwrap();
+            }
+
+            let out = h.run(&req(ToolName::ListFiles, json!({ "path": "." })));
+            let listed: std::collections::BTreeSet<String> = out.result.output.unwrap()["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| !e["isDir"].as_bool().unwrap_or(false))
+                .map(|e| e["path"].as_str().unwrap().to_string())
+                .collect();
+
+            let out = h.run(&req(ToolName::SearchText, json!({ "pattern": TOKEN, "path": "." })));
+            let searched: std::collections::BTreeSet<String> = out.result.output.unwrap()["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["path"].as_str().unwrap().to_string())
+                .collect();
+
+            assert!(!listed.is_empty(), "with_git={with_git}: 목록이 비었습니다");
+            assert!(!searched.is_empty(), "with_git={with_git}: 검색이 비었습니다");
+            // **제외가 실제로 일어났음**을 확인한다 — 아무것도 안 빠지면 부분집합은 공허하다.
+            assert!(
+                !listed.iter().any(|p| p.starts_with("ignored")),
+                "with_git={with_git}: 무시 규칙이 적용되지 않아 비교가 공허합니다: {listed:?}"
+            );
+            if with_git {
+                assert!(
+                    !listed.contains("excluded.ts"),
+                    "with_git={with_git}: .git/info/exclude가 적용되지 않았습니다: {listed:?}"
+                );
+            }
+            // dot 파일은 양쪽 다 **본다** — 제외 확인이 "전부 막혔다"가 아님을 보인다.
+            assert!(
+                listed.iter().any(|p| p.starts_with(".github")),
+                "with_git={with_git}: dot 디렉터리가 목록에서 빠졌습니다: {listed:?}"
+            );
+
+            let only_in_search: Vec<&String> = searched.difference(&listed).collect();
+            assert!(
+                only_in_search.is_empty(),
+                "with_git={with_git}: 목록이 말하지 않은 파일에서 검색이 맞았습니다: {only_in_search:?}"
+            );
+        }
     }
 
     /// `search_text`는 자동 승인 도구이므로, 비밀값 파일을 훑으면 승인 절차 없이 키가 유출된다.

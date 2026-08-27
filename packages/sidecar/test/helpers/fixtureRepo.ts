@@ -159,7 +159,13 @@ export function createFixtureRepo(
   writeFileSync(path.join(root, ".env"), "OPENAI_API_KEY=sk-fixture-must-never-leak\n");
   writeFileSync(path.join(root, ".gitignore"), "node_modules/\nignored/\n");
   mkdirSync(path.join(root, "ignored"), { recursive: true });
-  writeFileSync(path.join(root, "ignored", "junk.js"), "// gitignore된 파일\n");
+  // **검색이 실제로 걸릴 내용을 둔다**(context-engine 20절). 종전에는 주석 한 줄이라 어떤
+  // 키워드로도 맞지 않았고, 그래서 "무시된 파일이 컨텍스트에 없다"는 e2e가 **목록 경로만
+  // 지나고 검색 경로는 한 번도 지나지 않았다.** 결함은 검색 쪽에 있었다.
+  writeFileSync(
+    path.join(root, "ignored", "junk.js"),
+    "// gitignore된 파일\nfunction paginate(items, page, perPage) {\n  return items;\n}\n"
+  );
 
   if (options.gitRepo) {
     initGitRepo(root);
