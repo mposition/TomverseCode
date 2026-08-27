@@ -134,9 +134,38 @@ export interface OrchestratorDeps {
   triagePolicy?: TriagePolicy;
   retryPolicy?: RetryPolicy;
   contextEngine?: ContextEngine;
-  /** 공급자 호출 1회 타임아웃 */
+  /**
+   * 공급자 호출 1회 타임아웃. 생략하면 `DEFAULT_PROVIDER_TIMEOUT_MS`.
+   *
+   * **출력 예산에서 유도하지 않는다.** 유도하면 두 값이 한 손잡이가 되어, 완결성을 위해
+   * 기다리는 시간을 늘리려면 요청하는 출력도 함께 늘려야 한다. 둘은 다른 결정이다 —
+   * 출력 예산은 "얼마까지 받아줄 것인가"이고 타임아웃은 "얼마나 기다릴 것인가"다.
+   */
   providerTimeoutMs?: number;
 }
+
+/**
+ * 공급자 호출 1회 타임아웃의 기본값.
+ *
+ * # 이 값은 출력 예산과 독립이지만, 둘의 관계를 알고 정해야 한다
+ *
+ * 어댑터는 출력을 최대 `effectiveMaxOutputTokens`(현재 16,000)까지 요청한다. 그건 **상한이지
+ * 목표가 아니다** — 대부분의 응답은 그 근처에도 가지 않는다. 하지만 상한을 다 쓰는 응답이
+ * 나올 수 있고, 그때 이 타임아웃이 그보다 짧으면 그 호출은 **반드시** 죽는다.
+ *
+ * 실측(가설 게이트 P1, 2026-08-27): `claude-sonnet-5`의 출력 처리량은 57~97 tok/s였다.
+ * 최저값 기준으로 16,000토큰은 약 280초다. 종전 기본값 120초는 그 절반도 안 됐고, 실제로
+ * 검수 호출 하나가 정확히 120초에 취소됐다. 요청은 공급자에 도달해 **과금됐고**(청구 내역으로
+ * 확인), 우리는 응답을 받지 못했다 — 돈만 쓰고 결과가 없는 가장 나쁜 실패다.
+ *
+ * 그래서 기본값을 상한 응답이 완결될 수 있는 크기로 둔다. 대가는 **멈춘 호출이 실패로
+ * 확정되기까지 더 오래 걸린다**는 것이다. 그 대가를 감수하는 이유: 조용히 잘린 응답보다
+ * 느린 실패가 낫고, 취소된 호출도 과금은 그대로이기 때문이다.
+ *
+ * 제품이 응답 시간 SLA를 걸어야 하는 자리에서는 이 값을 **명시적으로 짧게 주입한다.**
+ * 기본값을 짧게 두고 그것을 SLA라고 부르지 않는다 — 그러면 SLA가 아니라 사고다.
+ */
+export const DEFAULT_PROVIDER_TIMEOUT_MS = 300_000;
 
 /**
  * 한 라운드에 실행하는 MCP 도구 호출의 최대 개수 (state-machine 32절).
@@ -1928,7 +1957,7 @@ export class Orchestrator {
     options: { optionalSample?: boolean }
   ): Promise<{ kind: "value"; value: T } | { kind: "final"; result: FinalResult } | { kind: "skipped" }> {
     const retryPolicy = this.deps.retryPolicy ?? DEFAULT_RETRY_POLICY;
-    const timeoutMs = this.deps.providerTimeoutMs ?? 120_000;
+    const timeoutMs = this.deps.providerTimeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS;
 
     // **예약은 재시도마다 한다.** 재시도도 유료 호출이므로 한 번 예약하고 세 번 부르면
     // 상한이 최대 세 배까지 새어 나간다.

@@ -70,6 +70,8 @@ export interface RunnerOptions {
   realProvider?: boolean;
   /** fake provider 스크립트 — 하네스 자동 테스트 전용. 있으면 기록이 `providerKind: "fake"`가 된다. */
   fakeScript?: unknown;
+  /** 공급자 호출 1회 타임아웃(ms). 게이트는 이걸 명시적으로 넘긴다 (host.ts 참조). */
+  providerTimeoutMs?: number;
   /** 호스트 바이너리 override — 하네스 자동 테스트 전용 (host.ts 참조). */
   hostBin?: string;
   executorModel?: string;
@@ -382,7 +384,18 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     // 몇 시간 동안 돈을 쓰게 된다. 0으로 대체하지도 않는다 — 0은 fake에만 참이다.
     const costUnmeasurable = options.realProvider === true && record.costUsd === undefined;
     if (costUnmeasurable) {
-      record.failureClass = "cost_unmeasurable";
+      /**
+       * **타임아웃을 `cost_unmeasurable`로 뭉개지 않는다.**
+       *
+       * 둘 다 "비용을 못 쟀다"로 끝나지만 고칠 곳이 다르다. usage가 없는 응답은 어댑터나
+       * 단가표의 문제이고, 타임아웃은 **우리가 정한 실행 예산**의 문제다. 하나로 적으면
+       * 원인을 알아내려고 매번 호출 시각을 손으로 빼봐야 한다.
+       *
+       * 그리고 모델 품질과도 섞이면 안 된다 — 둘 다 인프라 실패로 분모에서 빠지지만,
+       * 실패율을 읽는 사람에게 "모델이 못 풀었다"와 "우리가 기다려주지 않았다"는 다른 소식이다.
+       */
+      const timedOut = record.providerCalls.some((call) => call.errorKind === "timeout");
+      record.failureClass = timedOut ? "provider_timeout" : "cost_unmeasurable";
     }
 
     appendChecked(options.store, record);
@@ -575,6 +588,7 @@ function executeOne(options: ExecuteOneOptions): RecordWithDraft {
       ...(options.replayDraft !== undefined ? { replayDraft: options.replayDraft } : {}),
       ...(options.fakeScript !== undefined ? { fakeScript: options.fakeScript } : {}),
       ...(options.hostBin !== undefined ? { hostBin: options.hostBin } : {}),
+      ...(options.providerTimeoutMs !== undefined ? { providerTimeoutMs: options.providerTimeoutMs } : {}),
       ...(options.executorModel ? { executorModel: options.executorModel } : {}),
       ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
     });

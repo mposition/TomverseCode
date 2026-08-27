@@ -12,6 +12,21 @@ import { ProviderCallFailure } from "./types.js";
 const RETRYABLE: ProviderErrorKind[] = ["rate_limit", "transient", "timeout"];
 
 export function normalizeProviderError(raw: unknown): NormalizedProviderError {
+  /**
+   * **타임아웃을 취소보다 먼저 본다.**
+   *
+   * 타임아웃도 구현상 abort지만(`withTimeout`이 controller를 abort한다) 두 사실은 다르다.
+   * 취소는 **사용자가 그만두게 한 것**이고 타임아웃은 **우리가 정한 실행 예산을 넘긴 것**이다.
+   * 순서가 뒤바뀌어 있어서 모든 타임아웃이 `cancelled`로 기록됐고, 그러면 "사용자가 껐다"와
+   * "우리가 기다려주지 않았다"가 같은 값이 되어 어느 쪽도 셀 수 없다.
+   *
+   * 실측(가설 게이트 P1, 2026-08-27): 검수 호출이 120초에 취소됐는데 기록에는 `cancelled`만
+   * 남아, 원인이 타임아웃이라는 것을 알아내려면 시각을 손으로 빼봐야 했다. 그 요청은 공급자에
+   * 도달해 과금됐으므로 원인을 아는 것이 곧 고칠 곳을 아는 것이었다.
+   */
+  if (isTimeout(raw)) {
+    return { kind: "timeout", message: raw instanceof Error ? raw.message : "공급자 호출 타임아웃", retryable: true };
+  }
   // AbortError — 취소는 오류가 아니지만 오류 채널로 도착한다.
   if (isAbort(raw)) {
     return { kind: "cancelled", message: "호출이 취소되었습니다", retryable: false };

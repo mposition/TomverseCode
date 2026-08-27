@@ -83,6 +83,14 @@ import { validateAll } from "./validate.js";
 import type { ArmId } from "./types.js";
 
 /**
+ * 게이트 실행의 공급자 호출 타임아웃. 제품 기본값과 **따로** 정한다.
+ *
+ * 실측(P1, 2026-08-27): `claude-sonnet-5`의 출력 처리량은 57~97 tok/s였고, 어댑터가 요청하는
+ * 상한 16,000토큰은 최저값 기준 약 280초다. 여기에 요청·연결 오버헤드와 변동 여유를 더한다.
+ */
+export const GATE_PROVIDER_TIMEOUT_MS = 420_000;
+
+/**
  * CLI (§14).
  *
  * 하위 명령:
@@ -155,7 +163,7 @@ function newestAttestationPath(attestationsDir: string): string | undefined {
 
 async function main(): Promise<number> {
   const options = parseArgs(process.argv.slice(2), REPORTS_ROOT);
-  const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.GATE_FAKE === "1";
+const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.GATE_FAKE === "1";
   // **API를 부르기 전에** 유료 실행의 전제를 확인한다.
   requireCostLimitForPaidRun(options, usingFake);
 
@@ -1171,6 +1179,17 @@ async function main(): Promise<number> {
     ...(ledger ? { ledger } : {}),
     ...(estimateRecordCostUsd ? { estimateRecordCostUsd } : {}),
     realProvider: !usingFake,
+    // **실험 조건은 기본값에 기대지 않고 명시한다.**
+    //
+    // 이 값은 출력 예산과 별개다(orchestrator.ts DEFAULT_PROVIDER_TIMEOUT_MS). 게이트는 arm
+    // 사이의 공정한 비교를 위해 **응답 완결성**을 우선하므로 넉넉히 준다 — 어떤 arm의 응답만
+    // 잘려 나가면 그 arm이 나빠 보이는데, 그건 모델의 성질이 아니라 우리가 기다린 시간의
+    // 성질이다. 실제 지연은 기록의 latencyMs와 호출별 시각으로 따로 남으므로, 응답 시간에
+    // 대한 질문은 이 값과 무관하게 데이터로 답할 수 있다.
+    //
+    // 16,000토큰은 **상한이지 목표가 아니다.** 상한을 다 쓰는 응답이 나올 수 있고, 그때
+    // 잘리면 그 기록은 모델 실패도 인프라 실패도 아닌 무엇이 된다.
+    providerTimeoutMs: GATE_PROVIDER_TIMEOUT_MS,
     ...(options.executorModel ? { executorModel: options.executorModel } : {}),
     ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
     // 모든 기록이 이 승인을 달고 나온다 — attestation이 "무엇을 증명하는가"의 근거다(§2.3).

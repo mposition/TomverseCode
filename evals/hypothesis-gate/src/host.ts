@@ -66,6 +66,14 @@ export interface HostRunOptions {
    * 게이트를 돌리려면 반드시 키가 있어야 하므로 하필 그 환경에서만 그렇게 된다.
    */
   hostBin?: string;
+  /**
+   * 공급자 호출 1회 타임아웃(ms). **`timeoutMs`와 다른 값이다** — 저쪽은 호스트 프로세스를
+   * 기다리는 시간이고 이건 provider 호출 하나에 거는 상한이다.
+   *
+   * 게이트가 이걸 **명시적으로** 넘기는 이유: 제품 기본값에 기대면 실험 조건이 기본값 변경에
+   * 따라 조용히 바뀐다. 측정에서는 조건이 기록에 드러나야 한다.
+   */
+  providerTimeoutMs?: number;
   /** 모델 override — Model Registry의 축을 그대로 쓴다. 하드코딩하지 않는다. */
   executorModel?: string;
   reviewerModel?: string;
@@ -172,6 +180,9 @@ export function runHost(options: HostRunOptions): HostRunResult {
   const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1" };
   if (options.fakeScript !== undefined) {
     env.TOMVERSE_FAKE_SCRIPT = JSON.stringify(options.fakeScript);
+  }
+  if (options.providerTimeoutMs !== undefined) {
+    env.TOMVERSE_PROVIDER_TIMEOUT_MS = String(options.providerTimeoutMs);
   }
   if (options.executorModel) env.TOMVERSE_EXECUTOR_MODEL = options.executorModel;
   if (options.reviewerModel) env.TOMVERSE_REVIEWER_MODEL = options.reviewerModel;

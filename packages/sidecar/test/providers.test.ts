@@ -819,3 +819,22 @@ test("깨진 JSON은 원인을 가리키는 오류가 된다", () => {
     (error: unknown) => error instanceof ValidationError
   );
 });
+
+test("타임아웃은 취소와 구별되어 기록된다", () => {
+  // 타임아웃도 구현상 abort지만 두 사실은 다르다: 취소는 **사용자가 그만두게 한 것**이고
+  // 타임아웃은 **우리가 정한 실행 예산을 넘긴 것**이다. 순서가 뒤바뀌어 있어서 모든
+  // 타임아웃이 cancelled로 기록됐고, 그러면 어느 쪽도 셀 수 없다.
+  const timeout = new Error("공급자 호출이 120000ms 후 타임아웃됨");
+  timeout.name = "TimeoutError";
+  assert.equal(normalizeProviderError(timeout).kind, "timeout");
+
+  // SDK가 내는 이름도 같은 사실이다.
+  const sdk = new Error("connection timed out");
+  sdk.name = "APIConnectionTimeoutError";
+  assert.equal(normalizeProviderError(sdk).kind, "timeout");
+
+  // 진짜 취소는 그대로 cancelled다 — 구분이 한쪽으로 무너지면 안 된다.
+  const abort = new Error("The operation was aborted");
+  abort.name = "AbortError";
+  assert.equal(normalizeProviderError(abort).kind, "cancelled");
+});
