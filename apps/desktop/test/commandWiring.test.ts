@@ -152,7 +152,7 @@ test("두 진입점 모두 질문 태스크의 좁히기를 코어에 맡긴다"
     // **글자가 남아 있는지**만 본다 — 이른 return 하나로 죽여도 통과한다(실측).
     // 그래서 값 비교가 가능한 코어(skills.rs)로 옮겼고, 소스 검사가 정직하게 할 수 있는 일은
     // "부르는가" 하나뿐이다.
-    const call = "skills::tools_for_question" + "(";
+    const call = "skills::narrow_tools" + "(";
     assert.ok(body.includes(call), `${path.basename(file)}: 코어의 좁히기를 부르지 않습니다`);
     // needle은 "읽기 전용 필터"가 아니라 **도구 목록을 여기서 다시 훑는가**다.
     // `is_read_only`로 찾으면 종류 판정 함수 이름(`is_read_only_kind`)에 걸린다 — 검사가
@@ -163,11 +163,25 @@ test("두 진입점 모두 질문 태스크의 좁히기를 코어에 맡긴다"
     );
 
     // 그리고 정책 조립이 실제로 이 함수를 지나야 한다 — 함수만 있고 부르지 않으면 아무 일도 없다.
-    const policy = source.slice(source.indexOf("fn task_policy_from"));
+    const policy = source.slice(
+      source.indexOf("fn task_policy_from"),
+      source.indexOf("\n}", source.indexOf("fn task_policy_from"))
+    );
     assert.ok(
-      policy.includes("allowed_tools: allowed_tools_for("),
+      policy.includes("allowed_tools_for("),
       `${path.basename(file)}: task_policy_from이 좁히기를 지나지 않습니다`
     );
+    // **두 짝을 모두 꽂아야 한다**(70절). 좁히기가 목록과 출처를 함께 내놓게 된 뒤로는
+    // 목록만 받아 꽂고 출처를 버리는 것이 가능해졌고, 그러면 화면은 짧아진 목록을 보면서도
+    // 왜 짧은지 말하지 못한다 — 값이 있는데 아무도 읽지 않는 상태와 같다(68절).
+    // 컴파일러는 이걸 잡지 못한다: 출처 필드에는 기본값이 있어 `..Default::default()`가
+    // 조용히 빈 목록을 채운다.
+    for (const field of ["allowed_tools:", "allowed_tools_narrowed_by:"]) {
+      assert.ok(
+        policy.includes(field),
+        `${path.basename(file)}: task_policy_from이 ${field}를 채우지 않습니다`
+      );
+    }
   }
 });
 

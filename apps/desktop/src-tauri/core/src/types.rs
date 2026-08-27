@@ -205,6 +205,19 @@ pub enum RiskLevel {
     Prohibited,
 }
 
+/// 도구 목록을 좁힌 주체 (state-machine 70절).
+///
+/// **값이지 문장이 아니다.** 화면이 문장을 만들고, 여기서는 무엇이 좁혔는지만 말한다 —
+/// 산문으로 나르면 화면이 그것을 파싱하게 되고, 문구를 다듬는 순간 분기가 조용히 바뀐다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Narrowing {
+    /// 스킬 파일의 `allowedTools` (26절).
+    Skill,
+    /// 파일을 바꾸지 않는 종류(질문·계획)라 읽기 전용으로 좁혔다 (51·53절).
+    ReadOnlyKind,
+}
+
 /// 승인을 요구한 결정을 **사용자가 미리 넓혀 통과시킬 수 있는 정책 레버**.
 ///
 /// 무인 실행이 승인 지점에서 멈췄을 때(24.2절) 사용자가 다음에 물을 것은 하나다 —
@@ -405,6 +418,23 @@ pub struct TaskPolicy {
     /// 그대로 지나며, 이 목록은 그 앞에서 한 겹 더 막을 뿐이다.
     #[serde(rename = "allowedTools", default)]
     pub allowed_tools: Option<Vec<ToolName>>,
+    /// **무엇이 그 목록을 좁혔는가** — state-machine 70절.
+    ///
+    /// # 왜 유도하지 않고 기록하는가
+    ///
+    /// 목록만 보면 왜 그 값이 됐는지 알 수 없다. 좁히는 주체가 둘이기 때문이다 — 스킬(26절)과
+    /// 읽기 전용 종류(51·53절). 화면이 짧은 목록을 보여줄 때 사용자가 묻는 것은 "왜"이고,
+    /// 지금은 두 줄을 함께 보고 추측해야 한다.
+    ///
+    /// **비교로 되짚지 않는다.** 결과 목록을 후보들과 대조해 출처를 복원할 수는 있지만, 그건
+    /// 좁히기 규칙이 바뀌는 순간 **조용히 틀린 이름표**를 붙인다(60절이 예고를 다시 계산하지
+    /// 않기로 한 것과 같은 이유). 출처는 **두 사실을 다 아는 자리**에서만 정해지므로 거기서
+    /// 채워 여기까지 나른다.
+    ///
+    /// **게이트는 이 값을 읽지 않는다.** 판정은 `allowed_tools`가 하고 이건 설명이다 —
+    /// 게이트가 설명을 읽기 시작하면 설명을 고쳐서 판정을 바꿀 수 있게 된다.
+    #[serde(rename = "allowedToolsNarrowedBy", default)]
+    pub allowed_tools_narrowed_by: Vec<Narrowing>,
     /// 프로젝트가 **매니페스트에 선언해 둔** 검증 명령을 매번 묻지 않고 실행한다.
     ///
     /// 이 레버가 안전한 근거는 명령의 출처다 — `verify::detect_commands`가 `package.json`·
@@ -449,6 +479,7 @@ impl Default for TaskPolicy {
             auto_approve_workspace_writes: false,
             unattended: false,
             allowed_tools: None,
+            allowed_tools_narrowed_by: Vec::new(),
             auto_approve_verification: false,
             allow_git_commit: false,
             command_timeout_ms: default_timeout(),

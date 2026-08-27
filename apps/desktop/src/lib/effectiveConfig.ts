@@ -24,6 +24,8 @@ export interface PinnedConfig {
   allowGitCommit?: boolean;
   skill?: { name: string; summary: string } | null;
   allowedTools?: string[] | null;
+  /** 무엇이 그 목록을 좁혔는가 (70절). 비어 있으면 좁히지 않았다. */
+  allowedToolsNarrowedBy?: ("skill" | "read_only_kind")[];
   verificationPin?: { program: string; args: string[] }[];
   hooks?: { phase: string; command: string }[];
   mcpServers?: { name: string; program: string; args: string[]; tools?: string[] | null }[];
@@ -75,8 +77,24 @@ export function switchLines(config: PinnedConfig): ConfigLine[] {
 export function describeAllowedTools(config: PinnedConfig): string {
   const tools = config.allowedTools;
   if (tools === undefined || tools === null) return "도구를 좁히지 않았습니다 — 게이트의 기본 분류가 그대로 적용됩니다.";
-  if (tools.length === 0) return "허용된 도구가 없습니다.";
-  return `이 태스크가 쓸 수 있는 도구 ${tools.length}개: ${tools.join(", ")}`;
+  if (tools.length === 0) return `허용된 도구가 없습니다.${narrowedBy(config)}`;
+  return `이 태스크가 쓸 수 있는 도구 ${tools.length}개: ${tools.join(", ")}${narrowedBy(config)}`;
+}
+
+/**
+ * **무엇이 좁혔는가** — state-machine 70절.
+ *
+ * 좁히는 주체가 둘이다(스킬, 읽기 전용 종류). 목록만 보여주면 사용자는 짧은 목록을 보고
+ * "내 스킬이 그랬나?"를 추측하게 되는데, 질문·계획 태스크는 스킬이 없어도 좁아진다.
+ *
+ * **비어 있는데 목록이 있으면 그 사실을 말한다.** 좁혀졌는데 이유를 모르는 것은 기록이
+ * 낡았다는 뜻이고(이 필드가 생기기 전의 태스크), "아무도 안 좁혔다"와 다른 사실이다.
+ */
+export function narrowedBy(config: PinnedConfig): string {
+  const sources = config.allowedToolsNarrowedBy ?? [];
+  const names = sources.map((s) => (s === "skill" ? "스킬" : "읽기 전용 종류(질문·계획)"));
+  if (names.length === 0) return " (무엇이 좁혔는지 기록에 없습니다 — 이 값이 생기기 전의 작업입니다.)";
+  return ` — 좁힌 것: ${names.join(", ")}.`;
 }
 
 /**

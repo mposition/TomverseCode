@@ -200,3 +200,49 @@ test("여러 종류가 섞여도 순서가 고정된다", () => {
     ["verification", "hooks", "unknown"]
   );
 });
+
+// ---- 무엇이 좁혔는가 (state-machine 70절) ----
+
+/**
+ * **목록만 보면 왜 짧은지 모른다.** 좁히는 주체가 둘이라(스킬, 읽기 전용 종류) 스킬 줄과
+ * 목록 줄을 함께 봐도 추측이 된다 — 질문·계획 태스크는 스킬이 없어도 좁아진다.
+ */
+test("허용목록 줄이 무엇이 좁혔는지 말한다", () => {
+  const line = describeAllowedTools({
+    allowedTools: ["read_file", "list_files"],
+    allowedToolsNarrowedBy: ["read_only_kind"],
+  });
+  assert.match(line, /2개/);
+  assert.match(line, /읽기 전용 종류/);
+  // 스킬이 아니라는 것이 드러나야 한다 — 사용자가 자기 스킬을 의심하지 않도록.
+  assert.ok(!line.includes("스킬"), line);
+});
+
+/** **둘 다일 수 있다.** 하나만 말하면 사용자는 나머지를 자기 설정 탓으로 돌린다. */
+test("둘 다 좁혔으면 둘 다 말한다", () => {
+  const line = describeAllowedTools({
+    allowedTools: ["read_file"],
+    allowedToolsNarrowedBy: ["skill", "read_only_kind"],
+  });
+  assert.match(line, /스킬/);
+  assert.match(line, /읽기 전용 종류/);
+});
+
+/**
+ * **좁혀졌는데 이유가 없는 것은 "아무도 안 좁혔다"와 다른 사실이다.**
+ *
+ * 이 값이 생기기 전의 태스크가 그렇다. 침묵하면 화면이 "그냥 짧다"로 보이는데, 그건 우리가
+ * 아는 사실이 아니다.
+ */
+test("좁혀졌는데 출처가 없으면 그 사실을 말한다", () => {
+  const line = describeAllowedTools({ allowedTools: ["read_file"] });
+  assert.match(line, /기록에 없습니다/);
+});
+
+/** 좁히지 않았으면 출처 문장도 없다 — 붙일 것이 없다. */
+test("좁히지 않았으면 출처를 말하지 않는다", () => {
+  const line = describeAllowedTools({});
+  assert.match(line, /좁히지 않았습니다/);
+  assert.ok(!line.includes("좁힌 것"), line);
+  assert.ok(!line.includes("기록에 없습니다"), line);
+});

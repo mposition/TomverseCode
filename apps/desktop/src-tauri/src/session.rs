@@ -147,15 +147,16 @@ pub struct SessionState {
 fn allowed_tools_for(
     kind: &str,
     skill: Option<&tomverse_core::skills::Skill>,
-) -> Option<Vec<tomverse_core::types::ToolName>> {
+) -> (
+    Option<Vec<tomverse_core::types::ToolName>>,
+    Vec<tomverse_core::types::Narrowing>,
+) {
     let from_skill = skill.and_then(|s| s.allowed_tools.clone());
-    if !is_read_only_kind(kind) {
-        return from_skill;
-    }
-    // **좁히기 자체는 코어에 있다**(skills.rs `tools_for_question`). 이 크레이트는 이 환경에서
-    // 컴파일되지 않아 여기 로직을 두면 검사할 수단이 소스 문자열뿐이고, 그 검사는 좁히기가
-    // 살아 있는지가 아니라 글자가 남아 있는지만 본다.
-    tomverse_core::skills::tools_for_question(from_skill)
+    // **좁히기와 그 출처가 함께 코어에 있다**(skills.rs `narrow_tools`, 70절). 이 크레이트는
+    // 이 환경에서 컴파일되지 않아 여기 로직을 두면 검사할 수단이 소스 문자열뿐이고, 그 검사는
+    // 좁히기가 살아 있는지가 아니라 글자가 남아 있는지만 본다. 출처도 마찬가지라 여기서
+    // 정하지 않는다 — 정하면 두 진입점이 다른 이름표를 붙일 수 있다.
+    tomverse_core::skills::narrow_tools(from_skill, is_read_only_kind(kind))
 }
 
 /// 파일을 바꾸지 않는 요청 종류 (51·53절).
@@ -208,13 +209,15 @@ pub struct ScreenSwitches<'a> {
 /// `kind`를 넣지 않고 있었고, 그래서 질문 태스크를 쓰던 사용자가 받는 예고는 **변경
 /// 태스크에 대한 답**이었다.
 fn task_policy_from(switches: &ScreenSwitches<'_>) -> TaskPolicy {
+    let narrowed = allowed_tools_for(switches.kind, switches.skill);
     TaskPolicy {
         execution_mode: switches.mode,
         allow_git_commit: switches.allow_git_commit,
         unattended: switches.unattended,
         auto_approve_verification: switches.auto_approve_verification,
         auto_approve_workspace_writes: switches.auto_approve_workspace_writes,
-        allowed_tools: allowed_tools_for(switches.kind, switches.skill),
+        allowed_tools: narrowed.0,
+        allowed_tools_narrowed_by: narrowed.1,
         // **sidecar로 가지 않는다**(39.1절). 시계도 판정도 Rust가 갖는다.
         deadline_ms: switches.deadline_secs.map(|s| s * 1_000),
         ..TaskPolicy::default()
@@ -1145,6 +1148,7 @@ impl SessionState {
                 // **게이트에 꽂힌 값을 그대로 보낸다**(51절) — 여기서 다시 계산하면 화면이
                 // 말하는 허용목록과 실제로 좁혀진 목록이 갈릴 수 있다.
                 "allowedTools": allowed_tools_for(kind, skill.as_ref())
+                    .0
                     .as_ref()
                     .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
             },

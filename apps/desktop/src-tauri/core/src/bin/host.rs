@@ -190,7 +190,7 @@ mod tests {
     /// 우회할 수 있다. 게이트에 꽂히는 목록이 그때의 보장이다(원칙 2).
     #[test]
     fn a_question_is_narrowed_to_read_only_tools() {
-        let allowed = allowed_tools_for(&args_for("ask"), None).expect("좁혀지지 않았습니다");
+        let allowed = allowed_tools_for(&args_for("ask"), None).0.expect("좁혀지지 않았습니다");
         assert!(!allowed.is_empty());
         for tool in &allowed {
             assert!(tool.is_read_only(), "{}가 읽기 전용이 아닙니다", tool.as_str());
@@ -208,7 +208,7 @@ mod tests {
         std::fs::write(dir.path().join("a.ts"), "x").unwrap();
         let root = tomverse_core::paths::WorkspaceRoot::new(dir.path()).unwrap();
         let policy = TaskPolicy {
-            allowed_tools: allowed_tools_for(&args_for("ask"), None),
+            allowed_tools: allowed_tools_for(&args_for("ask"), None).0,
             ..TaskPolicy::default()
         };
         let gate = tomverse_core::policy::PolicyGate::new(&policy);
@@ -236,7 +236,7 @@ mod tests {
     /// `run`은 종전과 한 글자도 다르지 않다 — 기본값이 동작을 바꾸지 않는다.
     #[test]
     fn a_change_task_is_not_narrowed() {
-        assert_eq!(allowed_tools_for(&args_for("run"), None), None);
+        assert_eq!(allowed_tools_for(&args_for("run"), None).0, None);
     }
 }
 
@@ -719,13 +719,14 @@ fn real_main() -> Result<i32, String> {
 fn allowed_tools_for(
     args: &Args,
     skill: Option<&tomverse_core::skills::Skill>,
-) -> Option<Vec<tomverse_core::types::ToolName>> {
+) -> (
+    Option<Vec<tomverse_core::types::ToolName>>,
+    Vec<tomverse_core::types::Narrowing>,
+) {
     let from_skill = skill.and_then(|s| s.allowed_tools.clone());
-    if !is_read_only_command(&args.command) {
-        return from_skill;
-    }
-    // 좁히기 자체는 코어에 있다 — 화면과 이 CLI가 **같은 함수**를 쓴다.
-    tomverse_core::skills::tools_for_question(from_skill)
+    // 좁히기와 **그 출처**가 함께 코어에 있다(70절) — 화면과 이 CLI가 같은 함수를 쓴다.
+    // 출처를 여기서 정하면 두 진입점이 다른 이름표를 붙일 수 있다.
+    tomverse_core::skills::narrow_tools(from_skill, is_read_only_command(&args.command))
 }
 
 /// 파일을 바꾸지 않는 하위 명령들 (51·53절).
@@ -791,9 +792,11 @@ fn mcp_pool_from(args: &Args) -> Result<Option<Arc<tomverse_core::mcp::McpPool>>
 /// 다른 정책에 대해 답하게 되고, 그 어긋남은 "미리보기가 틀렸다"가 아니라 "도구가 거짓말했다"로
 /// 읽힌다.
 fn task_policy_from(args: &Args, skill: Option<&tomverse_core::skills::Skill>) -> TaskPolicy {
+    let narrowed = allowed_tools_for(args, skill);
     TaskPolicy {
         // 도구 허용목록은 **게이트에 꽂힌다.** sidecar에 알려 주기는 하지만 지키는 것은 여기다.
-        allowed_tools: allowed_tools_for(args, skill),
+        allowed_tools: narrowed.0,
+        allowed_tools_narrowed_by: narrowed.1,
         auto_approve_workspace_writes: args.auto_approve_writes,
         auto_approve_verification: args.auto_approve_verification,
         allow_git_commit: args.allow_git_commit,
@@ -1425,6 +1428,7 @@ fn run_task(
             // **게이트에 꽂힌 값을 그대로 보낸다**(51절). 여기서 다시 계산하면 화면이 말하는
             // 허용목록과 실제로 좁혀진 목록이 갈릴 수 있고, 갈리면 화면이 거짓말한다.
             "allowedTools": allowed_tools_for(args, skill)
+                .0
                 .as_ref()
                 .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
         },

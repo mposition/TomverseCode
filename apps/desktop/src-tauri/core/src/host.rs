@@ -667,6 +667,9 @@ impl TaskHost {
                 .allowed_tools
                 .as_ref()
                 .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
+            // **무엇이 좁혔는가**(70절). 목록만 보면 왜 짧은지 알 수 없고, 좁히는 주체가
+            // 둘이라(스킬 / 읽기 전용 종류) 스킬 줄과 목록 줄을 함께 봐도 추측이 된다.
+            "allowedToolsNarrowedBy": policy.allowed_tools_narrowed_by,
             // 24.5절의 고정을 **눈에 보이게** 한다. 이 집합이 비어 있으면 자동 승인 스위치를
             // 켜도 아무것도 자동 승인되지 않는다 — 그건 설정이 아니라 프로젝트의 사실이다.
             "verificationPin": profile
