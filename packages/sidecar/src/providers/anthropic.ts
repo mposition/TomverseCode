@@ -34,7 +34,7 @@ import {
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
 } from "./prompts.js";
-import { ProviderCallFailure } from "./types.js";
+import { ProviderCallFailure, validateReceived } from "./types.js";
 import type {
   AdapterDeps,
   CredentialCheck,
@@ -144,12 +144,12 @@ export class AnthropicAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateDraftProposal(parsed, {
+      value: validateReceived(() => validateDraftProposal(parsed, {
         taskId: ctx.taskId,
         proposalId: `${ctx.taskId}-${ctx.callId}`,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -168,14 +168,14 @@ export class AnthropicAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateReviewDecision(parsed, {
+      value: validateReceived(() => validateReviewDecision(parsed, {
         taskId: ctx.taskId,
         proposalId: input.draft.proposalId,
         // 프롬프트를 어떻게 구성했는지에 대한 사실이므로 우리가 기록한다 — 모델에게 묻지 않는다.
         reviewMode: input.blind ? "blind" : "informed",
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -189,11 +189,11 @@ export class AnthropicAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateSingleModelFixResult(parsed, {
+      value: validateReceived(() => validateSingleModelFixResult(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -207,11 +207,11 @@ export class AnthropicAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateQuestionAnswer(parsed, {
+      value: validateReceived(() => validateQuestionAnswer(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -225,11 +225,11 @@ export class AnthropicAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validatePlanOutline(parsed, {
+      value: validateReceived(() => validatePlanOutline(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -250,11 +250,11 @@ export class AnthropicAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateSingleModelFixResult(parsed, {
+      value: validateReceived(() => validateSingleModelFixResult(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,

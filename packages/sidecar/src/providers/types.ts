@@ -188,6 +188,53 @@ export class ProviderCallFailure extends Error {
 }
 
 /**
+ * **응답을 받은 뒤** 하는 검증의 실패를 usage와 함께 던진다.
+ *
+ * # 왜 필요한가 — 과금된 호출이 "비용 미측정"이 되고 있었다
+ *
+ * 어댑터는 응답을 받아 usage를 손에 쥔 상태에서 `validate*`를 부른다. 그 검증이 던지면
+ * **usage와 envelope 사실이 예외와 함께 사라진다** — 호출자가 보는 것은 "스키마 위반"뿐이고,
+ * 비용을 계산할 근거가 없으니 `dispatched_no_response`가 된다.
+ *
+ * 그 상태는 예산 관점에서 최악이다. 돈은 확실히 나갔는데(응답을 받았다) 얼마인지 모르므로
+ * 예약을 정산할 수도 해제할 수도 없고, 실행이 미해결 예약으로 멈춘다. 문서가 이미 경고한
+ * 경우다 — 공급자가 응답을 만들고 과금한 뒤 파싱에서 실패하면, "예외가 났으니 해제"는 쓴 돈을
+ * 안 쓴 것으로 만드는 것이다.
+ *
+ * 실측(가설 게이트 P1, 2026-08-27): 검수 호출이 171초 동안 출력 상한까지 달리다 잘려 구조화
+ * 출력이 깨졌다. 응답도 usage도 있었지만 검증이 던지면서 전부 버려졌고, **96건짜리 실행이
+ * 7건에서 멈췄다.**
+ *
+ * usage를 실어 보내면 그 기록은 `schema_violation` — **모델/파이프라인 실패**, 즉 정상적인
+ * 실험 결과가 된다. 예산 사고가 아니라 데이터다.
+ */
+export function validateReceived<T>(
+  validate: () => T,
+  received: { usage: TokenUsage; latencyMs: number; meta: ProviderCallMetadata }
+): T {
+  try {
+    return validate();
+  } catch (error) {
+    // 이미 dispatch 사실을 아는 오류면 그대로 둔다 — 여기서 다시 감싸면 분류가 덮인다.
+    if (error instanceof ProviderCallFailure) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ProviderCallFailure({
+      message: `응답을 받았으나 구조화 출력 검증에 실패했습니다: ${message}`,
+      // **응답을 받았다는 사실이 요점이다.** 이 값이 있어야 예약이 실제 비용으로 정산된다.
+      dispatchState: received.meta.dispatchState,
+      classification: { kind: "schema_violation", message, status: 400, retryable: false },
+      usage: received.usage,
+      ...(received.meta.providerReportedModelId
+        ? { providerReportedModelId: received.meta.providerReportedModelId }
+        : {}),
+      ...(received.meta.providerRequestId ? { providerRequestId: received.meta.providerRequestId } : {}),
+      latencyMs: received.latencyMs,
+      status: 400,
+    });
+  }
+}
+
+/**
  * 자격증명 확인 결과 (multi-engine-routing.md 17절).
  *
  * # 이 확인이 증명하는 것과 증명하지 못하는 것

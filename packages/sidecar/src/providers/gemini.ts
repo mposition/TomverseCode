@@ -32,7 +32,7 @@ import {
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
 } from "./prompts.js";
-import { ProviderCallFailure } from "./types.js";
+import { ProviderCallFailure, validateReceived } from "./types.js";
 import type {
   AdapterDeps,
   CredentialCheck,
@@ -157,12 +157,12 @@ export class GeminiAdapter implements ProviderAdapter {
   async generateDraft(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<DraftProposal>> {
     const { parsed, usage, latencyMs, meta } = await this.structuredCall(buildDraftPrompt(input), DRAFT_SCHEMA, ctx);
     return {
-      value: validateDraftProposal(parsed, {
+      value: validateReceived(() => validateDraftProposal(parsed, {
         taskId: ctx.taskId,
         proposalId: `${ctx.taskId}-${ctx.callId}`,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -172,14 +172,14 @@ export class GeminiAdapter implements ProviderAdapter {
   async reviewProposal(input: ReviewInput, ctx: ProviderCallContext): Promise<ProviderResponse<ReviewDecision>> {
     const { parsed, usage, latencyMs, meta } = await this.structuredCall(buildReviewPrompt(input), REVIEW_SCHEMA, ctx);
     return {
-      value: validateReviewDecision(parsed, {
+      value: validateReceived(() => validateReviewDecision(parsed, {
         taskId: ctx.taskId,
         proposalId: input.draft.proposalId,
         // 프롬프트 구성에 대한 사실이므로 우리가 기록한다 — 모델에게 묻지 않는다.
         reviewMode: input.blind ? "blind" : "informed",
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -193,11 +193,11 @@ export class GeminiAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateSingleModelFixResult(parsed, {
+      value: validateReceived(() => validateSingleModelFixResult(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -207,11 +207,11 @@ export class GeminiAdapter implements ProviderAdapter {
   async answerQuestion(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<QuestionAnswer>> {
     const { parsed, usage, latencyMs, meta } = await this.structuredCall(buildQuestionPrompt(input), QUESTION_SCHEMA, ctx);
     return {
-      value: validateQuestionAnswer(parsed, {
+      value: validateReceived(() => validateQuestionAnswer(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -221,11 +221,11 @@ export class GeminiAdapter implements ProviderAdapter {
   async outlinePlan(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<PlanOutline>> {
     const { parsed, usage, latencyMs, meta } = await this.structuredCall(buildPlanPrompt(input), PLAN_SCHEMA, ctx);
     return {
-      value: validatePlanOutline(parsed, {
+      value: validateReceived(() => validatePlanOutline(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -238,11 +238,11 @@ export class GeminiAdapter implements ProviderAdapter {
   ): Promise<ProviderResponse<SingleModelFixResult>> {
     const { parsed, usage, latencyMs, meta } = await this.structuredCall(buildFixPrompt(input), SINGLE_FIX_SCHEMA, ctx);
     return {
-      value: validateSingleModelFixResult(parsed, {
+      value: validateReceived(() => validateSingleModelFixResult(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,

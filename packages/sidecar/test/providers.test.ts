@@ -6,6 +6,7 @@ import { normalizeProviderError } from "../src/providers/errors.js";
 import { backoffDelayMs, callWithRetry, DEFAULT_RETRY_POLICY, ProviderCallFailed, withTimeout } from "../src/providers/retry.js";
 import { DRAFT_SCHEMA_STRICT, decodeMcpArguments, OpenAIAdapter } from "../src/providers/openai.js";
 import { AnthropicAdapter } from "../src/providers/anthropic.js";
+import { ProviderCallFailure, validateReceived } from "../src/providers/types.js";
 import {
   buildDraftPrompt,
   buildFixPrompt,
@@ -837,4 +838,64 @@ test("타임아웃은 취소와 구별되어 기록된다", () => {
   const abort = new Error("The operation was aborted");
   abort.name = "AbortError";
   assert.equal(normalizeProviderError(abort).kind, "cancelled");
+});
+
+test("응답을 받은 뒤의 검증 실패는 usage를 잃지 않는다", () => {
+  // 실측(가설 게이트 P1, 2026-08-27): 검수 호출이 출력 상한까지 달리다 잘려 구조화 출력이
+  // 깨졌다. 응답도 usage도 있었는데 검증이 던지면서 전부 사라졌고, 비용을 계산할 수 없어
+  // 예약이 미해결로 남아 **96건짜리 실행이 7건에서 멈췄다.**
+  const received = {
+    usage: { inputTokens: 2500, outputTokens: 16000 },
+    latencyMs: 171_000,
+    meta: {
+      requestedModelId: "claude-sonnet-5",
+      providerReportedModelId: "claude-sonnet-5",
+      dispatchState: "response_received_with_usage" as const,
+    },
+  };
+
+  let thrown: unknown;
+  try {
+    validateReceived(() => {
+      throw new ValidationError("reviewDecision.verdict", "expected one of ACCEPT/REVISE/REJECT");
+    }, received);
+  } catch (error) {
+    thrown = error;
+  }
+
+  const failure = thrown as InstanceType<typeof ProviderCallFailure>;
+  assert.equal(failure.name, "ProviderCallFailure");
+  // **이 세 가지가 요점이다** — 없으면 과금된 호출이 "안 썼다"나 "모른다"가 된다.
+  assert.deepEqual(failure.usage, received.usage);
+  assert.equal(failure.dispatchState, "response_received_with_usage");
+  assert.equal(failure.classification.kind, "schema_violation");
+  assert.equal(failure.providerReportedModelId, "claude-sonnet-5");
+});
+
+test("성공한 검증은 그대로 통과시킨다", () => {
+  const received = {
+    usage: { inputTokens: 1, outputTokens: 2 },
+    latencyMs: 3,
+    meta: { requestedModelId: "m", dispatchState: "response_received_with_usage" as const },
+  };
+  assert.equal(validateReceived(() => 42, received), 42);
+});
+
+test("이미 dispatch 사실을 아는 오류는 다시 감싸지 않는다", () => {
+  // 감싸면 어댑터가 확보한 분류(예: tool_use 블록 없음)가 덮인다.
+  const original = new ProviderCallFailure({
+    message: "tool_use 블록 없음",
+    dispatchState: "response_received_with_usage",
+    classification: { kind: "schema_violation", message: "없음", status: 400, retryable: false },
+    usage: { inputTokens: 5, outputTokens: 6 },
+  });
+  const received = {
+    usage: { inputTokens: 0, outputTokens: 0 },
+    latencyMs: 1,
+    meta: { requestedModelId: "m", dispatchState: "response_received_with_usage" as const },
+  };
+  assert.throws(
+    () => validateReceived(() => { throw original; }, received),
+    (error: unknown) => error === original
+  );
 });
