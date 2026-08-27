@@ -27,13 +27,22 @@ export function AutopilotPreviewPanel(props: {
   autoApproveVerification: boolean;
   skillPath: string | null;
   deadlineSecs: number | null;
+  /**
+   * 어떤 종류의 태스크에 대한 미리보기인가 (51·53절).
+   *
+   * **무인 스위치는 종류 게이트 밖에 있다** — 질문·계획 태스크에서도 켤 수 있다. 그때 종류를
+   * 보내지 않으면 Rust가 `change`로 보고, 화면은 **실제로는 좁혀질 쓰기 도구를 "그냥
+   * 지나갑니다"로** 보고하게 된다. 이 패널이 경계하는 "도구가 거짓말했다"가 그 모양이다.
+   */
+  kind: string;
   /** 워크스페이스가 열려 있는가. 닫혀 있으면 물을 곳이 없다. */
   ready: boolean;
 }) {
   const [preview, setPreview] = useState<AutopilotPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const { unattended, mode, allowGitCommit, autoApproveVerification, skillPath, deadlineSecs, ready } = props;
+  const { unattended, mode, allowGitCommit, autoApproveVerification, skillPath, deadlineSecs, kind, ready } =
+    props;
 
   useEffect(() => {
     if (!unattended || !ready) {
@@ -50,6 +59,7 @@ export function AutopilotPreviewPanel(props: {
       autoApproveVerification,
       skillPath,
       deadlineSecs,
+      kind,
     })
       .then((value) => {
         if (cancelled) return;
@@ -66,7 +76,7 @@ export function AutopilotPreviewPanel(props: {
     return () => {
       cancelled = true;
     };
-  }, [unattended, mode, allowGitCommit, autoApproveVerification, skillPath, deadlineSecs, ready]);
+  }, [unattended, mode, allowGitCommit, autoApproveVerification, skillPath, deadlineSecs, kind, ready]);
 
   const summary = summarizePreview(preview);
 

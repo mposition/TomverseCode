@@ -837,6 +837,52 @@ mod tests {
         }
     }
 
+    /// **실제 파일 시스템과 실제 PATHEXT로** 같은 거부를 확인한다 (Windows 착지 기준
+    /// `unknownShimIsRefusedNotGuessed`).
+    ///
+    /// 위 테스트들은 `is_file`을 주입한 가상 FS를 쓴다 — 그래서 Linux에서도 돌고, 그것이
+    /// 이 모듈을 그렇게 설계한 이유다. 하지만 **주입한 세계에서 통과한 것이 진짜 Windows에
+    /// 대해 말해주는 것은 없다**: PATHEXT 파싱, 확장자 대소문자, `Path::is_file`의 실제 동작이
+    /// 그 세계에는 없다. 착지 판정이 이 항목을 "사람이 Windows에서 확인할 것"으로 남겨둔
+    /// 이유이기도 하다 — 여기서는 그 확인을 사람의 기억이 아니라 **매 실행의 기록**으로 만든다.
+    ///
+    /// 거부가 중요한 이유는 원칙 6이다. `cmd.exe /c`로 감싸면 인자의 `&`/`|`/`%`가 셸에
+    /// 재해석되고, 그러면 **승인 화면에 표시된 argv와 실제 실행되는 것이 같다는 보장**이
+    /// 사라진다. 그 보장이 이 프로젝트가 argv 배열만 받는 이유 전체다.
+    #[cfg(windows)]
+    #[test]
+    fn an_unknown_batch_on_the_real_filesystem_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("deploy.bat"), "@echo off\r\necho hi\r\n").unwrap();
+        std::fs::write(dir.path().join("install.cmd"), "@echo off\r\necho hi\r\n").unwrap();
+        let path_value = dir.path().to_string_lossy().to_string();
+
+        let env = ResolveEnv {
+            platform: Platform::Windows,
+            path: &path_value,
+            pathext: ".COM;.EXE;.BAT;.CMD",
+            is_file: &|p: &Path| p.is_file(),
+        };
+
+        // 확장자를 붙여 부르든 안 붙이고 PATHEXT로 찾게 하든 결과는 같아야 한다.
+        for program in ["deploy", "install", "deploy.bat", "install.cmd"] {
+            let error = resolve_program(program, &args(&[]), &env)
+                .expect_err("알려지지 않은 배치가 실행 대상이 되었습니다");
+            assert!(
+                error.message.contains("알려지지 않은 배치 스크립트"),
+                "{program}: {}",
+                error.message
+            );
+            assert!(error.message.contains("재해석"), "{program}: {}", error.message);
+        }
+
+        // **그리고 이 거부가 공허하지 않다**: 같은 실제 디렉터리에 놓인 `.exe`는 통과한다.
+        // 이것이 없으면 "무엇을 놓아도 거부한다"와 구별되지 않는다.
+        std::fs::write(dir.path().join("real.exe"), b"MZ").unwrap();
+        let ok = resolve_program("real", &args(&[]), &env).expect("실제 실행 파일을 거부했습니다");
+        assert_eq!(ok.kind, ResolutionKind::DirectExecutable);
+    }
+
     #[test]
     fn other_script_types_are_refused_too() {
         let fs = Fs::new(&[r"C:\tools\thing.ps1"]);

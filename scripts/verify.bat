@@ -28,6 +28,7 @@ call npm run typecheck  || goto :fail
 call npm run core:build || goto :fail
 call npm test           || goto :fail
 call npm run core:test  || goto :fail
+call npm run desktop:check || goto :fail
 call npm run test:e2e   || goto :fail
 
 echo [tomverse] 전체 검증 통과

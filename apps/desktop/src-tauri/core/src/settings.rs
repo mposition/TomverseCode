@@ -319,7 +319,13 @@ mod tests {
     /// 하고, 그 변경은 이 검사에서 멈춘다.
     #[test]
     fn the_proposal_reader_cannot_register() {
-        let source = include_str!("settings.rs");
+        // **줄 끝을 먼저 정규화한다.** `include_str!`는 디스크의 바이트를 그대로 주는데,
+        // `.gitattributes`가 `* text=auto`이므로 Windows 체크아웃에서는 이 파일이 CRLF다
+        // (Git for Windows가 `core.autocrlf=true`를 기본으로 넣는다). 그러면 아래의
+        // `"\n}\n"`가 영원히 안 맞고, 검사는 "함수가 닫히지 않았습니다"로 죽는다 —
+        // **검사하려던 것과 아무 상관 없는 이유로.** 줄 끝은 이 검사의 논점이 아니다.
+        let source = include_str!("settings.rs").replace("\r\n", "\n");
+        let source = source.as_str();
         // needle을 런타임에 조립한다 — 리터럴로 적으면 이 검사 자체가 검사 대상에 걸린다.
         let marker = "fn load_proposal".to_string();
         let start = source.find(&marker).expect("load_proposal을 찾지 못했습니다");

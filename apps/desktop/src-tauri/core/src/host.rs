@@ -3988,9 +3988,15 @@ mod tests {
             None,
         );
         fs::write(ws.path().join("pyproject.toml"), "[tool.pytest.ini_options]\n").unwrap();
-        let venv = ws.path().join(".venv").join("bin");
-        fs::create_dir_all(&venv).unwrap();
-        fs::write(venv.join("python"), "").unwrap();
+        // 인터프리터는 **이 플랫폼의 자리**에 만든다. POSIX 자리에 고정하면 Windows에서는
+        // 사전 승인이 애초에 성립하지 않아, 철회를 확인하려던 이 테스트가 그 앞에서 죽는다.
+        let interpreter = ws.path().join(if cfg!(windows) {
+            ".venv\\Scripts\\python.exe"
+        } else {
+            ".venv/bin/python"
+        });
+        fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        fs::write(&interpreter, "").unwrap();
 
         host.begin_task(
             "task-1",
@@ -4005,7 +4011,7 @@ mod tests {
         let request = req(
             ToolName::RunTests,
             json!({
-                "program": venv.join("python").to_string_lossy(),
+                "program": interpreter.to_string_lossy(),
                 "args": ["-m", "pytest"],
                 "cwd": "."
             }),
@@ -4601,7 +4607,16 @@ mod tests {
             !ws.path().join(".git/REVERT_HEAD").exists(),
             "revert가 진행 중 상태로 남았습니다"
         );
-        assert_eq!(fs::read_to_string(ws.path().join("src/app.ts")).unwrap(), "a\nB3\nc\n");
+        // 줄 끝은 정규화해서 비교한다. `git revert --abort`는 작업 트리를 **git의 체크아웃
+        // 형태로** 되돌리는데, Windows의 기본 설정(`core.autocrlf=true`)에서 그 형태는 CRLF다.
+        // 즉 바이트가 달라지는 것은 우리가 무언가를 남긴 것이 아니라 git이 자기 규칙대로
+        // 복원한 결과다 — 우리가 지키는 계약은 **git이 보기에 깨끗한가**이고, 그것은 바로
+        // 아래 `status --porcelain`이 말한다. 바이트로 못박으면 그 계약이 아니라 이 머신의
+        // git 설정을 시험하게 된다.
+        assert_eq!(
+            fs::read_to_string(ws.path().join("src/app.ts")).unwrap().replace("\r\n", "\n"),
+            "a\nB3\nc\n"
+        );
         assert_eq!(git_at(ws.path(), &["status", "--porcelain"]).trim(), "");
     }
 

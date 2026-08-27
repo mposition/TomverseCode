@@ -18,9 +18,13 @@ use tomverse_core::sidecar::{RespawnOutcome, SidecarClient, SidecarSupervisor, M
 use tomverse_core::store::{Store, StoreIssue, StoreOp, TaskRow};
 use tomverse_core::uimsg::{UiMessage, UserFacing};
 use tomverse_core::types::{ApprovalRequest, ExecutionMode, TaskPolicy};
+// `available_providers`(허용 목록을 적용하지 않는 판)는 **일부러 들여오지 않는다.**
+// 이 파일의 모든 자리는 `available_providers_for`로 워크스페이스 허용 목록을 적용한다 —
+// 목록 밖 공급자의 모델을 고를 수 있게 보여주면, 고른 뒤 "키가 없다"는 오류를 만나게 된다.
+// 키는 있고 정책이 막은 것인데.
 use tomverse_core::{
-    available_providers, available_providers_for, credential_env_for, providers_blocked_by_policy,
-    CancellationRegistry, WorkspaceRoot, PROTOCOL_VERSION,
+    available_providers_for, credential_env_for, providers_blocked_by_policy, CancellationRegistry,
+    WorkspaceRoot, PROTOCOL_VERSION,
 };
 use tomverse_core::approvals::PendingApprovals;
 
@@ -535,6 +539,15 @@ impl SessionState {
         auto_approve_verification: bool,
         skill_path: Option<&str>,
         deadline_secs: Option<u64>,
+        // 이 미리보기가 **어느 종류의 태스크에 대한 답인가**(51·53절).
+        //
+        // 종전에는 여기에 `false`가 박혀 있었다 — `kind`가 종류로 바뀌기 전, 불리언이던
+        // 시절의 잔재다. 그대로 `"change"`로 옮기면 미리보기가 거짓말을 한다: 무인 스위치는
+        // 종류와 무관하게 켤 수 있는데(App.tsx에서 그 fieldset은 `taskKind` 게이트 밖에 있다),
+        // 질문·계획 태스크의 도구는 `tools_for_question`이 좁힌다. 좁혀진 것을 모르고 물으면
+        // 화면이 **실제로는 거부될 쓰기 도구를 "그냥 지나갑니다"로** 보고한다. 이 함수의 주석이
+        // 경계하는 "도구가 거짓말했다"가 바로 그 모양이다.
+        kind: &str,
     ) -> Result<Value, String> {
         let host = self.with_active(|active| Ok(active.host.clone()))?;
         // 스킬은 도구를 **좁힐** 수 있으므로 미리보기도 그것을 반영해야 한다 — 반영하지 않으면
@@ -553,7 +566,7 @@ impl SessionState {
             auto_approve_verification,
             skill.as_ref(),
             deadline_secs,
-            false,
+            kind,
         );
         serde_json::to_value(host.autopilot_preview(policy)).map_err(|e| format!("직렬화: {e}"))
     }
@@ -669,7 +682,7 @@ impl SessionState {
     /// **값을 돌려줄 뿐 파일을 쓰지 않는다.** 임의 경로 쓰기를 UI가 시킬 수 있게 만들면
     /// 모델 요청이 Policy Gate를 지나야 한다는 규칙과 나란히, 게이트를 지나지 않는 두 번째
     /// 쓰기 경로가 생긴다. 파일로 떨구는 것은 `tomverse-host export`가 한다.
-    pub fn task_export(&self, task_id: &str) -> Result<Value, String> {
+    pub fn task_export(&self, task_id: &str) -> Result<Value, UiMessage> {
         // **export 본문에 봉투 키를 섞지 않는다.** 이건 감사자가 그대로 복사해 가는 문서이고
         // `reproduce`가 읽는 입력이다 — 여기에 `ok`가 끼면 우리가 만든 기록이 아니게 된다.
         // 그래서 봉투가 감쌀 자리를 따로 만든다.
@@ -961,6 +974,10 @@ impl SessionState {
     /// `budget_usd`가 `None`이면 **상한 없이** 실행한다 — 사용자가 명시적으로 고른 경우이거나
     /// (가격을 모르는 모델) 화면이 그렇게 보낸 경우다. 값을 우리가 대신 채워 넣지 않는다:
     /// 상한은 사용자의 승인이고, 코드가 만들어낸 승인은 승인이 아니다.
+    ///
+    /// 아래 인자 설명이 `///`가 아니라 `//`인 이유: **Rust에는 파라미터 문서 주석이 없다.**
+    /// `///`를 붙이면 컴파일이 깨진다. 설명을 여기로 몰면 어느 인자의 이야기인지가 흐려지므로
+    /// 자리를 지키고 형식만 바꿨다 — 되돌리지 말 것.
     #[allow(clippy::too_many_arguments)]
     pub fn start_task(
         &self,
@@ -969,22 +986,22 @@ impl SessionState {
         allow_git_commit: bool,
         budget_usd: Option<f64>,
         model_pins: Value,
-        /// 무인 실행 (state-machine 24절). 승인이 필요한 지점에서 **멈춘다**.
+        // 무인 실행 (state-machine 24절). 승인이 필요한 지점에서 **멈춘다**.
         unattended: bool,
-        /// 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
+        // 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
         auto_approve_verification: bool,
-        /// 스킬 파일 경로 (26절). **Rust가 읽는다** — 도구 허용목록의 출처가 UI가 되면
-        /// 장악당한 UI가 "허용목록은 전부입니다"라고 말할 수 있다.
+        // 스킬 파일 경로 (26절). **Rust가 읽는다** — 도구 허용목록의 출처가 UI가 되면
+        // 장악당한 UI가 "허용목록은 전부입니다"라고 말할 수 있다.
         skill_path: Option<&str>,
-        /// 이 요청이 **질문인가** (state-machine 51절).
-        ///
-        /// 참이면 파일을 바꾸지 않는 경로를 탄다. 그 보장은 두 겹이다 — sidecar의 경로가
-        /// `EXECUTING`을 지나지 않고, 여기서 도구를 읽기 전용으로 좁혀 게이트에 꽂는다.
+        // 이 요청이 **질문인가** (state-machine 51절).
+        // 
+        // 참이면 파일을 바꾸지 않는 경로를 탄다. 그 보장은 두 겹이다 — sidecar의 경로가
+        // `EXECUTING`을 지나지 않고, 여기서 도구를 읽기 전용으로 좁혀 게이트에 꽂는다.
         kind: &str,
-        /// 무인 실행의 **시한**(초) — state-machine 39절. `None`이면 상한이 없다.
-        ///
-        /// `timeout`과 다른 값이다: 저쪽은 이 호출이 기다리기를 그만두는 시각이고, 이쪽은
-        /// 태스크가 멈추는 시각이다(39.2절).
+        // 무인 실행의 **시한**(초) — state-machine 39절. `None`이면 상한이 없다.
+        // 
+        // `timeout`과 다른 값이다: 저쪽은 이 호출이 기다리기를 그만두는 시각이고, 이쪽은
+        // 태스크가 멈추는 시각이다(39.2절).
         deadline_secs: Option<u64>,
         timeout: Duration,
     ) -> Result<Value, String> {
@@ -1011,10 +1028,15 @@ impl SessionState {
             ExecutionMode::Fast => "fast",
             ExecutionMode::Verified => "verified",
         };
-        host.with_store_prose("태스크를 만들 수 없습니다", |s| {
+        // **두 겹을 각각 편다.** 바깥은 저장 계층이 안 열린 것이고(`with_store_prose`가 이미
+        // 앞머리를 붙인다), 안쪽은 INSERT가 실패한 것이다. 종전에는 바깥에만 `?`를 걸고
+        // 안쪽 `Result`를 `;`로 버렸다 — **`create_task`가 실패해도 그대로 진행했다.**
+        // 그 상태에서는 존재하지 않는 태스크에 이벤트를 붙이게 되고, `task_events`가
+        // 진실의 원천이라는 전제(원칙 7)가 조용히 깨진다.
+        self.with_store_prose("태스크를 만들 수 없습니다", |s| {
             s.create_task(&task_id, &session_id, &workspace_id, &workspace_path, mode_str, message)
-        })
-            .map_err(|e| format!("태스크를 만들 수 없습니다: {e}"))?;
+        })?
+        .map_err(|e| format!("태스크를 만들 수 없습니다: {e}"))?;
 
         // 스킬 파일은 **Rust가 읽는다**(26.1절). 화면이 읽어 넘기면 도구 허용목록의 출처가
         // 화면이 되고, 그러면 장악당한 화면이 "허용목록은 전부입니다"라고 말할 수 있다.
@@ -1054,7 +1076,9 @@ impl SessionState {
             .read_store(StoreOp::ReadSessionMemory, |s| {
                 tomverse_core::session_memory::collect(s, &session_id, &task_id)
             })
-            .map_err(|m| m.text.clone())?;
+            // 실행 경로는 봉투로 나가지 않으므로 원문으로 되돌린다 — `with_store`의 주석이
+            // 말하는 그 자리다. **되돌리는 것은 눈에 보이고, 빠뜨리는 것은 보이지 않는다.**
+            .map_err(|m| m.message)?;
 
         let params = json!({
             "taskRequest": {
@@ -1138,8 +1162,14 @@ impl SessionState {
                 );
 
                 if let Some(obj) = value.as_object_mut() {
-                    let mutated = host
-                        .with_store(StoreOp::ReadTask, |s| s.mutated_paths(&task_id))
+                    // `read_store`는 두 겹(저장 계층 미개방 / 질의 실패)을 한 번에 편다.
+                    //
+                    // **여기서는 실패를 삼킨다** — 태스크는 이미 끝났고, 바뀐 파일 목록을
+                    // 읽지 못했다는 이유로 결과 전체를 실패로 만들면 사용자는 방금 끝난 작업을
+                    // 잃는다. 대신 화면에는 "바뀐 파일 없음"으로 보이므로, 이 자리는 언젠가
+                    // 목록과 "읽지 못했다"를 갈라 보내야 한다.
+                    let mutated = self
+                        .read_store(StoreOp::ReadTask, |s| s.mutated_paths(&task_id))
                         .unwrap_or_default();
                     obj.insert("mutatedPaths".to_string(), json!(mutated));
                     obj.insert("taskId".to_string(), json!(task_id));
@@ -1167,6 +1197,15 @@ impl SessionState {
         task_id: &str,
         budget_usd: Option<f64>,
         model_pins: Value,
+        // 종류는 **저장된 행에서 복원하지 않는다** — 애초에 복원할 수 없다. `tasks` 테이블에도
+        // `TaskRow`에도 `kind` 컬럼이 없고, `TASK_CONFIG_PINNED`에 남는 것은 파생값인
+        // `allowedTools`뿐이다(스킬도 그 목록을 좁히므로 거꾸로 유도할 수 없다).
+        //
+        // 그래서 화면이 준다. 이 함수의 주석이 이미 그렇게 말하고 있다 — **다시 실행은 새
+        // 태스크이고**(16.6절) 원래 태스크의 정책을 물려받지 않는다. 예산과 모델 지정을 이미
+        // "지금 화면의 값"으로 받는 것과 같은 부류다. 여기에 `"change"`를 박으면 질문으로
+        // 물었던 것이 재실행에서 쓰기 도구를 들고 돌게 되고, 그건 사용자가 고른 적 없는 권한이다.
+        kind: &str,
         timeout: Duration,
     ) -> Result<Value, String> {
         // 여기는 화면이 그리는 실패 경로가 아니라 재실행 중의 내부 조회다 — 봉투를 산문으로
@@ -1195,6 +1234,7 @@ impl SessionState {
             false,
             false,
             None,
+            kind,
             // 시한도 물려받지 않는다 — 같은 이유다. 무인이 아니면 시한을 걸 이유도 없다.
             None,
             timeout,

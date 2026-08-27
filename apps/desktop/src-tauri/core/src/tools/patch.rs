@@ -153,11 +153,31 @@ fn parse_hunk_header(line: &str, line_no: usize) -> Result<usize, PatchError> {
 
 /// 적용 결과. 성공하면 새 파일 내용 전체를 반환한다 — 호출자가 쓰기 전에
 /// pre-image를 저장할 수 있도록 파일 쓰기는 이 함수가 하지 않는다.
+///
+/// # CRLF
+///
+/// 줄 끝의 `\r`는 **비교에서 제외하고, 원본의 바이트는 보존한다.**
+///
+/// 이 구분이 필요한 이유는 두 쪽의 줄 분리 규칙이 원래 달랐기 때문이다: hunk는
+/// `patch.lines()`로 나뉘는데 Rust의 `str::lines()`는 `\r\n`의 `\r`를 떼어내고,
+/// 파일은 `split_lines()`가 `'\n'`으로만 잘라 `\r`를 줄 끝에 남긴다. 그래서 CRLF 파일은
+/// **모든 컨텍스트 줄이 어긋났다** — Git for Windows가 `core.autocrlf=true`를 기본으로
+/// 넣으므로 Windows 사용자의 작업 트리가 대부분 그 상태이고, 그 환경에서는 patch가
+/// 하나도 붙지 않았다. 제품의 중심 동작이 플랫폼 하나에서 통째로 멎는 결함이었다.
+///
+/// 고친 방향은 "정규화"가 아니라 "비교에서만 무시"다. 파일 전체를 LF로 정규화하면
+/// **건드리지 않은 줄의 바이트가 바뀌어** diff에 없던 변경이 생기고, 그건 승인 화면이
+/// 보여준 것과 실제 쓰이는 것이 달라진다는 뜻이다(원칙 6과 같은 종류의 약속). 그래서
+/// 컨텍스트 줄은 원본 슬라이스를 그대로 내보내고, patch가 **새로 넣는 줄만** 파일의
+/// 줄 끝을 따라간다.
 pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, PatchError> {
     let hunks = parse_hunks(patch)?;
 
     let had_trailing_newline = original.ends_with('\n') || original.is_empty();
     let lines: Vec<&str> = split_lines(original);
+    // 새로 넣는 줄이 따라갈 줄 끝. 섞여 있으면 다수를 따른다 — 파일에 없던 종류의
+    // 줄 끝을 새로 들여오지 않는 것이 목적이다.
+    let crlf = uses_crlf(&lines);
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     // 0-based 커서. 마지막으로 원본에서 소비한 위치.
@@ -193,7 +213,7 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, PatchEr
 
         for op in &hunk.ops {
             match op {
-                Op::Add(text) => out.push(text.clone()),
+                Op::Add(text) => out.push(if crlf { format!("{text}\r") } else { text.clone() }),
                 Op::Context(expected) | Op::Remove(expected) => {
                     let Some(actual) = lines.get(cursor) else {
                         return Err(PatchError::OutOfBounds {
@@ -202,8 +222,9 @@ pub fn apply_unified_diff(original: &str, patch: &str) -> Result<String, PatchEr
                             file_lines: lines.len(),
                         });
                     };
-                    // 정확히 일치해야 한다. 공백을 무시하거나 근처를 찾아보는 관용은 없다.
-                    if actual != expected {
+                    // 줄 끝의 `\r` 하나를 뺀 나머지는 정확히 일치해야 한다. 공백을 무시하거나
+                    // 근처를 찾아보는 관용은 여전히 없다 — 느슨해진 것은 줄 끝뿐이다.
+                    if strip_cr(actual) != strip_cr(expected) {
                         return Err(PatchError::ContextMismatch {
                             hunk: hunk_no,
                             at_line: cursor + 1,
@@ -241,6 +262,21 @@ fn split_lines(text: &str) -> Vec<&str> {
         lines.pop();
     }
     lines
+}
+
+/// 줄 끝의 `\r` **하나**만 뗀다. 줄 안의 `\r`는 내용이므로 건드리지 않는다.
+fn strip_cr(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// 이 파일이 CRLF를 쓰는가 — 다수결이다.
+///
+/// "하나라도 있으면 CRLF"로 하면 `\r` 한 줄이 섞인 LF 파일에서 새 줄이 전부 CRLF가 되고,
+/// "전부여야 CRLF"로 하면 마지막 줄에 개행이 없는 CRLF 파일이 LF로 판정된다
+/// (그 줄만 `\r`로 끝나지 않기 때문이다). 둘 다 파일에 없던 줄 끝을 들여온다.
+fn uses_crlf(lines: &[&str]) -> bool {
+    let crlf = lines.iter().filter(|l| l.ends_with('\r')).count();
+    crlf * 2 > lines.len()
 }
 
 /// pre-image로 되돌리는 역방향 patch를 만드는 대신, 롤백은 파일 전체를 pre-image로
@@ -412,5 +448,77 @@ mod tests {
     #[test]
     fn generated_diff_is_empty_when_unchanged() {
         assert_eq!(make_unified_diff("f.txt", "a\n", "a\n"), "");
+    }
+
+    // ---- CRLF ----
+    //
+    // **이 묶음은 Windows 실측에서 왔다.** e2e가 Windows에서 세 건 실패했고 원인이 하나였다:
+    // Git for Windows의 기본값(`core.autocrlf=true`)으로 체크아웃된 작업 트리는 CRLF인데,
+    // hunk 쪽은 `str::lines()`가 `\r`를 떼고 파일 쪽은 `split('\n')`이 남겨서 모든 컨텍스트
+    // 줄이 어긋났다. 그 상태에서 `apply_patch`는 **한 줄도 붙지 않는다.**
+    //
+    // 테스트를 Rust 단위 테스트로 두는 것이 요점이다 — Linux에서도 돌아야 결함이 다시
+    // 조용히 살아나지 않는다. e2e에만 두면 Windows에서 돌린 사람만 알게 된다.
+
+    const CRLF_ORIGINAL: &str = "line one\r\nline two\r\nline three\r\nline four\r\n";
+
+    #[test]
+    fn applies_an_lf_patch_to_a_crlf_file() {
+        // 모델이 내는 patch는 LF다. 파일은 CRLF다. 이 조합이 Windows의 기본 상태다.
+        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -2,2 +2,2 @@\n line two\n-line three\n+LINE THREE\n";
+        let out = apply_unified_diff(CRLF_ORIGINAL, patch).unwrap();
+        assert_eq!(out, "line one\r\nline two\r\nLINE THREE\r\nline four\r\n");
+    }
+
+    #[test]
+    fn untouched_lines_keep_their_exact_bytes() {
+        // 정규화로 고치면 건드리지 않은 줄까지 바뀐다 — 승인 화면이 보여준 것과 실제 쓰이는
+        // 것이 달라진다는 뜻이므로, 그 방향으로 고치지 않았다는 것을 여기서 못박는다.
+        let patch = "@@ -2,2 +2,1 @@\n line two\n-line three\n";
+        let out = apply_unified_diff(CRLF_ORIGINAL, patch).unwrap();
+        assert_eq!(out, "line one\r\nline two\r\nline four\r\n");
+        assert!(!out.contains("line one\n") || out.contains("line one\r\n"));
+    }
+
+    #[test]
+    fn inserted_lines_follow_the_files_line_ending() {
+        let patch = "@@ -1,1 +1,2 @@\n line one\n+inserted\n";
+        let out = apply_unified_diff(CRLF_ORIGINAL, patch).unwrap();
+        assert_eq!(out, "line one\r\ninserted\r\nline two\r\nline three\r\nline four\r\n");
+    }
+
+    #[test]
+    fn an_lf_file_never_gains_crlf() {
+        // 반대 방향도 지켜야 한다 — LF 파일에 CRLF patch가 와도 파일은 LF로 남는다.
+        let patch = "@@ -1,1 +1,2 @@\r\n line one\r\n+inserted\r\n";
+        let out = apply_unified_diff(ORIGINAL, patch).unwrap();
+        assert_eq!(out, "line one\ninserted\nline two\nline three\nline four\n");
+    }
+
+    #[test]
+    fn a_real_mismatch_is_still_a_mismatch() {
+        // 느슨해진 것은 줄 끝뿐이다. 내용이 다르면 여전히 거절해야 한다 —
+        // 여기가 무너지면 "붙었는데 엉뚱한 자리"가 되고, 그건 안 붙는 것보다 나쁘다.
+        let patch = "@@ -2,2 +2,2 @@\n line TWO\n-line three\n+LINE THREE\n";
+        let err = apply_unified_diff(CRLF_ORIGINAL, patch).unwrap_err();
+        assert!(matches!(err, PatchError::ContextMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn crlf_diff_round_trips() {
+        let before = "a\r\nb\r\nc\r\nd\r\ne\r\n";
+        let after = "a\r\nb\r\nCHANGED\r\nd\r\ne\r\n";
+        let diff = make_unified_diff("f.txt", before, after);
+        assert_eq!(apply_unified_diff(before, &diff).unwrap(), after);
+    }
+
+    #[test]
+    fn a_crlf_file_without_a_trailing_newline_is_still_crlf() {
+        // `uses_crlf`를 "전부여야 CRLF"로 두면 이 파일이 LF로 판정된다 — 마지막 줄만
+        // `\r`로 끝나지 않기 때문이다. 그러면 새 줄이 LF로 들어가 파일이 섞인다.
+        let original = "a\r\nb\r\nc";
+        let patch = "@@ -1,1 +1,2 @@\n a\n+inserted\n";
+        let out = apply_unified_diff(original, patch).unwrap();
+        assert_eq!(out, "a\r\ninserted\r\nb\r\nc");
     }
 }

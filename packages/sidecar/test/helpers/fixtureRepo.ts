@@ -117,6 +117,17 @@ setTimeout(() => {
  * `user.email`/`user.name`을 저장소 로컬로 박는 이유: CI나 컨테이너에는 전역 git identity가
  * 없는 경우가 흔하고, 그러면 `git commit`이 실패한다 — **테스트하려는 것과 무관한 이유로**
  * 실패하는 것이 가장 나쁘다. `commit.gpgsign=false`도 같은 이유다(서명 키가 없으면 실패한다).
+ *
+ * `core.autocrlf=false`도 **같은 부류**이며, Windows 실측에서 왔다. Git for Windows는
+ * `core.autocrlf=true`를 시스템 설정으로 넣는데, 그러면 픽스처가 LF로 써 넣은 파일을
+ * `git checkout`이 CRLF로 되돌린다. 즉 **최초 실행이 본 바이트와 복원된 바이트가 달라지고**,
+ * 그 위에서 "기록과 같은 상태가 됐는가"(재현)나 "시작 전과 같은가"(revert)를 물으면
+ * 답이 이 머신의 git 설정에 달리게 된다 — 검증하려는 것과 무관한 이유다. 픽스처는 자기가
+ * 쓴 바이트를 git이 그대로 돌려주는 저장소여야 한다.
+ *
+ * **CRLF 작업 트리 자체를 검증하지 않게 되는 것이 아니다** — 그건 아래 `crlf` 옵션이 만드는
+ * 전용 픽스처가 명시적으로 맡는다. 우연히(개발자 머신의 설정에 따라) 검사되던 것을
+ * 언제나 검사되는 자리로 옮긴 것이다.
  */
 function initGitRepo(root: string): void {
   const git = (args: string[]): void => {
@@ -126,17 +137,33 @@ function initGitRepo(root: string): void {
   git(["config", "user.email", "fixture@example.invalid"]);
   git(["config", "user.name", "Tomverse Fixture"]);
   git(["config", "commit.gpgsign", "false"]);
+  git(["config", "core.autocrlf", "false"]);
+  git(["config", "core.eol", "lf"]);
   git(["add", "-A"]);
   git(["commit", "-m", "initial"]);
 }
 
+/**
+ * `crlf: true`면 소스 파일을 **CRLF로** 써 넣는다.
+ *
+ * Git for Windows가 `core.autocrlf=true`를 기본으로 넣으므로 Windows 사용자의 작업 트리는
+ * 대부분 CRLF다. 그 상태에서 `apply_patch`가 한 줄도 붙지 않는 결함이 실제로 있었고
+ * (`tools/patch.rs`의 CRLF 절), 그때까지 아무 테스트도 그것을 잡지 못했다 — Linux에서는
+ * 그런 작업 트리가 만들어지지 않고, Windows에서도 **개발자 머신의 git 설정에 따라** 생기거나
+ * 안 생겼기 때문이다. 옵션으로 만들면 어느 플랫폼에서든 그 작업 트리가 반드시 만들어진다.
+ */
+function withEol(text: string, crlf: boolean): string {
+  return crlf ? text.replace(/\r?\n/g, "\r\n") : text;
+}
+
 export function createFixtureRepo(
-  options: { withPassingTest?: boolean; slowTest?: boolean; gitRepo?: boolean } = {}
+  options: { withPassingTest?: boolean; slowTest?: boolean; gitRepo?: boolean; crlf?: boolean } = {}
 ): FixtureRepo {
   const root = mkdtempSync(path.join(tmpdir(), "tomverse-fixture-"));
+  const eol = (text: string): string => withEol(text, options.crlf === true);
 
-  writeFileSync(path.join(root, "paginate.js"), options.withPassingTest ? FIXED_SOURCE : BUGGY_SOURCE);
-  writeFileSync(path.join(root, "paginate.test.js"), TEST_SOURCE);
+  writeFileSync(path.join(root, "paginate.js"), eol(options.withPassingTest ? FIXED_SOURCE : BUGGY_SOURCE));
+  writeFileSync(path.join(root, "paginate.test.js"), eol(TEST_SOURCE));
   if (options.slowTest) writeFileSync(path.join(root, "slow-test.js"), SLOW_TEST_SOURCE);
   writeFileSync(
     path.join(root, "package.json"),

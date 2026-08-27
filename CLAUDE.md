@@ -21,6 +21,7 @@ Windows 데스크톱 AI 코딩 어시스턴트.
 | [multi-engine-routing.md](./docs/design/multi-engine-routing.md) | Model Registry, Role 추상화, 검수자 독립성 불변식, 라우터 부트스트랩, **co-executor 배정(13절)** |
 | [process-architecture.md](./docs/design/process-architecture.md) | UI / Rust core / Node sidecar 3프로세스 구조, stdio+NDJSON IPC, 신뢰 경계 |
 | [ui-wireframes.md](./docs/design/ui-wireframes.md) | 화면 인벤토리, `TaskPhase` → 사용자 노출 5단계 매핑, **불일치 판정 카드(3.9)** |
+| [windows-landing-record.md](./docs/design/windows-landing-record.md) | **설계가 아니라 관측 기록.** `windows-landing`이 `NeedsHuman`으로 남기는 항목을 실제 Windows에서 태워본 결과 — 무엇이 확인됐고, 무엇을 **왜 태우지 못했는지**, 그리고 남은 착지 차단 |
 
 ## 절대 어기면 안 되는 원칙
 

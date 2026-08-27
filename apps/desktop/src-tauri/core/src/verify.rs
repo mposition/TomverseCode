@@ -687,14 +687,15 @@ mod tests {
     fn a_declared_python_project_runs_through_its_venv_interpreter() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("pytest.ini"), "[pytest]\n").unwrap();
-        let venv = dir.path().join(".venv").join("bin");
-        fs::create_dir_all(&venv).unwrap();
-        fs::write(venv.join("python"), "").unwrap();
+        // 인터프리터를 **이 플랫폼의 자리**에 만든다 — Windows는 `Scripts\python.exe`다.
+        let interpreter = dir.path().join(venv_interpreter_rel());
+        fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        fs::write(&interpreter, "").unwrap();
 
         let root = WorkspaceRoot::new(dir.path()).unwrap();
         let detected = detect_commands(&root);
         let (_, cmd, source) = detected.commands.get("test").expect("test 명령이 없습니다");
-        assert!(cmd.program.ends_with(".venv/bin/python"), "{}", cmd.program);
+        assert!(cmd.program.ends_with(venv_interpreter_rel()), "{}", cmd.program);
         assert_eq!(cmd.args, vec!["-m", "pytest"]);
         // 근거에 **어느 인터프리터를 왜 골랐는지**가 남는다.
         assert!(source.contains("pytest.ini"), "{source}");
@@ -774,8 +775,31 @@ mod tests {
     /// pytest 출력을 그대로 낸다. **`cargo test`를 쓸 수 없다** — 이 워크스페이스에는
     /// `Cargo.toml`이 있으므로 감지가 cargo를 고르는데, 그러면 fixture 하나에 러너 둘이
     /// 얽혀 무엇을 검증하는지 흐려진다.
+    /// 이 플랫폼의 가상환경 인터프리터 자리 — `bin/python` vs `Scripts\python.exe`.
+    ///
+    /// 픽스처가 POSIX 자리에 고정되어 있었다. 그러면 Windows에서는 `.venv\Scripts\python.exe`가
+    /// 없으므로 감지가 PATH로 폴백하고, **Windows의 venv 갈래는 한 번도 실행되지 않은 채**
+    /// 아래 테스트들이 "program이 `python`이다"로 실패한다 — 제품은 옳게 동작했는데 픽스처가
+    /// 그 플랫폼을 만들어주지 않은 것이다. 자리를 플랫폼에 맞추면 두 OS가 각자의 갈래를 태운다.
+    fn venv_interpreter_rel() -> &'static str {
+        if cfg!(windows) {
+            ".venv\\Scripts\\python.exe"
+        } else {
+            ".venv/bin/python"
+        }
+    }
+
+    /// 픽스처 워크스페이스 루트 기준의 인터프리터 절대 경로 — `FakeExecutor`의 응답 키가
+    /// 실제로 만들어지는 명령과 같아야 한다.
+    fn venv_interpreter_at(root: &WorkspaceRoot) -> String {
+        root.path().join(venv_interpreter_rel()).to_string_lossy().to_string()
+    }
+
     fn python_project() -> Vec<(&'static str, &'static str)> {
-        vec![("pyproject.toml", "[tool.pytest.ini_options]\n"), (".venv/bin/python", "#!/bin/sh\n")]
+        vec![
+            ("pyproject.toml", "[tool.pytest.ini_options]\n"),
+            (venv_interpreter_rel(), "#!/bin/sh\n"),
+        ]
     }
 
     /// **체크 단위 귀속이 새 회귀를 숨겼다** — state-machine 54절.
@@ -787,7 +811,7 @@ mod tests {
     fn a_new_regression_inside_an_already_failing_check_is_not_hidden() {
         let (_d, _a, root, artifacts) = setup(&python_project());
         let runner = VerificationRunner::new(&root, &artifacts);
-        let py = root.path().join(".venv/bin/python").to_string_lossy().to_string();
+        let py = venv_interpreter_at(&root);
 
         let mut base_exec = FakeExecutor {
             responses: vec![(
@@ -842,7 +866,7 @@ mod tests {
     fn the_attribution_survives_serialization() {
         let (_d, _a, root, artifacts) = setup(&python_project());
         let runner = VerificationRunner::new(&root, &artifacts);
-        let py = root.path().join(".venv/bin/python").to_string_lossy().to_string();
+        let py = venv_interpreter_at(&root);
 
         let mut base_exec = FakeExecutor {
             responses: vec![(format!("{py} -m pytest"), 0, "ok".to_string())],
@@ -874,7 +898,7 @@ mod tests {
     fn fixed_tests_are_counted_too() {
         let (_d, _a, root, artifacts) = setup(&python_project());
         let runner = VerificationRunner::new(&root, &artifacts);
-        let py = root.path().join(".venv/bin/python").to_string_lossy().to_string();
+        let py = venv_interpreter_at(&root);
 
         let mut base_exec = FakeExecutor {
             responses: vec![(
@@ -941,7 +965,7 @@ mod tests {
     fn everything_is_new_when_the_baseline_passed() {
         let (_d, _a, root, artifacts) = setup(&python_project());
         let runner = VerificationRunner::new(&root, &artifacts);
-        let py = root.path().join(".venv/bin/python").to_string_lossy().to_string();
+        let py = venv_interpreter_at(&root);
 
         let mut base_exec = FakeExecutor {
             responses: vec![(format!("{py} -m pytest"), 0, "2 passed".to_string())],
