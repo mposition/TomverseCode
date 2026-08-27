@@ -200,6 +200,67 @@ test("두 방향 모두 실제로 검사되고 있다", () => {
 
 // ---- 출시 기준 표 (8.2절) — state-machine 56절 ----
 
+/**
+ * **모든 기능 행에 상태 행이 있는가** — state-machine 66절.
+ *
+ * 56절이 만든 검사들은 전부 **상태 행**을 읽는다. 그래서 상태 행이 **아예 없는 기능 행**은
+ * 처음부터 그 검사들의 시야 밖이었다 — 그리고 실제로 다섯 개가 그랬다(세션 취소, git 도구,
+ * 프로젝트 규칙, Fleet, 승인·경계·secret). 넷은 구현돼 있었는데 표가 말하지 않았고, 하나는
+ * 미착수인데 그 사실도 없었다.
+ *
+ * **빠진 행은 실패하지 않으므로 빠진 사실이 드러나지 않는다.** 이 저장소가 이미 두 번 밟은
+ * 모양이다(루트 `test`에서 빠진 워크스페이스, 탐침이 없는 도구).
+ *
+ * 표는 "최대한의 정지 조건"이라고 적혀 있다. 상태가 없는 행이 있으면 그 표를 **재고 목록으로
+ * 읽을 수 없고**, 읽을 수 없는 정지 조건은 정지 조건이 아니다.
+ */
+function releaseTableLines(): string[] {
+  const source = readFileSync(DOC, "utf8").split("\n");
+  const head = "|" + " 영역 | 출시 기준";
+  const start = source.findIndex((l) => l.startsWith(head));
+  assert.notEqual(start, -1, "출시 기준 표의 머리글을 찾지 못했습니다");
+  // **다음 소제목에서 끊는다.** 8.3절에도 표가 있고 거기 행들은 상태 행을 갖지 않는다 —
+  // 제외 항목이라 "현재 상태"라는 개념이 없다.
+  const rest = source.slice(start + 1);
+  const end = rest.findIndex((l) => l.startsWith("###"));
+  assert.notEqual(end, -1, "출시 기준 표 다음 소제목을 찾지 못했습니다");
+  return rest.slice(0, end);
+}
+
+test("출시 기준 표의 모든 기능 행에 상태 행이 있다", () => {
+  const lines = releaseTableLines();
+  const feature = "|" + " **";
+  const status = "|" + " ↳ 위 행의 현재 상태";
+
+  const missing: string[] = [];
+  let pending: string | null = null;
+  let features = 0;
+  for (const line of lines) {
+    if (line.startsWith(status)) {
+      // 기능 행 없이 상태 행이 오면 그 상태는 무엇에 대한 것인지 알 수 없다.
+      assert.notEqual(pending, undefined);
+      assert.ok(pending !== null, `기능 행 없이 상태 행이 있습니다: ${line.slice(0, 60)}`);
+      pending = null;
+      continue;
+    }
+    if (!line.startsWith(feature)) continue;
+    if (pending) missing.push(pending);
+    pending = line.slice(1).split("|")[0]!.trim();
+    features += 1;
+  }
+  if (pending) missing.push(pending);
+
+  // 0개면 아래 비교가 빈 집합에 대해 통과한다 — 표 형식이 바뀐 경우다.
+  assert.ok(features >= 15, `기능 행을 ${features}개만 읽었습니다`);
+  assert.deepEqual(
+    missing,
+    [],
+    `상태 행이 없는 기능 행이 있습니다: ${missing.join(", ")}. ` +
+      `상태 행이 없으면 56절의 검사들이 그 행을 **보지 못하고**, 보이지 않는 행은 실패하지 ` +
+      `않으므로 빠진 사실도 드러나지 않습니다.`
+  );
+});
+
 test("출시 기준 표의 상태 행도 반증할 파일을 적는다", () => {
   const rows = readReleaseRows();
   // 표를 못 찾았는데 통과하는 것을 막는다.
