@@ -4,7 +4,7 @@ import { ValidationError, validateDraftProposal, validateReviewDecision, validat
 import { FakeProviderAdapter } from "../src/providers/fake.js";
 import { normalizeProviderError } from "../src/providers/errors.js";
 import { backoffDelayMs, callWithRetry, DEFAULT_RETRY_POLICY, ProviderCallFailed, withTimeout } from "../src/providers/retry.js";
-import { OpenAIAdapter } from "../src/providers/openai.js";
+import { DRAFT_SCHEMA_STRICT, decodeMcpArguments, OpenAIAdapter } from "../src/providers/openai.js";
 import { AnthropicAdapter } from "../src/providers/anthropic.js";
 import {
   buildDraftPrompt,
@@ -743,4 +743,79 @@ test("가르지 못했으면 프롬프트가 새 실패를 말하지 않는다",
     },
   });
   assert.ok(!prompt.includes("NEWLY failing"), prompt);
+});
+
+// ---- OpenAI strict structured output ----
+//
+// 이 검사가 실제 호출이 아니라 **스키마 자체**를 보는 이유: mock transport는 스키마를
+// 검증하지 않으므로 어떤 형태든 통과시킨다. 그래서 이 경로는 실제 API에 대해 한 번도 돌지
+// 않은 채 400을 내는 상태로 남아 있었고, 가설 게이트의 첫 유료 호출이 되어서야 드러났다.
+// 규칙을 여기 적어두면 무료로, 그리고 다음 사람이 스키마를 건드릴 때 바로 잡힌다.
+
+/** OpenAI strict 모드의 요구사항을 스키마 트리 전체에 대해 확인한다. */
+function strictViolations(node: unknown, path: string, out: string[] = []): string[] {
+  if (node === null || typeof node !== "object") return out;
+  const schema = node as Record<string, any>;
+
+  if (schema.type === "object") {
+    if (schema.additionalProperties !== false) {
+      out.push(`${path}: additionalProperties가 false여야 합니다`);
+    }
+    const properties = schema.properties ?? {};
+    const names = Object.keys(properties);
+    if (names.length === 0) {
+      // properties가 없는 자유 객체는 strict로 표현할 수 없다 — 400의 원인이었던 형태다.
+      out.push(`${path}: properties 없는 자유 객체는 strict 모드로 표현할 수 없습니다`);
+    }
+    const required = new Set<string>(schema.required ?? []);
+    for (const name of names) {
+      if (!required.has(name)) out.push(`${path}.${name}: strict 모드는 모든 속성이 required여야 합니다`);
+      strictViolations(properties[name], `${path}.${name}`, out);
+    }
+  }
+  if (schema.type === "array") strictViolations(schema.items, `${path}[]`, out);
+  return out;
+}
+
+test("strict로 보내는 스키마가 OpenAI의 요구를 만족한다", () => {
+  assert.deepEqual(strictViolations(DRAFT_SCHEMA_STRICT, "draft_proposal"), []);
+});
+
+test("고치기 전의 DRAFT_SCHEMA는 strict로 보낼 수 없다 — 검사가 공허하지 않다는 증거", () => {
+  // 이 단언이 없으면 위 테스트는 "검사기가 아무것도 안 잡는다"로도 통과할 수 있다.
+  const violations = strictViolations(DRAFT_SCHEMA, "draft_proposal");
+  assert.ok(
+    violations.some((v) => v.includes("mcpCalls[].arguments")),
+    `실제 400의 원인을 검사기가 잡지 못합니다: ${JSON.stringify(violations)}`
+  );
+});
+
+test("strict 때문에 문자열로 온 mcp arguments를 객체로 되돌린다", () => {
+  const decoded = decodeMcpArguments({
+    patch: "",
+    mcpCalls: [{ server: "s", tool: "t", arguments: "{\"path\":\"src/a.ts\"}", reason: "r" }],
+  }) as { mcpCalls: { arguments: unknown }[] };
+  assert.deepEqual(decoded.mcpCalls[0]!.arguments, { path: "src/a.ts" });
+
+  // 빈 인자도 정상이다 — 인자가 없는 도구가 있다.
+  const empty = decodeMcpArguments({ mcpCalls: [{ server: "s", tool: "t", arguments: "{}", reason: "r" }] }) as {
+    mcpCalls: { arguments: unknown }[];
+  };
+  assert.deepEqual(empty.mcpCalls[0]!.arguments, {});
+
+  // 비어 있는 배열이 정상 경로다 — 손대지 않는다.
+  assert.deepEqual(decodeMcpArguments({ mcpCalls: [] }), { mcpCalls: [] });
+});
+
+test("깨진 JSON은 원인을 가리키는 오류가 된다", () => {
+  // 문자열을 그대로 흘려보내면 검증기가 "expected an object"라고만 말해 원인과 먼 곳을 가리킨다.
+  assert.throws(
+    () => decodeMcpArguments({ mcpCalls: [{ server: "s", tool: "t", arguments: "{not json", reason: "r" }] }),
+    (error: unknown) => error instanceof ValidationError && String(error).includes("파싱할 수 없습니다")
+  );
+  // 배열은 이름 있는 인자가 아니다.
+  assert.throws(
+    () => decodeMcpArguments({ mcpCalls: [{ server: "s", tool: "t", arguments: "[1,2]", reason: "r" }] }),
+    (error: unknown) => error instanceof ValidationError
+  );
 });
