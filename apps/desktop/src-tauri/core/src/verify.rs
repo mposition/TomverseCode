@@ -804,6 +804,7 @@ mod tests {
                 duration_ms: 10,
                 completed_at: now_iso(),
                 denial_kind: None,
+                file_failure: None,
             }
         }
     }
@@ -1262,6 +1263,7 @@ mod tests {
                     duration_ms: 0,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 }
             }
         }
@@ -1299,6 +1301,7 @@ mod tests {
                         duration_ms: 5,
                         completed_at: now_iso(),
                         denial_kind: None,
+                        file_failure: None,
                     };
                 }
                 ToolResult {
@@ -1309,6 +1312,7 @@ mod tests {
                     duration_ms: 1,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 }
             }
         }
@@ -1403,6 +1407,7 @@ mod tests {
                     duration_ms: 1000,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 }
             }
         }

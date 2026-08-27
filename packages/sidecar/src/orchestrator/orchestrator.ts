@@ -1664,6 +1664,27 @@ export class Orchestrator {
           };
         }
 
+        // **재시도할 값어치가 없는 실패는 여기서 끝낸다**(65절).
+        //
+        // 아래 백오프에는 근거가 있다 — *"파일 락 같은 일시적 원인이 있을 수 있어 짧게
+        // 기다린다."* 맞는 말이지만 **모든 실패에 대해 참은 아니다**: 경로가 길어서 실패한
+        // 쓰기는 2.2초를 기다린 뒤에도 같은 이유로 실패하고, 그동안 사용자는 도구가 무언가
+        // 하고 있다고 믿는다.
+        //
+        // **판정은 Rust가 준다.** 오류 문장으로 여기서 다시 판정하면 두 곳이 갈리고(24.3절),
+        // 그 문장은 로케일에 따라 번역되므로 한국어 Windows에서만 분기가 사라진다.
+        const failure = result.fileFailure;
+        if (failure && !failure.retryable) {
+          return {
+            kind: "final",
+            result: await this.finish(
+              "failed",
+              `${failure.fact} ${failure.tryThis}`,
+              "tool_failed_permanently"
+            ),
+          };
+        }
+
         // error / timeout — 재시도 대상
         attempt += 1;
         this.state.counters.toolRetries[request.requestId] = attempt;

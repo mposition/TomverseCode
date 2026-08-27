@@ -928,6 +928,70 @@ test("도구 실행 오류는 상한까지 재시도한 뒤 실패한다", async
   assert.equal(host.events.filter((e) => e.type === "TOOL_RETRY").length, 2);
 });
 
+/**
+ * **재시도할 값어치가 없는 실패는 상한을 기다리지 않는다** — state-machine 65절.
+ *
+ * 백오프에는 근거가 있었다: *"파일 락 같은 일시적 원인이 있을 수 있어 짧게 기다린다."*
+ * 맞는 말이지만 모든 실패에 대해 참은 아니다 — 경로가 길어서 실패한 쓰기는 2.2초를 기다린
+ * 뒤에도 같은 이유로 실패하고, 그동안 사용자는 도구가 무언가 하고 있다고 믿는다.
+ */
+test("재시도해도 같은 실패는 한 번 만에 끝난다", async () => {
+  const { orchestrator, host } = build(
+    {
+      verifyResults: [{ overall: "pass" }],
+      toolResults: [
+        {
+          status: "error",
+          error: "경로가 너무 깁니다",
+          fileFailure: {
+            kind: "path_too_long",
+            fact: "경로가 이 시스템에서 다룰 수 있는 길이를 넘어 쓰지 못했습니다: src/app.ts",
+            tryThis: "저장소를 더 짧은 경로로 옮기세요. 재시도해도 같은 결과입니다.",
+            retryable: false,
+          },
+        },
+      ],
+    },
+    { defaultPatch: VALID_PATCH },
+    { policy: { limits: { toolRetries: 2 } as never } }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "failed");
+  // **`tool_retry_exhausted`와 뭉개지 않는다** — 사용자가 할 일이 다르다.
+  assert.equal(result.failureReason, "tool_failed_permanently");
+  // 한 번만 시도했다. 상한이 2인데도 재시도가 없다.
+  assert.equal(host.toolRequests.filter((r) => r.tool === "apply_patch").length, 1);
+  assert.equal(host.events.filter((e) => e.type === "TOOL_RETRY").length, 0);
+  // 그리고 **사실과 처방이 둘 다 보고에 남는다** — 하나만 남기면 사용자가 할 일을 모른다.
+  assert.match(result.summary, /길이를 넘어/);
+  assert.match(result.summary, /더 짧은 경로로/);
+});
+
+/**
+ * **잠김은 재시도한다.** 다른 프로세스가 놓을 수 있으므로 값어치가 있고, 이 검사가 없으면
+ * 위 검사가 "모든 판정에서 즉시 끝낸다"로 바뀌어도 통과한다.
+ */
+test("잠긴 파일은 상한까지 재시도한다", async () => {
+  const locked = {
+    status: "error" as const,
+    error: "다른 프로세스가 사용 중",
+    fileFailure: {
+      kind: "locked" as const,
+      fact: "다른 프로세스가 이 파일을 열고 있어 쓰지 못했습니다: src/app.ts",
+      tryThis: "편집기를 닫고 다시 시도하세요.",
+      retryable: true,
+    },
+  };
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }], toolResults: [locked, locked, locked] },
+    { defaultPatch: VALID_PATCH },
+    { policy: { limits: { toolRetries: 2 } as never } }
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.failureReason, "tool_retry_exhausted");
+  assert.equal(host.toolRequests.filter((r) => r.tool === "apply_patch").length, 3);
+});
+
 test("공급자 타임아웃은 재시도 상한 후 provider_retry_exhausted가 된다", async () => {
   const { orchestrator } = build(
     { verifyResults: [{ overall: "pass" }] },

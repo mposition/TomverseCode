@@ -314,6 +314,14 @@ export type FailureReason =
   | "revise_exhausted"
   | "fix_loop_exhausted"
   | "tool_retry_exhausted"
+  /**
+   * 도구가 실패했고 **재시도할 값어치가 없었다** (state-machine 65절).
+   *
+   * `tool_retry_exhausted`와 뭉개지 않는다: 저쪽은 여러 번 해 봤는데 안 된 것이고 이쪽은
+   * 한 번 만에 "다시 해도 같다"를 안 것이다. 사용자가 할 일도 다르다 — 저쪽은 대개
+   * 기다리거나 다시 돌리면 되고, 이쪽은 **먼저 무언가를 고쳐야 한다.**
+   */
+  | "tool_failed_permanently"
   | "provider_retry_exhausted"
   | "provider_config_error"
   | "app_restart_interrupted"

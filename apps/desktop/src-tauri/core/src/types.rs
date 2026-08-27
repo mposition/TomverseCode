@@ -165,6 +165,14 @@ pub struct ToolResult {
     /// 다시 생각해야 하고, 후자는 사람이 붙으면 그대로 진행된다.
     #[serde(rename = "denialKind", skip_serializing_if = "Option::is_none")]
     pub denial_kind: Option<DenialKind>,
+    /// `status == Error`일 때 **왜 실패했는가** — 우리가 아는 만큼만 (state-machine 65절).
+    ///
+    /// `denial_kind`와 같은 이유로 값이다: OS의 문장은 로케일에 따라 번역되고, 그것을
+    /// 파싱하게 만들면 한국어 Windows에서만 분기가 사라진다.
+    ///
+    /// 없으면 그 실패에 대해 **더 말할 것이 없다**는 뜻이다. "문제가 없다"가 아니다.
+    #[serde(rename = "fileFailure", skip_serializing_if = "Option::is_none")]
+    pub file_failure: Option<crate::file_errors::FileFailure>,
 }
 
 /// `Denied`의 종류. 문자열이 아니라 값이라 소비자가 분기할 수 있다.

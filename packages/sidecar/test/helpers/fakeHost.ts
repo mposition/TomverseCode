@@ -1,4 +1,4 @@
-import type { VerificationReport, VerificationStatus, VerificationKind, ToolRequest } from "@tomverse/protocol";
+import type { VerificationReport, VerificationStatus, VerificationKind, ToolRequest, ToolResult } from "@tomverse/protocol";
 import type { NdjsonTransport } from "../../src/ipc/transport.js";
 import { classifyFile } from "../../src/context/exclude.js";
 
@@ -85,6 +85,8 @@ export interface FakeHostOptions {
     policyDecision?: string;
     /** 거부가 **요청의 모양** 때문인가 (state-machine 41.4절). Rust가 정하는 값이다. */
     redraftable?: boolean;
+    /** 왜 실패했는가 (state-machine 65절). **Rust가 정하는 값이다** — 여기서 다시 판정하지 않는다. */
+    fileFailure?: ToolResult["fileFailure"];
   }[];
   /**
    * 계획 프리플라이트 응답 override — 도구 이름별 (state-machine 42절).
@@ -394,6 +396,9 @@ export class FakeHost {
             error: stub.error ?? "fake failure",
             durationMs: 1,
             completedAt: new Date().toISOString(),
+            // **없으면 키를 두지 않는다.** `undefined`를 실으면 "판정이 없다"와 "판정이
+            // undefined다"가 같아 보이는데, 전자가 뜻하는 것은 "더 말할 것이 없다"이다.
+            ...(stub.fileFailure ? { fileFailure: stub.fileFailure } : {}),
           },
           policy: {
             decision: stub.policyDecision ?? (stub.status === "denied" ? "deny" : "auto_approve"),

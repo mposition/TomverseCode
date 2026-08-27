@@ -1039,6 +1039,7 @@ impl TaskHost {
             duration_ms: 0,
             completed_at: now_iso(),
             denial_kind: None,
+            file_failure: None,
         };
         let _ = self.append_event(
             &request.task_id,
@@ -2170,6 +2171,7 @@ impl CommandExecutor for HostExecutor<'_> {
                     duration_ms: 0,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 })
             }
             Err(message) => ToolResult {
@@ -2180,6 +2182,7 @@ impl CommandExecutor for HostExecutor<'_> {
                 duration_ms: 0,
                 completed_at: now_iso(),
                 denial_kind: None,
+                file_failure: None,
             },
         }
     }

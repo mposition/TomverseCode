@@ -13,6 +13,7 @@ use crate::cancel::CancellationToken;
 use crate::paths::WorkspaceRoot;
 use crate::policy::parse_run_command;
 use crate::proctree;
+use crate::tools::program::Platform;
 use crate::time::{elapsed_ms, now_iso};
 use crate::types::{
     Decision, DenialKind, FileMutationRecord, ImageRef, PolicyDecision, RunCommandArgs, ToolName, ToolRequest,
@@ -161,11 +162,43 @@ impl ToolRuntime {
                     duration_ms: elapsed_ms(start),
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 },
                 mutations: Vec::new(),
                 output_ref: None,
                 diff: None,
             },
+        }
+    }
+
+    /// 파일을 바꾸려다 실패했을 때 — **왜 실패했는지를 값으로 함께 남긴다**(65절).
+    ///
+    /// OS의 문장만 남기면 두 가지가 일어난다. 사용자에게는 도구가 고장 난 것으로 읽히고,
+    /// 오케스트레이터는 **재시도한다** — 경로가 길어서 실패한 쓰기도 상한만큼 다시 한다.
+    ///
+    /// 판정이 없으면(`None`) OS의 문장을 그대로 남긴다. 없는 처방을 지어내지 않는다.
+    fn write_failed(&self, request: &ToolRequest, start: Instant, target: &str, err: &std::io::Error) -> ToolOutcome {
+        let failure = crate::file_errors::diagnose(Platform::current(), target, err);
+        // **사실 문장은 판정이 있으면 그것을 쓴다.** OS 문장은 뒤에 붙여 남긴다 — 지우면
+        // 우리가 모르는 실패를 디버깅할 근거가 사라진다.
+        let message = match &failure {
+            Some(f) => format!("{} ({err})", f.fact),
+            None => err.to_string(),
+        };
+        ToolOutcome {
+            result: ToolResult {
+                request_id: request.request_id.clone(),
+                status: ToolStatus::Error,
+                output: None,
+                error: Some(message),
+                duration_ms: elapsed_ms(start),
+                completed_at: now_iso(),
+                denial_kind: None,
+                file_failure: failure,
+            },
+            mutations: Vec::new(),
+            output_ref: None,
+            diff: None,
         }
     }
 
@@ -179,6 +212,7 @@ impl ToolRuntime {
                 duration_ms: elapsed_ms(start),
                 completed_at: now_iso(),
                 denial_kind: Some(kind),
+                file_failure: None,
             },
             mutations: Vec::new(),
             output_ref: None,
@@ -196,6 +230,7 @@ impl ToolRuntime {
                 duration_ms: elapsed_ms(start),
                 completed_at: now_iso(),
                 denial_kind: None,
+                file_failure: None,
             },
             mutations: Vec::new(),
             output_ref: None,
@@ -441,9 +476,13 @@ impl ToolRuntime {
         let pre_image = self.capture_pre_image(request, safe.relative(), existed, &before)?;
 
         if let Some(parent) = safe.absolute().parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(self.write_failed(request, start, safe.relative(), &e));
+            }
         }
-        std::fs::write(safe.absolute(), content).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::write(safe.absolute(), content) {
+            return Ok(self.write_failed(request, start, safe.relative(), &e));
+        }
 
         let post = self
             .artifacts
@@ -510,9 +549,13 @@ impl ToolRuntime {
         let pre_image = self.capture_pre_image(request, safe.relative(), existed, &before)?;
 
         if let Some(parent) = safe.absolute().parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(self.write_failed(request, start, safe.relative(), &e));
+            }
         }
-        std::fs::write(safe.absolute(), &after).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::write(safe.absolute(), &after) {
+            return Ok(self.write_failed(request, start, safe.relative(), &e));
+        }
 
         let post = self
             .artifacts
@@ -573,7 +616,9 @@ impl ToolRuntime {
             return Ok(self.cancelled(request, start, "취소 요청으로 파일 삭제를 수행하지 않음"));
         }
         let pre_image = self.capture_pre_image(request, safe.relative(), true, &before)?;
-        std::fs::remove_file(safe.absolute()).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::remove_file(safe.absolute()) {
+            return Ok(self.write_failed(request, start, safe.relative(), &e));
+        }
 
         let mutation = FileMutationRecord {
             request_id: request.request_id.clone(),
@@ -644,9 +689,14 @@ impl ToolRuntime {
         // pre-image는 **옮기기 전에** 잡는다. 옮긴 뒤에는 원본이 없다.
         let from_pre = self.capture_pre_image(request, from_safe.relative(), true, &before)?;
         if let Some(parent) = to_safe.absolute().parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Ok(self.write_failed(request, start, to_safe.relative(), &e));
+            }
         }
-        std::fs::rename(from_safe.absolute(), to_safe.absolute()).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::rename(from_safe.absolute(), to_safe.absolute()) {
+            // **대상이 아니라 원본을 지목한다.** 이동에서 잠기는 것은 대개 열려 있는 원본이다.
+            return Ok(self.write_failed(request, start, from_safe.relative(), &e));
+        }
 
         // post-image도 남긴다 — 되돌리기가 "대상이 생겼다"를 지우려면 무엇이 생겼는지 알아야 한다.
         let post_stored = self
@@ -824,6 +874,7 @@ impl ToolRuntime {
                     duration_ms: elapsed_ms(start),
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 },
                 mutations: Vec::new(),
                 output_ref: None,
@@ -977,6 +1028,7 @@ impl ToolRuntime {
                 duration_ms: elapsed_ms(start),
                 completed_at: now_iso(),
                 denial_kind: None,
+                file_failure: None,
             },
             mutations: Vec::new(),
             output_ref,
@@ -1016,6 +1068,7 @@ impl ToolRuntime {
                 duration_ms: elapsed_ms(start),
                 completed_at: now_iso(),
                 denial_kind: None,
+                file_failure: None,
             },
             mutations: Vec::new(),
             output_ref,
@@ -1872,6 +1925,47 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["path"].as_str().unwrap(), "src/app.ts");
         assert_eq!(matches[0]["line"].as_u64().unwrap(), 2);
+    }
+
+    /// **판정이 도구까지 닿는가** — state-machine 65절.
+    ///
+    /// `file_errors.rs`의 단위 테스트는 판정 자체를 값으로 본다. 그런데 그 판정을 **도구가
+    /// 부르는지**는 거기서 알 수 없고, 실제로 그 배선을 지워도 아무 검사도 실패하지 않았다
+    /// (프로브로 확인). 그래서 여기서 실제 실패를 하나 만들어 끝에서 끝까지 본다.
+    ///
+    /// **이름 길이를 쓰는 이유**: 권한 실패는 root로 도는 환경에서 재현되지 않고(권한 비트를
+    /// 무시한다), 잠금은 이 플랫폼에 없다. `ENAMETOOLONG`은 둘 다 아니다.
+    #[test]
+    fn a_write_failure_carries_a_diagnosis_to_the_tool_result() {
+        let h = harness();
+        // 파일 이름 한 칸의 상한은 255바이트다. 경로 전체가 아니라 **한 칸**을 넘긴다 —
+        // 전체 길이 상한은 플랫폼마다 다르고 여기서는 재현이 불안정하다.
+        let long_name = "z".repeat(300);
+        let out = h.run(&req(
+            ToolName::CreateFile,
+            json!({ "path": format!("src/{long_name}.ts"), "content": "x" }),
+        ));
+
+        assert_eq!(out.result.status, ToolStatus::Error, "{:?}", out.result);
+        let failure = out.result.file_failure.as_ref().expect("판정이 붙지 않았습니다");
+        assert_eq!(failure.kind, crate::file_errors::FileFailureKind::PathTooLong, "{failure:?}");
+        assert!(!failure.retryable, "{failure:?}");
+        // **OS 문장을 지우지 않았다.** 우리가 모르는 실패를 나중에 디버깅할 근거다.
+        let message = out.result.error.clone().unwrap_or_default();
+        assert!(message.contains("길이를 넘어"), "{message}");
+        assert!(message.contains("os error"), "OS 문장이 사라졌습니다: {message}");
+    }
+
+    /// 그리고 **성공한 쓰기에는 판정이 붙지 않는다** — 붙으면 위 검사가 언제나 통과한다.
+    #[test]
+    fn a_successful_write_carries_no_diagnosis() {
+        let h = harness();
+        let out = h.run(&req(
+            ToolName::CreateFile,
+            json!({ "path": "src/fine.ts", "content": "x" }),
+        ));
+        assert_eq!(out.result.status, ToolStatus::Ok, "{:?}", out.result);
+        assert!(out.result.file_failure.is_none(), "{:?}", out.result.file_failure);
     }
 
     #[test]

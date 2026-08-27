@@ -298,6 +298,7 @@ mod tests {
                     duration_ms: 5,
                     completed_at: "2026-01-01T00:01:00Z".into(),
                     denial_kind: None,
+                    file_failure: None,
                 },
                 output_ref.as_deref(),
             )
