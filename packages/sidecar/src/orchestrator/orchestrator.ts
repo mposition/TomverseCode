@@ -47,6 +47,7 @@ import { ModelRegistry, providerKindOf } from "../routing/registry.js";
 import { Router, RoutingError, type RouterOptions } from "../routing/router.js";
 import { ToolBridge } from "../tools/bridge.js";
 import { buildDigest } from "../verify/digest.js";
+import { snapshotPayload } from "./snapshotPayload.js";
 import { digestSectionSizes } from "../providers/prompts.js";
 import { canonicalText, contrastDrafts, fieldLabel, planQuestionRound } from "./contrast.js";
 import {
@@ -508,7 +509,7 @@ export class Orchestrator {
     if (this.input.mcpTools) {
       this.snapshot.mcpTools = this.input.mcpTools;
     }
-    await this.emit("SNAPSHOT_CREATED", this.snapshotPayload(this.snapshot));
+    await this.emit("SNAPSHOT_CREATED", snapshotPayload(this.snapshot));
 
     // ---- 질문이면 여기서 갈라진다 (state-machine 51절) ----
     //
@@ -2867,47 +2868,6 @@ export class Orchestrator {
    * 스냅샷 이벤트를 읽는다), 스냅샷을 내는 자리가 늘 때마다 필드를 손으로 맞추면 어느
    * 자리에서는 **나간 것을 나가지 않았다고** 말하게 된다.
    */
-  private snapshotPayload(snapshot: WorkspaceSnapshot): Record<string, unknown> {
-    return {
-      snapshotId: snapshot.snapshotId,
-      gitBranch: snapshot.gitBranch,
-      gitDirty: snapshot.gitDirty,
-      // **커밋되지 않은 변경 요약도 프롬프트에 실린다**(`renderSnapshot`의 Repository state).
-      // 이걸 이벤트에 넣지 않으면 전송 기록이 그것을 말할 수 없고, 화면은 "선정된 파일만
-      // 나갔다"로 읽힌다 — 이 요약에는 선정되지 않은 파일의 경로도 들어간다(7.2절).
-      gitDiffSummary: snapshot.gitDiffSummary ?? null,
-      // 스킬 지시문도 프롬프트에 실려 나간다 — 전송 집계가 세야 한다(7.2절).
-      skill: snapshot.skill ?? null,
-      // 앞선 태스크의 판정이 이 태스크의 프롬프트로 넘어간다는 사실도 마찬가지다(27.3절).
-      sessionMemory: snapshot.sessionMemory ?? null,
-      // MCP 도구 목록과 그 응답도 나간다(31.4절). 응답은 **외부 서버가 준 텍스트**라
-      // 특히 세야 한다 — 우리가 만든 것도 사용자가 쓴 것도 아니다.
-      mcpTools: snapshot.mcpTools ?? null,
-      mcpResults: snapshot.mcpResults ?? null,
-      // 어떤 파일이 어느 공급자에 갔는지 표시하기 위한 데이터 (README "데이터 전송 투명성").
-      relevantFiles: snapshot.relevantFiles.map((f) => ({
-        path: f.path,
-        reason: f.reason,
-        reasonDetail: f.reasonDetail,
-        truncated: f.truncated,
-        // **재는 장치의 값이 기록에 닿아야 한다**(state-machine 61절).
-        //
-        // context-engine 15.3절이 이 값을 만든 이유는 "앵커 분포를 잰 적이 없다"였는데,
-        // 스냅샷에만 있고 이벤트에 없으면 **여전히 잰 적이 없다.** 값이 메모리에서 태어나
-        // 기록에 닿지 못한 채 사라지는 자리이고, 16.1절이 본 것("값은 있는데 읽는 사람이
-        // 없다")보다 한 단계 앞이다.
-        //
-        // 없으면 키를 두지 않는다 — 잘리지 않은 파일에 `null`을 실으면 "가른 결과가 없다"와
-        // "가를 것이 없었다"가 같은 모양이 된다.
-        ...(f.anchorCoverage ? { anchorCoverage: f.anchorCoverage } : {}),
-      })),
-      excludedNotes: snapshot.excludedNotes ?? [],
-      // **파일이 아닌 노트는 따로 나른다**(context-engine 17절). 한 배열에 실으면 화면의
-      // "이름만 나간 파일" 목록에 파일이 아닌 것이 섞이고, 개수도 파일 수가 아니게 된다.
-      coverageNotes: snapshot.coverageNotes ?? [],
-      projectMeta: snapshot.projectMeta,
-    };
-  }
 
   // ---- MCP 도구 라운드 (state-machine 31절) ----
 
@@ -3064,7 +3024,7 @@ export class Orchestrator {
       },
       createdAt: new Date().toISOString(),
     };
-    await this.emit("SNAPSHOT_CREATED", this.snapshotPayload(this.snapshot));
+    await this.emit("SNAPSHOT_CREATED", snapshotPayload(this.snapshot));
   }
 
   private async snapshotForPrompt(): Promise<WorkspaceSnapshot> {
@@ -3088,7 +3048,7 @@ export class Orchestrator {
       // 새 스냅샷은 새 전송이다. 전송 기록이 마지막 `SNAPSHOT_CREATED`를 읽으므로
       // (core/src/transmission.rs), 이 이벤트를 빠뜨리면 화면은 옛 목록을 계속 보여준다.
       await this.emit("SNAPSHOT_CREATED", {
-        ...this.snapshotPayload(refreshed.snapshot),
+        ...snapshotPayload(refreshed.snapshot),
         // 무엇이 달라져서 다시 만들었는지. 이게 없으면 같은 태스크에 SNAPSHOT_CREATED가
         // 여러 개 남은 이유를 로그만 보고는 알 수 없다.
         refreshedAfterMutation: {

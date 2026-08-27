@@ -11,7 +11,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/index.js",
     "//test": "이 Node 버전은 `node --test <디렉터리>`가 동작하지 않는다(CLAUDE.md 함정 기록) — 파일 경로를 직접 나열한다.",
-    "test": "npm run build && node --test dist/test/boundary.test.js dist/test/cancellation.test.js dist/test/machine.test.js dist/test/triage.test.js dist/test/providers.test.js dist/test/router.test.js dist/test/context.test.js dist/test/planner.test.js dist/test/orchestrator.test.js dist/test/acceptance.test.js dist/test/contrast.test.js dist/test/disagreement.test.js dist/test/criteria.test.js dist/test/commit.test.js dist/test/budget.test.js dist/test/conformance.test.js dist/test/transmissionClaim.test.js dist/test/contextClaim.test.js dist/test/followUp.test.js dist/test/terminalPhases.test.js dist/test/hookPhases.test.js",
+    "test": "npm run build && node --test dist/test/boundary.test.js dist/test/cancellation.test.js dist/test/machine.test.js dist/test/triage.test.js dist/test/providers.test.js dist/test/router.test.js dist/test/context.test.js dist/test/planner.test.js dist/test/orchestrator.test.js dist/test/acceptance.test.js dist/test/contrast.test.js dist/test/disagreement.test.js dist/test/criteria.test.js dist/test/commit.test.js dist/test/budget.test.js dist/test/conformance.test.js dist/test/transmissionClaim.test.js dist/test/contextClaim.test.js dist/test/followUp.test.js dist/test/terminalPhases.test.js dist/test/hookPhases.test.js dist/test/snapshotRecord.test.js",
     "//test:e2e": "실제 tomverse-host 바이너리를 요구한다: cargo build --manifest-path ../../apps/desktop/src-tauri/core/Cargo.toml",
     "test:e2e": "npm run build && node --test dist/test/e2e.test.js dist/test/e2e-persistence.test.js",
     "test:all": "npm run test && npm run test:e2e"

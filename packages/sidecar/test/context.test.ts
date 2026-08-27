@@ -27,6 +27,7 @@ import type { NdjsonTransport } from "../src/ipc/transport.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
 import { extractFileReferences } from "../src/verify/digest.js";
+import { snapshotPayload } from "../src/orchestrator/snapshotPayload.js";
 import { buildFixPrompt, digestSectionSizes, renderSnapshot } from "../src/providers/prompts.js";
 
 // ---- 제외 규칙 (secret / binary / 대용량) ----
@@ -1378,16 +1379,15 @@ test("앵커 덮개가 SNAPSHOT_CREATED에 실린다", async () => {
   const ledger = snapshot.relevantFiles.find((f) => f.path === "src/ledger.ts");
   assert.ok(ledger?.anchorCoverage, "스냅샷에 앵커 덮개가 없습니다 — 이 검사가 공허합니다");
 
-  // 그리고 그 값이 **이벤트 payload 모양**으로 살아남아야 한다. payload를 만드는 코드는
-  // 오케스트레이터에 있으므로 여기서는 그 모양을 소스에서 확인한다.
-  const orchestrator = readFileSync(
-    path.resolve(__dirname, "..", "..", "..", "..", "packages", "sidecar", "src", "orchestrator", "orchestrator.ts"),
-    "utf8"
-  );
-  const payloadAt = orchestrator.indexOf("private snapshotPayload(");
-  assert.notEqual(payloadAt, -1, "snapshotPayload를 찾지 못했습니다");
-  const body = orchestrator.slice(payloadAt, orchestrator.indexOf("\n  }", payloadAt));
-  assert.ok(body.includes("anchorCoverage"), "SNAPSHOT_CREATED payload가 앵커 덮개를 싣지 않습니다");
+  // 그리고 그 값이 **이벤트 payload로 살아남아야 한다.**
+  //
+  // 종전에는 이것을 오케스트레이터 소스에서 문자열로 확인했다 — payload를 만드는 코드가
+  // private 메서드라 부를 수 없었기 때문이다. 소스 검사는 **글자가 남아 있는지**만 안다.
+  // 68절이 그 함수를 값으로 부를 수 있는 자리로 옮겼으므로 이제 실제 값을 본다.
+  const files = snapshotPayload(snapshot).relevantFiles as { path: string; anchorCoverage?: unknown }[];
+  const recorded = files.find((f) => f.path === "src/ledger.ts");
+  assert.ok(recorded?.anchorCoverage, "SNAPSHOT_CREATED payload가 앵커 덮개를 싣지 않습니다");
+  assert.deepEqual(recorded.anchorCoverage, ledger.anchorCoverage, "실린 값이 스냅샷의 것과 다릅니다");
 });
 
 // ---- 검증 출력의 크기 (state-machine 67절) ----
