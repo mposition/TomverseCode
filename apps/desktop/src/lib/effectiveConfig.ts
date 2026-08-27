@@ -147,3 +147,65 @@ export function describeDeadline(config: PinnedConfig): string {
     ? `시한 ${minutes}분 — 지나면 멈추고, 사용자 취소와 다른 사유로 기록됩니다.`
     : `시한 ${ms}ms — 지나면 멈추고, 사용자 취소와 다른 사유로 기록됩니다.`;
 }
+
+/**
+ * 시작 이후에 이 요약의 **뜻을 바꾼 일** — state-machine 37.8절, ui-wireframes 3.23절.
+ *
+ * # 값을 고쳐 쓰지 않는다
+ *
+ * 37.8절이 이 항목을 미뤄 둔 이유가 여기 있다: *"합치려면 어떤 이벤트가 이 요약의 어느 줄을
+ * 바꾸는지를 정해야 하고, 그 목록이 틀리면 화면이 다시 자신 있게 틀린 답을 한다."*
+ *
+ * 그래서 **합치지 않고 붙인다.** 스위치는 여전히 켜져 있다 — 바뀐 것은 "그 스위치가 답할 수
+ * 있는가"이지 스위치 자체가 아니다. 값을 "꺼짐"으로 고쳐 쓰면 새 거짓말이 하나 생긴다:
+ * 사용자는 자기가 끈 적이 없고, 매니페스트가 안정되면 같은 설정이 다시 답한다.
+ *
+ * # 어느 줄인지는 **이벤트가 말한다**
+ *
+ * 손으로 적은 이벤트→줄 표가 아니다. `PRE_APPROVAL_WITHDRAWN`은 `wouldHaveBeen`으로 **무엇이
+ * 답했을 것인가**를 담고 있고, 그 값이 곧 줄이다. 표를 적으면 그 표가 낡는다.
+ *
+ * 그리고 **모르는 값을 아는 줄에 붙이지 않는다.** 새 사전 승인 종류가 생기면 어느 줄인지
+ * 우리가 모르므로, 아무 데나 붙이는 대신 그 사실을 따로 말한다.
+ */
+export type PinnedChangeTarget = "verification" | "hooks" | "unknown";
+
+export interface PinnedChange {
+  target: PinnedChangeTarget;
+  /** 몇 번 일어났는가. **한 번과 여러 번은 다른 사실이다.** */
+  count: number;
+  note: string;
+}
+
+/** `wouldHaveBeen` → 이 요약의 어느 줄인가. 모르면 `unknown`이다. */
+function targetOf(wouldHaveBeen: unknown): PinnedChangeTarget {
+  if (wouldHaveBeen === "APPROVAL_AUTO_VERIFICATION") return "verification";
+  if (wouldHaveBeen === "APPROVAL_REGISTERED_HOOK") return "hooks";
+  return "unknown";
+}
+
+const NOTE: Record<PinnedChangeTarget, (count: number) => string> = {
+  verification: (n) =>
+    `이 스위치는 그대로지만, 시작 이후 매니페스트가 바뀌어 **고정된 검증 명령이 자동 승인을 답하지 못한 일이 ${n}번** 있었습니다. ` +
+    "그 요청은 평소 승인 경로로 돌아갔고, 무인 실행이면 거기서 멈춥니다.",
+  hooks: (n) =>
+    `등록은 그대로지만, 시작 이후 매니페스트가 바뀌어 **등록된 훅이 사전 승인을 답하지 못한 일이 ${n}번** 있었습니다. ` +
+    "그 실행은 평소 승인 경로로 돌아갔고, 무인 실행이면 거기서 멈춥니다.",
+  unknown: (n) =>
+    `시작 이후 사전 승인이 철회된 일이 ${n}번 있었는데, **어느 줄에 해당하는지 우리가 알지 못합니다** — ` +
+    "이벤트 로그에서 `PRE_APPROVAL_WITHDRAWN`을 보세요.",
+};
+
+export function pinnedChanges(events: readonly { type: string; payload: Record<string, unknown> }[]): PinnedChange[] {
+  const counts = new Map<PinnedChangeTarget, number>();
+  for (const event of events) {
+    if (event.type !== "PRE_APPROVAL_WITHDRAWN") continue;
+    const target = targetOf(event.payload.wouldHaveBeen);
+    counts.set(target, (counts.get(target) ?? 0) + 1);
+  }
+  // 순서를 고정한다 — 화면이 실행마다 다른 순서로 그리면 같은 사실이 달라 보인다.
+  const order: PinnedChangeTarget[] = ["verification", "hooks", "unknown"];
+  return order
+    .filter((target) => counts.has(target))
+    .map((target) => ({ target, count: counts.get(target) as number, note: NOTE[target](counts.get(target) as number) }));
+}

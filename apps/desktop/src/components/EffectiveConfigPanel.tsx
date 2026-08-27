@@ -4,6 +4,7 @@ import {
   describeIsolation,
   describeMcpServer,
   describeVerificationPin,
+  pinnedChanges,
   switchLines,
   type PinnedConfig,
 } from "../lib/effectiveConfig";
@@ -39,19 +40,30 @@ export function EffectiveConfigPanel({ events }: { events: ConfigEvent[] }) {
   const skill = config.skill;
   const hooks = config.hooks ?? [];
   const servers = config.mcpServers ?? [];
+  // **시작 이후의 변화**(37.8절). 값을 고쳐 쓰지 않고 해당 줄 옆에 붙인다 — 스위치는 여전히
+  // 켜져 있고, 바뀐 것은 "그 스위치가 답할 수 있는가"다.
+  const changes = pinnedChanges(events);
+  const changeFor = (target: "verification" | "hooks") => changes.find((c) => c.target === target);
+  const unknownChange = changes.find((c) => c.target === "unknown");
 
   return (
     <div className="panel">
       <h3>이 작업에 적용된 것</h3>
       <p className="muted small">
         태스크를 시작할 때 <strong>고정된</strong> 값입니다 — 화면에 입력한 값이 아니라 실제로 적용된 값이고,
-        이후의 변화(사전 승인 철회 같은 것)는 아래 이벤트 로그에 따로 남습니다.
+        이후의 변화 중 <strong>이 값들의 뜻을 바꾼 것</strong>은 해당 줄 아래에 붙였고, 나머지는 아래 이벤트
+        로그에 남습니다.
       </p>
 
       <ul className="transmission-files">
         {switchLines(config).map((line) => (
           <li key={line.label} className="small">
             {line.label}: <strong>{line.value}</strong>
+            {/* **값을 고쳐 쓰지 않는다.** 사용자가 끈 적이 없으므로 "꺼짐"으로 바꾸면
+                새 거짓말이 하나 생긴다 — 바뀐 것은 스위치가 아니라 그것이 답할 수 있는가다. */}
+            {line.label === "검증 명령 자동 승인" && changeFor("verification") && (
+              <div className="warn small">{changeFor("verification")!.note}</div>
+            )}
           </li>
         ))}
       </ul>
@@ -73,6 +85,7 @@ export function EffectiveConfigPanel({ events }: { events: ConfigEvent[] }) {
           ? "등록된 훅이 없습니다."
           : `등록된 훅 ${hooks.length}개 — 실패해도 작업의 판정을 바꾸지 않습니다.`}
       </p>
+      {changeFor("hooks") && <p className="warn small">{changeFor("hooks")!.note}</p>}
       {hooks.map((hook, index) => (
         <p key={`${hook.phase}-${index}`} className="muted small">
           {hook.phase}: {hook.command}
@@ -89,6 +102,10 @@ export function EffectiveConfigPanel({ events }: { events: ConfigEvent[] }) {
           {describeMcpServer(server)}
         </p>
       ))}
+
+      {/* **모르는 것을 아는 줄에 붙이지 않는다.** 새 사전 승인 종류가 생기면 어느 줄인지
+          우리가 모르므로, 아무 데나 붙이는 대신 그 사실을 따로 말한다. */}
+      {unknownChange && <p className="warn small">{unknownChange.note}</p>}
     </div>
   );
 }
