@@ -1229,6 +1229,10 @@ fn run_task(
         "TOMVERSE_EXECUTOR_MODEL",
         "TOMVERSE_REVIEWER_MODEL",
         "TOMVERSE_ALLOW_ORG_VERIFIED",
+        // 공급자 호출 1회 타임아웃(ms). **`--timeout-secs`와 다른 값이다** — 저쪽은 호스트가
+        // 기다리기를 그만두는 시각이고 이건 한 번의 provider 호출에 거는 상한이다. 둘을
+        // 하나로 묶으면 "응답을 끝까지 받겠다"와 "이 태스크를 여기서 접겠다"가 같은 손잡이가 된다.
+        "TOMVERSE_PROVIDER_TIMEOUT_MS",
     ] {
         if let Ok(value) = std::env::var(key) {
             env.push((key.to_string(), value));

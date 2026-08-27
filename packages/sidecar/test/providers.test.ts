@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import { ValidationError, validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
 import { FakeProviderAdapter } from "../src/providers/fake.js";
 import { normalizeProviderError } from "../src/providers/errors.js";
-import { backoffDelayMs, callWithRetry, DEFAULT_RETRY_POLICY, ProviderCallFailed, withTimeout } from "../src/providers/retry.js";
-import { OpenAIAdapter } from "../src/providers/openai.js";
+import { attemptFacts, backoffDelayMs, callWithRetry, DEFAULT_RETRY_POLICY, ProviderCallFailed, withTimeout } from "../src/providers/retry.js";
+import { DRAFT_SCHEMA_STRICT, decodeMcpArguments, OpenAIAdapter } from "../src/providers/openai.js";
 import { AnthropicAdapter } from "../src/providers/anthropic.js";
+import { ProviderCallFailure, validateReceived } from "../src/providers/types.js";
 import {
   buildDraftPrompt,
   buildFixPrompt,
@@ -743,4 +744,191 @@ test("가르지 못했으면 프롬프트가 새 실패를 말하지 않는다",
     },
   });
   assert.ok(!prompt.includes("NEWLY failing"), prompt);
+});
+
+// ---- OpenAI strict structured output ----
+//
+// 이 검사가 실제 호출이 아니라 **스키마 자체**를 보는 이유: mock transport는 스키마를
+// 검증하지 않으므로 어떤 형태든 통과시킨다. 그래서 이 경로는 실제 API에 대해 한 번도 돌지
+// 않은 채 400을 내는 상태로 남아 있었고, 가설 게이트의 첫 유료 호출이 되어서야 드러났다.
+// 규칙을 여기 적어두면 무료로, 그리고 다음 사람이 스키마를 건드릴 때 바로 잡힌다.
+
+/** OpenAI strict 모드의 요구사항을 스키마 트리 전체에 대해 확인한다. */
+function strictViolations(node: unknown, path: string, out: string[] = []): string[] {
+  if (node === null || typeof node !== "object") return out;
+  const schema = node as Record<string, any>;
+
+  if (schema.type === "object") {
+    if (schema.additionalProperties !== false) {
+      out.push(`${path}: additionalProperties가 false여야 합니다`);
+    }
+    const properties = schema.properties ?? {};
+    const names = Object.keys(properties);
+    if (names.length === 0) {
+      // properties가 없는 자유 객체는 strict로 표현할 수 없다 — 400의 원인이었던 형태다.
+      out.push(`${path}: properties 없는 자유 객체는 strict 모드로 표현할 수 없습니다`);
+    }
+    const required = new Set<string>(schema.required ?? []);
+    for (const name of names) {
+      if (!required.has(name)) out.push(`${path}.${name}: strict 모드는 모든 속성이 required여야 합니다`);
+      strictViolations(properties[name], `${path}.${name}`, out);
+    }
+  }
+  if (schema.type === "array") strictViolations(schema.items, `${path}[]`, out);
+  return out;
+}
+
+test("strict로 보내는 스키마가 OpenAI의 요구를 만족한다", () => {
+  assert.deepEqual(strictViolations(DRAFT_SCHEMA_STRICT, "draft_proposal"), []);
+});
+
+test("고치기 전의 DRAFT_SCHEMA는 strict로 보낼 수 없다 — 검사가 공허하지 않다는 증거", () => {
+  // 이 단언이 없으면 위 테스트는 "검사기가 아무것도 안 잡는다"로도 통과할 수 있다.
+  const violations = strictViolations(DRAFT_SCHEMA, "draft_proposal");
+  assert.ok(
+    violations.some((v) => v.includes("mcpCalls[].arguments")),
+    `실제 400의 원인을 검사기가 잡지 못합니다: ${JSON.stringify(violations)}`
+  );
+});
+
+test("strict 때문에 문자열로 온 mcp arguments를 객체로 되돌린다", () => {
+  const decoded = decodeMcpArguments({
+    patch: "",
+    mcpCalls: [{ server: "s", tool: "t", arguments: "{\"path\":\"src/a.ts\"}", reason: "r" }],
+  }) as { mcpCalls: { arguments: unknown }[] };
+  assert.deepEqual(decoded.mcpCalls[0]!.arguments, { path: "src/a.ts" });
+
+  // 빈 인자도 정상이다 — 인자가 없는 도구가 있다.
+  const empty = decodeMcpArguments({ mcpCalls: [{ server: "s", tool: "t", arguments: "{}", reason: "r" }] }) as {
+    mcpCalls: { arguments: unknown }[];
+  };
+  assert.deepEqual(empty.mcpCalls[0]!.arguments, {});
+
+  // 비어 있는 배열이 정상 경로다 — 손대지 않는다.
+  assert.deepEqual(decodeMcpArguments({ mcpCalls: [] }), { mcpCalls: [] });
+});
+
+test("깨진 JSON은 원인을 가리키는 오류가 된다", () => {
+  // 문자열을 그대로 흘려보내면 검증기가 "expected an object"라고만 말해 원인과 먼 곳을 가리킨다.
+  assert.throws(
+    () => decodeMcpArguments({ mcpCalls: [{ server: "s", tool: "t", arguments: "{not json", reason: "r" }] }),
+    (error: unknown) => error instanceof ValidationError && String(error).includes("파싱할 수 없습니다")
+  );
+  // 배열은 이름 있는 인자가 아니다.
+  assert.throws(
+    () => decodeMcpArguments({ mcpCalls: [{ server: "s", tool: "t", arguments: "[1,2]", reason: "r" }] }),
+    (error: unknown) => error instanceof ValidationError
+  );
+});
+
+test("타임아웃은 취소와 구별되어 기록된다", () => {
+  // 타임아웃도 구현상 abort지만 두 사실은 다르다: 취소는 **사용자가 그만두게 한 것**이고
+  // 타임아웃은 **우리가 정한 실행 예산을 넘긴 것**이다. 순서가 뒤바뀌어 있어서 모든
+  // 타임아웃이 cancelled로 기록됐고, 그러면 어느 쪽도 셀 수 없다.
+  const timeout = new Error("공급자 호출이 120000ms 후 타임아웃됨");
+  timeout.name = "TimeoutError";
+  assert.equal(normalizeProviderError(timeout).kind, "timeout");
+
+  // SDK가 내는 이름도 같은 사실이다.
+  const sdk = new Error("connection timed out");
+  sdk.name = "APIConnectionTimeoutError";
+  assert.equal(normalizeProviderError(sdk).kind, "timeout");
+
+  // 진짜 취소는 그대로 cancelled다 — 구분이 한쪽으로 무너지면 안 된다.
+  const abort = new Error("The operation was aborted");
+  abort.name = "AbortError";
+  assert.equal(normalizeProviderError(abort).kind, "cancelled");
+});
+
+test("응답을 받은 뒤의 검증 실패는 usage를 잃지 않는다", () => {
+  // 실측(가설 게이트 P1, 2026-08-27): 검수 호출이 출력 상한까지 달리다 잘려 구조화 출력이
+  // 깨졌다. 응답도 usage도 있었는데 검증이 던지면서 전부 사라졌고, 비용을 계산할 수 없어
+  // 예약이 미해결로 남아 **96건짜리 실행이 7건에서 멈췄다.**
+  const received = {
+    usage: { inputTokens: 2500, outputTokens: 16000 },
+    latencyMs: 171_000,
+    meta: {
+      requestedModelId: "claude-sonnet-5",
+      providerReportedModelId: "claude-sonnet-5",
+      dispatchState: "response_received_with_usage" as const,
+    },
+  };
+
+  let thrown: unknown;
+  try {
+    validateReceived(() => {
+      throw new ValidationError("reviewDecision.verdict", "expected one of ACCEPT/REVISE/REJECT");
+    }, received);
+  } catch (error) {
+    thrown = error;
+  }
+
+  const failure = thrown as InstanceType<typeof ProviderCallFailure>;
+  assert.equal(failure.name, "ProviderCallFailure");
+  // **이 세 가지가 요점이다** — 없으면 과금된 호출이 "안 썼다"나 "모른다"가 된다.
+  assert.deepEqual(failure.usage, received.usage);
+  assert.equal(failure.dispatchState, "response_received_with_usage");
+  assert.equal(failure.classification.kind, "schema_violation");
+  assert.equal(failure.providerReportedModelId, "claude-sonnet-5");
+});
+
+test("성공한 검증은 그대로 통과시킨다", () => {
+  const received = {
+    usage: { inputTokens: 1, outputTokens: 2 },
+    latencyMs: 3,
+    meta: { requestedModelId: "m", dispatchState: "response_received_with_usage" as const },
+  };
+  assert.equal(validateReceived(() => 42, received), 42);
+});
+
+test("이미 dispatch 사실을 아는 오류는 다시 감싸지 않는다", () => {
+  // 감싸면 어댑터가 확보한 분류(예: tool_use 블록 없음)가 덮인다.
+  const original = new ProviderCallFailure({
+    message: "tool_use 블록 없음",
+    dispatchState: "response_received_with_usage",
+    classification: { kind: "schema_violation", message: "없음", status: 400, retryable: false },
+    usage: { inputTokens: 5, outputTokens: 6 },
+  });
+  const received = {
+    usage: { inputTokens: 0, outputTokens: 0 },
+    latencyMs: 1,
+    meta: { requestedModelId: "m", dispatchState: "response_received_with_usage" as const },
+  };
+  assert.throws(
+    () => validateReceived(() => { throw original; }, received),
+    (error: unknown) => error === original
+  );
+});
+
+test("429·401·403이 아닌 4xx는 auth가 아니라 rejected다", () => {
+  // 실측(게이트 P1, 2026-08-27): gpt-4.1로 3회 성공한 뒤 4번째가 `auth`로 기록됐다.
+  // 같은 키로 직전 호출이 성공했는데 "인증 실패"가 뜨면 읽는 사람은 키를 의심하게 되고,
+  // 실제 원인(요청 형식·크기)과 정반대 방향을 본다.
+  const withStatus = (status: number, message = "bad request") =>
+    Object.assign(new Error(message), { status });
+
+  assert.equal(normalizeProviderError(withStatus(401)).kind, "auth");
+  assert.equal(normalizeProviderError(withStatus(403)).kind, "auth");
+  assert.equal(normalizeProviderError(withStatus(400)).kind, "rejected");
+  assert.equal(normalizeProviderError(withStatus(413, "payload too large")).kind, "rejected");
+  assert.equal(normalizeProviderError(withStatus(422)).kind, "rejected");
+
+  // 429와 5xx는 성질이 다르다 — 그대로 둔다.
+  assert.equal(normalizeProviderError(withStatus(429)).kind, "rate_limit");
+  assert.equal(normalizeProviderError(withStatus(503)).kind, "transient");
+
+  // 모델 미지원은 상태 코드보다 메시지가 정본이다 (gpt-5 사례).
+  assert.equal(normalizeProviderError(withStatus(404, "model_not_found")).kind, "model_unavailable");
+});
+
+test("반려는 dispatch 사실이 '나가지 않았다'로 확정된다", () => {
+  // 5xx·타임아웃과 반대 방향의 사실이다: 저쪽은 응답을 만든 뒤 실패했을 수 있어 모른다고
+  // 해야 하고, 이쪽은 만들기 전에 거절당했으므로 안다고 할 수 있다. 이 구별이 없으면
+  // 예약을 해제할 수 없고 그 한 건이 실행 전체를 멈춘다.
+  assert.equal(attemptFacts(0, new Error("bad request"), "rejected").dispatchState, "not_dispatched");
+
+  // 나머지는 여전히 보수적이다.
+  assert.equal(attemptFacts(0, new Error("boom"), "transient").dispatchState, "dispatched_no_response");
+  assert.equal(attemptFacts(0, new Error("boom"), "timeout").dispatchState, "dispatched_no_response");
+  assert.equal(attemptFacts(0, new Error("boom"), "auth").dispatchState, "dispatched_no_response");
 });

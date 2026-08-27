@@ -134,9 +134,38 @@ export interface OrchestratorDeps {
   triagePolicy?: TriagePolicy;
   retryPolicy?: RetryPolicy;
   contextEngine?: ContextEngine;
-  /** 공급자 호출 1회 타임아웃 */
+  /**
+   * 공급자 호출 1회 타임아웃. 생략하면 `DEFAULT_PROVIDER_TIMEOUT_MS`.
+   *
+   * **출력 예산에서 유도하지 않는다.** 유도하면 두 값이 한 손잡이가 되어, 완결성을 위해
+   * 기다리는 시간을 늘리려면 요청하는 출력도 함께 늘려야 한다. 둘은 다른 결정이다 —
+   * 출력 예산은 "얼마까지 받아줄 것인가"이고 타임아웃은 "얼마나 기다릴 것인가"다.
+   */
   providerTimeoutMs?: number;
 }
+
+/**
+ * 공급자 호출 1회 타임아웃의 기본값.
+ *
+ * # 이 값은 출력 예산과 독립이지만, 둘의 관계를 알고 정해야 한다
+ *
+ * 어댑터는 출력을 최대 `effectiveMaxOutputTokens`(현재 16,000)까지 요청한다. 그건 **상한이지
+ * 목표가 아니다** — 대부분의 응답은 그 근처에도 가지 않는다. 하지만 상한을 다 쓰는 응답이
+ * 나올 수 있고, 그때 이 타임아웃이 그보다 짧으면 그 호출은 **반드시** 죽는다.
+ *
+ * 실측(가설 게이트 P1, 2026-08-27): `claude-sonnet-5`의 출력 처리량은 57~97 tok/s였다.
+ * 최저값 기준으로 16,000토큰은 약 280초다. 종전 기본값 120초는 그 절반도 안 됐고, 실제로
+ * 검수 호출 하나가 정확히 120초에 취소됐다. 요청은 공급자에 도달해 **과금됐고**(청구 내역으로
+ * 확인), 우리는 응답을 받지 못했다 — 돈만 쓰고 결과가 없는 가장 나쁜 실패다.
+ *
+ * 그래서 기본값을 상한 응답이 완결될 수 있는 크기로 둔다. 대가는 **멈춘 호출이 실패로
+ * 확정되기까지 더 오래 걸린다**는 것이다. 그 대가를 감수하는 이유: 조용히 잘린 응답보다
+ * 느린 실패가 낫고, 취소된 호출도 과금은 그대로이기 때문이다.
+ *
+ * 제품이 응답 시간 SLA를 걸어야 하는 자리에서는 이 값을 **명시적으로 짧게 주입한다.**
+ * 기본값을 짧게 두고 그것을 SLA라고 부르지 않는다 — 그러면 SLA가 아니라 사고다.
+ */
+export const DEFAULT_PROVIDER_TIMEOUT_MS = 300_000;
 
 /**
  * 한 라운드에 실행하는 MCP 도구 호출의 최대 개수 (state-machine 32절).
@@ -590,9 +619,25 @@ export class Orchestrator {
       throw error;
     }
 
-    // reviewer가 드롭됐으면 활성 역할이 executor 하나이므로 사실상 simple 경로다.
-    // routing이 진실의 원천이므로 tier 변수를 다시 쓰지 않고 routing.activeRoles를 본다.
-    const crossVerified = this.routing.activeRoles.includes("reviewer");
+    /**
+     * **"검수자를 구하지 못했다"와 "태스크가 simple하다"는 다른 사실이다.**
+     *
+     * 예전에는 `routing.activeRoles.includes("reviewer")` 하나로 경로를 갈랐다. 그래서
+     * 공급자가 하나뿐이면 tier가 `standard`여도 파이프라인 전체가 `SINGLE_MODEL_FIX`로
+     * 바뀌었다 — 초안 프롬프트도, `DraftProposal`도, `DRAFT_RECEIVED`의 patch도 없어진다.
+     *
+     * 그건 CLAUDE.md 원칙 4의 읽기와 어긋난다. 거기 적힌 것은 **"검수 역할을 드롭한 뒤 그
+     * 사실을 사용자에게 표시한다"** 이지 다른 파이프라인으로 가라는 것이 아니다. 역할 하나가
+     * 빠진 것과 태스크의 성격이 바뀐 것은 같은 일이 아니며, 뭉개면 사용자가 키를 하나만
+     * 넣었다는 이유로 **받는 결과의 종류가 통째로 달라진다.**
+     *
+     * 가설 게이트가 이걸 드러냈다(2026-08-27 P0): 단독 arm이 초안을 만들지 않으므로
+     * 교차검증 arm이 재생할 초안이 없었고, 실험이 재려던 A↔C 비교가 성립하지 않았다.
+     * 측정이 막힌 것이 계기였지만 고치는 것은 제품의 동작이다.
+     *
+     * 이제 경로는 **tier가 정하고**, 검수자가 없으면 REVIEWING만 건너뛴다.
+     */
+    const crossVerified = tier.tier !== "simple";
 
     // ---- 실행 전 루프: DRAFTING→REVIEWING 또는 SINGLE_MODEL_FIX ----
     //
@@ -631,9 +676,15 @@ export class Orchestrator {
   /** DRAFTING → REVIEWING (교차검증 경로) */
   private async runCrossVerifiedPath(): Promise<PathOutcome> {
     const adapters = this.requireAdapters();
-    if (!adapters.reviewer) {
-      // 여기 도달하면 라우터의 불변식과 실제 어댑터가 어긋난 것이다 — 조용히 단일 모델로
-      // 넘어가지 않고 실패로 드러낸다. "검증한 척"보다 나쁜 것은 "검증했다고 착각하는 코드"다.
+    /**
+     * 라우터가 검수자를 **활성화했는가.** 어댑터 유무와 나눠 본다.
+     *
+     * - 활성화했는데 어댑터가 없다 → 불변식 위반. 조용히 넘어가지 않고 실패로 드러낸다.
+     *   "검증한 척"보다 나쁜 것은 "검증했다고 착각하는 코드"다.
+     * - 애초에 드롭했다 → 정상이다. 초안까지는 그대로 만들고 REVIEWING만 건너뛴다.
+     */
+    const reviewerActive = this.routing?.activeRoles.includes("reviewer") ?? false;
+    if (reviewerActive && !adapters.reviewer) {
       return {
         kind: "final",
         result: await this.finish(
@@ -737,8 +788,42 @@ export class Orchestrator {
     //
     // 별도 phase를 만들지 않는다(17.1절). 대조는 LLM 호출이 아니라 필드 비교 연산이라
     // 사용자에게 노출할 단계가 아니고, 실패할 수 있는 외부 경계도 없다.
-    const contrastOutcome = await this.contrastAndMaybeAsk(proposals);
-    if (contrastOutcome.kind !== "proceed") return contrastOutcome;
+    //
+    // **비교할 것이 하나뿐이면 대조를 돌리지 않는다.** 빈 리포트를 남기면 "대조했는데 쟁점이
+    // 없었다"로 읽히는데, 실제로는 시도조차 하지 않은 것이다(13.2절). 화면은 이벤트가 없는
+    // 것과 `contrasted: false`를 같은 결과로 다루므로(`contrastSummary.ts`) 잃는 정보도 없다.
+    if (proposals.length >= 2) {
+      const contrastOutcome = await this.contrastAndMaybeAsk(proposals);
+      if (contrastOutcome.kind !== "proceed") return contrastOutcome;
+    }
+
+    // ---- 검수자가 없으면 여기서 끝난다 ----
+    //
+    // 초안은 그대로 만들었고(프롬프트·`DraftProposal`·`DRAFT_RECEIVED` 전부 standard 경로의
+    // 것이다), 다만 검수할 사람이 없다. **그 사실을 로그에 남긴다** — 남기지 않으면 검수를
+    // 거친 실행과 구별되지 않고, "교차검증했다"는 주장이 조용히 근거를 잃는다(원칙 4).
+    if (!reviewerActive) {
+      const patch = proposal.patch ?? "";
+      const ops = fileOps(proposal);
+      await this.emit("PHASE_CHANGED_NOTE", {
+        phase: "REVIEWING",
+        skipped: true,
+        // 라우터가 남긴 사유를 그대로 옮긴다 — 여기서 다시 문장을 만들면 둘이 갈라진다.
+        reason:
+          this.routing?.appliedPolicies.find((p) => p.startsWith("reviewer_dropped")) ??
+          "reviewer_dropped",
+        reviewerIndependent: false,
+        note: "검수자를 배정하지 못해 초안을 그대로 최종 후보로 넘깁니다 (교차검증 없음).",
+      });
+      // ACCEPT 분기와 같은 조건이다. patch가 없어도 조작이 있으면 성립한다(45절).
+      if (patch.trim().length === 0 && !hasFileOps(ops)) {
+        return {
+          kind: "final",
+          result: await this.finish("failed", "초안에 적용할 변경이 없습니다.", "internal_invariant_violated"),
+        };
+      }
+      return { kind: "patch", patch, ops };
+    }
 
     // 13.3절 절충: 검수자가 살아남은 초안의 저자와 같은 모델이면 대조 참가자 중 다른 쪽으로
     // 바꿔 낀다. 자기가 쓴 안을 자기가 검수하지 않는다.
@@ -1872,7 +1957,7 @@ export class Orchestrator {
     options: { optionalSample?: boolean }
   ): Promise<{ kind: "value"; value: T } | { kind: "final"; result: FinalResult } | { kind: "skipped" }> {
     const retryPolicy = this.deps.retryPolicy ?? DEFAULT_RETRY_POLICY;
-    const timeoutMs = this.deps.providerTimeoutMs ?? 120_000;
+    const timeoutMs = this.deps.providerTimeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS;
 
     // **예약은 재시도마다 한다.** 재시도도 유료 호출이므로 한 번 예약하고 세 번 부르면
     // 상한이 최대 세 배까지 새어 나간다.
@@ -3119,6 +3204,9 @@ function providerFailureMessage(normalized: { kind: string; message: string }): 
   switch (normalized.kind) {
     case "auth":
       return `공급자 인증에 실패했습니다. API 키를 확인하세요. (${normalized.message})`;
+    // **키를 의심하게 만들지 않는다.** 요청이 반려된 것이므로 고칠 곳은 우리가 보낸 요청이다.
+    case "rejected":
+      return `공급자가 요청을 반려했습니다 (요청 형식·크기·파라미터를 확인하세요). ${normalized.message}`;
     case "model_unavailable":
       // gpt-5 사건: 키는 유효하지만 그 모델을 쓸 수 없다. 사용자가 할 일이 다르므로 구별해 알린다.
       return `이 자격증명으로는 해당 모델을 사용할 수 없습니다 (조직 인증 필요 또는 모델 미지원). ${normalized.message}`;

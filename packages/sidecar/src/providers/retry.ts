@@ -76,6 +76,20 @@ export function attemptFacts(attempt: number, raw: unknown, kind: string): Provi
       errorKind: kind,
     };
   }
+  /**
+   * **추론 전 반려는 아는 사실이다.**
+   *
+   * 429·401·403이 아닌 4xx는 공급자가 요청을 검증 단계에서 되돌린 것이므로 생성이 시작되지
+   * 않았고 과금도 없다 — 이 저장소에서 실측으로 확인했다(strict 스키마 400 거절이 공급자 청구
+   * 내역에 없었다). 이걸 `dispatched_no_response`로 두면 "돈을 썼는지 모른다"가 되어 예약을
+   * 해제할 수 없고, **그 한 건이 실행 전체를 멈춘다.**
+   *
+   * 5xx·타임아웃과는 반대 방향의 사실이라는 점이 요점이다. 저쪽은 응답을 만든 뒤 실패했을 수
+   * 있으므로 모른다고 해야 하고, 이쪽은 만들기 전에 거절당했으므로 안다고 할 수 있다.
+   */
+  if (kind === "rejected") {
+    return { attempt, dispatchState: "not_dispatched", errorKind: kind };
+  }
   // **모르면 불확실로 본다.** 어댑터 안쪽에서 난 오류는 요청이 나간 뒤일 수 있다.
   return { attempt, dispatchState: "dispatched_no_response", errorKind: kind };
 }

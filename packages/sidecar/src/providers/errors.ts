@@ -12,6 +12,21 @@ import { ProviderCallFailure } from "./types.js";
 const RETRYABLE: ProviderErrorKind[] = ["rate_limit", "transient", "timeout"];
 
 export function normalizeProviderError(raw: unknown): NormalizedProviderError {
+  /**
+   * **타임아웃을 취소보다 먼저 본다.**
+   *
+   * 타임아웃도 구현상 abort지만(`withTimeout`이 controller를 abort한다) 두 사실은 다르다.
+   * 취소는 **사용자가 그만두게 한 것**이고 타임아웃은 **우리가 정한 실행 예산을 넘긴 것**이다.
+   * 순서가 뒤바뀌어 있어서 모든 타임아웃이 `cancelled`로 기록됐고, 그러면 "사용자가 껐다"와
+   * "우리가 기다려주지 않았다"가 같은 값이 되어 어느 쪽도 셀 수 없다.
+   *
+   * 실측(가설 게이트 P1, 2026-08-27): 검수 호출이 120초에 취소됐는데 기록에는 `cancelled`만
+   * 남아, 원인이 타임아웃이라는 것을 알아내려면 시각을 손으로 빼봐야 했다. 그 요청은 공급자에
+   * 도달해 과금됐으므로 원인을 아는 것이 곧 고칠 곳을 아는 것이었다.
+   */
+  if (isTimeout(raw)) {
+    return { kind: "timeout", message: raw instanceof Error ? raw.message : "공급자 호출 타임아웃", retryable: true };
+  }
   // AbortError — 취소는 오류가 아니지만 오류 채널로 도착한다.
   if (isAbort(raw)) {
     return { kind: "cancelled", message: "호출이 취소되었습니다", retryable: false };
@@ -83,8 +98,17 @@ export function normalizeProviderError(raw: unknown): NormalizedProviderError {
   }
 
   if (status !== undefined && status >= 400 && status < 500) {
-    // 429 외 4xx는 재시도해도 같은 결과다 (9절 표).
-    return { kind: "auth", message, status, retryable: false };
+    /**
+     * 429·401·403이 아닌 4xx — **요청이 반려됐다.** 재시도해도 같은 결과다(9절 표).
+     *
+     * 예전에는 이 자리가 `auth`였다. 그래서 본문이 잘못됐거나 요청이 너무 큰 경우까지
+     * "인증 실패"로 읽혔고, 같은 키로 직전 호출이 성공한 뒤에 뜨면 원인과 정반대 방향을
+     * 보게 됐다(실측: 게이트 P1에서 gpt-4.1 3회 성공 뒤 4번째가 `auth`로 기록됨).
+     *
+     * 나누는 것이 과금 판정에도 필요하다. 이 계열은 **추론 전에 반려**되므로 비용이 없고,
+     * 그래서 예약을 해제할 근거가 된다 — 5xx와 정반대다.
+     */
+    return { kind: "rejected", message, status, retryable: false };
   }
 
   return { kind: "transient", message, status, retryable: false };

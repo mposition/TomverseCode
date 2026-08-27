@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +56,24 @@ export interface HostRunOptions {
   replayDraft?: unknown;
   /** fake provider 스크립트 (하네스 자동 테스트 전용). 실제 실험에서는 undefined다. */
   fakeScript?: unknown;
+  /**
+   * 실행할 호스트 바이너리 경로. **하네스 자동 테스트 전용이며 CLI로는 노출되지 않는다.**
+   *
+   * 있는 이유: 호스트가 뜨지 못했을 때의 경로(인프라 실패 → 비용 미측정 → 중단)를 검증하려면
+   * 실패를 **결정론적으로** 만들 수 있어야 한다. 예전에는 그 실패를 "자격증명이 없으니 공급자
+   * 후보가 비어 호스트가 거부한다"로 만들고 있었는데, 그건 검증이 **환경에 의존**한다는 뜻이다 —
+   * 키가 있는 기계에서는 실제 호출이 성공해 테스트가 실패하고, 그 과정에서 **실제 돈이 나간다.**
+   * 게이트를 돌리려면 반드시 키가 있어야 하므로 하필 그 환경에서만 그렇게 된다.
+   */
+  hostBin?: string;
+  /**
+   * 공급자 호출 1회 타임아웃(ms). **`timeoutMs`와 다른 값이다** — 저쪽은 호스트 프로세스를
+   * 기다리는 시간이고 이건 provider 호출 하나에 거는 상한이다.
+   *
+   * 게이트가 이걸 **명시적으로** 넘기는 이유: 제품 기본값에 기대면 실험 조건이 기본값 변경에
+   * 따라 조용히 바뀐다. 측정에서는 조건이 기록에 드러나야 한다.
+   */
+  providerTimeoutMs?: number;
   /** 모델 override — Model Registry의 축을 그대로 쓴다. 하드코딩하지 않는다. */
   executorModel?: string;
   reviewerModel?: string;
@@ -74,6 +93,47 @@ export interface HostRunResult {
   /** 프로세스를 띄우지도 못한 경우 — 인프라 실패로 분류된다. */
   spawnError?: string;
   wallClockMs: number;
+}
+
+/**
+ * fake 실행에서 arm의 실제 공급자를 대신할 로컬 가짜 공급자.
+ *
+ * # 왜 필요한가 — fake 모드가 실제 돈을 쓸 수 있었다
+ *
+ * `host.rs`는 fake 모드에서 후보에 `fake-a/b/c`를 **더하기만** 하고, 그 다음 `--providers`가
+ * 후보를 **좁힌다.** 그래서 arm A가 `--providers openai`를 주면 교집합이 `["openai"]`가 되어
+ * 가짜 항목이 전부 탈락하고 **실제 `gpt-4.1`이 선택된다.** `TOMVERSE_FAKE_SCRIPT`는
+ * `apiBaseUrl`이 `local://`인 항목에만 적용되므로(`providers/factory.ts`) 진짜 어댑터가 만들어져
+ * 실제 요청이 나간다.
+ *
+ * 증상이 환경에 따라 갈려서 오래 보이지 않았다: 키가 없는 기계에서는 후보가 가짜뿐이라
+ * 정상 동작하고, **키가 있는 기계에서만** 실제 호출이 된다. 그리고 게이트를 돌리려면
+ * 반드시 키가 있어야 하므로, 하필 실행하려는 환경에서만 새어 나간다.
+ *
+ * 새는 것이 돈만이 아니다. fake 실행은 `--max-cost-usd`와 `--run-card`를 면제받고(`cli.ts`)
+ * 예산 원장도 타지 않으므로, **유료 실행 안전장치 전체를 우회한 실제 호출**이 된다.
+ * 게다가 그 기록은 `providerKind: "fake"`로 남는다.
+ *
+ * 그래서 "fake 실행"이라는 선언이 곧 "실제 공급자에 닿을 수 없다"가 되도록 여기서 이름을
+ * 바꾼다. 공급자 **개수**는 그대로이므로 검수자 독립성 판단(단독 arm은 reviewer 드롭,
+ * 교차검증 arm은 독립 reviewer 배정)도 그대로다 — arm의 의미는 바뀌지 않는다.
+ *
+ * `arms.ts`를 고치지 않는 이유: 그 파일의 공급자 이름은 비용 추정·attestation·preflight가
+ * 함께 읽는 값이고, 그것들이 각자 fake를 다시 해석하면 반드시 갈라진다(`modelForRole` 주석).
+ * 바꿔야 하는 것은 **이번 실행이 무엇에 닿는가** 하나뿐이라 호출 경계에서만 바꾼다.
+ */
+const FAKE_PROVIDER_FOR = Object.freeze<Record<string, string>>({
+  openai: "fake-a",
+  anthropic: "fake-b",
+});
+
+/**
+ * fake 실행이면 실제 공급자 이름을 가짜 항목으로 바꾼다. 이미 가짜이거나 모르는 이름은
+ * 그대로 둔다 — `triageCalibration`은 처음부터 `fake-a/fake-b`를 넘긴다.
+ */
+export function resolveProviderArgs(providers: readonly string[], usingFake: boolean): string[] {
+  if (!usingFake) return [...providers];
+  return providers.map((p) => FAKE_PROVIDER_FOR[p] ?? p);
 }
 
 /**
@@ -101,7 +161,7 @@ export function runHost(options: HostRunOptions): HostRunResult {
     "--sidecar",
     SIDECAR_ENTRY,
     "--providers",
-    options.providers.join(","),
+    resolveProviderArgs(options.providers, options.fakeScript !== undefined).join(","),
     "--timeout-secs",
     String(Math.ceil(options.timeoutMs / 1000)),
     // 파일 변경을 자동 승인한다: 이 실험은 승인 UX가 아니라 수정 품질을 측정한다.
@@ -121,11 +181,14 @@ export function runHost(options: HostRunOptions): HostRunResult {
   if (options.fakeScript !== undefined) {
     env.TOMVERSE_FAKE_SCRIPT = JSON.stringify(options.fakeScript);
   }
+  if (options.providerTimeoutMs !== undefined) {
+    env.TOMVERSE_PROVIDER_TIMEOUT_MS = String(options.providerTimeoutMs);
+  }
   if (options.executorModel) env.TOMVERSE_EXECUTOR_MODEL = options.executorModel;
   if (options.reviewerModel) env.TOMVERSE_REVIEWER_MODEL = options.reviewerModel;
 
   const started = Date.now();
-  const result = spawnSync(HOST_BIN, args, {
+  const result = spawnSync(options.hostBin ?? HOST_BIN, args, {
     encoding: "utf8",
     // 호스트 자체 타임아웃보다 넉넉하게 — 호스트가 스스로 정리할 기회를 준다.
     timeout: options.timeoutMs + 60_000,
@@ -228,12 +291,76 @@ export function readEvents(dbPath: string, workspaceRoot: string, taskId: string
   );
   const line = (result.stdout ?? "").trim().split("\n").filter(Boolean).pop();
   if (!line) return [];
+  let parsed: { events?: StoredEvent[] };
   try {
-    const parsed = JSON.parse(line) as { events?: StoredEvent[] };
-    return parsed.events ?? [];
+    parsed = JSON.parse(line) as { events?: StoredEvent[] };
   } catch {
     return [];
   }
+  return resolveArtifactPayloads(parsed.events ?? [], artifactsRootFor(dbPath));
+}
+
+/** `runHost`가 `--artifacts`로 넘긴 위치. DB와 형제 디렉터리다. */
+export function artifactsRootFor(dbPath: string): string {
+  return path.join(path.dirname(dbPath), "artifacts");
+}
+
+/**
+ * 8KB를 넘어 artifact로 밀려난 payload를 되읽는다.
+ *
+ * # 왜 필요한가 — 실제 초안은 **언제나** 여기에 해당한다
+ *
+ * `store.rs`는 직렬화 길이가 `INLINE_PAYLOAD_LIMIT_BYTES`(8KB)를 넘으면 `payload_json`에
+ * 본문 대신 `{artifactRef, sha256, sizeBytes, preview}`만 넣고 본문을 artifact 파일로 뺀다
+ * (state-machine-and-protocol.md 7절 — SQLite WAL 비대화 방지).
+ *
+ * `DRAFT_RECEIVED`는 patch 본문을 싣는다. 실제 모델이 만든 unified diff는 거의 항상 8KB를
+ * 넘으므로 **실제 공급자 실행에서는 초안 payload가 DB에 남지 않는다.** 그래서 하네스는
+ * `proposalId`도 `patch`도 `draftSource`도 볼 수 없었고, Arm A의 초안을 재생해야 하는
+ * **Arm C/D가 매번 건너뛰어졌다** — 교차검증 arm, 즉 이 게이트가 재려는 대상 전체다.
+ *
+ * fake provider는 patch가 짧아 8KB를 넘지 않는다. 그래서 하네스 자동 테스트는 전부 통과했고,
+ * 이 결함은 **유료 실행에서만** 드러났다. 이 저장소에서 반복된 모양이다.
+ *
+ * # 해석 실패를 조용히 넘기지 않는다
+ *
+ * 참조만 남은 payload를 그대로 돌려주면 "이벤트를 읽었다"가 되는데 실제로는 내용을 모른다.
+ * 그 상태로 진행하면 초안이 없는 것과 구별되지 않으므로 예외를 던진다 — 호출부의
+ * `readEventsSafely`가 `eventsReadable = false`로 받아 **과금 불확실**로 보수적으로 처리한다.
+ * "못 읽었다"를 "없다"로 읽지 않는 것이 이 하네스의 규칙이다.
+ */
+export function resolveArtifactPayloads(events: readonly StoredEvent[], artifactsRoot: string): StoredEvent[] {
+  return events.map((event) => {
+    const ref = event.payload?.["artifactRef"];
+    if (typeof ref !== "string" || ref.length === 0) return event;
+
+    const file = path.join(artifactsRoot, ref);
+    let raw: Buffer;
+    try {
+      raw = readFileSync(file);
+    } catch (error) {
+      throw new Error(`이벤트 seq ${event.seq}(${event.type})의 artifact를 읽을 수 없습니다: ${file} — ${String(error)}`);
+    }
+
+    const expected = event.payload["sha256"];
+    if (typeof expected === "string") {
+      const actual = createHash("sha256").update(raw).digest("hex");
+      if (actual !== expected) {
+        throw new Error(`이벤트 seq ${event.seq}(${event.type})의 artifact 해시가 다릅니다: 기대 ${expected} / 실제 ${actual}`);
+      }
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(raw.toString("utf8"));
+    } catch (error) {
+      throw new Error(`이벤트 seq ${event.seq}(${event.type})의 artifact가 JSON이 아닙니다: ${file} — ${String(error)}`);
+    }
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error(`이벤트 seq ${event.seq}(${event.type})의 artifact가 객체가 아닙니다: ${file}`);
+    }
+    return { ...event, payload: payload as Record<string, unknown> };
+  });
 }
 
 /** 이벤트에서 특정 타입의 마지막 payload를 꺼낸다. */
@@ -246,4 +373,27 @@ export function lastPayload(events: readonly StoredEvent[], type: string): Recor
 
 export function allPayloads(events: readonly StoredEvent[], type: string): Record<string, unknown>[] {
   return events.filter((e) => e.type === type).map((e) => e.payload);
+}
+
+/** `DRAFT_RECEIVED` 중 **진짜 초안**인 마지막 payload. 왜 필요한지는 runner.ts 호출부에 있다. */
+export interface DraftReceivedPayload {
+  patch?: string | null;
+  plan?: unknown;
+  model?: string;
+  proposalId?: string;
+  interpretation?: string;
+  risks?: string[];
+  uncertainties?: string[];
+  draftSource?: string;
+}
+
+export function lastDraftProposalPayload(events: readonly StoredEvent[]): DraftReceivedPayload | undefined {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i]!;
+    if (event.type !== "DRAFT_RECEIVED") continue;
+    const payload = event.payload as DraftReceivedPayload;
+    // 초안에만 실리는 표지. 없는 것(kind/singleModel)으로 거르면 새 모양이 생겼을 때 뚫린다.
+    if (payload.draftSource === "generated" || payload.draftSource === "replayed") return payload;
+  }
+  return undefined;
 }

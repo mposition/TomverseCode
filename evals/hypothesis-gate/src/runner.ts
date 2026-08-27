@@ -3,7 +3,14 @@ import { existsSync } from "node:fs";
 import type { BudgetLedger, DispatchState } from "@tomverse/sidecar/budget";
 import { armExecutionOrder, armSpec, ARMS } from "./arms.js";
 import { criteriaHash } from "./criteria.js";
-import { allPayloads, lastPayload, readEvents, runHost, type HostRunResult } from "./host.js";
+import {
+  allPayloads,
+  lastDraftProposalPayload,
+  lastPayload,
+  readEvents,
+  runHost,
+  type HostRunResult,
+} from "./host.js";
 import { promptVersionHash, type LoadedFixture } from "./manifest.js";
 import { appendChecked, type RecordStore } from "./records.js";
 import { classifyContribution } from "./stats.js";
@@ -63,6 +70,10 @@ export interface RunnerOptions {
   realProvider?: boolean;
   /** fake provider 스크립트 — 하네스 자동 테스트 전용. 있으면 기록이 `providerKind: "fake"`가 된다. */
   fakeScript?: unknown;
+  /** 공급자 호출 1회 타임아웃(ms). 게이트는 이걸 명시적으로 넘긴다 (host.ts 참조). */
+  providerTimeoutMs?: number;
+  /** 호스트 바이너리 override — 하네스 자동 테스트 전용 (host.ts 참조). */
+  hostBin?: string;
   executorModel?: string;
   reviewerModel?: string;
   /** 이 실행을 승인한 receipt. 모든 기록에 그대로 실린다 (§2.3). */
@@ -136,9 +147,20 @@ export function budgetStop(cumulativeSpentUsd: number, maxCostUsd: number | unde
  * 이벤트를 읽지 못했으면 `dispatched_no_response`다 — "모른다"를 "안 썼다"로 읽지 않는다.
  */
 
+/**
+ * 401/403이 **연속** 몇 번이면 그 공급자를 끊는가.
+ *
+ * 1회로 끊지 않는 이유: 일시적인 경우가 있고, 그때 끊으면 멀쩡한 공급자의 표본을 잃는다.
+ * 2회로 두는 이유: 자격증명·권한 문제는 재시도로 풀리지 않으므로 두 번이면 충분히 확실하고,
+ * 더 기다리면 같은 실패에 시간과 (429가 아닌 이상 0원이지만) 호출을 계속 쓴다.
+ */
+const AUTH_CIRCUIT_THRESHOLD = 2;
+
 /** 호출 이전 단계에서만 날 수 있는 실패. 이 목록에 HTTP 분류를 넣지 말 것. */
 const PRE_DISPATCH_FAILURES: ReadonlySet<string> = new Set([
   "auth_failure",
+  // 추론 전 반려 — 비용이 없다는 것이 실측으로 확인된 유일한 4xx 계열이다.
+  "invalid_request",
   "fixture_setup_failure",
   "toolchain_unavailable",
 ]);
@@ -221,9 +243,24 @@ function envelopeModelId(record: { providerCalls: readonly ProviderCallFact[] })
   return reported.size === 1 ? [...reported][0] : undefined;
 }
 
-/** 초안 캐시 키 — 같은 fixture/반복이면 같은 초안을 공유한다. */
-function draftKey(fixtureId: string, repetition: number): string {
-  return `${fixtureId}::${repetition}`;
+/**
+ * 초안 캐시 키 — **초안을 만든 arm까지 포함한다.**
+ *
+ * 예전에는 `fixture::repetition`뿐이었다. 그런데 초안을 생성하는 arm은 하나가 아니다 —
+ * A(OpenAI)와 B(Anthropic)가 **둘 다** `draftSource: "generate"`이므로, 나중에 도는 B가
+ * A의 초안을 덮어썼다. 그러면 A의 초안을 재생해야 하는 C/D가 **B의 초안**을 받는다.
+ *
+ * 조용히 실험을 무너뜨리는 종류다. A↔C 차이는 "같은 초안에 검수를 붙인 순효과"여야 하는데,
+ * C가 다른 모델의 초안을 검수하면 그 차이는 초안 모델의 차이와 검수 효과가 섞인 값이 된다.
+ * 게다가 초안 저자가 검수자와 같은 공급자가 되어 라우터의 13.3절 절충이 발동하고, **검수자가
+ * executor 모델로 바뀐다** — 실측(P0, 2026-08-27)에서 `asy-03`의 C/D가 그렇게 됐고
+ * attestation의 "응답 envelope 모델 ID 일치" 검사가 그것을 잡아 P1을 막았다.
+ *
+ * 더 나쁜 것은 **순서 의존이라 절반만 틀린다**는 점이다: A의 초안이 살아남는 fixture와
+ * 덮어써지는 fixture가 섞여 있었다(같은 실행에서 `amb-01`은 A, `asy-03`은 B였다).
+ */
+function draftKey(fixtureId: string, repetition: number, arm: ArmId): string {
+  return `${fixtureId}::${arm}::${repetition}`;
 }
 
 export async function runExperiment(options: RunnerOptions): Promise<RunnerResult> {
@@ -271,6 +308,10 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
   let budgetExhausted = false;
   let unmeasurableCostAbort = false;
   let abortReason: string | undefined;
+  /** 공급자별 **연속** 인증/권한 실패 횟수. 성공이 끼면 되돌린다. */
+  const consecutiveAuthFailures = new Map<string, number>();
+  /** circuit이 열린 공급자 — 이 공급자를 쓰는 arm만 건너뛴다. */
+  const openCircuits = new Set<string>();
 
   for (const item of plan) {
     const { fixture, arm, repetition } = item;
@@ -279,9 +320,9 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     if (options.store.isDone(fixtureId, arm, repetition)) {
       skippedResume += 1;
       // 재개 시에도 초안 공유가 성립해야 한다. 이미 저장된 Arm A 기록에서 초안을 복구한다.
-      if (armSpec(arm).draftSource === "generate" && !drafts.has(draftKey(fixtureId, repetition))) {
+      if (armSpec(arm).draftSource === "generate" && !drafts.has(draftKey(fixtureId, repetition, arm))) {
         const restored = restoreDraftFromRecords(options.store, fixtureId, repetition, arm);
-        if (restored) drafts.set(draftKey(fixtureId, repetition), restored);
+        if (restored) drafts.set(draftKey(fixtureId, repetition, arm), restored);
       }
       continue;
     }
@@ -299,10 +340,29 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     }
 
     const spec = armSpec(arm);
+
+    /**
+     * circuit이 열린 공급자를 쓰는 arm은 건너뛴다 — **실험 전체는 계속한다.**
+     *
+     * 기록은 남긴다. 남기지 않으면 그 arm의 표본이 왜 비어 있는지 집계가 설명하지 못하고,
+     * "모델이 못 풀었다"와 "돌려보지도 못했다"가 같은 빈칸이 된다.
+     */
+    const blockedBy = spec.providers.filter((providerId) => openCircuits.has(providerId));
+    if (blockedBy.length > 0) {
+      log(`${fixtureId} rep${repetition} Arm ${arm}: ${blockedBy.join(", ")}의 circuit이 열려 건너뜁니다`);
+      appendChecked(
+        options.store,
+        skippedRecord(options, fixture, arm, repetition, hash, "auth_failure",
+          `circuit_open:${blockedBy.join(",")} — 인증/권한 실패가 연속되어 이 공급자를 쓰는 arm을 중단함`)
+      );
+      executed += 1;
+      continue;
+    }
+
     let replayDraft: unknown;
     if (spec.draftSource === "replay") {
       const source = spec.draftSourceArm!;
-      replayDraft = drafts.get(draftKey(fixtureId, repetition));
+      replayDraft = drafts.get(draftKey(fixtureId, repetition, source));
       if (replayDraft === undefined) {
         // Arm A가 초안을 만들지 못한 경우(실패/인프라 오류). 새 초안을 만들어 대체하면
         // "같은 초안 공유"라는 전제가 깨지므로 **이 arm은 건너뛴다** — 조용히 다르게 돌리지 않는다.
@@ -358,7 +418,37 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     // 몇 시간 동안 돈을 쓰게 된다. 0으로 대체하지도 않는다 — 0은 fake에만 참이다.
     const costUnmeasurable = options.realProvider === true && record.costUsd === undefined;
     if (costUnmeasurable) {
-      record.failureClass = "cost_unmeasurable";
+      /**
+       * **타임아웃을 `cost_unmeasurable`로 뭉개지 않는다.**
+       *
+       * 둘 다 "비용을 못 쟀다"로 끝나지만 고칠 곳이 다르다. usage가 없는 응답은 어댑터나
+       * 단가표의 문제이고, 타임아웃은 **우리가 정한 실행 예산**의 문제다. 하나로 적으면
+       * 원인을 알아내려고 매번 호출 시각을 손으로 빼봐야 한다.
+       *
+       * 그리고 모델 품질과도 섞이면 안 된다 — 둘 다 인프라 실패로 분모에서 빠지지만,
+       * 실패율을 읽는 사람에게 "모델이 못 풀었다"와 "우리가 기다려주지 않았다"는 다른 소식이다.
+       */
+      const timedOut = record.providerCalls.some((call) => call.errorKind === "timeout");
+      /**
+       * **추론 전 반려는 비용 미측정이 아니라 비용 0이다.**
+       *
+       * 429·401·403이 아닌 4xx는 공급자가 생성을 시작하기 전에 요청을 반려한 것이므로
+       * 과금되지 않는다 — 이 저장소에서 실측으로 확인했다(strict 스키마 400 거절이 공급자
+       * 청구 내역에 없었다). `cost_unmeasurable`로 두면 "얼마인지 모른다"가 되어 예약을
+       * 정산할 수도 해제할 수도 없고, **그 한 건이 96건 전체를 멈춘다.**
+       *
+       * 그 일이 실제로 반복됐다(P1이 네 번 멈췄고 매번 다른 원인이었다). 비용을 아는 경우를
+       * 모르는 것으로 적으면 예산 보호가 아니라 실행 불가가 된다.
+       */
+      const rejected =
+        record.providerCalls.some((call) => call.errorKind === "rejected") &&
+        !record.providerCalls.some((call) => call.dispatchState === "response_received_with_usage");
+      if (rejected) {
+        record.failureClass = "invalid_request";
+        record.costUsd = 0;
+      } else {
+        record.failureClass = timedOut ? "provider_timeout" : "cost_unmeasurable";
+      }
     }
 
     appendChecked(options.store, record);
@@ -430,7 +520,8 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
       }
     }
 
-    if (costUnmeasurable) {
+    // **반려는 멈출 이유가 아니다.** 비용을 아는(0인) 실패이므로 예산 상한은 여전히 강제된다.
+    if (costUnmeasurable && record.failureClass !== "invalid_request") {
       unmeasurableCostAbort = true;
       abortReason =
         `${fixtureId} rep${repetition} Arm ${arm}: 실제 응답에 usage가 없거나 비용을 계산할 수 없습니다. ` +
@@ -439,8 +530,37 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
       break;
     }
 
+    /**
+     * **401/403 circuit breaker — 공급자 단위로 끊고 실험은 계속한다.**
+     *
+     * 자격증명이나 권한 문제는 재시도로 풀리지 않고, 그 공급자를 쓰는 arm은 전부 같은 실패를
+     * 반복한다. 그렇다고 실행 전체를 멈추면 **그 공급자와 무관한 arm의 데이터까지 잃는다** —
+     * Arm B(anthropic 단독)는 openai가 죽어도 멀쩡히 돌 수 있다.
+     *
+     * **연속**으로 셈하는 이유: 한 번은 일시적일 수 있다. 중간에 성공이 끼면 자격증명 문제가
+     * 아니므로 계수를 되돌린다.
+     */
+    for (const providerId of new Set(record.providerCalls.map((call) => call.providerId))) {
+      const calls = record.providerCalls.filter((call) => call.providerId === providerId);
+      const authFailed = calls.some((call) => call.errorKind === "auth");
+      const anySucceeded = calls.some((call) => call.status === "succeeded");
+      if (authFailed && !anySucceeded) {
+        const next = (consecutiveAuthFailures.get(providerId) ?? 0) + 1;
+        consecutiveAuthFailures.set(providerId, next);
+        if (next >= AUTH_CIRCUIT_THRESHOLD && !openCircuits.has(providerId)) {
+          openCircuits.add(providerId);
+          log(
+            `${providerId}: 인증/권한 실패가 연속 ${next}회 — 이 공급자를 쓰는 arm을 중단합니다. ` +
+              `나머지 arm은 계속 실행합니다.`
+          );
+        }
+      } else if (anySucceeded) {
+        consecutiveAuthFailures.set(providerId, 0);
+      }
+    }
+
     if (spec.draftSource === "generate" && record.draftProposal !== undefined) {
-      drafts.set(draftKey(fixtureId, repetition), record.draftProposal);
+      drafts.set(draftKey(fixtureId, repetition, arm), record.draftProposal);
     }
   }
 
@@ -550,6 +670,8 @@ function executeOne(options: ExecuteOneOptions): RecordWithDraft {
       timeoutMs: manifest.timeoutMs,
       ...(options.replayDraft !== undefined ? { replayDraft: options.replayDraft } : {}),
       ...(options.fakeScript !== undefined ? { fakeScript: options.fakeScript } : {}),
+      ...(options.hostBin !== undefined ? { hostBin: options.hostBin } : {}),
+      ...(options.providerTimeoutMs !== undefined ? { providerTimeoutMs: options.providerTimeoutMs } : {}),
       ...(options.executorModel ? { executorModel: options.executorModel } : {}),
       ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
     });
@@ -567,7 +689,10 @@ function executeOne(options: ExecuteOneOptions): RecordWithDraft {
     base.eventsReadable = read.ok;
     if (read.ok) applyEventDerivedFields(base, read.events);
 
-    const infraFailure = classifyInfrastructureFailure(hostResult);
+    const infraFailure = classifyInfrastructureFailure(hostResult, {
+      eventsReadable: base.eventsReadable,
+      providerCalls: base.providerCalls,
+    });
     if (infraFailure) {
       base.failureClass = infraFailure;
       if (!read.ok) {
@@ -650,12 +775,44 @@ function readEventsSafely(
   }
 }
 
-/** 프로세스를 띄우지 못했거나 공급자 인증/한도 문제인가. */
-function classifyInfrastructureFailure(result: HostRunResult): FailureClass | undefined {
+/**
+ * 프로세스를 띄우지 못했거나 공급자 인증/한도 문제인가.
+ *
+ * # stderr 문자열이 구조화된 증거를 뒤집지 않는다
+ *
+ * 이 함수의 뒤쪽 절반은 호스트 stderr에 정규식을 건다. 그런데 stderr에는 `--verbose` 로그와
+ * **검증 명령의 출력 전체**(cargo·node --test)가 섞여 있고, 거기엔 소요 시간·토큰 수·해시처럼
+ * 숫자가 끝없이 나온다. `/\b5\d\d\b/`는 5로 시작하는 세 자리 숫자면 무엇이든 잡고,
+ * `429`는 단어 경계도 없어 더 긴 토큰 안에서도 잡혔다.
+ *
+ * 실측(P0 smoke, 2026-08-27): provider 호출이 **전부 `succeeded`이고 `retryCount=0`인** 기록 둘이
+ * `provider_5xx`로 분류됐다. 인프라 실패율이 75%로 찍혀 사전 등록 기준 9번(5% 미만)이
+ * 허위로 깨졌다.
+ *
+ * 그리고 이건 집계만 틀리는 문제가 아니다. 호출부가 이 값을 받으면 **곧바로 반환**해
+ * 공개 검증도 oracle 검증도 돌지 않는다 — 실제로 측정할 수 있었던 결과가 버려진다.
+ *
+ * 그래서 규칙을 하나 세운다: **이벤트를 읽을 수 있었고, 기록된 provider 호출이 있고, 그것들이
+ * 전부 성공했다면 stderr 문자열로 공급자 실패를 만들어내지 않는다.** 진짜 5xx는 실패한 호출
+ * 이벤트를 남기므로 이 규칙이 그것을 가리지 않는다. 가리는 것은 "성공했다고 기록된 실행"뿐이다.
+ *
+ * `spawnError`와 `provider_config_error`는 구조화된 사실이므로 이 규칙 앞에 둔다.
+ */
+export function classifyInfrastructureFailure(
+  result: HostRunResult,
+  evidence: { eventsReadable: boolean; providerCalls: readonly { status: string }[] }
+): FailureClass | undefined {
   if (result.spawnError) return "host_crash";
   if (result.failureReason === "provider_config_error") return "auth_failure";
+
+  const allCallsSucceeded =
+    evidence.eventsReadable &&
+    evidence.providerCalls.length > 0 &&
+    evidence.providerCalls.every((call) => call.status === "succeeded");
+  if (allCallsSucceeded) return undefined;
+
   const stderr = result.stderr;
-  if (/rate.?limit|429/i.test(stderr)) return "rate_limit";
+  if (/rate.?limit|\b429\b/i.test(stderr)) return "rate_limit";
   if (/\b5\d\d\b|internal server error|overloaded/i.test(stderr)) return "provider_5xx";
   if (/ETIMEDOUT|ECONNRESET|ENOTFOUND|socket hang up/i.test(stderr)) return "network_timeout";
   return undefined;
@@ -775,10 +932,23 @@ function applyEventDerivedFields(record: RecordWithDraft, events: ReturnType<typ
     record.providerId = routing!.assignments!.map((a) => `${a.role}=${a.providerId}`).join(",");
   }
 
-  const draft = lastPayload(events, "DRAFT_RECEIVED") as
-    | { patch?: string | null; plan?: unknown; model?: string; proposalId?: string; interpretation?: string;
-        risks?: string[]; uncertainties?: string[]; draftSource?: string }
-    | undefined;
+  /**
+   * **`DRAFT_RECEIVED`는 이름 하나에 모양이 넷이다.** 진짜 초안 말고도
+   * `kind: "question_answer"`, `kind: "plan_outline"`, 그리고 단일모델 fix 결과가 같은 이름으로
+   * 나온다(orchestrator.ts 926·1070·2407·2499). 셋 다 `proposalId`도 `patch`도 없다.
+   *
+   * 그래서 `lastPayload`로 마지막 것을 집으면 **뒤에 온 다른 모양이 초안을 지운다.**
+   * 실측(P0 smoke, 2026-08-27): Arm A가 executor 호출 4회를 전부 성공시켰는데 마지막
+   * `DRAFT_RECEIVED`가 재질문 응답이라 `draftProposal`이 비었고, 그 초안을 재생해야 하는
+   * **Arm C/D가 8건 중 4건 통째로 건너뛰어졌다** — 교차검증 arm, 즉 이 게이트가 재려는
+   * 대상 전체다. 모호한 요구 카테고리(`ambiguous_requirement`)에서 모델이 되묻는 것은
+   * 정상 동작이므로, 세트가 어려울수록 더 자주 일어난다.
+   *
+   * 없는 것으로 거르지 않고 **있는 것으로 고른다.** `draftSource`는 진짜 초안에만 실리므로
+   * 그것을 표지로 쓴다 — "kind가 없으면 초안"으로 두면 다섯 번째 모양이 생겼을 때 조용히
+   * 다시 깨진다.
+   */
+  const draft = lastDraftProposalPayload(events);
   if (draft) {
     record.returnedModelId = draft.model;
     if (draft.draftSource === "replayed" || draft.draftSource === "generated") {

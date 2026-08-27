@@ -44,7 +44,22 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
    * 진다: `mcpRounds`(기본 1)와 "상한을 알린 뒤에는 요청을 무시한다"는 규칙 둘이 함께
    * 유한성을 보장한다(원칙 5). 새로 자기 전이를 추가하려면 같은 논증을 함께 만들 것.
    */
-  DRAFTING: ["DRAFTING", "REVIEWING", "AWAITING_USER_INPUT", "CANCELLING", "CANCELLED", "FAILED"],
+  /**
+   * `DRAFTING → PLANNING`은 **검수자를 배정하지 못한 경우**다.
+   *
+   * 원칙 4는 검수자를 구할 수 없으면 "같은 공급자로 검증한 척하지 말고 **검수 역할을 드롭한
+   * 뒤 그 사실을 표시**하라"고 말한다. 역할이 빠진 것이지 태스크의 성격이 바뀐 것이 아니므로,
+   * 초안까지는 그대로 만들고 REVIEWING만 건너뛴다. 예전에는 이 경우 파이프라인 전체가
+   * `SINGLE_MODEL_FIX`로 갈아타서 **초안 프롬프트도 `DraftProposal`도 없어졌다** — 사용자가
+   * 키를 하나만 넣었다는 이유로 받는 결과의 종류가 통째로 달라지는 동작이었다.
+   *
+   * 비어 있는 REVIEWING을 지나가게 하지 않는다. 화면에 "검수 중"이 떴다가 아무 일도 없이
+   * 지나가면 검수를 거친 실행과 구별되지 않고, 그게 이 원칙이 막으려는 바로 그 착시다.
+   * 건너뛴 사실은 `PHASE_CHANGED_NOTE`로 남는다.
+   *
+   * 종료 논증은 그대로다 — 새 자기 전이가 아니라 앞으로만 가는 간선이다.
+   */
+  DRAFTING: ["DRAFTING", "REVIEWING", "PLANNING", "AWAITING_USER_INPUT", "CANCELLING", "CANCELLED", "FAILED"],
   // SINGLE_MODEL_FIX의 verdict: ACCEPT → PLANNING, NEED_USER_INPUT → AWAITING_USER_INPUT,
   // REJECT → REJECTED (문서 14.1절). 자기 전이의 이유는 DRAFTING과 같다(31절).
   SINGLE_MODEL_FIX: [

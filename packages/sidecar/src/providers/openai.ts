@@ -12,6 +12,7 @@ import type {
 } from "@tomverse/protocol";
 import { effectiveMaxOutputTokens } from "../budget/ledger.js";
 import {
+  ValidationError,
   validateDraftProposal,
   validatePlanOutline,
   validateQuestionAnswer,
@@ -34,7 +35,7 @@ import {
   REVIEW_SCHEMA,
   SINGLE_FIX_SCHEMA,
 } from "./prompts.js";
-import { ProviderCallFailure } from "./types.js";
+import { ProviderCallFailure, validateReceived } from "./types.js";
 import type {
   AdapterDeps,
   CredentialCheck,
@@ -46,6 +47,97 @@ import type {
   ProviderResponse,
   ReviewInput,
 } from "./types.js";
+
+/**
+ * strict 모드로 보낼 수 있게 고친 `DRAFT_SCHEMA` — **OpenAI 어댑터 안에서만 쓴다.**
+ *
+ * # 왜 파생시키는가
+ *
+ * OpenAI의 strict structured output은 **모든 객체**에 `additionalProperties: false`를 요구한다.
+ * 그런데 `mcpCalls[].arguments`는 도구가 선언한 스키마를 따르는 **자유 형식 객체**라 그 요구를
+ * 만족시킬 방법이 없다 — `properties` 없이 `additionalProperties: false`를 붙이면 `{}`만
+ * 허용되어 MCP 호출이 인자를 실을 수 없게 된다. strict 모드로는 표현할 수 없는 형태다.
+ *
+ * 실측: 이 스키마 그대로 보내면 요청이 400으로 거절된다.
+ *
+ *     400 Invalid schema for response_format 'draft_proposal':
+ *     In context=('properties','mcpCalls','items','properties','arguments'),
+ *     'additionalProperties' is required to be supplied and to be false.
+ *
+ * 추론 전 검증 단계에서 죽으므로 **초안 생성이 아예 성립하지 않는다.** 가설 게이트의 첫 실제
+ * 호출(`gate:g:probe-models`)이 이걸 처음 드러냈다 — 그 전까지 이 경로는 실제 API에 대해 한
+ * 번도 실행된 적이 없었고, mock transport는 스키마를 검증하지 않으므로 통과시켰다.
+ *
+ * # 왜 `DRAFT_SCHEMA` 자체를 고치지 않는가
+ *
+ * 그 상수는 **Anthropic·Gemini 어댑터가 함께 쓴다.** 거기서 `arguments`를 문자열로 바꾸면 세
+ * 공급자의 전송 계약과 `validateMcpCalls`가 동시에 바뀐다 — 되돌리기 비싼 변경을, 공급자 하나의
+ * 제약 때문에 전부에 물리는 것이다. 제약이 OpenAI의 것이므로 대응도 OpenAI 어댑터에 둔다.
+ *
+ * # 왜 `strict: false`로 내리지 않는가
+ *
+ * 한 줄이면 되지만 Model Registry가 이 모델을 `structuredOutput: "strict_schema"`로 **선언**하고
+ * 있다. 선언과 실제가 갈리면 라우터의 능력 필터가 거짓이 되고, 무엇보다 초안은 patch를 나르는
+ * 자리라 형태가 흔들리면 스키마 위반이 늘어난다. 표현할 수 없는 자리 하나를 옮기는 편이,
+ * 스키마 전체의 강제를 포기하는 것보다 잃는 것이 적다.
+ */
+const MCP_ARGUMENTS_AS_JSON_STRING =
+  "Named arguments matching the tool's declared schema, serialized as a JSON object string. " +
+  'Example: "{\\"path\\":\\"src/a.ts\\"}". Send "{}" when the tool takes no arguments.';
+
+export const DRAFT_SCHEMA_STRICT: unknown = (() => {
+  const clone = structuredClone(DRAFT_SCHEMA) as {
+    properties: { mcpCalls: { items: { properties: Record<string, unknown> } } };
+  };
+  clone.properties.mcpCalls.items.properties.arguments = {
+    type: "string",
+    description: MCP_ARGUMENTS_AS_JSON_STRING,
+  };
+  return clone;
+})();
+
+/**
+ * strict 스키마 때문에 문자열로 받은 `mcpCalls[].arguments`를 객체로 되돌린다.
+ *
+ * **`validateDraftProposal`에 넘기기 전에** 한다. 그래야 검증기가 보는 것이 다른 공급자에서
+ * 오는 것과 같은 모양이 되고, "OpenAI에서 왔는지"를 프로토콜 경계가 알 필요가 없다.
+ *
+ * 파싱 실패를 조용히 넘기지 않는 이유: 문자열을 그대로 두면 `validateMcpCalls`가
+ * "expected an object"라고만 말하는데, 그건 **모델이 객체 대신 문자열을 보냈다**는 뜻으로
+ * 읽힌다. 실제 원인(JSON이 깨졌다)과 다른 곳을 가리키는 오류가 가장 오래 걸린다.
+ */
+export function decodeMcpArguments(parsed: unknown): unknown {
+  if (parsed === null || typeof parsed !== "object") return parsed;
+  const draft = parsed as { mcpCalls?: unknown };
+  if (!Array.isArray(draft.mcpCalls)) return parsed;
+
+  return {
+    ...draft,
+    mcpCalls: draft.mcpCalls.map((call, i) => {
+      if (call === null || typeof call !== "object") return call;
+      const withArgs = call as { arguments?: unknown };
+      // 다른 형태로 오면 건드리지 않는다 — 판정은 검증기 한 곳에서 한다.
+      if (typeof withArgs.arguments !== "string") return call;
+
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(withArgs.arguments);
+      } catch (error) {
+        throw new ValidationError(
+          `draftProposal.mcpCalls[${i}].arguments`,
+          `JSON 문자열로 받았으나 파싱할 수 없습니다: ${String(error)}`
+        );
+      }
+      if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) {
+        throw new ValidationError(
+          `draftProposal.mcpCalls[${i}].arguments`,
+          "JSON 객체여야 합니다 (MCP는 이름 있는 인자를 씁니다)"
+        );
+      }
+      return { ...withArgs, arguments: decoded };
+    }),
+  };
+}
 
 /**
  * OpenAI 어댑터.
@@ -150,16 +242,16 @@ export class OpenAIAdapter implements ProviderAdapter {
   async generateDraft(input: DraftInput, ctx: ProviderCallContext): Promise<ProviderResponse<DraftProposal>> {
     const { parsed, usage, latencyMs, meta } = await this.structuredCall(
       buildDraftPrompt(input),
-      { name: "draft_proposal", schema: DRAFT_SCHEMA, strict: true },
+      { name: "draft_proposal", schema: DRAFT_SCHEMA_STRICT, strict: true },
       ctx
     );
     return {
-      value: validateDraftProposal(parsed, {
+      value: validateReceived(() => validateDraftProposal(decodeMcpArguments(parsed), {
         taskId: ctx.taskId,
         proposalId: `${ctx.taskId}-${ctx.callId}`,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -173,14 +265,14 @@ export class OpenAIAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateReviewDecision(parsed, {
+      value: validateReceived(() => validateReviewDecision(parsed, {
         taskId: ctx.taskId,
         proposalId: input.draft.proposalId,
         // 프롬프트를 어떻게 구성했는지에 대한 사실이므로 우리가 기록한다 — 모델에게 묻지 않는다.
         reviewMode: input.blind ? "blind" : "informed",
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -194,11 +286,11 @@ export class OpenAIAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateSingleModelFixResult(parsed, {
+      value: validateReceived(() => validateSingleModelFixResult(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -212,11 +304,11 @@ export class OpenAIAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateQuestionAnswer(parsed, {
+      value: validateReceived(() => validateQuestionAnswer(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -230,11 +322,11 @@ export class OpenAIAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validatePlanOutline(parsed, {
+      value: validateReceived(() => validatePlanOutline(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,
@@ -251,11 +343,11 @@ export class OpenAIAdapter implements ProviderAdapter {
       ctx
     );
     return {
-      value: validateSingleModelFixResult(parsed, {
+      value: validateReceived(() => validateSingleModelFixResult(parsed, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
-      }),
+      }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
       meta,

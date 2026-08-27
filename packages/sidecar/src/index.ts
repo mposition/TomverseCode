@@ -153,6 +153,7 @@ export function createSidecar(
       transport,
       routerOptions: routerOptionsFromEnv(),
       adapterOptions: { fake },
+      ...(providerTimeoutFromEnv() !== undefined ? { providerTimeoutMs: providerTimeoutFromEnv()! } : {}),
     };
 
     const orchestrator = new Orchestrator(
@@ -243,6 +244,27 @@ function mergePolicy(partial: Partial<TaskPolicy> | undefined): TaskPolicy {
     ...(partial ?? {}),
     limits: { ...DEFAULT_TASK_POLICY.limits, ...(partial?.limits ?? {}) },
   };
+}
+
+/**
+ * 공급자 호출 타임아웃 override (`TOMVERSE_PROVIDER_TIMEOUT_MS`).
+ *
+ * **출력 예산과 분리된 값이다**(orchestrator.ts `DEFAULT_PROVIDER_TIMEOUT_MS` 참조). 응답
+ * 완결성을 우선해야 하는 측정에서는 길게, 응답 시간 SLA를 걸어야 하는 자리에서는 짧게 준다.
+ *
+ * **이상한 값은 조용히 무시하지 않는다.** 무시하면 기본값으로 돌아가는데, 그건 사용자가 준
+ * 설정이 적용된 줄 알고 있는 상태에서 다른 조건으로 도는 것이다 — 측정에서는 특히 나쁘다.
+ */
+function providerTimeoutFromEnv(): number | undefined {
+  const raw = process.env.TOMVERSE_PROVIDER_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `TOMVERSE_PROVIDER_TIMEOUT_MS는 양의 정수(밀리초)여야 합니다: ${JSON.stringify(raw)}`
+    );
+  }
+  return parsed;
 }
 
 function fakeOptionsFromEnv(): FakeProviderOptions | undefined {
