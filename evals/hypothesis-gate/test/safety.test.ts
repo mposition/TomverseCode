@@ -1,7 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2514,8 +2523,13 @@ test("53. 이 파일의 모든 provider 상호작용이 mock 또는 주입 어�
 const TEST_RECEIPT_ID = "receipt-smoke-test";
 const TEST_RECEIPT_HASH = "0".repeat(64);
 
-/** 이 카드/evidence를 승인한 것으로 간주하는 receipt. attestation 체인 검사의 상대편이다. */
-function receiptFor(card: RunCard, evidence: ProbeEvidence): ExecutionAuthorizationReceipt {
+/**
+ * 이 카드/evidence를 승인한 것으로 간주하는 receipt. attestation 체인 검사의 상대편이다.
+ *
+ * **해시를 그대로 둔 판**이다. 파일로 써서 CLI가 읽는 경로를 태울 때는 이쪽을 쓴다 —
+ * `readExecutionReceipts`가 `receiptHash`를 실제로 검증하므로 더미 해시는 거부된다.
+ */
+function signedReceiptFor(card: RunCard, evidence: ProbeEvidence): ExecutionAuthorizationReceipt {
   const facts: ReceiptFacts = {
     cardId: card.cardId,
     cardHash: card.cardHash,
@@ -2559,7 +2573,12 @@ function receiptFor(card: RunCard, evidence: ProbeEvidence): ExecutionAuthorizat
     createdAt: "2026-07-30T01:00:00.000Z",
     receiptId: TEST_RECEIPT_ID,
   });
-  return { ...receipt, receiptHash: TEST_RECEIPT_HASH };
+  return receipt;
+}
+
+/** 순수 `attestP0` 테스트용 — 기록의 `receiptHash`(더미)와 짝을 맞춘다. */
+function receiptFor(card: RunCard, evidence: ProbeEvidence): ExecutionAuthorizationReceipt {
+  return { ...signedReceiptFor(card, evidence), receiptHash: TEST_RECEIPT_HASH };
 }
 
 /** attestP0의 나머지 입력. 테스트마다 다시 적으면 검사 축이 조용히 빠진다. */
@@ -2806,7 +2825,7 @@ test("54. --run-card 없는 유료 pilot은 기록을 하나도 만들지 않고
 function approvalBundle(
   base: string,
   options: { credentialEnv?: NodeJS.ProcessEnv; executorModel?: string; reviewerModel?: string } = {}
-): { card: RunCard; cliArgs: string[]; evidenceFile: string; runDir: string } {
+): { card: RunCard; evidence: ProbeEvidence; cliArgs: string[]; evidenceFile: string; runDir: string } {
   const fixtures = typescriptFixtures();
   const now = new Date().toISOString();
   const registry = new ModelRegistry(BUILTIN_MODELS);
@@ -2854,6 +2873,7 @@ function approvalBundle(
 
   return {
     card: cards.p0,
+    evidence,
     // 카드가 출력한 명령의 CLI 부분. **손으로 조립하지 않는다.**
     cliArgs: ["pilot", ...cards.p0.runArgv.slice(cards.p0.runArgv.indexOf("--") + 1)],
     evidenceFile: evidenceStore.file,
@@ -3790,4 +3810,55 @@ test("74. P1은 카드가 가리키는 attestation이 바뀌면 실행 직전에
   const verdict = validateP0Attestation(rehashed, baseExpect);
   assert.equal(verdict.ok, false, "확인한 호출이 0건인 attestation을 통과시켰습니다");
   if (!verdict.ok) assert.ok(verdict.reasons.some((r) => r.includes("호출이 0건")), verdict.reasons.join(" / "));
+});
+
+// ---------------------------------------------------------------------------
+// 75. attest-p0가 attestation을 **어디에** 쓰는가 (§10.10)
+//
+// `attest-p0 --output`은 P0 **실행** 디렉터리다 — records.jsonl이 거기 있기 때문이다.
+// 그런데 승인 번들(cards/evidence/attestations)은 단계 디렉터리의 **형제**여야 한다.
+// approvalStore.ts가 그 이유를 적어두었다: "P0와 P1이 같은 번들을 공유한다 — evidence 하나가
+// 두 단계의 근거이고, P1 카드가 P0 attestation을 가리키기 때문이다."
+//
+// 실행 디렉터리로 번들 위치를 계산하면 attestation이 `<run-dir>/approvals/`에 떨어지고,
+// P1 카드를 만드는 `plan-pilot --output <root>`은 `<root>/approvals/attestations/`를 보므로
+// 그것을 **찾지 못한다.** 증상이 고약한 이유: attest-p0는 성공(exit 0)을 보고하고 파일도
+// 실제로 만들어지므로, 사라진 것은 결과가 아니라 **다음 단계와의 연결**이다.
+// ---------------------------------------------------------------------------
+
+test("75. attest-p0는 카드가 지정한 승인 번들에 attestation을 쓴다", () => {
+  withDir((base) => {
+    const bundle = approvalBundle(base);
+    const card = bundle.card;
+
+    // 카드가 요구한 기록 전부 + 그것을 승인한 receipt를 P0 실행 디렉터리에 놓는다.
+    // receipt는 **해시를 그대로 둔 판**이어야 한다 — CLI가 읽으면서 검증한다.
+    const receipt = signedReceiptFor(card, bundle.evidence);
+    const records = p0Records(card, bundle.evidence).map((r) => ({
+      ...r,
+      receiptId: receipt.receiptId,
+      receiptHash: receipt.receiptHash,
+    }));
+    mkdirSync(card.outputDir, { recursive: true });
+    const jsonl = (rows: readonly unknown[]): string => `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`;
+    writeFileSync(path.join(card.outputDir, "records.jsonl"), jsonl(records));
+    writeFileSync(path.join(card.outputDir, "budget-events.jsonl"), jsonl(p0Events(records)));
+    writeFileSync(path.join(card.outputDir, "execution-authorizations.jsonl"), jsonl([receipt]));
+
+    const result = runCli(["attest-p0", "--output", card.outputDir], CLI_FAKE_KEYS);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+
+    // 카드·evidence와 **같은 번들**에 있어야 한다. 그래야 plan-pilot이 찾는다.
+    const attestations = approvalPaths(base).attestations;
+    assert.ok(existsSync(attestations), `승인 번들에 attestation이 없습니다:\n${result.stdout}`);
+    assert.equal(readdirSync(attestations).filter((f) => f.endsWith(".json")).length, 1, result.stdout);
+    assert.equal(attestations, path.join(card.approvalsDir, "attestations"));
+
+    // 실행 디렉터리 아래에 두 번째 번들이 생기지 않는다.
+    assert.equal(
+      existsSync(path.join(card.outputDir, "approvals")),
+      false,
+      `승인 번들이 단계 디렉터리 아래로 갈라졌습니다:\n${result.stdout}`
+    );
+  });
 });
