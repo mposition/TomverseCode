@@ -800,10 +800,34 @@ function readEventsSafely(
  */
 export function classifyInfrastructureFailure(
   result: HostRunResult,
-  evidence: { eventsReadable: boolean; providerCalls: readonly { status: string }[] }
+  evidence: { eventsReadable: boolean; providerCalls: readonly { status: string; errorKind?: string }[] }
 ): FailureClass | undefined {
   if (result.spawnError) return "host_crash";
-  if (result.failureReason === "provider_config_error") return "auth_failure";
+  if (result.failureReason === "provider_config_error") {
+    /**
+     * **`provider_config_error`는 거친 묶음이다 — 그 안에서 다시 갈라야 한다.**
+     *
+     * 오케스트레이터는 재시도 불가 오류를 전부 이 사유로 끝낸다: `auth`, `rejected`,
+     * `model_unavailable`, 그리고 **`schema_violation`**. 그런데 게이트에서 이 넷은 서로 다른
+     * 칸에 들어가야 한다 — 특히 `schema_violation`은 **모델/파이프라인 실패**이므로 성공률의
+     * **분모에 남아야 한다.**
+     *
+     * 예전에는 넷을 통째로 `auth_failure`(인프라)로 적었다. 그래서 모델이 스키마를 어긴 기록이
+     * "인프라 문제"로 세탁되어 **분모에서 빠졌다.** 실측(P1, 2026-08-27): `mfc-03`의 Arm A·C가
+     * fix loop에서 스키마를 어겼는데 두 arm의 분모가 24가 아니라 23이 됐다 — 통과율과
+     * 신뢰구간이 서 있는 바닥이 arm마다 달라진 것이다.
+     *
+     * 그리고 이 방향의 오류는 **결과를 좋게 만든다.** 실패한 기록이 분모에서 빠지므로
+     * 통과율이 올라간다. 측정 도구에서 가장 경계해야 하는 종류다.
+     *
+     * 호출별 사실(`errorKind`)이 호스트의 거친 사유보다 정확하므로 그쪽을 먼저 본다.
+     */
+    const kinds = new Set(evidence.providerCalls.map((call) => call.errorKind).filter(Boolean));
+    if (kinds.has("schema_violation")) return "schema_violation";
+    if (kinds.has("rejected")) return "invalid_request";
+    // `auth`·`model_unavailable`·알 수 없음은 자격증명 축의 사실이다.
+    return "auth_failure";
+  }
 
   const allCallsSucceeded =
     evidence.eventsReadable &&

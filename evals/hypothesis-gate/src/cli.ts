@@ -175,7 +175,7 @@ const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.
     log("옵션: --fixtures a,b --arms A,B,C,D --repetitions N --seed N");
     log("      --max-cost-usd N --max-concurrency 1 --resume --output <run-dir>");
     log("      --stage smoke|pilot|confirmatory --executor-model <id> --reviewer-model <id>");
-    log("      plan-pilot 전용: --p0-max-cost-usd N --p1-max-cost-usd N");
+    log("      plan-pilot 전용: --p0-max-cost-usd N --p1-max-cost-usd N --p2-max-cost-usd N");
     log("      유료 실행 필수: --run-card <path>   (선택: --probe-evidence <path>)");
     log("");
     log("--max-cost-usd는 실제 공급자를 쓰는 pilot/run에 **필수**입니다 (우회 옵션 없음).");
@@ -413,6 +413,7 @@ const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.
       outputRoot: options.output,
       ...(options.p0MaxCostUsd !== undefined ? { p0ApprovedLimitUsd: options.p0MaxCostUsd } : {}),
       ...(options.p1MaxCostUsd !== undefined ? { p1ApprovedLimitUsd: options.p1MaxCostUsd } : {}),
+      ...(options.p2MaxCostUsd !== undefined ? { p2ApprovedLimitUsd: options.p2MaxCostUsd } : {}),
       models,
       extraBlockers: extra,
       createdAt: now,
@@ -424,7 +425,7 @@ const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.
       joinPath: (a, b) => path.join(a, b),
     });
 
-    for (const card of [cards.p0, cards.p1]) {
+    for (const card of [cards.p0, cards.p1, cards.p2]) {
       for (const line of renderRunCard(card)) log(line);
       // **카드를 immutable 번들에 남긴다.** 실행이 이 파일을 요구하므로, 출력만 하고 끝나면
       // 승인 절차가 강제되지 않는다. 같은 id에 다른 내용을 쓰려 하면 예외로 멈춘다.

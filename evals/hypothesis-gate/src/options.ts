@@ -39,6 +39,8 @@ export interface CliOptions {
   p0MaxCostUsd?: number;
   /** plan-pilot 전용 — P1 단계에 승인할 금액. P0와 규모가 크게 다르므로 따로 받는다. */
   p1MaxCostUsd?: number;
+  /** confirmatory 승인 상한. P1과 따로 받는다 — 규모가 3배라 같은 승인으로 덮지 않는다. */
+  p2MaxCostUsd?: number;
   /**
    * 유료 실행이 근거로 삼는 Run Card 파일. **pilot/run에 필수다**(fake 실행은 면제).
    *
@@ -181,6 +183,9 @@ export function parseArgs(argv: string[], defaultOutput: string): CliOptions {
         break;
       case "--p1-max-cost-usd":
         options.p1MaxCostUsd = parseCostLimit(next());
+        break;
+      case "--p2-max-cost-usd":
+        options.p2MaxCostUsd = parseCostLimit(next());
         break;
       case "--stage":
         options.stage = parseStage(next());

@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { armExecutionOrder, ARMS, armSpec } from "../src/arms.js";
+import { buildStagedCards } from "../src/runCard.js";
+import { CRITERIA } from "../src/criteria.js";
 import {
   artifactsPresent,
   artifactsRootFor,
@@ -669,4 +671,79 @@ test("초안 캐시는 arm별로 나뉜다 — 생성 arm이 둘이기 때문이
     // C가 건너뛰어지지 않았어야 한다 — 건너뛰면 fixture_setup_failure로 남는다.
     assert.notEqual(armC!.failureClass, "fixture_setup_failure", "Arm C가 초안을 받지 못했습니다");
   });
+});
+
+test("provider_config_error를 통째로 auth_failure로 적지 않는다", () => {
+  // 오케스트레이터는 재시도 불가 오류를 전부 이 사유로 끝낸다 — auth, rejected,
+  // model_unavailable, 그리고 schema_violation. 그런데 게이트에서 이 넷은 서로 다른 칸에
+  // 들어가야 한다. 특히 schema_violation은 **모델/파이프라인 실패**이므로 분모에 남아야 한다.
+  //
+  // 실측(P1, 2026-08-27): mfc-03의 Arm A·C가 fix loop에서 스키마를 어겼는데 두 arm의 분모만
+  // 24가 아니라 23이 됐다. 실패한 기록이 분모에서 빠지면 **통과율이 올라간다** — 측정 도구에서
+  // 가장 경계해야 하는 방향의 오류다.
+  const host = {
+    stderr: "",
+    exitCode: 1,
+    status: "failed",
+    summary: "",
+    failureReason: "provider_config_error",
+    taskId: "t",
+    mutatedPaths: [],
+    eventTypes: [],
+    dbPath: "",
+    wallClockMs: 1,
+  } as unknown as Parameters<typeof classifyInfrastructureFailure>[0];
+
+  const withKind = (errorKind: string) => ({
+    eventsReadable: true,
+    providerCalls: [{ status: "succeeded" }, { status: "failed", errorKind }],
+  });
+
+  assert.equal(classifyInfrastructureFailure(host, withKind("schema_violation")), "schema_violation");
+  assert.equal(classifyInfrastructureFailure(host, withKind("rejected")), "invalid_request");
+  assert.equal(classifyInfrastructureFailure(host, withKind("auth")), "auth_failure");
+  assert.equal(classifyInfrastructureFailure(host, withKind("model_unavailable")), "auth_failure");
+
+  // 호출 사실이 없으면 알 수 있는 것이 사유뿐이다 — 보수적으로 자격증명 축에 둔다.
+  assert.equal(
+    classifyInfrastructureFailure(host, { eventsReadable: true, providerCalls: [] }),
+    "auth_failure"
+  );
+});
+
+test("schema_violation은 분모에 남는다 — 인프라 실패가 아니다", () => {
+  // 분류가 바뀌면 분모가 바뀐다. 그 연결을 테스트가 지킨다.
+  assert.equal(isInfrastructureFailure("schema_violation"), false);
+  assert.equal(isInfrastructureFailure("invalid_request"), true);
+  assert.equal(isInfrastructureFailure("auth_failure"), true);
+  assert.equal(isInfrastructureFailure("provider_timeout"), true);
+});
+
+test("confirmatory 카드가 있어야 승인 체인이 P1에서 끊기지 않는다", () => {
+  // `run`은 --run-card를 필수로 받는데 카드 생성기가 smoke/pilot 두 장만 냈다. 그래서
+  // **confirmatory를 승인할 방법이 없었다** — PASS/FAIL이 나오는 유일한 단계인데도.
+  const cards = buildStagedCards({
+    fixtures: loadAllFixtures(FIXTURES, listFixtureIds(FIXTURES)),
+    arms: ["A", "B", "C", "D"],
+    seed: 1,
+    maxConcurrency: 1,
+    outputRoot: "/out",
+    models: { blockers: ["테스트"], probeGaps: [] },
+    createdAt: "2026-01-01T00:00:00.000Z",
+    credentialsPresent: false,
+    joinPath: (a, b) => `${a}/${b}`,
+  });
+
+  assert.equal(cards.p2.stage.stage, "confirmatory");
+  // **반복 횟수는 상수가 아니라 기준에서 온다.** 기준을 바꾸면 이 단계도 따라와야 한다 —
+  // 따라오지 않으면 "PASS를 낼 수 있는 단계"가 기준을 만족하지 못하게 된다.
+  assert.equal(cards.p2.stage.repetitions, CRITERIA.minRepetitions);
+  assert.equal(cards.p2.stage.plannedRecords, cards.p1.stage.plannedRecords * CRITERIA.minRepetitions);
+
+  // 단계마다 다른 디렉터리를 쓴다 — 섞이면 집계가 조용히 틀린다.
+  const dirs = [cards.p0.outputDir, cards.p1.outputDir, cards.p2.outputDir];
+  assert.equal(new Set(dirs).size, 3, `단계가 디렉터리를 공유합니다: ${dirs.join(", ")}`);
+
+  // 승인 상한을 주지 않으면 유료 실행을 승인할 수 없다.
+  assert.notEqual(cards.p2.status, "READY_FOR_P1_APPROVAL");
 });

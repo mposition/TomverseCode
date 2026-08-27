@@ -72,6 +72,13 @@ export function summarizeArm(records: readonly GateRunRecord[], arm: ArmId): Arm
     oraclePassRate: evaluable.length === 0 ? 0 : oraclePasses / evaluable.length,
     publicPasses: evaluable.filter((r) => r.publicVerificationPassed).length,
     infraFailures: armRecords.length - evaluable.length,
+    excludedRuns: armRecords
+      .filter((r) => !isEvaluable(r))
+      .map((r) => ({
+        fixtureId: r.fixtureId,
+        repetition: r.repetition,
+        ...(r.failureClass ? { failureClass: r.failureClass } : {}),
+      })),
     meanCostUsd: evaluable.length === 0 ? 0 : totalCost / evaluable.length,
     costPerSuccessUsd: oraclePasses === 0 ? null : totalCost / oraclePasses,
     meanLatencyMs: latencies.length === 0 ? 0 : latencies.reduce((a, b) => a + b, 0) / latencies.length,
