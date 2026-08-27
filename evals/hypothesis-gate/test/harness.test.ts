@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { armExecutionOrder, ARMS, armSpec } from "../src/arms.js";
-import { artifactsPresent, HOST_BIN, REPO_ROOT } from "../src/host.js";
+import { artifactsPresent, HOST_BIN, REPO_ROOT, resolveProviderArgs } from "../src/host.js";
 import { loadAllFixtures, loadFixture, listFixtureIds } from "../src/manifest.js";
 import { openRecordStore } from "../src/records.js";
 import { budgetStop, fillReviewerContributions, runExperiment } from "../src/runner.js";
@@ -254,6 +254,32 @@ test("예산 소진 판정이 경계에서 정확하다", () => {
   assert.equal(budgetStop(0.99, 1), false);
   assert.equal(budgetStop(1, 1), true, "정확히 상한에 도달하면 새 호출을 시작하지 않는다");
   assert.equal(budgetStop(1.5, 1), true);
+});
+
+test("fake 실행은 실제 공급자에 닿지 않는다", () => {
+  // 이 검사가 순수 함수인 이유: 키가 없는 기계에서는 실제 공급자가 후보에 없어 어떤 통합
+  // 테스트든 통과한다. 그러면 **키가 있을 때만 나는 결함**을 잡지 못한다 — 실제로 그래서
+  // 오래 살아남았다. 실행 결과가 아니라 "무엇을 요청하는가"를 직접 본다.
+  assert.deepEqual(resolveProviderArgs(["openai"], true), ["fake-a"]);
+  assert.deepEqual(resolveProviderArgs(["anthropic"], true), ["fake-b"]);
+  assert.deepEqual(resolveProviderArgs(["openai", "anthropic"], true), ["fake-a", "fake-b"]);
+
+  // 실제 실행은 그대로 실제 공급자로 간다.
+  assert.deepEqual(resolveProviderArgs(["openai", "anthropic"], false), ["openai", "anthropic"]);
+
+  // 이미 가짜인 이름은 건드리지 않는다 (triageCalibration이 그렇게 넘긴다).
+  assert.deepEqual(resolveProviderArgs(["fake-a", "fake-b"], true), ["fake-a", "fake-b"]);
+
+  // **개수가 보존되어야 arm의 의미가 유지된다** — 단독 arm은 reviewer가 드롭되고
+  // 교차검증 arm은 독립 reviewer가 배정되는데, 그 판단이 공급자 개수로 이뤄지기 때문이다.
+  for (const spec of ARMS) {
+    const mapped = resolveProviderArgs(spec.providers, true);
+    assert.equal(mapped.length, spec.providers.length, `Arm ${spec.arm}의 공급자 개수가 바뀌었습니다`);
+    assert.equal(new Set(mapped).size, mapped.length, `Arm ${spec.arm}에 중복 공급자가 생겼습니다`);
+    for (const provider of mapped) {
+      assert.ok(provider.startsWith("fake-"), `Arm ${spec.arm}이 fake 실행에서 실제 공급자 ${provider}를 요청합니다`);
+    }
+  }
 });
 
 test("fake 실행은 비용을 잴 수 없어도 중단하지 않는다", async () => {

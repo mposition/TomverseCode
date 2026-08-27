@@ -63,6 +63,8 @@ export interface RunnerOptions {
   realProvider?: boolean;
   /** fake provider 스크립트 — 하네스 자동 테스트 전용. 있으면 기록이 `providerKind: "fake"`가 된다. */
   fakeScript?: unknown;
+  /** 호스트 바이너리 override — 하네스 자동 테스트 전용 (host.ts 참조). */
+  hostBin?: string;
   executorModel?: string;
   reviewerModel?: string;
   /** 이 실행을 승인한 receipt. 모든 기록에 그대로 실린다 (§2.3). */
@@ -550,6 +552,7 @@ function executeOne(options: ExecuteOneOptions): RecordWithDraft {
       timeoutMs: manifest.timeoutMs,
       ...(options.replayDraft !== undefined ? { replayDraft: options.replayDraft } : {}),
       ...(options.fakeScript !== undefined ? { fakeScript: options.fakeScript } : {}),
+      ...(options.hostBin !== undefined ? { hostBin: options.hostBin } : {}),
       ...(options.executorModel ? { executorModel: options.executorModel } : {}),
       ...(options.reviewerModel ? { reviewerModel: options.reviewerModel } : {}),
     });

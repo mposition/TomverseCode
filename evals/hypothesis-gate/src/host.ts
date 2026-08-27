@@ -55,6 +55,16 @@ export interface HostRunOptions {
   replayDraft?: unknown;
   /** fake provider 스크립트 (하네스 자동 테스트 전용). 실제 실험에서는 undefined다. */
   fakeScript?: unknown;
+  /**
+   * 실행할 호스트 바이너리 경로. **하네스 자동 테스트 전용이며 CLI로는 노출되지 않는다.**
+   *
+   * 있는 이유: 호스트가 뜨지 못했을 때의 경로(인프라 실패 → 비용 미측정 → 중단)를 검증하려면
+   * 실패를 **결정론적으로** 만들 수 있어야 한다. 예전에는 그 실패를 "자격증명이 없으니 공급자
+   * 후보가 비어 호스트가 거부한다"로 만들고 있었는데, 그건 검증이 **환경에 의존**한다는 뜻이다 —
+   * 키가 있는 기계에서는 실제 호출이 성공해 테스트가 실패하고, 그 과정에서 **실제 돈이 나간다.**
+   * 게이트를 돌리려면 반드시 키가 있어야 하므로 하필 그 환경에서만 그렇게 된다.
+   */
+  hostBin?: string;
   /** 모델 override — Model Registry의 축을 그대로 쓴다. 하드코딩하지 않는다. */
   executorModel?: string;
   reviewerModel?: string;
@@ -74,6 +84,47 @@ export interface HostRunResult {
   /** 프로세스를 띄우지도 못한 경우 — 인프라 실패로 분류된다. */
   spawnError?: string;
   wallClockMs: number;
+}
+
+/**
+ * fake 실행에서 arm의 실제 공급자를 대신할 로컬 가짜 공급자.
+ *
+ * # 왜 필요한가 — fake 모드가 실제 돈을 쓸 수 있었다
+ *
+ * `host.rs`는 fake 모드에서 후보에 `fake-a/b/c`를 **더하기만** 하고, 그 다음 `--providers`가
+ * 후보를 **좁힌다.** 그래서 arm A가 `--providers openai`를 주면 교집합이 `["openai"]`가 되어
+ * 가짜 항목이 전부 탈락하고 **실제 `gpt-4.1`이 선택된다.** `TOMVERSE_FAKE_SCRIPT`는
+ * `apiBaseUrl`이 `local://`인 항목에만 적용되므로(`providers/factory.ts`) 진짜 어댑터가 만들어져
+ * 실제 요청이 나간다.
+ *
+ * 증상이 환경에 따라 갈려서 오래 보이지 않았다: 키가 없는 기계에서는 후보가 가짜뿐이라
+ * 정상 동작하고, **키가 있는 기계에서만** 실제 호출이 된다. 그리고 게이트를 돌리려면
+ * 반드시 키가 있어야 하므로, 하필 실행하려는 환경에서만 새어 나간다.
+ *
+ * 새는 것이 돈만이 아니다. fake 실행은 `--max-cost-usd`와 `--run-card`를 면제받고(`cli.ts`)
+ * 예산 원장도 타지 않으므로, **유료 실행 안전장치 전체를 우회한 실제 호출**이 된다.
+ * 게다가 그 기록은 `providerKind: "fake"`로 남는다.
+ *
+ * 그래서 "fake 실행"이라는 선언이 곧 "실제 공급자에 닿을 수 없다"가 되도록 여기서 이름을
+ * 바꾼다. 공급자 **개수**는 그대로이므로 검수자 독립성 판단(단독 arm은 reviewer 드롭,
+ * 교차검증 arm은 독립 reviewer 배정)도 그대로다 — arm의 의미는 바뀌지 않는다.
+ *
+ * `arms.ts`를 고치지 않는 이유: 그 파일의 공급자 이름은 비용 추정·attestation·preflight가
+ * 함께 읽는 값이고, 그것들이 각자 fake를 다시 해석하면 반드시 갈라진다(`modelForRole` 주석).
+ * 바꿔야 하는 것은 **이번 실행이 무엇에 닿는가** 하나뿐이라 호출 경계에서만 바꾼다.
+ */
+const FAKE_PROVIDER_FOR = Object.freeze<Record<string, string>>({
+  openai: "fake-a",
+  anthropic: "fake-b",
+});
+
+/**
+ * fake 실행이면 실제 공급자 이름을 가짜 항목으로 바꾼다. 이미 가짜이거나 모르는 이름은
+ * 그대로 둔다 — `triageCalibration`은 처음부터 `fake-a/fake-b`를 넘긴다.
+ */
+export function resolveProviderArgs(providers: readonly string[], usingFake: boolean): string[] {
+  if (!usingFake) return [...providers];
+  return providers.map((p) => FAKE_PROVIDER_FOR[p] ?? p);
 }
 
 /**
@@ -101,7 +152,7 @@ export function runHost(options: HostRunOptions): HostRunResult {
     "--sidecar",
     SIDECAR_ENTRY,
     "--providers",
-    options.providers.join(","),
+    resolveProviderArgs(options.providers, options.fakeScript !== undefined).join(","),
     "--timeout-secs",
     String(Math.ceil(options.timeoutMs / 1000)),
     // 파일 변경을 자동 승인한다: 이 실험은 승인 UX가 아니라 수정 품질을 측정한다.
@@ -125,7 +176,7 @@ export function runHost(options: HostRunOptions): HostRunResult {
   if (options.reviewerModel) env.TOMVERSE_REVIEWER_MODEL = options.reviewerModel;
 
   const started = Date.now();
-  const result = spawnSync(HOST_BIN, args, {
+  const result = spawnSync(options.hostBin ?? HOST_BIN, args, {
     encoding: "utf8",
     // 호스트 자체 타임아웃보다 넉넉하게 — 호스트가 스스로 정리할 기회를 준다.
     timeout: options.timeoutMs + 60_000,
