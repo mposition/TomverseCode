@@ -147,11 +147,26 @@ export class ToolBridge {
 
   // ---- 읽기 헬퍼 (Context Engine이 쓴다) ----
 
-  async listFiles(path = "."): Promise<{ path: string; isDir: boolean; sizeBytes: number }[]> {
+  /**
+   * 파일 목록 — **잘렸는지도 함께 돌려준다** (context-engine 18절).
+   *
+   * 종전에는 배열만 돌려줬다. 실제 도구는 5000개에서 자르고 `truncated`를 함께 내는데
+   * **여기서 그 값을 버렸으므로**, 인덱스가 워크스페이스의 일부만 담은 채 만들어져도
+   * 그 사실이 아무 데도 남지 않았다 — 16절이 `search_text`에서 고친 것과 같은 모양이고,
+   * 이쪽이 더 넓게 퍼진다: 인덱스는 캐시에 저장되고 다음 태스크가 그대로 쓴다.
+   */
+  async listFiles(path = "."): Promise<ListResult> {
     const { result } = await this.execute("list_files", { path });
-    const output = expectOk(result, "list_files");
-    const entries = (output as { entries?: unknown }).entries;
-    return Array.isArray(entries) ? (entries as { path: string; isDir: boolean; sizeBytes: number }[]) : [];
+    const output = expectOk(result, "list_files") as { entries?: unknown; truncated?: unknown };
+    const entries = Array.isArray(output.entries)
+      ? (output.entries as { path: string; isDir: boolean; sizeBytes: number }[])
+      : [];
+    return {
+      entries,
+      // **`null`과 `false`는 다르다.** 말하지 않은 호스트를 "안 잘렸다"로 읽으면 우리가
+      // 모르는 것을 안다고 주장하게 된다(16절이 개수에 대해 세운 규칙과 같다).
+      truncated: typeof output.truncated === "boolean" ? output.truncated : null,
+    };
   }
 
   async readFile(path: string): Promise<{ content: string | null; truncated: boolean; sizeBytes: number; binary: boolean }> {
@@ -207,7 +222,10 @@ export class ToolBridge {
       : [];
     return {
       matches,
-      truncated: output.truncated === true,
+      // **`null`과 `false`를 뭉개지 않는다.** 16절은 이 규칙을 개수(`skippedSecretFiles`)에만
+      // 적용하고 불리언은 `=== true`로 접었다 — 말하지 않은 호스트가 "안 잘렸다"고 주장하는
+      // 셈이었고, 그건 같은 거짓말이 옆칸에서 살아남은 것이다(18절).
+      truncated: typeof output.truncated === "boolean" ? output.truncated : null,
       // **없는 것과 0은 다르다.** 필드를 내지 않는 구현(옛 호스트)에서 0으로 위장하면
       // "건너뛴 것이 없다"가 되고, 그건 우리가 아는 사실이 아니다.
       skippedSecretFiles: typeof output.skippedSecretFiles === "number" ? output.skippedSecretFiles : null,
@@ -227,11 +245,26 @@ export class ToolBridge {
   }
 }
 
+/** `list_files`의 결과 — 본 것과 **다 봤는지**를 함께 담는다 (context-engine 18절). */
+export interface ListResult {
+  entries: { path: string; isDir: boolean; sizeBytes: number }[];
+  /**
+   * 목록이 호스트의 상한에서 잘렸는가.
+   *
+   * `null`은 **"호스트가 말하지 않았다"**이고 `false`는 "안 잘렸다"이다. 뭉개면 옛 호스트가
+   * 조용히 "이게 전부다"라고 주장하게 된다.
+   */
+  truncated: boolean | null;
+}
+
 /** `search_text`의 결과 — 찾은 것과 **못 본 것**을 함께 담는다 (58절). */
 export interface SearchResult {
   matches: { path: string; line: number; text: string }[];
-  /** 결과가 상한에서 잘렸는가. 잘렸으면 "여기 없다"는 결론이 성립하지 않는다. */
-  truncated: boolean;
+  /**
+   * 결과가 상한에서 잘렸는가. 잘렸으면 "여기 없다"는 결론이 성립하지 않는다.
+   * `null`은 호스트가 말하지 않은 경우다 — `false`(안 잘렸다)와 다른 사실이다.
+   */
+  truncated: boolean | null;
   /**
    * 검색이 **읽지 않고 건너뛴** 비밀값 파일 수.
    *
@@ -240,6 +273,30 @@ export interface SearchResult {
    */
   skippedSecretFiles: number | null;
 }
+
+/**
+ * 실제 도구가 내는데 **브리지가 일부러 꺼내지 않는** 값들 — context-engine 18절.
+ *
+ * # 왜 목록으로 적어 두는가
+ *
+ * 16.1절과 18.1절이 같은 결함을 두 번 찾았다: Rust가 사실을 하나 내는데 Node 쪽에서 그 값을
+ * 읽는 코드가 없고, **읽지 않는다는 사실이 아무 데도 적혀 있지 않다.** 그러면 "일부러 안
+ * 읽는 것"과 "빠뜨린 것"이 코드에서 구별되지 않고, 빠뜨린 쪽은 아무도 알아채지 못한다.
+ *
+ * 그래서 결정을 여기 적는다. `packages/sidecar/test/contextClaim.test.ts`가 Rust의 응답
+ * 조립부에서 키를 유도해 대조하므로, **새 사실이 늘면 여기서 결정을 내려야 통과한다** —
+ * 꺼내 쓰거나, 안 쓰는 이유를 적거나.
+ */
+export const UNREAD_TOOL_FACTS: Record<string, readonly string[]> = {
+  // 목록을 요청한 경로(정규화된 값). 우리는 언제나 `"."`로 부르므로 답이 정해져 있다.
+  list_files: ["root"],
+  // 호스트가 실제로 실은 **바이트 수**. 쓰지 않는 이유는 단위가 섞이기 때문이다 —
+  // Node 쪽 `includedBytes`는 예산 계산과 함께 `string.length`(UTF-16 단위)로 다시
+  // 계산되고(`budget.ts`), 한 필드에 두 단위가 섞이면 그 숫자는 무엇도 뜻하지 않게 된다.
+  // 바이트로 통일하려면 예산 계산까지 바꿔야 하고, 그건 이 결정과 별개다.
+  read_file: ["includedBytes", "path"],
+  search_text: [],
+};
 
 function expectOk(result: ToolResult, tool: string): unknown {
   if (result.status !== "ok") {

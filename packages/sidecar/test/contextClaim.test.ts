@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { declaresSection, PYTEST_SECTIONS } from "../src/context/engine.js";
+import { ToolBridge, UNREAD_TOOL_FACTS } from "../src/tools/bridge.js";
+import { FakeHost } from "./helpers/fakeHost.js";
 
 /**
  * **감지가 두 곳에 있다 — 그러면 갈린다** (state-machine 49.3절).
@@ -112,23 +114,138 @@ function searchKeysOf(source: string, open: string, close: string): string[] {
   return [...new Set([...quoted, ...shorthand])];
 }
 
-test("fake의 search_text가 실제 도구와 같은 사실을 낸다", () => {
+/**
+ * **실제 도구가 내는 사실 중 브리지가 꺼내지 않는 것을 목록으로 고정한다** —
+ * context-engine 18절.
+ *
+ * 16.1절과 18.1절이 같은 결함을 두 번 찾았다: Rust가 사실을 내는데 Node가 그 값을 읽지 않고,
+ * **읽지 않는다는 사실이 아무 데도 적혀 있지 않다.** 그러면 "일부러 안 읽는 것"과 "빠뜨린
+ * 것"이 코드에서 구별되지 않는다 — 그리고 빠뜨린 쪽은 침묵이라 드러나지 않는다.
+ *
+ * 두 번 모두 사람이 우연히 발견했다. 이제는 **새 사실이 늘면 결정을 내려야 지나간다**:
+ * 브리지가 꺼내거나, `UNREAD_TOOL_FACTS`에 이유와 함께 적거나.
+ *
+ * # 무엇을 무엇과 대조하는가
+ *
+ * 내는 쪽은 **Rust 소스**(응답 조립부의 키), 꺼내는 쪽은 **실행 결과**(브리지가 돌려준
+ * 객체의 키)다. 타입 선언을 파싱하지 않는 이유는 그것이 계약이지 동작이 아니기 때문이다 —
+ * 타입에 있는데 채우지 않는 코드는 타입 대조를 통과한다.
+ */
+const REAL_OUTPUT_BLOCKS: { tool: string; open: string; close: string; expandBack?: string }[] = [
+  { tool: "list_files", open: '"entries": entries,', close: "}),"},
+  // **블록의 시작으로 되짚는다.** `"binary": false`는 텍스트 분기를 가리키는 유일한 표식인데
+  // 그 앞에 `"path"`가 있다 — 표식에서 그대로 자르면 앞에 있는 키를 통째로 놓치고, 그러면
+  // 이 검사가 "실제 도구가 내지 않는다"고 말하게 된다(실측으로 `path`가 그랬다).
+  { tool: "read_file", open: '"binary": false,', close: "}),", expandBack: "json!({" },
+  { tool: "search_text", open: '"matches": matches,', close: "}),"},
+];
+
+/** 표식이 가리키는 자리에서 **블록의 시작으로 되짚는다.** 잘라 낸 앞쪽에 키가 있으면 안 된다. */
+function backUpTo(source: string, marker: string, blockStart: string): string {
+  const at = source.indexOf(marker);
+  assert.notEqual(at, -1, `${marker}를 찾지 못했습니다`);
+  const start = source.lastIndexOf(blockStart, at);
+  assert.notEqual(start, -1, `${marker} 앞에서 ${blockStart}를 찾지 못했습니다`);
+  return source.slice(start, at + marker.length);
+}
+
+function sampleHost(): FakeHost {
+  return new FakeHost({
+    files: [{ path: "src/a.ts", isDir: false, sizeBytes: 10 }],
+    contents: { "src/a.ts": "const a = 1;\n" },
+    gitStatus: "## main",
+  });
+}
+
+async function bridgeKeysOf(tool: string): Promise<string[]> {
+  const bridge = new ToolBridge(sampleHost().asTransport(), "task-1");
+  if (tool === "list_files") return Object.keys(await bridge.listFiles("."));
+  if (tool === "read_file") return Object.keys(await bridge.readFile("src/a.ts"));
+  if (tool === "search_text") return Object.keys(await bridge.searchText("a"));
+  throw new Error(`모르는 도구: ${tool}`);
+}
+
+/**
+ * fake가 **실제로 내는** 키. 소스를 파싱하지 않는다 — 이 대역은 우리 코드라 그냥 돌리면 된다.
+ *
+ * 종전에는 `search_text`만, 그것도 소스 문자열로 대조했다. 도구마다 표식을 손으로 적어야
+ * 해서 늘리기 어려웠고, 그래서 `list_files`와 `read_file`은 **대조가 아예 없었다**(16.5절이
+ * 남겨 둔 항목). 값으로 재면 표식이 필요 없다.
+ */
+async function fakeOutputKeys(tool: string): Promise<string[]> {
+  const args: Record<string, Record<string, unknown>> = {
+    list_files: { path: "." },
+    read_file: { path: "src/a.ts" },
+    search_text: { pattern: "a", path: "." },
+  };
+  const { result } = await sampleHost().asTransport().request<{
+    result: { output?: Record<string, unknown> };
+  }>("tool.execute", {
+    request: { requestId: "r", taskId: "task-1", tool, args: args[tool] ?? {} },
+  });
+  return Object.keys(result.output ?? {});
+}
+
+/**
+ * **fake가 게으르면 검사도 게을러진다** — 세 도구 전부에 적용한다 (18절).
+ *
+ * 16.2절이 `search_text`에 세운 규율이고, 16.5절은 나머지 둘에 **대조가 없다**고 적어 두었다.
+ * 실제로 없는 동안 fake의 `list_files`는 `truncated`를 언제나 `false`로 냈고 `root`를 아예
+ * 내지 않았다 — 하필 그 `truncated`가 18절이 읽기 시작한 값이다.
+ */
+test("fake가 세 읽기 도구 모두에서 실제 도구와 같은 사실을 낸다", async () => {
   const rust = readFileSync(TOOLS_RS, "utf8");
-  // 실제 도구의 응답 조립부 — `matches`로 시작하는 json! 블록.
-  const realKeys = searchKeysOf(rust, '"matches": matches,', "}),");
-  assert.ok(realKeys.includes("matches"), realKeys.join(", "));
-  assert.ok(realKeys.length >= 3, `실제 도구의 응답 키를 ${realKeys.length}개만 읽었습니다`);
+  for (const block of REAL_OUTPUT_BLOCKS) {
+    const from = block.expandBack ? backUpTo(rust, block.open, block.expandBack) : block.open;
+    const realKeys = searchKeysOf(rust, from, block.close);
+    assert.ok(realKeys.length >= 2, `${block.tool}의 응답 키를 ${realKeys.length}개만 읽었습니다`);
 
-  const fake = readFileSync(FAKE_HOST, "utf8");
-  const fakeKeys = searchKeysOf(fake, "return ok({ matches", ");");
+    const fakeKeys = await fakeOutputKeys(block.tool);
+    const missing = realKeys.filter((k) => !fakeKeys.includes(k));
+    assert.deepEqual(
+      missing,
+      [],
+      `fake의 ${block.tool}이 실제 도구가 내는 사실을 빠뜨립니다: ${missing.join(", ")}. ` +
+        `fake가 내지 않는 값은 단위 테스트로 검증할 수 없고, 그 값을 읽는 코드를 지워도 ` +
+        `아무것도 실패하지 않습니다.`
+    );
+  }
+});
 
-  const missing = realKeys.filter((k) => !fakeKeys.includes(k));
-  assert.deepEqual(
-    missing,
-    [],
-    `fake의 search_text가 실제 도구가 내는 사실을 빠뜨립니다: ${missing.join(", ")}. ` +
-      `fake가 내지 않는 값은 단위 테스트로 검증할 수 없고, 그 값을 읽는 코드를 지워도 아무것도 실패하지 않습니다`
-  );
+test("브리지가 꺼내지 않는 사실은 전부 이유와 함께 적혀 있다", async () => {
+  const rust = readFileSync(TOOLS_RS, "utf8");
+  let checked = 0;
+
+  for (const block of REAL_OUTPUT_BLOCKS) {
+    const from = block.expandBack ? backUpTo(rust, block.open, block.expandBack) : block.open;
+    const realKeys = searchKeysOf(rust, from, block.close);
+    assert.ok(realKeys.length >= 2, `${block.tool}의 응답 키를 ${realKeys.length}개만 읽었습니다`);
+    const exposed = new Set(await bridgeKeysOf(block.tool));
+    const declared = new Set(UNREAD_TOOL_FACTS[block.tool] ?? []);
+
+    const undecided = realKeys.filter((k) => !exposed.has(k) && !declared.has(k));
+    assert.deepEqual(
+      undecided,
+      [],
+      `${block.tool}이 내는데 브리지가 꺼내지도, 안 쓴다고 적지도 않은 사실이 있습니다: ` +
+        `${undecided.join(", ")}. 꺼내 쓰거나 UNREAD_TOOL_FACTS에 이유와 함께 적으세요 — ` +
+        `적지 않으면 "일부러 안 읽는 것"과 "빠뜨린 것"이 구별되지 않습니다(16.1·18.1절).`
+    );
+
+    // 반대 방향: 목록이 낡으면 "안 쓰기로 했다"가 계속 남는다.
+    const stale = [...declared].filter((k) => !realKeys.includes(k));
+    assert.deepEqual(stale, [], `${block.tool}: 실제 도구가 내지 않는 키가 목록에 남아 있습니다: ${stale.join(", ")}`);
+    checked += 1;
+  }
+  assert.equal(checked, REAL_OUTPUT_BLOCKS.length, "도구를 다 돌지 않았습니다");
+});
+
+/** 세 도구가 **전부** 대조된다 — 하나라도 목록에서 빠지면 그 도구의 갈림은 다시 침묵이 된다. */
+test("읽기 도구 셋이 모두 대조 목록에 있다", () => {
+  const tools = REAL_OUTPUT_BLOCKS.map((b) => b.tool).sort();
+  assert.deepEqual(tools, ["list_files", "read_file", "search_text"], tools.join(", "));
+  // `UNREAD_TOOL_FACTS`의 키도 같은 집합이어야 한다 — 한쪽에만 있으면 결정이 새는 자리가 생긴다.
+  assert.deepEqual(Object.keys(UNREAD_TOOL_FACTS).sort(), tools, Object.keys(UNREAD_TOOL_FACTS).join(", "));
 });
 
 /**

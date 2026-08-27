@@ -174,11 +174,11 @@ export class ContextEngine {
     }
 
     const startedAt = Date.now();
-    const entries = await bridge.listFiles(".");
+    const listing = await bridge.listFiles(".");
     const fileTree: WorkspaceIndexFileEntry[] = [];
     const excluded: { path: string; reason: string }[] = [];
 
-    for (const entry of entries) {
+    for (const entry of listing.entries) {
       if (entry.isDir) continue;
       if (fileTree.length >= this.maxIndexedFiles) {
         excluded.push({ path: entry.path, reason: `인덱싱 상한(${this.maxIndexedFiles}개) 초과` });
@@ -211,6 +211,10 @@ export class ContextEngine {
       dependencyEdges: [],
       projectMeta,
       excluded,
+      // **잘린 목록으로 만든 인덱스라는 사실이 인덱스에 남아야 한다**(18절). 스냅샷을 만들
+      // 때 다시 물을 수 없기 때문이다 — 인덱스는 캐시에서 올 수 있고, 그때는 `list_files`를
+      // 부르지도 않는다.
+      listingTruncated: listing.truncated,
       builtAt: now,
       lastIncrementalUpdateAt: now,
     };
@@ -264,6 +268,11 @@ export class ContextEngine {
     // **파일에 대한 노트와 따로 모은다**(17절). 검색이 못 본 범위는 파일이 아니고, 같은
     // 목록에 넣으면 `(search: foo)`가 파일 이름으로 프롬프트와 화면에 나간다.
     const coverageNotes: { scope: string; reason: string }[] = [];
+    // **인덱스가 전부를 봤는지 말한다**(18절). 이 노트가 없으면 잘린 목록으로 만든 인덱스와
+    // 온전한 인덱스가 프롬프트에서도 화면에서도 **똑같아 보인다** — 그리고 인덱스는
+    // 캐시되므로 그 침묵이 다음 태스크들로 이어진다.
+    const listingNote = listingCoverageNote(index.listingTruncated);
+    if (listingNote) coverageNotes.push(listingNote);
 
     const candidates = await this.selectRelevantFiles(
       bridge,
@@ -643,10 +652,14 @@ export class ContextEngine {
             reason: `비밀값 파일 ${found.skippedSecretFiles}개는 검색하지 않았습니다 — 거기 있었다면 찾지 못했습니다.`,
           });
         }
-        if (found.truncated) {
+        // **`null`은 "잘리지 않았다"가 아니다**(18절). 모르는 것을 낙관으로 접지 않는다.
+        if (found.truncated !== false) {
           coverage.push({
             scope: `본문 검색: ${keyword}`,
-            reason: "검색 결과가 상한에서 잘렸습니다 — 이 키워드로 찾은 것이 전부가 아닙니다.",
+            reason:
+              found.truncated === true
+                ? "검색 결과가 상한에서 잘렸습니다 — 이 키워드로 찾은 것이 전부가 아닙니다."
+                : "검색 결과가 전부인지 호스트가 말하지 않았습니다 — 전부라고 가정할 수 없습니다.",
           });
         }
 
@@ -877,4 +890,27 @@ function hashString(input: string): string {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36);
+}
+
+/**
+ * 인덱스가 **전부를 봤는지**에 대한 범위 노트 — context-engine 18절.
+ *
+ * 세 값이 세 문장이다. `false`만 침묵이고, `null`은 침묵이 아니다 — "말하지 않았다"를
+ * "안 잘렸다"로 접으면 우리가 모르는 것을 안다고 주장하게 된다(16절의 `null` vs `0` 규칙).
+ */
+export function listingCoverageNote(
+  truncated: boolean | null | undefined
+): { scope: string; reason: string } | null {
+  if (truncated === false) return null;
+  if (truncated === true) {
+    return {
+      scope: "파일 목록",
+      reason:
+        "워크스페이스 파일 목록이 호스트 상한에서 잘렸습니다 — 여기 없는 파일이 저장소에 있을 수 있습니다.",
+    };
+  }
+  return {
+    scope: "파일 목록",
+    reason: "파일 목록이 전부인지 호스트가 말하지 않았습니다 — 전부라고 가정할 수 없습니다.",
+  };
 }

@@ -203,6 +203,18 @@ export interface WorkspaceIndex {
   projectMeta: ProjectMeta;
   /** 하드 필터로 인덱스 진입 자체가 막힌 파일 (context-engine.md 7절) */
   excluded: { path: string; reason: string }[];
+  /**
+   * **호스트의 파일 목록이 상한에서 잘렸는가** — context-engine.md 18절.
+   *
+   * `excluded`와 다른 사실이다. 저쪽은 "봤고 일부러 뺐다"이고 이쪽은 **"보지도 못했다"**이다 —
+   * 잘린 뒤의 파일은 `fileTree`에도 `excluded`에도 없으므로, 이 값이 없으면 그 파일들은
+   * 어디에서도 언급되지 않는다.
+   *
+   * `null`/부재는 **"모른다"**이다(옛 호스트, 또는 이 필드가 생기기 전에 저장된 캐시).
+   * `false`로 접지 않는다 — 인덱스는 캐시에 저장되어 다음 태스크가 그대로 쓰므로, 여기서
+   * 한 번 접으면 그 거짓이 계속 재사용된다.
+   */
+  listingTruncated?: boolean | null;
   builtAt: ISODateTime;
   lastIncrementalUpdateAt: ISODateTime;
 }

@@ -9,6 +9,14 @@ import { classifyFile } from "../../src/context/exclude.js";
  * fixture로 200개를 만들어야 하는데, 그건 검사를 읽을 수 없게 만든다. 맞춰야 하는 것은
  * 숫자가 아니라 **`truncated`가 참이 되는 경로가 존재한다**는 사실이다.
  */
+/**
+ * fake의 파일 목록 상한 (18절).
+ *
+ * 실제는 5000이다. **맞추지 않는 것이 의도다** — 자르는 경로가 존재한다는 사실만 있으면
+ * 되고, 5000개짜리 fixture는 읽을 수 없다. 기존 fixture는 전부 이보다 작으므로 걸리지 않는다.
+ */
+export const FAKE_MAX_LIST_ENTRIES = 50;
+
 export const FAKE_MAX_SEARCH_MATCHES = 3;
 
 /**
@@ -254,8 +262,22 @@ export class FakeHost {
     });
 
     switch (request.tool) {
-      case "list_files":
-        return ok({ entries: this.options.files ?? [], truncated: false });
+      // **상한을 흉내 낸다**(18절). 자르는 경로가 fake에 없으면 `truncated`를 읽는 코드도,
+      // 그 값이 만드는 범위 노트도 단위 테스트로는 검증되지 않는다 — 16.2절이 검색에서
+      // 배운 것과 같다.
+      //
+      // **숫자는 실제(5000)와 맞추지 않는다.** 맞춰야 하는 것은 숫자가 아니라 자르는 경로가
+      // 존재한다는 사실이고, 5000개짜리 fixture는 검사를 읽을 수 없게 만든다. 기존
+      // fixture들이 걸리지 않을 만큼 크되 테스트로 넘길 수 있을 만큼 작게 잡는다.
+      case "list_files": {
+        const all = this.options.files ?? [];
+        const truncated = all.length > FAKE_MAX_LIST_ENTRIES;
+        return ok({
+          entries: truncated ? all.slice(0, FAKE_MAX_LIST_ENTRIES) : all,
+          truncated,
+          root: ".",
+        });
+      }
       case "read_file": {
         const path = String(request.args.path);
         const content = this.options.contents?.[path];
@@ -271,7 +293,16 @@ export class FakeHost {
             policy: { decision: "auto_approve", riskLevel: "none", reason: "", matchedRule: "", normalizedTarget: path },
           };
         }
-        return ok({ path, binary: false, content, sizeBytes: content.length, truncated: false });
+        // **실제 도구가 내는 키를 전부 낸다**(18절). Node가 읽지 않기로 한 값이라도 fake가
+        // 내지 않으면 "안 읽는다"와 "낼 수 없다"가 구별되지 않는다.
+        return ok({
+          path,
+          binary: false,
+          content,
+          sizeBytes: content.length,
+          includedBytes: content.length,
+          truncated: false,
+        });
       }
       // **진짜로 찾는다**(51절). 빈 배열을 돌려주면 본문 기반 선정이 "찾지 못했다"로 돌고,
       // 그 검사는 무엇도 검사하지 못한 채 통과한다 — fake가 게으르면 검사도 게을러진다.

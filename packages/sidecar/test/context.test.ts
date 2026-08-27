@@ -6,6 +6,7 @@ import {
   extractKeywords,
   extractMentions,
   hasUncommittedChanges,
+  listingCoverageNote,
   parseBranch,
   parseNpmScripts,
 } from "../src/context/engine.js";
@@ -16,7 +17,7 @@ import {
   truncateToTokens,
   windowAroundLines,
 } from "../src/context/budget.js";
-import { FAKE_MAX_SEARCH_MATCHES, FakeHost } from "./helpers/fakeHost.js";
+import { FAKE_MAX_LIST_ENTRIES, FAKE_MAX_SEARCH_MATCHES, FakeHost } from "./helpers/fakeHost.js";
 import { ToolBridge } from "../src/tools/bridge.js";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -1246,6 +1247,72 @@ test("검색 결과가 잘렸다는 사실이 노트에 남는다", async () => 
 });
 
 /**
+ * **목록도 잘린다 — 그리고 아무도 그 사실을 읽지 않았다** — context-engine 18절.
+ *
+ * 실제 `list_files`는 5000개에서 자르고 `truncated`를 함께 내는데, 브리지가 배열만 꺼내면서
+ * 그 값을 버렸다. 그래서 인덱스가 워크스페이스의 **일부만** 담은 채 만들어져도 그 사실이
+ * 아무 데도 남지 않았다 — 16절이 검색에서 고친 것과 같은 모양이고, 이쪽이 더 넓게 퍼진다:
+ * 인덱스는 캐시에 저장되고 다음 태스크가 그대로 쓴다.
+ */
+test("파일 목록이 잘리면 그 사실이 범위 노트에 남는다", async () => {
+  const files = Array.from({ length: FAKE_MAX_LIST_ENTRIES + 2 }, (_u, i) => `src/f${i}.ts`);
+  const host = new FakeHost({
+    files: files.map((path) => ({ path, isDir: false, sizeBytes: 20 })),
+    contents: Object.fromEntries(files.map((path) => [path, "export const a = 1;\n"])),
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "무언가 고쳐주세요",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+
+  const note = (snapshot.coverageNotes ?? []).find((n) => n.scope === "파일 목록");
+  assert.ok(note, JSON.stringify(snapshot.coverageNotes));
+  assert.match(note.reason, /잘렸습니다/);
+  // **"여기 없으니 없다"를 막는 문장이어야 한다.** 잘렸다는 사실만으로는 읽는 쪽이 무엇을
+  // 하지 말아야 하는지 모른다.
+  assert.match(note.reason, /있을 수 있습니다/);
+});
+
+/** 안 잘렸으면 **그 노트가 없다** — 언제나 붙으면 신호가 아니라 배경이 된다. */
+test("파일 목록이 안 잘렸으면 그 노트가 없다", async () => {
+  const host = new FakeHost({
+    files: [{ path: "src/a.ts", isDir: false, sizeBytes: 20 }],
+    contents: { "src/a.ts": "export const a = 1;\n" },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "무언가 고쳐주세요",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+  assert.ok(
+    !(snapshot.coverageNotes ?? []).some((n) => n.scope === "파일 목록"),
+    JSON.stringify(snapshot.coverageNotes)
+  );
+});
+
+/**
+ * **세 값이 세 문장이다** — `false`만 침묵이다.
+ *
+ * 호스트가 말하지 않은 것(`null`)을 "안 잘렸다"로 접으면 우리가 모르는 것을 안다고 주장하게
+ * 된다. 16절이 개수에 대해 세운 규칙과 같고, 이 절은 그것을 불리언에도 적용한다.
+ */
+test("호스트가 말하지 않은 것과 안 잘린 것을 구별한다", () => {
+  assert.equal(listingCoverageNote(false), null);
+  const unknown = listingCoverageNote(null);
+  const cut = listingCoverageNote(true);
+  assert.ok(unknown && cut);
+  assert.notEqual(unknown.reason, cut.reason, "모르는 것과 잘린 것을 같은 문장으로 말합니다");
+  assert.match(unknown.reason, /말하지 않았습니다/);
+  // 필드가 아예 없는 경우(이 필드가 생기기 전에 저장된 캐시)도 "모른다"다.
+  assert.deepEqual(listingCoverageNote(undefined), unknown);
+});
+
+/**
  * **`null`과 `0`을 뭉개지 않는다** — 호스트가 이 사실을 말하지 않은 것과 "건너뛴 것이 없다"는
  * 다른 사실이다. 뭉개면 옛 호스트나 게으른 fake가 조용히 "건너뛴 것 없음"을 주장한다.
  */
@@ -1267,7 +1334,9 @@ test("호스트가 말하지 않으면 건너뛴 수는 null이다", async () =>
 
   const found = await new ToolBridge(transport, "task-1").searchText("x");
   assert.equal(found.skippedSecretFiles, null, "필드가 없는데 0으로 위장했습니다");
-  assert.equal(found.truncated, false);
+  // **불리언도 같은 규칙이다**(18절). 16절은 이 규칙을 개수에만 적용하고 여기서는 `false`로
+  // 접었는데, 그건 말하지 않은 호스트가 "안 잘렸다"고 주장하는 것과 같다.
+  assert.equal(found.truncated, null, "필드가 없는데 false로 위장했습니다");
 });
 
 /**
