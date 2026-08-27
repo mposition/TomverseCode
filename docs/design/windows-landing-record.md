@@ -30,16 +30,20 @@
 
 ## 2. 결말 요약
 
-`tomverse-host windows-landing --workspace <repo>` 은 실측 전후 모두
-`verdict = incomplete`, `remaining = 25`를 낸다. **도구가 사람의 확인을 받아들이지 못하기
-때문이며, 실측이 성과가 없었다는 뜻이 아니다.**
+`tomverse-host windows-landing --workspace <repo>` 은 `verdict = incomplete`,
+`remaining = 25`를 낸다 — **실측 전후가 같다.** 도구가 사람의 확인을 받아들이지 못하기
+때문이며(15절), 실측이 성과가 없었다는 뜻이 아니다.
+
+`--bundle <산출물>`을 함께 주면 `verdict = not_landed`, `remaining = 24`가 된다.
+**나빠진 것이 아니라 알게 된 것이다** — 처음에는 번들을 만들 수조차 없어 이 항목이
+"측정 불가"였고, 지금은 무엇이 왜 빠졌는지가 판정으로 남는다(5절).
 
 아래는 사람이 실제로 태워본 결과다.
 
 | 그룹 | 도구 판정 | 사람이 확인한 것 |
 |---|---|---|
 | `jobObject` | incomplete | 3개 중 2.5개 확인. 실제 취소에서 `TerminateJobObject`로 트리가 죽었다 |
-| `sidecarBundle` | incomplete | **막혔다 — 번들을 만들 수 없다**(4절) |
+| `sidecarBundle` | **not_landed** | 번들은 만들어진다(4절 해결). **동봉 설정이 없다**(5절) |
 | `credentialStore` | incomplete | 실측 대상 아님. 미구현 |
 | `commandResolution` | incomplete | **3개 모두 확인** |
 | `processGroup` | incomplete | 태우지 못함(강제할 스위치가 없다) |
@@ -73,50 +77,73 @@
 
 ---
 
-## 4. 착지 차단 — Tauri 껍데기 크레이트가 컴파일되지 않는다
+## 4. 해결됨 — Tauri 껍데기 크레이트가 컴파일되지 않았다
 
-**`sidecarBundle` 그룹 전체가 여기서 막힌다.** `scripts\tauri-build.bat`이 실패한다:
+**처음 실측했을 때 `sidecarBundle` 그룹 전체가 여기서 막혀 있었다.** `scripts\tauri-build.bat`이
+`error: could not compile `desktop` (lib) due to 32 previous errors`로 실패했고, 그래서 이
+항목은 "실패"가 아니라 **측정 불가**였다. 지금은 고쳤다(커밋: "껍데기가 core를 따라가지 못한 채…").
 
-```
-error: could not compile `desktop` (lib) due to 32 previous errors
-```
+성격이 둘로 갈렸고, 그 구분이 요점이다.
 
-성격은 **core와 껍데기의 API 드리프트**이고, Windows 전용 문제가 아니다(타입 오류다).
+**(a) 애초에 컴파일된 적이 없는 코드** — 함수 파라미터에 `///` 문서 주석 24곳
+(`lib.rs`·`session.rs`). Rust에 없는 자리라 하드 오류다. 설명은 살리고 형식만 `//`로 바꿨다.
 
-| 오류 | 자리 |
+**(b) core가 앞서가고 껍데기가 남은 드리프트** — 사라진 API가 아니었다:
+
+| 증상 | 실제 원인 |
 |---|---|
-| 함수 **파라미터**에 `///` 주석 (12곳, 하드 오류) | `src/session.rs:972~` |
-| `with_store_prose` 메서드 없음 | `src/session.rs:1014` |
-| `with_store`에 `StoreOp` 인자 — 시그니처가 1인자로 바뀜 | `src/session.rs:1142` |
-| `UiMessage.text` 필드 없음 (`code`/`params`/`message`) | `src/session.rs:1057` |
-| `read_store`가 `Result<_, UiMessage>` — `?`로 String 변환 불가 | `src/session.rs:676` |
-| `task_policy_from` 인자 타입 (`bool` ↔ `&str`) | `src/session.rs:556` |
-| `start_task` 인자 11개 중 9번(`kind: &str`) 누락 | `src/session.rs:1189` |
-| `envelope`가 `Result<_, UiMessage>`를 기대 | `src/lib.rs:247` |
+| `with_store_prose`가 없다 | `SessionState`의 메서드인데 `Arc<TaskHost>`에 대고 불렀다 |
+| `with_store`가 1인자다 | 같은 이유. `StoreOp`를 넘긴 것 자체가 `SessionState` 쪽을 의도했다는 증거다 |
+| `UiMessage.text`가 없다 | `message`로 이름이 바뀌었다 |
+| `?`가 String으로 변환되지 않는다 | `task_export`가 봉투를 쓰면서 반환만 산문이었다 |
+| `task_policy_from` 인자 타입 | 불리언 `is_question`이 `kind: &str`로 바뀔 때 호출부 둘이 안 따라왔다 |
 
-**왜 아무도 몰랐는가**: `scripts\cargo-check-desktop.bat`은 존재하는데 **`verify`에 들어 있지
-않다.** 검증이 도는 길 위에 없으면 드리프트는 조용히 쌓인다.
+**고치다 드러난 것 셋** (전부 컴파일과 무관한 결함이다):
 
-**이번 세션에서 고치지 않은 이유**: `StoreOp`(스토어 접근 감사 라벨로 보인다)와 `UiMessage`는
-보안·감사 배관이고, 사라진 API를 추측으로 되살리는 것은 착지 *측정*의 범위를 넘는다.
-`credentialStore`를 미구현으로 분리해 보고하는 것과 같은 판단이다.
+1. **`create_task`의 실패가 버려지고 있었다.** `with_store_prose`가 두 겹 `Result`를 돌려주는데
+   바깥에만 `?`를 걸고 안쪽을 `;`로 버렸다. 태스크 행이 만들어지지 않아도 그대로 진행하고,
+   존재하지 않는 태스크에 이벤트를 붙이게 된다 — **원칙 7이 조용히 깨진다.**
+2. **`autopilot_preview`가 종류를 몰랐다.** 무인 스위치는 화면의 종류 게이트 **밖**에 있어
+   질문·계획 태스크에서도 켤 수 있다. `false`를 그대로 `"change"`로 옮겼다면 미리보기가
+   **실제로는 좁혀질 쓰기 도구를 "그냥 지나갑니다"로** 보고했을 것이다.
+3. **`restart_task`도 종류를 몰랐다.** 그리고 복원할 수도 없다 — `tasks`에도 `TaskRow`에도
+   `kind` 컬럼이 없고, 이벤트에 남는 것은 파생값인 `allowedTools`뿐이다. `"change"`를 박으면
+   **질문으로 물었던 것이 재실행에서 쓰기 도구를 들고 돈다.** 화면이 지금 고른 값을 보내게 했다
+   (그 함수의 주석이 이미 "다시 실행은 새 태스크다"라고 말하고 있다).
 
-**다음 사람에게**: 이걸 고친 뒤 **반드시 `cargo-check-desktop`을 `verify`에 넣을 것.**
-넣지 않으면 같은 일이 반복되고, 다음번에도 착지 직전에 발견된다.
+**왜 아무도 몰랐는가 — 그리고 무엇을 바꿨는가.** `scripts\cargo-check-desktop.bat`은 존재했지만
+**`verify`에 들어 있지 않았다.** 껍데기는 core를 부르기만 하므로 core를 고쳐도 core의 테스트는
+전부 통과하고, 어긋난 사실이 드러나는 곳은 껍데기 컴파일뿐이다. 이제 `desktop:check`가 두
+진입점 모두에 있다. `verifyOrder.test.ts`의 단계 이름 목록에도 넣었다 — **그 목록에 없는
+단계는 두 진입점 비교에서 보이지 않으므로**, 넣지 않았다면 한쪽에만 추가해도 검사가 통과했다.
 
-그리고 고쳐도 번들은 아직 비어 있다 — 5절.
+리눅스에서는 tauri가 GUI 시스템 라이브러리를 요구해 이 단계가 실패한다. 조용히 건너뛰는 것보다
+낫다 — 그 환경에서는 앱을 만들 수 없다는 사실이 그대로 드러나야 한다.
 
 ---
 
-## 5. 착지 차단 — sidecar를 번들에 넣는 설정이 없다
+## 5. `not_landed` — sidecar를 번들에 넣는 설정이 없다
+
+4절을 고친 덕분에 **이제 이것은 추측이 아니라 판정 결과다.** `scripts\tauri-build.bat`이
+통과해 설치본이 나오고(.msi 5.3 MiB / .exe 3.6 MiB), 그 산출물에 대고 물으면:
+
+```
+sidecarBundle: not_landed
+  - bundleContents: failed
+      node.exe=false index.js=false (…\target\release)
+```
 
 `process-architecture.md` 10.4절은 "번들 안에 `sidecar/node.exe`와 `sidecar/index.js`가 있다"를
 기준으로 못박는데, `apps/desktop/src-tauri/tauri.conf.json`에는 `bundle.resources`도
-`externalBin`도 `beforeBundleCommand`도 **없다.** 스테이징하는 스크립트도 찾지 못했다.
+`externalBin`도 `beforeBundleCommand`도 **없다.** 스테이징하는 스크립트도 없다. 즉 launcher가
+찾는 `Bundled` 경로는 **현재 어떤 빌드로도 만들어지지 않는다.**
 
-즉 `bundleContents`는 4절을 고치더라도 통과하지 못한다. 이 항목은 **확인이 아니라 개발이
-필요하다.** 결정할 것: 어느 Node 런타임을 동봉하는가(버전·라이선스·크기), 어디서 가져오는가,
-그리고 그것을 `tauri-build`의 어느 단계가 넣는가.
+이 항목은 **확인이 아니라 개발이 필요하다.** 결정할 것: 어느 Node 런타임을 동봉하는가
+(버전·라이선스·크기), 어디서 가져오는가, 그리고 그것을 `tauri-build`의 어느 단계가 넣는가.
+
+`bundleSizeRecorded`는 `passed`로 나오지만 **그 숫자를 믿지 말 것** — `--bundle`에
+`target/release`를 주면 빌드 산출물까지 세어 1586.9 MiB가 나온다. 실제 설치본은 위의
+5.3/3.6 MiB다. 동봉이 생기면 그때 잴 대상은 설치된 앱 디렉터리다.
 
 ---
 
@@ -270,6 +297,8 @@ CLAUDE.md가 npm shim에서 경계한 실패 모드("검증 없이 완료로 보
 | `core:test` | 679 통과 / **11 실패** | **698 통과 / 0 실패** |
 | `test:e2e` | 42 통과 / **3 실패** | **46 통과 / 0 실패** |
 | 가설 게이트 | 205 통과 / **1 실패** | **206 통과 / 0 실패** |
+| `desktop:check` | **verify에 없었다** (있었다면 32개 오류) | **0 오류 / 0 경고, verify에 포함** |
+| `scripts\tauri-build.bat` | 실패 (껍데기 컴파일 불가) | **통과 — .msi 5.3 MiB / .exe 3.6 MiB** |
 
 두 진입점(`scripts\verify.bat`과 루트 `verify`)의 결과가 **처음부터 끝까지 같았다** —
 과거에 한쪽만 `_env.bat`을 call해 갈라졌던 사고는 재발하지 않았다.
@@ -278,9 +307,11 @@ CLAUDE.md가 npm shim에서 경계한 실패 모드("검증 없이 완료로 보
 
 ## 14. 아직 사람이 해야 하는 것
 
-1. **Tauri 껍데기 크레이트를 고친다**(4절). 그다음 `cargo-check-desktop`을 `verify`에 넣는다.
-2. **sidecar 동봉을 설계하고 구현한다**(5절). 그전까지 `sidecarBundle`은 측정 불가다.
-3. **node 없는 Windows 머신에서 설치본을 실행한다** — 1·2가 끝나야 시작할 수 있다.
+1. ~~Tauri 껍데기 크레이트를 고친다. 그다음 `cargo-check-desktop`을 `verify`에 넣는다.~~
+   → **둘 다 했다**(4절). 번들이 만들어지고 `desktop:check`가 두 진입점에 있다.
+2. **sidecar 동봉을 설계하고 구현한다**(5절). `sidecarBundle`이 `not_landed`인 유일한 이유다.
+3. **node 없는 Windows 머신에서 설치본을 실행한다** — 2가 끝나야 의미가 있다.
+   (설치본은 이미 있다: `target\release\bundle\{msi,nsis}`.)
 4. **Python이 있는 머신에서 `pythonEnv` 셋을 태운다**(10절). 이 머신에는 Python이 없다.
 5. **강제 포기 경로**로 job 핸들 수명을 마저 확인한다(7절) — UI가 필요하다.
 6. **`processGroup` 둘**(12절). Ctrl+C 전파는 별도 콘솔에서, taskkill 폴백은 강제할 수단이 필요하다.
