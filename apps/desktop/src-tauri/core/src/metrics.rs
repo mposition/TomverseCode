@@ -376,6 +376,45 @@ pub struct IndexCache {
     /// 구축한 인덱스의 파일 수 분포 — 느린 것이 저장소가 커서인지 디스크가 느려서인지 가른다.
     #[serde(rename = "p90FileCount")]
     pub p90_file_count: Option<u64>,
+    /// 캐시에 저장되는 payload 크기 분포(바이트) — context-engine 16절.
+    ///
+    /// 심볼/의존성이 차면서 이 값이 커졌다. **얼마나 커졌는지 모르는 것이 결함**이므로
+    /// 여기서 잰다 — SQLite 한 행에 들어가는 크기이자 IPC 한 줄로 오가는 크기다.
+    #[serde(rename = "p90PayloadBytes")]
+    pub p90_payload_bytes: Option<u64>,
+}
+
+/// 심볼 인덱스 층이 실제로 도는가 (context-engine.md 5·16절).
+///
+/// **`indexCache`와 나눠 두는 이유**: 캐시의 질문은 "재사용이 이득인가"이고 여기의 질문은
+/// "파서가 돌기는 하는가"다. 후자가 아니오여도 태스크는 정상으로 보인다 — 폴백(ripgrep)이
+/// 있기 때문이다. 그 조용함이 이 집계가 존재하는 이유다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct SymbolIndexHealth {
+    /// 심볼 통계를 함께 남긴 구축 횟수. 옛 기록에는 없으므로 `builds`와 다를 수 있다.
+    pub builds: u64,
+    /// **grammar를 하나라도 못 실은 구축 횟수.** 0이 아니면 그 사용자에게 이 층은 없는 것이다.
+    #[serde(rename = "buildsWithGrammarFailure")]
+    pub builds_with_grammar_failure: u64,
+    /// 못 실은 언어들 (중복 없이). 배포 문제인지 특정 언어 문제인지 가른다.
+    #[serde(rename = "failedLanguages")]
+    pub failed_languages: Vec<String>,
+    /// 파싱까지 간 파일 수의 합.
+    #[serde(rename = "filesIndexedTotal")]
+    pub files_indexed_total: u64,
+    /// 문법 오류로 심볼을 잃은 파일 수의 합 (6.1절).
+    ///
+    /// 비율이 높으면 grammar 버전이 소스의 문법을 못 따라가는 것이다 — 고칠 자리는 추출
+    /// 규칙이 아니라 grammar 쪽이다.
+    #[serde(rename = "filesParseFailedTotal")]
+    pub files_parse_failed_total: u64,
+    #[serde(rename = "p90SymbolCount")]
+    pub p90_symbol_count: Option<u64>,
+    #[serde(rename = "p90EdgeCount")]
+    pub p90_edge_count: Option<u64>,
+    /// 구축 시간 중 **파싱에 쓴 시간**. 인덱스가 느려졌을 때 어디가 느린지 가른다.
+    #[serde(rename = "p90SymbolIndexMs")]
+    pub p90_symbol_index_ms: Option<u64>,
 }
 
 /// 표본이 부족할 때 "이 계획은 크다"고 볼 파일 수.
@@ -1003,6 +1042,9 @@ pub struct Metrics {
     /// 인덱스 캐시의 이득 (context-engine.md 2.1절).
     #[serde(rename = "indexCache")]
     pub index_cache: IndexCache,
+    /// 심볼 인덱스 층이 실제로 도는가 (context-engine.md 16절).
+    #[serde(rename = "symbolIndex")]
+    pub symbol_index: SymbolIndexHealth,
     /// IPC 한 줄 크기 분포 (process-architecture.md 3.1절).
     #[serde(rename = "ipcLineSizes")]
     pub ipc_line_sizes: IpcLineSizes,
@@ -1289,7 +1331,15 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "인덱스 캐시가 이득인가 (context-engine 2.1절)",
             "구축 + 적중 횟수",
             m.index_cache.builds + m.index_cache.hits,
-            "적중률이 아니라 savedMsTotal을 본다. 구축이 원래 빨랐다면 캐시는 지우는 것이 맞다",
+            "적중률이 아니라 savedMsTotal을 본다. 구축이 원래 빨랐다면 캐시는 지우는 것이 맞다. **심볼 층이 붙으면서 구축이 비싸졌으므로 이 질문의 답이 뒤집힐 수 있다** — p90PayloadBytes가 함께 커졌는지도 본다(context-engine 16절)",
+        ),
+        open_question(
+            "symbolIndex",
+            "symbolIndex",
+            "Tree-sitter 심볼 층이 실제로 돌고 있는가, 그리고 파싱 실패가 얼마나 되는가 (context-engine 16절)",
+            "심볼 통계를 남긴 인덱스 구축 횟수",
+            m.symbol_index.builds,
+            "buildsWithGrammarFailure가 0이 아니면 **그 사용자에게 이 층은 없는 것**이고, 화면은 폴백으로 조용히 돌고 있다 — 고칠 자리는 grammar 번들이지 추출 규칙이 아니다. filesParseFailedTotal 비율이 높으면 grammar 버전이 소스 문법을 못 따라가는 것이다",
         ),
     ]
 }
@@ -1392,6 +1442,10 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     let mut token_ratios: Vec<u64> = Vec::new();
     let mut build_ms: Vec<u64> = Vec::new();
     let mut index_file_counts: Vec<u64> = Vec::new();
+    let mut index_payload_bytes: Vec<u64> = Vec::new();
+    let mut index_symbol_counts: Vec<u64> = Vec::new();
+    let mut index_edge_counts: Vec<u64> = Vec::new();
+    let mut index_symbol_ms: Vec<u64> = Vec::new();
     // `예약 / 실제` × 100. 정수로 모으는 이유는 다른 지표와 같은 백분위 함수를 쓰기 위해서다.
     let mut headroom_ratios: Vec<u64> = Vec::new();
     for (task_id, terminal_status) in &tasks {
@@ -1654,6 +1708,36 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
                     if let Some(n) = event.payload.get("fileCount").and_then(Value::as_u64) {
                         index_file_counts.push(n);
                     }
+                    if let Some(n) = event.payload.get("payloadBytes").and_then(Value::as_u64) {
+                        index_payload_bytes.push(n);
+                    }
+                    // **심볼 통계가 없는 기록은 이 집계에 넣지 않는다.** 0으로 세면 심볼 층이
+                    // 없던 시절의 기록이 "심볼이 하나도 없다"로 읽히고, 그건 배선이 끊긴 것과
+                    // 구별되지 않는다(hitsWithoutSavedMs를 따로 센 것과 같은 이유).
+                    let Some(symbols) = event.payload.get("symbolCount").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    metrics.symbol_index.builds += 1;
+                    index_symbol_counts.push(symbols);
+                    if let Some(n) = event.payload.get("edgeCount").and_then(Value::as_u64) {
+                        index_edge_counts.push(n);
+                    }
+                    if let Some(n) = event.payload.get("symbolIndexMs").and_then(Value::as_u64) {
+                        index_symbol_ms.push(n);
+                    }
+                    let tally = |key: &str| event.payload.get(key).and_then(Value::as_u64).unwrap_or(0);
+                    metrics.symbol_index.files_indexed_total += tally("filesIndexed");
+                    metrics.symbol_index.files_parse_failed_total += tally("filesParseFailed");
+                    if let Some(failed) = event.payload.get("grammarFailures").and_then(Value::as_array) {
+                        if !failed.is_empty() {
+                            metrics.symbol_index.builds_with_grammar_failure += 1;
+                        }
+                        for language in failed.iter().filter_map(Value::as_str) {
+                            if !metrics.symbol_index.failed_languages.iter().any(|l| l == language) {
+                                metrics.symbol_index.failed_languages.push(language.to_string());
+                            }
+                        }
+                    }
                 }
                 "WORKSPACE_INDEX_CACHE_HIT" => {
                     metrics.index_cache.hits += 1;
@@ -1760,6 +1844,11 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
     metrics.index_cache.p50_build_ms = percentile(&build_ms, 50);
     metrics.index_cache.p90_build_ms = percentile(&build_ms, 90);
     metrics.index_cache.p90_file_count = percentile(&index_file_counts, 90);
+    metrics.index_cache.p90_payload_bytes = percentile(&index_payload_bytes, 90);
+    metrics.symbol_index.p90_symbol_count = percentile(&index_symbol_counts, 90);
+    metrics.symbol_index.p90_edge_count = percentile(&index_edge_counts, 90);
+    metrics.symbol_index.p90_symbol_index_ms = percentile(&index_symbol_ms, 90);
+    metrics.symbol_index.failed_languages.sort();
 
     metrics.token_estimate.p50_ratio_percent = percentile(&token_ratios, 50);
     metrics.token_estimate.p90_ratio_percent = percentile(&token_ratios, 90);
@@ -2944,6 +3033,82 @@ mod tests {
         assert_eq!(m.index_cache.hits, 2);
         assert_eq!(m.index_cache.saved_ms_total, 500);
         assert_eq!(m.index_cache.hits_without_saved_ms, 1);
+    }
+
+    // ---- 심볼 인덱스 (context-engine.md 16절) ----
+
+    #[test]
+    fn the_symbol_layer_reports_what_it_actually_did() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "WORKSPACE_INDEX_BUILT",
+                &json!({
+                    "buildMs": 900,
+                    "fileCount": 800,
+                    "payloadBytes": 1_500_000,
+                    "symbolCount": 12_000,
+                    "edgeCount": 900,
+                    "filesIndexed": 700,
+                    "filesParseFailed": 12,
+                    "symbolIndexMs": 700,
+                    "grammarFailures": [],
+                }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.symbol_index.builds, 1);
+        assert_eq!(m.symbol_index.builds_with_grammar_failure, 0);
+        assert_eq!(m.symbol_index.files_indexed_total, 700);
+        assert_eq!(m.symbol_index.files_parse_failed_total, 12);
+        assert_eq!(m.symbol_index.p90_symbol_count, Some(12_000));
+        assert_eq!(m.symbol_index.p90_edge_count, Some(900));
+        assert_eq!(m.symbol_index.p90_symbol_index_ms, Some(700));
+        // 캐시 payload 크기 — 심볼이 차면서 커진 값이고, 재는 자리가 여기다(16절).
+        assert_eq!(m.index_cache.p90_payload_bytes, Some(1_500_000));
+    }
+
+    /// **grammar를 못 실은 것은 조용한 실패다.** 태스크는 폴백으로 정상처럼 돌기 때문에,
+    /// 이 계수기가 유일하게 그 사실을 말한다.
+    #[test]
+    fn a_build_that_lost_a_grammar_is_counted_and_named() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "WORKSPACE_INDEX_BUILT",
+                &json!({
+                    "buildMs": 100,
+                    "symbolCount": 0,
+                    "grammarFailures": ["python", "rust"],
+                }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.symbol_index.builds_with_grammar_failure, 1);
+        assert_eq!(m.symbol_index.failed_languages, vec!["python", "rust"]);
+    }
+
+    /// 심볼 통계가 없는 옛 기록을 0으로 세면 **"심볼이 하나도 없다"와 "그 시절 기록이다"가
+    /// 같아진다.** `hitsWithoutSavedMs`를 따로 센 것과 같은 이유로 아예 넣지 않는다.
+    #[test]
+    fn a_build_from_before_the_symbol_layer_is_not_counted_as_zero_symbols() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "WORKSPACE_INDEX_BUILT",
+                &json!({ "buildMs": 20, "fileCount": 10 }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.index_cache.builds, 1);
+        assert_eq!(m.symbol_index.builds, 0);
+        assert_eq!(m.symbol_index.p90_symbol_count, None);
     }
 
     // ---- 열린 질문의 준비 상태 ----

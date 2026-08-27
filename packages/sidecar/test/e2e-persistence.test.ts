@@ -904,6 +904,73 @@ test("[시나리오 F] 인덱스 캐시가 프로세스를 넘어 살아남는�
   });
 });
 
+/**
+ * 심볼 층이 **실제 실행에서** 도는가 (context-engine.md 16절).
+ *
+ * # 왜 단위 테스트로 부족한가
+ *
+ * 14.4절이 기록한 실패가 정확히 이 모양이었다: 조각마다 검사가 있는데 **이어지지 않으면
+ * 기능은 없다.** 여기서 이어져야 하는 것은 세 프로세스에 걸쳐 있다 — Node가 파일을 도구로
+ * 받아 파싱하고, 인덱스를 IPC로 Rust에 넘기고, Rust가 그 **본문에서** 통계를 유도해 이벤트로
+ * 남기고, `metrics`가 그것을 집계한다. 어느 한 칸이 끊겨도 단위 테스트는 전부 통과한다.
+ *
+ * # 그리고 이 검사가 grammar 배포를 지킨다
+ *
+ * grammar를 못 실으면 오류가 아니라 **조용한 성능 저하**다(16.5절). `buildsWithGrammarFailure`가
+ * 0이라는 것은 이 환경에서 wasm 5개가 실제로 실렸다는 뜻이고, 번들에서 빠지면 여기서 걸린다.
+ */
+test("[시나리오 G] 실제 실행이 심볼 인덱스를 만들고 그 사실이 집계까지 간다", async () => {
+  requireArtifacts();
+  await withCtx({ gitRepo: true }, (ctx) => {
+    const result = spawnSync(HOST_BIN, runArgs(ctx, ["--mode", "fast", "--timeout-secs", "180"]), {
+      encoding: "utf8",
+      timeout: 210_000,
+      env: hostEnv(),
+    });
+    const line = (result.stdout ?? "").trim().split("\n").filter(Boolean).pop();
+    assert.ok(line, `결과 JSON이 없습니다:\n${result.stdout}\n${result.stderr}`);
+
+    const metrics = hostQuery(ctx, [
+      "metrics",
+      "--workspace",
+      ctx.repo.root,
+      "--db",
+      ctx.db,
+      "--artifacts",
+      ctx.artifacts,
+    ]) as {
+      symbolIndex: {
+        builds: number;
+        buildsWithGrammarFailure: number;
+        failedLanguages: string[];
+        filesIndexedTotal: number;
+        filesParseFailedTotal: number;
+        p90SymbolCount: number | null;
+      };
+      indexCache: { p90PayloadBytes: number | null };
+      openQuestions: { id: string }[];
+    };
+
+    assert.ok(metrics.symbolIndex.builds > 0, `심볼 통계가 이벤트까지 오지 않았습니다: ${JSON.stringify(metrics.symbolIndex)}`);
+    assert.equal(
+      metrics.symbolIndex.buildsWithGrammarFailure,
+      0,
+      `grammar를 싣지 못했습니다: ${metrics.symbolIndex.failedLanguages.join(", ")}`
+    );
+    // fixture는 JavaScript다(`paginate.js`) — 범위 안 언어이므로 파싱까지 가야 한다.
+    assert.ok(metrics.symbolIndex.filesIndexedTotal > 0, JSON.stringify(metrics.symbolIndex));
+    // **심볼이 0이면 "파싱했는데 아무것도 없다"이고, 그건 배선이 끊긴 것과 같은 모양이다.**
+    assert.ok(
+      (metrics.symbolIndex.p90SymbolCount ?? 0) > 0,
+      `파싱은 했는데 심볼이 하나도 없습니다: ${JSON.stringify(metrics.symbolIndex)}`
+    );
+    // payload 크기는 16절이 재기로 한 값이다 — 배선이 끊기면 null이 된다.
+    assert.ok((metrics.indexCache.p90PayloadBytes ?? 0) > 0, JSON.stringify(metrics.indexCache));
+    // 지표를 추가하면서 열린 질문에 넣지 않으면 아무도 읽지 않는 숫자가 된다(metrics.rs 모듈 주석).
+    assert.ok(metrics.openQuestions.some((q) => q.id === "symbolIndex"), JSON.stringify(metrics.openQuestions));
+  });
+});
+
 test("[시나리오 D] 저장된 이벤트에서 기준 계측을 집계할 수 있다", async () => {
   // 12절 미해결 두 항목("기준↔테스트 연결의 커버리지", "위치 충돌 규칙의 오탐률")은 집계로만
   // 답할 수 있는 질문이다. **실제 DB 파일**에서 그 집계가 나오는지를 여기서 확인한다 —

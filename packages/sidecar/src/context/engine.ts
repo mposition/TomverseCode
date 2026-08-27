@@ -1,9 +1,12 @@
 import type {
+  DependencyEdge,
   DetectedCommand,
   ModelId,
   ProjectMeta,
   RelevanceReason,
   RelevantFile,
+  SymbolEntry,
+  SymbolIndexReport,
   WorkspaceIndex,
   WorkspaceIndexFileEntry,
   WorkspaceSnapshot,
@@ -12,6 +15,15 @@ import { DEFAULT_CONTEXT_TOKEN_BUDGET } from "../budget/ledger.js";
 import type { ToolBridge } from "../tools/bridge.js";
 import { classifyFile, languageOf } from "./exclude.js";
 import { packageFiles, type TokenBudget } from "./budget.js";
+import { dependenciesWithinHops, symbolMatchFiles } from "./graph.js";
+import {
+  indexSymbols,
+  mergeSymbolIndex,
+  recountReport,
+  SYMBOL_INDEX_VERSION,
+  type IndexTarget,
+} from "./symbolIndex.js";
+import type { GrammarSet } from "./treeSitter.js";
 
 /**
  * Context Engine — docs/design/context-engine.md.
@@ -20,14 +32,15 @@ import { packageFiles, type TokenBudget } from "./budget.js";
  *  - `WorkspaceIndex`: **세션 스코프**. 파일 트리 + 프로젝트 메타. 비싼 작업을 여기서 1회.
  *  - `WorkspaceSnapshot`: **태스크 스코프**. 인덱스에서 관련 파일을 고르고 예산에 맞춰 패키징.
  *
- * 아직 하지 않은 것: Tree-sitter 심볼 그래프(9절). 그래서 `symbols`/`dependencyEdges`는
- * 비어 있고 `symbol-match` 선정은 동작하지 않는다. 두 타입을 분리해 둔 덕분에 나중에 심볼
- * 인덱스를 채워도 스냅샷 생성 쪽 계약은 바뀌지 않는다.
+ * **심볼 그래프가 생겼다**(16절). `symbols`/`dependencyEdges`를 Tree-sitter가 채우므로
+ * `symbol-match`(정의가 여기 있다)와 `dependency`(1~2홉 import 이웃) 선정이 실제로 동작한다.
+ * 두 타입을 분리해 둔 덕분에 그 층을 채우면서 스냅샷 생성 쪽 **계약은 바뀌지 않았다.**
  *
- * **그 대신 본문 검색을 쓴다**(51절). 종전에는 선정이 파일 **이름**만 봤고, 그래서
+ * **본문 검색은 남는다**(51절, 13절). 종전에는 선정이 파일 **이름**만 봤고, 그래서
  * `resolveBudget`을 고쳐 달라는 요청에서 그 함수가 `ledger.ts`에 있으면 우리는 그 파일을
- * 영원히 고르지 못했다. `content-match`가 그 자리를 메우되, 근거가 정규식이라는 사실은
- * 이름에 남는다.
+ * 영원히 고르지 못했다. 심볼이 생겨도 `content-match`를 지우지 않는 이유는 5절이 정한
+ * 그대로다: **파싱에 실패한 파일과 MVP 범위 밖 언어에는 폴백이 필요하다.** 그리고 두 층은
+ * 서로 앵커를 보탠다(15.2절 — 근거는 먼저 것을 지키고 앵커는 합친다).
  *
  * **모든 파일 접근이 `ToolBridge`(= Rust Tool Runtime)를 지난다.** 이 모듈에 `node:fs`
  * import가 없는 것은 실수가 아니라 신뢰 경계 원칙이다.
@@ -47,7 +60,15 @@ function isWorkspaceIndex(value: unknown): value is WorkspaceIndex {
     typeof candidate.workspaceId === "string" &&
     Array.isArray(candidate.fileTree) &&
     typeof candidate.projectMeta === "object" &&
-    candidate.projectMeta !== null
+    candidate.projectMeta !== null &&
+    Array.isArray(candidate.symbols) &&
+    Array.isArray(candidate.dependencyEdges) &&
+    // **버전을 본다.** 심볼 층이 붙으면서 파일 항목에 `symbolStatus`가 늘었는데, 옛 행에는
+    // 그 필드가 없다. 그대로 쓰면 모든 파일이 "상태를 모르는 파일"이 되고, 그건 화면에서
+    // "심볼이 없는 파일"과 구별되지 않는다 — 조용한 거짓이므로 없는 것으로 다룬다.
+    typeof candidate.symbolIndex === "object" &&
+    candidate.symbolIndex !== null &&
+    candidate.symbolIndex.version === SYMBOL_INDEX_VERSION
   );
 }
 
@@ -84,6 +105,26 @@ export function escapeRegExp(text: string): string {
 
 const MANIFEST_FILES = ["package.json", "Cargo.toml", "pyproject.toml", "go.mod", "pom.xml", "build.gradle"];
 
+/** pytest 선언을 찾는 파일들 — 증분에서 프로젝트 메타를 다시 읽을지 판정할 때 함께 본다. */
+const PYTEST_FILES = ["pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"];
+
+/**
+ * 심볼 매치가 키워드 하나로 넣을 수 있는 파일 수 상한 (원칙 5).
+ *
+ * 흔한 이름(`new`, `run`, `id`)은 저장소 전체에 정의가 흩어져 있다. 상한이 없으면 그 하나가
+ * `maxRelevantFiles`를 다 먹고, 정작 사용자가 지목한 파일이 밀려난다.
+ */
+const MAX_SYMBOL_MATCH_FILES_PER_KEYWORD = 3;
+
+/** 심볼 매치를 시도할 키워드 수 상한. 본문 검색과 같은 이유의 상한이다. */
+const MAX_SYMBOL_MATCH_KEYWORDS = 6;
+
+/** 의존성 순회 홉 수 — 4절이 "1~2홉 이내"라고 적었다. */
+const DEPENDENCY_MAX_HOPS = 2;
+
+/** 의존성 순회가 넣을 수 있는 파일 수 상한. 배럴 파일 하나가 컨텍스트를 다 먹지 않게 한다. */
+const MAX_DEPENDENCY_FILES = 4;
+
 /** 도구 실행 뒤 스냅샷을 다시 읽은 결과. **무엇이 달라졌는지도 값으로 남긴다.** */
 export interface SnapshotRefresh {
   snapshot: WorkspaceSnapshot;
@@ -107,6 +148,20 @@ export interface ContextEngineOptions {
   maxIndexedFiles?: number;
   /** 관련 파일 후보 최대 개수 */
   maxRelevantFiles?: number;
+  /**
+   * 증분으로 다시 파싱할 파일 수 상한 — 6절 표 3행("diff가 너무 크면 전체 재구축").
+   *
+   * 넘으면 전체 재구축으로 간다. 증분의 이득은 "안 바뀐 것을 다시 안 한다"인데, 대부분이
+   * 바뀌었으면 그 이득이 없고 대신 옛 인덱스를 들고 다니는 복잡도만 남는다.
+   */
+  maxIncrementalFiles?: number;
+  /**
+   * grammar 집합 주입 — **테스트용**이다.
+   *
+   * grammar를 못 실은 상황에서 선정이 어떻게 되는지는 검사할 수 있어야 하는데, 실제 적재를
+   * 실패시키는 방법은 패키지를 지우는 것뿐이다. 기본값은 프로세스 캐시(`loadGrammars`).
+   */
+  grammars?: GrammarSet;
 }
 
 export class ContextEngine {
@@ -120,10 +175,14 @@ export class ContextEngine {
   private indexKey: string | null = null;
   private readonly maxIndexedFiles: number;
   private readonly maxRelevantFiles: number;
+  private readonly maxIncrementalFiles: number;
+  private readonly grammars: GrammarSet | undefined;
 
   constructor(options: ContextEngineOptions = {}) {
     this.maxIndexedFiles = options.maxIndexedFiles ?? 20_000;
     this.maxRelevantFiles = options.maxRelevantFiles ?? 12;
+    this.maxIncrementalFiles = options.maxIncrementalFiles ?? 200;
+    this.grammars = options.grammars;
   }
 
   /**
@@ -175,12 +234,15 @@ export class ContextEngine {
 
     const startedAt = Date.now();
     const entries = await bridge.listFiles(".");
-    const fileTree: WorkspaceIndexFileEntry[] = [];
+    // porcelain을 한 번만 읽는다 — 증분 판정(어떤 파일이 더러운가)과 인덱스 지문이 같은
+    // 출력을 쓰므로, 두 번 부르면 그 사이에 바뀐 상태로 서로 다른 답을 낼 수 있다.
+    const porcelain = (await bridge.gitStatus().catch(() => ({ stdout: "", exitCode: null }))).stdout;
+    const scanned: { path: string; language: string | null; sizeBytes: number }[] = [];
     const excluded: { path: string; reason: string }[] = [];
 
     for (const entry of entries) {
       if (entry.isDir) continue;
-      if (fileTree.length >= this.maxIndexedFiles) {
+      if (scanned.length >= this.maxIndexedFiles) {
         excluded.push({ path: entry.path, reason: `인덱싱 상한(${this.maxIndexedFiles}개) 초과` });
         continue;
       }
@@ -189,29 +251,85 @@ export class ContextEngine {
         excluded.push({ path: entry.path, reason: verdict.reason ?? "제외됨" });
         continue;
       }
+      scanned.push({ path: entry.path, language: languageOf(entry.path), sizeBytes: entry.sizeBytes });
+    }
+
+    // **이 프로세스가 들고 있던 인덱스가 있으면 증분으로 간다** — 6절 표 2·3행.
+    // 심볼 층이 붙기 전에는 전체 재구축이 파일 트리 워크 한 번이라 쌌지만, 이제 파일을
+    // 전부 읽고 파싱하는 비용이 붙는다. 지문이 바뀔 때마다 그 값을 다시 내는 것은
+    // "증분 갱신이 필요하다"는 6절의 전제 그대로다.
+    const previous = this.index && this.index.workspaceId === workspaceId ? this.index : null;
+    const changed = previous ? changedPaths(previous, scanned, porcelain) : null;
+    const incremental =
+      previous !== null && changed !== null && changed.size <= this.maxIncrementalFiles ? { previous, changed } : null;
+
+    const fileTree: WorkspaceIndexFileEntry[] = [];
+    const targets: IndexTarget[] = [];
+    const previousStatus = new Map(incremental?.previous.fileTree.map((f) => [f.path, f]) ?? []);
+    for (const entry of scanned) {
+      const carried = incremental && !incremental.changed.has(entry.path) ? previousStatus.get(entry.path) : undefined;
+      if (carried) {
+        fileTree.push({ ...carried, sizeBytes: entry.sizeBytes });
+        continue;
+      }
+      targets.push({ path: entry.path, language: entry.language });
       fileTree.push({
         path: entry.path,
-        language: languageOf(entry.path),
+        language: entry.language,
         sizeBytes: entry.sizeBytes,
         // sha256은 Rust가 파일을 쓸 때만 계산한다. 인덱싱 단계에서 전 파일 해시를 구하려면
         // 전부 읽어야 하고 그건 3절이 피하려는 비용이다. 빈 문자열이 아니라 명시적으로 비워둔다.
         sha256: "",
+        // 아래 `indexSymbols`가 덮어쓴다. 여기 값이 그대로 남으면 파서가 이 파일을 보지
+        // 못했다는 뜻이므로 "읽지 못함"이 맞다.
+        symbolStatus: "unreadable",
       });
     }
 
-    const projectMeta = await this.detectProjectMeta(bridge, fileTree);
+    const livePaths = new Set(fileTree.map((f) => f.path));
+    const outcome = await indexSymbols({
+      targets,
+      knownPaths: livePaths,
+      read: (path) => bridge.tryReadFile(path),
+      grammars: this.grammars,
+    });
+    for (const entry of fileTree) {
+      const status = outcome.statuses.get(entry.path);
+      if (status !== undefined) entry.symbolStatus = status;
+    }
+
+    const graph = incremental
+      ? mergeSymbolIndex(
+          {
+            symbols: incremental.previous.symbols,
+            edges: incremental.previous.dependencyEdges,
+            report: incremental.previous.symbolIndex,
+          },
+          incremental.changed,
+          outcome,
+          livePaths
+        )
+      : { symbols: outcome.symbols, edges: outcome.edges, report: outcome.report };
+
+    // 프로젝트 메타는 매니페스트/규칙 파일이 바뀌었을 때만 다시 읽는다 — CLAUDE.md 전문을
+    // 매번 다시 읽는 것이 증분에서 가장 큰 읽기다.
+    const projectMeta =
+      incremental && ![...PROJECT_RULE_FILES, ...MANIFEST_FILES, ...PYTEST_FILES].some((f) => incremental.changed.has(f))
+        ? incremental.previous.projectMeta
+        : await this.detectProjectMeta(bridge, fileTree);
 
     const now = new Date().toISOString();
-    const gitHead = await this.readGitHead(bridge);
+    const gitHead = gitHeadFingerprint(porcelain);
     const built: WorkspaceIndex = {
       workspaceId,
       gitHeadAtIndex: gitHead,
       fileTree,
-      symbols: [], // M0 범위 밖 (context-engine.md 9절)
-      dependencyEdges: [],
+      symbols: graph.symbols,
+      dependencyEdges: graph.edges,
       projectMeta,
       excluded,
-      builtAt: now,
+      symbolIndex: recountReport(graph.report, fileTree),
+      builtAt: incremental ? incremental.previous.builtAt : now,
       lastIncrementalUpdateAt: now,
     };
     this.index = built;
@@ -261,6 +379,10 @@ export class ContextEngine {
 
     // 명시 지목됐지만 제외 규칙에 걸린 파일은 사용자에게 알린다 (7절 마지막 문단).
     const excludedNotes = this.notesForMentionedButExcluded(index, input.userMessage);
+    // **grammar를 못 실었다는 사실은 침묵하면 안 된다.** 폴백(ripgrep)이 있으므로 태스크는
+    // 정상으로 보이는데, 실제로는 `symbol-match`/`dependency`가 통째로 빠진 채 돈다.
+    // 스냅샷에 남겨야 화면과 프롬프트가 그 사실을 말할 수 있다(16절).
+    excludedNotes.push(...grammarNotes(index));
 
     const candidates = await this.selectRelevantFiles(bridge, index, input.userMessage, excludedNotes);
 
@@ -360,6 +482,13 @@ export class ContextEngine {
     const removed: string[] = [];
     const unreadable: string[] = [];
     const changed: string[] = [];
+    /**
+     * 이번에 다시 읽은 내용. **인덱스 증분 갱신이 이걸 그대로 쓴다**(6절 표 1행) —
+     * 같은 파일을 인덱스 때문에 한 번 더 읽으면 IPC 왕복이 배가 되고, 무엇보다 두 번 읽는
+     * 사이에 파일이 바뀌면 **스냅샷과 인덱스가 서로 다른 내용을 근거로 삼는다.**
+     * `null`은 "이번 변경이 지웠다"이다.
+     */
+    const reread = new Map<string, string | null>();
 
     for (const file of snapshot.relevantFiles) {
       const read = await bridge.readFile(file.path).catch(() => null);
@@ -371,6 +500,7 @@ export class ContextEngine {
         // 남기되 낡았을 수 있다는 사실을 값으로 남긴다.
         if (mutated.has(file.path)) {
           removed.push(file.path);
+          reread.set(file.path, null);
           excludedNotes.push({ path: file.path, reason: "이번 변경이 삭제함" });
         } else {
           unreadable.push(file.path);
@@ -379,6 +509,7 @@ export class ContextEngine {
         continue;
       }
       if (read.content !== file.content) changed.push(file.path);
+      if (mutated.has(file.path)) reread.set(file.path, read.content);
       kept.push({
         ...file,
         content: read.content,
@@ -401,7 +532,13 @@ export class ContextEngine {
         continue;
       }
       const read = await bridge.readFile(path).catch(() => null);
-      if (!read || read.binary || read.content === null) continue;
+      if (!read || read.binary || read.content === null) {
+        // 이번 변경이 건드린 파일이 안 읽히면 **삭제다**(위 규칙과 같다). 스냅샷에는 없던
+        // 파일이라 뺄 것이 없지만 **인덱스에는 있을 수 있고**, 남겨두면 지워진 파일의 심볼이
+        // 남는다 — 6.1절이 금지한 상태다.
+        reread.set(path, null);
+        continue;
+      }
       // 크기 규칙은 읽은 뒤에야 판정할 수 있다.
       const bySize = classifyFile(path, read.sizeBytes);
       if (bySize.excluded) {
@@ -409,6 +546,7 @@ export class ContextEngine {
         continue;
       }
       added.push(path);
+      reread.set(path, read.content);
       kept.push({
         path,
         reason: "recently-changed",
@@ -429,6 +567,13 @@ export class ContextEngine {
     const budget = snapshot.tokenBudget[0]?.maxTokens ?? DEFAULT_CONTEXT_TOKEN_BUDGET;
     const packaged = packageFiles(ordered, budget);
     for (const dropped of packaged.dropped) excludedNotes.push({ path: dropped.path, reason: dropped.reason });
+
+    // **인덱스도 지금의 사실로 바꾼다** — 6절 표 1행("ToolResult가 확정되는 즉시 그 파일만
+    // 재파싱"). 여기서 하는 이유는 두 가지다. 첫째, 이 경로는 **단일 비행**이다
+    // (`Orchestrator.snapshotForPrompt`가 진행 중인 다시 읽기를 하나의 promise로 합친다) —
+    // 인덱스 갱신을 모델 호출마다 게으르게 두면 `Promise.all`로 나가는 초안 둘이 다른
+    // 인덱스를 본다(6.1절이 기록한 사고와 같은 자리다). 둘째, 방금 읽은 내용이 손에 있다.
+    await this.applyMutationsToIndex(reread);
 
     // git 상태도 지금의 사실로 바꾼다 — 패치가 적용됐으므로 dirty 여부와 diff 요약이 달라진다.
     const gitStatus = await bridge.gitStatus().catch(() => ({ stdout: "", exitCode: null }));
@@ -458,6 +603,90 @@ export class ContextEngine {
       removed,
       unreadable,
     };
+  }
+
+  /**
+   * 도구가 바꾼 파일만 다시 파싱해 인덱스를 갱신한다 — 6절 표 1행.
+   *
+   * # 왜 커밋을 기다리지 않는가
+   *
+   * 6절 표가 이 신호를 "가장 신뢰도 높은 신호"라고 적었다. `apply_patch`가 성공했다는 것은
+   * 그 파일이 지금 이렇게 생겼다는 **확정된 사실**이고, git 상태를 다시 재서 유도할 필요가
+   * 없다. 그리고 FIX_LOOP는 커밋 전에 돌므로, 커밋을 기다리면 다음 라운드의 선정이 언제나
+   * 한 라운드 낡은 인덱스를 본다.
+   *
+   * # 파싱 실패는 심볼만 잃는다
+   *
+   * 6.1절의 규칙이 여기서 실제로 쓰인다. 고치는 중의 파일은 문법이 깨져 있는 것이 정상이고,
+   * 그때 **낡은 심볼을 남기면 모델이 지금은 없는 함수를 "본다".** 그래서 그 파일의 심볼은
+   * 지우되 파일 자체는 인덱스에 남는다 — `symbolStatus`가 `parse-failed`로 그 사실을 나른다.
+   *
+   * # 인덱스가 없으면 아무 일도 하지 않는다
+   *
+   * 갱신할 대상이 없다는 뜻이고, 다음 `ensureIndex`가 전부 만든다.
+   */
+  private async applyMutationsToIndex(reread: ReadonlyMap<string, string | null>): Promise<void> {
+    const index = this.index;
+    if (!index || reread.size === 0) return;
+
+    const deleted = new Set([...reread].filter(([, content]) => content === null).map(([path]) => path));
+    const updated = new Map([...reread].filter((e): e is [string, string] => e[1] !== null));
+
+    const fileTree = index.fileTree.filter((entry) => !deleted.has(entry.path));
+    const known = new Set(fileTree.map((f) => f.path));
+    for (const [path, content] of updated) {
+      // **제외 규칙은 그대로 걸린다.** 변경이 만들었다는 이유로 `.env`가 인덱스에 들어오지
+      // 않는다 — `refreshSnapshot`이 스냅샷에 대해 이미 지키는 것과 같은 규칙이다.
+      if (classifyFile(path, content.length).excluded) continue;
+      if (known.has(path)) continue;
+      known.add(path);
+      fileTree.push({
+        path,
+        language: languageOf(path),
+        sizeBytes: content.length,
+        sha256: "",
+        symbolStatus: "unreadable",
+      });
+    }
+
+    const targets: IndexTarget[] = [];
+    for (const entry of fileTree) {
+      const content = updated.get(entry.path);
+      if (content === undefined) continue;
+      entry.sizeBytes = content.length;
+      targets.push({ path: entry.path, language: entry.language });
+    }
+
+    const outcome = await indexSymbols({
+      targets,
+      knownPaths: known,
+      // 방금 읽은 내용을 쓴다. 여기서 다시 읽으면 스냅샷과 인덱스가 다른 시점을 본다.
+      read: async (path) => updated.get(path) ?? null,
+      grammars: this.grammars,
+    });
+    for (const entry of fileTree) {
+      const status = outcome.statuses.get(entry.path);
+      if (status !== undefined) entry.symbolStatus = status;
+    }
+
+    const merged = mergeSymbolIndex(
+      { symbols: index.symbols, edges: index.dependencyEdges, report: index.symbolIndex },
+      new Set([...updated.keys(), ...deleted]),
+      outcome,
+      known
+    );
+
+    this.index = {
+      ...index,
+      fileTree,
+      symbols: merged.symbols,
+      dependencyEdges: merged.edges,
+      symbolIndex: recountReport(merged.report, fileTree),
+      lastIncrementalUpdateAt: new Date().toISOString(),
+    };
+    // **캐시 키는 건드리지 않는다.** 파일이 바뀌었으므로 Rust의 지문은 이미 달라졌고,
+    // 여기서 키를 옛 값 그대로 두면 다음 `ensureIndex`가 "지문이 다르다"를 보고 증분으로
+    // 들어온다 — 그게 맞는 동작이다. 새 지문을 우리가 지어내면 안 된다.
   }
 
   /**
@@ -527,7 +756,18 @@ export class ContextEngine {
       }
     }
 
-    // 4) **본문을 본다** — state-machine 51절.
+    // 4) **심볼 테이블을 본다** — 4절 `symbol-match`, 16절.
+    //
+    //    여기까지는 파일 **이름**만 봤다. 심볼 인덱스는 "이 식별자의 정의가 여기 있다"를
+    //    파서가 아는 근거이고, 그래서 다음 단계(정규식 본문 검색)보다 강하다 — 정규식은
+    //    정의와 문자열 리터럴을 구별하지 못한다(13.6절).
+    //
+    //    이미 들어온 파일(사용자가 이름을 댄 파일)에 대해서는 근거를 덮지 않고 **앵커만
+    //    보탠다**(15.2절). 그게 이 층이 그 파일에 주는 실제 이득이다: 지목된 600줄 파일에서
+    //    정의가 561번째 줄에 있으면, 앵커가 없을 때는 앞에서부터 잘려 그 정의를 버렸다.
+    this.addSymbolMatches(index, keywords, add);
+
+    // 5) **본문을 본다** — state-machine 51절.
     //
     //    여기까지는 파일 **이름**만 봤다. 그래서 `resolveBudget`을 고쳐 달라는 요청에서 그
     //    함수가 `ledger.ts`에 있으면 우리는 그 파일을 영원히 고르지 못하고, 모델은 엉뚱한
@@ -537,7 +777,13 @@ export class ContextEngine {
     //    않았다.** 문은 있고 길이 없었다.
     await this.addContentMatches(bridge, index, keywords, add, notes);
 
-    // 5) 소스로 보이는 파일이 하나도 안 잡혔으면, 최소한 진입점 후보를 넣는다.
+    // 6) **의존성을 1~2홉 따라간다** — 4절 `dependency`, 16절.
+    //
+    //    지금까지 고른 파일이 import하는 것들이다. 4절이 적은 대로 "타입 정의, 유틸 등
+    //    컴파일에 필요한 주변 맥락"이며, 직접 매치가 없으므로 우선순위는 가장 뒤다.
+    addDependencyNeighbours(index, [...selected.values()], add);
+
+    // 7) 소스로 보이는 파일이 하나도 안 잡혔으면, 최소한 진입점 후보를 넣는다.
     //    빈 컨텍스트로 모델을 부르면 확실히 실패하므로, 못 골랐다는 사실보다 후보를 주는 편이 낫다.
     if ([...selected.values()].every((f) => f.reason === "project-meta")) {
       const sourceFiles = index.fileTree
@@ -561,6 +807,40 @@ export class ContextEngine {
       dependency: 5,
     };
     return [...selected.values()].sort((a, b) => rank[a.reason] - rank[b.reason]);
+  }
+
+  /**
+   * 심볼 테이블에서 후보를 더한다 — 4절 `symbol-match`, 16절.
+   *
+   * # 왜 `mentioned`보다 뒤인가
+   *
+   * 4절 표의 우선순위가 그렇게 정해져 있고(`mentioned` > `symbol-match`), 그 순서는 근거의
+   * 종류가 아니라 **사용자가 직접 말했는가**를 앞에 두는 규칙이다. 심볼 매치는 우리가
+   * 유도한 것이므로 사용자가 지목한 것보다 뒤다.
+   *
+   * # 없으면 아예 만들지 않는다
+   *
+   * grammar를 못 실었거나 이 저장소가 전부 범위 밖 언어면 `index.symbols`가 비어 있고,
+   * 그러면 이 함수는 아무것도 더하지 않는다 — **빈 `symbol-match` 후보를 만들어 "구현했다"고
+   * 보이게 하지 않는다**(11절이 정한 규율 그대로). 폴백은 다음 단계의 본문 검색이다.
+   */
+  private addSymbolMatches(
+    index: WorkspaceIndex,
+    keywords: readonly string[],
+    add: (path: string, reason: RelevanceReason, reasonDetail: string, anchorLines?: number[]) => void
+  ): void {
+    if (index.symbols.length === 0) return;
+    for (const keyword of keywords.slice(0, MAX_SYMBOL_MATCH_KEYWORDS)) {
+      const hits = symbolMatchFiles(index.symbols, keyword);
+      for (const hit of hits.slice(0, MAX_SYMBOL_MATCH_FILES_PER_KEYWORD)) {
+        add(
+          hit.path,
+          "symbol-match",
+          `심볼 인덱스가 ${JSON.stringify(keyword)}의 ${describeKind(hit.kind)} 정의를 이 파일에서 찾음 (Tree-sitter)`,
+          hit.anchorLines
+        );
+      }
+    }
   }
 
   /**
@@ -644,14 +924,6 @@ export class ContextEngine {
     return notes;
   }
 
-  private async readGitHead(bridge: ToolBridge): Promise<string> {
-    const status = await bridge.gitStatus().catch(() => ({ stdout: "", exitCode: null }));
-    // porcelain=v1 --branch의 첫 줄: "## branch...upstream [ahead 1]"
-    // HEAD SHA는 여기 없으므로 git status 결과 전체를 지문으로 쓴다 — 인덱스 무효화 판정에는
-    // "무언가 바뀌었는가"만 필요하고, SHA를 얻으려 명령을 하나 더 실행할 이유가 없다.
-    const branch = parseBranch(status.stdout);
-    return branch === "(unknown)" ? "(no-git)" : `${branch}@${hashString(status.stdout)}`;
-  }
 
   /**
    * 프로젝트 유형과 검증 명령 감지.
@@ -661,7 +933,10 @@ export class ContextEngine {
    * "검증 명령을 바꿔치기해 통과시키는" 경로가 열리기 때문이다. 두 곳에 감지 로직이
    * 있는 것은 중복이 아니라 의도된 이중화다.
    */
-  private async detectProjectMeta(bridge: ToolBridge, fileTree: WorkspaceIndexFileEntry[]): Promise<ProjectMeta> {
+  private async detectProjectMeta(
+    bridge: ToolBridge,
+    fileTree: readonly { path: string; language: string | null }[]
+  ): Promise<ProjectMeta> {
     const paths = new Set(fileTree.map((f) => f.path));
     const languages = [...new Set(fileTree.map((f) => f.language).filter((l): l is string => l !== null))];
 
@@ -810,6 +1085,160 @@ export function extractKeywords(message: string): string[] {
     if (looksLikeIdentifier) found.add(token);
   }
   return [...found].slice(0, 12);
+}
+
+/**
+ * grammar 적재 실패를 스냅샷에 남긴다 — 16절.
+ *
+ * **그 언어의 파일이 실제로 있을 때만 적는다.** Python이 한 줄도 없는 저장소에서 "python
+ * grammar를 못 실었습니다"는 사용자가 할 일이 없는 잡음이고, 잡음이 섞이면 정작 읽어야 할
+ * 줄이 안 읽힌다.
+ */
+function grammarNotes(index: WorkspaceIndex): { path: string; reason: string }[] {
+  const affected = new Set(
+    index.fileTree.filter((f) => f.symbolStatus === "grammar-unavailable").map((f) => f.language)
+  );
+  return index.symbolIndex.languages
+    .filter((entry) => !entry.loaded && affected.has(entry.language))
+    .map((entry) => ({
+      path: `(symbol-index: ${entry.language})`,
+      reason:
+        `Tree-sitter ${entry.language} grammar를 싣지 못해 이 언어의 심볼/의존성 선정이 빠졌습니다` +
+        ` — 본문 검색(ripgrep) 폴백만 동작합니다: ${entry.error ?? "사유 미상"}`,
+    }));
+}
+
+/**
+ * 이미 고른 파일들이 **import하는** 파일을 더한다 — 4절 `dependency`, 16절.
+ *
+ * # 씨앗은 직접 매치된 파일뿐이다
+ *
+ * `project-meta`(README·package.json)와 이 단계가 스스로 넣은 파일은 씨앗이 아니다. 전자는
+ * 관련성이 아니라 규칙 때문에 들어온 파일이고, 후자를 씨앗으로 삼으면 홉 상한이 의미를
+ * 잃는다(2홉이 3홉이 된다).
+ *
+ * # 왜 우선순위가 가장 뒤인가
+ *
+ * 4절 표가 그렇게 정했다. 직접 매치가 없는 주변 맥락이므로, 예산이 모자라면 여기부터
+ * 잘리는 것이 맞다 — 잘려도 모델은 여전히 고칠 파일 자체는 보고 있다.
+ */
+function addDependencyNeighbours(
+  index: WorkspaceIndex,
+  selected: readonly { path: string; reason: RelevanceReason }[],
+  add: (path: string, reason: RelevanceReason, reasonDetail: string, anchorLines?: number[]) => void
+): void {
+  if (index.dependencyEdges.length === 0) return;
+  const seeds = selected
+    .filter((c) => c.reason === "mentioned" || c.reason === "symbol-match" || c.reason === "content-match")
+    .map((c) => c.path);
+  if (seeds.length === 0) return;
+
+  const indexed = new Set(index.fileTree.map((f) => f.path));
+  const neighbours = dependenciesWithinHops(index.dependencyEdges, seeds, DEPENDENCY_MAX_HOPS)
+    // 인덱스에 없는 파일은 하드 필터가 막은 것이다. 그래프를 통해 옆문으로 들이지 않는다.
+    .filter((n) => indexed.has(n.path))
+    .slice(0, MAX_DEPENDENCY_FILES);
+
+  for (const neighbour of neighbours) {
+    add(
+      neighbour.path,
+      "dependency",
+      `${neighbour.via}에서 import 그래프로 ${neighbour.hops}홉 (Tree-sitter 의존성 그래프)`
+    );
+  }
+}
+
+/** 화면과 감사 기록에 심볼 종류를 한국어로 적는다. 근거의 강도를 사람이 읽을 수 있어야 한다. */
+function describeKind(kind: SymbolEntry["kind"]): string {
+  switch (kind) {
+    case "function":
+      return "함수";
+    case "class":
+      return "클래스/구조체";
+    case "method":
+      return "메서드";
+    case "interface":
+      return "인터페이스/트레이트";
+    case "type":
+      return "타입";
+    case "const":
+      return "최상위 상수";
+    case "export":
+      return "재수출";
+  }
+}
+
+/**
+ * 인덱스가 어느 상태에서 만들어졌는가.
+ *
+ * porcelain=v1 --branch의 첫 줄은 `## branch...upstream [ahead 1]`이고 HEAD SHA는 없다.
+ * 인덱스 기록에 필요한 것은 "무언가 바뀌었는가"이므로 status 출력 전체를 지문으로 쓴다 —
+ * SHA를 얻자고 명령을 하나 더 실행할 이유가 없다. (재사용 **판정**의 키는 이것이 아니라
+ * Rust의 워크스페이스 지문이다 — 2.1절.)
+ */
+export function gitHeadFingerprint(porcelain: string): string {
+  const branch = parseBranch(porcelain);
+  return branch === "(unknown)" ? "(no-git)" : `${branch}@${hashString(porcelain)}`;
+}
+
+/**
+ * 지난 인덱스 이후 **다시 파싱해야 하는 파일** — 6절 표 2행.
+ *
+ * # 왜 `git diff <gitHeadAtIndex>..HEAD`가 아닌가
+ *
+ * 6절 표는 그 명령을 적었지만 Node에게는 그 명령이 없다. HEAD SHA를 주는 도구도, 리비전
+ * 범위를 받는 `git_diff`도 없고, **그걸 만들자고 Rust에 임의의 리비전 문자열을 받는 입구를
+ * 내는 것**은 읽기 전용 도구 하나를 위해 신뢰 경계에 손대는 일이다(원칙 2).
+ *
+ * 대신 같은 질문에 우리가 이미 가진 것으로 답한다:
+ *
+ * - `list_files`가 준 **경로와 크기** — 추가·삭제·크기가 달라진 편집을 전부 잡는다.
+ * - `git status`가 준 **더러운 경로** — 크기가 그대로인 편집(한 글자 교체)을 잡는다.
+ *
+ * 커밋으로 HEAD가 옮겨간 경우는 어떤가? 그 파일들은 커밋되기 전에 더러운 상태였고, 우리
+ * 세션 안에서 일어난 변경이면 6절 표 1행(도구 변경 직후 재파싱)이 이미 반영했다. 세션 **밖**
+ * 에서 커밋까지 끝난 변경은 이 두 신호에 안 잡히는데, 그 경우 인덱스는 프로세스 메모리에도
+ * 없다(sidecar가 워크스페이스마다 새로 뜬다 — process-architecture 11.3절). 즉 증분이 아니라
+ * 전체 구축 경로다.
+ *
+ * 남는 사각은 **같은 세션 안에서 우리 도구를 거치지 않고 편집한 뒤 외부에서 커밋까지** 한
+ * 경우 하나다. 그건 6절 표 3행(diff가 크면 전체 재구축)이 겨냥한 상황과 겹치므로, 상한을
+ * 넘으면 어차피 전체로 간다.
+ */
+export function changedPaths(
+  previous: WorkspaceIndex,
+  scanned: readonly { path: string; sizeBytes: number }[],
+  porcelain: string
+): Set<string> {
+  const before = new Map(previous.fileTree.map((f) => [f.path, f.sizeBytes]));
+  const changed = new Set<string>();
+  for (const entry of scanned) {
+    const size = before.get(entry.path);
+    if (size === undefined || size !== entry.sizeBytes) changed.add(entry.path);
+  }
+  const now = new Set(scanned.map((f) => f.path));
+  for (const path of before.keys()) if (!now.has(path)) changed.add(path);
+  for (const path of parseDirtyPaths(porcelain)) if (now.has(path)) changed.add(path);
+  return changed;
+}
+
+/**
+ * porcelain=v1의 더러운 경로.
+ *
+ * 이름 변경(`R  old -> new`)은 **새 이름**을 쓴다 — 다시 파싱해야 하는 것은 지금 있는 파일이고,
+ * 없어진 옛 이름은 파일 트리 비교가 이미 잡는다.
+ */
+export function parseDirtyPaths(porcelain: string): string[] {
+  const paths: string[] = [];
+  for (const line of porcelain.split("\n")) {
+    if (line.startsWith("## ") || line.trim() === "") continue;
+    const rest = line.slice(3);
+    const arrow = rest.indexOf(" -> ");
+    const target = arrow === -1 ? rest : rest.slice(arrow + 4);
+    // 특수문자가 있으면 git이 경로를 따옴표로 감싼다.
+    paths.push(target.replace(/^"/, "").replace(/"$/, "").trim());
+  }
+  return paths;
 }
 
 export function parseBranch(porcelain: string): string {

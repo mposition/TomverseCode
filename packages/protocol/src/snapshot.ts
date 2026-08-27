@@ -4,14 +4,15 @@ import type { ISODateTime, ModelId } from "./common.js";
 /**
  * 이 파일이 왜 골렸는가.
  *
- * # `symbol-match`와 `content-match`를 나눠 두는 이유 (context-engine 9절, state-machine 51절)
+ * # `symbol-match`와 `content-match`를 나눠 두는 이유 (context-engine 5·16절, state-machine 51절)
  *
  * `symbol-match`는 **심볼 그래프**가 있을 때의 근거다 — "이 식별자가 여기 정의돼 있다"를
- * 파서가 안다. 지금은 그 그래프가 없다.
+ * Tree-sitter가 안다. 그 그래프는 16절에서 생겼고, 그래서 이 값은 이제 실제로 만들어진다.
  *
  * `content-match`는 **본문 검색**이 찾은 것이다. 정의처럼 보이는 자리를 정규식으로 맞춘 것이라
  * 훨씬 약한 근거이고, 그 약함이 이름에 남아야 한다 — `symbol-match`로 적으면 화면과 감사
- * 기록이 "파서가 확인했다"고 말하게 된다.
+ * 기록이 "파서가 확인했다"고 말하게 된다. **심볼 그래프가 생겨도 이 값은 남는다**: 파싱에
+ * 실패한 파일과 MVP 범위 밖 언어의 폴백이 여기이기 때문이다(5절).
  */
 export type RelevanceReason =
   | "mentioned"
@@ -165,14 +166,69 @@ export interface WorkspaceSnapshot {
 // docs/design/context-engine.md 2절 — 세션 스코프로 유지되는 인덱스.
 // WorkspaceSnapshot과 달리 태스크 artifact가 아니며 SQLite workspace_index 테이블에 대응한다.
 //
-// M0에서는 symbols/dependencyEdges가 비어 있다 (Tree-sitter 미도입 — context-engine.md 9절).
-// 인터페이스를 WorkspaceSnapshot과 분리해 둔 이유가 이것이다: 나중에 심볼 그래프를 채워도
-// 스냅샷 선택 로직의 계약은 바뀌지 않는다.
+// `symbols`/`dependencyEdges`는 16절에서 채워졌다(Tree-sitter, MVP 3개 언어 — 9절).
+// 인터페이스를 WorkspaceSnapshot과 분리해 둔 덕분에 그 층을 채우면서 스냅샷 선택 로직의
+// **계약은 바뀌지 않았다** — 바뀐 것은 `relevantFiles[].reason`에 어떤 값이 나타나는가뿐이다.
+/**
+ * 이 파일에 대해 **심볼 인덱싱이 어디까지 갔는가** (context-engine.md 5·6.1절).
+ *
+ * # 왜 `symbols`가 비어 있다는 사실만으로는 부족한가
+ *
+ * "이 파일에 심볼이 없다"와 "이 파일을 파싱하지 못했다"는 **다른 사실**이고, 뒤를 앞으로
+ * 읽으면 선정이 조용히 좁아진다 — 파싱에 실패한 파일은 `symbol-match`로 영영 걸리지 않는데
+ * 화면에는 "심볼이 없는 파일"로 보인다. 6.1절이 정한 규칙("심볼을 잃되 파일이 사라지지는
+ * 않는다")을 지키려면 **잃었다는 사실 자체가 값으로 남아야** 한다.
+ */
+export type SymbolIndexStatus =
+  /** 파서가 읽었다. 심볼이 0개여도 그건 "없다"는 사실이다. */
+  | "indexed"
+  /** 파싱을 시도했고 문법 오류가 있었다 — 심볼을 잃되 파일은 인덱스에 남는다(6.1절). */
+  | "parse-failed"
+  /** 내용을 받지 못했다(읽기 실패·바이너리). 파싱을 시도조차 못 했다. */
+  | "unreadable"
+  /** 9절 MVP 언어 범위 밖 — 애초에 파서가 없다. 폴백은 ripgrep(5절). */
+  | "unsupported-language"
+  /** grammar를 싣지 못했다. **폴백이지 침묵이 아니다** — 이 값이 그 사실을 나른다. */
+  | "grammar-unavailable"
+  /** 인덱싱 상한에 걸려 시도하지 않았다. 결정적으로 잘린다(파일 트리 순서). */
+  | "skipped-budget";
+
 export interface WorkspaceIndexFileEntry {
   path: string;
   language: string | null;
   sizeBytes: number;
   sha256: string;
+  /** 심볼 인덱싱 결과 — 위 타입의 주석이 왜 필요한지를 말한다. */
+  symbolStatus: SymbolIndexStatus;
+}
+
+/**
+ * 심볼 인덱스 층이 **실제로 무엇을 했는가** — context-engine.md 5절.
+ *
+ * 값이 아니라 상태를 남기는 이유: grammar 로딩 실패는 폴백(ripgrep)으로 이어지므로 태스크는
+ * 계속 돈다. 그래서 **아무 오류도 나지 않는다.** 그 조용함이 곧 "Tree-sitter가 도는 줄 알았는데
+ * 실은 한 번도 안 돌았다"를 만든다 — 그 사실이 인덱스에 실려 이벤트로 나가야 한다.
+ */
+export interface SymbolIndexReport {
+  /**
+   * 인덱스 **모양**의 버전. 캐시가 이 값을 갖지 않거나 다르면 없는 것으로 다룬다(2.1절).
+   *
+   * 심볼이 붙으면서 `WorkspaceIndexFileEntry`에 필드가 늘었는데, 옛 행을 그대로 쓰면
+   * `symbolStatus`가 `undefined`인 파일들이 생기고 그건 "모른다"가 아니라 **조용한 거짓**이 된다.
+   */
+  version: number;
+  /** grammar별 로딩 결과. `loaded=false`인 언어의 파일은 전부 `grammar-unavailable`이다. */
+  languages: { language: string; loaded: boolean; error?: string }[];
+  filesIndexed: number;
+  filesParseFailed: number;
+  filesSkipped: number;
+  filesUnreadable: number;
+  symbolCount: number;
+  edgeCount: number;
+  /** 파싱에 쓴 시간. 인덱스 전체 구축 시간(`WORKSPACE_INDEX_BUILT.buildMs`)의 부분집합이다. */
+  durationMs: number;
+  /** 파서에 넣은 바이트 총량 — 시간이 저장소 크기 때문인지 파서 때문인지 가른다. */
+  bytesParsed: number;
 }
 
 export interface WorkspaceIndex {
@@ -184,6 +240,8 @@ export interface WorkspaceIndex {
   projectMeta: ProjectMeta;
   /** 하드 필터로 인덱스 진입 자체가 막힌 파일 (context-engine.md 7절) */
   excluded: { path: string; reason: string }[];
+  /** 심볼 인덱스 층이 무엇을 했는가 (context-engine.md 5절). */
+  symbolIndex: SymbolIndexReport;
   builtAt: ISODateTime;
   lastIncrementalUpdateAt: ISODateTime;
 }

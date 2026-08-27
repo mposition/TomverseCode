@@ -573,6 +573,14 @@ test("변경이 지운 파일은 빠지고, 건드린 적 없는데 못 읽는 �
  * `search_text` 도구는 처음부터 있었고 Rust가 구현하고 있었는데 **선정이 한 번도 부르지
  * 않았다.** 문은 있고 길이 없었다.
  */
+/**
+ * **16절이 이 검사의 답을 바꿨다.** 종전에는 같은 시나리오가 `content-match`(정규식)로
+ * 걸렸는데, 심볼 인덱스가 생기면서 같은 파일을 **더 강한 근거**로 먼저 집는다. 13.6절이
+ * "정규식은 정의와 문자열 리터럴을 구별하지 못한다"고 적어 둔 자리가 이것이다.
+ *
+ * 정규식 층이 사라진 것은 아니다 — 범위 밖 언어와 파싱 실패 파일의 폴백은 여전히 그쪽이고,
+ * 그건 `symbols.test.ts`가 따로 지킨다.
+ */
 test("이름이 안 맞아도 본문에 정의가 있으면 선정된다", async () => {
   const host = new FakeHost({
     files: [
@@ -596,10 +604,12 @@ test("이름이 안 맞아도 본문에 정의가 있으면 선정된다", async
 
   const ledger = snapshot.relevantFiles.find((f) => f.path === "src/ledger.ts");
   assert.ok(ledger, `본문에 정의가 있는 파일이 빠졌습니다: ${snapshot.relevantFiles.map((f) => f.path).join(", ")}`);
-  assert.equal(ledger.reason, "content-match");
-  // **근거의 강도가 이름에 남는다.** `symbol-match`로 적으면 "파서가 확인했다"로 읽힌다.
-  assert.match(ledger.reasonDetail, /정규식 — 심볼 그래프 아님/);
-  assert.match(ledger.reasonDetail, /정의처럼 보이는/);
+  // 파서가 정의를 알므로 근거가 정규식보다 강하다 — 그 강도가 이름에 남는다.
+  assert.equal(ledger.reason, "symbol-match");
+  assert.match(ledger.reasonDetail, /Tree-sitter/);
+  assert.match(ledger.reasonDetail, /함수 정의/);
+  // 그리고 **줄 번호가 함께 온다.** 예산에 쫓겨 잘릴 때 이 값이 정의를 지킨다(14절).
+  assert.deepEqual(ledger.anchorLines, [1]);
   // 무관한 파일까지 쓸어담지 않는다 — 그러면 예산만 먹는다.
   assert.ok(!snapshot.relevantFiles.some((f) => f.path === "src/unrelated.ts"));
 });

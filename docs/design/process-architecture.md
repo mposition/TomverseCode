@@ -271,9 +271,11 @@ sidecar를 띄우는 곳이 둘이다(Tauri 껍데기, 헤드리스 호스트). 
 **Node가 소유한다.** 근거:
 
 - Tree-sitter는 언어 문법을 npm 패키지(예: `tree-sitter`, `tree-sitter-typescript` 등)로 배포하는 생태계가 Rust crate 생태계보다 이 프로젝트 맥락에서 더 성숙하고 최신 문법 업데이트가 빠르다.
+  **구현에서 그 npm 갈래를 한 번 더 갈랐다**([context-engine.md 16.2절](./context-engine.md)): 네이티브 바인딩(`tree-sitter` + node-gyp)은 사용자 머신에 **MSVC를 요구하거나** Node ABI × 플랫폼별 prebuild 배포를 요구하므로, 파일 하나가 모든 플랫폼에서 도는 **WASM**(`web-tree-sitter` + `.wasm` grammar)을 쓴다. Rust 빌드에서 겨우 닫아 놓은 Windows 툴체인 문제를 사용자 설치 경로에 다시 들이지 않기 위해서다.
 - `WorkspaceIndex`는 순수 데이터 가공(파싱, 그래프 구성)이지 OS 권한이 필요한 작업이 아니다 — 2절의 "Rust는 신뢰 경계"라는 역할 분리 원칙에 따르면 권한이 필요 없는 작업은 Node에 두는 게 일관적이다.
 - `WorkspaceSnapshot`(태스크별 패키징 결과)을 만드는 것도 결국 `DraftProposal`/`ReviewDecision`과 같은 흐름으로 Node의 Orchestrator가 소비하므로, 인덱스와 소비자가 같은 프로세스에 있으면 프로세스 간 대용량 데이터 전송(파일 트리 전체, 심볼 테이블)을 피할 수 있다 — `WorkspaceIndex` 자체는 Rust나 UI로 넘어갈 필요가 없다(SQLite에 저장할 때만 3절 IPC로 Rust에 전달).
 - 파일 시스템 접근 자체(읽기)는 필요하지만, `read_file`/`list_files`는 이미 Tool Runtime(Rust)을 거치는 도구이므로, `WorkspaceIndex` 구축도 초기 전체 스캔 시에는 Node가 Rust의 `list_files`/`read_file`을 호출해 파일을 받아오는 방식을 쓴다 — Node가 워크스페이스 파일 시스템에 직접 접근하지 않는다(신뢰 경계 원칙 유지, 원 제안서의 "UI 프로세스에는... 직접적인 셸 실행 권한을 두지 않는다"와 같은 정신을 Node에도 적용).
+  **심볼 인덱스를 붙이면서 이 규칙이 실제로 시험됐다**: 파서에 넣을 바이트를 전부 도구로 받아야 하므로 이 저장소에서 `read_file` 왕복이 353번 붙는다. 그래도 뚫지 않았다 — 뚫는 순간 "Node가 완전히 장악당해도 Rust 게이트를 반드시 지난다"가 성립하지 않는다. grammar `.wasm`은 다른 범주다(우리 `node_modules` 안의 우리 자산이며 사용자 입력이 그 경로에 닿지 않는다). 그 구별을 말이 아니라 검사로 둔다([context-engine.md 16.3절](./context-engine.md)).
 
 ## 7. 보안 경계 요약
 
