@@ -52,6 +52,18 @@ export const BUILTIN_MODELS: ModelEntry[] = [
       maxOutputTokens: 32_768,
     },
     economics: { inputPerMTok: 2.0, outputPerMTok: 8.0, pricingAsOf: PRICING_AS_OF },
+    /**
+     * `gpt-4.1`은 **별칭**이고 응답 envelope은 날짜 스냅샷 ID로 돌아온다.
+     *
+     * 실측(2026-08-27, `gate:g:probe-models`): `gpt-4.1`을 요청하고 `gpt-4.1-2025-04-14`를
+     * 받았다. 조용한 대체가 아니라 OpenAI가 별칭을 그날의 스냅샷으로 푸는 정상 동작이며,
+     * 그래서 **추측이 아니라 관측한 값 하나만** 적는다.
+     *
+     * prefix 비교로 뭉개지 않는 이유는 이 파일의 exact-model 검증 주석에 있다 —
+     * `claude-sonnet-5`가 `claude-sonnet-5.5`의 prefix라 다른 모델을 통과시킨다.
+     * 목록에 없는 ID가 오면 여전히 실패해야 한다. 그게 이 검증이 지키는 전부다.
+     */
+    acceptedProviderModelIds: ["gpt-4.1-2025-04-14"],
     // 조직 인증이 없어도 쓸 수 있는 폴백. 스파이크가 실제로 이 모델로 돌았다.
     availability: { requiresOrgVerification: false },
   },
