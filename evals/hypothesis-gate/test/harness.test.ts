@@ -1,15 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { armExecutionOrder, ARMS, armSpec } from "../src/arms.js";
 import {
   artifactsPresent,
+  artifactsRootFor,
   HOST_BIN,
   lastDraftProposalPayload,
   REPO_ROOT,
+  resolveArtifactPayloads,
   resolveProviderArgs,
 } from "../src/host.js";
 import { loadAllFixtures, loadFixture, listFixtureIds } from "../src/manifest.js";
@@ -597,4 +600,44 @@ test("성공한 실행을 stderr 문자열로 공급자 실패로 만들지 않�
   // 구조화된 사실은 이 규칙보다 앞선다.
   const spawn = { ...host(""), spawnError: "ENOENT" } as Parameters<typeof classifyInfrastructureFailure>[0];
   assert.equal(classifyInfrastructureFailure(spawn, succeeded), "host_crash");
+});
+
+test("8KB를 넘어 artifact로 밀려난 payload를 되읽는다", () => {
+  // 실제 초안(unified diff)은 거의 항상 8KB를 넘으므로 DB에는 참조만 남는다.
+  // 그래서 **실제 공급자 실행에서는** 초안을 한 번도 읽지 못했고, fake는 patch가 짧아
+  // 통과했다 — 하네스 테스트가 전부 초록인 채로 남아 있던 이유다.
+  const dir = mkdtempSync(path.join(tmpdir(), "gate-artifact-"));
+  try {
+    const root = path.join(dir, "artifacts");
+    mkdirSync(path.join(root, "task-1"), { recursive: true });
+    const body = JSON.stringify({ proposalId: "p1", patch: "x".repeat(9000), draftSource: "generated" });
+    writeFileSync(path.join(root, "task-1", "event-3-DRAFT_RECEIVED.json"), body);
+    const sha = createHash("sha256").update(Buffer.from(body)).digest("hex");
+
+    const events = [
+      { eventId: 1, seq: 3, type: "DRAFT_RECEIVED", phase: null, createdAt: "",
+        payload: { artifactRef: "task-1/event-3-DRAFT_RECEIVED.json", sha256: sha, sizeBytes: body.length, preview: "{..." } },
+    ];
+    const resolved = resolveArtifactPayloads(events, root);
+    assert.equal(resolved[0]!.payload["proposalId"], "p1");
+    assert.equal(lastDraftProposalPayload(resolved)?.draftSource, "generated");
+
+    // 해시가 다르면 조용히 쓰지 않는다 — 내용이 바뀐 artifact를 초안으로 믿으면 안 된다.
+    const tampered = [{ ...events[0]!, payload: { ...events[0]!.payload, sha256: "0".repeat(64) } }];
+    assert.throws(() => resolveArtifactPayloads(tampered, root), /해시가 다릅니다/);
+
+    // 파일이 없으면 "초안이 없다"가 아니라 "못 읽었다"다.
+    assert.throws(() => resolveArtifactPayloads(events, path.join(dir, "없는-폴더")), /읽을 수 없습니다/);
+
+    // 참조가 없는 평범한 payload는 그대로 둔다.
+    const plain = [{ eventId: 2, seq: 4, type: "DRAFT_RECEIVED", phase: null, createdAt: "", payload: { proposalId: "small", patch: "y", draftSource: "generated" } }];
+    assert.equal(resolveArtifactPayloads(plain, root)[0]!.payload["proposalId"], "small");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("artifacts 루트는 DB와 형제 디렉터리다", () => {
+  // runHost가 --artifacts로 넘기는 위치와 같아야 한다. 갈라지면 조용히 못 읽는다.
+  assert.equal(artifactsRootFor(path.join("C:\tmp", "gate-state-x", "state.db")), path.join("C:\tmp", "gate-state-x", "artifacts"));
 });

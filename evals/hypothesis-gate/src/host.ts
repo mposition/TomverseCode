@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -279,12 +280,76 @@ export function readEvents(dbPath: string, workspaceRoot: string, taskId: string
   );
   const line = (result.stdout ?? "").trim().split("\n").filter(Boolean).pop();
   if (!line) return [];
+  let parsed: { events?: StoredEvent[] };
   try {
-    const parsed = JSON.parse(line) as { events?: StoredEvent[] };
-    return parsed.events ?? [];
+    parsed = JSON.parse(line) as { events?: StoredEvent[] };
   } catch {
     return [];
   }
+  return resolveArtifactPayloads(parsed.events ?? [], artifactsRootFor(dbPath));
+}
+
+/** `runHost`가 `--artifacts`로 넘긴 위치. DB와 형제 디렉터리다. */
+export function artifactsRootFor(dbPath: string): string {
+  return path.join(path.dirname(dbPath), "artifacts");
+}
+
+/**
+ * 8KB를 넘어 artifact로 밀려난 payload를 되읽는다.
+ *
+ * # 왜 필요한가 — 실제 초안은 **언제나** 여기에 해당한다
+ *
+ * `store.rs`는 직렬화 길이가 `INLINE_PAYLOAD_LIMIT_BYTES`(8KB)를 넘으면 `payload_json`에
+ * 본문 대신 `{artifactRef, sha256, sizeBytes, preview}`만 넣고 본문을 artifact 파일로 뺀다
+ * (state-machine-and-protocol.md 7절 — SQLite WAL 비대화 방지).
+ *
+ * `DRAFT_RECEIVED`는 patch 본문을 싣는다. 실제 모델이 만든 unified diff는 거의 항상 8KB를
+ * 넘으므로 **실제 공급자 실행에서는 초안 payload가 DB에 남지 않는다.** 그래서 하네스는
+ * `proposalId`도 `patch`도 `draftSource`도 볼 수 없었고, Arm A의 초안을 재생해야 하는
+ * **Arm C/D가 매번 건너뛰어졌다** — 교차검증 arm, 즉 이 게이트가 재려는 대상 전체다.
+ *
+ * fake provider는 patch가 짧아 8KB를 넘지 않는다. 그래서 하네스 자동 테스트는 전부 통과했고,
+ * 이 결함은 **유료 실행에서만** 드러났다. 이 저장소에서 반복된 모양이다.
+ *
+ * # 해석 실패를 조용히 넘기지 않는다
+ *
+ * 참조만 남은 payload를 그대로 돌려주면 "이벤트를 읽었다"가 되는데 실제로는 내용을 모른다.
+ * 그 상태로 진행하면 초안이 없는 것과 구별되지 않으므로 예외를 던진다 — 호출부의
+ * `readEventsSafely`가 `eventsReadable = false`로 받아 **과금 불확실**로 보수적으로 처리한다.
+ * "못 읽었다"를 "없다"로 읽지 않는 것이 이 하네스의 규칙이다.
+ */
+export function resolveArtifactPayloads(events: readonly StoredEvent[], artifactsRoot: string): StoredEvent[] {
+  return events.map((event) => {
+    const ref = event.payload?.["artifactRef"];
+    if (typeof ref !== "string" || ref.length === 0) return event;
+
+    const file = path.join(artifactsRoot, ref);
+    let raw: Buffer;
+    try {
+      raw = readFileSync(file);
+    } catch (error) {
+      throw new Error(`이벤트 seq ${event.seq}(${event.type})의 artifact를 읽을 수 없습니다: ${file} — ${String(error)}`);
+    }
+
+    const expected = event.payload["sha256"];
+    if (typeof expected === "string") {
+      const actual = createHash("sha256").update(raw).digest("hex");
+      if (actual !== expected) {
+        throw new Error(`이벤트 seq ${event.seq}(${event.type})의 artifact 해시가 다릅니다: 기대 ${expected} / 실제 ${actual}`);
+      }
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(raw.toString("utf8"));
+    } catch (error) {
+      throw new Error(`이벤트 seq ${event.seq}(${event.type})의 artifact가 JSON이 아닙니다: ${file} — ${String(error)}`);
+    }
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error(`이벤트 seq ${event.seq}(${event.type})의 artifact가 객체가 아닙니다: ${file}`);
+    }
+    return { ...event, payload: payload as Record<string, unknown> };
+  });
 }
 
 /** 이벤트에서 특정 타입의 마지막 payload를 꺼낸다. */
