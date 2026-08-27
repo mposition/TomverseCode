@@ -2290,6 +2290,26 @@ impl SidecarHandler for TaskHost {
                 }
                 self.with_store(|s| s.save_workspace_index(&self.workspace_id(), claimed, None, &index, build_ms))
                     .map_err(|e| format!("인덱스 캐시 저장 실패: {e}"))?;
+                // **심볼 층의 상태를 Node의 주장이 아니라 인덱스 본문에서 유도한다.**
+                // Node가 별도 필드로 "잘 됐다"를 보내면 그 값과 실제 인덱스가 갈릴 수 있고,
+                // 갈리면 이벤트가 거짓이 된다.
+                let symbol_index = index.get("symbolIndex");
+                let stat = |key: &str| symbol_index.and_then(|s| s.get(key)).cloned().unwrap_or(Value::Null);
+                // grammar를 못 실은 언어. **비어 있는 것과 없는 것을 구별한다** — 옛 인덱스에는
+                // 이 필드 자체가 없고, 그건 "전부 성공했다"가 아니라 "모른다"이다.
+                let grammar_failures = symbol_index
+                    .and_then(|s| s.get("languages"))
+                    .and_then(Value::as_array)
+                    .map(|langs| {
+                        Value::Array(
+                            langs
+                                .iter()
+                                .filter(|l| l.get("loaded").and_then(Value::as_bool) == Some(false))
+                                .filter_map(|l| l.get("language").cloned())
+                                .collect(),
+                        )
+                    })
+                    .unwrap_or(Value::Null);
                 let _ = self.append_event(
                     task_id,
                     "WORKSPACE_INDEX_BUILT",
@@ -2298,6 +2318,15 @@ impl SidecarHandler for TaskHost {
                         // 인덱스의 크기를 함께 남긴다 — 걸린 시간만으로는 그게 큰 저장소 때문인지
                         // 느린 디스크 때문인지 구별되지 않는다.
                         "fileCount": index.get("fileTree").and_then(Value::as_array).map(|a| a.len()),
+                        // 캐시에 실제로 저장되는 크기 (context-engine 16절). 심볼이 차면서
+                        // payload가 커졌는지는 **재봐야** 아는 값이고, 재는 자리가 여기다.
+                        "payloadBytes": serde_json::to_string(&index).map(|s| s.len()).ok(),
+                        "symbolCount": stat("symbolCount"),
+                        "edgeCount": stat("edgeCount"),
+                        "filesIndexed": stat("filesIndexed"),
+                        "filesParseFailed": stat("filesParseFailed"),
+                        "symbolIndexMs": stat("durationMs"),
+                        "grammarFailures": grammar_failures,
                     }),
                 );
                 Ok(json!({ "saved": true, "fingerprint": claimed }))

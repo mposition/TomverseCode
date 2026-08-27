@@ -11,15 +11,22 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/index.js",
     "//test": "이 Node 버전은 `node --test <디렉터리>`가 동작하지 않는다(CLAUDE.md 함정 기록) — 파일 경로를 직접 나열한다.",
-    "test": "npm run build && node --test dist/test/boundary.test.js dist/test/cancellation.test.js dist/test/machine.test.js dist/test/triage.test.js dist/test/providers.test.js dist/test/router.test.js dist/test/context.test.js dist/test/planner.test.js dist/test/orchestrator.test.js dist/test/acceptance.test.js dist/test/contrast.test.js dist/test/disagreement.test.js dist/test/criteria.test.js dist/test/commit.test.js dist/test/budget.test.js dist/test/conformance.test.js dist/test/transmissionClaim.test.js dist/test/contextClaim.test.js dist/test/terminalPhases.test.js dist/test/hookPhases.test.js",
+    "test": "npm run build && node --test dist/test/boundary.test.js dist/test/cancellation.test.js dist/test/machine.test.js dist/test/triage.test.js dist/test/providers.test.js dist/test/router.test.js dist/test/context.test.js dist/test/symbols.test.js dist/test/planner.test.js dist/test/orchestrator.test.js dist/test/acceptance.test.js dist/test/contrast.test.js dist/test/disagreement.test.js dist/test/criteria.test.js dist/test/commit.test.js dist/test/budget.test.js dist/test/conformance.test.js dist/test/transmissionClaim.test.js dist/test/contextClaim.test.js dist/test/terminalPhases.test.js dist/test/hookPhases.test.js",
     "//test:e2e": "실제 tomverse-host 바이너리를 요구한다: cargo build --manifest-path ../../apps/desktop/src-tauri/core/Cargo.toml",
     "test:e2e": "npm run build && node --test dist/test/e2e.test.js dist/test/e2e-persistence.test.js",
     "test:all": "npm run test && npm run test:e2e"
   },
+  "//dependencies": [
+    "web-tree-sitter는 0.25에 고정한다(^0.25.x). 0.26은 tree-sitter-wasms 0.1.13이 배포하는 grammar를 거부한다 — Language.load가 메시지 없는 Error를 던진다. rusqlite 0.37 고정과 같은 성질의 제약이므로, 올리려면 grammar 쪽 ABI를 먼저 확인할 것.",
+    "grammar는 네이티브 바인딩이 아니라 WASM이다. 네이티브(node-gyp)는 사용자 머신에 MSVC를 요구하거나 Node ABI × 플랫폼별 prebuild를 요구한다 — docs/design/context-engine.md 16.2절.",
+    "배포할 때 grammar 5개(typescript/tsx/javascript/python/rust)가 sidecar와 함께 가야 한다. 빠지면 오류가 아니라 조용한 성능 저하(grammar-unavailable)가 된다."
+  ],
   "dependencies": {
     "@anthropic-ai/sdk": "^0.68.0",
     "@tomverse/protocol": "*",
-    "openai": "^6.9.0"
+    "openai": "^6.9.0",
+    "tree-sitter-wasms": "^0.1.13",
+    "web-tree-sitter": "^0.25.10"
   },
   "devDependencies": {
     "@tomverse/toolchain": "*",
