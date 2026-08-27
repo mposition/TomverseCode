@@ -653,7 +653,13 @@ async function main(): Promise<number> {
       log(`→ 상태: ${outcome.status}`);
       return 2;
     }
-    const written = writeP0Attestation(approvals.root, options.output, outcome.attestation);
+    // **승인 번들의 위치는 카드가 말한다.** `--output`은 이 명령에서 P0 **실행** 디렉터리이므로
+    // (records.jsonl이 거기 있다) 그것으로 번들 위치를 계산하면 attestation이
+    // `<run-dir>/approvals/`에 떨어진다 — 카드와 evidence가 사는 `<root>/approvals/`가 아니다.
+    // 그러면 P1 카드를 만드는 plan-pilot(`--output <root>`)이 그것을 찾지 못하고, 승인 번들이
+    // 단계 디렉터리마다 갈라진다. approvalStore.ts가 "P0와 P1이 같은 번들을 공유한다"고
+    // 정해둔 불변식의 정본은 카드의 `approvalsDir`이고, 그 값은 카드 해시 안에 있다.
+    const written = writeP0Attestation(loadedCard.card.approvalsDir, options.output, outcome.attestation);
     log("");
     log(`attestation(immutable): ${written.file}`);
     log(`안내용 포인터: ${written.pointerFile}`);
