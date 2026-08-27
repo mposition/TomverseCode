@@ -590,9 +590,25 @@ export class Orchestrator {
       throw error;
     }
 
-    // reviewer가 드롭됐으면 활성 역할이 executor 하나이므로 사실상 simple 경로다.
-    // routing이 진실의 원천이므로 tier 변수를 다시 쓰지 않고 routing.activeRoles를 본다.
-    const crossVerified = this.routing.activeRoles.includes("reviewer");
+    /**
+     * **"검수자를 구하지 못했다"와 "태스크가 simple하다"는 다른 사실이다.**
+     *
+     * 예전에는 `routing.activeRoles.includes("reviewer")` 하나로 경로를 갈랐다. 그래서
+     * 공급자가 하나뿐이면 tier가 `standard`여도 파이프라인 전체가 `SINGLE_MODEL_FIX`로
+     * 바뀌었다 — 초안 프롬프트도, `DraftProposal`도, `DRAFT_RECEIVED`의 patch도 없어진다.
+     *
+     * 그건 CLAUDE.md 원칙 4의 읽기와 어긋난다. 거기 적힌 것은 **"검수 역할을 드롭한 뒤 그
+     * 사실을 사용자에게 표시한다"** 이지 다른 파이프라인으로 가라는 것이 아니다. 역할 하나가
+     * 빠진 것과 태스크의 성격이 바뀐 것은 같은 일이 아니며, 뭉개면 사용자가 키를 하나만
+     * 넣었다는 이유로 **받는 결과의 종류가 통째로 달라진다.**
+     *
+     * 가설 게이트가 이걸 드러냈다(2026-08-27 P0): 단독 arm이 초안을 만들지 않으므로
+     * 교차검증 arm이 재생할 초안이 없었고, 실험이 재려던 A↔C 비교가 성립하지 않았다.
+     * 측정이 막힌 것이 계기였지만 고치는 것은 제품의 동작이다.
+     *
+     * 이제 경로는 **tier가 정하고**, 검수자가 없으면 REVIEWING만 건너뛴다.
+     */
+    const crossVerified = tier.tier !== "simple";
 
     // ---- 실행 전 루프: DRAFTING→REVIEWING 또는 SINGLE_MODEL_FIX ----
     //
@@ -631,9 +647,15 @@ export class Orchestrator {
   /** DRAFTING → REVIEWING (교차검증 경로) */
   private async runCrossVerifiedPath(): Promise<PathOutcome> {
     const adapters = this.requireAdapters();
-    if (!adapters.reviewer) {
-      // 여기 도달하면 라우터의 불변식과 실제 어댑터가 어긋난 것이다 — 조용히 단일 모델로
-      // 넘어가지 않고 실패로 드러낸다. "검증한 척"보다 나쁜 것은 "검증했다고 착각하는 코드"다.
+    /**
+     * 라우터가 검수자를 **활성화했는가.** 어댑터 유무와 나눠 본다.
+     *
+     * - 활성화했는데 어댑터가 없다 → 불변식 위반. 조용히 넘어가지 않고 실패로 드러낸다.
+     *   "검증한 척"보다 나쁜 것은 "검증했다고 착각하는 코드"다.
+     * - 애초에 드롭했다 → 정상이다. 초안까지는 그대로 만들고 REVIEWING만 건너뛴다.
+     */
+    const reviewerActive = this.routing?.activeRoles.includes("reviewer") ?? false;
+    if (reviewerActive && !adapters.reviewer) {
       return {
         kind: "final",
         result: await this.finish(
@@ -737,8 +759,42 @@ export class Orchestrator {
     //
     // 별도 phase를 만들지 않는다(17.1절). 대조는 LLM 호출이 아니라 필드 비교 연산이라
     // 사용자에게 노출할 단계가 아니고, 실패할 수 있는 외부 경계도 없다.
-    const contrastOutcome = await this.contrastAndMaybeAsk(proposals);
-    if (contrastOutcome.kind !== "proceed") return contrastOutcome;
+    //
+    // **비교할 것이 하나뿐이면 대조를 돌리지 않는다.** 빈 리포트를 남기면 "대조했는데 쟁점이
+    // 없었다"로 읽히는데, 실제로는 시도조차 하지 않은 것이다(13.2절). 화면은 이벤트가 없는
+    // 것과 `contrasted: false`를 같은 결과로 다루므로(`contrastSummary.ts`) 잃는 정보도 없다.
+    if (proposals.length >= 2) {
+      const contrastOutcome = await this.contrastAndMaybeAsk(proposals);
+      if (contrastOutcome.kind !== "proceed") return contrastOutcome;
+    }
+
+    // ---- 검수자가 없으면 여기서 끝난다 ----
+    //
+    // 초안은 그대로 만들었고(프롬프트·`DraftProposal`·`DRAFT_RECEIVED` 전부 standard 경로의
+    // 것이다), 다만 검수할 사람이 없다. **그 사실을 로그에 남긴다** — 남기지 않으면 검수를
+    // 거친 실행과 구별되지 않고, "교차검증했다"는 주장이 조용히 근거를 잃는다(원칙 4).
+    if (!reviewerActive) {
+      const patch = proposal.patch ?? "";
+      const ops = fileOps(proposal);
+      await this.emit("PHASE_CHANGED_NOTE", {
+        phase: "REVIEWING",
+        skipped: true,
+        // 라우터가 남긴 사유를 그대로 옮긴다 — 여기서 다시 문장을 만들면 둘이 갈라진다.
+        reason:
+          this.routing?.appliedPolicies.find((p) => p.startsWith("reviewer_dropped")) ??
+          "reviewer_dropped",
+        reviewerIndependent: false,
+        note: "검수자를 배정하지 못해 초안을 그대로 최종 후보로 넘깁니다 (교차검증 없음).",
+      });
+      // ACCEPT 분기와 같은 조건이다. patch가 없어도 조작이 있으면 성립한다(45절).
+      if (patch.trim().length === 0 && !hasFileOps(ops)) {
+        return {
+          kind: "final",
+          result: await this.finish("failed", "초안에 적용할 변경이 없습니다.", "internal_invariant_violated"),
+        };
+      }
+      return { kind: "patch", patch, ops };
+    }
 
     // 13.3절 절충: 검수자가 살아남은 초안의 저자와 같은 모델이면 대조 참가자 중 다른 쪽으로
     // 바꿔 낀다. 자기가 쓴 안을 자기가 검수하지 않는다.

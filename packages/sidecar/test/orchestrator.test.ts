@@ -1806,3 +1806,50 @@ test("단계가 없는 계획은 통과하지 않는다", async () => {
   const result = await orchestrator.run();
   assert.notEqual(result.status, "planned", result.summary);
 });
+
+/**
+ * 원칙 4의 읽기: **검수 역할을 드롭하는 것이지 다른 파이프라인으로 가는 것이 아니다.**
+ *
+ * 예전에는 공급자가 하나뿐이면 tier가 standard여도 `SINGLE_MODEL_FIX`로 갈아탔다. 그러면
+ * 초안 프롬프트도 `DraftProposal`도 `DRAFT_RECEIVED`의 patch도 없어진다 — 사용자가 키를
+ * 하나만 넣었다는 이유로 받는 결과의 종류가 통째로 달라지는 동작이었다.
+ */
+test("검수자를 배정하지 못해도 초안 경로는 그대로 탄다", async () => {
+  const { orchestrator, host } = build(
+    { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
+    { defaultPatch: VALID_PATCH },
+    { providers: ["fake-a"] } // 독립 검수자가 없다
+  );
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  // 초안이 **초안의 모양으로** 남는다 — 이게 없으면 로그에 무엇을 제안했는지가 없다.
+  const draft = host.events.find((e) => e.type === "DRAFT_RECEIVED")!.payload as {
+    proposalId?: string;
+    patch?: string | null;
+    draftSource?: string;
+    singleModel?: boolean;
+  };
+  assert.ok(draft.proposalId, "초안이 단일모델 모양으로 남았습니다 (proposalId 없음)");
+  assert.equal(draft.draftSource, "generated");
+  assert.ok((draft.patch ?? "").length > 0, "초안 patch가 이벤트에 없습니다");
+  assert.notEqual(draft.singleModel, true);
+
+  // 단계 기록도 초안 경로의 것이어야 한다.
+  const phases = host.events.filter((e) => e.type === "PHASE_CHANGED").map((e) => (e.payload as { to: string }).to);
+  assert.ok(phases.includes("DRAFTING"), `DRAFTING을 지나지 않았습니다: ${phases.join(" → ")}`);
+  assert.ok(!phases.includes("SINGLE_MODEL_FIX"), `단일모델 경로로 갔습니다: ${phases.join(" → ")}`);
+
+  // **비어 있는 REVIEWING을 지나가지 않는다** — 지나가면 검수를 거친 실행과 구별되지 않는다.
+  assert.ok(!phases.includes("REVIEWING"), `검수자가 없는데 REVIEWING을 지났습니다: ${phases.join(" → ")}`);
+
+  // 건너뛴 사실은 로그에 남는다. 남지 않으면 "교차검증했다"는 주장이 근거를 잃는다.
+  const skipped = host.events.find(
+    (e) => e.type === "PHASE_CHANGED_NOTE" && (e.payload as { skipped?: boolean }).skipped === true
+  );
+  assert.ok(skipped, "검수를 건너뛴 사실이 로그에 없습니다");
+  assert.equal((skipped!.payload as { phase?: string }).phase, "REVIEWING");
+
+  // 검수는 실제로 일어나지 않았다.
+  assert.ok(!host.eventTypes().includes("REVIEW_RECEIVED"));
+});
