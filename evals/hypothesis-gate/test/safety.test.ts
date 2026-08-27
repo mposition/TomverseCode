@@ -3279,13 +3279,18 @@ test("64. 카드가 출력한 명령이 그 카드의 authorization을 통과한
       arms: ["A", "B", "C", "D"],
       seed: 7,
       maxConcurrency: 1,
-      outputRoot: "/tmp/run",
+      // **이 테스트만 경로를 플랫폼에 맞춘다.** 아래에서 카드의 명령을 `parseArgs`로 되읽는데,
+      // 그쪽은 `--output`을 `path.resolve`하기 때문이다. POSIX 절대경로를 그대로 주면
+      // Windows에서 `/tmp/run/p0-smoke` → `H:\tmp\run\p0-smoke`가 되어 카드와 요청이 갈리고,
+      // 실제로는 성립하는 왕복이 실패로 보인다(실제 CLI는 `options.output`을 이미 resolve해
+      // 카드를 만들므로 양쪽이 같다). 다른 테스트들은 resolve를 지나지 않아 상관없다.
+      outputRoot: path.resolve("/tmp/run"),
       p0ApprovedLimitUsd: 30,
       models,
       createdAt: "2026-07-30T00:00:00.000Z",
       credentialsPresent: true,
       probeEvidence: evidence,
-      joinPath: (a, b) => `${a}/${b}`,
+      joinPath: (a, b) => path.join(a, b),
     }).p0;
     assert.equal(card.status, "READY_FOR_P0_APPROVAL", card.blockers.join(" / "));
 

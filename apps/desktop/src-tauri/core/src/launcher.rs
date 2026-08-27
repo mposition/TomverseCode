@@ -511,6 +511,20 @@ mod tests {
         assert!(err.contains("/typo/index.js"), "{err}");
     }
 
+    /// 기대 경로도 **실행 중인 OS의 구분자로** 만든다.
+    ///
+    /// 이 모듈의 로직은 `windows`를 인자로 받으므로 플랫폼 독립인데, `Path::join`이 만드는
+    /// **문자열**은 그렇지 않다. 기대값을 `/`로 적어두면 Linux에서만 맞고, 그래서 아래 세
+    /// 테스트는 Windows에서 launcher를 **한 번도 검증하지 못한 채 실패만** 하고 있었다
+    /// (CLAUDE.md: `std::path`는 실행 중인 OS의 구분자만 안다).
+    fn joined(parts: &[&str]) -> String {
+        let mut path = PathBuf::from(parts[0]);
+        for part in &parts[1..] {
+            path.push(part);
+        }
+        path.to_string_lossy().to_string()
+    }
+
     /// 진입점을 못 찾으면 **확인한 경로를 전부** 말한다. "실행할 수 없습니다"만 말하면
     /// 무엇을 놓쳤는지 알 방법이 없다 — MSVC 탐지에서 같은 실수를 이미 했다.
     #[test]
@@ -520,8 +534,11 @@ mod tests {
         let c = ctx(&exe_dir, Some(&repo), true, &[], &[]);
         let err = resolve(&c).unwrap_err();
 
-        assert!(err.contains("/app/sidecar/index.js"), "{err}");
-        assert!(err.contains("/repo/packages/sidecar/dist/src/index.js"), "{err}");
+        assert!(err.contains(&joined(&["/app", BUNDLE_DIR, ENTRY_FILE])), "{err}");
+        assert!(
+            err.contains(&joined(&["/repo", "packages", "sidecar", "dist", "src", ENTRY_FILE])),
+            "{err}"
+        );
         assert!(err.contains("npm run build"), "개발자가 할 일을 말하지 않습니다: {err}");
     }
 
@@ -592,8 +609,8 @@ mod tests {
         let launcher = resolve(&c).unwrap();
         let config = config_from(&launcher, vec![("K".into(), "V".into())]);
 
-        assert_eq!(config.program, "/app/sidecar/node");
-        assert_eq!(config.args, vec!["/app/sidecar/index.js".to_string()]);
+        assert_eq!(config.program, joined(&["/app", BUNDLE_DIR, "node"]));
+        assert_eq!(config.args, vec![joined(&["/app", BUNDLE_DIR, ENTRY_FILE])]);
         assert_eq!(config.env, vec![("K".to_string(), "V".to_string())]);
     }
 
@@ -608,6 +625,8 @@ mod tests {
         let c = ctx(&exe_dir, None, false, &[], &present);
         let launcher = resolve(&c).unwrap();
         assert!(!launcher.checked.is_empty());
-        assert!(launcher.describe_failure().contains("/app/sidecar/node"));
+        assert!(launcher
+            .describe_failure()
+            .contains(&joined(&["/app", BUNDLE_DIR, "node"])));
     }
 }

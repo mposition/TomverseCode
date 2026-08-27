@@ -160,7 +160,7 @@ function gitLogSubjects(root: string): string[] {
 
 function withRepo(
   fn: (repo: FixtureRepo, stateDir: string) => void,
-  options: { gitRepo?: boolean } = {}
+  options: { gitRepo?: boolean; crlf?: boolean } = {}
 ): void {
   const repo = createFixtureRepo(options);
   const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
@@ -339,6 +339,46 @@ test("M0: 버그 수정 1건이 요청→분석→승인→파일 변경→검�
       assert.equal(seqs[0], 0);
     }
   });
+});
+
+/**
+ * **CRLF 작업 트리에서도 완주한다** — Windows 착지 실측에서 온 시나리오.
+ *
+ * Git for Windows는 `core.autocrlf=true`를 시스템 설정으로 넣으므로 Windows 사용자의 작업
+ * 트리는 대부분 CRLF다. 그 상태에서 `apply_patch`가 **한 줄도 붙지 않는** 결함이 있었다:
+ * hunk는 `str::lines()`로 나뉘어 `\r`가 떨어지는데 파일은 `split('\n')`으로 나뉘어 `\r`가
+ * 남아, 모든 컨텍스트 줄이 어긋났다.
+ *
+ * 증상이 고약한 이유는 이것이 **플랫폼 하나에서만, 그리고 그 플랫폼에서는 거의 언제나**
+ * 일어난다는 점이다. Linux CI는 영원히 초록이고, 제품의 중심 동작(고친다)은 Windows에서
+ * 통째로 멎는다. 그래서 판정을 개발자 머신의 git 설정에 맡기지 않고 픽스처가 CRLF를
+ * **직접 만든다** — 어느 플랫폼에서 돌려도 이 시나리오는 CRLF를 지난다.
+ */
+test("CRLF 작업 트리에서도 수정이 적용되고 검증까지 완주한다", () => {
+  withRepo(
+    (repo, stateDir) => {
+      // 픽스처가 실제로 CRLF다 — 이 단언이 없으면 아래가 무엇을 검증했는지 알 수 없다.
+      const before = repo.read("paginate.js");
+      assert.ok(before.includes("\r\n"), "픽스처가 CRLF가 아닙니다 — 이 시나리오가 성립하지 않습니다");
+
+      const run = runHost(repo, stateDir);
+      assert.equal(run.final.status, "completed", `실패: ${run.final.summary}\nstderr:\n${run.stderr}`);
+      assert.deepEqual(run.mutatedPaths, ["paginate.js"]);
+
+      // 고쳐졌다.
+      const after = repo.read("paginate.js");
+      assert.ok(after.includes("(page - 1) * perPage"), after);
+
+      // **줄 끝이 보존됐다.** 정규화로 고쳤다면 여기서 걸린다 — 건드리지 않은 줄까지
+      // 바뀌면 승인 화면이 보여준 diff와 실제 쓰인 것이 달라진다.
+      assert.ok(!/[^\r]\n/.test(after), `LF 줄이 섞였습니다: ${JSON.stringify(after)}`);
+      assert.equal(after.split("\r\n").length, before.split("\r\n").length, after);
+
+      // 그리고 검증이 실제로 돌아 통과했다 — 적용만 되고 검증이 못 돈 상태와 구별한다.
+      assert.equal(run.final.verificationReport?.overall, "pass", JSON.stringify(run.final.verificationReport));
+    },
+    { crlf: true }
+  );
 });
 
 test("M0: 검증되지 않은 통과를 만들지 않는다 — baseline과 post 리포트가 모두 기록된다", () => {
