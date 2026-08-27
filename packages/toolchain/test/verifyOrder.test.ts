@@ -40,6 +40,13 @@ const REQUIRED_ORDER: { before: string; after: string; why: string }[] = [
     after: "test:e2e",
     why: "e2e가 tomverse-host 바이너리를 요구한다",
   },
+  {
+    before: "core:test",
+    after: "desktop:check",
+    why:
+      "껍데기의 타입 오류보다 신뢰 경계의 동작 실패를 먼저 본다 — 둘 다 깨졌을 때 " +
+      "먼저 읽어야 하는 것은 보안 로직 쪽이다",
+  },
 ];
 
 /**
@@ -61,7 +68,11 @@ export function extractStepOrder(rawScript: string): string[] {
   const script = stripComments(rawScript);
   const steps: { index: number; name: string }[] = [];
   // 긴 이름을 먼저 찾아 `core:build`가 `build`로 잘못 잡히지 않게 한다.
-  const names = ["core:build", "core:test", "test:e2e", "typecheck", "build", "test"];
+  //
+  // **이 목록에 없는 단계는 두 진입점 비교에서 보이지 않는다.** 그게 이 추출기의 사각이다 —
+  // 새 단계를 한쪽에만 넣어도 아래 "같은 순서다" 검사가 통과한다. 그래서 단계를 추가할 때는
+  // 여기에도 이름을 넣어야 하고, 넣지 않으면 두 진입점이 갈라져도 아무도 모른다.
+  const names = ["core:build", "core:test", "desktop:check", "test:e2e", "typecheck", "build", "test"];
   const claimed: { start: number; end: number }[] = [];
 
   for (const name of names) {

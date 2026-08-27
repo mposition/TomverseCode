@@ -880,10 +880,14 @@ export default function App() {
       setElapsedMs(0);
       try {
         // 다시 실행은 **새 승인**이다 — 지금 입력란에 있는 값이 이 실행의 상한이다.
+        // 종류도 같다: 저장된 행에 종류가 없으므로 복원할 수 없고, 다시 실행은 새 태스크다
+        // (16.6절). 보내지 않으면 Rust가 `change`로 보므로, **질문으로 물었던 것이 재실행에서
+        // 쓰기 도구를 들고 도는** 상태가 된다 — 사용자가 고른 적 없는 권한이다.
         const result = await invoke<FinalResult>("restart_task", {
           taskId: id,
           ...budgetArgs(budgetText),
           modelPins: modelPins(pinExecutor, pinReviewer),
+          kind: taskKind,
         });
         setFinalResult(result);
         setTaskId(result.taskId);
@@ -895,7 +899,11 @@ export default function App() {
         void refreshTasks();
       }
     },
-    [running, refreshTasks]
+    // **콜백이 읽는 값을 전부 적는다.** 종전에는 `running`과 `refreshTasks`만 있어서
+    // `budgetText`/`pinExecutor`/`pinReviewer`가 첫 렌더의 값에 붙들려 있었다 — 위 주석이
+    // "지금 입력란에 있는 값이 이 실행의 상한이다"라고 약속하는데 실제로는 그렇지 않았다.
+    // 상한은 사용자의 승인이므로, 승인한 적 없는 값으로 도는 것은 그 약속을 깨는 것이다.
+    [running, refreshTasks, budgetText, pinExecutor, pinReviewer, taskKind]
   );
 
   const routing = useMemo(() => findRouting(events), [events]);
@@ -1199,6 +1207,7 @@ export default function App() {
                   autoApproveVerification={autoApproveVerification}
                   skillPath={skillPath.trim() === "" ? null : skillPath.trim()}
                   deadlineSecs={deadline.secs}
+                  kind={taskKind}
                   ready={Boolean(workspace)}
                 />
 

@@ -21,6 +21,17 @@ use tomverse_core::types::{ExecutionMode, TaskPolicy};
 use tomverse_core::uimsg::{envelope, UiMessage};
 use tomverse_core::{PROTOCOL_VERSION, PROVIDER_ENV_VARS};
 
+/// 화면이 종류를 보내지 않았을 때의 기본값 — 파일을 바꾸는 평범한 태스크 (51·53절).
+///
+/// **한 자리에 둔다.** 종류를 받는 명령이 셋이고(`start_task`·`autopilot_preview`·`restart_task`)
+/// 각자 기본값을 적으면, 한 곳만 바뀌었을 때 **미리보기가 실행과 다른 종류에 대해 답한다.**
+/// 그 어긋남은 "미리보기가 틀렸다"가 아니라 "도구가 거짓말했다"로 읽힌다(47절).
+///
+/// 기본값이 읽기 전용이 아닌 쪽인 것은 의도다: 화면은 언제나 종류를 보내고, 보내지 않는
+/// 경우란 화면이 아닌 것이 부르는 경우다. 그때 조용히 읽기 전용으로 좁히면 **아무것도
+/// 바꾸지 못하는 태스크가 이유 없이** 만들어지고, 그 실패는 원인과 멀다.
+const DEFAULT_TASK_KIND: &str = "change";
+
 /// 워크스페이스 열기.
 ///
 /// 경로는 UI가 문자열로 넘기지만 Rust가 canonicalize하고 디렉터리인지 확인한다.
@@ -74,31 +85,35 @@ fn provider_status() -> Value {
     })
 }
 
+/// 인자 설명이 `///`가 아니라 `//`인 이유: **Rust에는 파라미터 문서 주석이 없다.**
+/// `///`를 붙이면 "documentation comments cannot be applied to function parameters"로
+/// 컴파일이 깨진다. 설명을 함수 위로 몰면 어느 인자의 이야기인지가 흐려지므로 자리를
+/// 지키고 형식만 바꿨다 — 되돌리지 말 것.
 #[tauri::command]
 async fn start_task(
     app: tauri::AppHandle,
     message: String,
     mode: String,
-    /// 검증 통과 후 커밋을 **제안할지**. 승인 등급은 낮추지 않는다(session.rs 주석 참조).
+    // 검증 통과 후 커밋을 **제안할지**. 승인 등급은 낮추지 않는다(session.rs 주석 참조).
     allow_git_commit: Option<bool>,
-    /// 이 태스크의 예산 상한(USD). `budget_unlimited`와 함께 해석된다 —
-    /// **인자를 빠뜨린 화면이 상한을 조용히 끄지 못하게** 하는 것이 두 인자로 받는 이유다.
+    // 이 태스크의 예산 상한(USD). `budget_unlimited`와 함께 해석된다 —
+    // **인자를 빠뜨린 화면이 상한을 조용히 끄지 못하게** 하는 것이 두 인자로 받는 이유다.
     budget_usd: Option<f64>,
     budget_unlimited: Option<bool>,
-    /// 역할별 모델 지정(`{ executor?, reviewer? }`). 없으면 라우터가 정한다.
-    /// **Rust는 해석하지 않고 그대로 넘긴다** — 모델 목록은 Node의 것이다.
+    // 역할별 모델 지정(`{ executor?, reviewer? }`). 없으면 라우터가 정한다.
+    // **Rust는 해석하지 않고 그대로 넘긴다** — 모델 목록은 Node의 것이다.
     model_pins: Option<Value>,
-    /// 무인 실행 (state-machine 24절). 켜면 승인이 필요한 지점에서 **멈춘다** —
-    /// 대신 승인해 주지 않는다.
+    // 무인 실행 (state-machine 24절). 켜면 승인이 필요한 지점에서 **멈춘다** —
+    // 대신 승인해 주지 않는다.
     unattended: Option<bool>,
-    /// 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
+    // 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
     auto_approve_verification: Option<bool>,
-    /// 스킬 파일 경로 (26절). **Rust가 읽는다.**
+    // 스킬 파일 경로 (26절). **Rust가 읽는다.**
     skill_path: Option<String>,
-    /// 이 요청이 **질문인가** (state-machine 51절). 참이면 파일을 바꾸지 않는 경로를 탄다.
+    // 이 요청이 **질문인가** (state-machine 51절). 참이면 파일을 바꾸지 않는 경로를 탄다.
     kind: Option<String>,
-    /// 무인 실행의 시한(초) — state-machine 39절. 지나면 **태스크가 멈춘다.**
-    /// `timeout_secs`와 다르다: 저쪽은 기다리기를 그만두는 시각이다(39.2절).
+    // 무인 실행의 시한(초) — state-machine 39절. 지나면 **태스크가 멈춘다.**
+    // `timeout_secs`와 다르다: 저쪽은 기다리기를 그만두는 시각이다(39.2절).
     deadline_secs: Option<u64>,
     timeout_secs: Option<u64>,
 ) -> Result<Value, String> {
@@ -119,7 +134,7 @@ async fn start_task(
             unattended.unwrap_or(false),
             auto_approve_verification.unwrap_or(false),
             skill_path.as_deref(),
-            kind.as_deref().unwrap_or("change"),
+            kind.as_deref().unwrap_or(DEFAULT_TASK_KIND),
             // 0은 받지 않는다 — "즉시 멈춘다"를 시한으로 적을 이유가 없고, 받으면 시작하자마자
             // 멈추는 실행이 정상 동작처럼 보인다.
             deadline_secs.filter(|s| *s > 0),
@@ -350,6 +365,10 @@ fn autopilot_preview(
     auto_approve_verification: Option<bool>,
     skill_path: Option<String>,
     deadline_secs: Option<u64>,
+    // 무인 스위치는 종류와 무관하게 켤 수 있으므로(화면의 그 fieldset은 `taskKind` 게이트
+    // 밖에 있다) 미리보기도 종류를 알아야 한다. 모르면 질문·계획 태스크에서 좁혀진 도구를
+    // "그냥 지나갑니다"로 보고한다.
+    kind: Option<String>,
 ) -> Result<Value, String> {
     state.autopilot_preview(
         parse_mode(&mode)?,
@@ -358,6 +377,7 @@ fn autopilot_preview(
         auto_approve_verification.unwrap_or(false),
         skill_path.as_deref(),
         deadline_secs,
+        kind.as_deref().unwrap_or(DEFAULT_TASK_KIND),
     )
 }
 
@@ -498,15 +518,20 @@ async fn restart_task(
     budget_usd: Option<f64>,
     budget_unlimited: Option<bool>,
     model_pins: Option<Value>,
+    // 종류는 저장된 행에서 복원할 수 없다 — `tasks`에도 `TaskRow`에도 컬럼이 없다.
+    // 화면이 지금 고른 값을 보낸다: **다시 실행은 새 태스크이고**(16.6절) 예산·모델 지정도
+    // 이미 그렇게 받는다.
+    kind: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Result<Value, String> {
     // 재실행은 **새 승인**이다. 이전 태스크의 상한을 이어받지 않는다 — 상한이 태스크당이라는
     // 결정의 직접적 귀결이고, 이어받으면 사용자가 승인한 적 없는 값이 강제된다.
     let budget = tomverse_core::budget::resolve_budget(budget_usd, budget_unlimited)?;
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(900));
+    let kind = kind.unwrap_or_else(|| DEFAULT_TASK_KIND.to_string());
     tauri::async_runtime::spawn_blocking(move || {
         let session = app.state::<SessionState>();
-        session.restart_task(&task_id, budget, model_pins.unwrap_or(Value::Null), timeout)
+        session.restart_task(&task_id, budget, model_pins.unwrap_or(Value::Null), &kind, timeout)
     })
     .await
     .map_err(|e| format!("재실행 스레드 오류: {e}"))?
