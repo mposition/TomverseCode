@@ -5,10 +5,21 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { armExecutionOrder, ARMS, armSpec } from "../src/arms.js";
-import { artifactsPresent, HOST_BIN, REPO_ROOT, resolveProviderArgs } from "../src/host.js";
+import {
+  artifactsPresent,
+  HOST_BIN,
+  lastDraftProposalPayload,
+  REPO_ROOT,
+  resolveProviderArgs,
+} from "../src/host.js";
 import { loadAllFixtures, loadFixture, listFixtureIds } from "../src/manifest.js";
 import { openRecordStore } from "../src/records.js";
-import { budgetStop, fillReviewerContributions, runExperiment } from "../src/runner.js";
+import {
+  budgetStop,
+  classifyInfrastructureFailure,
+  fillReviewerContributions,
+  runExperiment,
+} from "../src/runner.js";
 import { evaluateGate } from "../src/stats.js";
 import { renderMarkdown, writeReports } from "../src/report.js";
 import { preflight } from "../src/preflight.js";
@@ -523,4 +534,67 @@ test("호스트 경로가 공용 helper와 일치한다", () => {
   assert.equal(HOST_BIN, hostBinaryPath(REPO_ROOT, process.platform));
   if (process.platform === "win32") assert.ok(HOST_BIN.endsWith(".exe"));
   else assert.ok(!HOST_BIN.endsWith(".exe"));
+});
+
+// ---- P0 smoke가 드러낸 세 결함 (2026-08-27) ----
+
+const ev = (type: string, payload: Record<string, unknown>, seq: number) =>
+  ({ seq, type, payload }) as unknown as Parameters<typeof lastDraftProposalPayload>[0][number];
+
+test("DRAFT_RECEIVED는 이름 하나에 모양이 넷이다 — 진짜 초안만 고른다", () => {
+  // 실측: 재질문 응답이 초안 **뒤에** 와서 마지막 것을 집으면 초안이 사라졌고,
+  // 그 초안을 재생하는 Arm C/D가 통째로 건너뛰어졌다.
+  const events = [
+    ev("DRAFT_RECEIVED", { proposalId: "p1", patch: "--- a", model: "m", draftSource: "generated" }, 1),
+    ev("DRAFT_RECEIVED", { model: "m", kind: "question_answer", citedFiles: [] }, 2),
+  ];
+  const draft = lastDraftProposalPayload(events);
+  assert.equal(draft?.proposalId, "p1", "재질문 응답이 초안을 지웠습니다");
+  assert.equal(draft?.patch, "--- a");
+});
+
+test("plan_outline과 단일모델 fix도 초안으로 오인되지 않는다", () => {
+  assert.equal(
+    lastDraftProposalPayload([ev("DRAFT_RECEIVED", { model: "m", kind: "plan_outline", stepCount: 2 }, 1)]),
+    undefined
+  );
+  assert.equal(
+    lastDraftProposalPayload([ev("DRAFT_RECEIVED", { model: "m", singleModel: true, verdict: "ACCEPT" }, 1)]),
+    undefined
+  );
+  // 뒤에 온 진짜 초안(재생본)은 고른다 — 최신 것을 고르는 성질 자체는 유지된다.
+  const events = [
+    ev("DRAFT_RECEIVED", { proposalId: "old", patch: "x", draftSource: "generated" }, 1),
+    ev("DRAFT_RECEIVED", { proposalId: "new", patch: "y", draftSource: "replayed" }, 2),
+  ];
+  assert.equal(lastDraftProposalPayload(events)?.proposalId, "new");
+});
+
+test("성공한 실행을 stderr 문자열로 공급자 실패로 만들지 않는다", () => {
+  // 실측: 검증 명령(cargo/node --test) 출력이 stderr에 섞이고 거기엔 소요 시간·토큰 수·해시가
+  // 끝없이 나온다. `\b5\d\d\b`는 5로 시작하는 세 자리 숫자면 무엇이든 잡았다.
+  const host = (stderr: string) =>
+    ({ stderr, exitCode: 0, status: "completed", summary: "", taskId: "t", mutatedPaths: [], eventTypes: [],
+       dbPath: "", wallClockMs: 1 }) as unknown as Parameters<typeof classifyInfrastructureFailure>[0];
+  const succeeded = { eventsReadable: true, providerCalls: [{ status: "succeeded" }, { status: "succeeded" }] };
+
+  // 평범한 검증 출력. 예전에는 이것만으로 provider_5xx가 됐다.
+  const noisy = "test result: ok. 512 passed; 0 failed | duration_ms: 543.21 | req-429-abc";
+  assert.equal(classifyInfrastructureFailure(host(noisy), succeeded), undefined);
+
+  // **진짜 실패는 여전히 잡힌다** — 실패한 호출이 있으면 stderr 판정이 되살아난다.
+  const withFailure = { eventsReadable: true, providerCalls: [{ status: "succeeded" }, { status: "failed" }] };
+  assert.equal(classifyInfrastructureFailure(host("upstream 503 overloaded"), withFailure), "provider_5xx");
+
+  // 이벤트를 읽지 못했으면 아무것도 단정할 수 없으므로 stderr가 유일한 단서다.
+  const unreadable = { eventsReadable: false, providerCalls: [] };
+  assert.equal(classifyInfrastructureFailure(host("socket hang up"), unreadable), "network_timeout");
+
+  // 호출 기록이 아예 없는 경우도 마찬가지.
+  const noCalls = { eventsReadable: true, providerCalls: [] };
+  assert.equal(classifyInfrastructureFailure(host("429 Too Many Requests"), noCalls), "rate_limit");
+
+  // 구조화된 사실은 이 규칙보다 앞선다.
+  const spawn = { ...host(""), spawnError: "ENOENT" } as Parameters<typeof classifyInfrastructureFailure>[0];
+  assert.equal(classifyInfrastructureFailure(spawn, succeeded), "host_crash");
 });

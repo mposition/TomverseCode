@@ -98,6 +98,25 @@ export function applyReferencePatch(fixture: LoadedFixture, workspaceRoot: strin
   }
 }
 
+/**
+ * 검증 명령이 **스스로 만들어내는** 디렉터리. 변경 비교에서 뺀다.
+ *
+ * 실측(P0 smoke, 2026-08-27): Rust fixture 기록의 `changedFiles`가 `target/debug/incremental/...`
+ * 등 **수백 개**였다. 모델이 바꾼 것은 `src/retry.rs` 하나인데, `cargo test`가 남긴 빌드
+ * 산출물이 전부 기록·리포트·집계에 실렸다.
+ *
+ * 노이즈만이 아니다. 세 가지가 함께 망가진다:
+ *  - `changedFiles.length === 0`으로 "모델이 아무것도 바꾸지 않았다"를 잡는 검사가 네이티브
+ *    fixture에서는 **영원히 발동하지 않는다** (cargo가 항상 무언가 쓰므로).
+ *  - `.rlib`·`.pdb`·`.o`를 `readFileSync(..., "utf8")`로 읽는다. 바이너리를 문자열로 읽어
+ *    비교하는 것이라 느리고 메모리도 크게 먹는다.
+ *  - 기록이 커져서 사람이 읽을 수 없게 된다.
+ *
+ * 금지 경로(`forbiddenPaths`)와는 다른 축이다. 그쪽은 "건드리면 안 되는 것"이고 여기는
+ * "우리가 만든 것"이다.
+ */
+const GENERATED_DIRS: ReadonlySet<string> = new Set(["target", "node_modules", ".git"]);
+
 /** 실행 후 실제로 바뀐 파일 목록 (원본 fixture 대비). */
 export function changedFilesSince(fixture: LoadedFixture, workspaceRoot: string): string[] {
   const before = new Map<string, string>();
@@ -105,6 +124,8 @@ export function changedFilesSince(fixture: LoadedFixture, workspaceRoot: string)
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
+        // 최상위에서만 거른다 — 소스 안의 `target/`이라는 이름은 사용자 파일일 수 있다.
+        if (prefix === "" && GENERATED_DIRS.has(entry.name)) continue;
         collect(path.join(dir, entry.name), rel, into);
       } else if (entry.isFile()) {
         into.set(rel, readFileSync(path.join(dir, entry.name), "utf8"));

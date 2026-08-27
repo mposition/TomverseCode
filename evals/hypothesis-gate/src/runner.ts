@@ -3,7 +3,14 @@ import { existsSync } from "node:fs";
 import type { BudgetLedger, DispatchState } from "@tomverse/sidecar/budget";
 import { armExecutionOrder, armSpec, ARMS } from "./arms.js";
 import { criteriaHash } from "./criteria.js";
-import { allPayloads, lastPayload, readEvents, runHost, type HostRunResult } from "./host.js";
+import {
+  allPayloads,
+  lastDraftProposalPayload,
+  lastPayload,
+  readEvents,
+  runHost,
+  type HostRunResult,
+} from "./host.js";
 import { promptVersionHash, type LoadedFixture } from "./manifest.js";
 import { appendChecked, type RecordStore } from "./records.js";
 import { classifyContribution } from "./stats.js";
@@ -570,7 +577,10 @@ function executeOne(options: ExecuteOneOptions): RecordWithDraft {
     base.eventsReadable = read.ok;
     if (read.ok) applyEventDerivedFields(base, read.events);
 
-    const infraFailure = classifyInfrastructureFailure(hostResult);
+    const infraFailure = classifyInfrastructureFailure(hostResult, {
+      eventsReadable: base.eventsReadable,
+      providerCalls: base.providerCalls,
+    });
     if (infraFailure) {
       base.failureClass = infraFailure;
       if (!read.ok) {
@@ -653,12 +663,44 @@ function readEventsSafely(
   }
 }
 
-/** 프로세스를 띄우지 못했거나 공급자 인증/한도 문제인가. */
-function classifyInfrastructureFailure(result: HostRunResult): FailureClass | undefined {
+/**
+ * 프로세스를 띄우지 못했거나 공급자 인증/한도 문제인가.
+ *
+ * # stderr 문자열이 구조화된 증거를 뒤집지 않는다
+ *
+ * 이 함수의 뒤쪽 절반은 호스트 stderr에 정규식을 건다. 그런데 stderr에는 `--verbose` 로그와
+ * **검증 명령의 출력 전체**(cargo·node --test)가 섞여 있고, 거기엔 소요 시간·토큰 수·해시처럼
+ * 숫자가 끝없이 나온다. `/\b5\d\d\b/`는 5로 시작하는 세 자리 숫자면 무엇이든 잡고,
+ * `429`는 단어 경계도 없어 더 긴 토큰 안에서도 잡혔다.
+ *
+ * 실측(P0 smoke, 2026-08-27): provider 호출이 **전부 `succeeded`이고 `retryCount=0`인** 기록 둘이
+ * `provider_5xx`로 분류됐다. 인프라 실패율이 75%로 찍혀 사전 등록 기준 9번(5% 미만)이
+ * 허위로 깨졌다.
+ *
+ * 그리고 이건 집계만 틀리는 문제가 아니다. 호출부가 이 값을 받으면 **곧바로 반환**해
+ * 공개 검증도 oracle 검증도 돌지 않는다 — 실제로 측정할 수 있었던 결과가 버려진다.
+ *
+ * 그래서 규칙을 하나 세운다: **이벤트를 읽을 수 있었고, 기록된 provider 호출이 있고, 그것들이
+ * 전부 성공했다면 stderr 문자열로 공급자 실패를 만들어내지 않는다.** 진짜 5xx는 실패한 호출
+ * 이벤트를 남기므로 이 규칙이 그것을 가리지 않는다. 가리는 것은 "성공했다고 기록된 실행"뿐이다.
+ *
+ * `spawnError`와 `provider_config_error`는 구조화된 사실이므로 이 규칙 앞에 둔다.
+ */
+export function classifyInfrastructureFailure(
+  result: HostRunResult,
+  evidence: { eventsReadable: boolean; providerCalls: readonly { status: string }[] }
+): FailureClass | undefined {
   if (result.spawnError) return "host_crash";
   if (result.failureReason === "provider_config_error") return "auth_failure";
+
+  const allCallsSucceeded =
+    evidence.eventsReadable &&
+    evidence.providerCalls.length > 0 &&
+    evidence.providerCalls.every((call) => call.status === "succeeded");
+  if (allCallsSucceeded) return undefined;
+
   const stderr = result.stderr;
-  if (/rate.?limit|429/i.test(stderr)) return "rate_limit";
+  if (/rate.?limit|\b429\b/i.test(stderr)) return "rate_limit";
   if (/\b5\d\d\b|internal server error|overloaded/i.test(stderr)) return "provider_5xx";
   if (/ETIMEDOUT|ECONNRESET|ENOTFOUND|socket hang up/i.test(stderr)) return "network_timeout";
   return undefined;
@@ -778,10 +820,23 @@ function applyEventDerivedFields(record: RecordWithDraft, events: ReturnType<typ
     record.providerId = routing!.assignments!.map((a) => `${a.role}=${a.providerId}`).join(",");
   }
 
-  const draft = lastPayload(events, "DRAFT_RECEIVED") as
-    | { patch?: string | null; plan?: unknown; model?: string; proposalId?: string; interpretation?: string;
-        risks?: string[]; uncertainties?: string[]; draftSource?: string }
-    | undefined;
+  /**
+   * **`DRAFT_RECEIVED`는 이름 하나에 모양이 넷이다.** 진짜 초안 말고도
+   * `kind: "question_answer"`, `kind: "plan_outline"`, 그리고 단일모델 fix 결과가 같은 이름으로
+   * 나온다(orchestrator.ts 926·1070·2407·2499). 셋 다 `proposalId`도 `patch`도 없다.
+   *
+   * 그래서 `lastPayload`로 마지막 것을 집으면 **뒤에 온 다른 모양이 초안을 지운다.**
+   * 실측(P0 smoke, 2026-08-27): Arm A가 executor 호출 4회를 전부 성공시켰는데 마지막
+   * `DRAFT_RECEIVED`가 재질문 응답이라 `draftProposal`이 비었고, 그 초안을 재생해야 하는
+   * **Arm C/D가 8건 중 4건 통째로 건너뛰어졌다** — 교차검증 arm, 즉 이 게이트가 재려는
+   * 대상 전체다. 모호한 요구 카테고리(`ambiguous_requirement`)에서 모델이 되묻는 것은
+   * 정상 동작이므로, 세트가 어려울수록 더 자주 일어난다.
+   *
+   * 없는 것으로 거르지 않고 **있는 것으로 고른다.** `draftSource`는 진짜 초안에만 실리므로
+   * 그것을 표지로 쓴다 — "kind가 없으면 초안"으로 두면 다섯 번째 모양이 생겼을 때 조용히
+   * 다시 깨진다.
+   */
+  const draft = lastDraftProposalPayload(events);
   if (draft) {
     record.returnedModelId = draft.model;
     if (draft.draftSource === "replayed" || draft.draftSource === "generated") {

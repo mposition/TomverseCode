@@ -298,3 +298,26 @@ export function lastPayload(events: readonly StoredEvent[], type: string): Recor
 export function allPayloads(events: readonly StoredEvent[], type: string): Record<string, unknown>[] {
   return events.filter((e) => e.type === type).map((e) => e.payload);
 }
+
+/** `DRAFT_RECEIVED` 중 **진짜 초안**인 마지막 payload. 왜 필요한지는 runner.ts 호출부에 있다. */
+export interface DraftReceivedPayload {
+  patch?: string | null;
+  plan?: unknown;
+  model?: string;
+  proposalId?: string;
+  interpretation?: string;
+  risks?: string[];
+  uncertainties?: string[];
+  draftSource?: string;
+}
+
+export function lastDraftProposalPayload(events: readonly StoredEvent[]): DraftReceivedPayload | undefined {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i]!;
+    if (event.type !== "DRAFT_RECEIVED") continue;
+    const payload = event.payload as DraftReceivedPayload;
+    // 초안에만 실리는 표지. 없는 것(kind/singleModel)으로 거르면 새 모양이 생겼을 때 뚫린다.
+    if (payload.draftSource === "generated" || payload.draftSource === "replayed") return payload;
+  }
+  return undefined;
+}
