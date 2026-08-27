@@ -3204,6 +3204,9 @@ function providerFailureMessage(normalized: { kind: string; message: string }): 
   switch (normalized.kind) {
     case "auth":
       return `공급자 인증에 실패했습니다. API 키를 확인하세요. (${normalized.message})`;
+    // **키를 의심하게 만들지 않는다.** 요청이 반려된 것이므로 고칠 곳은 우리가 보낸 요청이다.
+    case "rejected":
+      return `공급자가 요청을 반려했습니다 (요청 형식·크기·파라미터를 확인하세요). ${normalized.message}`;
     case "model_unavailable":
       // gpt-5 사건: 키는 유효하지만 그 모델을 쓸 수 없다. 사용자가 할 일이 다르므로 구별해 알린다.
       return `이 자격증명으로는 해당 모델을 사용할 수 없습니다 (조직 인증 필요 또는 모델 미지원). ${normalized.message}`;

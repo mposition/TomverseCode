@@ -98,8 +98,17 @@ export function normalizeProviderError(raw: unknown): NormalizedProviderError {
   }
 
   if (status !== undefined && status >= 400 && status < 500) {
-    // 429 외 4xx는 재시도해도 같은 결과다 (9절 표).
-    return { kind: "auth", message, status, retryable: false };
+    /**
+     * 429·401·403이 아닌 4xx — **요청이 반려됐다.** 재시도해도 같은 결과다(9절 표).
+     *
+     * 예전에는 이 자리가 `auth`였다. 그래서 본문이 잘못됐거나 요청이 너무 큰 경우까지
+     * "인증 실패"로 읽혔고, 같은 키로 직전 호출이 성공한 뒤에 뜨면 원인과 정반대 방향을
+     * 보게 됐다(실측: 게이트 P1에서 gpt-4.1 3회 성공 뒤 4번째가 `auth`로 기록됨).
+     *
+     * 나누는 것이 과금 판정에도 필요하다. 이 계열은 **추론 전에 반려**되므로 비용이 없고,
+     * 그래서 예약을 해제할 근거가 된다 — 5xx와 정반대다.
+     */
+    return { kind: "rejected", message, status, retryable: false };
   }
 
   return { kind: "transient", message, status, retryable: false };

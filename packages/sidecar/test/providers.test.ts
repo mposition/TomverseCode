@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { ValidationError, validateDraftProposal, validateReviewDecision, validateSingleModelFixResult } from "@tomverse/protocol";
 import { FakeProviderAdapter } from "../src/providers/fake.js";
 import { normalizeProviderError } from "../src/providers/errors.js";
-import { backoffDelayMs, callWithRetry, DEFAULT_RETRY_POLICY, ProviderCallFailed, withTimeout } from "../src/providers/retry.js";
+import { attemptFacts, backoffDelayMs, callWithRetry, DEFAULT_RETRY_POLICY, ProviderCallFailed, withTimeout } from "../src/providers/retry.js";
 import { DRAFT_SCHEMA_STRICT, decodeMcpArguments, OpenAIAdapter } from "../src/providers/openai.js";
 import { AnthropicAdapter } from "../src/providers/anthropic.js";
 import { ProviderCallFailure, validateReceived } from "../src/providers/types.js";
@@ -898,4 +898,37 @@ test("이미 dispatch 사실을 아는 오류는 다시 감싸지 않는다", ()
     () => validateReceived(() => { throw original; }, received),
     (error: unknown) => error === original
   );
+});
+
+test("429·401·403이 아닌 4xx는 auth가 아니라 rejected다", () => {
+  // 실측(게이트 P1, 2026-08-27): gpt-4.1로 3회 성공한 뒤 4번째가 `auth`로 기록됐다.
+  // 같은 키로 직전 호출이 성공했는데 "인증 실패"가 뜨면 읽는 사람은 키를 의심하게 되고,
+  // 실제 원인(요청 형식·크기)과 정반대 방향을 본다.
+  const withStatus = (status: number, message = "bad request") =>
+    Object.assign(new Error(message), { status });
+
+  assert.equal(normalizeProviderError(withStatus(401)).kind, "auth");
+  assert.equal(normalizeProviderError(withStatus(403)).kind, "auth");
+  assert.equal(normalizeProviderError(withStatus(400)).kind, "rejected");
+  assert.equal(normalizeProviderError(withStatus(413, "payload too large")).kind, "rejected");
+  assert.equal(normalizeProviderError(withStatus(422)).kind, "rejected");
+
+  // 429와 5xx는 성질이 다르다 — 그대로 둔다.
+  assert.equal(normalizeProviderError(withStatus(429)).kind, "rate_limit");
+  assert.equal(normalizeProviderError(withStatus(503)).kind, "transient");
+
+  // 모델 미지원은 상태 코드보다 메시지가 정본이다 (gpt-5 사례).
+  assert.equal(normalizeProviderError(withStatus(404, "model_not_found")).kind, "model_unavailable");
+});
+
+test("반려는 dispatch 사실이 '나가지 않았다'로 확정된다", () => {
+  // 5xx·타임아웃과 반대 방향의 사실이다: 저쪽은 응답을 만든 뒤 실패했을 수 있어 모른다고
+  // 해야 하고, 이쪽은 만들기 전에 거절당했으므로 안다고 할 수 있다. 이 구별이 없으면
+  // 예약을 해제할 수 없고 그 한 건이 실행 전체를 멈춘다.
+  assert.equal(attemptFacts(0, new Error("bad request"), "rejected").dispatchState, "not_dispatched");
+
+  // 나머지는 여전히 보수적이다.
+  assert.equal(attemptFacts(0, new Error("boom"), "transient").dispatchState, "dispatched_no_response");
+  assert.equal(attemptFacts(0, new Error("boom"), "timeout").dispatchState, "dispatched_no_response");
+  assert.equal(attemptFacts(0, new Error("boom"), "auth").dispatchState, "dispatched_no_response");
 });

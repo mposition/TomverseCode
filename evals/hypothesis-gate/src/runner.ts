@@ -147,9 +147,20 @@ export function budgetStop(cumulativeSpentUsd: number, maxCostUsd: number | unde
  * 이벤트를 읽지 못했으면 `dispatched_no_response`다 — "모른다"를 "안 썼다"로 읽지 않는다.
  */
 
+/**
+ * 401/403이 **연속** 몇 번이면 그 공급자를 끊는가.
+ *
+ * 1회로 끊지 않는 이유: 일시적인 경우가 있고, 그때 끊으면 멀쩡한 공급자의 표본을 잃는다.
+ * 2회로 두는 이유: 자격증명·권한 문제는 재시도로 풀리지 않으므로 두 번이면 충분히 확실하고,
+ * 더 기다리면 같은 실패에 시간과 (429가 아닌 이상 0원이지만) 호출을 계속 쓴다.
+ */
+const AUTH_CIRCUIT_THRESHOLD = 2;
+
 /** 호출 이전 단계에서만 날 수 있는 실패. 이 목록에 HTTP 분류를 넣지 말 것. */
 const PRE_DISPATCH_FAILURES: ReadonlySet<string> = new Set([
   "auth_failure",
+  // 추론 전 반려 — 비용이 없다는 것이 실측으로 확인된 유일한 4xx 계열이다.
+  "invalid_request",
   "fixture_setup_failure",
   "toolchain_unavailable",
 ]);
@@ -297,6 +308,10 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
   let budgetExhausted = false;
   let unmeasurableCostAbort = false;
   let abortReason: string | undefined;
+  /** 공급자별 **연속** 인증/권한 실패 횟수. 성공이 끼면 되돌린다. */
+  const consecutiveAuthFailures = new Map<string, number>();
+  /** circuit이 열린 공급자 — 이 공급자를 쓰는 arm만 건너뛴다. */
+  const openCircuits = new Set<string>();
 
   for (const item of plan) {
     const { fixture, arm, repetition } = item;
@@ -325,6 +340,25 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
     }
 
     const spec = armSpec(arm);
+
+    /**
+     * circuit이 열린 공급자를 쓰는 arm은 건너뛴다 — **실험 전체는 계속한다.**
+     *
+     * 기록은 남긴다. 남기지 않으면 그 arm의 표본이 왜 비어 있는지 집계가 설명하지 못하고,
+     * "모델이 못 풀었다"와 "돌려보지도 못했다"가 같은 빈칸이 된다.
+     */
+    const blockedBy = spec.providers.filter((providerId) => openCircuits.has(providerId));
+    if (blockedBy.length > 0) {
+      log(`${fixtureId} rep${repetition} Arm ${arm}: ${blockedBy.join(", ")}의 circuit이 열려 건너뜁니다`);
+      appendChecked(
+        options.store,
+        skippedRecord(options, fixture, arm, repetition, hash, "auth_failure",
+          `circuit_open:${blockedBy.join(",")} — 인증/권한 실패가 연속되어 이 공급자를 쓰는 arm을 중단함`)
+      );
+      executed += 1;
+      continue;
+    }
+
     let replayDraft: unknown;
     if (spec.draftSource === "replay") {
       const source = spec.draftSourceArm!;
@@ -395,7 +429,26 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
        * 실패율을 읽는 사람에게 "모델이 못 풀었다"와 "우리가 기다려주지 않았다"는 다른 소식이다.
        */
       const timedOut = record.providerCalls.some((call) => call.errorKind === "timeout");
-      record.failureClass = timedOut ? "provider_timeout" : "cost_unmeasurable";
+      /**
+       * **추론 전 반려는 비용 미측정이 아니라 비용 0이다.**
+       *
+       * 429·401·403이 아닌 4xx는 공급자가 생성을 시작하기 전에 요청을 반려한 것이므로
+       * 과금되지 않는다 — 이 저장소에서 실측으로 확인했다(strict 스키마 400 거절이 공급자
+       * 청구 내역에 없었다). `cost_unmeasurable`로 두면 "얼마인지 모른다"가 되어 예약을
+       * 정산할 수도 해제할 수도 없고, **그 한 건이 96건 전체를 멈춘다.**
+       *
+       * 그 일이 실제로 반복됐다(P1이 네 번 멈췄고 매번 다른 원인이었다). 비용을 아는 경우를
+       * 모르는 것으로 적으면 예산 보호가 아니라 실행 불가가 된다.
+       */
+      const rejected =
+        record.providerCalls.some((call) => call.errorKind === "rejected") &&
+        !record.providerCalls.some((call) => call.dispatchState === "response_received_with_usage");
+      if (rejected) {
+        record.failureClass = "invalid_request";
+        record.costUsd = 0;
+      } else {
+        record.failureClass = timedOut ? "provider_timeout" : "cost_unmeasurable";
+      }
     }
 
     appendChecked(options.store, record);
@@ -467,13 +520,43 @@ export async function runExperiment(options: RunnerOptions): Promise<RunnerResul
       }
     }
 
-    if (costUnmeasurable) {
+    // **반려는 멈출 이유가 아니다.** 비용을 아는(0인) 실패이므로 예산 상한은 여전히 강제된다.
+    if (costUnmeasurable && record.failureClass !== "invalid_request") {
       unmeasurableCostAbort = true;
       abortReason =
         `${fixtureId} rep${repetition} Arm ${arm}: 실제 응답에 usage가 없거나 비용을 계산할 수 없습니다. ` +
         `예산 상한을 강제할 수 없으므로 남은 유료 호출을 중단합니다 (기록은 보존되며 --resume으로 이어받을 수 있습니다).`;
       log(abortReason);
       break;
+    }
+
+    /**
+     * **401/403 circuit breaker — 공급자 단위로 끊고 실험은 계속한다.**
+     *
+     * 자격증명이나 권한 문제는 재시도로 풀리지 않고, 그 공급자를 쓰는 arm은 전부 같은 실패를
+     * 반복한다. 그렇다고 실행 전체를 멈추면 **그 공급자와 무관한 arm의 데이터까지 잃는다** —
+     * Arm B(anthropic 단독)는 openai가 죽어도 멀쩡히 돌 수 있다.
+     *
+     * **연속**으로 셈하는 이유: 한 번은 일시적일 수 있다. 중간에 성공이 끼면 자격증명 문제가
+     * 아니므로 계수를 되돌린다.
+     */
+    for (const providerId of new Set(record.providerCalls.map((call) => call.providerId))) {
+      const calls = record.providerCalls.filter((call) => call.providerId === providerId);
+      const authFailed = calls.some((call) => call.errorKind === "auth");
+      const anySucceeded = calls.some((call) => call.status === "succeeded");
+      if (authFailed && !anySucceeded) {
+        const next = (consecutiveAuthFailures.get(providerId) ?? 0) + 1;
+        consecutiveAuthFailures.set(providerId, next);
+        if (next >= AUTH_CIRCUIT_THRESHOLD && !openCircuits.has(providerId)) {
+          openCircuits.add(providerId);
+          log(
+            `${providerId}: 인증/권한 실패가 연속 ${next}회 — 이 공급자를 쓰는 arm을 중단합니다. ` +
+              `나머지 arm은 계속 실행합니다.`
+          );
+        }
+      } else if (anySucceeded) {
+        consecutiveAuthFailures.set(providerId, 0);
+      }
     }
 
     if (spec.draftSource === "generate" && record.draftProposal !== undefined) {
