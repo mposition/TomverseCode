@@ -982,7 +982,9 @@ test("프롬프트가 제외된 파일과 보지 못한 범위를 다른 문단�
   const rendered = renderSnapshot(
     makeSnapshot({
       excludedNotes: [{ path: ".env", reason: "비밀값 파일" }],
-      coverageNotes: [{ scope: "본문 검색: resolveBudget", reason: "비밀값 파일 2개는 검색하지 않았습니다" }],
+      coverageNotes: [
+        { kind: "search_secret_skipped", scope: "본문 검색: resolveBudget", reason: "비밀값 파일 2개는 검색하지 않았습니다" },
+      ],
     })
   );
 

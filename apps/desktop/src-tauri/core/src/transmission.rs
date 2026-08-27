@@ -93,6 +93,12 @@ pub struct NamedOnlyFile {
 pub struct CoverageNote {
     pub scope: String,
     pub reason: String,
+    /// 집계의 열쇠 (context-engine 19절). **문장이 아니라 값이다** — 문장으로 묶으면
+    /// 표현을 다듬는 순간 계열이 갈라지고, 갈라진 계열은 "줄었다"로 읽힌다.
+    ///
+    /// 우리가 모르는 값이 올 수 있다(옛 기록, 새 종류). **`unknown`으로 접지 않고** 온
+    /// 문자열을 그대로 나른다 — 접으면 새 종류가 조용히 옛 칸에 섞인다.
+    pub kind: Option<String>,
 }
 
 /// **파일이 아닌데 프롬프트에 실려 나가는 것.**
@@ -414,6 +420,7 @@ pub fn collect(store: &Store, task_id: &str) -> Result<Transmission, String> {
                         .and_then(Value::as_str)
                         .unwrap_or("(사유 없음)")
                         .to_string(),
+                    kind: note.get("kind").and_then(Value::as_str).map(str::to_string),
                 });
             }
         }

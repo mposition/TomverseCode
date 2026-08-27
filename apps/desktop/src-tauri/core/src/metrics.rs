@@ -779,6 +779,43 @@ pub struct ContextRounds {
     pub skipped_as_pointless: u64,
 }
 
+/// **우리가 못 본 채로 답한 태스크가 얼마나 되는가** — context-engine 19절.
+///
+/// # 왜 이 집계가 필요한가
+///
+/// 16·17·18절이 범위 노트를 만들었다. 그 노트는 모델에게도 사용자에게도 가지만, **얼마나
+/// 자주 그런 상태로 답하는지는 아무도 몰랐다.** 한 태스크에서 "검색이 못 본 것이 있다"는
+/// 주의를 주는 것과, 열 번 중 아홉 번이 그렇다는 것은 다른 사실이고 할 일도 다르다.
+///
+/// # 종류를 나누는 이유
+///
+/// 종류마다 **할 일이 다르다.** 목록이 잘린 것은 상한 문제, 검색 실패는 도구 문제,
+/// 비밀값 건너뜀은 고칠 것이 없는 정상 동작이다. 한 숫자로 세면 그 숫자로 할 수 있는 일이
+/// 없다.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ContextCoverage {
+    /// 스냅샷을 만든 태스크 수. **비율의 분모다** — 전체 태스크가 아니다(스냅샷 전에 끝난
+    /// 태스크에는 이 질문이 성립하지 않는다).
+    #[serde(rename = "tasksWithSnapshot")]
+    pub tasks_with_snapshot: u64,
+    /// 그중 범위 노트가 하나라도 있던 태스크 수.
+    #[serde(rename = "tasksWithGap")]
+    pub tasks_with_gap: u64,
+    /// 종류별 **태스크 수**(노트 수가 아니다). 한 태스크가 같은 종류의 노트를 여럿 남겨도
+    /// 하나로 센다 — 노트 수로 세면 키워드가 많은 요청 하나가 분포를 끌고 간다.
+    ///
+    /// **키를 우리가 정하지 않는다.** 기록에 있는 문자열을 그대로 쓴다 — 여기에 아는 종류
+    /// 목록을 두면 Node의 목록과 두 벌이 되고, 새 종류가 조용히 옛 칸에 섞인다.
+    #[serde(rename = "byKind")]
+    pub by_kind: BTreeMap<String, u64>,
+    /// 종류가 없는 노트가 있던 태스크 수 (이 필드가 생기기 전의 기록).
+    ///
+    /// **`byKind`에 섞지 않는다.** "모른다"를 아무 칸에나 넣으면 그 칸의 숫자가 무엇도
+    /// 뜻하지 않게 된다.
+    #[serde(rename = "tasksWithUnlabelledNote")]
+    pub tasks_with_unlabelled_note: u64,
+}
+
 /// 무인 실행 **예고가 얼마나 맞았는가** — state-machine 59.6절.
 ///
 /// # 예고와 실제를 기록에서 잇는다
@@ -1148,6 +1185,9 @@ pub struct Metrics {
     /// 읽기 전용 경로가 더 읽어 달라고 한 횟수 (state-machine 57.8절).
     #[serde(rename = "contextRounds")]
     pub context_rounds: ContextRounds,
+    /// 우리가 못 본 채로 답한 태스크의 비율 (context-engine 19절).
+    #[serde(rename = "contextCoverage")]
+    pub context_coverage: ContextCoverage,
     /// 무인 예고가 얼마나 맞았는가 (state-machine 59.6절).
     #[serde(rename = "previewAccuracy")]
     pub preview_accuracy: PreviewAccuracy,
@@ -1342,6 +1382,14 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "답변·계획 태스크 수",
             m.context_rounds.read_only_tasks,
             "stoppedByLimit가 크면 상한을 올릴 근거다. **skippedAsPointless가 크면 아니다** — 그건 돌 이유가 없었다는 뜻이라 상한을 올려도 아무 일도 일어나지 않는다. requestsRefused가 크면 상한이 아니라 프롬프트 문제다: 모델이 경로가 아닌 것을 요청하고 있다",
+        ),
+        open_question(
+            "contextCoverage",
+            "contextCoverage",
+            "우리가 못 본 채로 답하는 일이 얼마나 흔한가 (context-engine 19절)",
+            "스냅샷을 만든 태스크 수",
+            m.context_coverage.tasks_with_snapshot,
+            "byKind로 갈라서 읽어야 한다 — 종류마다 할 일이 다르다. listing_truncated가 크면 인덱싱 상한(또는 하위 경로로 나눠 부르는 방식)의 근거이고, search_truncated는 키워드당 상한 쪽이다. **search_secret_skipped는 고칠 것이 아니다** — 정상 동작이고, 이 칸이 커도 그건 저장소에 비밀값 파일이 많다는 뜻일 뿐이다. search_failed가 0이 아니면 도구 문제이므로 가장 먼저 본다. *_unknown 계열은 호스트가 사실을 말하지 않는 경우이며, 우리 코드에서는 나오지 않아야 한다 — 나오면 옛 호스트나 옛 캐시를 읽고 있다는 신호다",
         ),
         open_question(
             "previewAccuracy",
@@ -1899,6 +1947,7 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
 
         // ---- 읽기 전용 경로의 컨텍스트 라운드 (57.8절) ----
         collect_context_rounds(&events, &mut metrics.context_rounds);
+        collect_context_coverage(&events, &mut metrics.context_coverage);
 
         // ---- 무인 예고가 맞았는가 (59.6절) ----
         collect_preview_accuracy(&events, &mut metrics.preview_accuracy);
@@ -2065,6 +2114,48 @@ fn collect_test_attribution(events: &[crate::store::StoredEvent], out: &mut Test
         if mixed {
             out.reports_mixed += 1;
         }
+    }
+}
+
+/// 범위 노트를 **태스크 단위로** 센다 — context-engine 19절.
+///
+/// 마지막 `SNAPSHOT_CREATED`만 본다. 갱신 스냅샷이 노트를 물려받으므로(17절) 전부 세면 같은
+/// 사실이 라운드 수만큼 곱해진다 — `transmission.rs`가 같은 이유로 마지막 것을 읽는다.
+fn collect_context_coverage(events: &[crate::store::StoredEvent], out: &mut ContextCoverage) {
+    let Some(payload) = events
+        .iter()
+        .rev()
+        .find(|e| e.event_type == "SNAPSHOT_CREATED")
+        .map(|e| &e.payload)
+    else {
+        return;
+    };
+    out.tasks_with_snapshot += 1;
+
+    let Some(notes) = payload.get("coverageNotes").and_then(Value::as_array) else {
+        return;
+    };
+    if notes.is_empty() {
+        return;
+    }
+    out.tasks_with_gap += 1;
+
+    // **태스크당 한 번씩만 센다.** 노트 수로 세면 키워드가 많은 요청 하나가 분포를 끌고 간다.
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut unlabelled = false;
+    for note in notes {
+        match note.get("kind").and_then(Value::as_str) {
+            Some(kind) => {
+                kinds.insert(kind.to_string());
+            }
+            None => unlabelled = true,
+        }
+    }
+    for kind in kinds {
+        *out.by_kind.entry(kind).or_insert(0) += 1;
+    }
+    if unlabelled {
+        out.tasks_with_unlabelled_note += 1;
     }
 }
 
@@ -3368,6 +3459,119 @@ mod tests {
         // 건너뛰기만 있었으면 "라운드를 돈" 태스크가 아니다.
         assert_eq!(m.context_rounds.tasks_with_round, 0);
         assert_eq!(m.context_rounds.read_only_tasks, 1);
+    }
+
+    // ---- 못 본 채로 답했는가 (context-engine 19절) ----
+
+    fn snapshot_with_coverage(notes: Value) -> Value {
+        json!({ "snapshotId": "snap-1", "relevantFiles": [], "excludedNotes": [], "coverageNotes": notes })
+    }
+
+    /// **종류별로 태스크를 센다** — 종류마다 할 일이 다르므로 한 숫자로 세면 쓸 수 없다.
+    #[test]
+    fn coverage_gaps_are_counted_by_kind_once_per_task() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with_coverage(json!([
+                    { "kind": "search_secret_skipped", "scope": "본문 검색: a", "reason": "…" },
+                    // **같은 종류가 두 번** — 키워드마다 붙으므로 흔하다. 태스크는 하나로 세야 한다.
+                    { "kind": "search_secret_skipped", "scope": "본문 검색: b", "reason": "…" },
+                    { "kind": "listing_truncated", "scope": "파일 목록", "reason": "…" },
+                ])),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.tasks_with_snapshot, 1);
+        assert_eq!(m.context_coverage.tasks_with_gap, 1);
+        assert_eq!(m.context_coverage.by_kind.get("search_secret_skipped"), Some(&1), "{:?}", m.context_coverage);
+        assert_eq!(m.context_coverage.by_kind.get("listing_truncated"), Some(&1), "{:?}", m.context_coverage);
+        assert_eq!(m.context_coverage.tasks_with_unlabelled_note, 0);
+    }
+
+    /// **분모는 스냅샷을 만든 태스크다** — 전체 태스크가 아니다.
+    ///
+    /// 스냅샷 전에 끝난 태스크에는 이 질문이 성립하지 않는다. 분모에 넣으면 비율이 낮아지고,
+    /// 그건 우리가 더 잘 보고 있다는 뜻으로 읽힌다 — **잘못된 분모가 표본 부족보다 나쁘다.**
+    #[test]
+    fn a_task_without_a_snapshot_is_not_in_the_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .create_task("task-2", "sess-1", "ws-1", "/tmp/ws", "verified", "fix")
+            .unwrap();
+        // task-1만 스냅샷을 만든다. task-2는 그 전에 끝났다.
+        store
+            .append_event("task-1", "SNAPSHOT_CREATED", &snapshot_with_coverage(json!([])))
+            .unwrap();
+        store.append_event("task-2", "TASK_FAILED", &json!({})).unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.tasks_with_snapshot, 1, "{:?}", m.context_coverage);
+        // 노트가 없으면 "못 본 것이 없다" — 분자에 들어가지 않는다.
+        assert_eq!(m.context_coverage.tasks_with_gap, 0, "{:?}", m.context_coverage);
+    }
+
+    /// **갱신 스냅샷이 노트를 물려받아도 한 번만 센다.**
+    ///
+    /// 17절의 갱신 경로는 앞선 노트를 그대로 나른다. 전부 세면 같은 사실이 라운드 수만큼
+    /// 곱해지고, 그러면 fix loop를 많이 돈 태스크가 분포를 끌고 간다.
+    #[test]
+    fn only_the_last_snapshot_counts() {
+        let (_d, mut store) = seeded();
+        for _ in 0..3 {
+            store
+                .append_event(
+                    "task-1",
+                    "SNAPSHOT_CREATED",
+                    &snapshot_with_coverage(json!([{ "kind": "listing_truncated", "scope": "파일 목록", "reason": "…" }])),
+                )
+                .unwrap();
+        }
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.tasks_with_snapshot, 1, "{:?}", m.context_coverage);
+        assert_eq!(m.context_coverage.by_kind.get("listing_truncated"), Some(&1), "{:?}", m.context_coverage);
+    }
+
+    /// **종류가 없는 노트를 아무 칸에나 넣지 않는다.**
+    ///
+    /// 이 필드가 생기기 전의 기록이 그렇다. 아는 칸에 섞으면 그 칸의 숫자가 무엇도 뜻하지
+    /// 않게 되고, 버리면 "못 본 것이 없었다"가 된다 — 둘 다 틀리므로 따로 센다.
+    #[test]
+    fn an_unlabelled_note_is_counted_apart() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with_coverage(json!([{ "scope": "본문 검색: a", "reason": "옛 기록" }])),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.tasks_with_gap, 1);
+        assert_eq!(m.context_coverage.tasks_with_unlabelled_note, 1);
+        assert!(m.context_coverage.by_kind.is_empty(), "{:?}", m.context_coverage.by_kind);
+    }
+
+    /// **모르는 종류를 옛 칸에 접지 않는다.** Rust가 아는 종류 목록을 들면 Node의 목록과
+    /// 두 벌이 되고, 그때 새 종류는 조용히 사라지거나 엉뚱한 칸에 섞인다.
+    #[test]
+    fn an_unknown_kind_gets_its_own_bucket() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with_coverage(json!([{ "kind": "some_future_kind", "scope": "x", "reason": "…" }])),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.by_kind.get("some_future_kind"), Some(&1), "{:?}", m.context_coverage);
+        assert_eq!(m.context_coverage.tasks_with_unlabelled_note, 0);
     }
 
     // ---- 예고가 맞았는가 (state-machine 59.6절) ----

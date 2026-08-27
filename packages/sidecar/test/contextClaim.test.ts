@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { declaresSection, PYTEST_SECTIONS } from "../src/context/engine.js";
+import { COVERAGE_NOTE_KINDS } from "@tomverse/protocol";
 import { ToolBridge, UNREAD_TOOL_FACTS } from "../src/tools/bridge.js";
 import { FakeHost } from "./helpers/fakeHost.js";
 
@@ -261,4 +262,44 @@ test("fake가 비밀값 판정을 다시 구현하지 않는다", () => {
   // 그리고 `.env`를 직접 보는 정규식이 남아 있지 않아야 한다.
   const needle = "\\.env" + "($";
   assert.ok(!fake.includes(needle), "fake에 손으로 적은 비밀값 정규식이 남아 있습니다");
+});
+
+/**
+ * **종류 목록과 실제로 붙이는 종류가 같아야 한다** — context-engine 19절.
+ *
+ * 집계는 이 값으로 묶는다. 목록에만 있고 아무도 붙이지 않는 종류가 있으면 그 칸은 영원히
+ * 0이고 — 0은 "그런 일이 없었다"로 읽힌다. 반대로 붙이는데 목록에 없으면 타입이 넓어지는
+ * 순간(예: JSON에서 읽은 노트) 조용히 새 칸이 생긴다.
+ *
+ * 컴파일러가 잡는 것은 후자뿐이고, 그것도 리터럴로 적었을 때만이다. 여기서는 **양쪽을
+ * 소스에서 유도해** 대조한다.
+ */
+// **`__dirname`은 실행 시점에 `dist/test`다.** 소스 기준으로 세면 없는 경로가 나오고,
+// 그 실패는 원인과 멀다(파일이 없다고만 말한다). 위 `PYTHON_RS`가 같은 기준으로 센다.
+const ENGINE_TS = path.resolve(__dirname, "..", "..", "src", "context", "engine.ts");
+
+test("범위 노트의 종류 목록과 실제로 붙이는 종류가 같다", () => {
+  const source = readFileSync(ENGINE_TS, "utf8");
+  // needle을 런타임에 조립한다 — 리터럴로 적으면 이 파일이 검사 대상처럼 보인다.
+  const marker = "kind" + ": ";
+  const produced = new Set<string>();
+  for (const m of source.matchAll(/\bkind: (?:[^\n]*\? )?"([a-z_]+)"(?: : "([a-z_]+)")?/g)) {
+    produced.add(m[1] as string);
+    if (m[2]) produced.add(m[2]);
+  }
+  assert.ok(marker.length > 0);
+  // 0개면 아래 비교가 빈 집합에 대해 통과한다 — 형식이 바뀐 경우다.
+  assert.ok(produced.size >= 4, `engine.ts에서 종류를 ${produced.size}개만 읽었습니다`);
+
+  const declared = new Set<string>(COVERAGE_NOTE_KINDS);
+  const undeclared = [...produced].filter((k) => !declared.has(k));
+  assert.deepEqual(undeclared, [], `목록에 없는 종류를 붙입니다: ${undeclared.join(", ")}`);
+
+  const unused = [...declared].filter((k) => !produced.has(k));
+  assert.deepEqual(
+    unused,
+    [],
+    `아무도 붙이지 않는 종류가 목록에 있습니다: ${unused.join(", ")}. ` +
+      `그 칸은 영원히 0이고, 0은 "그런 일이 없었다"로 읽힙니다.`
+  );
 });

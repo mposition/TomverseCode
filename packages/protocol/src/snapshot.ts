@@ -177,8 +177,50 @@ export interface WorkspaceSnapshot {
    * `path`가 아니라 `scope`인 이유가 그것이다 — 이 값은 경로가 아니고, 경로인 척하면
    * 읽는 쪽이 파일을 찾는다.
    */
-  coverageNotes?: { scope: string; reason: string }[];
+  coverageNotes?: CoverageNote[];
   createdAt: ISODateTime;
+}
+
+/**
+ * 범위 노트의 **종류** — context-engine.md 19절.
+ *
+ * # 왜 문장 말고 값이 필요한가
+ *
+ * `reason`은 사람이 읽는 문장이라 집계의 열쇠가 될 수 없다. 문장으로 묶으면 표현을 다듬는
+ * 순간 계열이 갈라지고, **갈라진 계열은 "줄었다"로 읽힌다** — 잘못된 분모가 표본 부족보다
+ * 나쁘다는 규칙이 여기에도 그대로 적용된다.
+ *
+ * 그리고 종류마다 **할 일이 다르다**: 목록이 잘린 것은 상한 문제이고, 검색이 실패한 것은
+ * 도구 문제이며, 비밀값을 건너뛴 것은 고칠 것이 없는 정상 동작이다. 셋을 한 숫자로 세면
+ * 그 숫자로 할 수 있는 일이 없다.
+ *
+ * **배열이 정본이고 타입은 거기서 유도한다.** 둘을 따로 적으면 갈라지고, 갈라지면 런타임
+ * 검사가 타입에 없는 값을 통과시킨다.
+ */
+export const COVERAGE_NOTE_KINDS = [
+  /** 호스트의 파일 목록이 상한에서 잘렸다 (18절). */
+  "listing_truncated",
+  /** 목록이 전부인지 호스트가 말하지 않았다. **`listing_truncated`와 다른 사실이다.** */
+  "listing_unknown",
+  /** 본문 검색 호출 자체가 실패했다 (13절). */
+  "search_failed",
+  /** 검색이 비밀값 파일을 읽지 않고 건너뛰었다 (16절). */
+  "search_secret_skipped",
+  /** 검색 결과가 상한에서 잘렸다. */
+  "search_truncated",
+  /** 검색 결과가 전부인지 호스트가 말하지 않았다. */
+  "search_unknown",
+] as const;
+
+export type CoverageNoteKind = (typeof COVERAGE_NOTE_KINDS)[number];
+
+export interface CoverageNote {
+  /** 어느 범위인가. 사람이 읽는 이름이고 **경로가 아니다**(17절). */
+  scope: string;
+  /** 사람이 읽는 문장. **집계의 열쇠로 쓰지 않는다** — 다듬으면 계열이 갈라진다. */
+  reason: string;
+  /** 집계의 열쇠. 종류마다 할 일이 다르다(19절). */
+  kind: CoverageNoteKind;
 }
 
 // docs/design/context-engine.md 2절 — 세션 스코프로 유지되는 인덱스.

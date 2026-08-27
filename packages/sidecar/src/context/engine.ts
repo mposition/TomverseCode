@@ -1,4 +1,5 @@
 import type {
+  CoverageNote,
   DetectedCommand,
   ModelId,
   ProjectMeta,
@@ -267,7 +268,7 @@ export class ContextEngine {
     const excludedNotes = this.notesForMentionedButExcluded(index, input.userMessage);
     // **파일에 대한 노트와 따로 모은다**(17절). 검색이 못 본 범위는 파일이 아니고, 같은
     // 목록에 넣으면 `(search: foo)`가 파일 이름으로 프롬프트와 화면에 나간다.
-    const coverageNotes: { scope: string; reason: string }[] = [];
+    const coverageNotes: CoverageNote[] = [];
     // **인덱스가 전부를 봤는지 말한다**(18절). 이 노트가 없으면 잘린 목록으로 만든 인덱스와
     // 온전한 인덱스가 프롬프트에서도 화면에서도 **똑같아 보인다** — 그리고 인덱스는
     // 캐시되므로 그 침묵이 다음 태스크들로 이어진다.
@@ -489,7 +490,7 @@ export class ContextEngine {
     index: WorkspaceIndex,
     userMessage: string,
     notes: { path: string; reason: string }[],
-    coverage: { scope: string; reason: string }[]
+    coverage: CoverageNote[]
   ): Promise<Candidate[]> {
     const selected = new Map<string, Candidate>();
 
@@ -607,7 +608,7 @@ export class ContextEngine {
     index: WorkspaceIndex,
     keywords: string[],
     add: (path: string, reason: RelevanceReason, reasonDetail: string, anchorLines?: number[]) => void,
-    coverage: { scope: string; reason: string }[]
+    coverage: CoverageNote[]
   ): Promise<void> {
     const indexed = new Set(index.fileTree.map((f) => f.path));
 
@@ -632,6 +633,7 @@ export class ContextEngine {
           // **실패를 "없음"으로 읽지 않는다.** 읽지 못한 것과 없는 것은 다른 사실이고,
           // 뭉개면 컨텍스트가 조용히 좁아진 채 모델이 불린다.
           coverage.push({
+            kind: "search_failed",
             scope: `본문 검색: ${keyword}`,
             reason: `검색이 실패해 이 키워드로는 후보를 찾지 못했습니다: ${String(error)}`,
           });
@@ -648,6 +650,7 @@ export class ContextEngine {
         // **일부러 안 본** 경우다.
         if (found.skippedSecretFiles !== null && found.skippedSecretFiles > 0) {
           coverage.push({
+            kind: "search_secret_skipped",
             scope: `본문 검색: ${keyword}`,
             reason: `비밀값 파일 ${found.skippedSecretFiles}개는 검색하지 않았습니다 — 거기 있었다면 찾지 못했습니다.`,
           });
@@ -655,6 +658,9 @@ export class ContextEngine {
         // **`null`은 "잘리지 않았다"가 아니다**(18절). 모르는 것을 낙관으로 접지 않는다.
         if (found.truncated !== false) {
           coverage.push({
+            // **두 사실을 한 종류로 뭉개지 않는다**(19절). 문장이 다르면 종류도 달라야 한다 —
+            // 같은 칸에 세면 "상한을 올려라"와 "호스트를 고쳐라"가 한 숫자가 된다.
+            kind: found.truncated === true ? "search_truncated" : "search_unknown",
             scope: `본문 검색: ${keyword}`,
             reason:
               found.truncated === true
@@ -898,18 +904,18 @@ function hashString(input: string): string {
  * 세 값이 세 문장이다. `false`만 침묵이고, `null`은 침묵이 아니다 — "말하지 않았다"를
  * "안 잘렸다"로 접으면 우리가 모르는 것을 안다고 주장하게 된다(16절의 `null` vs `0` 규칙).
  */
-export function listingCoverageNote(
-  truncated: boolean | null | undefined
-): { scope: string; reason: string } | null {
+export function listingCoverageNote(truncated: boolean | null | undefined): CoverageNote | null {
   if (truncated === false) return null;
   if (truncated === true) {
     return {
+      kind: "listing_truncated",
       scope: "파일 목록",
       reason:
         "워크스페이스 파일 목록이 호스트 상한에서 잘렸습니다 — 여기 없는 파일이 저장소에 있을 수 있습니다.",
     };
   }
   return {
+    kind: "listing_unknown",
     scope: "파일 목록",
     reason: "파일 목록이 전부인지 호스트가 말하지 않았습니다 — 전부라고 가정할 수 없습니다.",
   };
