@@ -523,24 +523,95 @@ product-strategy.md 14절 표에는 **"검수 모델이 실제 결함을 발견�
 계약, 실행 디렉터리 기반 재개, **재개 시 예산 복구(재시작이 한도를 늘리지 않는다)**,
 append-only 예산 감사 추적, 모델 준비성 축 분리, 단계별(P0/P1) 승인 카드가 모두 들어갔다.
 
-**crash-safe 재개 / 증거 체인: 완료.** 열린 예약 상태 머신, 읽기 전용 예산 조회,
-provider envelope 모델 ID 검증, ProbeEvidence, Run Card 강제, P0 attestation, 불확실 과금 처리,
-실제 timeout abort, 공용 호출 수 계산기, PowerShell 경로 인용이 들어갔다.
+**crash-safe 재개 / 증거 체인: 완료 — 단, ⑧→⑨가 한 번 끊겨 있었다.** 열린 예약 상태 머신,
+읽기 전용 예산 조회, provider envelope 모델 ID 검증, ProbeEvidence, Run Card 강제,
+P0 attestation, 불확실 과금 처리, 실제 timeout abort, 공용 호출 수 계산기, PowerShell 경로
+인용이 들어갔다.
+
+그런데 실제로 순서를 이어보려 하자 `attest-p0`와 `plan-pilot`이 **승인 번들을 서로 다른 곳에서
+찾고 있었다.** `attest-p0 --output`은 P0 **실행** 디렉터리여야 하는데(`records.jsonl`이 거기
+있다) 같은 값으로 번들 위치까지 계산해서, attestation이 `<run-dir>/approvals/`에 떨어졌다 —
+P1 카드를 만드는 `plan-pilot --output <root>`이 보는 `<root>/approvals/attestations/`가 아니다.
+번들 위치의 정본을 **카드의 `approvalsDir`** (카드 해시 안에 있고 `writeRunCard`가 이미 쓰는
+값)로 바꿨고, 테스트 75가 CLI를 하위 프로세스로 돌려 지킨다.
+
+**이건 코드를 읽어서는 잘 드러나지 않는 종류였다.** `attest-p0`는 exit 0을 내고 파일도 실제로
+만들어지므로, 사라지는 것은 결과가 아니라 **다음 단계와의 연결**이다. 게다가 우회로
+(`plan-pilot --p0-attestation <경로>`)가 있어서 "그렇게 쓰는 것"으로 굳으면 번들이 갈라진 채
+남는다. 단계를 실제로 이어보지 않으면 안 보인다.
 
 **모델 실제 확인: 미실행.** `probe-models`는 구현되어 있고 mock transport로 검증되지만
-**실제로 돌리지 않았다** — 이 저장소에는 자격증명이 없고, 유료 호출은 사용자 승인 사항이다.
+**실제 호출은 아직 한 번도 하지 않았다.**
 
-**실제 가설 판정: INCONCLUSIVE — API 실험 미실행.** 이 저장소에는 OpenAI/Anthropic 자격증명이
-없으므로 pilot도 confirmatory도 돌리지 않았다. 성공률과 비용을 지어내지 않는다.
+**실제 가설 판정: INCONCLUSIVE — API 실험 미실행.** 성공률과 비용을 지어내지 않는다.
 
-다음 단계:
+### 2026-08-27 실행 시도 — ①~④는 돌았고 ⑤에서 막혔다
+
+무료 단계는 전부 돌았다. **지출 $0, 미해결 예약 0건.**
+
+| 단계 | 결과 |
+|---|---|
+| `validate` | 24/24 통과 (Rust fixture 4개 포함) |
+| `difficulty` | 어려움 21 / 보이는 신호가 정답을 결정함 3 / **판정 못 함 0** |
+| `dry-run` | blocker 2개 → `core:build`로 1개 해소, 자격증명 1개 남음 |
+| `plan-pilot` | 카드 상태 `BLOCKED_MISSING_CREDENTIALS` |
+
+난이도 판정은 위 "실측: 24개 중 21개"와 **일치했고 실격된 셋도 같았다.** 툴체인이 전부 있는
+기계였으므로 `판정 못 함`이 0이다 — 세트가 조용히 쉬워 보이는 경우가 아니라는 뜻이다.
+
+카드가 계산한 보수적 최대 비용:
+
+| 단계 | 기록 수 | provider 호출 상한 | 최대 비용 |
+|---|---|---|---|
+| P0 smoke | 8건 | 44회 (executor 32 + reviewer 12) | **$11.55** |
+| P1 pilot | 96건 | 528회 (executor 384 + reviewer 144) | **$138.62** |
+
+`gpt-4.1` $0.2480/회 + `claude-sonnet-5` $0.2800/회 기준(입력 60,000 상한 + 출력 16,000).
+
+**⑤에서 막은 것은 둘이고, 둘 다 하네스 밖이다.**
+
+1. **`ANTHROPIC_API_KEY`가 없다** — Arm B/C/D, 즉 가설이 재려는 교차검증 전부를 돌릴 수 없다.
+2. **`api.openai.com`이 egress에서 차단된다** — 원격 클라우드 세션에서 게이트웨이가 CONNECT에
+   403을 냈다. 프록시를 우회한 직접 연결도, 제품 어댑터가 쓰는 Node `fetch`도 같은 403이다.
+
+두 번째가 위 "preflight의 '막는 요인 없음'은 '실행할 수 있다'가 아니다" 절이 예고한 바로 그
+상황이다 — **키가 있는데 호스트에 닿지 못하고, 존재만 보는 점검은 그것을 볼 방법이 없다.**
+반대로 `api.anthropic.com`은 도달하는데(401) 키가 없다. 어느 arm도 성립하지 않는다.
+
+우회하지 않았고, 다른 모델로 바꿔 성공시키지도 않았다 — 그건 `probe-models`가 답하려는 질문을
+지운다. **게이트를 돌리려면 두 공급자에 모두 닿는 환경이 필요하다.**
+
+### 다음 단계
 
 ```bash
-npm run gate:g:plan-pilot -- --p0-max-cost-usd <P0 금액> --p1-max-cost-usd <P1 금액> --output <dir>
-npm run gate:g:probe-models -- --max-cost-usd <probe 금액> --output <dir>
-npm run gate:g:plan-pilot -- --p0-max-cost-usd <P0 금액> --p1-max-cost-usd <P1 금액> --output <dir>
-npm run gate:g:pilot -- --stage smoke --run-card <dir>/p0-smoke/p0-run-card.json ...
+# 무료 — 견적과 카드 상태 확인
+npm run gate:g:dry-run
+npm run gate:g:plan-pilot -- --output <root>
+
+# 유료 — 역할당 1회. 여기서 처음 실제 호출이 나간다
+npm run gate:g:probe-models -- --max-cost-usd <probe 금액> --output <root>
+
+# 무료 — evidence를 읽어 P0 카드를 확정한다. **금액을 여기서 넣어야**
+# 카드의 실행 명령에 --max-cost-usd가 채워져 그대로 복사할 수 있다.
+# 이 시점의 exit code는 2가 정상이다 — P1은 아직 attestation이 없다.
+npm run gate:g:plan-pilot -- --p0-max-cost-usd <P0 금액> --p1-max-cost-usd <P1 금액> --output <root>
+
+# 유료 — **카드가 출력한 명령을 그대로** 쓴다. 손으로 조립하면 argv가 달라져 거부된다.
+# 카드는 <root>/approvals/cards/<cardId>.json 이다.
+# <root>/p0-smoke/p0-run-card.pointer.json 은 **안내용이고 카드가 아니다** — 넘기면 거부된다.
+
+# 무료 — --output은 P0 **실행** 디렉터리다(records.jsonl 위치). 카드를 인자로 받지 않는다.
+npm run gate:g:attest-p0 -- --output <root>/p0-smoke
 ```
+
+각 유료 단계 뒤에는 `gate:g:budget-status`로 **알려진 지출**과 **최대 미해결 노출**을 따로
+읽는다. 둘은 다른 숫자다.
+
+Run Card와 probe evidence는 **24시간 만료**다. ⑤~⑩을 하루 안에 끝내지 못하면 probe부터
+다시 돌아야 한다.
 
 카드에는 계획 기록 수, **총 provider 호출 상한(executor/reviewer 내역 포함)**, 보수적 최대 비용,
 중단 조건, 실행 명령이 들어가고 **실제 API 호출은 0건**이다.
+
+**P1은 PASS를 내지 않는다.** 반복 1회는 사전 등록 기준 2번(fixture당 최소 3회)을 만족하지
+못하므로 구조적으로 항상 `INCONCLUSIVE`다. PASS/FAIL은 confirmatory(3반복 = 288건)에서만 나온다.
