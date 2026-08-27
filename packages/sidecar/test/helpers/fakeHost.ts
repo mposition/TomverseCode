@@ -5,9 +5,15 @@ import { classifyFile } from "../../src/context/exclude.js";
 /**
  * fake의 검색 결과 상한 — 실제 도구의 `MAX_SEARCH_MATCHES`에 대응한다 (58절).
  *
- * **값을 맞추지 않는다.** 실제는 200이고 여기는 3이다: 상한이 **있다**는 사실을 검사하려면
- * fixture로 200개를 만들어야 하는데, 그건 검사를 읽을 수 없게 만든다. 맞춰야 하는 것은
- * 숫자가 아니라 **`truncated`가 참이 되는 경로가 존재한다**는 사실이다.
+ * **값을 맞추지 않는다.** 실제는 200이고 여기는 훨씬 작다: 상한이 **있다**는 사실을
+ * 검사하려면 fixture로 200개를 만들어야 하는데, 그건 검사를 읽을 수 없게 만든다. 맞춰야
+ * 하는 것은 숫자가 아니라 **`truncated`가 참이 되는 경로가 존재한다**는 사실이다.
+ *
+ * **다만 아무 작은 값이나 되는 것은 아니다**(21절). 이 값이 `MAX_MATCHES_PER_KEYWORD`보다
+ * 크지 않으면 **엔진의 키워드당 상한에 걸리는 경로가 fake로는 도달할 수 없다** — 실제로
+ * 둘 다 3이라 그 상한이 fake로 한 번도 밟히지 않았고, 거기서 버려지는 파일은 어디에도
+ * 기록되지 않고 있었다. 낮춘 상한이 **다른 상한을 가린다**는 것이 여기서 배운 것이다.
+ * 그 관계는 주석이 아니라 `context.test.ts`가 확인한다.
  */
 /**
  * fake의 파일 목록 상한 (18절).
@@ -17,7 +23,7 @@ import { classifyFile } from "../../src/context/exclude.js";
  */
 export const FAKE_MAX_LIST_ENTRIES = 50;
 
-export const FAKE_MAX_SEARCH_MATCHES = 3;
+export const FAKE_MAX_SEARCH_MATCHES = 8;
 
 /**
  * 비밀값처럼 보이는 경로인가 — **`classifyFile`이 쓰는 것과 같은 규칙**을 지난다 (58절).

@@ -210,6 +210,16 @@ export const COVERAGE_NOTE_KINDS = [
   "search_truncated",
   /** 검색 결과가 전부인지 호스트가 말하지 않았다. */
   "search_unknown",
+  /**
+   * 검색은 맞혔는데 **인덱스에 없어 후보로 올리지 않았다** (21절).
+   *
+   * `search_secret_skipped`와 다른 사실이다: 저쪽은 호스트가 읽지 않은 것이고 이쪽은
+   * 호스트가 읽어서 돌려줬는데 **우리가 버린** 것이다. 할 일도 다르다 — 저쪽은 그대로
+   * 두는 것이 맞고, 이쪽은 인덱스 제외 규칙을 볼 자리다.
+   */
+  "search_hit_not_indexed",
+  /** 한 키워드가 맞힌 파일이 상한보다 많아 뒤쪽을 버렸다 (21절). */
+  "search_hits_capped",
 ] as const;
 
 export type CoverageNoteKind = (typeof COVERAGE_NOTE_KINDS)[number];

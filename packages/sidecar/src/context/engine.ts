@@ -66,7 +66,14 @@ interface Candidate {
 /** 본문 검색을 돌릴 키워드 수 상한 (원칙 5). 검색은 저장소 크기에 비례한다. */
 const MAX_SEARCHED_KEYWORDS = 4;
 /** 키워드 하나가 넣을 수 있는 후보 수 상한. 흔한 이름 하나가 예산을 다 먹는 것을 막는다. */
-const MAX_MATCHES_PER_KEYWORD = 3;
+/**
+ * 키워드 하나가 후보로 올릴 수 있는 파일 수의 상한.
+ *
+ * **내보내는 이유는 fake와의 관계를 테스트가 확인해야 하기 때문이다**(21절). fake의 검색
+ * 상한이 이 값보다 크지 않으면 이 상한에 걸리는 경로가 fake로는 **도달 불가능**해지고,
+ * 그러면 그 경로의 코드를 지워도 아무 검사도 실패하지 않는다. 실제로 둘 다 3이라 그랬다.
+ */
+export const MAX_MATCHES_PER_KEYWORD = 3;
 
 /**
  * "정의처럼 보이는 자리"의 앞부분.
@@ -314,6 +321,8 @@ export class ContextEngine {
       excludedNotes.push({ path: dropped.path, reason: dropped.reason });
     }
 
+    const folded = foldCoverageNotes(coverageNotes);
+
     return {
       snapshotId: `snap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       workspaceId: input.workspaceId,
@@ -325,7 +334,9 @@ export class ContextEngine {
       projectMeta: index.projectMeta,
       tokenBudget: input.tokenBudgets.map((b) => ({ modelId: b.modelId as ModelId, maxTokens: b.maxTokens })),
       excludedNotes: excludedNotes.length > 0 ? excludedNotes : undefined,
-      coverageNotes: coverageNotes.length > 0 ? coverageNotes : undefined,
+      // **한 자리에서 접는다**(21절). 노트를 만드는 곳은 여럿이고 앞으로 더 늘어난다 —
+      // 만드는 쪽마다 "이미 있나"를 묻게 하면 새 생산자가 그 물음을 빠뜨린다.
+      coverageNotes: folded.length > 0 ? folded : undefined,
       createdAt: new Date().toISOString(),
     };
   }
@@ -669,10 +680,32 @@ export class ContextEngine {
           });
         }
 
-        // **인덱스에 있는 파일만 받는다.** 검색은 제외 규칙(비밀값·크기·gitignore)을 우리와
-        // 똑같이 적용하지 않으므로, 여기서 거르지 않으면 제외했던 파일이 옆문으로 들어온다.
-        const paths = [...new Set(hits.map((h) => h.path))].filter((p) => indexed.has(p));
+        // **인덱스에 있는 파일만 받는다.** 검색은 우리 제외 규칙(크기 상한, 하드 제외 목록)을
+        // 적용하지 않으므로, 여기서 거르지 않으면 제외했던 파일이 옆문으로 들어온다.
+        // (gitignore는 20절 이후 양쪽이 같다 — 그래서 여기서 걸리는 것은 우리 규칙뿐이다.)
+        const unique = [...new Set(hits.map((h) => h.path))];
+        const paths = unique.filter((p) => indexed.has(p));
+        // **버린 것을 말한다**(21절). 검색이 맞혔는데 후보로 올리지 않았다는 것은
+        // "검색했는데 없다"와 다른 사실이고, 종전에는 그 차이가 호출부에서 빈 배열 하나로
+        // 뭉개졌다 — 16절이 `skippedSecretFiles`에서 본 것과 같은 모양이 한 칸 옆에 있었다.
+        const notIndexed = unique.length - paths.length;
+        if (notIndexed > 0) {
+          coverage.push({
+            kind: "search_hit_not_indexed",
+            scope: `본문 검색: ${keyword}`,
+            reason: `검색이 맞힌 파일 ${notIndexed}개는 인덱스에 없어 후보로 올리지 않았습니다 — 제외 규칙(크기·기본 제외 목록)에 걸린 파일입니다.`,
+          });
+        }
         if (paths.length === 0) continue;
+        // **상한에서 버린 것도 말한다**(21절). 상한이 3이므로 흔한 이름 하나면 바로 걸리는데,
+        // 종전에는 그 사실이 어디에도 남지 않아 "이 키워드로 찾은 것은 셋뿐"으로 읽혔다.
+        if (paths.length > MAX_MATCHES_PER_KEYWORD) {
+          coverage.push({
+            kind: "search_hits_capped",
+            scope: `본문 검색: ${keyword}`,
+            reason: `이 키워드가 맞힌 파일 ${paths.length}개 중 ${MAX_MATCHES_PER_KEYWORD}개만 후보로 올렸습니다 — 나머지는 보지 않았습니다.`,
+          });
+        }
         for (const path of paths.slice(0, MAX_MATCHES_PER_KEYWORD)) {
           // **줄 번호를 함께 나른다**(14절). 잘라 넣어야 할 때 어디를 남길지가 여기 걸려 있다 —
           // 없으면 앞에서부터 자르고, 파일 뒤쪽에 있는 정의는 찾아 놓고도 잘려 나간다.
@@ -919,4 +952,48 @@ export function listingCoverageNote(truncated: boolean | null | undefined): Cove
     scope: "파일 목록",
     reason: "파일 목록이 전부인지 호스트가 말하지 않았습니다 — 전부라고 가정할 수 없습니다.",
   };
+}
+
+/**
+ * 범위 노트를 **똑같은 것끼리** 접는다 — context-engine 21절.
+ *
+ * # 왜 생기는가
+ *
+ * 키워드 하나에 검색 시도가 둘이다(정의 모양 → 아무 등장). 첫 시도가 인덱스에 있는 파일을
+ * 하나도 못 집으면 둘째 시도가 이어 돌고, **두 시도가 같은 워크스페이스를 훑으므로 같은
+ * 사실을 두 번 보고한다.** 실측으로 `비밀값 파일 1개는 검색하지 않았습니다`가 글자까지
+ * 똑같이 둘 나왔다.
+ *
+ * 파일 노트에는 경로당 하나로 접는 장치가 있었지만(`byPathNote`) 범위 쪽에는 없었다.
+ *
+ * # "같은 것"을 무엇으로 볼 것인가
+ *
+ * 17.5절은 이 결정을 어렵게 봤다 — *"`scope`가 같으면 접는 것이 자연스럽지만, '비밀값 3개를
+ * 건너뜀'과 '상한에서 잘림'은 같은 `scope`의 다른 사실이다."*
+ *
+ * **세 값이 모두 같을 때만 접는다**(`kind`·`scope`·`reason`). 그러면 그 걱정이 사라진다:
+ * 종류가 다르면 남고, 종류가 같아도 문장이 다르면 남는다. 접히는 것은 **글자까지 같은 중복**
+ * 뿐이고, 그건 정의상 사용자에게 새 사실이 아니다.
+ *
+ * 개수를 합치지 않는 이유도 같다. 두 시도가 각각 "비밀값 1개"를 보고했다고 2개를 건너뛴 것이
+ * 아니다 — **같은 파일을 두 번 지나친 것**이다. 합치면 없는 숫자가 생긴다.
+ *
+ * # 순서는 유지한다
+ *
+ * 노트는 프롬프트와 화면에 나온 순서대로 읽힌다. 목록 노트가 먼저, 검색 노트가 키워드
+ * 순서대로 오는 것이 지금의 배치이고, 접는 일이 그 배치를 바꾸면 안 된다.
+ */
+export function foldCoverageNotes(notes: CoverageNote[]): CoverageNote[] {
+  const seen = new Set<string>();
+  const folded: CoverageNote[] = [];
+  for (const note of notes) {
+    // 구분자는 사용자 문장에 나올 수 없는 값이어야 한다 — 공백으로 이으면 서로 다른 세 값이
+    // 우연히 같은 키가 될 수 있다. 소스에 리터럴 NUL을 박으면 그 파일이 grep에서 통째로
+    // 사라지므로 이스케이프로 쓴다(CLAUDE.md 함정 기록).
+    const key = [note.kind ?? "", note.scope, note.reason].join("\u0000");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    folded.push(note);
+  }
+  return folded;
 }
