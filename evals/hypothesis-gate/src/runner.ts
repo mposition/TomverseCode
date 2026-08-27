@@ -916,8 +916,24 @@ function applyEventDerivedFields(record: RecordWithDraft, events: ReturnType<typ
       callId?: string; role?: string; attempt?: number; providerId?: string;
       requestedModelId?: string; providerReportedModelId?: string; providerRequestId?: string;
       dispatchState?: string; errorKind?: string;
-      usage?: { inputTokens?: number; outputTokens?: number }; at?: string;
+      usage?: { inputTokens?: number; outputTokens?: number }; costUsd?: number; at?: string;
     };
+    /**
+     * **실패했어도 응답을 받았으면 그 지출은 이 기록의 것이다.**
+     *
+     * 예전에는 실패한 호출의 usage와 비용을 합계에 넣지 않았다. 그래서 응답을 받고 과금된
+     * 뒤 검증에서 실패한 기록이 `costUsd = undefined`가 되어 **비용 미측정으로 실행을 멈췄다**
+     * — 토큰도 단가도 이미 손에 있는데 모른다고 적은 것이다.
+     *
+     * `providerCallCount`는 올리지 않는다. 그 값은 attestation이 "성공한 호출이 존재하는가"를
+     * 묻는 데 쓰므로 의미가 다르다.
+     */
+    if (f.usage !== undefined) {
+      record.inputTokens += f.usage.inputTokens ?? 0;
+      record.outputTokens += f.usage.outputTokens ?? 0;
+      if (f.costUsd !== undefined) record.costUsd = (record.costUsd ?? 0) + f.costUsd;
+    }
+
     const id = key(f.callId, f.attempt);
     const existing = calls.get(id);
     calls.set(id, {
@@ -935,6 +951,7 @@ function applyEventDerivedFields(record: RecordWithDraft, events: ReturnType<typ
       dispatchState: isDispatchState(f.dispatchState) ? f.dispatchState : "dispatched_no_response",
       ...(f.usage?.inputTokens !== undefined ? { inputTokens: f.usage.inputTokens } : {}),
       ...(f.usage?.outputTokens !== undefined ? { outputTokens: f.usage.outputTokens } : {}),
+      ...(f.costUsd !== undefined ? { costUsd: f.costUsd } : {}),
       ...(f.errorKind ? { errorKind: f.errorKind } : {}),
       status: "failed",
       startedAt: existing?.startedAt ?? f.at ?? record.startedAt,
