@@ -659,7 +659,7 @@ async fn restart_task(
     let kind = kind.unwrap_or_else(|| DEFAULT_TASK_KIND.to_string());
     tauri::async_runtime::spawn_blocking(move || {
         let session = app.state::<SessionState>();
-        session.restart_task(&task_id, budget, model_pins.unwrap_or(Value::Null), timeout)
+        session.restart_task(&task_id, budget, model_pins.unwrap_or(Value::Null), &kind, timeout)
     })
     .await
     .map_err(|e| format!("재실행 스레드 오류: {e}"))?
