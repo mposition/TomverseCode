@@ -297,3 +297,43 @@ test("_env.bat이 vcvarsall 성공을 INCLUDE로 확인한다", () => {
     "_env.bat이 vcvarsall 실행 후 INCLUDE를 확인하지 않습니다"
   );
 });
+
+/**
+ * 주석을 걷어낸다 — YAML 판.
+ *
+ * CI 워크플로의 머리말은 "왜 단계를 나열하지 않는가"를 설명하느라 단계 이름을 그대로 쓴다.
+ * 그걸 실행 단계로 세면 아래 검사가 자기 설명 때문에 실패한다(`.bat`의 `rem`과 같은 함정이다).
+ */
+function stripYamlComments(script: string): string {
+  return script
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+}
+
+test("CI 워크플로가 세 번째 진입점이 되지 않는다", () => {
+  // 진입점이 셋이 되면 반드시 갈라진다. 실측 사례: `scripts\verify.bat`만 `_env.bat`을
+  // call해서 **단계 순서는 같은데 환경 준비 의미가 다른** 상태가 됐고, 그래서 `.bat`은
+  // 통과하는데 일반 PowerShell의 `npm run verify`는 stdarg.h 없음으로 죽었다.
+  //
+  // 그래서 CI는 단계를 풀어 적지 않고 `npm run verify` 한 줄만 부른다. 나열해야 할 이유가
+  // 생기면 이 테스트를 지우지 말고, 위 REQUIRED_ORDER 대조를 CI에도 적용하도록 넓힐 것.
+  const ci = stripYamlComments(
+    readFileSync(path.join(REPO_ROOT, ".github", "workflows", "ci.yml"), "utf8")
+  );
+
+  assert.ok(
+    /npm run verify\b/.test(ci),
+    "CI가 `npm run verify`를 부르지 않습니다 — 그러면 검증 대상이 무엇인지 이 파일이 따로 정하게 됩니다"
+  );
+
+  const enumerated = extractStepOrder(ci);
+  assert.deepEqual(
+    enumerated,
+    [],
+    "CI가 verify의 단계를 따로 나열합니다: " +
+      `${enumerated.join(" → ")}\n` +
+      "루트 verify와 scripts\\verify.bat에 이어 세 번째 목록이 생기면 셋이 갈라집니다. " +
+      "나열이 정말 필요하면 이 테스트를 REQUIRED_ORDER 대조로 넓힐 것."
+  );
+});
