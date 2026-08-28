@@ -7,6 +7,7 @@
 //! Node를 거치지 않는다. `UiApprovalGateway`가 그 왕복의 Rust 쪽 절반이다.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -133,6 +134,9 @@ pub struct SessionState {
     /// 앱 수명 동안 유지되는 취소 registry. 워크스페이스를 바꿔도 진행 중이던 태스크의
     /// 취소 신호가 유실되면 안 된다.
     cancels: Arc<CancellationRegistry>,
+    /// 지금 도는 Fleet. **승인 응답의 범위와 취소가 여기서 나온다**(`RunningFleet` 주석).
+    /// 하나만 돈다 — 둘을 겹치면 합계 상한이 Fleet마다 따로 걸려 총지출이 다시 통제되지 않는다.
+    fleet: Mutex<Option<RunningFleet>>,
     /// 자격증명 저장소. **앱 수명 동안 하나**다 — 워크스페이스와 무관하게 사용자의 것이다.
     ///
     /// 처음 필요할 때 열고 그다음부터 같은 것을 쓴다. 여는 데 실패라는 상태가 없는 이유는
@@ -239,6 +243,108 @@ fn task_policy_from(switches: &ScreenSwitches<'_>) -> TaskPolicy {
         // **sidecar로 가지 않는다**(39.1절). 시계도 판정도 Rust가 갖는다.
         deadline_ms: switches.deadline_secs.map(|s| s * 1_000),
         ..TaskPolicy::default()
+    }
+}
+
+/// 태스크 하나가 **어디서** 도는가.
+///
+/// # 왜 이 값이 따로 있는가 (Fleet 배선)
+///
+/// Fleet 구성원은 자기 격리 트리를 게이트 루트로 받는 **평범한 태스크다**(fleet.rs). 그런데
+/// 종전의 `start_task`는 `with_active`로 활성 워크스페이스를 직접 집어 왔으므로, 구성원을
+/// 돌리려면 그 함수를 통째로 한 벌 더 적어야 했다. **두 벌은 갈라진다** — 그리고 갈라지는
+/// 자리가 하필 `task.start` 파라미터, 즉 세션 메모리·허용목록·정책이 실리는 곳이다.
+/// 한쪽에서만 빠진 필드는 컴파일도 통과하고, 이 크레이트는 개발 환경에서 컴파일조차 되지
+/// 않으므로(CLAUDE.md), 그 누락은 앱을 띄워야만 보인다.
+///
+/// 그래서 "어디서 도는가"만 값으로 뽑았다. **파라미터를 만드는 자리는 그대로 하나다.**
+struct TaskTarget {
+    host: Arc<TaskHost>,
+    sidecar: Arc<SidecarClient>,
+    workspace_id: String,
+    /// Policy Gate가 제한하는 루트. 격리 실행이면 격리 트리이고, Fleet 구성원이면 그 구성원의 트리다.
+    workspace_path: String,
+    workspace_name: String,
+    session_id: String,
+    allowed_providers: Option<Vec<String>>,
+}
+
+/// 지금 도는 Fleet — **화면이 붙어 있는 루트들이 여기서 나온다.**
+///
+/// 승인 응답은 "사용자가 지금 보고 있는 것"의 것일 때만 전달된다(`approvals.rs`). Fleet은 한
+/// 저장소의 worktree 여러 개에서 동시에 도므로 "보고 있는 것"이 하나가 아니게 됐고, 그 목록이
+/// 이것이다. **넓게 잡지 않는다** — 목록 밖의 승인은 종전과 똑같이 거부되고 지워지지도 않는다.
+struct RunningFleet {
+    fleet_id: String,
+    /// 실제로 시작된 구성원들. 아직 시작하지 않은 것은 여기 없다 — 없는 트리를 승인 범위에
+    /// 넣으면 그 범위는 사실이 아니다.
+    members: Vec<RunningMember>,
+    /// 대기열을 닫는 스위치. **도는 것만 멈추면 취소를 누른 뒤에 새 태스크가 시작된다.**
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct RunningMember {
+    branch: String,
+    task_id: String,
+    /// Policy Gate가 제한하는 그 루트.
+    root_display: String,
+    host: Arc<TaskHost>,
+    sidecar: Arc<SidecarClient>,
+}
+
+/// 구성원 하나가 끝났다는 소식. `host`는 정산 이벤트를 붙일 자리이고, 트리를 만들지도 못한
+/// 구성원에는 없다.
+struct MemberDone {
+    report: tomverse_core::fleet::MemberReport,
+    host: Option<Arc<TaskHost>>,
+}
+
+/// 구성원 전부가 공유하는 값들. **한 번 정해지고 바뀌지 않는다** — 태스크마다 다시 읽으면
+/// 구성원들이 서로 다른 설정으로 돌 수 있고, 그 차이는 기록에도 화면에도 남지 않는다.
+struct FleetContext {
+    app: AppHandle,
+    fleet_id: String,
+    session_id: String,
+    /// **본체 저장소.** 구성원의 트리는 여기서 딴다.
+    repo: WorkspaceRoot,
+    parent_dir: PathBuf,
+    launcher: tomverse_core::launcher::Launcher,
+    allowed_providers: Option<Vec<String>>,
+    fleet_size: usize,
+    caps: tomverse_core::fleet::FleetCaps,
+    mode: ExecutionMode,
+    allow_git_commit: bool,
+    unattended: bool,
+    auto_approve_verification: bool,
+    auto_approve_workspace_writes: bool,
+    deadline_secs: Option<u64>,
+    budget_usd: Option<f64>,
+    model_pins: Value,
+    timeout: Duration,
+}
+
+/// 구성원의 이벤트를 **화면의 다른 채널로** 보낸다.
+///
+/// `task-event`로 흘리면 활성 태스크의 이벤트 로그와 단계 표시가 남의 태스크를 따라간다 —
+/// 화면이 조용히 거짓말하는 자리다. 채널을 나누면 Fleet 화면이 그것만 골라 듣는다.
+struct FleetSink {
+    app: AppHandle,
+    fleet_id: String,
+    branch: String,
+}
+
+impl EventSink for FleetSink {
+    fn emit(&self, channel: &str, payload: &Value) {
+        let _ = self.app.emit(
+            "fleet-event",
+            json!({
+                "fleetId": self.fleet_id,
+                "branch": self.branch,
+                "channel": channel,
+                "payload": payload,
+            }),
+        );
     }
 }
 
@@ -880,6 +986,15 @@ impl SessionState {
         policy: TaskPolicy,
         isolate: Option<&str>,
     ) -> Result<Value, String> {
+        // **Fleet이 도는 중에는 바꾸지 않는다.** 바꾸면 승인 범위(`attending_roots`)의 기준인
+        // "활성 워크스페이스"가 도는 구성원들과 무관한 것이 되고, 아래에서 이전 워크스페이스의
+        // 대기 승인을 거부로 정리하는 동작이 **돌고 있는 구성원의 승인까지** 지운다.
+        if let Some(fleet) = self.fleet.lock().unwrap().as_ref() {
+            return Err(format!(
+                "Fleet({})이 도는 중입니다 — 끝나거나 취소된 뒤에 워크스페이스를 바꾸세요.",
+                fleet.fleet_id
+            ));
+        }
         let repo = WorkspaceRoot::new(path).map_err(|e| format!("워크스페이스를 열 수 없습니다: {e}"))?;
 
         // **격리는 루트를 바꾸는 것이 전부다**(22.1절). 트리를 먼저 만들고, 그 경로를 게이트
@@ -1140,56 +1255,32 @@ impl SessionState {
     /// `///`를 붙이면 컴파일이 깨진다. 설명을 여기로 몰면 어느 인자의 이야기인지가 흐려지므로
     /// 자리를 지키고 형식만 바꿨다 — 되돌리지 말 것.
     #[allow(clippy::too_many_arguments)]
-    pub fn start_task(
+    /// 활성 워크스페이스에서 도는 자리.
+    fn active_target(&self) -> Result<TaskTarget, String> {
+        self.with_active(|active| {
+            Ok(TaskTarget {
+                host: active.host.clone(),
+                sidecar: active.sidecar.client(),
+                workspace_id: active.workspace_id.clone(),
+                workspace_path: active.root_display.clone(),
+                workspace_name: active.name.clone(),
+                session_id: active.session_id.clone(),
+                allowed_providers: active.allowed_providers.clone(),
+            })
+        })
+    }
+
+    /// 태스크 행을 만들고 **이 태스크의 정책을 고정한다.**
+    ///
+    /// 등록은 한 번뿐이므로 진행 중에 바뀌지 않는다(3.16.2절).
+    fn create_and_begin(
         &self,
+        target: &TaskTarget,
+        task_id: &str,
         message: &str,
-        mode: ExecutionMode,
-        allow_git_commit: bool,
-        budget_usd: Option<f64>,
-        model_pins: Value,
-        // 무인 실행 (state-machine 24절). 승인이 필요한 지점에서 **멈춘다**.
-        unattended: bool,
-        // 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
-        auto_approve_verification: bool,
-        // 워크스페이스 안의 파일 쓰기를 묻지 않고 승인한다 (63절). 위 주석의 근거 참조.
-        auto_approve_workspace_writes: bool,
-        // 스킬 파일 경로 (26절). **Rust가 읽는다** — 도구 허용목록의 출처가 UI가 되면
-        // 장악당한 UI가 "허용목록은 전부입니다"라고 말할 수 있다.
-        skill_path: Option<&str>,
-        // 이 요청이 **질문인가** (state-machine 51절).
-        // 
-        // 참이면 파일을 바꾸지 않는 경로를 탄다. 그 보장은 두 겹이다 — sidecar의 경로가
-        // `EXECUTING`을 지나지 않고, 여기서 도구를 읽기 전용으로 좁혀 게이트에 꽂는다.
-        kind: &str,
-        // 이 태스크가 이어받는 앞선 태스크 (state-machine 70절).
-        follows_up: Option<&str>,
-        // 무인 실행의 **시한**(초) — state-machine 39절. `None`이면 상한이 없다.
-        //
-        // `timeout`과 다른 값이다: 저쪽은 이 호출이 기다리기를 그만두는 시각이고, 이쪽은
-        // 태스크가 멈추는 시각이다(39.2절).
-        deadline_secs: Option<u64>,
-        timeout: Duration,
-    ) -> Result<Value, String> {
-        // **태스크를 시작하기 전에** 살아 있는지 확인한다(5절). 도중에 바꿔치기하면 진행 중인
-        // 요청이 어느 프로세스의 것인지 알 수 없게 되므로, 재spawn 지점은 여기 한 곳이다.
-        self.ensure_sidecar_alive()?;
-
-        let (sidecar, host, workspace_id, session_id, allowed_providers) = self.with_active(|active| {
-            Ok((
-                active.sidecar.client(),
-                active.host.clone(),
-                active.workspace_id.clone(),
-                active.session_id.clone(),
-                active.allowed_providers.clone(),
-            ))
-        })?;
-
-        let task_id = format!("task-{}", uuid::Uuid::new_v4());
-        let workspace_path = self
-            .info()
-            .and_then(|i| i["rootPath"].as_str().map(str::to_string))
-            .unwrap_or_default();
-        let mode_str = match mode {
+        switches: &ScreenSwitches<'_>,
+    ) -> Result<(), String> {
+        let mode_str = match switches.mode {
             ExecutionMode::Fast => "fast",
             ExecutionMode::Verified => "verified",
         };
@@ -1199,39 +1290,45 @@ impl SessionState {
         // 그 상태에서는 존재하지 않는 태스크에 이벤트를 붙이게 되고, `task_events`가
         // 진실의 원천이라는 전제(원칙 7)가 조용히 깨진다.
         self.with_store_prose("태스크를 만들 수 없습니다", |s| {
-            s.create_task(&task_id, &session_id, &workspace_id, &workspace_path, mode_str, message)
+            s.create_task(
+                task_id,
+                &target.session_id,
+                &target.workspace_id,
+                &target.workspace_path,
+                mode_str,
+                message,
+            )
         })?
         .map_err(|e| format!("태스크를 만들 수 없습니다: {e}"))?;
 
-        // 스킬 파일은 **Rust가 읽는다**(26.1절). 화면이 읽어 넘기면 도구 허용목록의 출처가
-        // 화면이 되고, 그러면 장악당한 화면이 "허용목록은 전부입니다"라고 말할 수 있다.
-        let skill = match skill_path {
-            None => None,
-            // **워크스페이스 안의 스킬 파일은 거부된다**(34절) — 모델이 쓸 수 있는 파일이
-            // 지시문과 도구 허용목록을 정하게 두지 않는다. 게이트의 루트를 그대로 넘긴다:
-            // "모델이 쓸 수 있는 곳"의 정의가 그것이기 때문이다.
-            Some(path) => Some(
-                tomverse_core::skills::load(std::path::Path::new(path), host.root())
-                    .map_err(|e| e.to_string())?,
-            ),
-        };
+        // **이 태스크의 정책을 여기서 정하고, 여기서만 정한다.**
+        let task_policy = task_policy_from(switches);
+        target.host.begin_task(task_id, task_policy, switches.skill)?;
+        Ok(())
+    }
 
-        // **이 태스크의 정책을 여기서 정하고, 여기서만 정한다.** 등록은 한 번뿐이므로
-        // 진행 중에 바뀌지 않는다(3.16.2절).
-        let task_policy = task_policy_from(&ScreenSwitches {
-            mode,
-            allow_git_commit,
-            unattended,
-            auto_approve_verification,
-            auto_approve_workspace_writes,
-            skill: skill.as_ref(),
-            deadline_secs,
-            kind,
-        });
-        host.begin_task(&task_id, task_policy, skill.as_ref())?;
+    /// 만들어 둔 태스크를 sidecar로 보내고, 결말을 **호스트가 확정한다.**
+    ///
+    /// 이 함수가 `task.start` 파라미터를 만드는 **유일한 자리**다(`TaskTarget` 주석 참조).
+    /// 그리고 게이트에 꽂힌 정책과 sidecar로 가는 정책이 **같은 `ScreenSwitches` 하나**에서
+    /// 나온다 — 종전에는 두 값이 각자 인자로 흘러 다녀서 한쪽만 바뀔 수 있었다.
+    fn dispatch_task(
+        &self,
+        target: &TaskTarget,
+        task_id: &str,
+        message: &str,
+        switches: &ScreenSwitches<'_>,
+        budget_usd: Option<f64>,
+        model_pins: Value,
+        follows_up: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let host = &target.host;
+        let skill = switches.skill;
+        let kind = switches.kind;
 
         // 스킬의 모델 지정은 화면이 명시한 지정에 **진다** — 우선순위를 한 곳에서 정한다(26.1절).
-        let model_pins = merge_model_pins(skill.as_ref().and_then(|s| s.model_pins.as_ref()), model_pins);
+        let model_pins = merge_model_pins(skill.and_then(|s| s.model_pins.as_ref()), model_pins);
 
         // 세션 메모리는 **Rust가 저장소에서 유도한다**(27.1절). 화면 경로에서는 세션이 실제로
         // 여러 태스크를 담으므로, 헤드리스와 달리 이 값이 대체로 비어 있지 않다.
@@ -1240,7 +1337,7 @@ impl SessionState {
         // 정한 것이 이번 태스크에서 사라지고, 그 사실은 아무 데도 보이지 않는다.
         let memory = self
             .read_store(StoreOp::ReadSessionMemory, |s| {
-                tomverse_core::session_memory::collect(s, &session_id, &task_id)
+                tomverse_core::session_memory::collect(s, &target.session_id, task_id)
             })
             // 실행 경로는 봉투로 나가지 않으므로 원문으로 되돌린다 — `with_store`의 주석이
             // 말하는 그 자리다. **되돌리는 것은 눈에 보이고, 빠뜨리는 것은 보이지 않는다.**
@@ -1249,12 +1346,11 @@ impl SessionState {
         let params = json!({
             "taskRequest": {
                 "taskId": task_id,
-                "sessionId": session_id,
-                "workspaceId": workspace_id,
+                "sessionId": target.session_id,
+                "workspaceId": target.workspace_id,
                 "userMessage": message,
                 // **바꿔 달라는 것인가 물어보는 것인가**(51절). 화면이 정한다 — 사용자의
                 // 문장을 보고 우리가 추측하면 "고쳐 달라"에 답만 하거나 그 반대가 된다.
-                // **종류를 화면이 정한다**(51.7절). 우리가 사용자의 문장을 보고 추측하지 않는다.
                 // 알 수 없는 값은 `change`로 접는다 — 모르는 값을 읽기 전용으로 접으면
                 // 오타 하나가 실행을 조용히 막고, 사용자는 도구가 고장 났다고 읽는다.
                 "kind": if is_read_only_kind(kind) { kind } else { "change" },
@@ -1265,29 +1361,29 @@ impl SessionState {
                 "createdAt": tomverse_core::time::now_iso(),
             },
             "policy": {
-                "executionMode": match mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
-                "allowGitCommit": allow_git_commit,
+                "executionMode": match switches.mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
+                "allowGitCommit": switches.allow_git_commit,
                 // null은 "기본값을 쓰라"가 아니라 **"상한 없음"**이다. sidecar의 mergePolicy가
                 // 키의 부재와 null을 구별하므로 여기서 항상 키를 넣는다.
                 "budgetUsd": budget_usd,
                 // 역할별 모델 지정. **Rust는 값을 해석하지 않고 그대로 넘긴다** — 모델 목록은
                 // Node의 것이고, 여기서 검증하면 두 곳이 서로 다른 규칙을 갖게 된다.
                 "modelPins": model_pins,
-                "unattended": unattended,
-                "autoApproveVerification": auto_approve_verification,
+                "unattended": switches.unattended,
+                "autoApproveVerification": switches.auto_approve_verification,
                 // **게이트에 꽂힌 값과 같은 값을 보낸다**(63절). Node가 이 값을 지키는 것은
                 // 아니지만(지키는 것은 Rust다), 보내지 않으면 sidecar가 보는 정책이 언제나
                 // "꺼짐"이라 기록과 화면이 서로 다른 설정을 말하게 된다.
-                "autoApproveWorkspaceWrites": auto_approve_workspace_writes,
+                "autoApproveWorkspaceWrites": switches.auto_approve_workspace_writes,
                 // 화면은 이 목록을 **지키지 않는다** — 지키는 것은 Rust의 게이트다(26.1절).
                 // **게이트에 꽂힌 값을 그대로 보낸다**(51절) — 여기서 다시 계산하면 화면이
                 // 말하는 허용목록과 실제로 좁혀진 목록이 갈릴 수 있다.
-                "allowedTools": allowed_tools_for(kind, skill.as_ref())
+                "allowedTools": allowed_tools_for(kind, skill)
                     .0
                     .as_ref()
                     .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
             },
-            "skill": skill.as_ref().map(|s| json!({ "name": s.name, "instructions": s.instructions })),
+            "skill": skill.map(|s| json!({ "name": s.name, "instructions": s.instructions })),
             "sessionMemory": if memory.is_empty() {
                 Value::Null
             } else {
@@ -1300,7 +1396,7 @@ impl SessionState {
             // 등록된 MCP 서버의 도구 목록 (31절). **Rust가 서버를 띄워 묻는다.**
             // 이것이 없으면 모델은 서버 이름도 도구 이름도 몰라 `mcp_call`을 부를 수 없다 —
             // 등록만 있고 걸어 들어갈 길이 없는 상태가 된다.
-            "mcpTools": match host.mcp_catalog(&task_id) {
+            "mcpTools": match host.mcp_catalog(task_id) {
                 None => Value::Null,
                 Some(catalog) => json!({
                     "text": catalog.render(),
@@ -1309,13 +1405,16 @@ impl SessionState {
                     "truncated": catalog.truncated(),
                 }),
             },
-            "workspaceName": self.info().and_then(|i| i.get("name").cloned()).unwrap_or(Value::Null),
+            "workspaceName": target.workspace_name,
             // 라우터가 보는 후보도 같은 목록이어야 한다 — 주입된 키와 후보가 어긋나면
             // "고를 수 있다고 했는데 호출이 실패"가 된다.
-            "availableProviders": available_providers_for(self.credentials().as_ref(), allowed_providers.as_deref()),
+            "availableProviders": available_providers_for(
+                self.credentials().as_ref(),
+                target.allowed_providers.as_deref(),
+            ),
         });
 
-        let result = sidecar.request("task.start", params, timeout);
+        let result = target.sidecar.request("task.start", params, timeout);
         match result {
             Ok(mut value) => {
                 // Node가 보고한 최종 상태를 **호스트가 원자적으로 확정한다.** Node의 주장을
@@ -1329,7 +1428,7 @@ impl SessionState {
                 };
                 let summary = value.get("summary").and_then(Value::as_str).unwrap_or("").to_string();
                 let _ = host.finish_task(
-                    &task_id,
+                    task_id,
                     terminal,
                     &format!("TASK_{terminal}"),
                     if terminal == "FAILED" { Some(&summary) } else { None },
@@ -1344,7 +1443,7 @@ impl SessionState {
                     // 잃는다. 대신 화면에는 "바뀐 파일 없음"으로 보이므로, 이 자리는 언젠가
                     // 목록과 "읽지 못했다"를 갈라 보내야 한다.
                     let mutated = self
-                        .read_store(StoreOp::ReadTask, |s| s.mutated_paths(&task_id))
+                        .read_store(StoreOp::ReadTask, |s| s.mutated_paths(task_id))
                         .unwrap_or_default();
                     obj.insert("mutatedPaths".to_string(), json!(mutated));
                     obj.insert("taskId".to_string(), json!(task_id));
@@ -1357,10 +1456,696 @@ impl SessionState {
                 //
                 // **적기 전에 멈춘다**(39.2절). 여기가 실제로 위험한 자리다 — 감독자가 sidecar를
                 // 살려 두므로, 실패로 적기만 하면 그 태스크는 화면 밖에서 계속 돈다.
-                host.abandon_unanswered(&task_id, &message);
+                host.abandon_unanswered(task_id, &message);
                 Err(message)
             }
         }
+    }
+
+    /// 스킬 파일을 읽는다. **Rust가 읽는다**(26.1절) — 화면이 읽어 넘기면 도구 허용목록의
+    /// 출처가 화면이 되고, 그러면 장악당한 화면이 "허용목록은 전부입니다"라고 말할 수 있다.
+    ///
+    /// **워크스페이스 안의 스킬 파일은 거부된다**(34절). 게이트의 루트를 그대로 넘긴다:
+    /// "모델이 쓸 수 있는 곳"의 정의가 그것이기 때문이다.
+    fn load_skill(
+        &self,
+        target: &TaskTarget,
+        skill_path: Option<&str>,
+    ) -> Result<Option<tomverse_core::skills::Skill>, String> {
+        match skill_path {
+            None => Ok(None),
+            Some(path) => tomverse_core::skills::load(std::path::Path::new(path), target.host.root())
+                .map(Some)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_task(
+        &self,
+        message: &str,
+        mode: ExecutionMode,
+        allow_git_commit: bool,
+        budget_usd: Option<f64>,
+        model_pins: Value,
+        // 무인 실행 (state-machine 24절). 승인이 필요한 지점에서 **멈춘다**.
+        unattended: bool,
+        // 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
+        auto_approve_verification: bool,
+        // 워크스페이스 안의 파일 쓰기를 묻지 않고 승인한다 (63절).
+        auto_approve_workspace_writes: bool,
+        // 스킬 파일 경로 (26절). **Rust가 읽는다.**
+        skill_path: Option<&str>,
+        // 이 요청이 **질문인가** (state-machine 51절).
+        kind: &str,
+        // 이 태스크가 이어받는 앞선 태스크 (state-machine 70절).
+        follows_up: Option<&str>,
+        // 무인 실행의 **시한**(초) — state-machine 39절. `None`이면 상한이 없다.
+        deadline_secs: Option<u64>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        // **태스크를 시작하기 전에** 살아 있는지 확인한다(5절). 도중에 바꿔치기하면 진행 중인
+        // 요청이 어느 프로세스의 것인지 알 수 없게 되므로, 재spawn 지점은 여기 한 곳이다.
+        self.ensure_sidecar_alive()?;
+
+        let target = self.active_target()?;
+        let task_id = format!("task-{}", uuid::Uuid::new_v4());
+        let skill = self.load_skill(&target, skill_path)?;
+        let switches = ScreenSwitches {
+            mode,
+            allow_git_commit,
+            unattended,
+            auto_approve_verification,
+            auto_approve_workspace_writes,
+            skill: skill.as_ref(),
+            deadline_secs,
+            kind,
+        };
+
+        self.create_and_begin(&target, &task_id, message, &switches)?;
+        self.dispatch_task(
+            &target,
+            &task_id,
+            message,
+            &switches,
+            budget_usd,
+            model_pins,
+            follows_up,
+            timeout,
+        )
+    }
+
+
+    // ---- Fleet — worktree 격리 기반 N개 병렬 실행 (fleet.rs, process-architecture 11.6절) ----
+
+    /// 기록에서 유도한 Fleet 상태. **화면은 자기가 보낸 폼이 아니라 이것을 읽는다**(37절).
+    ///
+    /// 요청한 것과 적용된 것은 갈릴 수 있다 — 예컨대 합계 상한은 태스크당 상한이 없으면
+    /// 계획 단계에서 거부되고, 구성원 하나는 상한이 남지 않아 시작조차 못 할 수 있다.
+    /// 폼을 그대로 그리면 화면이 틀린 답을 자신 있게 말한다.
+    pub fn fleet_status(&self, fleet_id: Option<&str>) -> Result<Value, UiMessage> {
+        let fleets = self.read_store(StoreOp::ReadTasks, |s| {
+            tomverse_core::fleet::collect_status(s, fleet_id)
+        })?;
+        let running = self.fleet.lock().unwrap().as_ref().map(|f| f.fleet_id.clone());
+        Ok(json!({
+            "fleets": fleets,
+            // **"도는 중"은 이 프로세스만 안다.** 기록에는 "확정되지 않았다"까지만 있고,
+            // 그건 크래시로 죽은 것과 구별되지 않는다(그래서 `recover`가 따로 있다).
+            "runningFleetId": running,
+            "maxFleetSize": tomverse_core::fleet::MAX_FLEET_SIZE,
+        }))
+    }
+
+    /// Fleet 전체 취소 — **구성원 하나의 취소와 다른 요청이다.** 손잡이를 합치지 않는다.
+    ///
+    /// **아직 시작하지 않은 구성원에도 닿아야 한다.** 도는 것만 멈추고 대기열을 그대로 두면
+    /// 취소를 누른 뒤에 새 태스크가 시작된다 — 사용자가 요청한 것의 정반대다.
+    pub fn cancel_fleet(&self) -> Result<Value, String> {
+        let (members, fleet_id) = {
+            let guard = self.fleet.lock().unwrap();
+            let Some(fleet) = guard.as_ref() else {
+                return Err("도는 중인 Fleet이 없습니다.".to_string());
+            };
+            // **대기열을 먼저 닫는다.** 나중에 닫으면 그 사이에 하나가 더 시작될 수 있고,
+            // 그 구성원은 아래 목록에 없으므로 끝까지 돈다.
+            fleet.cancelled.store(true, Ordering::SeqCst);
+            (fleet.members.clone(), fleet.fleet_id.clone())
+        };
+        // **어느 구성원에 닿았는지 말한다.** 개수만 주면 화면은 "3개 취소함"이라고 쓰고,
+        // 사용자는 자기가 보고 있던 브랜치가 그 셋에 들었는지 알 수 없다.
+        let mut reached: Vec<String> = Vec::new();
+        for member in &members {
+            // 순서: Rust 먼저. 토큰이 켜져야 진행 중인 프로세스가 죽고 새 도구가 시작되지 않는다.
+            if member.host.cancel_task(&member.task_id).is_ok() {
+                reached.push(member.branch.clone());
+            }
+            let _ = member
+                .sidecar
+                .request("task.cancel", json!({ "taskId": member.task_id }), Duration::from_secs(5));
+        }
+        Ok(json!({
+            "fleetId": fleet_id,
+            "cancelledBranches": reached,
+            // **대기열도 닫았다.** 닫지 않으면 취소를 누른 뒤에 새 태스크가 시작된다.
+            "queueClosed": true,
+        }))
+    }
+
+    /// 구성원 하나만 취소한다. **Fleet 전체의 취소가 아니다** — 나머지는 계속 돈다.
+    pub fn cancel_fleet_member(&self, task_id: &str) -> Result<Value, String> {
+        let member = {
+            let guard = self.fleet.lock().unwrap();
+            guard
+                .as_ref()
+                .and_then(|f| f.members.iter().find(|m| m.task_id == task_id).cloned())
+                .ok_or_else(|| "그 구성원은 지금 도는 Fleet에 없습니다.".to_string())?
+        };
+        let rust_outcome = member.host.cancel_task(task_id)?;
+        let node_outcome = member
+            .sidecar
+            .request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5))
+            .unwrap_or(Value::Null);
+        Ok(json!({
+            "accepted": rust_outcome.get("accepted").and_then(Value::as_bool).unwrap_or(false),
+            "host": rust_outcome,
+            "sidecar": node_outcome,
+        }))
+    }
+
+    /// Fleet을 시작한다. **화면이 상한을 정하지 않는다** — `fleet::plan`이 정하고 거부한다.
+    ///
+    /// # 각 구성원은 평범한 태스크다
+    ///
+    /// 자기 worktree를 게이트 루트로 받는 것 말고는 `start_task`와 다르지 않다 — 같은
+    /// `TaskHost`, 같은 Policy Gate, 같은 `dispatch_task`. Policy Gate에 "Fleet 모드" 분기를
+    /// 만들지 않은 것이 요점이다(22.1절이 worktree에서 한 결정과 같다).
+    ///
+    /// # 화면이 상한보다 큰 값을 받아 놓고 나중에 거부하지 않는다
+    ///
+    /// 검증은 **아무것도 시작하기 전에** 끝난다(`fleet::plan`). 세 번째 구성원의 브랜치
+    /// 이름이 잘못됐다는 것을 두 개가 이미 돈 뒤에 알면, 사용자는 절반만 실행된 Fleet을
+    /// 손으로 수습해야 한다.
+    ///
+    /// # 구성원은 훅·MCP 등록을 쓰지 않는다
+    ///
+    /// 헤드리스 `fleet`과 같다(`bin/host.rs`의 `start_member`도 `with_hooks`/`with_mcp`를
+    /// 붙이지 않는다). 여기서만 붙이면 같은 요청이 두 진입점에서 다르게 돌고, 그 차이는
+    /// 아무 데도 적혀 있지 않게 된다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_fleet(
+        &self,
+        app: &AppHandle,
+        members: Vec<tomverse_core::fleet::MemberSpec>,
+        mode: ExecutionMode,
+        allow_git_commit: bool,
+        // **태스크당** 상한. 합계 상한을 걸려면 이것이 있어야 한다(`fleet::plan`이 강제한다).
+        budget_usd: Option<f64>,
+        // **합계** 상한. 태스크당 상한만으로는 총지출이 통제되지 않는다(11.2②).
+        fleet_cap_usd: Option<f64>,
+        model_pins: Value,
+        unattended: bool,
+        auto_approve_verification: bool,
+        auto_approve_workspace_writes: bool,
+        deadline_secs: Option<u64>,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        use tomverse_core::fleet::{Admission, FleetBudget, MemberReport};
+
+        let fleet_id = format!("fleet-{}", uuid::Uuid::new_v4());
+        // **아무것도 시작하기 전에** 크기·이름·예산을 전부 본다. 상한은 여기서 강제된다.
+        let plan =
+            tomverse_core::fleet::plan(&fleet_id, members, budget_usd, fleet_cap_usd).map_err(|e| e.to_string())?;
+
+        // **본체 저장소에서 트리를 딴다.** 활성 세션이 이미 격리 트리에서 돌고 있어도
+        // 구성원의 트리는 저장소에서 나와야 한다 — 트리에서 트리를 따면 정리 순서가 꼬인다.
+        let (repo_display, session_id, allowed_providers) = self.with_active(|active| {
+            Ok((
+                active.repo_display.clone(),
+                active.session_id.clone(),
+                active.allowed_providers.clone(),
+            ))
+        })?;
+        let repo = WorkspaceRoot::new(&repo_display).map_err(|e| format!("저장소를 열 수 없습니다: {e}"))?;
+
+        // **PATH가 인터프리터를 고르게 두지 않는다**(launcher.rs). 구성원마다 다시 찾으면
+        // 그 사이 PATH가 바뀌었을 때 구성원들이 서로 다른 런타임으로 뜬다.
+        let launcher = tomverse_core::launcher::detect()?;
+
+        // **하나만 돈다.** 둘을 겹치면 합계 상한이 Fleet마다 따로 걸려 총지출이 다시 통제되지
+        // 않고, 승인 큐는 자기가 어느 Fleet의 것인지 말할 수 없게 된다.
+        let cancelled = {
+            let mut guard = self.fleet.lock().unwrap();
+            if let Some(running) = guard.as_ref() {
+                return Err(format!(
+                    "이미 도는 Fleet이 있습니다({}). 끝나거나 취소된 뒤에 시작하세요.",
+                    running.fleet_id
+                ));
+            }
+            let flag = Arc::new(AtomicBool::new(false));
+            *guard = Some(RunningFleet {
+                fleet_id: fleet_id.clone(),
+                members: Vec::new(),
+                cancelled: flag.clone(),
+            });
+            flag
+        };
+
+        let size = plan.members.len();
+        let caps = plan.caps();
+        let mut budget = FleetBudget::from_plan(&plan);
+        let mut reports: Vec<Option<MemberReport>> = (0..size).map(|_| None).collect();
+        let (tx, rx) = std::sync::mpsc::channel::<MemberDone>();
+
+        let context = FleetContext {
+            app: app.clone(),
+            fleet_id: fleet_id.clone(),
+            session_id,
+            repo,
+            parent_dir: tomverse_core::worktree::parent_dir(&app_state_dir()),
+            launcher,
+            allowed_providers,
+            fleet_size: size,
+            caps,
+            mode,
+            allow_git_commit,
+            unattended,
+            auto_approve_verification,
+            auto_approve_workspace_writes,
+            deadline_secs,
+            budget_usd,
+            model_pins,
+            timeout,
+        };
+
+        // **스코프 스레드다.** 구성원 스레드가 `&self`를 빌려 저장소·자격증명·승인 등록부를
+        // 그대로 쓰므로, 소유권을 복제하지 않아도 되고 이 함수가 끝날 때 전부 join된다.
+        let outcome: Result<(), String> = std::thread::scope(|scope| {
+            let mut next = 0usize;
+            let mut running = 0usize;
+            loop {
+                while next < size {
+                    let index = next;
+                    let spec = &plan.members[index];
+                    // **취소된 Fleet은 새 구성원을 시작하지 않는다.**
+                    if cancelled.load(Ordering::SeqCst) {
+                        next += 1;
+                        reports[index] = Some(self.record_unstarted_member(
+                            &context,
+                            index,
+                            spec,
+                            "fleet_cancelled",
+                            "Fleet이 취소되어 시작하지 않았습니다",
+                        ));
+                        continue;
+                    }
+                    match budget.try_admit() {
+                        Admission::Admitted { reserved_usd } => {
+                            next += 1;
+                            running += 1;
+                            let tx = tx.clone();
+                            let context = &context;
+                            scope.spawn(move || {
+                                let done = self.run_fleet_member(context, index, spec, reserved_usd);
+                                // **보내지 못하면 스케줄러가 영원히 기다린다.** 받는 쪽이
+                                // 사라지는 경우는 스케줄러가 이미 끝난 때뿐이다.
+                                let _ = tx.send(done);
+                            });
+                        }
+                        Admission::Refused {
+                            cap_usd,
+                            committed_usd,
+                            reserved_usd,
+                            per_task_usd,
+                        } => {
+                            if budget.waiting_could_help() {
+                                // 도는 구성원이 정산되면 자리가 생길 수 있다. 지금 거부로 확정하지 않는다.
+                                break;
+                            }
+                            next += 1;
+                            let reason = format!(
+                                "Fleet 합계 상한(${cap_usd:.2})이 남지 않아 시작하지 않았습니다 \
+                                 (확정 지출 ${committed_usd:.4} + 예약 ${reserved_usd:.4} + 태스크당 상한 ${per_task_usd:.2})"
+                            );
+                            reports[index] = Some(self.record_unstarted_member(
+                                &context,
+                                index,
+                                spec,
+                                "fleet_budget_exhausted",
+                                &reason,
+                            ));
+                        }
+                    }
+                }
+
+                if running == 0 {
+                    break;
+                }
+                let done = rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))?;
+                running -= 1;
+                // **비용은 저장소가 말한다** — Node의 주장이 아니라 `provider_usage` 행이다.
+                budget.settle(done.report.reserved_usd, done.report.cost_usd);
+                if let Some(host) = &done.host {
+                    let _ = host.append_event(
+                        &done.report.task_id,
+                        "FLEET_MEMBER_SETTLED",
+                        json!({
+                            "fleetId": fleet_id,
+                            "branch": done.report.branch,
+                            "memberIndex": done.report.index + 1,
+                            "status": done.report.status,
+                            "costUsd": done.report.cost_usd,
+                            "reservedUsd": done.report.reserved_usd,
+                            "fleetCommittedUsd": budget.committed_usd(),
+                        }),
+                    );
+                }
+                let index = done.report.index;
+                reports[index] = Some(done.report);
+            }
+            Ok(())
+        });
+
+        // **등록부를 반드시 비운다.** 남겨두면 다음 Fleet이 시작되지 않고, 승인 응답의 범위가
+        // 이미 끝난 트리들을 계속 포함한다.
+        *self.fleet.lock().unwrap() = None;
+        outcome?;
+
+        let members: Vec<MemberReport> = reports
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                r.unwrap_or_else(|| {
+                    MemberReport::not_started(i, &plan.members[i].branch, "", "결말이 기록되지 않았습니다".to_string())
+                })
+            })
+            .collect();
+        let report = tomverse_core::fleet::FleetReport::build(
+            &fleet_id,
+            members,
+            &budget,
+            tomverse_core::verify::lane_stats(),
+        );
+        // **부분 실패를 성공으로 접지 않는다** — `allCompleted`는 전부 완료됐을 때만 참이다.
+        let all_completed = report.all_completed();
+        let notices = report.notices();
+        Ok(json!({
+            "fleet": report,
+            "allCompleted": all_completed,
+            "notices": notices,
+        }))
+    }
+
+    /// 합계 상한이 남지 않아, 또는 취소되어 시작하지 못한 구성원을 **기록으로 남긴다**(원칙 7).
+    ///
+    /// 기록하지 않으면 그 구성원은 화면에서 사라진다 — 사용자는 자기가 N개를 요청했는데
+    /// 결말이 N-1개인 것을 보게 되고, 없어진 하나가 실패인지 시작조차 안 한 것인지 알 수 없다.
+    fn record_unstarted_member(
+        &self,
+        context: &FleetContext,
+        index: usize,
+        spec: &tomverse_core::fleet::MemberSpec,
+        reason_code: &str,
+        reason: &str,
+    ) -> tomverse_core::fleet::MemberReport {
+        let task_id = format!("task-{}", uuid::Uuid::new_v4());
+        // **본체 경로로 만든다.** 시작하지 않았으므로 격리 트리도 만들지 않았고, 있지도 않은
+        // 경로를 기록에 적으면 그 기록을 여는 사람이 없는 디렉터리를 찾게 된다.
+        let workspace_id = tomverse_core::paths::workspace_id_for(&context.repo.display());
+        let written = self.with_store_prose("미시작 구성원을 기록할 수 없습니다", |s| {
+            s.upsert_session(&context.session_id, &workspace_id, Some("fleet"))
+                .map_err(|e| e.to_string())?;
+            s.create_task(
+                &task_id,
+                &context.session_id,
+                &workspace_id,
+                &context.repo.display(),
+                "verified",
+                &spec.message,
+            )
+            .map_err(|e| e.to_string())?;
+            s.append_event(
+                &task_id,
+                "FLEET_ENROLLED",
+                &tomverse_core::fleet::Enrollment {
+                    fleet_id: &context.fleet_id,
+                    spec,
+                    index,
+                    fleet_size: context.fleet_size,
+                    caps: context.caps,
+                    admitted: false,
+                    reserved_usd: None,
+                    worktree_path: None,
+                    reused_tree: false,
+                    reason: Some(reason),
+                }
+                .payload(),
+            )
+            .map_err(|e| e.to_string())?;
+            s.finish_task(
+                &task_id,
+                "REJECTED",
+                "TASK_REJECTED",
+                None,
+                &json!({ "reason": reason_code, "detail": reason }),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        });
+        if let Err(message) | Ok(Err(message)) = written {
+            eprintln!("[fleet] 미시작 구성원 기록 실패: {message}");
+        }
+        tomverse_core::fleet::MemberReport::not_started(index, &spec.branch, &task_id, reason.to_string())
+    }
+
+    /// 구성원 하나: 트리 확보 → 태스크 생성 → 등록 이벤트 → 자기 sidecar → 평범한 태스크.
+    ///
+    /// **`Err`를 돌려주지 않는다.** 구성원 하나의 실패는 Fleet의 실패가 아니고, 결말은
+    /// 개별로 보고된다 — 여기서 `?`로 빠져나가면 그 구성원의 결말이 사라진다.
+    fn run_fleet_member(
+        &self,
+        context: &FleetContext,
+        index: usize,
+        spec: &tomverse_core::fleet::MemberSpec,
+        reserved_usd: Option<f64>,
+    ) -> MemberDone {
+        let started_at = tomverse_core::time::now_iso();
+        let failed = |summary: String| MemberDone {
+            host: None,
+            report: tomverse_core::fleet::MemberReport {
+                index,
+                branch: spec.branch.clone(),
+                task_id: String::new(),
+                admitted: false,
+                worktree_path: None,
+                status: "failed".to_string(),
+                summary,
+                cost_usd: 0.0,
+                // **예약을 돌려준다.** 돌려주지 않으면 남은 구성원들이 있지도 않은 지출에 막힌다.
+                reserved_usd,
+                started_at: Some(started_at.clone()),
+                finished_at: Some(tomverse_core::time::now_iso()),
+            },
+        };
+
+        // **격리는 루트를 바꾸는 것이 전부다**(22.1절).
+        let tree = match tomverse_core::worktree::ensure(
+            context.repo.path(),
+            &context.parent_dir,
+            &spec.branch,
+            None,
+        ) {
+            Ok(tree) => tree,
+            Err(e) => return failed(e.to_string()),
+        };
+        let isolation = tomverse_core::worktree::Isolation::of(context.repo.path(), &tree);
+        let member_root = match WorkspaceRoot::new(&tree.path) {
+            Ok(root) => root,
+            Err(e) => return failed(format!("{:?}를 열 수 없습니다: {e}", tree.path)),
+        };
+        let workspace_id = tomverse_core::paths::workspace_id_for(&member_root.display());
+        let task_id = format!("task-{}", uuid::Uuid::new_v4());
+
+        let recorded = self.with_store_prose("구성원 워크스페이스를 기록할 수 없습니다", |s| {
+            s.upsert_workspace(&workspace_id, &member_root.display(), &spec.branch)
+                .map_err(|e| e.to_string())?;
+            s.upsert_session(&context.session_id, &workspace_id, Some("fleet"))
+                .map_err(|e| e.to_string())
+        });
+        match recorded {
+            Err(message) => return failed(message),
+            Ok(Err(message)) => return failed(message),
+            Ok(Ok(())) => {}
+        }
+
+        // **승인 화면이 어느 트리의 것인지 말할 수 있어야 한다**(11.6①). 게이트는 이 값을
+        // 보지 않는다 — 보게 되면 "Fleet일 때만 다른 규칙"이 생긴다.
+        let origin = tomverse_core::types::ApprovalOrigin {
+            fleet_id: context.fleet_id.clone(),
+            member_index: index + 1,
+            fleet_size: context.fleet_size,
+            branch: spec.branch.clone(),
+        };
+        let approvals = Arc::new(UiApprovalGateway::new(context.app.clone(), self.pending_approvals.clone()));
+        // **구성원 이벤트는 화면의 다른 채널로 간다.** `task-event`로 흘리면 활성 태스크의
+        // 로그와 단계 표시가 남의 태스크를 따라간다 — 화면이 조용히 거짓말하는 자리다.
+        let sink = Arc::new(FleetSink {
+            app: context.app.clone(),
+            fleet_id: context.fleet_id.clone(),
+            branch: spec.branch.clone(),
+        });
+        let store = match self.store() {
+            Ok(store) => store,
+            Err(message) => return failed(message),
+        };
+        let artifacts = match self.artifacts() {
+            Ok(artifacts) => artifacts,
+            Err(message) => return failed(message),
+        };
+        // **정책을 여기서 한 번 만든다.** `TaskHost`가 들고 있는 것과 `begin_task`가 이 태스크에
+        // 고정하는 것이 같은 값이어야 한다 — 헤드리스 `start_member`도 같은 값을 두 자리에 넣는다.
+        let switches = ScreenSwitches {
+            mode: context.mode,
+            allow_git_commit: context.allow_git_commit,
+            unattended: context.unattended,
+            auto_approve_verification: context.auto_approve_verification,
+            auto_approve_workspace_writes: context.auto_approve_workspace_writes,
+            // 스킬은 구성원에 붙이지 않는다 — 헤드리스 `fleet`과 같은 자리를 지킨다.
+            skill: None,
+            deadline_secs: context.deadline_secs,
+            kind: "change",
+        };
+        let host = Arc::new(
+            TaskHost::new(
+                member_root.clone(),
+                task_policy_from(&switches),
+                store,
+                artifacts,
+                approvals,
+                sink,
+                self.cancels.clone(),
+            )
+            .with_isolation(isolation)
+            .with_fleet_member(origin),
+        );
+
+        // 구성원마다 **자기 sidecar**다(11.6④). 여기서 API 키가 자식 환경으로 1회 주입된다.
+        let sidecar = match tomverse_core::sidecar::SidecarClient::spawn(
+            tomverse_core::launcher::config_from(
+                &context.launcher,
+                credential_injection_for(self.credentials().as_ref(), context.allowed_providers.as_deref()),
+            ),
+            host.clone(),
+        ) {
+            Ok(client) => client,
+            Err(e) => {
+                return failed(format!(
+                    "백엔드(sidecar)를 시작할 수 없습니다: {e}\n{}",
+                    context.launcher.describe_failure()
+                ))
+            }
+        };
+        let ready = match sidecar.wait_ready(Duration::from_secs(10)) {
+            Ok(ready) => ready,
+            Err(message) => {
+                sidecar.shutdown(Duration::from_secs(2));
+                return failed(message);
+            }
+        };
+        if ready.get("protocolVersion").and_then(Value::as_str).unwrap_or("") != PROTOCOL_VERSION {
+            sidecar.shutdown(Duration::from_secs(2));
+            return failed("백엔드 프로토콜 버전이 맞지 않습니다. 앱을 업데이트하세요.".to_string());
+        }
+        if let Err(message) = tomverse_core::launcher::require_supported_node(
+            ready.get("nodeVersion").and_then(Value::as_str),
+            &context.launcher,
+        ) {
+            sidecar.shutdown(Duration::from_secs(2));
+            return failed(message);
+        }
+
+        let target = TaskTarget {
+            host: host.clone(),
+            sidecar: sidecar.clone(),
+            workspace_id,
+            workspace_path: member_root.display(),
+            workspace_name: spec.branch.clone(),
+            session_id: context.session_id.clone(),
+            allowed_providers: context.allowed_providers.clone(),
+        };
+        let mut report = tomverse_core::fleet::MemberReport {
+            index,
+            branch: spec.branch.clone(),
+            task_id: task_id.clone(),
+            admitted: true,
+            worktree_path: Some(tree.path.to_string_lossy().to_string()),
+            status: "failed".to_string(),
+            summary: String::new(),
+            cost_usd: 0.0,
+            reserved_usd,
+            started_at: Some(started_at.clone()),
+            finished_at: None,
+        };
+
+        if let Err(message) = self.create_and_begin(&target, &task_id, &spec.message, &switches) {
+            sidecar.shutdown(Duration::from_secs(2));
+            report.summary = message;
+            report.finished_at = Some(tomverse_core::time::now_iso());
+            return MemberDone { report, host: Some(host) };
+        }
+        // **등록을 이벤트로 남긴다**(원칙 7). `FLEET_ENROLLED`는 `NODE_MAY_NOT_EMIT`에 있으므로
+        // sidecar가 자기를 이 집합에 넣을 수 없다 — 모델은 Fleet을 기록할 수도 없다.
+        if let Err(message) = host.append_event(
+            &task_id,
+            "FLEET_ENROLLED",
+            tomverse_core::fleet::Enrollment {
+                fleet_id: &context.fleet_id,
+                spec,
+                index,
+                fleet_size: context.fleet_size,
+                caps: context.caps,
+                admitted: true,
+                reserved_usd,
+                worktree_path: Some(tree.path.to_string_lossy().to_string()),
+                reused_tree: !tree.created,
+                reason: None,
+            }
+            .payload(),
+        ) {
+            eprintln!("[fleet] 등록 이벤트 기록 실패({}): {message}", spec.branch);
+        }
+
+        // **승인이 이 트리의 것으로 판정되려면 등록부에 있어야 한다**(`respond_in_scope`).
+        // 태스크를 보내기 **전에** 넣는다 — 첫 승인은 시작 직후에 뜰 수 있다.
+        if let Some(fleet) = self.fleet.lock().unwrap().as_mut() {
+            fleet.members.push(RunningMember {
+                branch: spec.branch.clone(),
+                task_id: task_id.clone(),
+                root_display: member_root.display(),
+                host: host.clone(),
+                sidecar: sidecar.clone(),
+            });
+        }
+
+        let outcome = self.dispatch_task(
+            &target,
+            &task_id,
+            &spec.message,
+            &switches,
+            context.budget_usd,
+            context.model_pins.clone(),
+            None,
+            context.timeout,
+        );
+        sidecar.shutdown(Duration::from_secs(3));
+
+        match outcome {
+            Ok(value) => {
+                report.status = value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed")
+                    .to_string();
+                report.summary = value
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+            }
+            Err(message) => {
+                report.status = "failed".to_string();
+                report.summary = message;
+            }
+        }
+        // **비용은 저장소가 말한다** — Node의 주장이 아니라 `provider_usage` 행이다.
+        report.cost_usd = self
+            .with_store_prose("비용 집계", |s| s.task_cost_usd(&task_id))
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|(cost, _, _)| cost)
+            .unwrap_or(0.0);
+        report.finished_at = Some(tomverse_core::time::now_iso());
+        MemberDone { report, host: Some(host) }
     }
 
     /// 저장된 작업을 **새 task_id로 다시 실행한다.**
@@ -1403,14 +2188,25 @@ impl SessionState {
         self.start_task(
             &task.user_message,
             mode,
+            // allow_git_commit
             false,
             budget_usd,
             model_pins,
+            // unattended
             false,
+            // auto_approve_verification
             false,
+            // **넓히는 스위치는 물려받지 않는다**(63절). 기본값이 좁은 쪽인 것도 같은 이유다.
+            // auto_approve_workspace_writes
+            false,
+            // skill_path
             None,
             kind,
+            // 다시 실행은 **정지에서 이어지는 것이 아니다**(62절) — 이을 앞선 태스크가 없다.
+            // follows_up
+            None,
             // 시한도 물려받지 않는다 — 같은 이유다. 무인이 아니면 시한을 걸 이유도 없다.
+            // deadline_secs
             None,
             timeout,
         )
@@ -1504,8 +2300,34 @@ impl SessionState {
     /// 화면이 낡은 모달을 들고 있을 수 있고, 그때 승인이 통과하면 사용자가 보고 있지 않은
     /// 저장소에서 명령이 돈다 — 이전 워크스페이스의 `TaskHost`가 그 워크스페이스 루트로
     /// 판정하기 때문이다.
+    /// 화면이 **지금 붙어 있는** 루트들: 활성 워크스페이스와, 도는 중인 Fleet 구성원들.
+    ///
+    /// 넓게 잡으면(예: "전부") 낡은 모달에서 누른 승인이 사용자가 보고 있지 않은 저장소에서
+    /// 명령을 돌린다 — 11.5절이 닫은 구멍이 그것이다.
+    fn attending_roots(&self) -> Result<Vec<String>, String> {
+        let mut roots = vec![self.with_active(|active| Ok(active.root_display.clone()))?];
+        if let Some(fleet) = self.fleet.lock().unwrap().as_ref() {
+            for member in &fleet.members {
+                roots.push(member.root_display.clone());
+            }
+        }
+        Ok(roots)
+    }
+
+    /// 지금 밀려 있는 승인들 — **도착 순서대로**(core `approvals.rs`).
+    ///
+    /// 화면이 받은 `approval-required` 이벤트만으로 큐를 만들면, 시간이 초과되거나 워크스페이스
+    /// 전환으로 정리된 항목이 화면에만 남는다. 그 목록은 **등록부가 정본이다.**
+    pub fn pending_approvals(&self) -> Value {
+        json!({ "pending": self.pending_approvals.pending() })
+    }
+
     pub fn respond_approval(&self, approval_id: &str, granted: bool, note: Option<String>) -> Result<Value, String> {
-        let active_root = self.with_active(|active| Ok(active.root_display.clone()))?;
+        // **화면이 지금 붙어 있는 루트들**(11.6①). Fleet이 돌면 하나가 아니다 — 구성원마다
+        // 게이트 루트가 다르므로, "활성 루트 하나"로 판정하면 자기 Fleet의 승인이 전부
+        // 거부된다. 불변식은 그대로다: 목록 밖의 승인은 전달되지 않고 지워지지도 않는다.
+        let roots = self.attending_roots()?;
+        let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
         let outcome = if granted {
             ApprovalOutcome::Granted
         } else {
@@ -1520,7 +2342,7 @@ impl SessionState {
         // `message` 대신 `error`를 쓰고 있었다.
         Ok(tomverse_core::uimsg::envelope(
             self.pending_approvals
-                .respond(approval_id, &active_root, outcome)
+                .respond_in_scope(approval_id, &root_refs, outcome)
                 .map(|()| json!({}))
                 .map_err(|issue| tomverse_core::uimsg::UserFacing::ui(&issue)),
         ))

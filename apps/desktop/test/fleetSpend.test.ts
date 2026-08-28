@@ -89,3 +89,46 @@ test("하나라도 완료가 아니면 완료로 접지 않는다", () => {
 test("구성원이 없으면 모두 완료가 아니다", () => {
   assert.equal(summarizeFleetOutcome([]).allCompleted, false);
 });
+
+/**
+ * **아직 끝나지 않은 것은 결말이 아니다.**
+ *
+ * 도는 구성원을 결말 칸에 빈칸으로 그리면 끝난 것과 같은 자리에 놓이고, 합계 금액은 이미
+ * 확정된 것처럼 읽힌다. 둘 다 화면이 조용히 거짓말하는 자리다.
+ */
+test("도는 구성원은 완료로도 실패로도 세지 않는다", () => {
+  const members = [
+    { branch: "a", costUsd: 0.4, status: "completed" },
+    { branch: "b", costUsd: 0.1, status: "running" },
+  ];
+  const outcome = summarizeFleetOutcome(members);
+  assert.equal(outcome.allCompleted, false);
+  assert.equal(outcome.stillRunning, true);
+  assert.match(outcome.headline, /진행 중 1/);
+
+  const view = summarizeFleetSpend({ members, fleetCapUsd: null, perTaskCapUsd: null });
+  assert.equal(view.runningCount, 1);
+  assert.match(view.notices.join("\n"), /아직 돌고 있습니다/);
+  assert.match(view.notices.join("\n"), /아직 늘어납니다/);
+});
+
+/** 모르는 결말을 지우지 않는다 — 지우면 개수의 합이 구성원 수와 어긋난다. */
+test("모르는 결말도 세어서 보여준다", () => {
+  const outcome = summarizeFleetOutcome([
+    { branch: "a", costUsd: 0, status: "completed" },
+    { branch: "b", costUsd: 0, status: "interrupted" },
+  ]);
+  assert.match(outcome.headline, /중단됨 1/);
+  assert.equal(
+    Object.values(outcome.counts).reduce((sum, n) => sum + n, 0),
+    2
+  );
+});
+
+/** 미시작의 **사유를 단정하지 않는다** — 취소로 시작 못 한 것도 미시작이다. */
+test("미시작 문구가 원인을 하나로 단정하지 않는다", () => {
+  const view = summarizeFleetSpend({ members: MEMBERS, fleetCapUsd: null, perTaskCapUsd: null });
+  const text = view.notices.join("\n");
+  assert.match(text, /Fleet이 취소되었습니다/);
+  assert.match(text, /실패와 다른 결말/);
+});

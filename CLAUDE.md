@@ -433,6 +433,13 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
   **간헐적이라서 더 나쁘다**: `verify`가 가끔 빨간색이 되면 사람이 "다시 돌려 보자"를 배우고,
   그 습관이 진짜 회귀를 지나가게 만든다.
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
+- **껍데기 크레이트를 이 환경에서 검사할 수 없다는 것은 사실이 아니었다.** GUI **개발
+  라이브러리**(`libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`,
+  `librsvg2-dev`)를 설치하면 `npm run desktop:check`가 Linux에서 그대로 돈다. 빌드 스크립트가
+  `bundle/sidecar`(스테이징 산출물)를 요구하므로 **디렉터리만 있으면** 되고(`mkdir -p`),
+  핀된 node.exe는 타입 검사에 필요 없다. 몰라서 치른 대가가 있다 — 껍데기가 **컴파일되지
+  않는 채로** 커밋돼 있었다(`restart_task`가 13개를 받는 `start_task`에 11개를 넘기고 있었다).
+  소스를 읽는 검사는 그 종류를 잡지 못한다: 인자 개수는 글자가 아니라 타입의 문제다.
 
 ## 관련 프로젝트
 

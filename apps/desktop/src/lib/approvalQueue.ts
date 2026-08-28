@@ -20,13 +20,12 @@
  * 있는 구별이다. **경로도 함께 보여주되** 그건 근거이지 구별이 아니다.
  */
 
-export interface ApprovalOrigin {
-  fleetId: string;
-  /** 1부터 센다. */
-  memberIndex: number;
-  fleetSize: number;
-  branch: string;
-}
+// **타입을 두 벌로 두지 않는다.** 승인 요청의 모양은 Rust가 정하고 화면의 계약은
+// `types.ts` 하나다 — 여기 같은 이름의 두 번째 정의가 있으면 필드가 하나 늘 때 한쪽만
+// 갱신되고, 갈라진 쪽을 쓰는 화면이 조용히 옛 모양을 그린다.
+import type { ApprovalOrigin } from "../types";
+
+export type { ApprovalOrigin };
 
 export interface PendingApproval {
   approvalId: string;

@@ -1055,3 +1055,33 @@ button.tiny {
   padding-left: 0.6rem;
   margin: 0.4rem 0;
 }
+
+/*
+ * 승인 큐 — **밀려 있는 것을 숨기지 않는다** (ui-wireframes 3.30.2절).
+ *
+ * 지금 답하는 것과 뒤에 선 것을 **배치로** 나눈다. 색만으로 나누면 색약 사용자에게 둘이 같은
+ * 줄로 보이는데, 이 구별은 장식이 아니라 사용자가 지금 무엇을 승인하는지를 정한다.
+ */
+.approval-origin {
+  margin: 0 0 0.2rem;
+}
+
+.approval-queue {
+  margin: 0.4rem 0 0.6rem;
+  padding-left: 1.2rem;
+}
+
+.approval-queue-active {
+  font-weight: 600;
+}
+
+/* Fleet 결말은 **구성원별로** 읽힌다 — 한 덩어리로 붙으면 어느 줄이 어느 Fleet인지 사라진다. */
+.fleet-outcome {
+  border-top: 1px solid var(--border);
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+}
+
+.fleet-outcome h4 {
+  margin: 0 0 0.3rem;
+}

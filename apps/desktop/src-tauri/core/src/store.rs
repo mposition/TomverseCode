@@ -226,6 +226,11 @@ pub struct FleetMemberRow {
     /// 구성원이다 — **실패가 아니다**(사용자가 다음에 할 일이 다르다).
     pub admitted: bool,
     pub reserved_usd: Option<f64>,
+    /// 이 Fleet에 걸려 있던 상한. **`None`은 "상한이 없었다"가 아니라 "기록에 없다"이다** —
+    /// 이 필드가 생기기 전의 기록이 그렇다(`fleet::FleetCaps`의 주석).
+    pub caps: Option<crate::fleet::FleetCaps>,
+    /// 격리 트리 경로. 시작하지 못한 구성원에는 없다 — 트리를 만들지 않았기 때문이다.
+    pub worktree_path: Option<String>,
     pub workspace_path: Option<String>,
     pub phase: String,
     pub final_status: Option<String>,
@@ -1289,6 +1294,15 @@ impl Store {
                 fleet_size: payload.get("fleetSize").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
                 admitted: payload.get("admitted").and_then(|v| v.as_bool()).unwrap_or(true),
                 reserved_usd: payload.get("reservedUsd").and_then(|v| v.as_f64()),
+                // **키가 없으면 `None`이다.** `null` 값과 키의 부재를 뭉개지 않으려고
+                // 상한을 한 객체로 묶어 적는다(`fleet::Enrollment::payload`).
+                caps: payload
+                    .get("caps")
+                    .and_then(|v| serde_json::from_value::<crate::fleet::FleetCaps>(v.clone()).ok()),
+                worktree_path: payload
+                    .get("worktreePath")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 workspace_path,
                 phase,
                 final_status,

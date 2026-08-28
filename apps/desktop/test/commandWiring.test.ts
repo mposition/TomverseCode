@@ -299,27 +299,59 @@ function screenSwitchFields(source: string): string[] {
   return [...body.matchAll(/^\s*pub ([a-z_]+):/gm)].map((m) => m[1] as string);
 }
 
-test("정책을 만드는 두 호출부가 화면 스위치를 빠짐없이 채운다", () => {
+test("스위치를 만드는 모든 자리가 필드를 빠짐없이 채운다", () => {
   const source = readFileSync(SESSION_RS, "utf8");
   const fields = screenSwitchFields(source);
   // 0개면 아래 비교가 빈 집합에 대한 전칭 명제가 된다 — 정의 형식이 바뀐 경우다.
   assert.ok(fields.length >= 6, `필드를 ${fields.length}개만 읽었습니다: ${fields.join(", ")}`);
 
-  const call = "task_policy_from(&ScreenSwitches" + " {";
+  // **구조체 리터럴을 센다.** 종전에는 `task_policy_from(&ScreenSwitches {`를 셌는데, 그러면
+  // 스위치를 만들어 **넘겨 주는** 자리(정책을 스스로 만들지 않는 자리)가 검사 밖에 남는다 —
+  // 그리고 필드를 빠뜨리는 실수는 정확히 그 자리에서 일어난다.
+  const literal = "ScreenSwitches" + " {";
   const sites: string[] = [];
-  let at = source.indexOf(call);
+  let at = source.indexOf(literal);
   while (at !== -1) {
-    sites.push(source.slice(at, source.indexOf("\n        });", at)));
-    at = source.indexOf(call, at + call.length);
+    // 정의(`pub struct ScreenSwitches<'a> {`)는 `<`가 끼어 있어 이 needle에 걸리지 않는다.
+    sites.push(source.slice(at, source.indexOf("\n        };", at) + 1 || source.length));
+    at = source.indexOf(literal, at + literal.length);
   }
-  // **둘이어야 한다.** 하나면 한쪽이 다른 길로 정책을 만들고 있다는 뜻이고, 그게 47절이
-  // 없애려던 상태다.
-  assert.equal(sites.length, 2, `정책 조립 호출부가 ${sites.length}곳입니다`);
+  // **셋 이상 셀 수 있다.** 개수를 고정하면 새 진입점이 생길 때마다 이 숫자를 고치게 되고,
+  // 고치는 사람은 "왜 둘이어야 했는지"를 다시 읽지 않는다. 지키려는 것은 개수가 아니라
+  // **모든 자리가 같은 필드를 채운다**는 것이다.
+  assert.ok(sites.length >= 2, `스위치 조립 자리가 ${sites.length}곳입니다`);
 
   for (const [index, site] of sites.entries()) {
     const missing = fields.filter((field) => !site.includes(field));
-    assert.deepEqual(missing, [], `${index}번째 호출부가 빠뜨린 필드: ${missing.join(", ")}`);
+    assert.deepEqual(missing, [], `${index}번째 자리가 빠뜨린 필드: ${missing.join(", ")}`);
   }
+});
+
+/**
+ * **정책을 만드는 길은 하나여야 한다** — state-machine 47절.
+ *
+ * 위 검사는 "스위치를 만드는 자리가 필드를 다 채우는가"를 본다. 그런데 어떤 자리가
+ * `ScreenSwitches`를 거치지 **않고** `TaskPolicy`를 직접 조립하면 위 검사의 시야 밖이고,
+ * 그 자리는 새 스위치가 생겨도 조용히 옛 정책을 만든다.
+ *
+ * 그래서 `TaskPolicy { … }` 리터럴이 `task_policy_from` 안에만 있는지 본다. 껍데기 크레이트가
+ * 이 환경에서 컴파일되지 않던 동안 이런 종류의 어긋남이 실제로 쌓였다(이 파일 첫 주석).
+ */
+test("정책 리터럴은 한 함수 안에만 있다", () => {
+  const source = readFileSync(SESSION_RS, "utf8");
+  const literal = "TaskPolicy" + " {";
+  const occurrences: number[] = [];
+  let at = source.indexOf(literal);
+  while (at !== -1) {
+    // 반환 타입 표기(`-> TaskPolicy {`)는 리터럴이 아니다 — 세면 만드는 함수 자신이 걸린다.
+    if (!source.slice(Math.max(at - 3, 0), at).endsWith("> ")) occurrences.push(at);
+    at = source.indexOf(literal, at + literal.length);
+  }
+  assert.equal(occurrences.length, 1, `TaskPolicy 리터럴이 ${occurrences.length}곳입니다`);
+
+  const maker = source.indexOf("fn task_policy_from(");
+  assert.notEqual(maker, -1, "session.rs에 task_policy_from이 없습니다");
+  assert.ok(occurrences[0]! > maker, "정책 리터럴이 task_policy_from 밖에 있습니다");
 });
 
 /** 화면이 그 값들을 **보내야** 한다 — 안 보내면 토글도 종류도 아무것도 하지 않는다. */

@@ -23,7 +23,12 @@ export interface FleetMemberSpend {
   branch: string;
   /** 이 구성원 하나의 지출. **합계가 아니다.** */
   costUsd: number;
-  /** `completed` | `failed` | `cancelled` | `rejected` | `not_started` */
+  /**
+   * `completed` | `failed` | `cancelled` | `rejected` | `interrupted` | `not_started` | `running` | `unknown`
+   *
+   * **판정은 Rust가 한다**(`fleet::member_status`). 화면이 `finalStatus`를 다시 해석하면
+   * "시작조차 못 한 것"과 "거부된 것"이 다시 뭉쳐진다 — 사용자가 다음에 할 일이 다른데도.
+   */
   status: string;
   /** 가격을 모르는 모델로 나간 호출 수. 있으면 그 구성원의 금액은 **하한이다.** */
   unpricedCalls?: number;
@@ -45,7 +50,9 @@ export interface FleetSpendView {
   memberCount: number;
   /** 시작조차 하지 않은 구성원 수. **실패와 다른 결말이다.** */
   notStartedCount: number;
-  /** 완료되지 않은 구성원 수(실패·취소·거부·미시작 전부). */
+  /** 아직 도는 구성원 수. **결말이 아니다** — 이걸 완료로도 실패로도 세지 않는다. */
+  runningCount: number;
+  /** 완료되지 않은 구성원 수(진행 중·실패·취소·거부·미시작 전부). */
   unfinishedCount: number;
   /** 합계 상한을 실제로 강제했는가. */
   capEnforced: boolean;
@@ -65,6 +72,7 @@ export function summarizeFleetSpend(input: FleetSpendInput): FleetSpendView {
   const fleetCostUsd = members.reduce((sum, m) => sum + (Number.isFinite(m.costUsd) ? m.costUsd : 0), 0);
   const approximate = members.some((m) => (m.unpricedCalls ?? 0) > 0);
   const notStartedCount = members.filter((m) => m.status === "not_started").length;
+  const runningCount = members.filter((m) => m.status === "running").length;
   const unfinishedCount = members.filter((m) => m.status !== "completed").length;
   const capEnforced = input.fleetCapUsd !== null;
 
@@ -93,8 +101,17 @@ export function summarizeFleetSpend(input: FleetSpendInput): FleetSpendView {
     notices.push("가격을 모르는 모델로 나간 호출이 있어 위 금액은 실제 청구의 하한입니다.");
   }
   if (notStartedCount > 0) {
+    // **사유를 단정하지 않는다.** 미시작은 합계 상한이 남지 않은 경우와 Fleet이 취소된
+    // 경우 둘 다이고, 여기서 앞엣것으로 단정하면 취소한 사용자에게 예산 이야기를 한다.
     notices.push(
-      `${notStartedCount}개 작업은 합계 상한이 남지 않아 시작되지 않았습니다 — 실패와 다른 결말입니다.`
+      `${notStartedCount}개 작업은 **시작되지 않았습니다**(합계 상한이 남지 않았거나 Fleet이 취소되었습니다) — ` +
+        `실패와 다른 결말입니다.`
+    );
+  }
+  if (runningCount > 0) {
+    // **아직 끝나지 않은 것을 결말로 접지 않는다.** 위 금액도 그만큼 아직 자란다.
+    notices.push(
+      `${runningCount}개 작업이 아직 돌고 있습니다 — 위 금액은 지금까지의 합계이며 아직 늘어납니다.`
     );
   }
 
@@ -103,6 +120,7 @@ export function summarizeFleetSpend(input: FleetSpendInput): FleetSpendView {
     approximate,
     memberCount: members.length,
     notStartedCount,
+    runningCount,
     unfinishedCount,
     capEnforced,
     notices,
@@ -117,9 +135,36 @@ export function summarizeFleetSpend(input: FleetSpendInput): FleetSpendView {
  */
 export interface FleetOutcomeSummary {
   allCompleted: boolean;
+  /** 아직 결말이 없는 구성원이 있는가. **"완료가 아니다"와 다른 사실이다.** */
+  stillRunning: boolean;
   counts: Record<string, number>;
   /** 화면 배지에 그대로 쓰는 한 줄. */
   headline: string;
+}
+
+/** 사람이 읽는 이름. **모르는 값은 지우지 않고 그대로 센다** — 지우면 개수가 구성원 수와 어긋난다. */
+const OUTCOME_LABELS: Record<string, string> = {
+  completed: "완료",
+  failed: "실패",
+  cancelled: "취소",
+  rejected: "거부",
+  interrupted: "중단됨",
+  not_started: "미시작",
+  running: "진행 중",
+  unknown: "알 수 없음",
+};
+
+/**
+ * 결말 하나를 사람이 읽는 이름으로. **모르는 값은 코드를 그대로 낸다.**
+ *
+ * 빈 문자열이나 "알 수 없음"으로 접으면 새 종착지가 생겼을 때 화면에서 **사라진다** —
+ * 코드가 그대로 보이면 적어도 사용자가 그것을 우리에게 말할 수 있다.
+ *
+ * 목록 줄과 배지가 같은 이름을 써야 하므로 그 표를 여기서 내보낸다: 화면이 자기 표를
+ * 따로 들면 같은 결말이 두 이름으로 보인다.
+ */
+export function outcomeLabel(status: string): string {
+  return OUTCOME_LABELS[status] ?? status;
 }
 
 export function summarizeFleetOutcome(members: readonly FleetMemberSpend[]): FleetOutcomeSummary {
@@ -127,15 +172,18 @@ export function summarizeFleetOutcome(members: readonly FleetMemberSpend[]): Fle
   for (const member of members) counts[member.status] = (counts[member.status] ?? 0) + 1;
   const completed = counts.completed ?? 0;
   const allCompleted = members.length > 0 && completed === members.length;
-  const parts = [
-    `완료 ${completed}`,
-    `실패 ${counts.failed ?? 0}`,
-    `취소 ${counts.cancelled ?? 0}`,
-    `거부 ${counts.rejected ?? 0}`,
-    `미시작 ${counts.not_started ?? 0}`,
-  ];
+  const stillRunning = (counts.running ?? 0) > 0;
+
+  // **자주 쓰는 다섯은 0이어도 적는다** — 화면의 칸이 실행마다 달라지면 사용자가 그 줄을
+  // 읽는 법을 배울 수 없다. 나머지는 실제로 있을 때만 는다.
+  const always = ["completed", "failed", "cancelled", "rejected", "not_started"];
+  const extra = Object.keys(counts)
+    .filter((status) => !always.includes(status))
+    .sort();
+  const parts = [...always, ...extra].map((status) => `${outcomeLabel(status)} ${counts[status] ?? 0}`);
   return {
     allCompleted,
+    stillRunning,
     counts,
     headline: allCompleted ? `${members.length}개 모두 완료` : parts.join(" · "),
   };

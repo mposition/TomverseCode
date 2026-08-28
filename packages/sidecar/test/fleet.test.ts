@@ -453,24 +453,34 @@ test("[Fleet] Fleet 단위 상태가 task_events에 남아 새 프로세스가 �
       "--fleet",
       run.fleet.fleetId,
     ]) as {
-      members: { branch: string; taskId: string; fleetId: string; finalStatus: string | null; admitted: boolean }[];
-      fleetCostUsd: number;
-      unfinishedTaskIds: string[];
+      fleets: {
+        fleetId: string;
+        members: { branch: string; taskId: string; status: string; admitted: boolean }[];
+        fleetCostUsd: number;
+        capsRecorded: boolean;
+        unfinishedTaskIds: string[];
+      }[];
     };
 
-    assert.equal(status.members.length, 3, JSON.stringify(status.members));
+    // **화면과 CLI가 같은 함수를 읽는다**(`fleet::collect_status`). 그래서 이 모양이 곧
+    // 화면이 보는 모양이고, 여기서 확인하는 것이 거기서도 참이다.
+    assert.equal(status.fleets.length, 1, JSON.stringify(status.fleets));
+    const fleet = status.fleets[0]!;
+    assert.equal(fleet.fleetId, run.fleet.fleetId);
+    assert.equal(fleet.members.length, 3, JSON.stringify(fleet.members));
     assert.deepEqual(
-      status.members.map((m) => m.branch).sort(),
+      fleet.members.map((m) => m.branch).sort(),
       ["fleet-a", "fleet-b", "fleet-c"]
     );
-    for (const member of status.members) {
-      assert.equal(member.fleetId, run.fleet.fleetId);
+    for (const member of fleet.members) {
       assert.equal(member.admitted, true);
-      assert.equal(member.finalStatus, "COMPLETED");
+      assert.equal(member.status, "completed");
     }
     // 끝났으므로 "돌고 있던 것"은 없다. 크래시했다면 여기 남는다.
-    assert.deepEqual(status.unfinishedTaskIds, []);
+    assert.deepEqual(fleet.unfinishedTaskIds, []);
     // **합계는 합계라고 부른다.** 태스크 하나의 지출과 같은 이름이면 화면이 둘을 구별할 수 없다.
-    assert.equal(typeof status.fleetCostUsd, "number");
+    assert.equal(typeof fleet.fleetCostUsd, "number");
+    // **상한이 기록에 남는다.** 남기지 않으면 화면은 "상한이 없었다"와 "모른다"를 구별할 수 없다.
+    assert.equal(fleet.capsRecorded, true);
   });
 });
