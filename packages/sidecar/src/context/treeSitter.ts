@@ -113,8 +113,15 @@ export interface GrammarSet {
   anyLoaded(): boolean;
 }
 
-/** grammar wasm 파일 이름. `tree-sitter-wasms` 패키지의 배치와 1:1이다. */
-const WASM_BASENAME: Record<GrammarId, string> = {
+/**
+ * grammar wasm 파일 이름. `tree-sitter-wasms` 패키지의 배치와 1:1이다.
+ *
+ * **export하는 이유는 배포다.** 동봉 번들은 이 패키지 전체(50 MiB)가 아니라 여기 적힌 5개만
+ * 담는데(`scripts/stage-sidecar.mjs`), 그 목록을 스테이징 쪽에 다시 적으면 언젠가 갈라진다.
+ * 갈라진 결과는 오류가 아니라 **조용한 성능 저하**다 — 그 언어만 심볼이 없고 폴백(ripgrep)이
+ * 조용히 받아낸다. 목록은 여기 하나뿐이어야 한다.
+ */
+export const WASM_BASENAME: Record<GrammarId, string> = {
   typescript: "tree-sitter-typescript.wasm",
   tsx: "tree-sitter-tsx.wasm",
   javascript: "tree-sitter-javascript.wasm",

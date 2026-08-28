@@ -1,0 +1,59 @@
+{
+  "//": [
+    "동봉하는 Node 런타임의 **핀**이다. 이 파일이 '설치본에 무엇이 들어가는가'의 정본이며,",
+    "빌드는 여기 적힌 sha256과 정확히 일치하는 바이트만 번들에 넣는다(scripts/stage-sidecar.mjs).",
+    "",
+    "왜 해시를 저장소에 박는가: 배포되는 node.exe는 API 키가 주입되고 신뢰 경계와 대화하는",
+    "프로세스의 인터프리터다(process-architecture.md 10.1절). '공식 배포처에서 받았다'는",
+    "받는 시점의 사실일 뿐이고, 저장소는 그 사실을 기억하지 못한다. 해시를 커밋하면 무엇이",
+    "들어갔는지의 정본이 git 이력이 되고, 배포처가 바뀌거나 중간에서 갈아치워져도 빌드가 멈춘다.",
+    "",
+    "이 값을 손으로 고치지 말 것. `npm run node-runtime:pin -- --version vX.Y.Z --write`가",
+    "SHASUMS256.txt의 GPG 서명을 allowlist 키로 검증한 뒤에만 다시 쓴다(scripts/pin-node-runtime.mjs).",
+    "근거: docs/design/process-architecture.md 10.6절."
+  ],
+  "schemaVersion": 1,
+  "version": "v24.20.0",
+  "//version": [
+    "Node 24 LTS('Krypton'). 22 LTS는 2027-04에 유지보수가 끝나므로 지금 22를 동봉하면 제품",
+    "수명 안에서 런타임 교체가 확정적으로 한 번 더 발생한다. 24는 2028-04까지 간다.",
+    "",
+    "**이것은 우리가 배포하는 버전이지, sidecar가 요구하는 최소 버전이 아니다.** 후자는",
+    "루트 package.json의 engines.node이고 강제는 launcher.rs의 MIN_NODE_MAJOR다(10.5절).",
+    "둘을 한 값으로 합치지 않는다 — '무엇을 싣는가'와 '무엇이면 돌아가는가'는 다른 사실이고,",
+    "합치면 개발 머신의 런타임이 배포 런타임보다 낮다는 이유만으로 앱이 뜨지 않는다.",
+    "다만 싣는 것이 요구보다 낮으면 그건 결함이므로, 그 방향만 테스트가 막는다."
+  ],
+  "artifacts": {
+    "win-x64": {
+      "url": "https://nodejs.org/dist/v24.20.0/win-x64/node.exe",
+      "sha256": "5c976096e04e5c2c1f091938926234cc9fbebfe9787ddd149351b3b0ecc707b5"
+    },
+    "win-arm64": {
+      "url": "https://nodejs.org/dist/v24.20.0/win-arm64/node.exe",
+      "sha256": "92949e7764e56e305cb84ea3d575912e822c79e85599362e8d408b04b9ffd326"
+    }
+  },
+  "//artifacts": [
+    "arch별로 따로 적는다. 섞이면 잡을 방법이 없고, 잘못 섞인 설치본의 증상은 '앱이 뜨지 않는다'뿐이다.",
+    "win-arm64는 핀만 있고 아직 그 아키텍처에서 빌드해 본 적이 없다 — 해시는 같은 서명된",
+    "목록에서 왔으므로 진짜지만, 그것과 'arm64에서 동작한다'는 다른 사실이다."
+  ],
+  "licenseUrl": "https://raw.githubusercontent.com/nodejs/node/v24.20.0/LICENSE",
+  "provenance": {
+    "shasumsUrl": "https://nodejs.org/dist/v24.20.0/SHASUMS256.txt",
+    "signatureUrl": "https://nodejs.org/dist/v24.20.0/SHASUMS256.txt.sig",
+    "signingKeyFingerprint": "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+    "signer": "Antoine du Hamel <antoine.duhamel@platformatic.dev>",
+    "verifiedAt": "2026-08-28",
+    "gpgResult": "GOODSIG + VALIDSIG"
+  },
+  "//provenance": [
+    "핀을 **처음 넣는 순간**을 보호하는 것이 서명이다. 해시가 저장소에 박힌 뒤로는 다운로드한",
+    "바이트가 그 값과 같은지만 보면 되므로 매 빌드마다 GPG가 필요하지 않다 — 서명이 보증하는",
+    "것은 '이 해시가 Node 릴리스팀에서 왔다'이고 그건 핀 시점에 한 번 성립하면 계속 성립한다.",
+    "그래서 gpg는 pin 명령에만 필요하고 빌드 머신에는 필요 없다.",
+    "fingerprint가 signing-keys.json의 allowlist에 있어야 하며, 그 목록을 늘리는 것은 코드",
+    "리뷰가 필요한 별도 변경이다 — 키서버에서 빌드 때마다 임의로 받지 않는다."
+  ]
+}

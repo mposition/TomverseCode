@@ -138,7 +138,31 @@ main이 그보다 앞서 있기 때문이다. 그게 정상이고, 만료가 실
 
 ---
 
-## 5. `not_landed` — sidecar를 번들에 넣는 설정이 없다
+## 5. ~~`not_landed`~~ → 해결됨 — sidecar를 번들에 넣는 설정이 없었다
+
+> **이후 변동(2026-08-28, `4bdce17` 기준 작업).** 동봉을 구현했고 이 머신에서 실측했다.
+> `sidecarBundle`은 이제 **`not_landed`가 아니라 `incomplete`**다 — `bundleContents`와
+> `bundleSizeRecorded`가 도구 판정으로 `passed`이고, 남은 둘은 설치된 GUI 앱을 node 없는
+> 머신에서 실행해야 하는 항목이다(14절 #2·#3). 아래 원문은 **당시 관측**이므로 고치지 않는다.
+>
+> 실측 결과:
+>
+> | 무엇 | 결과 |
+> |---|---|
+> | `npm run sidecar:stage` | 핀(`v24.20.0`, sha256 일치) 검증 후 **102.4 MiB** 스테이징, 잘라냄 57.3 MiB |
+> | 스테이징 smoke | **통과** — 동봉 node.exe로 sidecar가 뜨고 ping 왕복 성립 (`protocol 0.2.0 / node 24.20.0`) |
+> | `scripts\tauri-build.bat` | **통과**. `.msi` 5.3 → **41.0 MiB**, `.exe` 3.6 → **27.2 MiB** |
+> | `.msi` 페이로드 | `PFiles\Tomverse Code\sidecar\node.exe` **있음** (`msiexec /a`로 추출해 확인) |
+> | `windows-landing --bundle <추출한 앱 디렉터리>` | `bundleContents: passed` — 파일 5개 전부 있고 **런타임 sha256이 manifest와 일치** |
+> | 같은 실행의 `bundleSizeRecorded` | `passed` — 앱 117.1 MiB / 그중 동봉 102.4 MiB |
+>
+> **결정의 근거는 process-architecture.md 10.6절에 있다** — 어느 런타임(Node 24 LTS 고정),
+> 어디서(핀된 sha256 + 핀 회전 시 GPG allowlist 검증), 누가 넣는가(별도 스테이징 스크립트 +
+> `bundle.resources`).
+
+---
+
+### 5.0 (원문) `not_landed` — sidecar를 번들에 넣는 설정이 없다
 
 4절을 고친 덕분에 **이제 이것은 추측이 아니라 판정 결과다.** `scripts\tauri-build.bat`이
 통과해 설치본이 나오고(.msi 5.3 MiB / .exe 3.6 MiB), 그 산출물에 대고 물으면:
@@ -157,9 +181,12 @@ sidecarBundle: not_landed
 이 항목은 **확인이 아니라 개발이 필요하다.** 결정할 것: 어느 Node 런타임을 동봉하는가
 (버전·라이선스·크기), 어디서 가져오는가, 그리고 그것을 `tauri-build`의 어느 단계가 넣는가.
 
-`bundleSizeRecorded`는 `passed`로 나오지만 **그 숫자를 믿지 말 것** — `--bundle`에
-`target/release`를 주면 빌드 산출물까지 세어 1586.9 MiB가 나온다. 실제 설치본은 위의
-5.3/3.6 MiB다. 동봉이 생기면 그때 잴 대상은 설치된 앱 디렉터리다.
+~~`bundleSizeRecorded`는 `passed`로 나오지만 **그 숫자를 믿지 말 것** — `--bundle`에
+`target/release`를 주면 빌드 산출물까지 세어 1586.9 MiB가 나온다.~~
+→ **고쳤다.** 이제 `build`/`deps`/`.fingerprint`/`incremental` 중 둘 이상이 보이면
+"빌드 트리를 가리키고 있습니다"로 **실패**한다. 통과 표시가 붙은 숫자는 아무도 다시 보지
+않으므로, 그 상태는 "얼마인지 알고 받아들였다"의 정확히 반대였다. 잴 대상은 설치된 앱
+디렉터리이고, **앱 전체와 동봉분을 따로** 적는다 — 합계만 있으면 동봉이 얼마를 차지하는지 모른다.
 
 ---
 
@@ -503,9 +530,36 @@ Remove-SmbShare -Name tomverse-unc -Force   # 위에서 만들었다면
 
 1. ~~Tauri 껍데기 크레이트를 고친다. 그다음 `cargo-check-desktop`을 `verify`에 넣는다.~~
    → **둘 다 했다**(4절). 번들이 만들어지고 `desktop:check`가 두 진입점에 있다.
-2. **sidecar 동봉을 설계하고 구현한다**(5절). `sidecarBundle`이 `not_landed`인 유일한 이유다.
-3. **node 없는 Windows 머신에서 설치본을 실행한다** — 2가 끝나야 의미가 있다.
-   (설치본은 이미 있다: `target\release\bundle\{msi,nsis}`.)
+2. ~~**sidecar 동봉을 설계하고 구현한다**(5절). `sidecarBundle`이 `not_landed`인 유일한 이유다.~~
+   → **구현하고 확인했다.** 결정은 [process-architecture.md 10.6절](./process-architecture.md),
+   실측은 5절 상단. `sidecarBundle`은 더 이상 `not_landed`가 아니다 —
+   `bundleContents`·`bundleSizeRecorded`가 **도구 판정으로** `passed`이므로 여기에 사람의
+   확인을 적을 것이 없다(15.2절: `passed`는 덮을 것이 없다).
+   **이 항목에 남은 일은 아래 3번뿐이다.**
+3. **node 없는 Windows 머신에서 설치본을 실행한다** — `runsWithoutNodeOnPath`와
+   `sourcesAreBundled`. 2가 끝났으므로 이제 의미가 있고, **이것이 `sidecarBundle`에 남은
+   전부다.** 설치본: `apps\desktop\src-tauri\target\release\bundle\{msi,nsis}`.
+
+   **이번에 확인하지 *못한* 이유를 적어 둔다** — 15절의 취지가 이것이다.
+   두 기준은 **설치된 GUI 앱**을 요구하는데, `desktop.exe`는 사용자가 워크스페이스를 열 때
+   비로소 sidecar를 띄운다(`session.rs`). 즉 화면 조작 없이는 태울 수 없고,
+   MSI를 실제로 설치하는 것은 이 작업의 범위 밖이다. 그래서 **attestation에 적지 않았다.**
+
+   **대신 확인한 것**(같은 사실이 아니므로 통과로 세지 않는다):
+   `msiexec /a`로 꺼낸 설치 레이아웃(`PFiles\Tomverse Code\`)에 `tomverse-host.exe`를 넣고,
+   **PATH에서 node가 있는 디렉터리를 전부 걷어낸 뒤**(`where node` → 없음) `--sidecar`를
+   주지 않고 `run`을 돌렸다. **exit 0, `mutatedPaths = ["paginate.js"]`, 태스크 완주.**
+   PATH에 node가 없으므로 인터프리터는 번들에서 왔고, `resolve()`가 번들 진입점을 개발
+   트리보다 먼저 보므로 진입점도 번들이다(그 우선순위는 `launcher.rs`의
+   `a_staged_layout_on_a_real_filesystem_resolves_to_bundled`가 실제 파일시스템으로 지킨다).
+   해석·spawn 함수는 껍데기와 공유한다(10.3절). **그래도 `desktop.exe`를 태운 것은 아니다.**
+
+   다시 확인하는 절차:
+   ```
+   scripts\tauri-build.bat
+   # 설치본을 node 없는 Windows에 설치하고 실행 → 워크스페이스를 연다
+   # stderr에 "[sidecar] 동봉 런타임이 아닙니다"가 **없어야** 한다 (session.rs)
+   ```
 4. **Python이 있는 머신에서 `pythonEnv` 셋을 태운다**(10절). 이 머신에는 Python이 없다.
 5. **강제 포기 경로**로 job 핸들 수명을 마저 확인한다(7절) — UI가 필요하다.
 6. **`processGroup` 둘**(12절). Ctrl+C 전파는 별도 콘솔에서, taskkill 폴백은 강제할 수단이 필요하다.
