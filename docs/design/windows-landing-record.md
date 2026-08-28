@@ -3,11 +3,21 @@
 이 문서는 설계가 아니라 **관측 기록**이다. `tomverse-host windows-landing`이 판정하지 못하는
 것 — 사람이 Windows에서 직접 해봐야 하는 항목 — 을 실제로 해본 결과를 남긴다.
 
-**왜 문서가 필요한가.** `landing.rs`는 "확인했다는 기억"과 "확인됐다는 기록"을 가르려고
-만들어졌다. 그런데 그 도구에는 **사람이 확인한 결과를 넣을 입구가 없다.** 항목이
-`NeedsHuman`으로 하드코딩되어 있어, 사람이 실제로 확인해도 다음 실행은 여전히 같은 25개를
-`remaining`으로 낸다. 그러면 확인한 사실이 다시 사람의 기억에만 남는다 — 도구가 없애려던
-바로 그 상태다. 이 문서가 그 자리를 임시로 메운다. **제대로 된 답은 15절에 적었다.**
+**왜 문서가 필요했는가 — 그리고 무엇이 바뀌었는가.** `landing.rs`는 "확인했다는 기억"과
+"확인됐다는 기록"을 가르려고 만들어졌다. 그런데 그 도구에는 **사람이 확인한 결과를 넣을
+입구가 없었다.** 항목이 `NeedsHuman`으로 하드코딩되어 있어, 사람이 실제로 확인해도 다음
+실행은 여전히 같은 25개를 `remaining`으로 냈다. 그러면 확인한 사실이 다시 사람의 기억에만
+남는다 — 도구가 없애려던 바로 그 상태다. **이 문서가 그 자리를 임시로 메우고 있었다.**
+
+**그 자리는 이제 닫혔다.** `tomverse-host windows-landing --attest <파일>`이 사람의 확인을
+받아들인다(15절 — 제안이 아니라 구현이다). 7~12절에서 확인한 열 항목은
+[`attestations/windows-landing-206d2ef.json`](./attestations/windows-landing-206d2ef.json)에
+그 형식으로 옮겼다. **그 파일은 지금 만료 상태로 나온다** — `206d2ef`에서 확인한 기록인데
+main이 그보다 앞서 있기 때문이다. 그게 정상이고, 만료가 실제로 동작한다는 증거다(15.7절).
+
+이 문서가 계속 있는 이유는 남는다. attestation은 **확인된 것**의 기록이고, 이 문서는
+**확인하지 못한 것과 그 이유**, 그리고 실측에서 드러난 제품 결함(3·5·6절)의 기록이다.
+그 둘은 같은 파일에 들어갈 수 없다.
 
 ---
 
@@ -31,8 +41,9 @@
 ## 2. 결말 요약
 
 `tomverse-host windows-landing --workspace <repo>` 은 `verdict = incomplete`,
-`remaining = 25`를 낸다 — **실측 전후가 같다.** 도구가 사람의 확인을 받아들이지 못하기
-때문이며(15절), 실측이 성과가 없었다는 뜻이 아니다.
+`remaining = 25`를 냈다 — **실측 전후가 같았다.** 도구가 사람의 확인을 받아들이지 못했기
+때문이며, 실측이 성과가 없었다는 뜻이 아니다. **그 입구는 이제 있다**(15절):
+`--attest`를 주면 아래 표의 확인들이 판정에 들어간다.
 
 `--bundle <산출물>`을 함께 주면 `verdict = not_landed`, `remaining = 24`가 된다.
 **나빠진 것이 아니라 알게 된 것이다** — 처음에는 번들을 만들 수조차 없어 이 항목이
@@ -318,23 +329,120 @@ CLAUDE.md가 npm shim에서 경계한 실패 모드("검증 없이 완료로 보
 7. **UNC 워크스페이스를 어떻게 할지 결정한다**(6절).
 8. **`credentialStore`** — 실측이 아니라 개발이다. 만들 때 `injectionStaysOnce` 기준을 먼저 읽을 것.
 
+위의 것들을 확인하면 **문서가 아니라 attestation 파일에 적는다**(15절). 이 목록은 확인하지
+못한 것의 목록이고, 확인한 것은 도구가 읽는 자리로 간다 — 그 둘이 갈리는 것이 이 작업의
+결과다. 확인은 **그 커밋에서만** 유효하므로, main이 움직이면 다시 확인해 새로 적어야 한다.
+
 ---
 
-## 15. 도구에 필요한 것 — 사람의 확인을 받아들이는 입구
+## 15. 사람의 확인을 받아들이는 입구 — **구현됨**
 
-`windows-landing`은 실측 전후로 **똑같이** `remaining = 25`를 낸다. 위의 8~11절을 전부
-확인했는데도 그렇다. 그 설계는 옳다 — 도구가 못 본 것을 스스로 통과로 바꾸면 착시를 만든다.
-**그러나 사람이 확인한 결과를 넣을 자리가 없으면, 확인한 사실은 다시 기억에만 남는다.**
+`windows-landing`은 실측 전후로 **똑같이** `remaining = 25`를 냈다. 위의 7~11절을 전부
+확인했는데도 그랬다. 그 설계 자체는 옳다 — 도구가 못 본 것을 스스로 통과로 바꾸면 착시를
+만든다. **그러나 사람이 확인한 결과를 넣을 자리가 없으면, 확인한 사실은 다시 기억에만 남는다.**
 이 도구가 없애려던 상태로 되돌아가는 것이다.
 
-저장소에는 이미 이 문제의 답이 있다. 가설 게이트의 `attest-p0`가 결과를 검사해
+저장소에는 이미 이 문제의 답이 있었다. 가설 게이트의 `attest-p0`가 결과를 검사해
 `approvals/attestations/<id>.json`에 **immutable하게** 적고, 이후 단계는 그 파일을 근거로
-삼는다(multi-engine-routing.md 10.10절). 같은 모양을 여기에 두는 것을 제안한다:
+삼는다(multi-engine-routing.md 10.10절). 같은 모양을 여기에 두었다 —
+`apps/desktop/src-tauri/core/src/landing_attest.rs`.
 
-- `tomverse-host windows-landing --attest <파일>` — 사람이 확인한 항목의 서명된 기록을 읽는다.
-- 기록에는 **무엇을**, **어느 머신에서**(OS 빌드·Node·VS·git 설정), **어느 커밋에서**
-  확인했는지가 들어간다. 이 문서 1절이 왜 필요했는지가 그 이유다 —
-  "Python으로 확인했다"는 Python이 있는 머신에서만 뜻이 있다.
-- 커밋이 바뀌면 attestation은 **만료된다.** 안 그러면 옛 확인이 새 코드를 통과시킨다.
+```
+tomverse-host windows-landing --workspace <repo> --attest <파일>
+```
 
-그 입구가 생기기 전까지, 이 문서가 그 기록이다.
+### 15.1 기록에 들어가는 것
+
+**무엇을**, **어느 머신에서**, **어느 커밋에서**, **누가** 확인했는지. 1절이 왜 표로
+시작하는지가 그 이유다.
+
+```json
+{
+  "schemaVersion": 1,
+  "kind": "windows-landing-attestation",
+  "attestationId": "windows-landing-206d2ef",
+  "attestedBy": "...",
+  "createdAt": "2026-08-27T00:00:00Z",
+  "commit": "206d2ef",
+  "machine": {
+    "os": "windows", "osVersion": "10.0.19045",
+    "nodeVersion": "v22.22.2", "npmShim": "C:\\nvm4w\\nodejs\\npm.CMD",
+    "visualStudio": "...\\2022\\BuildTools", "gitForWindows": "C:\\Program Files\\Git",
+    "gitAutocrlf": "true", "python": null, "installedBundle": null
+  },
+  "checks": [
+    { "group": "commandResolution", "check": "npmResolvesToNodeCli",
+      "observedAt": "2026-08-27", "evidence": "무엇을 보고 그렇게 판단했는가" }
+  ],
+  "attestationHash": "<64자리 hex>"
+}
+```
+
+`evidence`는 비어 있을 수 없다. 근거 없는 통과 표시는 이 도구가 없애려는 바로 그것이다.
+
+**`machine`의 필드는 하나도 생략할 수 없다.** 없으면 `null`이라고 **적어야** 한다.
+`deny_unknown_fields`는 더 적은 것을 막지 못하고 serde의 `Option`은 없는 필드를 조용히
+`None`으로 만드는데, 그러면 "적지 않는 것"이 요구를 피하는 가장 쉬운 길이 된다. 그 순간
+이 기록은 판정 재료가 아니라 장식이다.
+
+### 15.2 무엇을 덮을 수 있고, 무엇을 덮을 수 없는가
+
+| 도구가 관측한 상태 | attestation |
+|---|---|
+| `needs_human` | **통과로 바꾼다** — 애초에 사람을 기다리던 자리다 |
+| `not_checkable_here` | **통과로 바꾼다** — "여기서는 볼 수 없다"에 대한 답이 다른 머신의 확인이다 |
+| `failed` | **덮지 못한다.** 도구가 실제로 관측한 실패를 사람의 종이가 지우지 못한다 |
+| `not_implemented` | **덮지 못한다.** 없는 기능을 확인할 수는 없다 |
+| `passed` | 덮을 것이 없다. 적혀 있으면 "아무것도 바꾸지 않았다"고 알린다 |
+
+5절이 정확히 세 번째 줄의 자리다 — 번들에 sidecar가 없다는 것은 도구가 **봤다.**
+
+### 15.3 머신 사양이 판정에 반영된다
+
+각 기준이 "사람이 확인하려면 그 머신에 무엇이 있어야 하는가"를 **기준 옆에** 선언한다
+(`Check.requires`). 별도 표로 몰아두면 기준을 고칠 때 요구를 함께 고치지 않게 되고, 그러면
+없는 것으로 확인했다는 기록이 통과한다.
+
+10절이 그 이유다: **이 머신에는 Python이 없었다.** 그러므로 같은 문장을 적어도 `pythonEnv`
+세 항목은 이 머신의 기록으로 통과하지 않는다 — "Python으로 확인했다"는 Python이 있는
+머신에서만 뜻이 있다. 거부는 조용하지 않다: 어느 줄이 왜 반영되지 않았는지가
+`attestation.rejections`에 남는다.
+
+### 15.4 커밋이 바뀌면 만료된다
+
+옛 확인이 새 코드를 통과시키면 이 도구는 착시를 만드는 쪽이 된다. 그래서 커밋이 다르면
+**항목별로 따질 것도 없이 통째로** 반영하지 않는다(`status: expired`). 지금 커밋을 읽지
+못하면(git 저장소가 아니면) 만료 여부를 판정할 수 없으므로 역시 반영하지 않는다
+(`status: inapplicable`) — 모르는 것을 통과로 세지 않는다.
+
+### 15.5 해시는 재귀 canonical JSON이다
+
+가설 게이트가 `JSON.stringify(v, Object.keys(v).sort())`로 **중첩 객체를 통째로 지워**
+"해시가 있는데 아무것도 지키지 못하던" 결함을 겪었다(CLAUDE.md 함정 기록,
+`evals/hypothesis-gate/src/canonical.ts`). 같은 실수를 반복하지 않는다 — key를 모든 깊이에서
+정렬하고 배열의 순서는 보존하며, 그 규칙을 지키는 테스트가 있다.
+
+**해시를 만들어 주는 명령은 없다.** 맞지 않으면 재계산한 값을 알려주고 거부할 뿐이고,
+파일에 옮겨 적는 것은 사람이다. 알려주는 것은 "무엇을 확인했는가"가 아니라 "이 내용이 그 뒤로
+바뀌지 않았다"는 봉인뿐이다. 이건 전자서명이 아니다 — 막으려는 것은 공격자가 아니라 사고다
+(편집기로 열었다 저장했다, 다른 실행의 파일을 복사해 왔다).
+
+### 15.6 `remaining`이 줄어드는 것은 목적이 아니다
+
+목적은 **누가·어디서·언제·무엇을 보고** 확인했는지가 남는 것이다. 그래서 통과한 기준에는
+그 출처가 붙고(`check.attestation`), 보고서 표면에 **그중 몇 개가 사람의 확인인지**가
+따로 있다(`attestedPasses`). 기계가 본 통과와 같은 칸에 넣지 않는다.
+
+### 15.7 이 저장소에 있는 기록
+
+[`attestations/windows-landing-206d2ef.json`](./attestations/windows-landing-206d2ef.json) —
+7~12절의 실측을 옮긴 것. 열 항목이다(jobObject 2, commandResolution 3, developerEnv 3,
+pathNormalization 2). **확인하지 못한 것은 적지 않았다**: `jobHandleLifetime`(강제 포기 경로를
+태우지 못했다), `aFailedPreparationDoesNotBlockTheCommand`, `processGroup` 둘, `pythonEnv` 셋.
+
+`206d2ef`를 체크아웃한 트리에서 돌리면 `status = accepted`, `attestedPasses = 10`이고
+`remaining`이 26에서 16으로 줄어든다(Linux 기준. 26인 이유는 `coreBuild`가 Windows에서는
+`passed`인데 여기서는 `not_checkable_here`이기 때문이다).
+
+**지금 main에서 돌리면 `status = expired`, `attestedPasses = 0`이고 `remaining`은 그대로다.**
+그게 정상이고, 만료가 실제로 동작한다는 증거다.

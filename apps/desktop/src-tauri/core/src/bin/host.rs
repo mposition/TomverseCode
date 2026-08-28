@@ -143,6 +143,11 @@ struct Args {
     all_workspaces: bool,
     /// `windows-landing` 전용 — tauri 번들 디렉터리.
     bundle: Option<PathBuf>,
+    /// `windows-landing` 전용 — **사람이 확인한 항목의 기록**(landing_attest.rs).
+    ///
+    /// 도구가 자동으로 만들지 않는다. 사람이 확인한 것을 사람이 적는 것이 이 기록의 전부이며,
+    /// 도구가 스스로 채우면 그 순간 아무것도 증명하지 않는다.
+    attest: Option<PathBuf>,
 
     // ---- 가설 게이트(evals/hypothesis-gate) 전용 ----
     //
@@ -284,6 +289,7 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         force: false,
         all_workspaces: false,
         bundle: None,
+        attest: None,
         providers: None,
         review_mode: None,
         replay_draft: None,
@@ -382,6 +388,7 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "--verbose" => args.verbose = true,
             "--all-workspaces" => args.all_workspaces = true,
             "--bundle" => args.bundle = Some(PathBuf::from(value()?)),
+            "--attest" => args.attest = Some(PathBuf::from(value()?)),
             other => return Err(format!("알 수 없는 인자: {other}\n\n{}", usage())),
         }
     }
@@ -521,7 +528,12 @@ fn usage() -> String {
      windows-landing — Windows에서만 확인되는 착지 기준(Job Object·번들·Credential Store)을\n\
                  판정한다. 읽기 전용이고 DB도 열지 않는다. **확인하지 못한 것을 통과로 세지\n\
                  않는다** — 사람이 해야 하는 단계는 remaining에 남는다.\n\
-                 [--bundle <경로>]로 tauri-build 산출물을 가리키면 번들 기준까지 본다"
+                 [--bundle <경로>]로 tauri-build 산출물을 가리키면 번들 기준까지 본다.\n\
+                 [--attest <파일>]로 **사람이 확인한 기록**을 읽는다 — 무엇을, 어느 머신에서\n\
+                 (OS 빌드·Node·VS·git 설정·Python 유무), 어느 커밋에서 확인했는지가 들어 있다.\n\
+                 **커밋이 바뀌면 만료된다**(옛 확인이 새 코드를 통과시키면 안 된다). 관측된\n\
+                 `failed`와 아직 만들지 않은 기능은 덮지 못하고, 기록된 머신에 없는 것으로\n\
+                 확인했다는 줄도 통과시키지 않는다. 만들어 주는 명령은 없다 — 사람이 적는다"
         .to_string()
 }
 
@@ -662,7 +674,19 @@ fn real_main() -> Result<i32, String> {
     // **착지 검사도 DB를 열지 않는다.** 관측만 하고 아무것도 쓰지 않으므로, 여기서 store를
     // 열면 없던 state.db가 생긴다 — reproduce와 같은 이유로 store를 만들기 전에 갈라진다.
     if args.command == "windows-landing" {
-        let report = tomverse_core::landing::assess(&tomverse_core::landing::Observations::here(args.bundle.clone()));
+        // **읽기와 판정을 나눈다.** 파일을 읽는 것(IO)만 여기서 하고, 만료·머신 사양·덮어쓸 수
+        // 없는 상태의 판정은 전부 순수 함수 안에 있다 — 그래야 Windows 없이도 규칙을 테스트한다.
+        let attestation = args.attest.as_deref().map(tomverse_core::landing_attest::read_file);
+        // 지금 커밋. **만료 판정의 기준**이며, 읽지 못하면 attestation을 반영하지 않는다
+        // (모르는 것을 통과로 세지 않는다). `read_only_git`은 인자를 allowlist로 막으므로
+        // 이 경로가 저장소에 쓸 수 없다는 것이 구조로 확인된다.
+        let head_commit = tomverse_core::reproduce::read_only_git(root.path(), &["rev-parse", "HEAD"])
+            .ok()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty());
+        let obs = tomverse_core::landing::Observations::here(args.bundle.clone())
+            .with_attestation(head_commit, attestation);
+        let report = tomverse_core::landing::assess(&obs);
         println!("{}", serde_json::to_string(&report).unwrap_or_default());
         // **판정을 종료 코드에 싣지 않는다.** 실으면 "도구가 실패했다"와 "아직 착지하지
         // 않았다"가 같은 값이 된다 — reproduce가 같은 이유로 그렇게 한다.

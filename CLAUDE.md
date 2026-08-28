@@ -76,6 +76,12 @@ apps/desktop/        Tauri 2 + React
                      `windows-landing`은 **Windows에서만 검증되는 동작의 착지 판정을 사람 머릿속에서 꺼낸 것**이다 —
                      Job Object·sidecar 번들·Credential Store·명령 해석(npm shim)·프로세스 그룹·경로 정규화·개발자 환경(MSVC)·Python 가상환경 여덟 묶음이고,
                      `cfg(windows)`/`Platform::Windows`를 쓰는 파일이 그 목록에 없으면 테스트가 실패한다.
+                     `--attest <파일>`이 **사람이 확인한 결과를 받는 입구**다(`landing_attest.rs`, 기록 15절) —
+                     입구가 없으면 확인한 사실이 다시 기억에만 남는다. 다만 사람의 확인은 `needs_human`/
+                     `not_checkable_here`만 통과로 바꾼다: **관측된 `failed`도, 아직 없는 기능도 덮지 못하고**,
+                     기록된 머신에 없는 것으로 확인했다는 줄도 통과시키지 않는다(Python 없는 머신의 `pythonEnv`).
+                     **커밋이 바뀌면 만료된다** — 옛 확인이 새 코드를 통과시키면 안 되기 때문이다.
+                     만들어 주는 명령은 없다. 사람이 확인한 것을 사람이 적는 것이 이 기록의 전부다.
                      `metrics`는 저장된 이벤트에서 계측을 집계한다 — 기준 커버리지·충돌 결말과
                      **취소 소요 분포**(강제 포기 탈출구가 뜨는 시점의 근거), 그리고 **모델 정면
                      비교**(`modelEvaluation` — 대조 실행에서 사용자가 어느 모델의 안을 골랐는가.
