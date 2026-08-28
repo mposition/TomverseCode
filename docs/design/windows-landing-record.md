@@ -49,6 +49,10 @@ main이 그보다 앞서 있기 때문이다. 그게 정상이고, 만료가 실
 **나빠진 것이 아니라 알게 된 것이다** — 처음에는 번들을 만들 수조차 없어 이 항목이
 "측정 불가"였고, 지금은 무엇이 왜 빠졌는지가 판정으로 남는다(5절).
 
+> **이후 변동**: 6절의 결함을 고치면서 착지 묶음 `uncWorkspace`(항목 4개)를 새로 두었으므로
+> 이 숫자는 각각 **29 / 28**이 된다. 늘어난 것도 같은 이유다 — 몰랐던 것이 판정으로
+> 바뀌었다. 위 숫자는 이 문서가 기록한 **당시 관측값**이므로 고치지 않는다.
+
 아래는 사람이 실제로 태워본 결과다.
 
 | 그룹 | 도구 판정 | 사람이 확인한 것 |
@@ -61,6 +65,7 @@ main이 그보다 앞서 있기 때문이다. 그게 정상이고, 만료가 실
 | `developerEnv` | incomplete | 4개 중 3개 확인 |
 | `pythonEnv` | incomplete | 1개 **실패**, 2개 확인 불가(이 머신에 Python이 없다) |
 | `pathNormalization` | incomplete | verbatim 확인, UNC는 확인했으나 **다른 결함이 드러났다**(6절) |
+| `uncWorkspace` | (당시 없음) → incomplete | 6절의 결함을 고치면서 **새로 생긴 묶음**. **4개 모두 확인**(6.2절) — 전제(cmd.exe만 거부한다)까지 재현했다 |
 
 ---
 
@@ -158,7 +163,7 @@ sidecarBundle: not_landed
 
 ---
 
-## 6. 새 결함 — UNC 워크스페이스에서 검증이 "테스트 실패"로 보고된다
+## 6. 새 결함 — UNC 워크스페이스에서 검증이 "테스트 실패"로 보고된다 (고쳤다)
 
 착지 목록에 없던 항목이다. `pathNormalization`을 태우다 드러났다.
 
@@ -182,9 +187,187 @@ Could not find 'paginate.test.js'
 CLAUDE.md가 npm shim에서 경계한 실패 모드("검증 없이 완료로 보고")의 사촌이며, 이쪽은
 **없는 실패를 지어내는** 방향이다.
 
-**결정할 것**: 네트워크 드라이브 워크스페이스를 (a) UNC를 드라이브 문자로 매핑해 지원할지,
-(b) 시작 시 명확한 이유와 함께 거절할지. 지금처럼 "사용자 테스트가 깨진 것처럼 보이는" 상태로
-두면 안 된다.
+### 6.1 결정됨 — 고쳤다 (state-machine 55절)
+
+~~**결정할 것**: 네트워크 드라이브 워크스페이스를 (a) UNC를 드라이브 문자로 매핑해 지원할지,
+(b) 시작 시 명확한 이유와 함께 거절할지.~~
+→ **(c) + (d)로 결정했다.** 근거는
+[state-machine-and-protocol.md 55절](./state-machine-and-protocol.md).
+
+조사하고 나니 질문이 둘이었고, 앞의 것이 (a)/(b)와 **독립적으로** 답을 갖고 있었다.
+
+- **(c) 정직하게 보고한다.** 거짓말을 멈추는 것은 (a)든 (b)든 상관없이 옳다. UNC 작업
+  디렉터리 + cmd.exe를 지나는 러너 조합은 **spawn 전에** 막고(`unc.rs`, 차단 지점은
+  `run_process` 하나 — 검증뿐 아니라 모델의 `run_command`도 같은 답을 받는다),
+  `spawned: false` / `exitCode: null` / `durationMs: 0`을 남긴다.
+  종합 판정은 `fail`이 아니라 **`could_not_run`**이 된다.
+  - 판정은 **구조**로만 한다. cmd.exe의 `UNC paths are not supported`는 **로캘로 번역되므로**
+    출력 매칭은 한국어 Windows에서 조용히 도로 거짓말이 된다.
+  - **돌려 보고 판정하지 않는 이유**: cmd.exe가 `C:\Windows`로 떨어진 뒤 우연히 난 exit 0이
+    **가짜 통과**가 된다. 없는 실패보다 없는 통과가 더 나쁘다.
+- **(d) 열되 경고한다.** (a)는 드라이브 매핑이 **우리 프로세스 밖에 남는 전역 상태**라
+  버렸다 — 태스크가 죽으면 사용자 탐색기에 우리 흔적이 남고, "우리 것만 지운다"를 보장할
+  방법이 없다. (b)는 UNC에서 **실제로 동작하는 기능**(인덱싱·게이트·`apply_patch` — 바로 위
+  11절이 실측한 것)까지 버린다. 그래서 열되, 여는 자리에서 배너로 경고하고 `net use` 명령을
+  알려준다. **매핑은 사용자가 만든다** — 전역 상태의 소유자와 만든 사람이 같아진다.
+
+**아직 Windows에서 확인해야 한다.** 판정 로직은 Linux에서 검증되지만(플랫폼·경로·환경을 전부
+인자로 받는다) 그 판정이 실제 실행 경로에 걸려 있는지는 아니다. 새 착지 묶음 `uncWorkspace`가
+그 네 항목을 들고 있다 — 확인 절차는 아래 6.2절.
+
+`pathNormalization`에 붙이지 않은 이유: 묻는 것이 다르다. 저쪽은 "경로가 깨지지 않는가"이고
+여기는 "결과를 정직하게 보고하는가"인데, **저쪽은 이미 ✅였는데 이쪽이 거짓말하고 있었다.**
+한 묶음이었다면 통과가 실패를 가렸을 것이다.
+
+### 6.2 실측 — 네 항목 모두 확인했다 ✅
+
+**이 머신에서 실제로 태웠고 네 항목 모두 통과했다.** 1절의 환경, 작업 트리는 55절 구현
+직후(커밋 전). 모델 호출은 없다 — e2e가 쓰는 fake 공급자로 돌렸으므로 판정 경로는 진짜이고
+LLM 응답만 가짜다.
+
+먼저 **전제**부터 이 머신에서 재현했다. `\\localhost\Users`(기본 공유, 승격 불필요) 아래
+픽스처를 두고 UNC를 작업 디렉터리로 프로세스를 띄웠다:
+
+| 무엇 | 결과 |
+|---|---|
+| `node --test t.test.js` (우리가 띄우는 방식) | **exit 0, 테스트 통과** |
+| `node npm-cli.js test` (npm이 cmd.exe로 넘김) | exit 1, `UNC paths are not supported.` → `Could not find 't.test.js'` |
+
+즉 **Win32는 UNC 작업 디렉터리를 받아들이고 거부하는 것은 cmd.exe 하나**라는 55절의 전제가
+그대로 확인됐다. 장벽을 npm 계열로만 좁힌 근거가 이것이다.
+
+그다음 `tomverse-host run`을 두 워크스페이스에 대해 돌렸다(픽스처는 **둘** 만든다 — 하나를
+공유하면 첫 실행이 파일을 고쳐 두 번째 patch가 안 맞는다):
+
+| 항목 | 결과 |
+|---|---|
+| ① `npmIsNotSpawnedOnUnc` | ✅ test 체크에 `exitCode`가 **없다**. 기록된 도구 출력이 `"spawned": false`, `"reason": "unsupported_unc_working_directory"`, `"exitCode": null`, `"durationMs": 0`, `checked` 3개, `remediation` 3개 |
+| ② `theReportSaysCouldNotRunNotFailed` | ✅ `overall = could_not_run` (`fail`이 아니다). 최종 상태는 `completed` + "변경을 적용했으나 검증 명령을 **실행하지 못해** 검증되지 않았습니다". 그리고 **`mutatedPaths = ["paginate.js"]`** — 11절이 실측한 "patch는 UNC에서 동작한다"가 그대로 살아 있다 |
+| ③ `theOpenBannerWarnsBeforeWork` | ✅ stderr 첫 줄에 배너. 5가지(무엇이 안 되나·무엇은 되나·실패가 아님·`net use`·자동화 금지)가 모두 들어 있다 |
+| ④ `aLocalWorkspaceIsUnaffected` | ✅ `C:\Users\...` 워크스페이스에서 `overall = pass`, `test: PASSED exit=0`. **거짓 양성이 없다** |
+
+부수적으로 확인된 것 하나: 워크스페이스 루트의 canonical 형태가 `\\?\UNC\localhost\...`로
+나온다. `paths.rs`가 verbatim UNC를 일부러 벗기지 않기 때문이며(11절), `is_unc`가 그 형태를
+따로 다루는 이유가 여기서 실물로 확인됐다 — `\\?\`만 보고 벗겼다면 이 경로는 UNC로 인식되지
+않아 장벽이 통째로 지나갔을 것이다.
+
+**그래도 `windows-landing`은 여전히 이 넷을 `NeedsHuman`으로 낸다.** 15절이 말하는 그 문제이며,
+이 문단이 그 기록이다.
+
+#### 다시 확인하는 절차
+
+Linux에는 UNC가 없으므로 이 네 항목은 여기서 확인할 수 없다. 아래가 위 실측에 실제로 쓴
+절차다. **모델 호출은 없다** — e2e가 쓰는 fake 공급자로 돌리므로 판정 경로는 진짜이고 LLM
+응답만 가짜다. 유료 실행으로 확인하지 말 것: 이 항목들이 묻는 것은 모델이 무엇을 내놓는지가
+아니라 **결과를 어떻게 보고하는지**다.
+
+준비 — 먼저 빌드하고, UNC로 볼 수 있는 자리를 확인한다:
+
+```powershell
+npm run build            # sidecar dist + 테스트 헬퍼(fixtureRepo)
+npm run core:build       # tomverse-host.exe
+Get-SmbShare | Where-Object Name -eq 'Users'   # 기본 공유. 없으면 아래 대안을 쓴다
+```
+
+`Users` 공유(→ `C:\Users`)는 Windows 기본값이고 **승격이 필요 없다.** 관리자 공유
+(`C$`, `H$` …)는 승격을 요구하므로 쓰지 않는다. 공유가 없는 머신이면 하나 만든다:
+
+```powershell
+New-SmbShare -Name tomverse-unc -Path "$env:USERPROFILE\tomverse-unc-fixture" -FullAccess $env:USERNAME
+```
+
+**전제부터 재현한다** — 이걸 건너뛰면 장벽이 옳은지 알 수 없다. 같은 UNC 작업 디렉터리에
+프로세스를 둘 띄워, **우리 방식은 통과하고 npm만 실패하는지** 본다:
+
+```powershell
+$fx  = "$env:TEMP\tomverse-unc-fixture"
+$unc = $fx -replace '^C:\\Users', '\\localhost\Users'
+New-Item -ItemType Directory -Force $fx | Out-Null
+Set-Content "$fx\package.json" '{"name":"fx","scripts":{"test":"node --test t.test.js"}}'
+Set-Content "$fx\t.test.js" "const t=require('node:test');const a=require('node:assert');t.test('ok',()=>a.equal(1,1));"
+$node = (Get-Command node).Source
+$npm  = Join-Path (Split-Path $node) "node_modules\npm\bin\npm-cli.js"
+Start-Process $node "--test t.test.js" -WorkingDirectory $unc -NoNewWindow -Wait   # exit 0 이어야 한다
+Start-Process $node "`"$npm`" test"    -WorkingDirectory $unc -NoNewWindow -Wait   # UNC paths are not supported
+```
+
+**①②③④ 본체** — 픽스처를 **둘** 만들어(하나를 공유하면 첫 실행이 파일을 고쳐 두 번째
+patch가 안 맞는다) 로컬과 UNC에 각각 태운다. 스크립트 하나로 두는 편이 확실하다:
+
+```javascript
+// node <이 파일>.mjs — packages/sidecar/test/e2e.test.ts의 runHost와 같은 인자를 쓴다.
+import { spawnSync } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { createFixtureRepo, FIX_PATCH }
+  from "file:///H:/Project/TomverseCode/packages/sidecar/dist/test/helpers/fixtureRepo.js";
+
+const REPO = "H:/Project/TomverseCode";
+const HOST = path.join(REPO, "apps/desktop/src-tauri/core/target/debug/tomverse-host.exe");
+const SIDECAR = path.join(REPO, "packages/sidecar/dist/src/index.js");   // dist/index.js가 아니다
+
+function run(workspace, label) {
+  const stateDir = mkdtempSync(path.join(tmpdir(), "tomverse-state-"));
+  const r = spawnSync(HOST, [
+    "run", "--workspace", workspace,
+    "--message", "paginate.js 의 페이지 계산이 한 칸 밀려 있습니다. 1페이지가 첫 항목부터 나오게 고쳐주세요.",
+    "--mode", "fast", "--approve", "auto",
+    "--db", path.join(stateDir, "state.db"),
+    "--artifacts", path.join(stateDir, "artifacts"),
+    "--sidecar", SIDECAR, "--timeout-secs", "180",
+  ], {
+    encoding: "utf8", timeout: 210_000,
+    env: { ...process.env,
+      TOMVERSE_FAKE_SCRIPT: JSON.stringify({ defaultPatch: FIX_PATCH }),
+      TOMVERSE_EXECUTOR_MODEL: "fake-executor", TOMVERSE_REVIEWER_MODEL: "fake-reviewer",
+      OPENAI_API_KEY: "", ANTHROPIC_API_KEY: "" },   // 우연히 네트워크를 타지 않게 지운다
+  });
+  const out = JSON.parse(r.stdout.trim().split("\n").filter(Boolean).pop());
+  console.log(`\n== ${label} ==`, workspace);
+  console.log("배너:", r.stderr.split("\n").find((l) => l.includes("UNC")) ?? "(없음)");
+  console.log("status:", out.final.status, "| overall:", out.final.verificationReport?.overall);
+  console.log("mutatedPaths:", JSON.stringify(out.mutatedPaths));
+  for (const c of out.final.verificationReport?.checks ?? [])
+    console.log(`  - ${c.kind}: ${c.status} exit=${c.exitCode ?? "(없음)"}`);
+}
+
+const local = createFixtureRepo();
+const remote = createFixtureRepo();
+const P = "C:" + String.fromCharCode(92) + "Users";
+const U = String.fromCharCode(92, 92) + "localhost" + String.fromCharCode(92) + "Users";
+try {
+  run(local.root, "④ 로컬");
+  run(U + remote.root.slice(P.length), "①②③ UNC");
+} finally { local.cleanup(); remote.cleanup(); }
+```
+
+확인할 것:
+
+- **④ 로컬**: `overall = pass`, `test: PASSED exit=0`, 배너 **없음**.
+  여기서 `could_not_run`이 나오면 `is_unc`가 로컬 경로를 UNC로 잘못 읽은 것이고, 그러면
+  **정상 워크스페이스의 검증이 통째로 막힌 상태다.** 이 항목을 빼먹지 말 것 — 이쪽 실패는
+  "검증이 조용해지는" 방향이라 눈에 덜 띈다.
+- **① UNC**: test 체크에 `exitCode`가 **없다**(`exit=(없음)`), `status = SKIPPED_WITH_REASON`.
+- **② UNC**: `overall = could_not_run` (`fail`이 아니다), `mutatedPaths = ["paginate.js"]`
+  (patch는 여전히 동작한다).
+- **③ UNC**: stderr 첫 줄에 배너. 데스크톱 앱은 워크스페이스를 열자마자 같은 문장을 노란
+  배너에 띄운다(55.4절이 다섯 가지를 열거한다).
+
+기록된 도구 출력의 모양까지 보려면 `--db`를 지운 자리에 두고 `show`로 읽는다:
+
+```powershell
+.\apps\desktop\src-tauri\core\target\debug\tomverse-host.exe show --db <state.db> --workspace <UNC 경로> --task <taskId>
+```
+
+`"spawned": false` · `"reason": "unsupported_unc_working_directory"` · `"exitCode": null` ·
+`"durationMs": 0` · `checked` · `remediation`이 그대로 있어야 한다.
+
+정리:
+
+```powershell
+Remove-SmbShare -Name tomverse-unc -Force   # 위에서 만들었다면
+```
 
 ---
 
@@ -326,7 +509,14 @@ CLAUDE.md가 npm shim에서 경계한 실패 모드("검증 없이 완료로 보
 4. **Python이 있는 머신에서 `pythonEnv` 셋을 태운다**(10절). 이 머신에는 Python이 없다.
 5. **강제 포기 경로**로 job 핸들 수명을 마저 확인한다(7절) — UI가 필요하다.
 6. **`processGroup` 둘**(12절). Ctrl+C 전파는 별도 콘솔에서, taskkill 폴백은 강제할 수단이 필요하다.
-7. **UNC 워크스페이스를 어떻게 할지 결정한다**(6절).
+7. ~~**UNC 워크스페이스를 어떻게 할지 결정한다**(6절).~~ → **결정하고, 고치고, 확인했다**
+   (6.1·6.2절, [state-machine 55절](./state-machine-and-protocol.md)). (c) 정직한
+   `could_not_run` + (d) 열되 경고. 새 착지 묶음 `uncWorkspace`의 네 항목을 이 머신에서
+   태워 전부 통과했고, 전제(Win32는 UNC cwd를 받아들이고 거부하는 것은 cmd.exe 하나)도
+   재현했다. **이 항목에 남은 일은 없다** — 코드가 바뀌면 6.2절 절차로 다시 태울 것.
+   특히 ④(로컬 워크스페이스가 영향을 받지 않는다)를 빼먹지 말 것: 이 고침이 **반대
+   방향으로** 틀리면 정상 워크스페이스의 검증이 통째로 막히고, 그 증상은 "검증이
+   조용해지는" 쪽이라 눈에 덜 띈다.
 8. **`credentialStore`** — 실측이 아니라 개발이다. 만들 때 `injectionStaysOnce` 기준을 먼저 읽을 것.
 
 위의 것들을 확인하면 **문서가 아니라 attestation 파일에 적는다**(15절). 이 목록은 확인하지

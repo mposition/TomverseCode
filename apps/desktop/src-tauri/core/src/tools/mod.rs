@@ -760,7 +760,10 @@ impl ToolRuntime {
             developer_env.as_ref().map(|p| p.vars()).unwrap_or_default();
         env.extend(request.injected_env.clone());
 
-        let execution = run_process(&cmd, cwd.absolute(), timeout, cancel, &env)?;
+        let execution = match run_process(&cmd, cwd.absolute(), timeout, cancel, &env) {
+            Ok(execution) => execution,
+            Err(refusal) => return self.spawn_refused(request, &cmd, refusal),
+        };
         self.finish_command(request, start, &cmd, execution, developer_env)
     }
 
@@ -777,7 +780,10 @@ impl ToolRuntime {
             cwd: ".".to_string(),
             timeout_ms: None,
         };
-        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default())?;
+        let execution = match run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default()) {
+            Ok(execution) => execution,
+            Err(refusal) => return self.spawn_refused(request, &cmd, refusal),
+        };
         self.finish_command(request, start, &cmd, execution, None)
     }
 
@@ -793,7 +799,10 @@ impl ToolRuntime {
     ) -> Result<ToolOutcome, String> {
         let target = crate::pr::parse_push(&request.args).map_err(|e| e.to_string())?;
         let cmd = target.command();
-        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default())?;
+        let execution = match run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default()) {
+            Ok(execution) => execution,
+            Err(refusal) => return self.spawn_refused(request, &cmd, refusal),
+        };
         self.finish_command(request, start, &cmd, execution, None)
     }
 
@@ -861,8 +870,60 @@ impl ToolRuntime {
             cwd: ".".to_string(),
             timeout_ms: None,
         };
-        let execution = run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default())?;
+        let execution = match run_process(&cmd, self.root.path(), self.default_timeout, cancel, &Default::default()) {
+            Ok(execution) => execution,
+            Err(refusal) => return self.spawn_refused(request, &cmd, refusal),
+        };
         self.finish_command(request, start, &cmd, execution, None)
+    }
+
+    /// 실행을 내놓지 못한 두 경우를 가른다 (55.2절).
+    ///
+    /// `Failed`는 종전 그대로 `Err`로 올라가 `ToolStatus::Error` + 문자열이 된다.
+    /// `NotSpawned`는 **구조를 실어야 하므로** 여기서 결과를 직접 만든다 — 문자열만 남기면
+    /// 화면과 모델이 "실행했는데 실패"와 "시작하지 않음"을 다시 구별하지 못한다.
+    /// `start`를 받지 않는다 — 이 경로에는 **잴 실행이 없다**(아래 `durationMs` 참조).
+    fn spawn_refused(
+        &self,
+        request: &ToolRequest,
+        cmd: &RunCommandArgs,
+        refusal: SpawnRefusal,
+    ) -> Result<ToolOutcome, String> {
+        let barrier = match refusal {
+            SpawnRefusal::Failed(message) => return Err(message),
+            SpawnRefusal::NotSpawned(barrier) => barrier,
+        };
+        Ok(ToolOutcome {
+            result: ToolResult {
+                request_id: request.request_id.clone(),
+                // **`Denied`가 아니다.** 정책이 막은 것이 아니라 환경이 결과를 해석 불가능하게
+                // 만든 것이고, 사용자가 할 일이 다르다(정책 레버를 켜도 이건 지나가지 않는다).
+                // `Error`는 `verify.rs`에서 `SkippedWithReason`이 되어 종합 판정을
+                // `could_not_run`으로 만든다 — 정확히 우리가 원하는 자리다.
+                status: ToolStatus::Error,
+                output: Some(json!({
+                    "command": { "program": cmd.program, "args": cmd.args, "cwd": cmd.cwd },
+                    // **이 한 줄이 이 결함의 핵심이다.** 프로세스가 없었으므로 exit code도
+                    // 출력도 없고, 없는 것을 0이나 1로 채우면 그 순간 다시 거짓말이 된다.
+                    "spawned": false,
+                    "reason": barrier.reason,
+                    "workspace": barrier.cwd,
+                    "checked": barrier.checked,
+                    "remediation": barrier.remediation,
+                    "exitCode": serde_json::Value::Null,
+                    // 아무것도 돌지 않았다. 정책 판정에 쓴 시간을 여기 적으면 "이 명령이
+                    // 얼마나 걸렸나"라는 질문에 없는 실행의 시간이 답하게 된다.
+                    "durationMs": 0,
+                })),
+                error: Some(barrier.message()),
+                duration_ms: 0,
+                completed_at: now_iso(),
+                denial_kind: None,
+            },
+            mutations: Vec::new(),
+            output_ref: None,
+            diff: None,
+        })
     }
 
     fn finish_command(
@@ -1211,14 +1272,81 @@ fn prepare_developer_env() -> crate::msvc::Preparation {
     )
 }
 
+/// `run_process`가 실행을 내놓지 못한 두 가지 이유. **문자열 하나로 뭉치지 않는다** —
+/// 뒤쪽은 화면과 모델에게 구조로 전달되어야 하는 사실이다.
+enum SpawnRefusal {
+    /// 실행하려 했으나 실패했다(프로그램 해석 실패, spawn 오류 등). 문자열이 전부다.
+    Failed(String),
+    /// **시작하지 않았다.** 환경이 이 명령의 결과를 해석 불가능하게 만든다 (`unc.rs`, 55절).
+    /// `Box`인 이유는 이 변형만 크고, 성공 경로가 그 크기를 지불할 이유가 없기 때문이다.
+    NotSpawned(Box<crate::unc::Barrier>),
+}
+
+impl From<String> for SpawnRefusal {
+    fn from(message: String) -> Self {
+        SpawnRefusal::Failed(message)
+    }
+}
+
+/// **모든 프로세스 실행 앞의 공통 경계** (55.2절).
+///
+/// `run_command`·`git`·`git_push`·`revert` 네 경로가 전부 `run_process`를 지나므로 검사를
+/// 여기 한 번만 둔다. `verify.rs`에만 두면 모델이 직접 요청한 `run_command`는 여전히 엉뚱한
+/// 실패 출력을 받고, **없는 버그를 고치려 fix loop를 태운다.**
+fn spawn_barrier(cmd: &RunCommandArgs, cwd: &Path) -> Option<crate::unc::Barrier> {
+    // 판정은 전부 `unc.rs`에 있다 — 여기서 `cfg!(windows)`나 경로 모양을 읽으면 그 판정이
+    // Linux에서 검증되지 않는다(`developer_env_for`와 같은 규율).
+    let cwd = cwd.to_string_lossy().to_string();
+    // **알려진 한계**: npm은 프로젝트 `.npmrc`를 패키지 루트에서 읽지만 우리는 `cwd`에서
+    // 읽는다. `cwd`가 하위 디렉터리이고 루트에만 `script-shell` 재정의가 있으면 우리가
+    // 장벽을 잘못 세운다. 부모를 거슬러 올라가면 워크스페이스 **밖** 파일을 읽게 되므로
+    // 하지 않는다 — 그리고 틀렸을 때의 결말이 나쁘지 않다: 거부 사유가 화면에 그대로 뜨고,
+    // 세 가지 해결책 중 하나가 정확히 그 재정의를 가리킨다.
+    let npmrc_sources = || -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        // 프로젝트가 먼저다 — npm의 우선순위와 같다.
+        for (label, path) in [
+            ("프로젝트 .npmrc".to_string(), Path::new(&cwd).join(".npmrc")),
+            (
+                "사용자 .npmrc".to_string(),
+                match std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+                    Ok(home) => Path::new(&home).join(".npmrc"),
+                    Err(_) => return out,
+                },
+            ),
+        ] {
+            // **없는 파일은 목록에 넣지 않는다.** "없다"와 "빈 파일"을 뭉갤 이유가 없다.
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                out.push((label, body));
+            }
+        }
+        out
+    };
+    crate::unc::check(
+        &crate::unc::Probe {
+            platform: program::Platform::current(),
+            cwd: &cwd,
+            env: &|key| std::env::var(key).ok(),
+            npmrc: &npmrc_sources,
+        },
+        &cmd.program,
+    )
+}
+
 fn run_process(
     cmd: &RunCommandArgs,
     cwd: &Path,
     timeout: Duration,
     cancel: &CancellationToken,
     extra_env: &std::collections::BTreeMap<String, String>,
-) -> Result<Execution, String> {
+) -> Result<Execution, SpawnRefusal> {
     let start = Instant::now();
+
+    // **해석보다 먼저 본다.** 이 판정은 머신이 아니라 워크스페이스에 대한 것이라 더 싸고,
+    // 무엇보다 놓치면 결과가 "사용자 테스트 실패"로 둔갑하는 유일한 경로다.
+    if let Some(barrier) = spawn_barrier(cmd, cwd) {
+        return Err(SpawnRefusal::NotSpawned(Box::new(barrier)));
+    }
 
     // 해석은 취소 검사보다 먼저 한다 — 해석 실패는 "실행하지 못했다"이지 "취소됐다"가 아니고,
     // 두 가지를 섞으면 취소 경로가 환경 결함을 감춘다.
@@ -1336,7 +1464,7 @@ fn run_process(
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(e) => return Err(format!("자식 프로세스 상태를 확인할 수 없음: {e}")),
+            Err(e) => return Err(format!("자식 프로세스 상태를 확인할 수 없음: {e}").into()),
         }
     };
 
@@ -1993,6 +2121,59 @@ mod tests {
         ));
         assert_ne!(out.result.status, ToolStatus::Ok);
         assert!(h.root_path.join("src/app.ts").exists());
+    }
+
+    /// **시작하지 않은 명령의 결과 모양** — UNC 워크스페이스 결함(55.2절).
+    ///
+    /// 장벽 자체는 Windows에서만 성립하므로 여기서는 `unc::check`로 판정을 만들어
+    /// **결과 직렬화**를 검증한다. 확인하는 것은 "무엇이 기록되는가"이고, 그건 플랫폼과
+    /// 무관하게 틀릴 수 있는 부분이다 — 없는 exit code를 0으로 채우는 종류의 실수.
+    #[test]
+    fn a_command_that_was_not_spawned_records_that_it_was_not_spawned() {
+        let h = harness();
+        let barrier = crate::unc::check(
+            &crate::unc::Probe {
+                platform: program::Platform::Windows,
+                cwd: r"\\localhost\Users\me\repo",
+                env: &|_| None,
+                npmrc: &Vec::new,
+            },
+            "npm",
+        )
+        .expect("Windows + UNC + npm이면 장벽이 있어야 합니다");
+
+        let cmd = RunCommandArgs {
+            program: "npm".to_string(),
+            args: vec!["test".to_string()],
+            cwd: ".".to_string(),
+            timeout_ms: None,
+        };
+        let request = req(ToolName::RunTests, json!({ "program": "npm", "args": ["test"], "cwd": "." }));
+        let out = h
+            .runtime
+            .spawn_refused(&request, &cmd, SpawnRefusal::NotSpawned(Box::new(barrier)))
+            .expect("NotSpawned는 Err가 아니라 구조화된 결과여야 합니다");
+
+        // 정책 거부가 아니다 — 레버를 켜도 지나가지 않는다.
+        assert_eq!(out.result.status, ToolStatus::Error);
+        assert_eq!(out.result.denial_kind, None);
+
+        let output = out.result.output.as_ref().unwrap();
+        assert_eq!(output["spawned"], json!(false));
+        assert_eq!(output["reason"], json!(crate::unc::REASON));
+        // **없는 것을 채우지 않는다.** 프로세스가 없었으므로 exit code도 소요 시간도 없다.
+        assert!(output["exitCode"].is_null());
+        assert_eq!(output["durationMs"], json!(0));
+        assert_eq!(out.result.duration_ms, 0);
+        // 무엇을 보고 그렇게 판정했는지, 그리고 사용자가 할 수 있는 일이 함께 남는다.
+        assert!(output["checked"].as_array().is_some_and(|a| a.len() >= 3));
+        assert!(output["remediation"].as_array().is_some_and(|a| !a.is_empty()));
+        // 화면으로 흘러가는 문장이 "실패"라고 말하지 않는다.
+        let message = out.result.error.clone().unwrap();
+        assert!(message.contains("검증 실패가 아니라"), "{message}");
+        assert!(message.contains("net use"), "{message}");
+        // 아무것도 바꾸지 않았다.
+        assert!(out.mutations.is_empty());
     }
 
     #[test]

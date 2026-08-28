@@ -1192,6 +1192,58 @@ mod tests {
         assert_eq!(report.overall, Overall::CouldNotRun);
     }
 
+    /// **시작하지 않은 명령은 실패가 아니다** — UNC 워크스페이스 결함(55절).
+    ///
+    /// 종전에는 `exit != 0 ⇒ FAILED` 한 줄뿐이라, cmd.exe가 UNC 작업 디렉터리를 거부해 러너가
+    /// 테스트 파일을 **찾지도 못한** 실행이 "당신의 테스트가 실패했다"로 보고됐다. 장벽은
+    /// `tools/mod.rs`가 spawn 전에 세우고 `ToolStatus::Error`로 돌려주므로, 여기서 확인할 것은
+    /// **그 신호가 `Failed`가 되지 않는다**는 것이다.
+    ///
+    /// 이 검사가 Linux에서 도는 이유: 판정에 UNC 경로도 Windows도 필요 없다. 필요한 것은
+    /// "시작하지 않았다는 도구 결과"뿐이고, 그게 이 결함이 사는 유일한 자리다.
+    #[test]
+    fn a_command_that_was_never_spawned_is_not_a_test_failure() {
+        struct NotSpawnedExecutor;
+        impl CommandExecutor for NotSpawnedExecutor {
+            fn execute(&mut self, request: &ToolRequest) -> ToolResult {
+                ToolResult {
+                    request_id: request.request_id.clone(),
+                    status: ToolStatus::Error,
+                    output: Some(json!({ "spawned": false, "reason": crate::unc::REASON })),
+                    error: Some("작업 디렉터리가 UNC 경로입니다 — 검증 실패가 아니라 검증 안 됨입니다".into()),
+                    duration_ms: 0,
+                    completed_at: now_iso(),
+                    denial_kind: None,
+                }
+            }
+        }
+        let (_d, _a, root, artifacts) = setup(&[(
+            "package.json",
+            r#"{ "scripts": { "test": "node --test", "build": "tsc" } }"#,
+        )]);
+        let runner = VerificationRunner::new(&root, &artifacts);
+        let report = runner.run("task-1", VerificationPhase::Post, 0, &mut NotSpawnedExecutor, None);
+
+        let test_check = report.checks.iter().find(|c| c.kind == VerificationKind::Test).unwrap();
+        assert_eq!(test_check.status, VerificationStatus::SkippedWithReason);
+        // **화면에 뜨는 문장이 실패라고 말하지 않는다.** 이 결함의 전부가 이 자리였다.
+        assert!(!test_check.summary.contains("실패 (exit"), "{}", test_check.summary);
+        assert!(test_check.summary.contains("UNC"), "{}", test_check.summary);
+        // 없는 exit code를 지어내지 않는다 — 0이나 1로 채우면 그 순간 다시 거짓말이다.
+        assert_eq!(test_check.exit_code, None);
+        // 실패한 테스트 이름을 세지 않는다. 실패한 테스트가 없기 때문이다.
+        assert_eq!(test_check.failed_tests, None);
+
+        assert_eq!(report.overall, Overall::CouldNotRun);
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| matches!(c.status, VerificationStatus::Failed)),
+            "시작하지도 않은 명령이 실패로 기록됐습니다"
+        );
+    }
+
     /// Windows 결함이 만든 상황 그대로: build는 돌아서 통과했는데 test는 프로그램 해석 실패로
     /// 실행조차 못했다. 예전 규칙이면 `pass`가 나오고, 작업이 검증 없이 완료로 보고된다.
     #[test]

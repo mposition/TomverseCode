@@ -430,6 +430,13 @@ export interface WorkspaceInfo {
   isolation?: Isolation | null;
   /** 말하지 않으면 사용자가 정반대로 읽는 사실들 (22.5절). 문장은 Rust가 만든다. */
   isolationNotices?: string[];
+  /**
+   * **환경 때문에 이 워크스페이스에서 못 하는 것** (55.4절). 문장은 Rust가 만든다.
+   *
+   * `isolationNotices`와 필드를 나눈 이유: 출처가 다르고, 격리를 쓰지 않는 사용자에게도
+   * 이쪽은 떠야 한다. 한 배열에 합치면 "격리 공지가 없다"가 "환경 경고도 없다"가 된다.
+   */
+  environmentNotices?: string[];
   name: string;
   workspaceId: string;
   sessionId: string;

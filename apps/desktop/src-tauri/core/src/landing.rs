@@ -713,6 +713,73 @@ fn path_normalization_checks(obs: &Observations) -> Vec<Check> {
     ]
 }
 
+/// UNC 워크스페이스에서의 검증 정직성 (`unc.rs`, state-machine 55절).
+///
+/// # 왜 별도 묶음인가
+///
+/// `pathNormalization`과 붙여 두고 싶은 유혹이 있다 — 실제로 이 결함은 그 항목을 태우다
+/// 드러났다(windows-landing-record 6절). 그러나 묻는 것이 다르다. 저쪽은 **"경로가 깨지지
+/// 않는가"**이고, 여기는 **"결과를 정직하게 보고하는가"**다. 저쪽은 이미 ✅였는데 이쪽이
+/// 거짓말하고 있었으므로, 한 묶음이었다면 통과가 실패를 가렸을 것이다.
+///
+/// # Linux에서 확인되는 것과 되지 않는 것
+///
+/// 판정 로직(`unc::check`)은 바깥 세계를 전부 인자로 받으므로 여기서 검증된다. **그러나
+/// 그 판정이 실제 실행 경로에 걸려 있는지, 그리고 cmd.exe가 정말 UNC를 거부하는지는
+/// Windows에서만 확인된다** — `msvc.rs`·`python.rs`와 같은 자리다.
+fn unc_workspace_checks(obs: &Observations) -> Vec<Check> {
+    let (status, detail) = if obs.os == "windows" {
+        (
+            CheckStatus::NeedsHuman,
+            "UNC 워크스페이스에서 사람이 확인해야 한다.".to_string(),
+        )
+    } else {
+        (
+            CheckStatus::NotCheckableHere,
+            format!("여기는 {} — UNC도 cmd.exe도 이 플랫폼에 없다.", obs.os),
+        )
+    };
+    vec![
+        check(
+            "npmIsNotSpawnedOnUnc",
+            "UNC 워크스페이스의 `npm test`는 **시작되지 않는다** — 결과에 `spawned: false`가 남고 exit code가 없다.",
+            status.clone(),
+            format!(
+                "{detail} 돌려 보고 판정하면 cmd.exe가 `C:\\Windows`로 떨어진 뒤 우연히 낸 \
+                 exit 0이 **가짜 통과**가 된다."
+            ),
+        ),
+        check(
+            "theReportSaysCouldNotRunNotFailed",
+            "그 태스크의 검증 종합 판정이 `could_not_run`이고, 화면이 \"실패\"라고 말하지 않는다.",
+            status.clone(),
+            format!(
+                "{detail} 이 결함의 전부가 이 한 줄이다 — 러너가 테스트 파일을 찾지도 못했는데 \
+                 화면이 사용자에게 \"당신의 테스트가 실패했다\"고 말했다."
+            ),
+        ),
+        check(
+            "theOpenBannerWarnsBeforeWork",
+            "워크스페이스를 **열 때** 경고가 뜬다 — 무엇이 안 도는지, 실패가 아니라는 것, `net use` 안내까지.",
+            status.clone(),
+            format!(
+                "{detail} 결과에서 처음 알면 이미 모델 호출 비용을 쓴 뒤다(격리 실행 공지가 \
+                 배너 자리에 있는 것과 같은 이유)."
+            ),
+        ),
+        check(
+            "aLocalWorkspaceIsUnaffected",
+            "드라이브 문자 워크스페이스(`C:\\...`, 매핑된 `X:\\...`)에서는 npm이 종전과 똑같이 돈다.",
+            status,
+            format!(
+                "{detail} **반대 방향의 거짓말을 확인하는 항목이다** — 로컬 경로를 UNC로 잘못 \
+                 읽으면 정상 워크스페이스에서 검증이 통째로 막힌다. `\\\\?\\C:\\`가 `\\\\`로 \
+                 시작한다는 사실이 그 함정이다."
+            ),
+        ),
+    ]
+}
+
 /// Python 가상환경 해석 (`python.rs`, state-machine 49절).
 ///
 /// `msvc.rs`와 같은 자리다: **판정 로직은 여기서 검증되지만**(바깥 세계를 전부 인자로 받는다)
@@ -898,6 +965,15 @@ pub fn assess(obs: &Observations) -> LandingReport {
             Group {
                 id: "pathNormalization",
                 documented_at: "process-architecture.md 4절 (`paths.rs`)",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+        {
+            let checks = unc_workspace_checks(obs);
+            Group {
+                id: "uncWorkspace",
+                documented_at: "state-machine-and-protocol.md 55절 (`unc.rs`)",
                 verdict: verdict_of(&checks),
                 checks,
             }

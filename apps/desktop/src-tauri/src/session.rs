@@ -940,6 +940,10 @@ impl SessionState {
                 "repoPath": active.repo_display,
                 "isolation": active.isolation.clone(),
                 "isolationNotices": active.isolation.as_ref().map(|i| i.notices()).unwrap_or_default(),
+                // **환경이 만드는 한계는 열 때 말한다** (unc.rs, state-machine 55.4절).
+                // 격리 공지와 같은 배너 자리를 쓰되 필드를 나눈다: 출처가 다르고, 하나가
+                // 없다고 다른 하나가 없어지면 안 된다. 문장은 Rust가 만든다.
+                "environmentNotices": environment_notices(&active.root_display),
                 "name": active.name,
                 "workspaceId": active.workspace_id,
                 "sessionId": active.session_id,
@@ -1350,6 +1354,17 @@ impl SessionState {
                 .map_err(|issue| tomverse_core::uimsg::UserFacing::ui(&issue)),
         ))
     }
+}
+
+/// 이 워크스페이스에서 **환경 때문에 못 하는 것**. 판정과 문장은 전부 core에 있다
+/// (`tomverse_core::unc`) — 여기서 문장을 만들면 헤드리스 호스트와 갈라지고, 갈라진 쪽이
+/// 조용해지면 그 경로의 사용자만 경고를 못 받는다.
+///
+/// 목록인 이유는 `isolationNotices`와 같다: 환경이 만드는 한계가 하나뿐일 이유가 없다.
+fn environment_notices(root_display: &str) -> Vec<String> {
+    tomverse_core::unc::workspace_notice(tomverse_core::tools::program::Platform::current(), root_display)
+        .into_iter()
+        .collect()
 }
 
 /// `%APPDATA%/Tomverse Code/` (Windows) 또는 대응 위치.
