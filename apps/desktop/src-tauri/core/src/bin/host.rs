@@ -38,7 +38,9 @@ use tomverse_core::sidecar::SidecarClient;
 use tomverse_core::store::{Store, TerminalOutcome};
 use tomverse_core::types::{ExecutionMode, TaskPolicy};
 use tomverse_core::CancellationRegistry;
-use tomverse_core::{available_providers, credential_env, WorkspaceRoot, PROTOCOL_VERSION};
+use tomverse_core::{
+    available_providers_for, credential_injection_for, credentials, WorkspaceRoot, PROTOCOL_VERSION,
+};
 
 /// 이벤트를 stderr로 흘린다. stdout은 최종 결과 JSON 전용이므로 섞지 않는다 —
 /// 호출자가 stdout을 그대로 파싱할 수 있어야 한다.
@@ -1254,10 +1256,15 @@ fn run_task(
     let launcher = tomverse_core::launcher::detect_with_entry(args.sidecar.clone())?;
 
     // 자격증명은 여기서 한 번 주입된다. Node는 이 값을 디스크에 쓰지 않는다.
-    let mut env = credential_env();
+    //
+    // **저장소를 여는 것이지 새 경로를 만드는 것이 아니다**(credentials.rs). 헤드리스
+    // 호스트는 저장소가 비어 있는 것이 정상이며(키를 넣는 화면이 없다), 그때는 종전대로
+    // 환경변수에서 온다. 그래도 앱과 **같은 함수**를 지나야 한다 — 진입점이 둘이면 갈라진다.
+    let store = credentials::open_credential_store();
+    let mut env = credential_injection_for(store.as_ref(), None);
     // fake 공급자 스크립트는 자격증명이 아니므로 그대로 전달한다 (e2e 테스트가 쓴다).
     if let Ok(script) = std::env::var("TOMVERSE_FAKE_SCRIPT") {
-        env.push(("TOMVERSE_FAKE_SCRIPT".to_string(), script));
+        env.push_plain("TOMVERSE_FAKE_SCRIPT", script);
     }
     for key in [
         "TOMVERSE_EXECUTOR_MODEL",
@@ -1269,7 +1276,7 @@ fn run_task(
         "TOMVERSE_PROVIDER_TIMEOUT_MS",
     ] {
         if let Ok(value) = std::env::var(key) {
-            env.push((key.to_string(), value));
+            env.push_plain(key, value);
         }
     }
 
@@ -1293,8 +1300,8 @@ fn run_task(
         ));
     }
 
-    let providers = available_providers();
-    // fake 공급자는 자격증명이 없으므로 available_providers()에 안 잡힌다.
+    let providers = available_providers_for(store.as_ref(), None);
+    // fake 공급자는 자격증명이 없으므로 available_providers_for()에 안 잡힌다.
     // 명시적으로 fake 모드를 요청했을 때만 후보에 넣는다 — 키가 없으면 조용히 가짜 모델로
     // 넘어가는 동작은 사용자를 속이는 것이다.
     let providers = if std::env::var("TOMVERSE_FAKE_SCRIPT").is_ok() || std::env::var("TOMVERSE_USE_FAKE").is_ok() {

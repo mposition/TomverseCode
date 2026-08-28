@@ -517,7 +517,19 @@ Remove-SmbShare -Name tomverse-unc -Force   # 위에서 만들었다면
    특히 ④(로컬 워크스페이스가 영향을 받지 않는다)를 빼먹지 말 것: 이 고침이 **반대
    방향으로** 틀리면 정상 워크스페이스의 검증이 통째로 막히고, 그 증상은 "검증이
    조용해지는" 쪽이라 눈에 덜 띈다.
-8. **`credentialStore`** — 실측이 아니라 개발이다. 만들 때 `injectionStaysOnce` 기준을 먼저 읽을 것.
+8. ~~**`credentialStore`** — 실측이 아니라 개발이다.~~ → **만들었다**
+   ([multi-engine-routing.md 20절](./multi-engine-routing.md)). 다섯 기준 중 **둘은 소스
+   불변식이라 여기서 이미 `passed`이고**(3·4 — 18.1절의 표), 셋이 Windows에 남는다:
+   `storedThroughDpapi`, `noPlaintextAtRest`, `productionStoreIsNotTheDevelopmentOne`.
+   **`not_implemented`은 하나도 남지 않았다** — 그러므로 이 셋은 attestation으로 통과할 수 있다.
+   확인 절차는 16절에 있다.
+
+   경계를 분명히 해 둔다: `win_credentials.rs`는 `win_job.rs`와 같은 성질이다
+   ([state-machine 20.5절](./state-machine-and-protocol.md)) — Linux에서 통과한 `verify`가
+   그 파일에 대해 말해주는 것이 없다. **그리고 이 파일은 `cfg(windows)`도 `Platform::Windows`도
+   쓰지 않으므로 `landing.rs`의 그물(`windows_only_code_has_a_landing_check_or_a_reason`)에
+   걸리지 않는다** — `msvc.rs`와 같은 사각지대다. 걸리는 것은 `credentials.rs` 쪽이고,
+   그 이름이 `landing.rs`에 적혀 있어 통과한다.
 
 위의 것들을 확인하면 **문서가 아니라 attestation 파일에 적는다**(15절). 이 목록은 확인하지
 못한 것의 목록이고, 확인한 것은 도구가 읽는 자리로 간다 — 그 둘이 갈리는 것이 이 작업의
@@ -636,3 +648,78 @@ pathNormalization 2). **확인하지 못한 것은 적지 않았다**: `jobHandl
 
 **지금 main에서 돌리면 `status = expired`, `attestedPasses = 0`이고 `remaining`은 그대로다.**
 그게 정상이고, 만료가 실제로 동작한다는 증거다.
+
+---
+
+## 16. `credentialStore` — 이번에 만들고, 이 머신에서 태워본 것
+
+구현과 설계 근거는 [multi-engine-routing.md 20절](./multi-engine-routing.md).
+여기 적는 것은 **관측**이다.
+
+### 16.1 이 머신에서 실제로 본 것
+
+1절의 실측 머신(Windows 10 Pro 10.0.19045)에서, 프로덕션 저장 경로를 그대로 태우는 일회성
+프로브(`open_credential_store()` → `store`/`has`/`read_for_injection`/`forget`)로 확인했다.
+프로브는 저장소에 커밋하지 않았다 — 제품 코드가 아니고, 남겨두면 다음 사람이 그것을 근거로 쓴다.
+
+| 무엇을 봤나 | 결과 |
+|---|---|
+| 열린 저장소 종류 | `WindowsCredentialManager` (`is_production = true`). 개발용으로 물러서지 않았다 |
+| 저장 전 `has` | `false` |
+| 저장 후 `has` / `read_for_injection` | `true` / 넣은 값과 **일치** |
+| `cmdkey /list` | `Target: LegacyGeneric:target=TomverseCode/openai`, `Type: Generic`, `User: openai` |
+| 저장 시각에 바뀐 파일 | `%LOCALAPPDATA%\Microsoft\Credentials\07E5D7DD…` (496 bytes) — Credential Manager의 자격 증명 저장소 |
+| 그 파일에서 평문 검색 | **0건**. `%APPDATA%\Microsoft\Credentials`, `%APPDATA%\Microsoft\Protect`도 0건 |
+| 앱 상태 디렉터리·번들·`.cache` 평문 검색 | 0건 (번들 1311개 파일 포함) |
+| 지우기 | `removed = true` → 두 번째 호출은 `removed = false` (**없었던 것과 실패를 가른다**) |
+| 지운 뒤 `cmdkey /list` | `TomverseCode` 항목 0개 |
+
+**가장 값어치 있는 줄은 아래에서 다섯 번째다.** "저장했다"는 것과 "평문으로 남지 않는다"는
+다른 사실인데, 그 둘을 한 번에 잇는 관측이 **저장 순간에 쓰인 그 파일에서 평문이 나오지
+않는다**는 것이다. 그 파일을 짚지 않고 "어디에도 없더라"만 적으면, 아무 데도 저장되지
+않았을 때와 구별되지 않는다.
+
+**약한 줄도 적어 둔다:** 앱 상태 디렉터리(`%APPDATA%\Tomverse Code`)는 **파일이 0개였다** —
+앱을 띄운 적이 없기 때문이다. 그러므로 거기서 0건이 나온 것은 근거로 세지 않는다.
+기준 2를 사람이 확인할 때는 **앱을 실제로 띄워 태스크를 한 번 돌린 뒤** 검색해야 한다.
+
+### 16.2 그런데도 attestation을 쓰지 않았다
+
+두 가지 이유이고, 둘 다 이 도구의 존재 이유와 같은 것이다.
+
+1. **커밋이 없다.** attestation은 커밋에 묶이고 커밋이 바뀌면 통째로 만료된다(15.4절).
+   이 작업이 커밋되기 전에 적은 기록은 **적는 순간 만료된 것**이다.
+2. **`attestedBy`는 사람이다.** 위 표는 도구가 낸 출력이고, 그것을 "확인했다"로 바꾸는 것은
+   사람의 판단이다. 자동으로 못 본 것을 통과로 바꾸지 않는다는 규칙과 같은 규칙이,
+   자동으로 본 것을 사람의 확인으로 바꾸지 않는다고도 말한다.
+
+### 16.3 확인 절차 — 세 기준
+
+커밋한 뒤 이 절차로 태우고, 결과를 attestation 파일에 적는다(15절).
+
+```
+tomverse-host windows-landing --workspace <repo>          # 무엇이 남았는지 먼저 본다
+tomverse-host windows-landing --workspace <repo> --attest <파일>
+```
+
+**`storedThroughDpapi`**
+1. 앱을 띄우고 자격증명 배너에서 공급자 키를 넣는다.
+2. `control keymgr.dll` → Windows 자격 증명에 `TomverseCode/<공급자>`가 보인다.
+   (`cmdkey /list`로도 같다. 항목이 보이는 것 자체가 DPAPI를 지났다는 표시다 —
+   Credential Manager는 blob을 그 위에 저장한다.)
+3. 앱에서 "지우기"를 누르면 그 항목이 사라진다.
+
+**`noPlaintextAtRest`**
+1. 키를 넣은 뒤 **앱으로 태스크를 한 번 돌린다** — 로그·캐시·이벤트가 실제로 쓰이게 한다
+   (16.1절의 약한 줄이 이 단계 때문이다).
+2. `%APPDATA%\Tomverse Code` 전체(state.db·settings·artifacts·로그)와 번들 디렉터리에서
+   그 키 문자열을 찾는다. **0건이어야 한다.**
+3. `%LOCALAPPDATA%\Microsoft\Credentials`에서 **저장 시각에 바뀐 파일**을 찾고, 거기서도
+   평문이 안 나오는지 본다. 이 단계를 빼면 2번이 "아무 데도 저장 안 됨"과 구별되지 않는다.
+
+**`productionStoreIsNotTheDevelopmentOne`**
+1. 앱의 자격증명 배너가 "Windows Credential Manager (DPAPI)"를 표시한다.
+2. 개발용 문구("개발용 메모리 저장소…", "앱을 끄면 사라집니다")가 **뜨지 않는다.**
+
+`uiNeverHoldsTheKey`와 `injectionStaysOnce`는 적지 않는다 — 이미 기계가 통과로 판정했고,
+적으면 "아무것도 바꾸지 않았다"고 알린다(15.2절).

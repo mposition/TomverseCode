@@ -22,9 +22,10 @@ use tomverse_core::types::{ApprovalRequest, ExecutionMode, TaskPolicy};
 // 이 파일의 모든 자리는 `available_providers_for`로 워크스페이스 허용 목록을 적용한다 —
 // 목록 밖 공급자의 모델을 고를 수 있게 보여주면, 고른 뒤 "키가 없다"는 오류를 만나게 된다.
 // 키는 있고 정책이 막은 것인데.
+use tomverse_core::credentials::{self, CredentialStore, Secret};
 use tomverse_core::{
-    available_providers_for, credential_env_for, providers_blocked_by_policy, CancellationRegistry,
-    WorkspaceRoot, PROTOCOL_VERSION,
+    available_providers_for, credential_injection_for, credential_presence, providers_blocked_by_policy,
+    CancellationRegistry, WorkspaceRoot, PROTOCOL_VERSION,
 };
 use tomverse_core::approvals::PendingApprovals;
 
@@ -125,6 +126,12 @@ pub struct SessionState {
     /// 앱 수명 동안 유지되는 취소 registry. 워크스페이스를 바꿔도 진행 중이던 태스크의
     /// 취소 신호가 유실되면 안 된다.
     cancels: Arc<CancellationRegistry>,
+    /// 자격증명 저장소. **앱 수명 동안 하나**다 — 워크스페이스와 무관하게 사용자의 것이다.
+    ///
+    /// 처음 필요할 때 열고 그다음부터 같은 것을 쓴다. 여는 데 실패라는 상태가 없는 이유는
+    /// `credentials::open_credential_store`의 주석에 있다 — 열 때의 실패 분기가 곧 조용한
+    /// 폴백이 자라는 자리다.
+    credential_store: Mutex<Option<Arc<dyn CredentialStore>>>,
 }
 
 /// 스킬의 모델 지정 위에 화면이 명시한 지정을 덮는다.
@@ -230,6 +237,11 @@ fn merge_model_pins(skill: Option<&tomverse_core::skills::ModelPins>, explicit: 
     }
 }
 
+/// 화면이 보낸 공급자 id를 제품 표에 대본다. **모르는 공급자는 저장소에 닿지 못한다.**
+fn env_name_for(provider_id: &str) -> Result<&'static str, String> {
+    tomverse_core::env_name_for(provider_id).ok_or_else(|| format!("알 수 없는 공급자입니다: {provider_id}"))
+}
+
 impl SessionState {
     /// 앱 시작 시 1회. 저장 계층을 열고 **비정상 종료된 작업을 INTERRUPTED로 확정한다.**
     ///
@@ -263,6 +275,86 @@ impl SessionState {
             .unwrap()
             .clone()
             .ok_or_else(|| "저장 계층이 아직 초기화되지 않았습니다".to_string())
+    }
+
+    /// 자격증명 저장소. 처음 부를 때 열고 그다음부터 같은 것을 돌려준다.
+    ///
+    /// **한 번만 여는 이유**는 성능이 아니다. 개발용 저장소는 프로세스 메모리에 있으므로
+    /// 매번 새로 열면 방금 넣은 키가 사라진다 — "넣었는데 없다"는 원인과 가장 먼 증상이다.
+    pub fn credentials(&self) -> Arc<dyn CredentialStore> {
+        let mut slot = self.credential_store.lock().unwrap();
+        slot.get_or_insert_with(credentials::open_credential_store).clone()
+    }
+
+    /// 키를 저장한다. **값은 여기서 끝난다** — 돌려주는 것은 상태뿐이다.
+    ///
+    /// 공급자가 제품 표에 있는지는 여기서 본다. 저장 계층은 이름의 *모양*만 보고
+    /// (credentials.rs `valid_provider_id`), 어떤 공급자가 존재하는가는 제품의 질문이다.
+    pub fn set_credential(&self, provider_id: &str, secret: String) -> Result<Value, String> {
+        let env_name = env_name_for(provider_id)?;
+        let secret = Secret::new(secret).map_err(|e| e.to_string())?;
+        let store = self.credentials();
+        store.store(provider_id, secret).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "providerId": provider_id,
+            "envName": env_name,
+            "configured": true,
+            // **다음 sidecar spawn부터 적용된다.** 주입은 spawn 시 1회이므로(원칙 2·8.2절)
+            // 이미 떠 있는 sidecar의 환경은 바뀌지 않는다. 화면이 이 사실을 말해야
+            // "키를 넣었는데 왜 그대로지"가 생기지 않는다.
+            "appliesToNextSpawn": true,
+        }))
+    }
+
+    /// 키를 지운다. `removed`는 **지울 것이 있었는가**다.
+    pub fn delete_credential(&self, provider_id: &str) -> Result<Value, String> {
+        let env_name = env_name_for(provider_id)?;
+        let removed = self.credentials().forget(provider_id).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "providerId": provider_id,
+            "envName": env_name,
+            "removed": removed,
+            "appliesToNextSpawn": true,
+        }))
+    }
+
+    /// 자격증명 상태 — **값이 아니라 "있다/없다"와 그 출처.**
+    ///
+    /// 이 함수가 원칙 3의 실체다. 화면이 부를 수 있는 조회는 이것 하나이고, 여기에 키 값이
+    /// 실릴 자리가 없다. `credential_presence`가 돌려주는 타입에도 값 필드가 없다.
+    pub fn credential_status(&self) -> Value {
+        let store = self.credentials();
+        let kind = store.kind();
+        let providers: Vec<Value> = credential_presence(store.as_ref())
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "providerId": p.provider_id,
+                    "envName": p.env_name,
+                    "configured": p.source.is_some(),
+                    "source": p.source,
+                    "conflict": p.conflict,
+                })
+            })
+            .collect();
+        let configured_count = providers
+            .iter()
+            .filter(|p| p["configured"].as_bool() == Some(true))
+            .count();
+        json!({
+            "providers": providers,
+            "store": {
+                "kind": kind,
+                "label": kind.label(),
+                // 화면이 "개발용"이라고 말해야 하는가. **저장소 종류에서 유도한다** —
+                // 종전에는 이 값이 상수 `true`였고, 그래서 저장소를 만들어도 문구가 남았을 것이다.
+                "isDevelopmentOnly": !kind.is_production(),
+                "survivesRestart": kind.survives_restart(),
+            },
+            // 서로 다른 공급자 2개 이상이 있어야 교차검증(검수자 독립성 불변식)이 성립한다.
+            "crossVerificationPossible": configured_count >= 2,
+            "protocolVersion": PROTOCOL_VERSION,
+        })
     }
 
     fn artifacts(&self) -> Result<ArtifactStore, String> {
@@ -656,7 +748,7 @@ impl SessionState {
             self.with_active(|active| Ok((active.sidecar.client(), active.allowed_providers.clone())))?;
         sidecar.request(
             "providers.probe",
-            json!({ "availableProviders": available_providers_for(allowed.as_deref()) }),
+            json!({ "availableProviders": available_providers_for(self.credentials().as_ref(), allowed.as_deref()) }),
             timeout,
         )
     }
@@ -672,7 +764,7 @@ impl SessionState {
             "models.list",
             // **허용 목록을 여기서도 적용한다.** 목록에 없는 공급자의 모델을 고를 수 있게
             // 보여주면, 고른 뒤 "키가 없다"는 오류를 만나게 된다 — 키는 있고 정책이 막은 것인데.
-            json!({ "availableProviders": available_providers_for(allowed.as_deref()) }),
+            json!({ "availableProviders": available_providers_for(self.credentials().as_ref(), allowed.as_deref()) }),
             timeout,
         )
     }
@@ -837,6 +929,9 @@ impl SessionState {
         // 재spawn이 **같은 설정으로** 일어나야 하므로 spawn 방법을 클로저로 넘긴다.
         // 자격증명은 이 클로저 안에서 매번 다시 읽는다 — 감독자가 키 사본을 들고 있지 않다.
         let allowed_for_spawn = allowed_providers.clone();
+        // **저장소는 재spawn마다 다시 읽힌다.** 감독자가 키 사본을 들고 있지 않다 —
+        // 들고 있으면 사용자가 화면에서 지운 키가 재spawn된 sidecar에 다시 들어간다.
+        let store_for_spawn = self.credentials();
         let host_for_spawn = host.clone();
         // **PATH가 인터프리터를 고르게 두지 않는다**(launcher.rs). 여기서 한 번 해석해
         // 재spawn까지 같은 것을 쓴다 — 재spawn마다 다시 찾으면 그 사이 PATH가 바뀌었을 때
@@ -853,7 +948,10 @@ impl SessionState {
                 // 그 공급자를 호출할 수단 자체가 없다 — 검사를 지워도 키가 없다.
                 tomverse_core::launcher::config_from(
                     &launcher_for_spawn,
-                    credential_env_for(allowed_for_spawn.as_deref()),
+                    // **껍데기는 봉투를 옮길 뿐 열 수 없다.** 값 꺼내기는 `pub(crate)`이므로
+                    // 이 크레이트에서는 컴파일되지 않는다 — 원칙 3이 규율이 아니라 가시성으로
+                    // 지켜지는 자리다(credentials.rs).
+                    credential_injection_for(store_for_spawn.as_ref(), allowed_for_spawn.as_deref()),
                 ),
                 host_for_spawn.clone(),
             )
@@ -933,6 +1031,10 @@ impl SessionState {
     }
 
     pub fn info(&self) -> Option<Value> {
+        // **잠그기 전에 저장소를 잡는다.** 두 잠금을 겹쳐 잡는 자리를 만들지 않는다 —
+        // 지금은 다른 뮤텍스라 안전하지만, 순서가 정해지지 않은 중첩은 나중에 반대 순서가
+        // 하나만 생겨도 교착이 된다.
+        let store_for_policy = self.credentials();
         let guard = self.inner.lock().unwrap();
         guard.as_ref().map(|active| {
             json!({
@@ -950,7 +1052,7 @@ impl SessionState {
                 // 허용 목록과 **그 때문에 빠진 공급자**를 함께 준다. "키가 없다"와 "정책이
                 // 막았다"는 다른 사실이고, 화면이 뭉개면 사용자는 없는 키를 찾아 헤맨다.
                 "allowedProviders": active.allowed_providers,
-                "providersBlockedByPolicy": providers_blocked_by_policy(active.allowed_providers.as_deref()),
+                "providersBlockedByPolicy": providers_blocked_by_policy(store_for_policy.as_ref(), active.allowed_providers.as_deref()),
             })
         })
     }
@@ -1141,7 +1243,7 @@ impl SessionState {
             "workspaceName": self.info().and_then(|i| i.get("name").cloned()).unwrap_or(Value::Null),
             // 라우터가 보는 후보도 같은 목록이어야 한다 — 주입된 키와 후보가 어긋나면
             // "고를 수 있다고 했는데 호출이 실패"가 된다.
-            "availableProviders": available_providers_for(allowed_providers.as_deref()),
+            "availableProviders": available_providers_for(self.credentials().as_ref(), allowed_providers.as_deref()),
         });
 
         let result = sidecar.request("task.start", params, timeout);

@@ -9,6 +9,11 @@
  * 여기 있는 타입은 프로토콜의 **부분 미러**이며 필드를 추가할 때는 프로토콜을 먼저 바꾼다.
  */
 
+// 자격증명 화면의 타입은 순수 로직 모듈이 정본이다 — 판정(`storeNotice` 등)이 거기 있고,
+// 타입만 여기 다시 적으면 둘이 갈라진다. 여기서는 다시 내보내기만 한다.
+import type { CredentialStoreInfo, ProviderCredential } from "./lib/credentialDraft";
+export type { CredentialStoreInfo, CredentialSource, ProviderCredential } from "./lib/credentialDraft";
+
 export type TaskPhase =
   | "CREATED"
   | "SNAPSHOTTING"
@@ -454,10 +459,16 @@ export interface WorkspaceInfo {
   providersBlockedByPolicy: string[];
 }
 
+/**
+ * 자격증명 상태. **값은 절대 들어 있지 않다** — 원칙 3.
+ *
+ * 이 타입에 키 값을 담을 필드가 없다는 것이 화면 쪽 계약의 전부다. Rust 쪽에서 값이
+ * 나오지 않는다는 보장은 별도로 있다(`packages/toolchain/test/credentialBoundary.test.ts`).
+ */
 export interface ProviderStatus {
-  providers: { providerId: string; envName: string; configured: boolean }[];
-  source: string;
-  isDevelopmentOnly: boolean;
+  providers: ProviderCredential[];
+  /** 어떤 저장 계층이 실제로 쓰이고 있는가. 화면 문구는 여기서 유도한다. */
+  store: CredentialStoreInfo;
   crossVerificationPossible: boolean;
   protocolVersion: string;
 }

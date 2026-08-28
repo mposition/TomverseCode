@@ -89,3 +89,76 @@ test("자격증명 이름을 안내 문구로 쓰는 것은 허용된다", () =>
   const mentions = sourceFiles(SRC).filter((f) => readFileSync(f, "utf8").includes("API_KEY"));
   assert.ok(mentions.length > 0, "안내 문구가 사라졌습니다 — 이 테스트가 지키려던 대상이 없습니다");
 });
+
+/**
+ * **프런트엔드는 브라우저 영속 저장소를 열지 않는다** — 착지 기준 `uiNeverHoldsTheKey`.
+ *
+ * # 왜 지금 이 검사를 만드는가
+ *
+ * Credential Store가 생기면서 **화면이 처음으로 키를 손에 쥔다**(입력창에서 Rust로 넘기는
+ * 그 한 순간). 그 값을 `localStorage`에 넣는 것은 한 줄이고, 넣으면 "다시 입력할 필요 없어
+ * 편하다"가 된다. 그리고 그 순간 키가 **디스크에 평문으로** 남는다 — 웹뷰의 저장소는 DPAPI를
+ * 지나지 않는다. 착지 기준 `noPlaintextAtRest`가 금지하는 바로 그것이 앱 디렉터리가 아니라
+ * 웹뷰 프로필에 생긴다.
+ *
+ * # 왜 저장소 API 자체를 막는가
+ *
+ * "키만 넣지 않으면 된다"로 좁힐 수도 있다. 그러려면 **무엇이 키인지**를 이 검사가 알아야
+ * 하는데, 변수 이름으로 그걸 판정하는 것은 언제나 통과하는 방식으로 고장 난다.
+ * 지금 프런트엔드는 이 API를 하나도 쓰지 않으므로 잃는 것이 없다 — 필요해지면 그때 이
+ * 검사를 좁히되, **좁히는 사람이 그 결정을 내리게** 한다. 지금 열어두면 키가 그리로 갈 때
+ * 아무도 모른다.
+ */
+test("프런트엔드는 브라우저 영속 저장소를 쓰지 않는다", () => {
+  // needle을 런타임에 조립한다 — 소스에 그대로 적으면 이 파일이 자기 자신에 걸린다.
+  const needles = ["local" + "Storage", "session" + "Storage", "indexed" + "DB"];
+  const offenders: string[] = [];
+  for (const file of sourceFiles(SRC)) {
+    const source = readFileSync(file, "utf8");
+    for (const [index, line] of source.split("\n").entries()) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) continue;
+      if (needles.some((n) => line.includes(n))) offenders.push(`${path.relative(SRC, file)}:${index + 1}`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `프런트엔드가 브라우저 저장소를 씁니다: ${offenders.join(", ")} — ` +
+      "자격증명이 지나는 프로세스에 영속 저장소를 열지 않습니다(착지 기준 uiNeverHoldsTheKey)"
+  );
+});
+
+/**
+ * **화면이 키를 저장하는 명령은 하나뿐이고, 되읽는 명령은 없다.**
+ *
+ * 이 검사가 보는 것은 화면이 `invoke`하는 **이름**이다. Rust 쪽에서 값이 나오지 않는다는
+ * 보장은 `credentialBoundary.test.ts`가 소스로 확인하고, 여기서는 화면이 그런 이름을
+ * 부르려 시도조차 하지 않는지를 본다 — 새 command를 만들면서 화면부터 쓰는 순서가 흔하다.
+ */
+test("화면은 자격증명 값을 되읽는 명령을 부르지 않는다", () => {
+  const allowed = new Set([
+    "set_provider_credential",
+    "delete_provider_credential",
+    // 아래 셋은 값을 돌려주지 않는다: 상태·허용 목록·무료 조회 결과다(multi-engine-routing 17절).
+    "provider_status",
+    "set_allowed_providers",
+    "probe_providers",
+  ]);
+  const called = new Set<string>();
+  for (const file of sourceFiles(SRC)) {
+    const source = readFileSync(file, "utf8");
+    for (const match of source.matchAll(/invoke(?:<[^>]*>)?\(\s*"([a-z0-9_]+)"/g)) {
+      const name = match[1]!;
+      if (name.includes("credential") || name.includes("provider")) called.add(name);
+    }
+  }
+  assert.ok(called.size > 0, "자격증명 관련 invoke를 하나도 찾지 못했습니다 — 스캔이 깨졌습니다");
+  const unexpected = [...called].filter((n) => !allowed.has(n));
+  assert.deepEqual(
+    unexpected,
+    [],
+    `화면이 알려지지 않은 자격증명 명령을 부릅니다: ${unexpected.join(", ")} — ` +
+      "값을 돌려주는 명령이 아닌지 확인하고, 아니라면 이 목록에 넣으세요"
+  );
+});

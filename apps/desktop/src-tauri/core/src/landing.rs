@@ -554,33 +554,80 @@ fn bundle_checks(obs: &Observations) -> Vec<Check> {
     ]
 }
 
-fn credential_checks() -> Vec<Check> {
-    // **기준은 있는데 기능이 없다.** 그 사실을 `Failed`로 적으면 "만들었는데 깨졌다"로 읽힌다.
-    let why = "아직 환경변수에서 읽는다 — Credential Store는 구현되지 않았다.";
+/// Credential Store (`credentials.rs`, `win_credentials.rs`) — multi-engine-routing.md 12절.
+///
+/// # 네 기준이 두 종류로 갈린다
+///
+/// 앞의 둘(`storedThroughDpapi`·`noPlaintextAtRest`)은 **Windows API의 동작**이다.
+/// `win_credentials.rs`는 Linux에서 한 줄도 컴파일되지 않으므로(`win_job.rs`와 같은 성질 —
+/// state-machine 20.5절) 여기서 통과한 `verify`가 그 코드에 대해 말해주는 것이 없다.
+///
+/// 뒤의 둘(`uiNeverHoldsTheKey`·`injectionStaysOnce`)은 **플랫폼과 무관한 소스 불변식**이다.
+/// `appNotInJob`과 같은 자리이므로 Windows를 기다리지 않는다 — 대신 검사가 `verify`에서 돈다
+/// (`packages/toolchain/test/credentialBoundary.test.ts`,
+/// `apps/desktop/test/frontendTrust.test.ts`). 산문으로만 두면 다음 사람이 되살린다.
+fn credential_checks(obs: &Observations) -> Vec<Check> {
+    let (status, detail) = if obs.on_windows() {
+        (CheckStatus::NeedsHuman, "Windows에서 사람이 확인해야 한다.".to_string())
+    } else {
+        (
+            CheckStatus::NotCheckableHere,
+            format!("여기는 {} — DPAPI도 Credential Manager도 이 플랫폼에 없다.", obs.os),
+        )
+    };
+
     vec![
         check(
             "storedThroughDpapi",
             "키를 앱 안에서 넣고 지울 수 있고, 저장이 Windows Credential Manager(DPAPI)를 지난다.",
-            CheckStatus::NotImplemented,
-            why,
+            status.clone(),
+            format!(
+                "{detail} 앱에서 키를 넣은 뒤 `control keymgr.dll`(자격 증명 관리자 → Windows 자격 증명)에 \
+                 `TomverseCode/<공급자>` 항목이 생기는지, 앱에서 지우면 그 항목이 사라지는지 볼 것. \
+                 항목이 보이는 것 자체가 DPAPI를 지났다는 표시다 — Credential Manager는 blob을 그 위에 저장한다."
+            ),
         ),
         check(
             "noPlaintextAtRest",
             "저장 후 앱 디렉터리와 설정 어디에도 키 문자열이 평문으로 남지 않는다.",
-            CheckStatus::NotImplemented,
-            why,
+            status.clone(),
+            format!(
+                "{detail} 키를 넣은 뒤 상태 디렉터리(`%APPDATA%`의 앱 폴더: state.db·settings·artifacts·로그)와 \
+                 번들 디렉터리에서 그 문자열을 찾을 것 — 0건이어야 한다. \
+                 **이 경로에는 우리가 만드는 자격증명 파일이 아예 없다**(win_credentials.rs 모듈 주석): \
+                 저장은 Credential Manager가 하고 우리는 파일을 만들지 않는다."
+            ),
         ),
         check(
             "uiNeverHoldsTheKey",
             "UI 프로세스는 키를 갖지 않는다 — 입력 즉시 Rust로 넘기고 이후 조회는 \"있다/없다\"만 돌려준다(원칙 3).",
-            CheckStatus::NotImplemented,
-            why,
+            CheckStatus::Passed,
+            "플랫폼과 무관한 **소스 불변식**이므로 Windows를 기다리지 않는다. 세 겹으로 지킨다: \
+             (1) 값 꺼내기(`CredentialInjection::into_pairs`)가 `pub(crate)`라 껍데기 크레이트는 \
+             **꺼낼 수단이 없다** — 컴파일러가 막는다. (2) `Secret`은 `Debug`가 값을 가리고 \
+             `Display`/`Serialize`가 없다. (3) 어떤 Tauri command도 값을 돌려주지 않는다는 것을 \
+             `credentialBoundary.test.ts`가 소스에서 확인한다.",
         ),
         check(
             "injectionStaysOnce",
             "sidecar에는 여전히 spawn 시 1회 주입이고 허용 목록으로 걸러진다 — 저장소가 생겨도 `credential.get`이 되살아나지 않는다.",
-            CheckStatus::NotImplemented,
-            "8.2절이 지운 메서드다. 저장소를 만들면서 되살리고 싶어지는 자리이므로 기준으로 못박아 둔다.",
+            CheckStatus::Passed,
+            "process-architecture 8.2절이 지운 메서드다. 저장소를 만들면서 되살리고 싶어지는 자리이므로 \
+             기준으로 못박아 두었고, 이제 **검사가 지킨다**: `host.rs`의 `credential.get`이 여전히 거절하는가, \
+             sidecar 소스에 그 메서드를 부르는 곳이 없는가, `read_for_injection`을 부르는 곳이 \
+             주입 지점 하나뿐인가 — `credentialBoundary.test.ts`가 셋 다 본다. \
+             저장소는 주입 지점 **앞**에 놓이는 것이지 그 경로를 바꾸지 않는다.",
+        ),
+        check(
+            "productionStoreIsNotTheDevelopmentOne",
+            "Windows에서 열리는 저장소가 개발용 메모리 저장소로 조용히 물러서지 않는다.",
+            status,
+            format!(
+                "{detail} 앱을 띄우고 자격증명 배너의 저장소 표시가 \"Windows Credential Manager (DPAPI)\"인지 볼 것. \
+                 **절반은 여기서 이미 지킨다**: 개발용 구현은 `cfg(any(test, not(windows)))`라 \
+                 Windows 릴리스 빌드에 타입 자체가 없고, 폴백을 쓰려면 그 cfg를 고쳐야 한다. \
+                 나머지 절반은 '실제로 그 종류가 열리는가'다."
+            ),
         ),
     ]
 }
@@ -916,7 +963,7 @@ pub fn assess(obs: &Observations) -> LandingReport {
             }
         },
         {
-            let checks = credential_checks();
+            let checks = credential_checks(obs);
             Group {
                 id: "credentialStore",
                 documented_at: "multi-engine-routing.md 12절",
@@ -1119,12 +1166,26 @@ mod tests {
         assert!(size.detail.contains("2"), "{}", size.detail);
     }
 
-    /// 만들지 않은 것은 실패가 아니다 — 다음에 할 일이 다르다.
+    /// **Credential Store의 기준은 두 종류다** — 그리고 그 구분이 보고서에 남아야 한다.
+    ///
+    /// 소스 불변식(`uiNeverHoldsTheKey`·`injectionStaysOnce`)은 플랫폼과 무관하므로 Linux에서
+    /// 통과한다. Windows API의 동작(DPAPI 저장·평문 미잔존·실제로 열리는 저장소 종류)은
+    /// 여기서 볼 수 없다. **둘을 같은 상태로 적으면 어느 쪽이 남은 일인지 알 수 없다.**
     #[test]
-    fn an_unbuilt_feature_is_not_a_failure() {
+    fn the_credential_store_separates_source_invariants_from_windows_behaviour() {
         let report = assess(&linux());
         let cred = report.groups.iter().find(|g| g.id == "credentialStore").unwrap();
-        assert!(cred.checks.iter().all(|c| c.status == CheckStatus::NotImplemented));
+
+        for id in ["uiNeverHoldsTheKey", "injectionStaysOnce"] {
+            let c = cred.checks.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(c.status, CheckStatus::Passed, "{id}는 소스 불변식이라 Linux에서 판정된다");
+        }
+        for id in ["storedThroughDpapi", "noPlaintextAtRest", "productionStoreIsNotTheDevelopmentOne"] {
+            let c = cred.checks.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(c.status, CheckStatus::NotCheckableHere, "{id}는 Windows에서만 확인된다");
+        }
+
+        // 소스 불변식이 통과했다고 묶음이 착지한 것은 아니다.
         assert_eq!(cred.verdict, Verdict::Incomplete);
     }
 
@@ -1445,18 +1506,38 @@ mod tests {
     }
 
     /// **없는 기능은 확인할 수 없다.** `NotImplemented`도 덮이지 않는다 —
-    /// 덮이면 "만들었는데 확인했다"가 되고, credentialStore는 아직 만들지 않았다.
+    /// 덮이면 "만들었는데 확인했다"가 된다.
+    ///
+    /// # 왜 실제 보고서가 아니라 만든 묶음으로 재는가
+    ///
+    /// 종전에는 `credentialStore/storedThroughDpapi`로 쟀다. 그 기능을 만드는 순간 이 테스트가
+    /// 깨졌는데, **깨진 것이 규칙이 아니라 예시였다.** 규칙을 그때그때 남아 있는 미구현 기능에
+    /// 묶으면 마지막 하나를 만들 때 이 규칙을 검사할 방법이 사라진다 — 그때 규칙을 지우고
+    /// 싶어지고, 그러면 다음에 `NotImplemented`가 생겼을 때 아무도 막지 않는다.
     #[test]
     fn an_attestation_cannot_pass_an_unbuilt_feature() {
+        let mut groups = vec![Group {
+            id: "credentialStore",
+            documented_at: "테스트용",
+            checks: vec![check(
+                "storedThroughDpapi",
+                "아직 만들지 않은 기능",
+                CheckStatus::NotImplemented,
+                "테스트용",
+            )],
+            verdict: Verdict::Incomplete,
+        }];
         let obs = windows_with(
             attestation_for(HEAD, measured_machine(), attested("credentialStore", "storedThroughDpapi")),
             Some(HEAD),
         );
-        let report = assess(&obs);
-        assert_eq!(status_of(&report, "credentialStore", "storedThroughDpapi").status, CheckStatus::NotImplemented);
-        assert!(report.attestation.as_ref().unwrap().rejections[0]
-            .reason
-            .contains("기능이 아직 없습니다"));
+
+        let report = apply_attestation(&mut groups, &obs).unwrap();
+
+        assert_eq!(groups[0].checks[0].status, CheckStatus::NotImplemented);
+        assert!(groups[0].checks[0].attestation.is_none());
+        assert!(report.accepted.is_empty());
+        assert!(report.rejections[0].reason.contains("기능이 아직 없습니다"), "{report:?}");
     }
 
     /// **머신 사양이 판정에 반영된다.**
