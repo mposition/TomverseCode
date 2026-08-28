@@ -213,6 +213,25 @@ pub enum TerminalOutcome {
     AlreadyTerminal { status: String },
 }
 
+/// `FLEET_ENROLLED` 이벤트 + 그 태스크의 현재 상태. **`final_status`가 없으면 돌고 있었다.**
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetMemberRow {
+    pub fleet_id: String,
+    pub task_id: String,
+    pub branch: String,
+    pub member_index: usize,
+    pub fleet_size: usize,
+    /// 시작됐는가. `false`면 합계 예산이 남지 않았거나 Fleet이 취소되어 들어가지 못한
+    /// 구성원이다 — **실패가 아니다**(사용자가 다음에 할 일이 다르다).
+    pub admitted: bool,
+    pub reserved_usd: Option<f64>,
+    pub workspace_path: Option<String>,
+    pub phase: String,
+    pub final_status: Option<String>,
+    pub created_at: String,
+}
+
 /// `tasks` 행의 조회 결과 (UI 목록/상세용).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TaskRow {
@@ -1222,6 +1241,61 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![workspace_path, cursor_created, cursor_id, limit], map_task_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Fleet 구성원 조회 — **크래시 후 "무엇이 돌고 있었나"에 답하는 자리** (원칙 7).
+    ///
+    /// # 왜 새 테이블이 없는가
+    ///
+    /// Fleet 단위 상태를 별도 테이블에 두면 그 테이블이 `task_events`와 갈라질 수 있고, 갈리면
+    /// 어느 쪽이 진실인지 정하는 규칙이 새로 필요해진다. 대신 **각 구성원이 자기 태스크의
+    /// 이벤트로 등록 사실을 남긴다**(`FLEET_ENROLLED`). Fleet은 그 이벤트를 가진 태스크들의
+    /// 집합이고, "지금 도는 것"은 그중 `final_status`가 없는 것이다 — 파생이 아니라 **유도**다.
+    ///
+    /// `FLEET_ENROLLED`는 `NODE_MAY_NOT_EMIT`에 있으므로 sidecar가 이 집합에 자기를 넣을 수 없다.
+    pub fn fleet_members(&self, fleet_id: Option<&str>) -> Result<Vec<FleetMemberRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.task_id, e.payload_json, t.phase, t.final_status, t.workspace_path, t.created_at
+             FROM task_events e JOIN tasks t ON t.task_id = e.task_id
+             WHERE e.event_type = 'FLEET_ENROLLED'
+             ORDER BY e.event_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let payload: String = r.get(1)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                payload,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (task_id, payload, phase, final_status, workspace_path, created_at) = row?;
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
+            let id = payload.get("fleetId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if let Some(wanted) = fleet_id {
+                if id != wanted {
+                    continue;
+                }
+            }
+            out.push(FleetMemberRow {
+                fleet_id: id,
+                task_id,
+                branch: payload.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                member_index: payload.get("memberIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                fleet_size: payload.get("fleetSize").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                admitted: payload.get("admitted").and_then(|v| v.as_bool()).unwrap_or(true),
+                reserved_usd: payload.get("reservedUsd").and_then(|v| v.as_f64()),
+                workspace_path,
+                phase,
+                final_status,
+                created_at,
+            });
+        }
+        Ok(out)
     }
 
     /// 이 행 다음 페이지를 가리키는 커서. **질의가 정렬에 쓰는 것과 같은 필드로 만든다.**

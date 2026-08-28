@@ -53,7 +53,14 @@ impl UiApprovalGateway {
 
 impl ApprovalGateway for UiApprovalGateway {
     fn request_approval(&self, request: &ApprovalRequest) -> ApprovalOutcome {
-        let rx = self.pending.register(&request.approval_id, &request.workspace_root);
+        // **출처를 함께 등록한다**(process-architecture 11.6①). 큐가 여러 트리의 요청을
+        // 담을 수 있게 됐으므로, 화면이 "3개 대기 중"이라고만 쓰지 않으려면 각 항목이
+        // 어느 구성원의 것인지 알아야 한다 — 트리 경로는 서로 한 글자만 다르다.
+        let rx = self.pending.register_with_origin(
+            &request.approval_id,
+            &request.workspace_root,
+            request.origin.clone(),
+        );
 
         // ui-wireframes.md 3.3절 승인 모달이 이 페이로드를 그대로 렌더링한다.
         // run_command 항목의 program/args/cwd는 실제 실행값과 같다 (argv 계약).

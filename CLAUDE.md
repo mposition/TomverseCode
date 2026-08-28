@@ -83,7 +83,14 @@ apps/desktop/        Tauri 2 + React
                      않으므로 여기서 통과한 verify가 이 파일에 대해 말해주는 것이 없다.**
                      별도 크레이트에서 실제 파일을 #[path]로 가리켜 타입 검증만 했다(문서 20.5절)
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
-                     `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`/`windows-landing`.
+                     `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`/`fleet-status`/`windows-landing`.
+                     `fleet`은 **N개 병렬 실행**이다(구성원마다 worktree 하나). 각 구성원은 자기 트리를 게이트
+                     루트로 받는 **평범한 태스크**이며 Policy Gate에 분기가 없다. 어려운 것은 병렬 실행이 아니라
+                     process-architecture 11.2절의 셋이었다 — 승인 큐(`approvals.rs`), **합계 예산의 예약**
+                     (`fleet.rs`: 태스크당 상한과 별개이며, 태스크당 상한 없이는 걸 수 없다), 검증 직렬화
+                     (`verify.rs`의 레인 — 언제나 켜져 있다). Fleet 단위 상태는 새 테이블이 아니라
+                     `task_events`의 `FLEET_ENROLLED`이고, 그 이벤트는 `NODE_MAY_NOT_EMIT`이라 모델은
+                     Fleet을 시작할 수도 기록할 수도 없다.
                      `windows-landing`은 **Windows에서만 검증되는 동작의 착지 판정을 사람 머릿속에서 꺼낸 것**이다 —
                      Job Object·sidecar 번들·Credential Store·명령 해석(npm shim)·프로세스 그룹·경로 정규화·개발자 환경(MSVC)·Python 가상환경 여덟 묶음이고,
                      `cfg(windows)`/`Platform::Windows`를 쓰는 파일이 그 목록에 없으면 테스트가 실패한다.

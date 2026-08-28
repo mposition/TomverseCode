@@ -329,6 +329,11 @@ pub struct TaskHost {
     /// 격리 안에 있는지 모른다. 그런데 사용자는 알아야 한다 — 결과가 본체에 없기 때문이다.
     /// 그 사실을 기록으로 남길 수 있는 자리가 여기다.
     isolation: Option<crate::worktree::Isolation>,
+    /// 이 호스트가 Fleet의 구성원인가 (fleet.rs, process-architecture 11.6①).
+    ///
+    /// **승인 화면의 출처 표시가 여기서 나온다.** 게이트에는 아무 영향이 없다 — Fleet 구성원은
+    /// 자기 worktree를 루트로 받는 **평범한 태스크**이고, 게이트에 "Fleet 모드" 분기는 없다.
+    fleet_member: Option<crate::types::ApprovalOrigin>,
 }
 
 /// `abandon_unanswered`가 남기는 취소 사유. **사용자 취소·시한 초과와 다른 문자열이다** —
@@ -371,6 +376,7 @@ impl TaskHost {
             ipc_meter: Mutex::new(None),
             mcp: None,
             isolation: None,
+            fleet_member: None,
         }
     }
 
@@ -496,6 +502,15 @@ impl TaskHost {
     /// 격리 실행의 사실 — 화면이 "결과가 어디 있는가"에 답하는 데 쓴다.
     pub fn isolation(&self) -> Option<&crate::worktree::Isolation> {
         self.isolation.as_ref()
+    }
+
+    /// 이 호스트가 Fleet의 몇 번째 구성원인지 붙인다 (11.6①).
+    ///
+    /// **표시용이며 판정에는 쓰이지 않는다.** 게이트도 정책도 이 값을 보지 않는다 — 보게 되는
+    /// 순간 "Fleet일 때만 다른 규칙"이 생기고, 그것이 22.1절이 worktree에서 피한 모양이다.
+    pub fn with_fleet_member(mut self, origin: crate::types::ApprovalOrigin) -> Self {
+        self.fleet_member = Some(origin);
+        self
     }
 
     /// 무인 실행이 이 정책으로 무엇을 허용하는지 (47절). **아무것도 쓰지 않는다.**
@@ -1109,6 +1124,9 @@ impl TaskHost {
                 // Policy Gate가 벗어나지 못하게 지키는 바로 그 루트다. 승인 화면이 말하는
                 // 워크스페이스와 실제로 제한되는 워크스페이스가 같아야 한다.
                 workspace_root: self.root.display(),
+                // **어느 트리의 요청인지 화면이 말할 수 있어야 한다**(11.6①). 경로만으로는
+                // `tomverse-feat-a`와 `tomverse-feat-b`가 화면에서 구별되지 않는다.
+                origin: self.fleet_member.clone(),
                 items: vec![self.describe_for_approval(request, &decision)],
                 created_at: now_iso(),
             };
@@ -2444,6 +2462,12 @@ pub const NODE_MAY_NOT_EMIT: &[&str] = &[
     "ROLLBACK_STARTED",
     "ROLLBACK_COMPLETED",
     "ROLLBACK_FAILED",
+    // Fleet은 호스트만 시작한다(fleet.rs, worktree.rs 22.3절과 같은 이유). 모델이 병렬 실행을
+    // 띄울 수 있으면 예산 상한도 승인도 우회 가능해진다. **기록할 수도 없어야 한다** —
+    // 낼 수 있으면 장악당한 Node가 자기가 만든 태스크를 Fleet 구성원으로 등록해 합계 예산의
+    // 근거를 오염시킬 수 있다.
+    "FLEET_ENROLLED",
+    "FLEET_MEMBER_SETTLED",
 ];
 
 fn redact_user_decision(event_type: &str, payload: Value) -> Value {
