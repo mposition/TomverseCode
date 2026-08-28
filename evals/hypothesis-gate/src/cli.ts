@@ -9,6 +9,7 @@ import {
   budgetEventsPath,
   budgetStatus,
   createBudgetEventSink,
+  analyzeBudgetEvents,
   readBudgetEvents,
   reconcileBudget,
   recoverSpendFromRecords,
@@ -62,6 +63,18 @@ import {
 } from "./probeModels.js";
 import { ADAPTER_CONTRACT_VERSION, createAdapterProbeTransport } from "./probeTransport.js";
 import { openRecordStore } from "./records.js";
+import {
+  appendBillingEntry,
+  attestBillingEntry,
+  billingLedgerPath,
+  closeOverdueEntry,
+  currentBillingEntries,
+  deriveFailedCallProvider,
+  readBillingLedger,
+  RECONCILE_DEADLINE_HOURS,
+  summarizeBillingExposure,
+  type BillingLedgerEntry,
+} from "./billingLedger.js";
 import {
   authorizeRunCard,
   buildStagedCards,
@@ -315,6 +328,155 @@ const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.
       language: f.manifest.language,
       hash: f.fixtureHash,
     }));
+
+  // ---- billing ----
+  // **미정산 부채 원장.** 과금 여부를 확정할 수 없는 예약을 격리해 보관하고, 사람이 공급자
+  // 청구 내역으로 확인한 결과를 근거와 함께 기록한다. **API 호출 0건.**
+  if (options.command === "billing") {
+    const sub = options.billingSub ?? "status";
+    const root = options.output;
+    const now = new Date();
+
+    if (sub === "register") {
+      // 예산 원장에서 **확정할 수 없는 예약**을 찾아 부채로 등록한다.
+      // 자동으로 $0이나 확정 비용으로 바꾸지 않는다 — 그건 코드가 알 수 없는 사실이다.
+      const from = options.billingFrom;
+      if (from === undefined) {
+        log("billing register에는 --from <실행 디렉터리>가 필요합니다");
+        return 3;
+      }
+      const read = readBudgetEvents(from);
+      if (!read.ok) {
+        log(`예산 이벤트를 읽을 수 없습니다: ${read.reasons.join(" / ")}`);
+        return 3;
+      }
+      const analysis = analyzeBudgetEvents(read.events);
+      const existing = new Set(currentBillingEntries(readBillingLedger(root)).map((e) => e.entryId));
+      const candidates = analysis.reservations.filter(
+        (r) => r.outcome === "open" || r.outcome === "unresolved" || r.outcome === "partially_settled"
+      );
+      if (candidates.length === 0) {
+        log(`${from}: 확정할 수 없는 예약이 없습니다`);
+        return 0;
+      }
+      let added = 0;
+      for (const view of candidates) {
+        const entryId = `${path.basename(from)}::${view.correlationId}`;
+        if (existing.has(entryId)) {
+          log(`이미 등록됨, 건너뜁니다: ${entryId}`);
+          continue;
+        }
+        const entry: BillingLedgerEntry = {
+          schemaVersion: 1,
+          entryId,
+          correlationId: view.correlationId,
+          ...deriveFailedCallProvider(from, view.correlationId),
+          windowStart: view.openedAt,
+          reservedUsd: view.reservedUsd,
+          ...(view.actualUsd !== undefined ? { settledUsd: view.actualUsd } : {}),
+          abortCause: view.problems.join(" / ") || `종결 상태: ${view.outcome}`,
+          runDir: from,
+          runId: view.runId,
+          stage: view.stage,
+          status: "billing_unknown_pending",
+          statusSetAt: now.toISOString(),
+          statusSetBy: "auto-register",
+        };
+        appendBillingEntry(root, entry);
+        added += 1;
+        log(`등록: ${entryId} — 최대 노출 $${(entry.reservedUsd - (entry.settledUsd ?? 0)).toFixed(6)}`);
+      }
+      log("");
+      log(`${added}건을 billing_unknown_pending으로 격리했습니다. 원장: ${billingLedgerPath(root)}`);
+      log("**자동으로 $0이나 확정 비용으로 바꾸지 않았습니다** — 공급자 청구 내역으로만 판별됩니다.");
+      return 0;
+    }
+
+    if (sub === "settle") {
+      const entryId = options.billingEntry;
+      const outcome = options.billingOutcome;
+      const evidence = options.billingEvidence;
+      if (entryId === undefined || outcome === undefined || evidence === undefined) {
+        log("billing settle에는 --entry <id> --outcome billed|not_billed --evidence <근거>가 필요합니다");
+        log("**근거는 생략할 수 없습니다** — 이 전이는 돈에 대한 주장이고 나중에 되짚을 수 있어야 합니다.");
+        return 3;
+      }
+      const entries = currentBillingEntries(readBillingLedger(root));
+      const target = entries.find((e) => e.entryId === entryId);
+      if (!target) {
+        log(`그런 항목이 없습니다: ${entryId}`);
+        for (const e of entries) log(`  후보: ${e.entryId} (${e.status})`);
+        return 3;
+      }
+      try {
+        const updated = attestBillingEntry(target, {
+          outcome,
+          ...(options.billingActualUsd !== undefined ? { actualUsd: options.billingActualUsd } : {}),
+          evidence,
+          at: now.toISOString(),
+        });
+        appendBillingEntry(root, updated);
+        log(`${entryId} → ${updated.status}`);
+        log(`  근거: ${evidence}`);
+        if (updated.actualUsd !== undefined) log(`  실제 금액: $${updated.actualUsd.toFixed(6)}`);
+        return 0;
+      } catch (error) {
+        log(String(error instanceof Error ? error.message : error));
+        return 3;
+      }
+    }
+
+    if (sub === "close-overdue") {
+      // 재조정 기한이 지난 항목을 **영구 미확정**으로 닫는다. 삭제하지 않는다.
+      const entries = currentBillingEntries(readBillingLedger(root));
+      const exposure = summarizeBillingExposure(entries, now);
+      if (exposure.overdue.length === 0) {
+        log(`재조정 기한(${RECONCILE_DEADLINE_HOURS}시간)이 지난 항목이 없습니다`);
+        return 0;
+      }
+      for (const entry of exposure.overdue) {
+        appendBillingEntry(root, closeOverdueEntry(entry, now.toISOString()));
+        log(`${entry.entryId} → billing_unknown (기한 경과, 최대 노출 $${entry.reservedUsd.toFixed(6)} 유지)`);
+      }
+      return 0;
+    }
+
+    // status (기본)
+    const entries = currentBillingEntries(readBillingLedger(root));
+    const exposure = summarizeBillingExposure(entries, now);
+    log("=== 미정산 부채 원장 (읽기 전용, API 호출 없음) ===");
+    log(`원장: ${billingLedgerPath(root)}`);
+    log("");
+    if (entries.length === 0) {
+      log("등록된 항목이 없습니다.");
+      return 0;
+    }
+    log("| entryId | 공급자 | 시간 창 | 최대 노출 | 상태 |");
+    log("|---|---|---|---|---|");
+    for (const e of entries) {
+      const outstanding = Math.max(0, e.reservedUsd - (e.settledUsd ?? 0));
+      const window = e.windowEnd ? `${e.windowStart} → ${e.windowEnd}` : e.windowStart;
+      log(`| ${e.entryId} | ${e.providerId} | ${window} | $${outstanding.toFixed(6)} | ${e.status} |`);
+    }
+    log("");
+    log(`확인된 과금(confirmed): $${exposure.confirmedUsd.toFixed(6)}`);
+    log(`미정산 최대 노출(unsettled exposure): $0 – $${exposure.unsettledMaxUsd.toFixed(6)}`);
+    if (exposure.billedAmountUnknownUsd > 0) {
+      // "과금 여부를 모른다"와 "과금됐는데 얼마인지 모른다"는 다음에 할 일이 다르다.
+      log(`  ↑ 그중 과금은 확인됐으나 금액 미상: $${exposure.billedAmountUnknownUsd.toFixed(6)}`);
+    }
+    log(`과금 없음으로 닫힌 금액(cleared): $${exposure.clearedUsd.toFixed(6)}`);
+    log(`미판별 ${exposure.pendingCount}건 / 영구 미확정 ${exposure.permanentUnknownCount}건`);
+    if (exposure.overdue.length > 0) {
+      log("");
+      log(`**재조정 기한(${RECONCILE_DEADLINE_HOURS}시간) 경과 ${exposure.overdue.length}건** — 확인하거나 close-overdue로 닫으세요:`);
+      for (const e of exposure.overdue) log(`  - ${e.entryId}`);
+    }
+    log("");
+    log("이 금액은 **범위**입니다. 실제 과금 여부는 공급자 청구 내역으로만 확인됩니다.");
+    return 0;
+  }
+
 
   // ---- plan-pilot ----
   // **실제 API를 부르지 않는다.** 사용자가 승인할 수 있는 실행 계획서를 만든다.

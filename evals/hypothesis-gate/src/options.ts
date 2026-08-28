@@ -41,6 +41,13 @@ export interface CliOptions {
   p1MaxCostUsd?: number;
   /** confirmatory 승인 상한. P1과 따로 받는다 — 규모가 3배라 같은 승인으로 덮지 않는다. */
   p2MaxCostUsd?: number;
+  /** billing 서브커맨드: status | register | settle | close-overdue */
+  billingSub?: string;
+  billingFrom?: string;
+  billingEntry?: string;
+  billingOutcome?: "billed" | "not_billed";
+  billingEvidence?: string;
+  billingActualUsd?: number;
   /**
    * 유료 실행이 근거로 삼는 Run Card 파일. **pilot/run에 필수다**(fake 실행은 면제).
    *
@@ -154,7 +161,18 @@ export function parseArgs(argv: string[], defaultOutput: string): CliOptions {
     output: defaultOutput,
   };
 
-  for (let i = 1; i < argv.length; i += 1) {
+  /**
+   * **위치 인자 하위 명령.** `gate billing status`처럼 쓸 수 있게 argv[1]이 플래그가 아니면
+   * 하위 명령으로 읽는다. 플래그로만 받으면 `--billing-sub status`가 되어 읽기 불편하고,
+   * 하위 명령이 있는 명령은 앞으로도 늘어난다.
+   */
+  let firstFlag = 1;
+  if (argv[1] !== undefined && !argv[1].startsWith("--")) {
+    options.billingSub = argv[1];
+    firstFlag = 2;
+  }
+
+  for (let i = firstFlag; i < argv.length; i += 1) {
     const flag = argv[i];
     const next = (): string => {
       const value = argv[i + 1];
@@ -186,6 +204,29 @@ export function parseArgs(argv: string[], defaultOutput: string): CliOptions {
         break;
       case "--p2-max-cost-usd":
         options.p2MaxCostUsd = parseCostLimit(next());
+        break;
+      case "--billing-sub":
+        options.billingSub = next();
+        break;
+      case "--from":
+        options.billingFrom = next();
+        break;
+      case "--entry":
+        options.billingEntry = next();
+        break;
+      case "--outcome": {
+        const v = next();
+        if (v !== "billed" && v !== "not_billed") {
+          throw new Error(`--outcome은 billed 또는 not_billed여야 합니다: ${v}`);
+        }
+        options.billingOutcome = v;
+        break;
+      }
+      case "--evidence":
+        options.billingEvidence = next();
+        break;
+      case "--actual-usd":
+        options.billingActualUsd = Number(next());
         break;
       case "--stage":
         options.stage = parseStage(next());
