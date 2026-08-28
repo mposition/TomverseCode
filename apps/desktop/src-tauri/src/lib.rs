@@ -160,6 +160,104 @@ async fn start_task(
     .map_err(|e| format!("태스크 실행 스레드 오류: {e}"))?
 }
 
+/// Fleet 시작 — **worktree 격리 기반 N개 병렬 실행**(process-architecture 11.6절).
+///
+/// # 화면이 상한을 정하지 않는다
+///
+/// 크기 상한(`MAX_FLEET_SIZE`)도 합계 예산도 Rust가 강제한다(`fleet::plan`). 화면은 그보다 큰
+/// 값을 받아 놓고 나중에 거부하지 않기 위해 상한을 **미리 물어서**(`fleet_status`의
+/// `maxFleetSize`) 입력을 막지만, 그것은 편의이고 판정이 아니다.
+///
+/// 예산 인자가 둘씩인 이유는 `start_task`와 같다 — **인자를 빠뜨린 화면이 상한을 조용히 끄지
+/// 못하게** 하는 것이 `resolve_budget`의 목적이다.
+#[tauri::command]
+async fn start_fleet(
+    app: tauri::AppHandle,
+    // `{ branch, message }`의 목록. 하나의 요청을 우리가 N개로 쪼개지 않는다 — N개를 주는 것은
+    // 사용자다(8.2절 "작업 분해"는 이후 깊이 확장 열이다).
+    members: Vec<FleetMemberInput>,
+    mode: String,
+    allow_git_commit: Option<bool>,
+    budget_usd: Option<f64>,
+    budget_unlimited: Option<bool>,
+    fleet_budget_usd: Option<f64>,
+    fleet_budget_unlimited: Option<bool>,
+    model_pins: Option<Value>,
+    unattended: Option<bool>,
+    auto_approve_verification: Option<bool>,
+    auto_approve_writes: Option<bool>,
+    deadline_secs: Option<u64>,
+    timeout_secs: Option<u64>,
+) -> Result<Value, String> {
+    let execution_mode = parse_mode(&mode)?;
+    let per_task = tomverse_core::budget::resolve_budget(budget_usd, budget_unlimited)?;
+    let fleet_cap = tomverse_core::budget::resolve_budget(fleet_budget_usd, fleet_budget_unlimited)
+        .map_err(|e| format!("Fleet 합계 상한: {e}"))?;
+    let specs: Vec<tomverse_core::fleet::MemberSpec> = members
+        .into_iter()
+        .map(|m| tomverse_core::fleet::MemberSpec {
+            branch: m.branch,
+            message: m.message,
+        })
+        .collect();
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(900));
+
+    // 태스크 실행은 승인 대기 때문에 오래 블록된다. 별도 스레드로 보내야 그 사이에
+    // `respond_approval` command가 처리될 수 있다 — 같은 스레드면 교착된다.
+    tauri::async_runtime::spawn_blocking(move || {
+        let session = app.state::<SessionState>();
+        session.start_fleet(
+            &app,
+            specs,
+            execution_mode,
+            allow_git_commit.unwrap_or(false),
+            per_task,
+            fleet_cap,
+            model_pins.unwrap_or(Value::Null),
+            unattended.unwrap_or(false),
+            auto_approve_verification.unwrap_or(false),
+            auto_approve_writes.unwrap_or(false),
+            deadline_secs.filter(|s| *s > 0),
+            timeout,
+        )
+    })
+    .await
+    .map_err(|e| format!("Fleet 실행 스레드 오류: {e}"))?
+}
+
+/// 화면이 보내는 구성원 하나. **브랜치 이름 규칙은 여기서 보지 않는다** — `worktree.rs`가
+/// 정본이고 `fleet::plan`이 그것을 부른다(규칙을 두 곳에 적으면 하나는 덜 검사된다).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FleetMemberInput {
+    branch: String,
+    message: String,
+}
+
+/// Fleet **전체** 취소. 구성원 하나의 취소와 다른 요청이다 — 이쪽은 대기열도 닫는다.
+#[tauri::command]
+fn cancel_fleet(state: tauri::State<'_, SessionState>) -> Result<Value, String> {
+    state.cancel_fleet()
+}
+
+/// 구성원 **하나**만 취소한다. 나머지는 계속 돈다.
+#[tauri::command]
+fn cancel_fleet_member(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
+    state.cancel_fleet_member(&task_id)
+}
+
+/// 기록에서 유도한 Fleet 상태 — 구성원별 결말과 **합계** 지출.
+#[tauri::command]
+fn fleet_status(state: tauri::State<'_, SessionState>, fleet_id: Option<String>) -> Result<Value, String> {
+    Ok(envelope(state.fleet_status(fleet_id.as_deref())))
+}
+
+/// 지금 밀려 있는 승인들 — 화면의 승인 **큐**가 이것을 정본으로 쓴다.
+#[tauri::command]
+fn pending_approvals(state: tauri::State<'_, SessionState>) -> Value {
+    state.pending_approvals()
+}
+
 /// ui-wireframes.md 3.3절 승인 모달의 응답. Node를 거치지 않고 Rust가 직접 받는다.
 #[tauri::command]
 fn respond_approval(
@@ -593,6 +691,11 @@ pub fn run() {
             delete_provider_credential,
             start_task,
             respond_approval,
+            pending_approvals,
+            start_fleet,
+            cancel_fleet,
+            cancel_fleet_member,
+            fleet_status,
             cancel_task,
             provide_user_input,
             force_abandon_task,
