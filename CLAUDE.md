@@ -131,6 +131,39 @@ docs/design/         설계 문서
 
 ## 빌드 및 실행
 
+### CI — 무엇이 자동으로 돌고 무엇이 사람 몫인가
+
+`.github/workflows/ci.yml`이 **리눅스 러너(ubuntu-24.04)에서 `npm run verify`를 끝까지 돌린다** —
+`desktop:check`와 `test:e2e`까지다. PR, main push, 주간 schedule, 수동 실행에서 돈다.
+
+**CI는 단계를 다시 나열하지 않는다.** 검증 진입점은 루트 `verify`와 `scripts\verify.bat` 둘이고,
+CI가 세 번째 목록이 되면 셋이 갈라진다(이 저장소는 `.bat`만 `_env.bat`을 call해서 **순서는 같은데
+환경 준비 의미가 다른** 상태를 이미 겪었다). CI는 `npm run verify` 한 줄만 부르고,
+`packages/toolchain/test/verifyOrder.test.ts`가 그 사실을 지킨다. 나머지 약속(락파일이 정본,
+Node 하한, 실패를 삼키지 않기, 캐시 없는 경로)은 `packages/toolchain/test/ciWorkflow.test.ts`에 있다.
+
+| 자동으로 돈다 | 여전히 사람 몫이다 |
+|---|---|
+| `npm ci` — 락파일 누락을 여기서 잡는다 | `scripts\verify.bat`(Windows 진입점) |
+| `build`·`typecheck`·`core:build`·`test`·`core:test` | `windows-landing` 착지 판정과 `--attest` — **리눅스 러너가 판정할 수 없는 것들이다**(Job Object, Credential Store, npm shim 해석, MSVC) |
+| `desktop:check` — 껍데기/core 드리프트 | `scripts\tauri-build.bat` 릴리스 번들과 `sidecar:stage`(핀된 node.exe가 필요하고 오래 걸린다) |
+| `test:e2e` — 실제 sidecar·호스트 왕복 | 가설 게이트 유료 실행(`gate:g:pilot`/`run`) — API 키와 예산 승인이 필요하다 |
+| | `cargo fmt --check` — verify에 없다 |
+
+**캐시가 감출 수 있는 것.** npm/cargo 캐시를 쓰지만, 이 저장소는 낡은 산출물 때문에 원인과 먼
+오류를 본 적이 있다(낡은 `.d.ts`로 컴파일되던 일). 그래서 **주간 schedule 실행은 캐시를 끄고**
+clean clone과 같은 경로로 돈다(`TOMVERSE_CI_CACHE=off`). 캐시 유무로 job을 나누지 않는다 —
+같은 job의 같은 단계 목록에서 캐시 **단계만** 건너뛴다. 급하면
+`workflow_dispatch`에 `cache: off`로 수동 실행할 수 있다.
+
+**`desktop:check`는 리눅스에서 돈다.** GUI **개발** 패키지(`libgtk-3-dev`,
+`libwebkit2gtk-4.1-dev`, `libjavascriptcoregtk-4.1-dev`, `libsoup-3.0-dev`,
+`libayatana-appindicator3-dev`, `librsvg2-dev`)를 설치하면 된다. `bundle.resources`가 가리키는
+`bundle/sidecar`는 **디렉터리만 있으면** 되고 이제 `scripts/ensureBundleSlot.mjs`가 만든다 —
+예전에는 그 자리를 `sidecar:stage`(릴리스 앞에서만 돈다)가 만들었기 때문에 clean clone의
+`npm run verify`가 여기서 반드시 죽었고, 그것을 "이 환경에서는 원래 실패한다"는 **사람이 기억하는
+예외**로 들고 있었다. 그 예외는 이제 없다.
+
 ### Node 쪽 (protocol, sidecar)
 
 ```bash

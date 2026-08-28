@@ -1,0 +1,118 @@
+# 리눅스 러너에서 `npm run verify`를 **끝까지** 돌린다.
+#
+# # 왜 있는가
+#
+# 이 저장소는 오랫동안 모든 검증이 "누군가 돌리는 것을 기억하는 것"에 기대고 있었고, 그 대가를
+# 두 번 치렀다. 껍데기 크레이트가 **컴파일되지 않는 채로** 커밋돼 있었고(`9ae5a7b`), 그 직전에는
+# `sidecarBundle` 테스트 둘이 리눅스에서 실패하는 채로 main에 있었다. 둘 다 "돌리면 보이는" 것이었다.
+#
+# # 왜 단계를 여기 다시 나열하지 않는가
+#
+# 검증 진입점은 루트 `npm run verify`와 `scripts\verify.bat` 둘이고, 이 파일은 **세 번째가
+# 되지 않는다.** 예전에 `.bat`만 `_env.bat`을 call해서 "단계 순서는 같은데 환경 준비 의미가
+# 다른" 상태가 만들어졌고, 그래서 한쪽만 통과했다. 여기서 단계를 풀어 적으면 같은 사고가
+# 되풀이된다 — CI는 `npm run verify` 한 줄만 부른다.
+# `packages/toolchain/test/verifyOrder.test.ts`가 이 파일이 단계를 나열하지 않는지 확인하고,
+# `packages/toolchain/test/ciWorkflow.test.ts`가 나머지 약속(락파일·Node 버전·삼키지 않기·
+# 캐시 없는 경로)을 지킨다.
+#
+# # 캐시가 감추는 것
+#
+# 이 저장소는 낡은 산출물 때문에 원인과 먼 오류를 본 적이 있다(낡은 `.d.ts`로 컴파일되던 일).
+# 그래서 캐시를 **끄고 도는 경로를 정기적으로 둔다** — 주간 schedule 실행에서는
+# `TOMVERSE_CI_CACHE`가 `off`가 되어 npm/cargo 캐시 단계가 통째로 건너뛰어진다.
+# 중요한 것은 그때도 **같은 job의 같은 단계 목록**을 탄다는 점이다. 캐시 유무로 job을 둘로
+# 나누면 그 둘이 갈라지고, 갈라진 사실은 둘 중 하나가 깨질 때까지 드러나지 않는다.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 매주 일요일 03:00 UTC — 캐시 없이 clean clone 경로를 그대로 태운다.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      cache:
+        description: "캐시 사용 여부. off면 clean clone과 같은 경로로 돈다"
+        type: choice
+        options: ["on", "off"]
+        default: "on"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  # main과 schedule 결과는 남긴다. PR은 새 push가 오면 이전 실행을 취소한다.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: verify (ubuntu)
+    runs-on: ubuntu-24.04
+    # e2e가 실제 sidecar 프로세스를 여럿 띄우므로 기본 6시간은 너무 관대하다.
+    timeout-minutes: 60
+    env:
+      TOMVERSE_CI_CACHE: ${{ github.event_name == 'schedule' && 'off' || inputs.cache || 'on' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # `desktop:check`가 요구하는 것. 예전에는 "리눅스에서는 껍데기를 검사할 수 없다"를
+      # 사람이 기억하는 예외로 들고 있었는데, 사실은 개발 패키지를 깔면 그대로 돈다.
+      # 이 목록은 추측이 아니라 **실제로 통과한 조합**이다 — 없으면 gdk-3.0을 못 찾아
+      # `gdk-sys` 빌드 스크립트에서 멈춘다.
+      - name: 네이티브 개발 패키지 (tauri 껍데기)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      # 루트 package.json의 engines.node 하한을 지킨다. 그 하한은 Rust의 MIN_NODE_MAJOR와
+      # nodeVersion.test.ts로 묶여 있고, 여기 버전은 ciWorkflow.test.ts가 그것과 대조한다.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Rust 툴체인
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: npm 캐시
+        if: env.TOMVERSE_CI_CACHE == 'on'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      # 두 워크스페이스 루트가 각자 target을 가진다(core는 자체 [workspace]다).
+      # restore-keys로 낡은 트리를 이어받을 수 있지만 cargo가 fingerprint로 판정하므로
+      # 결과가 달라지지 않는다 — 그래도 그 가정을 믿지 않기 위해 주간 cold 실행이 있다.
+      - name: cargo 캐시
+        if: env.TOMVERSE_CI_CACHE == 'on'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/desktop/src-tauri/core/target
+            apps/desktop/src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('apps/desktop/src-tauri/Cargo.lock', 'apps/desktop/src-tauri/core/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # 락파일이 정본이다. `npm install`은 락파일을 고쳐가며 통과하므로, 빠진 의존성이
+      # CI에서도 드러나지 않는다 — 이 저장소는 그 누락을 두 번 고쳤다.
+      - name: 의존성 설치
+        run: npm ci
+
+      - name: 전체 검증
+        run: npm run verify
