@@ -390,6 +390,12 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 - **HMAC은 비밀값을 키로 써야 의미가 있다.** credential binding이 salt를 HMAC 키로, API 키를
   메시지로 쓰고 있었다. salt는 공개값이므로 그 배치에서는 "키를 모르면 다이제스트를 만들 수 없다"가
   성립하지 않는다. 키를 HMAC 키로, 나머지를 메시지로 쓴다.
+- **저장소 안에서 만든 번들은 "떴다"만으로 검증되지 않는다.** Node의 모듈 해석은 찾을 때까지
+  상위 디렉터리를 거슬러 올라가므로, `apps/desktop/src-tauri/bundle/` 아래의 번들은 자기
+  `node_modules`가 비어 있어도 **저장소 루트의 것을 집어 정상 동작한다.** 설치본에는 그 상위가
+  없으니 거기서만 죽는다. 실측으로 확인했다 — 번들에서 grammar 하나를 지워도 적재가 성공했다.
+  판정 기준은 "해석되는가"가 아니라 **"번들 안으로 해석되는가"**여야 한다
+  (`scripts/stage-sidecar.mjs`의 `resolutionSmoke`).
 - **`tauri.conf.json`에는 `"//"` 주석 키를 둘 수 없다.** tauri의 스키마가
   `additionalProperties`를 **어느 깊이에서도** 막으므로 `bundle` 안에 두든 최상위에 두든
   `Additional properties are not allowed ('//resources' was unexpected)`로 빌드가 죽는다.

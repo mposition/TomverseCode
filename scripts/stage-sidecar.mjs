@@ -31,6 +31,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -331,6 +332,128 @@ function smokeTest(bundleDir, windows) {
   });
 }
 
+/**
+ * 번들이 **자기 안의 것만** 쓰는지 본다 — 그리고 grammar가 실제로 적재되는지도.
+ *
+ * # 왜 "뜬다"만으로는 부족한가 (실측으로 드러났다)
+ *
+ * 스테이징 트리는 저장소 **안에** 있고, Node의 모듈 해석은 찾을 때까지 상위 디렉터리를
+ * 거슬러 올라간다. 그래서 번들의 `node_modules`가 통째로 비어 있어도 저장소 루트의
+ * `node_modules`가 잡혀 **smoke가 통과한다.** 설치본에는 그 상위가 없으므로 거기서만 죽는다 —
+ * 개발에서는 보이지 않고 배포에서만 다르게 죽는, 이 저장소가 가장 경계하는 모양이다.
+ *
+ * 실제로 확인했다: 번들에서 `tree-sitter-python.wasm`을 지워도 적재는 성공했다.
+ * 저장소의 것을 집었기 때문이다.
+ *
+ * 그래서 판정 기준을 "해석되는가"가 아니라 **"번들 안으로 해석되는가"**로 둔다.
+ * 이건 위치와 무관하게 성립하므로 저장소 안에서 돌려도 뜻이 있다.
+ *
+ * # grammar를 따로 보는 이유
+ *
+ * grammar는 지연 적재라 `ping` 왕복이 건드리지 않는데, 잘라내기가 가장 과감한 곳이 정확히
+ * 여기다(`tree-sitter-wasms` 50개 중 45개를 버린다). 게다가 적재 실패는 **던지지 않는다**
+ * (폴백이 ripgrep이므로 태스크는 계속 돌아야 한다) — 빠져도 오류가 없고 증상은
+ * "그 언어만 심볼이 없다"는 조용한 저하다.
+ */
+function resolutionSmoke(bundleDir, windows, dependencies) {
+  const program = path.join(bundleDir, runtimeFileName(windows));
+  const entryUrl = pathToFileURL(path.join(bundleDir, ENTRY_FILE)).href;
+  const treeSitterUrl = pathToFileURL(path.join(bundleDir, "context", "treeSitter.js")).href;
+  const script = `
+    const { createRequire } = await import("node:module");
+    const require = createRequire(${JSON.stringify(entryUrl)});
+    const resolved = {};
+    for (const name of ${JSON.stringify(dependencies)}) {
+      // 루트 진입점이 없는 패키지가 있다(tree-sitter-wasms는 wasm 파일 묶음일 뿐이고,
+      // openai/anthropic은 서브패스만 export한다). 그건 결함이 아니라 그 패키지의 모양이므로,
+      // **원본에서도 같은 이유로 실패하는지**를 부모가 대조한다.
+      try { resolved[name] = require.resolve(name); }
+      catch (e) { resolved[name] = "UNRESOLVED:" + e.code; }
+    }
+    const m = await import(${JSON.stringify(treeSitterUrl)});
+    const grammars = {};
+    for (const id of Object.keys(m.WASM_BASENAME)) {
+      try { grammars[id] = m.resolveGrammarPath(id); }
+      catch (e) { grammars[id] = "ERROR: " + e.code; }
+    }
+    const set = await m.loadGrammars();
+    process.stdout.write(JSON.stringify({ resolved, grammars, report: set.report(), any: set.anyLoaded() }));
+  `;
+  const result = spawnSync(program, ["--input-type=module", "-e", script], {
+    encoding: "utf8",
+    timeout: 60_000,
+    cwd: bundleDir,
+  });
+  if (result.status !== 0) {
+    return { ok: false, detail: `해석 스크립트가 실패했습니다 (exit ${result.status}): ${result.stderr ?? ""}` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch {
+    return { ok: false, detail: `해석 결과를 읽지 못했습니다: ${result.stdout?.slice(0, 400)}` };
+  }
+
+  const inside = path.resolve(bundleDir) + path.sep;
+  const escapes = [];
+
+  // **디스크 존재부터 본다.** Node는 가장 가까운 `node_modules`를 먼저 보므로, 번들 안에
+  // 있는 패키지는 상위의 것에 가려질 수 없다. 즉 위로 새는 경우는 **복사하지 못한 패키지**뿐이고,
+  // 그건 해석을 돌리지 않아도 알 수 있다. (해석만으로 판정하면 루트를 export하지 않는
+  // 패키지에서 "실패"와 "샜다"를 구별할 수 없다.)
+  for (const name of dependencies) {
+    const marker = path.join(bundleDir, "node_modules", ...name.split("/"), "package.json");
+    if (!fs.existsSync(marker)) escapes.push(`${name} → 번들에 없음 (${marker})`);
+  }
+
+  // 원본(저장소)에서의 해석 가능성. **여기서 되는데 번들에서 안 되면** 우리가 진입점을
+  // 잘라낸 것이고, 양쪽 다 안 되면 그 패키지에 루트 진입점이 없는 것이다.
+  const fromSource = createRequire(pathToFileURL(path.join(REPO_ROOT, "packages", "sidecar", "dist", "src", ENTRY_FILE)));
+  for (const [name, where] of Object.entries(parsed.resolved)) {
+    if (typeof where === "string" && where.startsWith("UNRESOLVED:")) {
+      let resolvableAtSource = true;
+      try {
+        fromSource.resolve(name);
+      } catch {
+        resolvableAtSource = false;
+      }
+      if (resolvableAtSource) {
+        escapes.push(`${name} → 원본에서는 해석되는데 번들에서 안 됩니다 (${where}) — 진입점을 잘라냈습니까?`);
+      }
+      continue;
+    }
+    if (typeof where !== "string" || !path.resolve(where).startsWith(inside)) {
+      // 여기가 요점이다. "찾았다"가 아니라 "우리 것을 찾았다"여야 한다.
+      escapes.push(`${name} → 번들 밖 (${where})`);
+    }
+  }
+  for (const [id, where] of Object.entries(parsed.grammars)) {
+    if (typeof where !== "string" || where.startsWith("ERROR:")) {
+      escapes.push(`grammar ${id} → 해석 실패 (${where})`);
+    } else if (!path.resolve(where).startsWith(inside)) {
+      escapes.push(`grammar ${id} → 번들 밖 (${where})`);
+    }
+  }
+  if (escapes.length > 0) {
+    return {
+      ok: false,
+      detail:
+        `번들이 자기 밖의 모듈을 쓰고 있습니다 — 설치본에는 그 경로가 없습니다:\n  ${escapes.join("\n  ")}\n` +
+        "스테이징이 그 패키지를 빠뜨렸거나 잘라내기가 지나쳤습니다.",
+    };
+  }
+
+  const failed = Object.entries(parsed.report ?? {})
+    .filter(([, v]) => v && v.loaded === false)
+    .map(([k, v]) => `${k}: ${v.reason ?? "사유 없음"}`);
+  if (!parsed.any || failed.length > 0) {
+    return { ok: false, detail: `grammar 적재에 실패한 언어가 있습니다:\n  ${failed.join("\n  ")}` };
+  }
+
+  const counts = `의존성 ${Object.keys(parsed.resolved).length}개 · grammar ${Object.keys(parsed.grammars).length}개 · 언어 ${Object.keys(parsed.report ?? {}).length}개 적재`;
+  return { ok: true, detail: `전부 번들 안에서 해석됨 (${counts})` };
+}
+
 // ---- manifest 재료 ----
 
 function gitCommit() {
@@ -441,6 +564,12 @@ async function main() {
         );
       }
       log(`smoke 통과 — ${result.detail}`);
+
+      // **ping이 떴다는 것으로 충분하지 않다.** 스테이징 트리가 저장소 안에 있으면 모듈
+      // 해석이 위로 올라가 저장소의 node_modules를 집으므로, 번들이 비어 있어도 뜬다.
+      const resolution = resolutionSmoke(plan.bundleDir, windows, manifest.sidecar.dependencies);
+      if (!resolution.ok) fail(`해석 smoke 실패: ${resolution.detail}`);
+      log(`해석 smoke 통과 — ${resolution.detail}`);
     }
   }
 
