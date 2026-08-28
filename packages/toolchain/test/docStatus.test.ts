@@ -5,7 +5,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * 전략 문서의 자기 진단 표가 낡는 것을 막는다 — product-strategy.md 3.1절.
+ * 손으로 적은 상태 주장이 낡는 것을 막는다 — product-strategy.md 3.1절.
+ *
+ * 대상은 셋이다: 전략 문서의 **자기 진단 표**(3절), **출시 기준 표의 상태 행**(8.2절), 그리고
+ * **README의 "지금 동작하는 것" / "아직 없는 것"**. 셋 다 같은 마커 규칙과 같은 리더를 쓴다.
  *
  * # 왜 이 검사가 필요한가
  *
@@ -15,6 +18,14 @@ import { fileURLToPath } from "node:url";
  *
  * 실제로 네 행이 틀려 있었고 **전부 같은 방향으로** 틀렸다(있는 것을 없다고 말했다). 방향이
  * 한쪽으로 쏠린 이유는 분명하다: 만들면 코드가 늘고 표는 그대로 남는다.
+ *
+ * # README가 뒤늦게 들어온 이유
+ *
+ * 이 검사는 오래 **두 표만** 지켰고, README는 밖에 있었다. 그래서 예언대로 낡았다 —
+ * 2026-07-27 이후 손대지 않은 채 M1·M2·M3와 가설 게이트 판정을 전부 지나쳤고, 첫 사용자가
+ * 가장 먼저 읽는 문서가 "Tool Runtime(9개 도구)"·"Tree-sitter 없음"·"교차검증은 아직 측정 중"을
+ * 말하고 있었다. **검사 밖에 있는 문서는 검사가 있는 문서보다 빨리 낡는 것이 아니라, 낡은
+ * 사실이 드러나지 않는다** — 이 저장소가 루트 `test`에서 빠진 워크스페이스로 이미 배운 모양이다.
  *
  * # 왜 toolchain에 두는가
  *
@@ -26,12 +37,25 @@ import { fileURLToPath } from "node:url";
  *
  * 파일이 생기거나 사라진 것은 잡지만, **파일이 남아 있는데 그 안의 기능이 무의미해진 것**은
  * 못 잡는다. 그건 문장을 읽어야 아는 일이다. 목적은 판정을 대신하는 것이 아니라 가장 자주
- * 일어나는 낡는 방식을 자동으로 막는 것이다.
+ * 일어나는 낡는 방식(**만들어 놓고 문서를 안 고침**)을 자동으로 막는 것이다.
+ *
+ * README에는 한 가지가 더 있다. **"만들어졌다"와 "Windows 실기에서 확인됐다"는 다른 사실인데,
+ * 뒤의 것은 파일 존재로 판정되지 않는다** — 사람의 확인은 `docs/design/attestations/`의 기록으로
+ * 들어가고 그 파일 이름에는 커밋 해시가 붙는다(커밋이 바뀌면 만료되기 때문이다). 그래서
+ * 착지 항목의 마커는 "확인됐다"가 아니라 **"판정을 적는 자리가 있다"**만 지킨다. 그 자리를
+ * 지우면 이 검사가 실패하고, 확인이 끝났는데 README를 안 고친 것은 여전히 사람이 잡아야 한다.
+ *
+ * 그리고 **항목을 통째로 지운 것**도 못 잡는다(최소 개수 아래로 내려가기 전까지는). 8.2절 표는
+ * 기능 행이 재고 목록이라 "상태 행 없는 기능 행"을 잡을 수 있지만, README에는 무엇이 실려 있어야
+ * 하는지 말해주는 목록이 없다 — 그 재고는 8.2절 표이고, 그쪽은 이미 이 파일이 지킨다. 실측으로
+ * 확인한 것: 있는 파일을 `absent:`로, 없는 파일을 `present:`로, 마커를 지우고, 절 이름을 바꾸면
+ * **넷 다 실패한다.** 항목 하나를 지우는 것만 통과했고, 그것이 이 검사의 경계다.
  */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..", "..");
 const DOC = path.join(REPO_ROOT, "docs", "design", "product-strategy.md");
+const README = path.join(REPO_ROOT, "README.md");
 
 interface StatusRow {
   label: string;
@@ -81,8 +105,8 @@ function readStatusRows(): StatusRow[] {
   return readRows("| \u00a7");
 }
 
-function readRows(prefix: string): StatusRow[] {
-  const source = readFileSync(DOC, "utf8");
+function readRows(prefix: string, file: string = DOC): StatusRow[] {
+  const source = readFileSync(file, "utf8");
   const rows: StatusRow[] = [];
   for (const line of source.split("\n")) {
     if (!line.startsWith(prefix)) continue;
@@ -161,35 +185,109 @@ function markerPaths(line: string, kind: "present" | "absent"): string[] {
     .filter((p) => p.length > 0);
 }
 
-test("자기 진단 표의 모든 행이 반증할 파일을 함께 적는다", () => {
-  const rows = readStatusRows();
-  // 표를 못 찾았는데 통과하는 것을 막는다 — 제목이 바뀌거나 형식이 달라지면 0행이 된다.
-  assert.ok(rows.length >= 5, `상태표 행을 찾지 못했습니다 (${rows.length}행). 표 형식이 바뀌었습니까?`);
+/**
+ * README의 **항목 목록**을 같은 `StatusRow`로 읽는다.
+ *
+ * # 왜 표가 아니라 목록인가
+ *
+ * README는 사람이 읽는 문서라 상태를 표로 쓰지 않는다. 그래서 행 대신 **글머리 항목**을 읽되,
+ * 나머지는 두 표와 **같은 규칙·같은 마커 추출기**를 쓴다. 리더를 두 벌로 두면 갈라지고, 그
+ * 갈라짐은 **양쪽 다 통과하므로 드러나지 않는다** — 이 파일이 방금 그것을 겪었다(`readReleaseRows`
+ * 주석).
+ *
+ * # 왜 소제목으로 구간을 자르는가
+ *
+ * README 전체에서 `- `로 시작하는 줄을 세면 설계 원칙·제외 항목처럼 **상태 주장이 아닌 목록**이
+ * 함께 걸린다. 그것들에 마커를 요구하면 검사가 없는 결함을 보고하게 되고, 그러면 사람은 검사를
+ * 고치는 대신 **검사를 약하게 만든다.** 그래서 상태를 주장하는 두 절만 이름으로 집어 든다.
+ *
+ * 항목은 여러 줄로 이어질 수 있으므로(마커는 보통 마지막 줄에 있다) 다음 항목이나 구간 끝까지를
+ * **한 덩어리**로 모아 하나의 행으로 만든다.
+ */
+function readReadmeRows(heading: string): StatusRow[] {
+  const lines = readFileSync(README, "utf8").split("\n");
+  const start = lines.findIndex((l) => l.trim() === heading);
+  assert.notEqual(start, -1, `README에서 "${heading}" 절을 찾지 못했습니다`);
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((l) => l.startsWith("#"));
+  // 구간이 파일 끝까지 이어지면 다음 소제목이 없다 — 그건 형식이 바뀐 것이므로 실패로 만든다.
+  assert.notEqual(end, -1, `"${heading}" 다음 소제목을 찾지 못했습니다`);
+
+  const rows: StatusRow[] = [];
+  let block: string[] = [];
+  const flush = () => {
+    if (block.length === 0) return;
+    const text = block.join(" ");
+    rows.push({
+      label: labelOf(block[0]!),
+      status: text,
+      present: markerPaths(text, "present"),
+      absent: markerPaths(text, "absent"),
+    });
+    block = [];
+  };
+  for (const line of rest.slice(0, end)) {
+    if (line.startsWith("- ")) flush();
+    if (line.startsWith("- ") || block.length > 0) block.push(line.trim());
+  }
+  flush();
+  return rows;
+}
+
+/** 항목의 첫 줄에서 사람이 알아볼 이름만 — 실패 메시지가 어느 항목인지 말해야 한다. */
+function labelOf(first: string): string {
+  const mark = "*" + "*";
+  const open = first.indexOf(mark);
+  if (open !== -1) {
+    const close = first.indexOf(mark, open + mark.length);
+    if (close !== -1) return first.slice(open + mark.length, close).trim();
+  }
+  return first.slice(0, 40).trim();
+}
+
+/**
+ * **근거 없이 상태만 적는 항목은 실패다** — 세 대상이 공유하는 규칙.
+ *
+ * 마커가 없는 항목은 처음부터 이 검사의 시야 밖에 있고, **보이지 않는 항목은 실패하지 않으므로
+ * 빠진 사실도 드러나지 않는다.**
+ */
+function assertEveryRowHasEvidence(rows: StatusRow[], what: string, least: number): void {
+  // 0행인데 통과하는 것을 막는다 — 제목이나 형식이 바뀌면 아래 for가 빈 집합을 돈다.
+  assert.ok(rows.length >= least, `${what}을 ${rows.length}개만 읽었습니다. 형식이 바뀌었습니까?`);
   for (const row of rows) {
     assert.ok(
       row.present.length + row.absent.length > 0,
-      `"${row.label}" 행에 반증할 파일이 없습니다. 근거 없이 상태만 적는 행은 처음부터 검사 밖에 있습니다`
+      `${what}에 반증할 파일이 없는 항목이 있습니다: "${row.label}". ` +
+        `근거 없이 상태만 적는 항목은 처음부터 검사 밖에 있습니다`
     );
   }
-});
+}
 
-test("있다고 적은 것은 실제로 있고, 없다고 적은 것은 실제로 없다", () => {
-  const rows = readStatusRows();
+/** **있다고 적은 것은 있고, 없다고 적은 것은 없다** — 세 대상이 공유하는 규칙. */
+function assertMarkersMatchDisk(rows: StatusRow[], what: string): void {
   for (const row of rows) {
     for (const rel of row.present) {
       assert.ok(
         existsSync(path.join(REPO_ROOT, rel)),
-        `"${row.label}"이 있다고 적었는데 ${rel}가 없습니다. 옮겼거나 지웠다면 표를 함께 고칠 것`
+        `${what}: "${row.label}"이 있다고 적었는데 ${rel}가 없습니다. 옮겼거나 지웠다면 문서를 함께 고칠 것`
       );
     }
     for (const rel of row.absent) {
       assert.ok(
         !existsSync(path.join(REPO_ROOT, rel)),
-        `"${row.label}"을 미착수로 적었는데 ${rel}가 생겼습니다. 만들었으면 표를 고칠 것 — ` +
-          `표가 낡는 방식 중 가장 비싼 것이 "있는 것을 없다고 말하는" 쪽입니다`
+        `${what}: "${row.label}"을 없다고 적었는데 ${rel}가 생겼습니다. 만들었으면 문서를 고칠 것 — ` +
+          `문서가 낡는 방식 중 가장 비싼 것이 "있는 것을 없다고 말하는" 쪽입니다`
       );
     }
   }
+}
+
+test("자기 진단 표의 모든 행이 반증할 파일을 함께 적는다", () => {
+  assertEveryRowHasEvidence(readStatusRows(), "자기 진단 표(3절)의 행", 5);
+});
+
+test("있다고 적은 것은 실제로 있고, 없다고 적은 것은 실제로 없다", () => {
+  assertMarkersMatchDisk(readStatusRows(), "자기 진단 표(3절)");
 });
 
 test("두 방향 모두 실제로 검사되고 있다", () => {
@@ -268,33 +366,11 @@ test("출시 기준 표의 모든 기능 행에 상태 행이 있다", () => {
 });
 
 test("출시 기준 표의 상태 행도 반증할 파일을 적는다", () => {
-  const rows = readReleaseRows();
-  // 표를 못 찾았는데 통과하는 것을 막는다.
-  assert.ok(rows.length >= 10, `출시 기준 표의 상태 행을 ${rows.length}개만 읽었습니다. 형식이 바뀌었습니까?`);
-  for (const row of rows) {
-    assert.ok(
-      row.present.length + row.absent.length > 0,
-      `출시 기준 표에 근거 없는 상태 행이 있습니다: "${row.status.slice(0, 40)}…". ` +
-        `근거 없이 상태만 적는 행은 처음부터 검사 밖에 있습니다`
-    );
-  }
+  assertEveryRowHasEvidence(readReleaseRows(), "출시 기준 표(8.2절)의 상태 행", 10);
 });
 
 test("출시 기준 표도 있다/없다가 실제와 같다", () => {
-  for (const row of readReleaseRows()) {
-    for (const rel of row.present) {
-      assert.ok(
-        existsSync(path.join(REPO_ROOT, rel)),
-        `"${row.status.slice(0, 40)}…"이 있다고 적었는데 ${rel}가 없습니다`
-      );
-    }
-    for (const rel of row.absent) {
-      assert.ok(
-        !existsSync(path.join(REPO_ROOT, rel)),
-        `"${row.status.slice(0, 40)}…"을 없다고 적었는데 ${rel}가 생겼습니다. 만들었으면 표를 고칠 것`
-      );
-    }
-  }
+  assertMarkersMatchDisk(readReleaseRows(), "출시 기준 표(8.2절)");
 });
 
 /**
@@ -354,4 +430,69 @@ test("판정어 추출이 실제로 값을 가른다", () => {
   assert.equal(verdictOf(`${mark}부분${mark}(M3) — 어쩌고`), "부분");
   assert.equal(verdictOf("3사 어댑터 " + mark + "구현 완료" + mark), null);
   assert.equal(verdictOf("굵은 글씨가 없는 행"), null);
+});
+
+// ---- README — 첫 사용자가 가장 먼저 읽는 문서 ----
+
+/**
+ * README의 두 절 이름. **여기서만 적는다** — 절 이름이 바뀌면 리더가 못 찾고 실패하므로,
+ * 문서와 검사가 조용히 갈라지지 않는다.
+ */
+const README_WORKS = "### 지금 동작하는 것";
+const README_MISSING = "### 아직 없는 것";
+
+test("README의 상태 항목이 전부 반증할 파일을 함께 적는다", () => {
+  assertEveryRowHasEvidence(readReadmeRows(README_WORKS), `README "${README_WORKS}"의 항목`, 8);
+  assertEveryRowHasEvidence(readReadmeRows(README_MISSING), `README "${README_MISSING}"의 항목`, 4);
+});
+
+test("README가 있다고 적은 것은 있고, 없다고 적은 것은 없다", () => {
+  assertMarkersMatchDisk(readReadmeRows(README_WORKS), `README "${README_WORKS}"`);
+  assertMarkersMatchDisk(readReadmeRows(README_MISSING), `README "${README_MISSING}"`);
+});
+
+/**
+ * **두 방향이 README에서도 실제로 돌고 있는가.**
+ *
+ * "아직 없는 것" 절이 `present:`만 갖게 되면 위 검사는 절반만 도는데, 그 사실이 어디에도
+ * 나타나지 않는다 — 두 표에 대해 이미 같은 것을 지키고 있다. `absent:`가 하나도 없다는 것은
+ * 보통 "없다고 적은 것을 만들고 README에서 지웠다"가 아니라 **근거를 무른 쪽으로 바꿨다**는
+ * 뜻이다.
+ */
+test("README도 두 방향 모두 실제로 검사되고 있다", () => {
+  const works = readReadmeRows(README_WORKS);
+  const missing = readReadmeRows(README_MISSING);
+  assert.ok(
+    works.every((r) => r.present.length > 0),
+    `"${README_WORKS}"의 항목은 있다는 주장이므로 present 마커가 있어야 합니다`
+  );
+  assert.ok(
+    missing.some((r) => r.absent.length > 0),
+    `"${README_MISSING}"에 absent 마커가 하나도 없습니다 — 없다는 주장을 무엇이 반증합니까?`
+  );
+});
+
+/**
+ * **리더가 실제로 항목을 가르는가.**
+ *
+ * 여러 줄 항목을 한 덩어리로 모으는 부분이 고장 나면 증상이 조용하다 — 전부 한 행이 되거나
+ * 각 줄이 따로 행이 되고, 어느 쪽이든 위 검사들은 그럴듯한 개수를 세며 통과할 수 있다.
+ * 그래서 **덩어리 하나가 마커를 실제로 물고 있는지**와 **덩어리 수가 글머리 수와 같은지**를
+ * 따로 확인한다.
+ */
+test("README 리더가 항목 단위로 마커를 문다", () => {
+  const rows = readReadmeRows(README_MISSING);
+  const bullets = readFileSync(README, "utf8")
+    .split("\n")
+    .slice(1)
+    .join("\n");
+  const section = bullets.slice(bullets.indexOf(README_MISSING) + README_MISSING.length);
+  const untilNextHeading = section.slice(0, section.indexOf("\n#"));
+  const bulletCount = untilNextHeading.split("\n").filter((l) => l.startsWith("- ")).length;
+
+  assert.equal(rows.length, bulletCount, "글머리 수와 읽은 항목 수가 다릅니다 — 덩어리 나누기가 틀렸습니까?");
+  assert.ok(
+    rows.every((r) => r.label.length > 0),
+    "항목 이름을 하나도 읽지 못했습니다 — 실패 메시지가 어느 항목인지 말하지 못하게 됩니다"
+  );
 });
