@@ -656,13 +656,20 @@ Insight는 `ai` + `@ai-sdk/{openai,anthropic,google}`를 쓰고, Code는 공급�
 **구현했다**(20절). 그리고 만들고 나서야 분명해진 것이 있다: **위 다섯 중 둘은 Windows를
 기다릴 이유가 없다.**
 
-| 기준 | landing id | 지금 상태 | 왜 |
+| 기준 | landing id | 도구가 내는 상태 | 왜 |
 |---|---|---|---|
 | 1 | `storedThroughDpapi` | `needs_human` | Win32 API의 **동작**. Linux에서는 한 줄도 컴파일되지 않는다 |
 | 2 | `noPlaintextAtRest` | `needs_human` | 같음. 그리고 "무엇이 어디에 쓰였는가"는 그 머신에서만 볼 수 있다 |
 | 3 | `uiNeverHoldsTheKey` | **`passed`** | **소스 불변식**이다 — 아래 참조 |
 | 4 | `injectionStaysOnce` | **`passed`** | 같음 |
 | 5 | `productionStoreIsNotTheDevelopmentOne` | `needs_human` | 절반은 컴파일러가 지키고, 나머지 절반(실제로 그 종류가 열리는가)은 실행해야 안다 |
+
+**1·2·5는 커밋 `2ef2689`에서 확인했다** — 관측은
+[windows-landing-record.md 17절](./windows-landing-record.md), 기록은
+[`attestations/windows-landing-2ef2689.json`](./attestations/windows-landing-2ef2689.json)에
+있고 그 커밋에서 이 묶음의 판정은 `landed`다. 표의 상태를 고치지 않는 이유는 그것이
+**도구가 내는 값**이기 때문이다 — 사람의 확인은 커밋에 묶이므로 attestation 쪽에 있어야 하고,
+표에 `passed`라고 적어 두면 코드가 바뀐 뒤에도 그 글자가 남는다.
 
 3·4가 `passed`인 것은 `jobObject`의 `appNotInJob`과 같은 자리다. 다만 **그 둘이 통과라고
 말하려면 검사가 있어야 한다** — 산문으로 두면 다음 사람이 되살린다. 그래서 셋을 두었다:
@@ -686,11 +693,17 @@ Insight는 `ai` + `@ai-sdk/{openai,anthropic,google}`를 쓰고, Code는 공급�
 `needs_human` 셋은 사람의 확인으로 통과가 되고, 그 확인은 **그 커밋에서만** 유효하다.
 `passed` 둘은 적을 필요가 없다 — 적으면 "이미 기계가 통과로 판정했다"고 거절된다.
 
+~~그리고 그 확인이 아직 남아 있다.~~ → **`2ef2689`에서 적었다**:
+[`attestations/windows-landing-2ef2689.json`](./attestations/windows-landing-2ef2689.json).
+셋 다 accepted이고 묶음은 `landed`다. 태우지 못한 것 하나(설치본을 띄워 배너를 **눈으로**
+확인하는 것)는 attestation이 아니라 기록 17.4절에 있다 — 확인한 것과 확인하지 못한 것이
+다른 자리에 있어야 목록이 목록으로 남는다.
+
 ## 12. 미해결
 
 - ~~라우터가 `RoutingDecision`을 만들 때 사용자에게 모델 선택권을 얼마나 노출할지~~ → 15절에서 해결: **역할별 수동 지정을 태스크 단위로 노출하되, 지정은 힌트가 아니라 요구로 다룬다.** 지정과 예산 상한의 상호작용은 15.5절에서 닫았다 — 확실히 거부되는 조합은 **시작 전에** 말한다
 - ~~공급자별 어댑터 호환성 테스트 스위트 형태~~ → 14절에서 해결(`packages/sidecar/test/conformance.test.ts`). 스파이크 하네스를 확장하는 대신 **같은 표를 모든 어댑터에 돌리는** 형태로 만들었고, `fetch`를 주입해 **네트워크 없이 실제 어댑터를 태운다**. 첫 실행에서 실제 갈라짐 하나를 잡았다(14.2절). ~~남은 것: 새 공급자를 추가할 때 `ADAPTERS` 표에 넣는 것을 강제하는 장치는 없다~~ → 14.5절에서 닫았다. 모델 레지스트리에서 유도한 대조로 막고(표 누락 + 팩토리 분기 누락), **그 대조가 실제로 잡는지를 확인하는 검사**를 함께 둔다 — 대조 검사는 언제나 통과하는 방식으로 고장 나기 때문이다
-- ~~**BYOK에서 공급자 6개 = 자격증명 6개일 때 Rust 쪽 Credential Store / 가용성 확인 UX**~~ — **둘 다 닫혔다.** 가용성 확인은 17절(무료 조회로 자격증명을 확인하고, "조회된다"와 "호출된다"를 구별해서 말한다), Credential Store는 **20절에서 구현했다**(`core/src/credentials.rs`, `core/src/win_credentials.rs`). 착지 기준은 18절에 있고, 그중 셋은 여전히 Windows에서 사람이 확인해야 한다 — Job Object와 같은 성질이다(state-machine 20.5절). 남은 것은 **그 확인이고, 확인은 문서가 아니라 attestation 파일에 적는다**(18.2절).
+- ~~**BYOK에서 공급자 6개 = 자격증명 6개일 때 Rust 쪽 Credential Store / 가용성 확인 UX**~~ — **둘 다 닫혔다.** 가용성 확인은 17절(무료 조회로 자격증명을 확인하고, "조회된다"와 "호출된다"를 구별해서 말한다), Credential Store는 **20절에서 구현했다**(`core/src/credentials.rs`, `core/src/win_credentials.rs`). 착지 기준은 18절에 있고, 그중 셋은 Windows에서 사람이 확인해야 했다 — Job Object와 같은 성질이다(state-machine 20.5절). ~~남은 것은 **그 확인이다.**~~ → **`2ef2689`에서 태웠고 attestation 파일에 적었다**(18.2절, [기록 17절](./windows-landing-record.md)). 남은 것은 설치본의 배너를 **눈으로** 확인하는 것 하나다(기록 17.4절).
   되돌리기 비싼 결정 둘(**저장 형식**과 **트레이트 경계**)의 근거는 20.1·20.2절에 있다
 - ~~`evaluation` 데이터의 통계적 유의성 판단 기준 (표본 몇 개부터 라우팅에 반영할 것인가)~~ → 8.1절에서 해결. **문항이 임계를 물었지만 먼저 답해야 하는 것은 '무엇이 표본인가'였다**: `verificationPassRate`는 라우터가 만든 분포 위에서 재는 값이라 표본이 쌓여도 편향이 줄지 않고 신뢰구간만 좁아진다. 난이도가 상쇄되는 관측은 대조 실행에서의 정면 비교 하나뿐이며, 표본 단위는 쟁점이 아니라 **태스크**다(한 태스크의 쟁점들은 같은 두 초안에서 나오므로 독립이 아니다). 임계는 상수가 아니라 부호 검정에서 유도된다(α=0.05에서 n=5). `ModelEvaluation`을 `paired`/`unpaired`로 갈랐고 집계는 `tomverse-host metrics`의 `modelEvaluation`이 한다 — **새 계측 없이** 기존 세 이벤트를 이었으므로 과거 로그에도 적용된다. 남은 것: **라우터를 바꾸는 일 자체는 아직 하지 않았다** — `verdict`가 `separated`인 쌍이 실제로 생겼을 때가 그 시점이다
 - ~~사용자 워크스페이스별 공급자 허용 목록(기업용 데이터 주권 요구)이 Policy Gate와 어떻게 맞물리는지~~ → 16절에서 해결. 답은 **맞물리지 않는다**였다: 공급자 호출은 Policy Gate를 지나지 않으므로(HTTP는 Node가 직접 한다) 게이트에 규칙을 얹을 자리가 없고, 대신 **자격증명 주입 지점**이 게이트 역할을 한다. 남은 것: **이건 기업 통제가 아니라 사용자 자신의 가드레일이다**(BYOK에서는 사용자가 관리자다). 조직이 강제하는 정책이 되려면 라이선스/정책 백엔드가 목록을 내려줘야 하고, 그건 11절의 HTTP 계약(M6)에 딸린다
