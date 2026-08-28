@@ -58,6 +58,17 @@ packages/toolchain/  @tomverse/toolchain — 빌드 산출물 위치(Windows는 
                      MSVC 환경 준비, 워크스페이스 빌드 순서. sidecar e2e·가설 게이트·cargo
                      런처가 **같은 함수**를 쓴다 — 이 지식을 복사해 두었다가 두 곳만 틀려
                      Windows e2e가 깨진 적이 있다
+  node-runtime.json  **동봉하는 Node 런타임의 핀.** 설치본에 무엇이 들어가는지의 정본이며,
+                     빌드는 여기 적힌 sha256과 정확히 일치하는 바이트만 넣는다. 손으로 고치지
+                     말 것 — `npm run node-runtime:pin`이 GPG 서명을 allowlist
+                     (`node-signing-keys.json`)로 검증한 뒤에만 다시 쓴다. 근거는
+                     process-architecture.md 10.6절
+  js/nodeRuntime.mjs,
+  js/sidecarStage.mjs  동봉 번들의 **레이아웃과 스테이징 계획**. exec.mjs와 같은 이유로
+                     빌드하지 않는 일반 JavaScript다. 레이아웃 상수는 `launcher.rs`(찾는 쪽)와
+                     대조되고, 스테이징 자리는 `tauri.conf.json`과 대조된다 —
+                     `test/sidecarBundle.test.ts`가 **파일을 직접 읽어** 지킨다. 갈라지면
+                     증상이 "설치본이 조용히 PATH의 node로 돈다"라 눈에 띄지 않는다
   js/exec.mjs        **일반 JavaScript다. 빌드하지 않는다.** MSVC 환경 준비와 실행 파일 해석의
                      실제 구현이 여기 있고, src/msvc.ts와 src/nodeCli.ts는 타입만 붙여 재수출한다.
                      TypeScript에 두면 "Rust를 빌드하려면 TypeScript를 먼저 빌드해야 한다"는
@@ -80,7 +91,14 @@ apps/desktop/        Tauri 2 + React
                      spawn 시 1회다. 그 불변식을
                      `packages/toolchain/test/credentialBoundary.test.ts`가 소스에서 지킨다
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
-                     `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`/`windows-landing`.
+                     `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`/`fleet-status`/`windows-landing`.
+                     `fleet`은 **N개 병렬 실행**이다(구성원마다 worktree 하나). 각 구성원은 자기 트리를 게이트
+                     루트로 받는 **평범한 태스크**이며 Policy Gate에 분기가 없다. 어려운 것은 병렬 실행이 아니라
+                     process-architecture 11.2절의 셋이었다 — 승인 큐(`approvals.rs`), **합계 예산의 예약**
+                     (`fleet.rs`: 태스크당 상한과 별개이며, 태스크당 상한 없이는 걸 수 없다), 검증 직렬화
+                     (`verify.rs`의 레인 — 언제나 켜져 있다). Fleet 단위 상태는 새 테이블이 아니라
+                     `task_events`의 `FLEET_ENROLLED`이고, 그 이벤트는 `NODE_MAY_NOT_EMIT`이라 모델은
+                     Fleet을 시작할 수도 기록할 수도 없다.
                      `windows-landing`은 **Windows에서만 검증되는 동작의 착지 판정을 사람 머릿속에서 꺼낸 것**이다 —
                      Job Object·sidecar 번들·Credential Store·명령 해석(npm shim)·프로세스 그룹·경로 정규화·개발자 환경(MSVC)·Python 가상환경 여덟 묶음이고,
                      `cfg(windows)`/`Platform::Windows`를 쓰는 파일이 그 목록에 없으면 테스트가 실패한다.
@@ -254,7 +272,9 @@ TypeScript로 두면 "Rust를 빌드하려면 TypeScript를 먼저 빌드해야 
 | `scripts\cargo-build-core.bat` | `tomverse-host` 빌드 — e2e가 이 산출물을 요구한다 |
 | `scripts\cargo-check-desktop.bat` | Tauri 껍데기 크레이트 `cargo check` |
 | `scripts\msvc-env.bat` | `_env.bat`을 call한 뒤 **필요한 변수만** 출력. `set`으로 전체를 덤프하면 API 키가 버퍼에 들어간다 |
-| `scripts\tauri-build.bat` | Windows 배포 번들(.msi/.exe). 프런트엔드 빌드를 먼저 돌린다 |
+| `scripts\stage-sidecar.mjs` | 동봉 sidecar 스테이징 — 핀된 node.exe + sidecar dist + production 의존성. 끝나면 **그 트리로 sidecar를 실제로 띄워** ping 왕복을 받는다(잘라내기의 안전망). `npm run sidecar:stage` |
+| `scripts\pin-node-runtime.mjs` | 동봉 런타임 핀 회전. **gpg가 필요하다** — 빌드는 아니다(10.6절) |
+| `scripts\tauri-build.bat` | Windows 배포 번들(.msi/.exe). 프런트엔드 빌드와 **sidecar 스테이징**을 먼저 돌린다 — `bundle.resources`가 가리키는 디렉터리를 그 단계가 만들기 때문이다 |
 | `scripts\verify.bat` | 전체 검증 (Node 빌드/타입/테스트 + Rust + e2e). 하나라도 실패하면 즉시 멈춘다. **`_env.bat`을 call하지 않는다** — 미리 준비해 버리면 루트 `verify`와의 차이가 다시 감춰진다 |
 
 `tauri-build.bat`을 `verify.bat`에 넣지 않은 이유: 번들 빌드는 훨씬 오래 걸려서 매번 도는
@@ -385,6 +405,25 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 - **HMAC은 비밀값을 키로 써야 의미가 있다.** credential binding이 salt를 HMAC 키로, API 키를
   메시지로 쓰고 있었다. salt는 공개값이므로 그 배치에서는 "키를 모르면 다이제스트를 만들 수 없다"가
   성립하지 않는다. 키를 HMAC 키로, 나머지를 메시지로 쓴다.
+- **저장소 안에서 만든 번들은 "떴다"만으로 검증되지 않는다.** Node의 모듈 해석은 찾을 때까지
+  상위 디렉터리를 거슬러 올라가므로, `apps/desktop/src-tauri/bundle/` 아래의 번들은 자기
+  `node_modules`가 비어 있어도 **저장소 루트의 것을 집어 정상 동작한다.** 설치본에는 그 상위가
+  없으니 거기서만 죽는다. 실측으로 확인했다 — 번들에서 grammar 하나를 지워도 적재가 성공했다.
+  판정 기준은 "해석되는가"가 아니라 **"번들 안으로 해석되는가"**여야 한다
+  (`scripts/stage-sidecar.mjs`의 `resolutionSmoke`).
+- **`tauri.conf.json`에는 `"//"` 주석 키를 둘 수 없다.** tauri의 스키마가
+  `additionalProperties`를 **어느 깊이에서도** 막으므로 `bundle` 안에 두든 최상위에 두든
+  `Additional properties are not allowed ('//resources' was unexpected)`로 빌드가 죽는다.
+  `package.json`의 `exports`와 증상이 반대다 — 저쪽은 조용히 깨지고 이쪽은 요란하게 멈춘다.
+  동봉 설정의 근거는 `process-architecture.md` 10.6절과 `scripts/stage-sidecar.mjs` 머리말에 있다.
+- **`path.join("C:", "repo")`는 절대 경로가 아니다.** Windows에서 그건 `C:repo`(드라이브
+  **상대** 경로)가 되어 `path.relative`가 전혀 다른 답을 낸다. 테스트 픽스처에서 이걸 쓰면
+  Linux에서는 통과하고 Windows에서만 실패한다. 실행 중인 OS의 규칙으로 절대 경로를 만들려면
+  `path.resolve(path.sep, "...")`를 쓸 것.
+- **경로를 나누는 정규식의 `[\\/]`는 한 겹 벗겨지기 쉽고, 벗겨지면 Windows만 조용히 깨진다.**
+  `/[\/]/`가 되면 `\`로 이어진 경로가 **하나도 나뉘지 않아** 모든 항목이 "경로가 아니다"로
+  걸러진다 — 스테이징에서 실제로 그렇게 됐고, 계획은 성공을 돌려주고 복사할 것만 0개가 됐다.
+  `sidecarStage.mjs`의 `splitPath`처럼 `path.sep`과 `/`를 명시적으로 쪼개는 함수를 쓸 것.
 - **SQLite 뷰에는 `rowid`가 없다.** `tool_executions`처럼 뷰를 조회할 때 `ORDER BY rowid`는 런타임 오류다 — 정렬 기준이 될 컬럼을 뷰에 포함시켜야 한다.
 
 ## 관련 프로젝트

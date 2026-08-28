@@ -10,6 +10,12 @@ pushd "%~dp0.."
 
 rem Tauri가 dist/를 번들에 넣으므로 프런트엔드가 먼저 빌드되어 있어야 한다.
 call npm run build || goto :fail
+
+rem 동봉 sidecar 스테이징. **tauri build보다 먼저다** — tauri.conf.json의 bundle.resources가
+rem 가리키는 디렉터리를 이 단계가 만들기 때문이다. 없으면 tauri가 리소스를 못 찾아 실패한다.
+rem 별도 명령인 이유(스테이징만 따로 검증할 수 있어야 한다)는 process-architecture.md 10.6절.
+call npm run sidecar:stage || goto :fail
+
 call npx tauri build %* || goto :fail
 
 echo [tomverse] Tauri 번들 빌드 완료

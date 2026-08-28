@@ -617,6 +617,30 @@ pub struct ApprovalRequestItem {
     pub preview: Option<String>,
 }
 
+/// 이 승인이 **Fleet의 어느 구성원의 것인가** (process-architecture 11.6①).
+///
+/// # 왜 경로만으로 부족한가
+///
+/// `workspace_root`는 이미 격리 트리의 경로다. 그런데 Fleet의 트리 경로는 서로 한 글자만
+/// 다르고(`tomverse-feat-a` / `tomverse-feat-b`) 화면에서는 길이도 비슷하다. 세 개가 동시에
+/// 밀려 있을 때 사용자가 구별해야 하는 것은 경로가 아니라 **"넷 중 둘째, feat-b"** 같은
+/// 자리다. 원칙 6("보인 argv가 실행되는 것과 같다")은 같은 argv라도 대상 트리가 다르면 다른
+/// 동작이라는 점에서 이 표시가 없으면 절반만 성립한다.
+///
+/// **Node가 채울 수 없다**(`skip_deserializing`) — 승인 화면의 출처 표시를 sidecar가 지어낼
+/// 수 있으면 그 표시는 증거가 아니다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalOrigin {
+    #[serde(rename = "fleetId")]
+    pub fleet_id: String,
+    /// 1부터 센다 — 화면에 "2/4"로 그대로 나간다.
+    #[serde(rename = "memberIndex")]
+    pub member_index: usize,
+    #[serde(rename = "fleetSize")]
+    pub fleet_size: usize,
+    pub branch: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     #[serde(rename = "approvalId")]
@@ -634,6 +658,9 @@ pub struct ApprovalRequest {
     /// 기준이 여기다(`approvals.rs`).
     #[serde(rename = "workspaceRoot")]
     pub workspace_root: String,
+    /// Fleet 구성원의 요청이면 어느 구성원인가. 단일 태스크에서는 `None`이다.
+    #[serde(rename = "origin", skip_serializing_if = "Option::is_none", default, skip_deserializing)]
+    pub origin: Option<ApprovalOrigin>,
     pub items: Vec<ApprovalRequestItem>,
     #[serde(rename = "createdAt")]
     pub created_at: String,

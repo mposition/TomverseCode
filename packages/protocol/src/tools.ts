@@ -174,6 +174,23 @@ export interface ApprovalRequestItem {
   preview?: string;
 }
 
+/**
+ * 이 승인이 **Fleet의 어느 구성원의 것인가** (process-architecture.md 11.6①).
+ *
+ * `workspaceRoot`는 이미 격리 트리의 경로다. 그런데 Fleet의 트리 경로는 서로 한 글자만 다르고
+ * 화면에서 길이도 비슷하다 — 셋이 동시에 밀려 있을 때 사용자가 구별해야 하는 것은 경로가
+ * 아니라 **"넷 중 둘째, feat-b"** 같은 자리다.
+ *
+ * **Rust가 채운다.** sidecar가 지어낼 수 있으면 이 표시는 증거가 아니다.
+ */
+export interface ApprovalOrigin {
+  fleetId: string;
+  /** 1부터 센다 — 화면에 "2/4"로 그대로 나간다. */
+  memberIndex: number;
+  fleetSize: number;
+  branch: string;
+}
+
 export interface ApprovalRequest {
   approvalId: string;
   taskId: string;
@@ -185,6 +202,8 @@ export interface ApprovalRequest {
    * 워크스페이스의 것인지 검사하는 기준**이기도 하다(process-architecture.md 11절).
    */
   workspaceRoot: string;
+  /** Fleet 구성원의 요청이면 어느 구성원인가. 단일 태스크에서는 없다. */
+  origin?: ApprovalOrigin;
   items: ApprovalRequestItem[];
   createdAt: ISODateTime;
 }

@@ -73,6 +73,7 @@ impl EventSink for StderrSink {
     }
 }
 
+#[derive(Clone)]
 struct Args {
     command: String,
     workspace: PathBuf,
@@ -177,6 +178,27 @@ struct Args {
     /// 검사에 그치지 않고 **적용한다.** 기본값이 검사인 이유: 쓰는 쪽이 기본이면 실수의 대가가
     /// 워크스페이스에 남는다.
     apply: bool,
+
+    // ---- fleet 전용 (fleet.rs, process-architecture 11.6절) ----
+    /// `--member <branch>=<요청>` — 구성원 하나. **N개를 주는 것은 사용자다**(8.2절: 작업
+    /// 분해는 이후 깊이 확장 열이다).
+    fleet_members: Vec<tomverse_core::fleet::MemberSpec>,
+    /// Fleet **합계** 상한(USD). 태스크당 상한(`--budget-usd`)과 **별개다.**
+    fleet_budget_usd: Option<f64>,
+    /// 합계 상한 없음을 **명시**했는가. `budget.rs`와 같은 규칙 — 말하지 않은 것을 "없음의
+    /// 선택"으로 읽지 않는다.
+    fleet_budget_unlimited: bool,
+    /// Fleet id. 주지 않으면 만든다 — 기록에서 이 Fleet을 다시 찾는 열쇠다.
+    fleet_id: Option<String>,
+    /// **Fleet 전체**를 N ms 뒤에 취소한다. 구성원 하나를 취소하는 것과 **다른 요청**이므로
+    /// 플래그도 다르다(둘을 한 손잡이로 합치지 않는다).
+    ///
+    /// `--cancel-after-ms`와 같은 성질의 테스트 편의 기능이지만, **실행되는 취소 경로는 실제
+    /// 경로와 동일하다** — 같은 registry, 같은 `TaskHost::cancel_task`, 같은 `task.cancel`.
+    /// 화면이 붙으면 그 버튼이 여기와 같은 함수를 부른다.
+    cancel_fleet_after_ms: Option<u64>,
+    /// `--cancel-member-after-ms <branch>=<ms>` — **구성원 하나만** 취소한다.
+    cancel_member_after_ms: Vec<(String, u64)>,
 }
 
 #[cfg(test)]
@@ -298,6 +320,12 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         file: None,
         accept_fingerprint: None,
         apply: false,
+        fleet_members: Vec::new(),
+        fleet_budget_usd: None,
+        fleet_budget_unlimited: false,
+        fleet_id: None,
+        cancel_fleet_after_ms: None,
+        cancel_member_after_ms: Vec::new(),
     };
 
     while let Some(flag) = raw.next() {
@@ -315,6 +343,22 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--approve" => args.approve = value()?,
             "--worktree" => args.worktree = Some(value()?),
+            "--member" => args.fleet_members.push(parse_member(&value()?)?),
+            "--fleet" => args.fleet_id = Some(value()?),
+            "--fleet-budget-usd" => {
+                let raw = value()?;
+                args.fleet_budget_usd = Some(
+                    raw.parse::<f64>()
+                        .map_err(|_| format!("--fleet-budget-usd는 수여야 합니다: {raw}"))?,
+                )
+            }
+            "--fleet-budget-unlimited" => args.fleet_budget_unlimited = true,
+            "--cancel-fleet-after-ms" => {
+                let raw = value()?;
+                args.cancel_fleet_after_ms =
+                    Some(raw.parse::<u64>().map_err(|_| format!("--cancel-fleet-after-ms: {raw}"))?)
+            }
+            "--cancel-member-after-ms" => args.cancel_member_after_ms.push(parse_member_delay(&value()?)?),
             "--worktree-base" => args.worktree_base = Some(value()?),
             "--force" => args.force = true,
             "--mcp-server" => args.mcp_servers.push(parse_mcp_server(&value()?)?),
@@ -445,7 +489,7 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|ask|rollback|revert|pr|recover|tasks|show|blocked|autopilot-preview|decisions|withdraw|metrics|transmission|export|reproduce|worktree|windows-landing> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|ask|rollback|revert|pr|recover|tasks|show|blocked|autopilot-preview|decisions|withdraw|metrics|transmission|export|reproduce|worktree|fleet|fleet-status|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--skill <파일.json>] [--session <id>]\n\
      [--auto-approve-writes] [--auto-approve-verification]\n\
@@ -485,6 +529,17 @@ fn usage() -> String {
                  저쪽은 호스트가 **기다리기를 그만두는** 시각이지 태스크가 멈추는 시각이 아니다\n\
      worktree — 격리 트리 목록(JSON). [--worktree <branch>]를 주면 그 트리를 정리한다.\n\
                  커밋되지 않은 변경이 있으면 지우지 않고 사유를 낸다 — 버리려면 [--force]\n\
+     fleet --member <branch>=<요청> (반복) — **N개 병렬 실행.** 구성원마다 격리 트리를 하나씩\n\
+                 만들고, 각각은 자기 트리를 게이트 루트로 받는 **평범한 태스크**가 된다.\n\
+                 크기 상한 8. 결말은 구성원별로 보고되며 부분 실패를 성공으로 접지 않는다\n\
+     fleet --fleet-budget-usd <n> | --fleet-budget-unlimited — **합계 상한.** 태스크당 상한\n\
+                 (--budget-usd)과 별개이며, 둘 중 하나만으로는 총지출이 통제되지 않는다.\n\
+                 합계 상한을 걸려면 태스크당 상한도 있어야 한다(예약할 금액을 알아야 한다).\n\
+                 남은 예산으로 태스크당 상한을 예약할 수 없으면 **새 구성원을 시작하지 않는다**\n\
+     fleet --cancel-fleet-after-ms <n> / --cancel-member-after-ms <branch>=<n> —\n\
+                 **전체 취소와 하나 취소는 다른 요청이다.** 손잡이를 합치지 않는다\n\
+     fleet-status [--fleet <id>] — 기록에서 Fleet 구성원과 합계 지출을 읽는다. DB만 본다 —\n\
+                 크래시 후 \"무엇이 돌고 있었나\"의 답은 프로세스가 아니라 이벤트에 있다\n\
      ask     — 질문에 답한다(--message). **파일을 바꾸지 않는다** — 계획도 실행도 검증도\n\
                  하지 않고 모델을 한 번 부른다. 도구는 읽기 전용으로 좁혀 게이트에 꽂히므로,\n\
                  sidecar가 장악당해도 이 태스크는 파일을 바꿀 수 없다. `COMPLETED`가 아니라\n\
@@ -593,6 +648,32 @@ fn parse_mcp_server(spec: &str) -> Result<tomverse_core::mcp::McpServerConfig, S
         // 인자와 도구 이름이 같은 구분자를 쓰게 되어 서로 구별되지 않는다.
         tools: None,
     })
+}
+
+/// `--member <branch>=<요청>` — Fleet 구성원 하나.
+///
+/// **`=`를 처음 한 번만 나눈다.** 요청 문장에 `=`가 들어가는 것은 흔하고, 거기서 또 나누면
+/// 사용자가 적은 문장이 잘린 채 모델에게 간다 — 조용히 다른 요청이 되는 종류의 결함이다.
+fn parse_member(spec: &str) -> Result<tomverse_core::fleet::MemberSpec, String> {
+    let (branch, message) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--member 형식은 브랜치=요청 입니다: {spec}"))?;
+    Ok(tomverse_core::fleet::MemberSpec {
+        branch: branch.trim().to_string(),
+        message: message.to_string(),
+    })
+}
+
+/// `--cancel-member-after-ms <branch>=<ms>` — **구성원 하나만** 취소한다.
+fn parse_member_delay(spec: &str) -> Result<(String, u64), String> {
+    let (branch, ms) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--cancel-member-after-ms 형식은 브랜치=밀리초 입니다: {spec}"))?;
+    let ms = ms
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("--cancel-member-after-ms의 밀리초가 수가 아닙니다: {spec}"))?;
+    Ok((branch.trim().to_string(), ms))
 }
 
 /// `--mcp-tools 이름=도구1,도구2` — 그 서버에서 부를 수 있는 도구를 좁힌다 (32절).
@@ -931,7 +1012,7 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
             // 태스크가 하나뿐이라 워크스페이스 기본값과 같지만, **경로를 하나로 둔다** —
             // 두 경로면 언젠가 한쪽만 고쳐진다.
             host.begin_task(&task_id, policy_for_task, skill.as_ref())?;
-            let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id, skill.as_ref());
+            let final_result = run_task(&args, host.clone(), &workspace_id, &session_id, &task_id, skill.as_ref(), None);
             // **띄운 서버를 반드시 내린다.** 남기면 사용자가 모르는 프로세스가 계속 돈다.
             // 태스크가 실패해도 내려야 하므로 `?` 앞에서 한다.
             if let Some(pool) = &mcp {
@@ -1044,6 +1125,50 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
                 }
                 Err(e) => Err(e.to_string()),
             }
+        }
+
+        // Fleet — 구성원마다 격리 트리 하나. **호스트만 부른다**(fleet.rs, 22.3절과 같은 이유).
+        "fleet" => run_fleet(
+            &args,
+            root,
+            store,
+            artifacts,
+            approvals,
+            sink,
+            skill,
+            policy_for_task,
+            &db_path,
+        ),
+
+        // Fleet 조회 — **DB만 읽는다.** 크래시 후 "무엇이 돌고 있었나"에 답하는 자리이므로
+        // 실행 중인 프로세스가 아니라 이벤트에서 유도한다(원칙 7).
+        "fleet-status" => {
+            let guard = store.lock().unwrap();
+            let members = guard
+                .fleet_members(args.fleet_id.as_deref())
+                .map_err(|e| format!("Fleet 조회 실패: {e}"))?;
+            let mut cost = 0.0;
+            for member in &members {
+                cost += guard.task_cost_usd(&member.task_id).map(|(c, _, _)| c).unwrap_or(0.0);
+            }
+            // **`final_status`가 없으면 돌고 있었다.** 크래시로 죽은 것은 `recover`가
+            // `INTERRUPTED`로 확정하며, 그전까지는 "확정되지 않았다"가 정직한 답이다.
+            let unfinished: Vec<&str> = members
+                .iter()
+                .filter(|m| m.final_status.is_none())
+                .map(|m| m.task_id.as_str())
+                .collect();
+            println!(
+                "{}",
+                json!({
+                    "members": members,
+                    // 이름이 `fleetCostUsd`인 이유: 태스크 하나의 지출과 같은 이름으로 부르면
+                    // 화면이 둘을 구별할 수 없고, 그러면 참인 숫자가 답이 아니게 된다.
+                    "fleetCostUsd": cost,
+                    "unfinishedTaskIds": unfinished,
+                })
+            );
+            Ok(0)
         }
 
         "tasks" => {
@@ -1240,6 +1365,40 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
     }
 }
 
+/// Fleet 구성원 하나를 밖에서 멈추기 위한 손잡이.
+///
+/// # 왜 필요한가 — 취소가 N개 전부에 닿아야 한다
+///
+/// Rust 쪽 취소(`TaskHost::cancel_task`)는 task_id만 있으면 되지만, Node 쪽의 진행 중인 공급자
+/// 호출을 끊으려면 그 구성원의 `SidecarClient`가 필요하다. 클라이언트는 `run_task` **안에서**
+/// 만들어지므로, 만들어지는 즉시 여기에 걸어 둔다.
+///
+/// **취소가 클라이언트보다 먼저 올 수 있다.** 그때 `cancelled`가 이미 켜져 있으면 게시하는
+/// 쪽이 즉시 끊는다 — 켜지지 않았다고 가정하면 "시작 직후 Fleet 취소"에서 그 구성원만 살아남는다.
+#[derive(Default)]
+struct MemberControl {
+    client: Mutex<Option<Arc<SidecarClient>>>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl MemberControl {
+    /// Node 쪽 취소. Rust 쪽은 `TaskHost::cancel_task`가 따로 한다 — 둘 다 필요하다.
+    fn cancel_sidecar(&self, task_id: &str) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        let client = self.client.lock().unwrap().clone();
+        if let Some(client) = client {
+            let _ = client.request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5));
+        }
+    }
+
+    fn publish(&self, task_id: &str, client: &Arc<SidecarClient>) {
+        *self.client.lock().unwrap() = Some(client.clone());
+        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = client.request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5));
+        }
+    }
+}
+
 fn run_task(
     args: &Args,
     host: Arc<TaskHost>,
@@ -1249,6 +1408,8 @@ fn run_task(
     // **이미 읽은 것을 받는다.** 여기서 파일을 다시 읽으면 정책에 꽂힌 것과 sidecar로 보내는
     // 것이 서로 다른 시점의 파일이 될 수 있다.
     skill: Option<&tomverse_core::skills::Skill>,
+    // Fleet 구성원이면 밖에서 멈출 수 있게 클라이언트를 걸어 둘 자리. 단일 태스크는 `None`이다.
+    control: Option<Arc<MemberControl>>,
 ) -> Result<Value, String> {
     // 진입점도 인터프리터도 **launcher가 정한다**(launcher.rs). 여기서 따로 찾으면
     // 헤드리스 호스트와 데스크톱 앱이 서로 다른 규칙으로 sidecar를 띄우게 되고,
@@ -1283,6 +1444,11 @@ fn run_task(
     let config = tomverse_core::launcher::config_from(&launcher, env);
     let client = SidecarClient::spawn(config, host.clone())
         .map_err(|e| format!("sidecar를 spawn할 수 없습니다: {e}\n{}", launcher.describe_failure()))?;
+
+    // **만들어지는 즉시 건다.** 뒤로 미루면 그 사이의 Fleet 취소가 이 구성원을 놓친다.
+    if let Some(control) = &control {
+        control.publish(task_id, &client);
+    }
 
     // process-architecture.md 5절 — ready 대기 타임아웃 10초.
     let ready = client.wait_ready(Duration::from_secs(10))?;
@@ -1516,6 +1682,582 @@ fn run_task(
             Ok(json!({ "status": "failed", "summary": message, "taskId": task_id }))
         }
     }
+}
+
+
+// ---- Fleet — worktree 격리 기반 N개 병렬 실행 (fleet.rs, process-architecture 11.6절) ----
+
+/// 구성원별로 이벤트에 **누구의 것인지** 붙여 내보낸다.
+///
+/// N개가 동시에 돌면 stderr가 섞인다. 섞인 로그에서 "3개가 실패했다"를 읽어내는 것은 사람의
+/// 일이 되고, 그러면 부분 실패가 조용해진다 — 이 제품이 팔지 않기로 한 바로 그것이다.
+struct MemberSink {
+    inner: Arc<dyn EventSink>,
+    label: String,
+}
+
+impl EventSink for MemberSink {
+    fn emit(&self, channel: &str, payload: &Value) {
+        self.inner.emit(&format!("{}·{channel}", self.label), payload);
+    }
+}
+
+/// 한 구성원이 끝났다는 소식.
+struct MemberDone {
+    index: usize,
+    status: String,
+    summary: String,
+    finished_at: String,
+}
+
+/// 도는 중인 구성원.
+struct RunningMember {
+    branch: String,
+    task_id: String,
+    host: Arc<TaskHost>,
+    control: Arc<MemberControl>,
+    reserved_usd: Option<f64>,
+    worktree_path: String,
+    started_at: String,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// Fleet 실행.
+///
+/// # 각 구성원은 **평범한 태스크다**
+///
+/// 자기 worktree를 게이트 루트로 받는 것 말고는 `run`과 한 글자도 다르지 않다 — 같은
+/// `TaskHost`, 같은 Policy Gate, 같은 Tool Runtime, 같은 sidecar 계약. Policy Gate에 "Fleet
+/// 모드" 분기를 만들지 않은 것이 요점이다(22.1절이 worktree에서 한 결정과 같다): 분기를 만들면
+/// 게이트가 두 규칙을 갖고, 둘 중 하나는 언젠가 덜 검사되며 그 순간 우회 지점이 된다.
+///
+/// # 왜 프로세스가 아니라 스레드인가
+///
+/// 구성원을 별도 `tomverse-host` 프로세스로 띄우면 세 가지가 프로세스 경계를 넘어야 한다:
+/// 승인 큐, 합계 예산 원장, 검증 레인. 셋 다 **파일 잠금이나 새 IPC 채널**을 요구하고, 그
+/// 코드는 이 환경에서 동작을 검증할 수 없다(플랫폼별 잠금 API — `win_job.rs`가 남긴 교훈).
+/// 스레드로 두면 셋 다 프로세스 안의 평범한 자료구조가 되고, **검증할 수 있는 것이 된다.**
+///
+/// 그러면서도 "여러 프로세스가 실제로 동시에 돈다"는 사실은 그대로다 — 구성원마다 **자기
+/// sidecar 프로세스**가 뜨고 그 아래에서 검증 명령이 돈다. 병렬성은 거기 있다.
+///
+/// # 자격증명 노출면 (11.6④)
+///
+/// 11.3절은 워크스페이스마다 sidecar를 살려두는 것을 거부했다. 근거는 **아무 일도 하지 않는
+/// 프로세스가 키를 들고 있다**는 것이었고, 그 조건이 Fleet에서는 성립하지 않는다: 여기 있는
+/// sidecar는 전부 사용자가 방금 시작한 태스크를 돌리고 있고, 태스크가 끝나면 즉시 내려간다.
+/// 사본 수는 `MAX_FLEET_SIZE`로 묶여 있고 수명은 일의 수명이다. 11.3절의 두 번째 근거(공유
+/// sidecar가 게이트 루트를 요청마다 정하게 만든다)는 **그대로 지켜진다** — 구성원마다 sidecar가
+/// 하나씩이고 각각 루트가 하나뿐이다. 즉 Fleet은 11.3절을 어기는 것이 아니라 만족한다.
+#[allow(clippy::too_many_arguments)]
+fn run_fleet(
+    args: &Args,
+    repo: WorkspaceRoot,
+    store: Arc<Mutex<Store>>,
+    artifacts: ArtifactStore,
+    approvals: Arc<dyn ApprovalGateway>,
+    sink: Arc<dyn EventSink>,
+    skill: Option<tomverse_core::skills::Skill>,
+    policy: TaskPolicy,
+    db_path: &Path,
+) -> Result<i32, String> {
+    use tomverse_core::fleet::{Admission, FleetBudget, MemberReport};
+
+    if args.worktree.is_some() {
+        // 격리 트리는 구성원마다 하나씩 만들어진다. 여기에 또 하나를 주면 "어느 트리에서
+        // 도는가"의 답이 둘이 되고, 둘 중 하나는 거짓이다.
+        return Err("fleet은 구성원마다 격리 트리를 만듭니다 — --worktree와 함께 쓸 수 없습니다".to_string());
+    }
+    // **합계 상한도 "말하지 않은 것"과 "없음"을 구별한다**(budget.rs와 같은 규칙). 인자를
+    // 빠뜨린 호출이 합계 상한을 조용히 끄면, 그 순간 이 기능의 출시 기준("비용 상한")이 거짓이 된다.
+    let cap_usd = tomverse_core::budget::resolve_budget(
+        args.fleet_budget_usd,
+        Some(args.fleet_budget_unlimited),
+    )
+    .map_err(|e| format!("Fleet 합계 상한: {e}"))?;
+
+    let fleet_id = args
+        .fleet_id
+        .clone()
+        .unwrap_or_else(|| format!("fleet-{}", uuid::Uuid::new_v4()));
+    let plan = tomverse_core::fleet::plan(
+        &fleet_id,
+        args.fleet_members.clone(),
+        args.budget_usd,
+        cap_usd,
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 취소 지연이 가리키는 브랜치가 실제로 있는지 **시작 전에** 본다. 오타를 통과시키면
+    // "취소를 걸었는데 아무 일도 없었다"가 되고, 그건 취소가 동작하지 않는 것과 구별되지 않는다.
+    for (branch, _) in &args.cancel_member_after_ms {
+        if !plan.members.iter().any(|m| &m.branch == branch) {
+            return Err(format!("--cancel-member-after-ms가 가리키는 구성원이 없습니다: {branch}"));
+        }
+    }
+
+    let session_id = args
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("sess-{}", uuid::Uuid::new_v4()));
+    let parent_dir = worktree_parent_dir(args);
+    // **취소 등록부를 공유한다.** 구성원마다 따로 두면 Fleet 전체 취소가 각 호스트를 찾아다녀야
+    // 하고, 그 목록이 곧 두 번째 진실의 원천이 된다.
+    let cancels = Arc::new(CancellationRegistry::new());
+    let mut budget = FleetBudget::from_plan(&plan);
+
+    let size = plan.members.len();
+    eprintln!(
+        "Fleet {fleet_id}: 구성원 {size}개 (최대 {}), 태스크당 상한 {}, 합계 상한 {}",
+        tomverse_core::fleet::MAX_FLEET_SIZE,
+        args.budget_usd.map(|v| format!("${v}")).unwrap_or_else(|| "없음".into()),
+        cap_usd.map(|v| format!("${v}")).unwrap_or_else(|| "없음".into()),
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel::<MemberDone>();
+    let mut reports: Vec<Option<MemberReport>> = (0..size).map(|_| None).collect();
+    let mut running: std::collections::HashMap<usize, RunningMember> = std::collections::HashMap::new();
+    let mut next = 0usize;
+
+    // **Fleet 전체 취소는 구성원 하나의 취소와 다른 요청이다.** 손잡이를 합치지 않는다.
+    //
+    // **아직 시작하지 않은 구성원에도 닿아야 한다.** 도는 것만 멈추고 대기열은 그대로 두면,
+    // 취소를 누른 뒤에 새 태스크가 시작된다 — 사용자가 요청한 것의 정반대다. 그래서 취소는
+    // 도는 구성원을 멈추는 것과 **대기열을 닫는 것** 둘 다 한다.
+    let cancel_all: Arc<Mutex<Vec<(String, Arc<MemberControl>, Arc<TaskHost>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let fleet_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(delay) = args.cancel_fleet_after_ms {
+        let registry = cancel_all.clone();
+        let flag = fleet_cancelled.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay));
+            // **대기열을 먼저 닫는다.** 나중에 닫으면 그 사이에 하나가 더 시작될 수 있고,
+            // 그 구성원은 취소 목록에 없으므로 끝까지 돈다.
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            // 스냅샷을 떠서 잠금을 놓고 취소한다 — 취소가 sidecar 왕복을 기다리는 동안
+            // 잠금을 쥐고 있으면 새로 시작하는 구성원이 등록되지 못한다.
+            let members = registry.lock().unwrap().clone();
+            eprintln!("Fleet 전체 취소: 구성원 {}개", members.len());
+            for (task_id, control, host) in members {
+                if let Err(message) = host.cancel_task(&task_id) {
+                    eprintln!("취소 요청 실패({task_id}): {message}");
+                }
+                control.cancel_sidecar(&task_id);
+            }
+        });
+    }
+
+    loop {
+        // ---- 들여보낼 수 있는 만큼 들여보낸다 ----
+        while next < size {
+            // **취소된 Fleet은 새 구성원을 시작하지 않는다.** 도는 것만 멈추면 취소를 누른
+            // 뒤에 태스크가 시작되고, 그건 사용자가 요청한 것의 정반대다.
+            if fleet_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                let index = next;
+                next += 1;
+                let spec = &plan.members[index];
+                let reason = "Fleet이 취소되어 시작하지 않았습니다".to_string();
+                eprintln!("구성원 미시작({}): {reason}", spec.branch);
+                let task_id = format!("task-{}", uuid::Uuid::new_v4());
+                if let Err(message) = record_unstarted_member(
+                    &store, &repo, &session_id, &fleet_id, size, index, spec, &task_id,
+                    "fleet_cancelled", &reason,
+                ) {
+                    eprintln!("미시작 구성원 기록 실패: {message}");
+                }
+                reports[index] = Some(MemberReport::not_started(index, &spec.branch, &task_id, reason));
+                continue;
+            }
+            match budget.try_admit() {
+                Admission::Admitted { reserved_usd } => {
+                    let index = next;
+                    next += 1;
+                    let spec = plan.members[index].clone();
+                    match start_member(
+                        args,
+                        &repo,
+                        &parent_dir,
+                        &store,
+                        &artifacts,
+                        &approvals,
+                        &sink,
+                        &cancels,
+                        skill.clone(),
+                        policy.clone(),
+                        &fleet_id,
+                        size,
+                        index,
+                        &spec,
+                        &session_id,
+                        reserved_usd,
+                        tx.clone(),
+                    ) {
+                        Ok(member) => {
+                            cancel_all.lock().unwrap().push((
+                                member.task_id.clone(),
+                                member.control.clone(),
+                                member.host.clone(),
+                            ));
+                            if let Some((_, delay)) =
+                                args.cancel_member_after_ms.iter().find(|(b, _)| *b == spec.branch)
+                            {
+                                let task_id = member.task_id.clone();
+                                let control = member.control.clone();
+                                let host = member.host.clone();
+                                let delay = *delay;
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(Duration::from_millis(delay));
+                                    eprintln!("구성원 취소: {task_id}");
+                                    if let Err(message) = host.cancel_task(&task_id) {
+                                        eprintln!("취소 요청 실패({task_id}): {message}");
+                                    }
+                                    control.cancel_sidecar(&task_id);
+                                });
+                            }
+                            running.insert(index, member);
+                        }
+                        Err(message) => {
+                            // **시작에 실패한 것도 결말이다.** 예약을 돌려주지 않으면 남은
+                            // 구성원들이 있지도 않은 지출에 막힌다.
+                            budget.settle(reserved_usd, 0.0);
+                            eprintln!("구성원 시작 실패({}): {message}", spec.branch);
+                            reports[index] = Some(MemberReport {
+                                index,
+                                branch: spec.branch.clone(),
+                                task_id: String::new(),
+                                admitted: false,
+                                worktree_path: None,
+                                status: "failed".to_string(),
+                                summary: message,
+                                cost_usd: 0.0,
+                                reserved_usd: None,
+                                started_at: None,
+                                finished_at: Some(tomverse_core::time::now_iso()),
+                            });
+                        }
+                    }
+                }
+                Admission::Refused {
+                    cap_usd,
+                    committed_usd,
+                    reserved_usd,
+                    per_task_usd,
+                } => {
+                    if budget.waiting_could_help() {
+                        // 도는 구성원이 정산되면 자리가 생길 수 있다. 지금 거부로 확정하지 않는다.
+                        break;
+                    }
+                    // **영원히 자리가 없다.** 합계 상한이 걸렸으므로 새 태스크를 시작하지 않는다.
+                    let index = next;
+                    next += 1;
+                    let spec = &plan.members[index];
+                    let reason = format!(
+                        "Fleet 합계 상한(${cap_usd:.2})이 남지 않아 시작하지 않았습니다 \
+                         (확정 지출 ${committed_usd:.4} + 예약 ${reserved_usd:.4} + 태스크당 상한 ${per_task_usd:.2})"
+                    );
+                    eprintln!("구성원 미시작({}): {reason}", spec.branch);
+                    let task_id = format!("task-{}", uuid::Uuid::new_v4());
+                    if let Err(message) = record_unstarted_member(
+                        &store, &repo, &session_id, &fleet_id, size, index, spec, &task_id,
+                        "fleet_budget_exhausted", &reason,
+                    ) {
+                        eprintln!("미시작 구성원 기록 실패: {message}");
+                    }
+                    reports[index] = Some(MemberReport::not_started(index, &spec.branch, &task_id, reason));
+                }
+            }
+        }
+
+        if running.is_empty() {
+            break;
+        }
+
+        // ---- 하나가 끝나기를 기다린다 ----
+        let done = rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))?;
+        let member = running.remove(&done.index).expect("도는 구성원");
+        let _ = member.handle.join();
+        // **비용은 저장소가 말한다.** Node의 주장이 아니라 `provider_usage` 행이다 —
+        // 합계 상한의 근거가 sidecar에 있으면 장악당한 sidecar가 상한을 지웠다고 말할 수 있다.
+        let (cost_usd, _, _) = store
+            .lock()
+            .unwrap()
+            .task_cost_usd(&member.task_id)
+            .unwrap_or((0.0, 0, 0));
+        budget.settle(member.reserved_usd, cost_usd);
+        let _ = member.host.append_event(
+            &member.task_id,
+            "FLEET_MEMBER_SETTLED",
+            json!({
+                "fleetId": fleet_id,
+                "branch": member.branch,
+                "memberIndex": done.index + 1,
+                "status": done.status,
+                "costUsd": cost_usd,
+                "reservedUsd": member.reserved_usd,
+                "fleetCommittedUsd": budget.committed_usd(),
+            }),
+        );
+        eprintln!(
+            "구성원 종료: {} → {} (${cost_usd:.4}) / Fleet 합계 ${:.4}",
+            member.branch,
+            done.status,
+            budget.committed_usd()
+        );
+        reports[done.index] = Some(MemberReport {
+            index: done.index,
+            branch: member.branch,
+            task_id: member.task_id,
+            admitted: true,
+            worktree_path: Some(member.worktree_path),
+            status: done.status,
+            summary: done.summary,
+            cost_usd,
+            reserved_usd: member.reserved_usd,
+            started_at: Some(member.started_at),
+            finished_at: Some(done.finished_at),
+        });
+    }
+
+    let members: Vec<MemberReport> = reports
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.unwrap_or_else(|| {
+                MemberReport::not_started(i, &plan.members[i].branch, "", "결말이 기록되지 않았습니다".to_string())
+            })
+        })
+        .collect();
+    let report = tomverse_core::fleet::FleetReport::build(
+        &fleet_id,
+        members,
+        &budget,
+        tomverse_core::verify::lane_stats(),
+    );
+    for notice in report.notices() {
+        eprintln!("{notice}");
+    }
+    println!(
+        "{}",
+        json!({
+            "fleet": report,
+            "dbPath": db_path.to_string_lossy(),
+            "sessionId": session_id,
+        })
+    );
+    // **부분 실패를 성공으로 접지 않는다.**
+    Ok(if report.all_completed() { 0 } else { 1 })
+}
+
+/// 합계 상한이 남지 않아 시작하지 못한 구성원을 **기록으로 남긴다**(원칙 7).
+///
+/// 기록하지 않으면 그 구성원은 화면에서 사라진다 — 사용자는 자기가 N개를 요청했는데 결말이
+/// N-1개인 것을 보게 되고, 없어진 하나가 실패인지 시작조차 안 한 것인지 알 방법이 없다.
+/// 그리고 나중에 기록을 여는 사람에게는 **그 태스크가 아예 존재한 적 없는 것**이 된다.
+#[allow(clippy::too_many_arguments)]
+fn record_unstarted_member(
+    store: &Arc<Mutex<Store>>,
+    repo: &WorkspaceRoot,
+    session_id: &str,
+    fleet_id: &str,
+    fleet_size: usize,
+    index: usize,
+    spec: &tomverse_core::fleet::MemberSpec,
+    task_id: &str,
+    // 사유 **코드**. 문장과 따로 두는 이유: 기록을 읽는 쪽이 문장을 다시 뜯게 하지 않는다.
+    reason_code: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let workspace_id = tomverse_core::paths::workspace_id_for(&repo.display());
+    let mut guard = store.lock().unwrap();
+    guard
+        .upsert_session(session_id, &workspace_id, Some("fleet"))
+        .map_err(|e| e.to_string())?;
+    // **본체 경로로 만든다.** 시작하지 않았으므로 격리 트리도 만들지 않았고, 있지도 않은
+    // 경로를 기록에 적으면 그 기록을 여는 사람이 없는 디렉터리를 찾게 된다.
+    guard
+        .create_task(task_id, session_id, &workspace_id, &repo.display(), "verified", &spec.message)
+        .map_err(|e| e.to_string())?;
+    guard
+        .append_event(
+            task_id,
+            "FLEET_ENROLLED",
+            &json!({
+                "fleetId": fleet_id,
+                "branch": spec.branch,
+                "memberIndex": index + 1,
+                "fleetSize": fleet_size,
+                "admitted": false,
+                "reason": reason,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    guard
+        .finish_task(
+            task_id,
+            "REJECTED",
+            "TASK_REJECTED",
+            None,
+            &json!({ "reason": reason_code, "detail": reason }),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 구성원 하나를 시작한다: worktree 확보 → 태스크 생성 → 등록 이벤트 → 스레드.
+#[allow(clippy::too_many_arguments)]
+fn start_member(
+    args: &Args,
+    repo: &WorkspaceRoot,
+    parent_dir: &Path,
+    store: &Arc<Mutex<Store>>,
+    artifacts: &ArtifactStore,
+    approvals: &Arc<dyn ApprovalGateway>,
+    sink: &Arc<dyn EventSink>,
+    cancels: &Arc<CancellationRegistry>,
+    skill: Option<tomverse_core::skills::Skill>,
+    policy: TaskPolicy,
+    fleet_id: &str,
+    fleet_size: usize,
+    index: usize,
+    spec: &tomverse_core::fleet::MemberSpec,
+    session_id: &str,
+    reserved_usd: Option<f64>,
+    tx: std::sync::mpsc::Sender<MemberDone>,
+) -> Result<RunningMember, String> {
+    // **격리는 루트를 바꾸는 것이 전부다**(22.1절). 구성원은 자기 트리를 루트로 받는
+    // 평범한 태스크가 된다.
+    let wt = tomverse_core::worktree::ensure(
+        repo.path(),
+        parent_dir,
+        &spec.branch,
+        args.worktree_base.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    let isolation = tomverse_core::worktree::Isolation::of(repo.path(), &wt);
+    for notice in isolation.notices() {
+        eprintln!("[{}] {notice}", spec.branch);
+    }
+    let member_root = WorkspaceRoot::new(&wt.path).map_err(|e| format!("{:?}를 열 수 없습니다: {e}", wt.path))?;
+    let workspace_id = tomverse_core::paths::workspace_id_for(&member_root.display());
+    let task_id = format!("task-{}", uuid::Uuid::new_v4());
+    {
+        let mut guard = store.lock().unwrap();
+        guard
+            .upsert_workspace(&workspace_id, &member_root.display(), &spec.branch)
+            .map_err(|e| format!("워크스페이스 기록 실패: {e}"))?;
+        guard
+            .upsert_session(session_id, &workspace_id, Some("fleet"))
+            .map_err(|e| format!("세션 기록 실패: {e}"))?;
+        guard
+            .create_task(
+                &task_id,
+                session_id,
+                &workspace_id,
+                &member_root.display(),
+                match args.mode {
+                    ExecutionMode::Fast => "fast",
+                    ExecutionMode::Verified => "verified",
+                },
+                &spec.message,
+            )
+            .map_err(|e| format!("태스크 생성 실패: {e}"))?;
+    }
+
+    let origin = tomverse_core::types::ApprovalOrigin {
+        fleet_id: fleet_id.to_string(),
+        member_index: index + 1,
+        fleet_size,
+        branch: spec.branch.clone(),
+    };
+    let member_sink: Arc<dyn EventSink> = Arc::new(MemberSink {
+        inner: sink.clone(),
+        label: spec.branch.clone(),
+    });
+    let host = Arc::new(
+        TaskHost::new(
+            member_root,
+            policy.clone(),
+            store.clone(),
+            artifacts.clone(),
+            approvals.clone(),
+            member_sink,
+            cancels.clone(),
+        )
+        .with_isolation(isolation)
+        // **승인 화면이 어느 트리의 것인지 말할 수 있어야 한다**(11.6①). 게이트는 이 값을
+        // 보지 않는다 — 보게 되면 "Fleet일 때만 다른 규칙"이 생긴다.
+        .with_fleet_member(origin),
+    );
+    host.begin_task(&task_id, policy, skill.as_ref())?;
+    // **등록을 이벤트로 남긴다**(원칙 7). Fleet 단위 상태를 메모리에만 두면 크래시 후
+    // "무엇이 돌고 있었나"에 답할 수 없다. `FLEET_ENROLLED`는 `NODE_MAY_NOT_EMIT`에 있으므로
+    // sidecar가 자기를 이 집합에 넣을 수 없다.
+    host.append_event(
+        &task_id,
+        "FLEET_ENROLLED",
+        json!({
+            "fleetId": fleet_id,
+            "branch": spec.branch,
+            "memberIndex": index + 1,
+            "fleetSize": fleet_size,
+            "admitted": true,
+            "reservedUsd": reserved_usd,
+            "worktreePath": wt.path.to_string_lossy(),
+            "reusedTree": !wt.created,
+        }),
+    )?;
+
+    let control = Arc::new(MemberControl::default());
+    let started_at = tomverse_core::time::now_iso();
+    // 구성원은 자기 요청으로 도는 **평범한 `run`**이다 — 메시지만 다르다.
+    let mut member_args = args.clone();
+    member_args.command = "run".to_string();
+    member_args.message = spec.message.clone();
+    member_args.cancel_after_ms = None;
+
+    let thread_host = host.clone();
+    let thread_control = control.clone();
+    let thread_task = task_id.clone();
+    let thread_session = session_id.to_string();
+    let thread_workspace = workspace_id.clone();
+    let handle = std::thread::spawn(move || {
+        let outcome = run_task(
+            &member_args,
+            thread_host,
+            &thread_workspace,
+            &thread_session,
+            &thread_task,
+            skill.as_ref(),
+            Some(thread_control),
+        );
+        let (status, summary) = match outcome {
+            Ok(value) => (
+                value.get("status").and_then(Value::as_str).unwrap_or("failed").to_string(),
+                value.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
+            ),
+            Err(message) => ("failed".to_string(), message),
+        };
+        // **보내지 못하면 스케줄러가 영원히 기다린다.** 받는 쪽이 사라지는 경우는 스케줄러가
+        // 이미 끝난 때뿐이고, 그때는 보낼 곳이 없는 것이 맞다.
+        let _ = tx.send(MemberDone {
+            index,
+            status,
+            summary,
+            finished_at: tomverse_core::time::now_iso(),
+        });
+    });
+
+    Ok(RunningMember {
+        branch: spec.branch.clone(),
+        task_id,
+        host,
+        control,
+        reserved_usd,
+        worktree_path: wt.path.to_string_lossy().to_string(),
+        started_at,
+        handle,
+    })
 }
 
 /// 개발 모드 sidecar 경로 해석용 리포지토리 루트.

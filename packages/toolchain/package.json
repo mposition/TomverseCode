@@ -6,19 +6,27 @@
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
-  "//exports": "`./exec`는 **빌드되지 않은 일반 JavaScript**를 그대로 노출한다. scripts/cargo.mjs가 Rust 빌드 전에 이걸 import해야 하므로, dist를 거치면 '빌드하려면 먼저 빌드해야 한다'는 순환이 생긴다.",
+  "//exports": "`./exec`·`./node-runtime`·`./sidecar-stage`는 **빌드되지 않은 일반 JavaScript**를 그대로 노출한다. scripts/cargo.mjs와 scripts/stage-sidecar.mjs가 워크스페이스 빌드 전에 이걸 import해야 하므로, dist를 거치면 \"빌드하려면 먼저 빌드해야 한다\"는 순환이 생긴다.",
   "exports": {
     ".": "./dist/src/index.js",
     "./exec": {
       "types": "./js/exec.d.mts",
       "default": "./js/exec.mjs"
+    },
+    "./node-runtime": {
+      "types": "./js/nodeRuntime.d.mts",
+      "default": "./js/nodeRuntime.mjs"
+    },
+    "./sidecar-stage": {
+      "types": "./js/sidecarStage.d.mts",
+      "default": "./js/sidecarStage.mjs"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "//test": "이 Node 버전은 `node --test <디렉터리>`가 동작하지 않는다 — 파일을 직접 나열한다(CLAUDE.md 함정 기록).",
-    "test": "npm run build && node --test dist/test/hostBinary.test.js dist/test/msvc.test.js dist/test/verifyOrder.test.js dist/test/exec.test.js dist/test/buildOrder.test.js dist/test/cargoLauncher.test.js dist/test/nodeVersion.test.js dist/test/docStatus.test.js dist/test/policyBridge.test.js dist/test/rustOnlyEvents.test.js dist/test/credentialBoundary.test.js"
+    "test": "npm run build && node --test dist/test/hostBinary.test.js dist/test/msvc.test.js dist/test/verifyOrder.test.js dist/test/exec.test.js dist/test/buildOrder.test.js dist/test/cargoLauncher.test.js dist/test/nodeVersion.test.js dist/test/sidecarBundle.test.js dist/test/docStatus.test.js dist/test/policyBridge.test.js dist/test/rustOnlyEvents.test.js dist/test/credentialBoundary.test.js"
   },
   "devDependencies": {
     "@types/node": "^24.9.0",

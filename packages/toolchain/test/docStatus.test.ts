@@ -44,10 +44,32 @@ interface StatusRow {
  * 예시로 적혀 있으므로, 파일 전체에서 찾으면 설명문을 검사 대상으로 세게 된다.
  */
 function readStatusRows(): StatusRow[] {
+  return readRows("| \u00a7");
+}
+
+/**
+ * 8.2절 기능 표의 **상태 줄**(`↳`).
+ *
+ * # 왜 이 표도 검사하는가
+ *
+ * 3.1절 표와 목적이 같다. 8.2절은 "무엇까지 하면 출시 기준을 만족하는가"를 정하는 표이고,
+ * 그 아래 `↳` 줄이 **지금 어디까지 왔는가**를 적는다. 그 줄이 낡으면 3.1절이 낡을 때와 같은
+ * 대가를 치른다 — 있는 것을 없다고 읽고 다시 만들거나, 없는 것을 있다고 읽고 출시 기준을
+ * 충족했다고 믿는다.
+ *
+ * 그리고 8.2절의 상태 줄은 3.1절보다 더 자주 늘어난다(기능을 하나 닫을 때마다 한 줄).
+ * 사람이 지키는 규칙으로 두면 언젠가 마커 없는 줄이 생기고, **마커가 없는 줄은 검사 밖에
+ * 있으므로 그 사실이 드러나지 않는다.** 그래서 마커가 없는 것 자체를 실패로 본다.
+ */
+function readProgressRows(): StatusRow[] {
+  return readRows("| \u21b3");
+}
+
+function readRows(prefix: string): StatusRow[] {
   const source = readFileSync(DOC, "utf8");
   const rows: StatusRow[] = [];
   for (const line of source.split("\n")) {
-    if (!line.startsWith("| §")) continue;
+    if (!line.startsWith(prefix)) continue;
     const label = line.slice(1).split("|")[0]!.trim();
     rows.push({ label, present: markerPaths(line, "present"), absent: markerPaths(line, "absent") });
   }
@@ -110,4 +132,34 @@ test("두 방향 모두 실제로 검사되고 있다", () => {
   // 위 두 테스트가 아무것도 확인하지 못한 채 통과한다.
   assert.equal(existsSync(path.join(REPO_ROOT, "package.json")), true);
   assert.equal(existsSync(path.join(REPO_ROOT, "package.json.nonexistent")), false);
+});
+
+test("8.2절 기능 표의 상태 줄도 반증할 파일을 함께 적는다", () => {
+  const rows = readProgressRows();
+  // 줄을 못 찾았는데 통과하는 것을 막는다 — 표 형식이 바뀌면 0행이 되고, 0행은 언제나 통과한다.
+  assert.ok(rows.length >= 10, `8.2절 상태 줄을 찾지 못했습니다 (${rows.length}행). 표 형식이 바뀌었습니까?`);
+  for (const row of rows) {
+    assert.ok(
+      row.present.length + row.absent.length > 0,
+      `8.2절의 "${row.label}" 줄에 반증할 파일이 없습니다. 마커가 없는 줄은 처음부터 검사 밖에 있으므로, ` +
+        `낡아도 그 사실이 드러나지 않습니다`
+    );
+  }
+});
+
+test("8.2절 상태 줄이 가리키는 파일이 실제로 있다", () => {
+  for (const row of readProgressRows()) {
+    for (const rel of row.present) {
+      assert.ok(
+        existsSync(path.join(REPO_ROOT, rel)),
+        `8.2절 "${row.label}" 줄이 ${rel}를 가리키는데 그 파일이 없습니다. 옮겼거나 지웠다면 줄을 함께 고칠 것`
+      );
+    }
+    for (const rel of row.absent) {
+      assert.ok(
+        !existsSync(path.join(REPO_ROOT, rel)),
+        `8.2절 "${row.label}" 줄이 ${rel}를 없다고 적었는데 생겼습니다`
+      );
+    }
+  }
 });

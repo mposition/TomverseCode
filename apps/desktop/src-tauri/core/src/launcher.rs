@@ -621,6 +621,80 @@ mod tests {
         assert_eq!(config.env, vec![("K".to_string(), "V".to_string())]);
     }
 
+    /// **스테이징이 만든 실제 디렉터리를 해석한다.**
+    ///
+    /// 위의 테스트들은 `exists`를 주입하므로 "우리가 있다고 말한 것"을 해석할 뿐이다. 동봉이
+    /// 실패하는 방식은 대부분 그 층 아래에 있다 — 파일이 한 칸 다른 디렉터리에 놓이거나,
+    /// `.exe`가 붙지 않거나, 진입점이 하위 폴더에 남는 것. 그건 **실제 파일시스템**에 대고
+    /// 물어야만 드러나고, 그때 나오는 답은 조용하다: 배포판이 `PathLookup`으로 떨어져도
+    /// 개발 머신에는 PATH에 node가 있으므로 아무 일도 없는 것처럼 보인다.
+    ///
+    /// 여기서 만드는 것은 `scripts/stage-sidecar.mjs`가 만드는 것과 **같은 모양**이며,
+    /// 그 합의는 `packages/toolchain/test/sidecarBundle.test.ts`가 상수 대조로 지킨다.
+    #[test]
+    fn a_staged_layout_on_a_real_filesystem_resolves_to_bundled() {
+        let root = std::env::temp_dir().join(format!("tomverse-stage-{}", std::process::id()));
+        let exe_dir = root.join("app");
+        let bundle = exe_dir.join(BUNDLE_DIR);
+        std::fs::create_dir_all(&bundle).unwrap();
+
+        // 대상 플랫폼은 이 테스트가 도는 플랫폼이다 — 파일을 실제로 만들어야 하므로
+        // 이름을 `cfg!(windows)`에 맞춘다. `.exe` 분기 자체는 위 테스트가 따로 지킨다.
+        let windows = cfg!(windows);
+        std::fs::write(bundle.join(runtime_file_name(windows)), b"not really node").unwrap();
+        std::fs::write(bundle.join(ENTRY_FILE), b"// sidecar").unwrap();
+
+        let launcher = resolve(&Context {
+            exe_dir: &exe_dir,
+            // 개발 트리가 **있어도** 번들이 이긴다. 배포판에서 개발 트리 경로가 우연히
+            // 존재하는 상황(같은 머신에서 개발하고 설치했다)에서 조용히 그쪽으로 가면 안 된다.
+            repo_root: Some(&development_repo_root()),
+            windows,
+            entry_override: None,
+            var: &|_| None,
+            exists: &|path| path.exists(),
+        })
+        .unwrap();
+
+        assert!(
+            launcher.is_bundled(),
+            "스테이징된 레이아웃이 번들로 읽히지 않았습니다:\n{}",
+            launcher.describe_failure()
+        );
+        assert_eq!(launcher.program, bundle.join(runtime_file_name(windows)));
+        assert_eq!(launcher.entry, bundle.join(ENTRY_FILE));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **런타임만 빠져도 번들은 깨진 것이다** — 그리고 그 상태가 실제 파일시스템에서도
+    /// 보여야 한다. 실측에서 `not_landed`였던 것이 정확히 이 모양이다(기록 5절):
+    /// 설치본은 나왔는데 그 안에 sidecar가 없었다.
+    #[test]
+    fn a_staged_layout_missing_the_runtime_is_not_bundled() {
+        let root = std::env::temp_dir().join(format!("tomverse-stage-broken-{}", std::process::id()));
+        let exe_dir = root.join("app");
+        let bundle = exe_dir.join(BUNDLE_DIR);
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join(ENTRY_FILE), b"// sidecar").unwrap();
+
+        let launcher = resolve(&Context {
+            exe_dir: &exe_dir,
+            repo_root: None,
+            windows: cfg!(windows),
+            entry_override: None,
+            var: &|_| None,
+            exists: &|path| path.exists(),
+        })
+        .unwrap();
+
+        assert_eq!(launcher.entry_source, EntrySource::Bundled);
+        assert_eq!(launcher.program_source, ProgramSource::PathLookup);
+        assert!(!launcher.is_bundled());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// 성공한 해석도 확인한 경로를 들고 있어야 한다 — 왜 이 조합이 골라졌는지 물을 수 있어야 한다.
     #[test]
     fn a_successful_resolution_still_carries_what_it_checked() {
