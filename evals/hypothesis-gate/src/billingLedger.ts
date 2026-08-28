@@ -91,6 +91,8 @@ export interface BillingLedgerEntry {
   /** 사람이 무엇을 보고 그렇게 판단했는가. `billed`/`not_billed`에는 필수다. */
   evidence?: string;
   note?: string;
+  /** 이 줄이 **어떤 상태를 뒤집은 정정**인가. 최초 판정에는 없다. */
+  correctsStatus?: BillingStatus;
 }
 
 export function billingLedgerPath(outputRoot: string): string {
@@ -224,11 +226,27 @@ export function isOverdue(entry: BillingLedgerEntry, now: Date, deadlineHours: n
  */
 export function attestBillingEntry(
   entry: BillingLedgerEntry,
-  input: { outcome: "billed" | "not_billed"; actualUsd?: number; evidence: string; at: string }
+  input: {
+    outcome: "billed" | "not_billed";
+    actualUsd?: number;
+    evidence: string;
+    at: string;
+    /**
+     * 사람이 내린 판정(`billed`/`not_billed`)을 **뒤집는다**는 명시적 선언.
+     *
+     * `billing_unknown`에는 필요 없다 — 그건 "판정했다"가 아니라 **"판정을 포기했다"**이므로,
+     * 나중에 청구 증거가 나오면 정정하는 것이 원래 의도다. 반면 사람이 확인해 닫은 것을
+     * 조용히 덮으면 두 번의 확인 중 어느 쪽이 맞는지 기록만 보고 알 수 없다.
+     */
+    correct?: boolean;
+  }
 ): BillingLedgerEntry {
-  if (TERMINAL_BILLING_STATUSES.has(entry.status)) {
+  // **영구 미확정은 잠긴 상태가 아니다.** 기한이 지나 판별을 포기한 것일 뿐이고, 나중에
+  // 청구 증거가 나오면 정정 이벤트를 붙이는 것이 이 원장의 설계다.
+  const isHumanVerdict = entry.status === "billed" || entry.status === "not_billed";
+  if (isHumanVerdict && input.correct !== true) {
     throw new Error(
-      `${entry.entryId}는 이미 ${entry.status}로 닫혔습니다 — 닫힌 항목을 다시 판정하지 않습니다`
+      `${entry.entryId}는 이미 ${entry.status}로 판정됐습니다 — 뒤집으려면 정정임을 명시하세요`
     );
   }
   if (input.evidence.trim().length === 0) {
@@ -244,6 +262,9 @@ export function attestBillingEntry(
     status: input.outcome,
     statusSetAt: input.at,
     statusSetBy: "human-attestation",
+    // **무엇을 뒤집었는지 남긴다.** append-only라 이전 줄도 남지만, 현재 줄만 봐도
+    // 이것이 정정인지 최초 판정인지 알 수 있어야 한다.
+    ...(entry.status !== "billing_unknown_pending" ? { correctsStatus: entry.status } : {}),
     ...(input.actualUsd !== undefined ? { actualUsd: input.actualUsd } : {}),
     evidence: input.evidence,
   };

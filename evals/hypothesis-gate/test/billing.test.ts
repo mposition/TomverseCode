@@ -62,11 +62,11 @@ test("근거 없이 과금 여부를 기록할 수 없다", () => {
   );
 });
 
-test("닫힌 항목을 다시 판정하지 않는다", () => {
+test("사람이 판정한 항목은 조용히 뒤집히지 않는다", () => {
   const closed = base({ status: "billed", evidence: "청구 내역 확인" });
   assert.throws(
     () => attestBillingEntry(closed, { outcome: "not_billed", evidence: "번복", at: "2026-08-27T02:00:00.000Z" }),
-    /이미 billed로 닫혔습니다/
+    /정정임을 명시하세요/
   );
 });
 
@@ -104,4 +104,37 @@ test("부분 정산의 확정분은 부채에서 뺀다", () => {
   const partial = base({ reservedUsd: 1.832, settledUsd: 0.5 });
   const e = summarizeBillingExposure([partial], new Date("2026-08-27T01:00:00.000Z"));
   assert.equal(Math.round(e.unsettledMaxUsd * 1e6) / 1e6, 1.332);
+});
+
+test("영구 미확정은 잠긴 상태가 아니다 — 나중에 증거가 나오면 정정한다", () => {
+  // `close-overdue`는 "$0 판정"이 아니라 **판별을 포기한 상태**다. 잠그면 뒤늦게 나온 청구
+  // 증거를 원장에 반영할 방법이 없어지고, 그러면 원장이 사실과 어긋난 채로 굳는다.
+  const closed = base({ status: "billing_unknown", statusSetBy: "deadline-close" });
+  const corrected = attestBillingEntry(closed, {
+    outcome: "billed",
+    actualUsd: 0.42,
+    evidence: "뒤늦게 도착한 공급자 청구 내역에서 확인",
+    at: "2026-09-01T00:00:00.000Z",
+  });
+  assert.equal(corrected.status, "billed");
+  assert.equal(corrected.actualUsd, 0.42);
+  // 무엇을 뒤집었는지 현재 줄만 봐도 알 수 있어야 한다.
+  assert.equal(corrected.correctsStatus, "billing_unknown");
+});
+
+test("사람이 내린 판정은 명시적 정정으로만 뒤집는다", () => {
+  // 조용히 덮으면 두 번의 확인 중 어느 쪽이 맞는지 기록만 보고 알 수 없다.
+  const verdict = base({ status: "not_billed", statusSetBy: "human-attestation", evidence: "청구 내역에 없음" });
+  assert.throws(
+    () => attestBillingEntry(verdict, { outcome: "billed", evidence: "다시 보니 있음", at: "2026-09-01T00:00:00.000Z" }),
+    /정정임을 명시하세요/
+  );
+  const corrected = attestBillingEntry(verdict, {
+    outcome: "billed",
+    evidence: "다시 보니 있음 — 청구 주기가 늦게 반영됨",
+    correct: true,
+    at: "2026-09-01T00:00:00.000Z",
+  });
+  assert.equal(corrected.status, "billed");
+  assert.equal(corrected.correctsStatus, "not_billed");
 });

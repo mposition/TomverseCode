@@ -413,6 +413,7 @@ const usingFake = process.env.TOMVERSE_FAKE_SCRIPT !== undefined || process.env.
           outcome,
           ...(options.billingActualUsd !== undefined ? { actualUsd: options.billingActualUsd } : {}),
           evidence,
+          ...(options.billingCorrect ? { correct: true } : {}),
           at: now.toISOString(),
         });
         appendBillingEntry(root, updated);

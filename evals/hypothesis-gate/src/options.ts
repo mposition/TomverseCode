@@ -48,6 +48,8 @@ export interface CliOptions {
   billingOutcome?: "billed" | "not_billed";
   billingEvidence?: string;
   billingActualUsd?: number;
+  /** 사람이 내린 판정을 뒤집는 정정임을 명시한다. billing_unknown에는 필요 없다. */
+  billingCorrect?: boolean;
   /**
    * 유료 실행이 근거로 삼는 Run Card 파일. **pilot/run에 필수다**(fake 실행은 면제).
    *
@@ -227,6 +229,9 @@ export function parseArgs(argv: string[], defaultOutput: string): CliOptions {
         break;
       case "--actual-usd":
         options.billingActualUsd = Number(next());
+        break;
+      case "--correct":
+        options.billingCorrect = true;
         break;
       case "--stage":
         options.stage = parseStage(next());
