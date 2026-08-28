@@ -19,7 +19,6 @@ use tomverse_core::types::{ExecutionMode, TaskPolicy};
 // 봉투를 만드는 자리는 **한 곳**이고 그 자리는 core다 — 껍데기 크레이트는 이 개발
 // 환경에서 컴파일되지 않으므로 화면과의 계약을 정하는 코드를 여기 두지 않는다.
 use tomverse_core::uimsg::{envelope, UiMessage};
-use tomverse_core::{PROTOCOL_VERSION, PROVIDER_ENV_VARS};
 
 /// 화면이 종류를 보내지 않았을 때의 기본값 — 파일을 바꾸는 평범한 태스크 (51·53절).
 ///
@@ -59,30 +58,37 @@ fn current_workspace(state: tauri::State<'_, SessionState>) -> Option<Value> {
     state.info()
 }
 
-/// 자격증명 **보유 여부만** 알려준다. 값은 절대 UI로 나가지 않는다 (작업 지침 4.9절).
+/// 자격증명 **보유 여부만** 알려준다. 값은 절대 UI로 나가지 않는다 (원칙 3).
+///
+/// 무엇이 설정됐는가·어디서 왔는가·어떤 저장소인가는 전부 core가 판정한다
+/// (`credential_presence`, `StoreKind`). 여기와 `session.rs`는 그 결과를 화면 모양으로
+/// 옮길 뿐이며, **값을 담을 필드가 없다는 것이 이 명령의 계약이다.**
 #[tauri::command]
-fn provider_status() -> Value {
-    let providers: Vec<Value> = PROVIDER_ENV_VARS
-        .iter()
-        .map(|(id, env_name)| {
-            let configured = std::env::var(env_name).map(|v| !v.trim().is_empty()).unwrap_or(false);
-            json!({ "providerId": id, "envName": env_name, "configured": configured })
-        })
-        .collect();
-    let configured_count = providers
-        .iter()
-        .filter(|p| p["configured"].as_bool() == Some(true))
-        .count();
-    json!({
-        "providers": providers,
-        // M0에서는 Windows Credential Manager 연동 대신 환경변수를 지원한다.
-        // UI가 이걸 "개발용 임시 방식"으로 표시하도록 명시적으로 알린다.
-        "source": "environment",
-        "isDevelopmentOnly": true,
-        // 서로 다른 공급자 2개 이상이 있어야 교차검증(검수자 독립성 불변식)이 성립한다.
-        "crossVerificationPossible": configured_count >= 2,
-        "protocolVersion": PROTOCOL_VERSION,
+fn provider_status(state: tauri::State<'_, SessionState>) -> Value {
+    state.credential_status()
+}
+
+/// 키를 저장한다. **값은 이 함수로 들어가고 나오지 않는다.**
+///
+/// 화면은 입력 즉시 이걸 부르고 자기 상태에서 값을 지운다. 이후 조회는 `provider_status`
+/// 하나이며 그것은 "있다/없다"만 돌려준다 — 착지 기준 `uiNeverHoldsTheKey`.
+///
+/// `async` + `spawn_blocking`인 이유: Windows Credential Manager 호출은 블로킹이다.
+#[tauri::command]
+async fn set_provider_credential(app: tauri::AppHandle, provider_id: String, secret: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<SessionState>().set_credential(&provider_id, secret)
     })
+    .await
+    .map_err(|e| format!("자격증명 저장 스레드 오류: {e}"))?
+}
+
+/// 키를 지운다. `removed`는 **지울 것이 있었는가**다 — 없었던 것과 실패는 다른 사실이다.
+#[tauri::command]
+async fn delete_provider_credential(app: tauri::AppHandle, provider_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<SessionState>().delete_credential(&provider_id))
+        .await
+        .map_err(|e| format!("자격증명 삭제 스레드 오류: {e}"))?
 }
 
 /// 인자 설명이 `///`가 아니라 `//`인 이유: **Rust에는 파라미터 문서 주석이 없다.**
@@ -559,6 +565,8 @@ pub fn run() {
             open_workspace,
             current_workspace,
             provider_status,
+            set_provider_credential,
+            delete_provider_credential,
             start_task,
             respond_approval,
             cancel_task,

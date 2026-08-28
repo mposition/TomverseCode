@@ -357,19 +357,24 @@ pub fn require_supported_node(reported: Option<&str>, launcher: &Launcher) -> Re
 /// 겪었다(`.bat`만 `_env.bat`을 call해서 진입점 둘의 환경 준비 의미가 달랐던 일). 게다가
 /// 껍데기 크레이트는 GUI 라이브러리를 요구해 이 개발 환경에서 **컴파일조차 되지 않으므로**,
 /// 거기 있는 코드는 여기서 검증되지 않는다. 검증할 수 있는 쪽으로 옮긴다.
-pub fn spawn_config(env: Vec<(String, String)>) -> Result<(crate::sidecar::SpawnConfig, Launcher), String> {
+pub fn spawn_config(
+    env: crate::credentials::CredentialInjection,
+) -> Result<(crate::sidecar::SpawnConfig, Launcher), String> {
     let launcher = detect()?;
     Ok((config_from(&launcher, env), launcher))
 }
 
 /// 해석된 launcher로 spawn 설정을 만든다. `spawn_config`에서 갈라낸 이유는 테스트다 —
 /// `detect()`는 실제 프로세스 경로를 보므로 주입할 수 없다.
-pub fn config_from(launcher: &Launcher, env: Vec<(String, String)>) -> crate::sidecar::SpawnConfig {
+pub fn config_from(launcher: &Launcher, env: crate::credentials::CredentialInjection) -> crate::sidecar::SpawnConfig {
     crate::sidecar::SpawnConfig {
         program: launcher.program.to_string_lossy().to_string(),
         args: vec![launcher.entry.to_string_lossy().to_string()],
         working_dir: None,
-        env,
+        // **봉투를 여는 자리가 이 크레이트 안에 하나뿐이다**(credentials.rs `into_pairs`는
+        // `pub(crate)`). 껍데기 크레이트는 봉투를 만드는 곳에서 여기까지 옮길 수만 있고,
+        // 값을 들여다볼 수단이 없다 — 원칙 3이 규율이 아니라 가시성으로 지켜지는 자리다.
+        env: env.into_pairs(),
     }
 }
 
@@ -607,7 +612,9 @@ mod tests {
         ];
         let c = ctx(&exe_dir, None, false, &[], &present);
         let launcher = resolve(&c).unwrap();
-        let config = config_from(&launcher, vec![("K".into(), "V".into())]);
+        let mut env = crate::credentials::CredentialInjection::new();
+        env.push_plain("K", "V");
+        let config = config_from(&launcher, env);
 
         assert_eq!(config.program, joined(&["/app", BUNDLE_DIR, "node"]));
         assert_eq!(config.args, vec![joined(&["/app", BUNDLE_DIR, ENTRY_FILE])]);

@@ -47,14 +47,18 @@ thiserror = "2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Job Object로 프로세스 트리 종료를 **보장**한다(src/win_job.rs, 문서 20절).
-# taskkill은 스냅샷 기반이라 고아가 된 손자를 놓치는데, 커널이 소속을 관리하면 그 구멍이 없다.
+# 두 가지에 쓴다.
+#  - Job Object로 프로세스 트리 종료를 **보장**한다(src/win_job.rs, 문서 20절).
+#    taskkill은 스냅샷 기반이라 고아가 된 손자를 놓치는데, 커널이 소속을 관리하면 그 구멍이 없다.
+#  - Credential Manager로 자격증명을 **DPAPI 위에** 저장한다(src/win_credentials.rs,
+#    multi-engine-routing.md 12절).
 # Linux 개발 환경에서는 이 의존성이 아예 해석되지 않으므로 빌드에 영향이 없다 —
-# 그래서 **여기서 통과한 verify는 이 코드에 대해 아무것도 말하지 않는다**(20.5절).
+# 그래서 **여기서 통과한 verify는 그 두 파일에 대해 아무것도 말하지 않는다**(20.5절).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_Security_Credentials",
   "Win32_System_JobObjects",
   "Win32_System_Threading",
 ] }

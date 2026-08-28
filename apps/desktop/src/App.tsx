@@ -35,6 +35,14 @@ import {
 } from "./types";
 import { AcceptanceCriteriaPanel } from "./components/AcceptanceCriteriaPanel";
 import { resultBasis } from "./lib/resultBasis";
+import {
+  applyNotice,
+  conflictNotice,
+  draftAfterSubmit,
+  sourceLabel,
+  storeNotice,
+  submitState,
+} from "./lib/credentialDraft";
 import { summarizeContrast, type ContrastInput } from "./lib/contrastSummary";
 import { describeCallPlan } from "./lib/callPlan";
 import { ApprovalModal } from "./components/ApprovalModal";
@@ -162,6 +170,20 @@ export default function App() {
   /** 자격증명 확인 결과 (17절). `null`은 아직 확인하지 않은 것이며 "문제없음"이 아니다. */
   const [credentialChecks, setCredentialChecks] = useState<CredentialCheck[] | null>(null);
   const [probing, setProbing] = useState(false);
+  /**
+   * 입력 중인 키 (multi-engine-routing.md 12절).
+   *
+   * **이 값은 제출 즉시 버려진다** — 성공이든 실패든(`draftAfterSubmit`). UI 프로세스가 키를
+   * 들고 있는 시간을 요청 한 번의 수명으로 줄이는 것이 원칙 3의 실체이고, 실패 시 남겨 두는
+   * 편의의 대가가 정확히 그 원칙이다.
+   *
+   * 공급자별로 나누는 이유: 하나로 두면 openai 칸에 입력하다 anthropic 칸으로 옮길 때 값이
+   * 따라가고, 그러면 **넣으려던 곳이 아닌 곳에 키가 저장된다.**
+   */
+  const [credentialDrafts, setCredentialDrafts] = useState<Record<string, string>>({});
+  const [credentialBusy, setCredentialBusy] = useState<string | null>(null);
+  /** 저장·삭제 결과 안내. 키는 들어 있지 않다 — Rust가 상태만 돌려준다. */
+  const [credentialNotice, setCredentialNotice] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<"fast" | "verified">("verified");
   /**
@@ -568,6 +590,52 @@ export default function App() {
     [workspace, providerStatus]
   );
 
+  /**
+   * 키를 저장한다 (multi-engine-routing.md 12절).
+   *
+   * **초안을 먼저 비운다.** `invoke`를 기다린 뒤에 비우면 실패 경로에서 값이 남고, 화면이
+   * 키를 계속 들고 있게 된다 — 그 순서가 곧 원칙 3이 지키려는 것이다.
+   */
+  const saveCredential = useCallback(async (providerId: string, secret: string) => {
+    setCredentialBusy(providerId);
+    setCredentialDrafts((drafts) => ({ ...drafts, [providerId]: draftAfterSubmit() }));
+    try {
+      const result = await invoke<{ appliesToNextSpawn: boolean }>("set_provider_credential", {
+        providerId,
+        secret,
+      });
+      setProviderStatus(await invoke<ProviderStatus>("provider_status"));
+      setCredentialNotice(applyNotice(result));
+    } catch (error) {
+      // 초안은 이미 비웠다. 다시 입력해야 한다는 사실을 말한다 — 말하지 않으면 사용자는
+      // 값이 남아 있는 줄 알고 다시 누른다.
+      setCredentialNotice(`${String(error)} — 값은 저장되지 않았습니다. 다시 입력하세요.`);
+    } finally {
+      setCredentialBusy(null);
+    }
+  }, []);
+
+  const deleteCredential = useCallback(async (providerId: string) => {
+    setCredentialBusy(providerId);
+    try {
+      const result = await invoke<{ removed: boolean; appliesToNextSpawn: boolean }>("delete_provider_credential", {
+        providerId,
+      });
+      setProviderStatus(await invoke<ProviderStatus>("provider_status"));
+      // **"지웠다"와 "지울 것이 없었다"를 가른다.** 뭉개면 환경변수로 설정된 키를 지우려던
+      // 사용자가 "지웠습니다"를 보고 여전히 설정됨인 것을 버그로 읽는다.
+      setCredentialNotice(
+        result.removed
+          ? `저장소에서 ${providerId} 키를 지웠습니다. ${applyNotice(result) ?? ""}`
+          : `저장소에 ${providerId} 키가 없었습니다 — 환경변수로 설정된 키는 여기서 지울 수 없습니다.`
+      );
+    } catch (error) {
+      setCredentialNotice(String(error));
+    } finally {
+      setCredentialBusy(null);
+    }
+  }, []);
+
   const probeProviders = useCallback(async () => {
     setProbing(true);
     try {
@@ -946,9 +1014,60 @@ export default function App() {
           <div className="chips">
             {providerStatus.providers.map((p) => (
               <span key={p.providerId} className="chip">
-                {p.providerId}: {p.configured ? "설정됨" : "미설정"} <code>{p.envName}</code>
+                {/* **출처를 뭉개지 않는다.** 저장소에 넣은 것과 환경변수에서 온 것은 다른
+                    사실이고, 지울 수 있는지가 다르다. 문장은 순수 로직이 만든다. */}
+                {p.providerId}: {sourceLabel(p)} <code>{p.envName}</code>
               </span>
             ))}
+          </div>
+
+          {/* 12절 Credential Store — **앱 안에서 키를 넣고 지운다.**
+              값은 입력 즉시 Rust로 가고, 이후 조회는 위 칩의 "있다/없다"뿐이다(원칙 3). */}
+          <div className="credentials">
+            {providerStatus.providers.map((p) => {
+              const draft = credentialDrafts[p.providerId] ?? "";
+              const { canSubmit } = submitState(draft);
+              const busy = credentialBusy === p.providerId;
+              return (
+                <div key={`cred-${p.providerId}`} className="row">
+                  <label className="small">{p.providerId} 키</label>
+                  <input
+                    type="password"
+                    value={draft}
+                    placeholder="키를 붙여 넣으세요"
+                    autoComplete="off"
+                    disabled={busy}
+                    onChange={(e) =>
+                      setCredentialDrafts((drafts) => ({ ...drafts, [p.providerId]: e.target.value }))
+                    }
+                  />
+                  <button
+                    className="secondary"
+                    disabled={!canSubmit || busy}
+                    onClick={() => void saveCredential(p.providerId, draft)}
+                  >
+                    {busy ? "저장 중..." : "저장"}
+                  </button>
+                  <button
+                    className="secondary"
+                    disabled={busy || p.source !== "store"}
+                    onClick={() => void deleteCredential(p.providerId)}
+                  >
+                    지우기
+                  </button>
+                </div>
+              );
+            })}
+            <p className="muted small">
+              입력한 키는 <strong>즉시 Rust로 넘어가고 화면에는 남지 않습니다.</strong> 이후 이 화면이 알 수 있는 것은
+              "설정됨/미설정"뿐입니다.
+            </p>
+            {credentialNotice && <p className="warn small">{credentialNotice}</p>}
+            {/* 저장소와 환경변수가 다른 값을 들고 있으면 **어느 쪽을 쓰는지** 말한다.
+                말하지 않으면 "앱에서 키를 바꿨는데 예전 키로 호출된다"는 의심이 남는다. */}
+            {conflictNotice(providerStatus.providers) && (
+              <p className="warn small">{conflictNotice(providerStatus.providers)}</p>
+            )}
           </div>
           {/* 16절 워크스페이스 공급자 제한. **"키가 없다"와 "정책이 막았다"를 갈라 말한다** —
               뭉개면 사용자는 없는 키를 찾아 헤매거나 자기가 건 제한을 잊는다. */}
@@ -1011,8 +1130,8 @@ export default function App() {
           )}
           {noProviders && (
             <p>
-              API 키가 설정되지 않았습니다. <code>OPENAI_API_KEY</code> 또는 <code>ANTHROPIC_API_KEY</code> 환경변수를
-              설정한 뒤 앱을 다시 실행하세요.
+              API 키가 설정되지 않았습니다. <strong>위 칸에 키를 넣거나</strong>, <code>OPENAI_API_KEY</code> 또는{" "}
+              <code>ANTHROPIC_API_KEY</code> 환경변수를 설정한 뒤 앱을 다시 실행하세요.
             </p>
           )}
           {!noProviders && !providerStatus.crossVerificationPossible && (
@@ -1021,10 +1140,15 @@ export default function App() {
               수행됩니다.
             </p>
           )}
-          {providerStatus.isDevelopmentOnly && (
+          {/* **문구를 저장소 종류에서 유도한다.** 종전에는 "개발용 임시 방식"이 상수였고,
+              그래서 저장소를 만들어도 그 문장이 남았을 것이다 — 사실을 말하지 않는 화면은
+              없는 것보다 나쁘다. 판정은 `credentialDraft.ts`에 있고 테스트가 지킨다. */}
+          {storeNotice(providerStatus.store) && (
+            <p className="warn small">{storeNotice(providerStatus.store)}</p>
+          )}
+          {!providerStatus.store.isDevelopmentOnly && (
             <p className="muted small">
-              자격증명을 환경변수에서 읽고 있습니다 — <strong>개발용 임시 방식</strong>입니다. Windows Credential
-              Manager 연동은 아직 구현되지 않았습니다.
+              키는 <strong>{providerStatus.store.label}</strong>에 저장됩니다.
             </p>
           )}
         </section>

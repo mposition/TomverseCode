@@ -82,6 +82,14 @@ apps/desktop/        Tauri 2 + React
     core/src/win_job.rs  Windows Job Object — 프로세스 트리 종료 보장. **Linux에서는 컴파일되지
                      않으므로 여기서 통과한 verify가 이 파일에 대해 말해주는 것이 없다.**
                      별도 크레이트에서 실제 파일을 #[path]로 가리켜 타입 검증만 했다(문서 20.5절)
+    core/src/credentials.rs  Credential Store — 키를 앱 안에서 넣고 지운다(multi-engine-routing 20절).
+                     저장 계층이 트레이트 뒤에 있고 **폴백은 컴파일러가 막는다**: 개발용
+                     `MemoryCredentialStore`는 `cfg(any(test, not(windows)))`라 Windows 릴리스
+                     빌드에 타입 자체가 없다. `win_credentials.rs`가 Credential Manager(DPAPI)
+                     구현이고 `win_job.rs`와 같은 검증 경계를 갖는다.
+                     **저장소가 생겨도 `credential.get`은 되살아나지 않는다** — 주입은 여전히
+                     spawn 시 1회다. 그 불변식을
+                     `packages/toolchain/test/credentialBoundary.test.ts`가 소스에서 지킨다
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
                      `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`/`fleet-status`/`windows-landing`.
                      `fleet`은 **N개 병렬 실행**이다(구성원마다 worktree 하나). 각 구성원은 자기 트리를 게이트
