@@ -299,9 +299,14 @@ test("Windows 구분자로 온 의존성이 조용히 사라지지 않는다", (
 
 test("스코프 패키지 이름을 두 조각으로 읽는다", () => {
   const root = FAKE_ROOT;
-  assert.equal(packageNameFromPath(root, path.join(root, "node_modules", "@babel", "runtime")), "@babel/runtime");
-  assert.equal(packageNameFromPath(root, path.join(root, "node_modules", "openai")), "openai");
-  assert.equal(packageNameFromPath(root, root), null);
+  // 이 fixture는 **호스트** 경로로 만들어졌으므로 호스트 플랫폼으로 읽는다.
+  const hostIsWindows = process.platform === "win32";
+  assert.equal(
+    packageNameFromPath(root, path.join(root, "node_modules", "@babel", "runtime"), hostIsWindows),
+    "@babel/runtime"
+  );
+  assert.equal(packageNameFromPath(root, path.join(root, "node_modules", "openai"), hostIsWindows), "openai");
+  assert.equal(packageNameFromPath(root, root, hostIsWindows), null);
 });
 
 // ---- 5. 잘라내기 ----
