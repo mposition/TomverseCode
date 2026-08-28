@@ -932,3 +932,19 @@ test("반려는 dispatch 사실이 '나가지 않았다'로 확정된다", () =>
   assert.equal(attemptFacts(0, new Error("boom"), "timeout").dispatchState, "dispatched_no_response");
   assert.equal(attemptFacts(0, new Error("boom"), "auth").dispatchState, "dispatched_no_response");
 });
+
+test("실패한 호출도 응답을 받았으면 비용이 기록된다", async () => {
+  // 실측(confirmatory, 2026-08-27): claude-sonnet-5가 in 2,180 / out 1,402을 쓰고 스키마
+  // 위반으로 실패했다. 토큰도 단가도 손에 있었는데 비용이 비어 있어 예약을 정산할 수 없었고
+  // **288건짜리 실행이 2건에서 멈췄다.** 모르는 것과 아는 것을 같은 칸에 넣은 결과다.
+  const registry = new ModelRegistry();
+  const entry = registry.get("claude-sonnet-5");
+  assert.ok(entry, "테스트가 가정한 모델이 레지스트리에 없습니다");
+
+  const usage = { inputTokens: 2180, outputTokens: 1402 };
+  const cost = registry.costUsd("claude-sonnet-5", usage);
+  assert.ok(cost !== undefined && cost > 0, `토큰을 아는데 비용을 계산하지 못했습니다: ${cost}`);
+
+  // 성공 경로와 같은 함수를 쓴다 — 두 경로가 다른 방법으로 값을 내면 언젠가 갈라진다.
+  assert.equal(cost, (2180 / 1e6) * entry!.economics.inputPerMTok + (1402 / 1e6) * entry!.economics.outputPerMTok);
+});

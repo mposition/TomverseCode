@@ -278,6 +278,13 @@ export interface ArmSummary {
   oraclePassRate: number;
   publicPasses: number;
   infraFailures: number;
+  /**
+   * **분모에서 빠진 기록이 무엇이었는지.**
+   *
+   * 개수만 적으면 "23 / 24"의 그 1건이 무엇인지 알 수 없고, 그러면 분모가 arm마다 다른
+   * 이유를 리포트만 보고 설명할 수 없다. 성공률과 신뢰구간이 서 있는 바닥이므로 목록으로 낸다.
+   */
+  excludedRuns: { fixtureId: string; repetition: number; failureClass?: string }[];
   meanCostUsd: number;
   costPerSuccessUsd: number | null;
   meanLatencyMs: number;

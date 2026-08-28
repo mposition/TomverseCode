@@ -594,6 +594,7 @@ export function buildStagedCards(input: {
   outputRoot: string;
   p0ApprovedLimitUsd?: number;
   p1ApprovedLimitUsd?: number;
+  p2ApprovedLimitUsd?: number;
   models: ModelPlan | { blockers: string[]; probeGaps: string[] };
   extraBlockers?: string[];
   createdAt: string;
@@ -606,7 +607,7 @@ export function buildStagedCards(input: {
   /** 경로 결합 — 테스트가 플랫폼과 무관하게 검증할 수 있어야 한다. */
   joinPath?: (a: string, b: string) => string;
   ttlHours?: number;
-}): { p0: RunCard; p1: RunCard } {
+}): { p0: RunCard; p1: RunCard; p2: RunCard } {
   const join = input.joinPath ?? ((a: string, b: string): string => `${a}/${b}`);
   // **승인 번들은 두 단계가 공유한다** — evidence 하나가 P0와 P1의 근거이고, P1 카드가 P0
   // attestation을 가리킨다. 단계별 실행 디렉터리는 그 아래가 아니라 형제로 둔다.
@@ -648,6 +649,25 @@ export function buildStagedCards(input: {
       prerequisites: [
         "P0 smoke가 완전히 정상이어야 합니다 — 인프라 실패 0건, 비용 측정 가능, 구조화 출력 성공",
         "P0에서 요청한 모델 ID와 응답 envelope 모델 ID가 같았음이 attestation으로 확인되어야 합니다",
+      ],
+    }),
+    p2: buildStageCard({
+      ...common,
+      stage: "confirmatory",
+      label: "Stage P2 — confirmatory (PASS/FAIL이 나오는 유일한 단계)",
+      fixtures: input.fixtures,
+      // **사전 등록 기준 2번이 요구하는 값이다.** 여기서만 만족시킬 수 있으므로 상수로 두지
+      // 않고 기준에서 읽는다 — 기준을 바꾸면 이 값도 따라와야 한다.
+      repetitions: CRITERIA.minRepetitions,
+      outputDir: join(input.outputRoot, "p2-confirmatory"),
+      ...(input.p2ApprovedLimitUsd !== undefined ? { approvedLimitUsd: input.p2ApprovedLimitUsd } : {}),
+      ...(input.p0Attestation ? { p0Attestation: input.p0Attestation } : {}),
+      ...(input.p0AttestationProblems ? { p0AttestationProblems: input.p0AttestationProblems } : {}),
+      prerequisites: [
+        "P0 smoke가 완전히 정상이어야 합니다 — 인프라 실패 0건, 비용 측정 가능, 구조화 출력 성공",
+        "P0에서 요청한 모델 ID와 응답 envelope 모델 ID가 같았음이 attestation으로 확인되어야 합니다",
+        "P1이 끝까지 돌았어야 합니다 — 이 단계는 P1의 3배 규모이므로, 완주하지 못한 하네스로 " +
+          "시작하면 같은 자리에서 세 배의 비용을 쓰고 멈춘다 (강제되지는 않는다: P1 attestation은 없다)",
       ],
     }),
   };

@@ -2120,6 +2120,26 @@ export class Orchestrator {
       dispatchState: facts.dispatchState,
       errorKind: normalized.kind,
       ...(facts.usage ? { usage: facts.usage } : {}),
+      /**
+       * **실패한 호출도 과금된다 — 토큰을 알면 비용도 안다.**
+       *
+       * 응답을 받은 뒤 검증에서 실패한 호출은 usage를 갖고 있다. 그런데 여기서 비용을 싣지
+       * 않으면 그 지출이 어디에도 남지 않고, 읽는 쪽은 "얼마인지 모른다"로 처리할 수밖에 없다.
+       * 모르는 것과 아는 것을 같은 칸에 넣는 셈이다.
+       *
+       * 실측(confirmatory, 2026-08-27): `claude-sonnet-5`가 in 2,180 / out 1,402을 쓰고 스키마
+       * 위반으로 실패했다. 토큰도 단가도 손에 있었는데 비용이 비어 있어 예약을 정산할 수 없었고,
+       * **288건짜리 실행이 2건에서 멈췄다.**
+       *
+       * 성공 경로(`recordUsage`)와 **같은 함수**로 계산한다 — 두 경로가 다른 방법으로 값을
+       * 내면 언젠가 갈라지고, 그때 어느 쪽이 맞는지 알 수 없다.
+       */
+      ...(facts.usage
+        ? (() => {
+            const costUsd = this.registry.costUsd(adapter.modelId, facts.usage);
+            return costUsd === undefined ? {} : { costUsd };
+          })()
+        : {}),
       // 오류 메시지는 남기지만 응답 원문은 남기지 않는다 (작업 지침 4.6절).
       message: normalized.message,
       at: new Date().toISOString(),

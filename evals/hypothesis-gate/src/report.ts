@@ -166,17 +166,42 @@ export function renderMarkdown(
 
   lines.push("## Arm 비교", "");
   lines.push(
-    "| Arm | 설명 | 유효 실행 | oracle 통과 | 통과율 | 평균 비용 | 성공 1건당 비용 | p50 | p95 |",
+    "| Arm | 설명 | 분모 (전체) | oracle 통과 | 통과율 | 평균 비용 | 성공 1건당 비용 | p50 | p95 |",
     "|---|---|---|---|---|---|---|---|---|"
   );
   for (const arm of evaluation.arms) {
     lines.push(
-      `| ${arm.arm} | ${arm.label} | ${arm.evaluableRuns} | ${arm.oraclePasses} | ${pct(arm.oraclePassRate)} | ` +
+      `| ${arm.arm} | ${arm.label} | ${arm.evaluableRuns}${arm.evaluableRuns === arm.runs ? "" : ` (${arm.runs})`} | ${arm.oraclePasses} | ${pct(arm.oraclePassRate)} | ` +
         `$${arm.meanCostUsd.toFixed(4)} | ${arm.costPerSuccessUsd === null ? "—" : `$${arm.costPerSuccessUsd.toFixed(4)}`} | ` +
         `${Math.round(arm.p50LatencyMs)}ms | ${Math.round(arm.p95LatencyMs)}ms |`
     );
   }
   lines.push("");
+
+  /**
+   * **분모가 arm마다 다르면 그 이유를 리포트가 말해야 한다.**
+   *
+   * 통과율과 신뢰구간이 이 숫자 위에 서 있다. 개수만 적으면 "23 / 24"의 그 1건이 무엇이었는지
+   * 알 수 없고, 기록 파일을 직접 뒤져야 알 수 있는 사실은 리포트가 답하지 못한 사실이다.
+   */
+  const excluded = evaluation.arms.flatMap((arm) =>
+    arm.excludedRuns.map((run) => ({ arm: arm.arm, ...run }))
+  );
+  if (excluded.length > 0) {
+    lines.push("### 분모에서 제외된 기록 (인프라 실패)", "");
+    lines.push("| Arm | fixture | 반복 | 분류 |", "|---|---|---|---|");
+    for (const run of excluded) {
+      lines.push(`| ${run.arm} | ${run.fixtureId} | ${run.repetition} | ${run.failureClass ?? "(없음)"} |`);
+    }
+    lines.push("");
+    lines.push(
+      "인프라 실패는 **실험 결과가 아니므로** 성공률의 분모에서 뺀다. 다만 그만큼 arm 사이의" +
+        " 분모가 달라지므로, 무엇이 왜 빠졌는지를 여기 적는다 — 모델이 스키마를 어긴 것처럼" +
+        " **모델/파이프라인 실패는 분모에 남아야 한다.**",
+      ""
+    );
+  }
+
   if (evaluation.strongestSingleArm) {
     lines.push(`가장 강한 단일 모델 arm: **${evaluation.strongestSingleArm}**`, "");
   }
