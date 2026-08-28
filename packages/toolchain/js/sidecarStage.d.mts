@@ -14,10 +14,17 @@ export type BundleTargetResult = { ok: true; target: string } | { ok: false; rea
 export declare function bundleTargetFor(
   repoRoot: string,
   depPath: string,
-  stageBundleDir: string
+  stageBundleDir: string,
+  /** 대상 플랫폼. 입력 경로를 읽는 규칙을 정한다 — 호스트가 아니다. */
+  windows: boolean
 ): BundleTargetResult;
 
-export declare function packageNameFromPath(repoRoot: string, depPath: string): string | null;
+export declare function packageNameFromPath(
+  repoRoot: string,
+  depPath: string,
+  /** 대상 플랫폼. 입력 경로를 읽는 규칙을 정한다 — 호스트가 아니다. */
+  windows: boolean
+): string | null;
 
 export interface StageCopy {
   what: string;

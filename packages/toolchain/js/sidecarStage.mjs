@@ -44,17 +44,31 @@ export function shouldPrune(fileName) {
 /**
  * 상대 경로를 조각으로 나눈다.
  *
- * **`path.sep` 하나로 나누지 않는다.** Windows는 두 구분자를 모두 받아들이므로 입력에
- * 섞여 들어올 수 있고, `path.relative`는 `\`를 주지만 사람이 적은 값은 `/`일 수 있다.
- * (여기서 정규식 리터럴을 쓰지 않는 이유는 사고 이력이다 — 문자 클래스의 `\\`가 한 겹
- * 벗겨져 `/[\/]/`가 되면 **Windows 경로만 조용히 나뉘지 않고**, 그 결과 모든 의존성이
- * "node_modules 아래가 아니다"로 걸러져 **빈 번들**이 나온다. 실제로 그렇게 됐다.)
+ * **`path.sep`을 쓰지 않는다 — 두 구분자를 모두 문자로 적는다.** `path.sep`은 *실행 중인*
+ * OS의 구분자이므로, Linux에서 이 함수를 부르면 `\`가 구분자가 아니게 되어 Windows 경로가
+ * 통째로 한 조각이 된다. 그러면 모든 의존성이 "node_modules 아래가 아니다"로 걸러져
+ * **빈 번들**이 나오고, 그 결함은 Windows 빌드 머신에서는 보이지 않는다. CLAUDE.md가
+ * 기록해 둔 함정("std::path와 Node의 path는 실행 중인 OS의 구분자만 안다")이 여기 그대로
+ * 재현됐다 — 이 모듈은 **대상 플랫폼**을 인자로 받으므로 호스트를 보는 값이 섞이면 안 된다.
+ *
+ * (여기서 정규식 리터럴을 쓰지 않는 이유는 또 다른 사고 이력이다 — 문자 클래스의 `\\`가
+ * 한 겹 벗겨져 `/[\/]/`가 되면 Windows 경로만 조용히 나뉘지 않고 같은 증상이 나온다.)
  */
 export function splitPath(value) {
   return String(value)
-    .split(path.sep)
+    .split("\\")
     .flatMap((part) => part.split("/"))
     .filter((part) => part.length > 0);
+}
+
+/**
+ * 경로 조작에 쓸 **대상 플랫폼**의 path 구현.
+ *
+ * 기본값을 두지 않는다. 호스트를 기본으로 삼으면 "적지 않는 것"이 가장 쉬운 길이 되고,
+ * 그때 Windows 분기는 Windows에서만 검증된다 — 이 모듈이 순수 함수인 이유가 사라진다.
+ */
+function flavor(windows) {
+  return windows ? path.win32 : path.posix;
 }
 
 /**
@@ -64,21 +78,25 @@ export function splitPath(value) {
  * npm이 안쪽에 따로 설치한 경우)가 있으면 그 중첩까지 같이 따라간다 — 평탄화하면 두 버전이
  * 한 자리를 다투고, 어느 쪽이 이겼는지는 복사 순서가 정한다.
  */
-export function bundleTargetFor(repoRoot, depPath, stageBundleDir) {
-  const rel = path.relative(repoRoot, depPath);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+export function bundleTargetFor(repoRoot, depPath, stageBundleDir, windows) {
+  const p = flavor(windows);
+  const rel = p.relative(repoRoot, depPath);
+  if (rel.startsWith("..") || p.isAbsolute(rel)) {
     return { ok: false, reason: `저장소 밖의 의존성입니다: ${depPath}` };
   }
   const segments = splitPath(rel);
   if (segments[0] !== "node_modules") {
     return { ok: false, reason: `node_modules 아래가 아닙니다: ${rel}` };
   }
+  // **자리를 만드는 것은 호스트 `path.join`이다.** 대상 플랫폼 flavor는 입력을 *읽는* 데만
+  // 쓴다 — 실제 스테이징은 언제나 대상 플랫폼에서 돌므로 둘이 같고, 계획 테스트는 호스트
+  // 경로로 기대값을 만든다. 여기서 flavor로 이어붙이면 Linux에서 `\`가 섞여 나온다.
   return { ok: true, target: path.join(stageBundleDir, ...segments) };
 }
 
 /** `node_modules/<...>` 상대 경로에서 패키지 이름을 읽는다(`@scope/name` 포함). */
-export function packageNameFromPath(repoRoot, depPath) {
-  const segments = splitPath(path.relative(repoRoot, depPath));
+export function packageNameFromPath(repoRoot, depPath, windows) {
+  const segments = splitPath(flavor(windows).relative(repoRoot, depPath));
   const last = segments.lastIndexOf("node_modules");
   if (last < 0) return null;
   const rest = segments.slice(last + 1);
@@ -116,7 +134,7 @@ export function planSidecarStage({ repoRoot, stageRoot, windows, sidecarDistDir,
   const skipped = [];
 
   for (const depPath of depPaths) {
-    const name = packageNameFromPath(repoRoot, depPath);
+    const name = packageNameFromPath(repoRoot, depPath, windows);
     if (name === null) {
       // 루트 자신(`npm ls`가 첫 줄에 낸다)이나 워크스페이스 디렉터리다.
       skipped.push({ path: depPath, why: "node_modules 아래가 아닙니다" });
@@ -126,7 +144,7 @@ export function planSidecarStage({ repoRoot, stageRoot, windows, sidecarDistDir,
       skipped.push({ path: depPath, why: `${SELF_PACKAGE}는 번들 루트로 평탄화됩니다` });
       continue;
     }
-    const target = bundleTargetFor(repoRoot, depPath, bundleDir);
+    const target = bundleTargetFor(repoRoot, depPath, bundleDir, windows);
     if (!target.ok) {
       skipped.push({ path: depPath, why: target.reason });
       continue;
