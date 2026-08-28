@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "kind": "windows-landing-attestation",
+  "attestationId": "windows-landing-2ef2689",
+  "attestedBy": "Claude (Opus 5) — Vyper의 Windows 머신에서 돌린 세션. 절차는 windows-landing-record.md 17절",
+  "createdAt": "2026-08-28T07:00:00Z",
+  "commit": "2ef2689",
+  "machine": {
+    "os": "windows",
+    "osVersion": "10.0.19045",
+    "nodeVersion": "v22.22.2",
+    "npmShim": "C:\\nvm4w\\nodejs\\npm.CMD",
+    "visualStudio": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools",
+    "gitForWindows": "C:\\Program Files\\Git",
+    "gitAutocrlf": "true",
+    "python": null,
+    "installedBundle": null
+  },
+  "checks": [
+    {
+      "group": "credentialStore",
+      "check": "storedThroughDpapi",
+      "observedAt": "2026-08-28",
+      "evidence": "기록 17.1절. 프로덕션 저장 경로(open_credential_store() → WindowsCredentialStore)를 그대로 태웠다. 저장 전 has=false → store → has=true, read_for_injection이 넣은 값과 일치. cmdkey /list에 Target: LegacyGeneric:target=TomverseCode/openai, Type: Generic, User: openai, Local machine persistence가 나왔다 — Persist가 ENTERPRISE(로밍)가 아니라 LOCAL_MACHINE이라는 것까지 보인다. 저장 순간 %LOCALAPPDATA%\\Microsoft\\Credentials\\07E5D7DD37E0419B0FA3FE5D9CF0DE99(496 bytes)가 쓰였다 — 항목이 Credential Manager에 있다는 것이 DPAPI를 지났다는 표시다. 지우기는 removed=true, 두 번째 호출은 removed=false(없었던 것과 실패를 가른다), 그 뒤 cmdkey의 TomverseCode 항목은 0개. GUI(desktop.exe)의 자격증명 배너를 조작한 것은 아니다 — 태운 것은 배너가 부르는 그 저장 경로이며, 이 기준의 requires에는 InstalledBundle이 없다."
+    },
+    {
+      "group": "credentialStore",
+      "check": "noPlaintextAtRest",
+      "observedAt": "2026-08-28",
+      "evidence": "기록 17.2절. 카나리 값을 저장소에 넣고 태스크를 한 번 완주시켰다(tomverse-host run, mode=verified, exit 0, status=completed, verification=pass, 이벤트 85개, mutatedPaths=[paginate.js]) — 16.1절이 약한 줄로 남겨둔 '앱을 띄운 적이 없어 상태 디렉터리가 비어 있었다'를 이 단계가 메운다. 주입이 실제로 일어났다는 근거: OPENAI_API_KEY/ANTHROPIC_API_KEY를 빈 값으로 둔 채 host가 부르는 그 함수(credential_injection_for)가 secretCount=1, secretNames=[OPENAI_API_KEY]를 냈다 — 값의 출처는 환경변수가 아니라 저장소다. 그 상태에서 평문 검색 결과: 상태 디렉터리(state.db 249856 bytes·artifacts·host stdout/stderr 로그) 5개 파일 0건, 워크스페이스 7개 파일 0건, 동봉 번들 1311개 파일 0건, %APPDATA%\\Tomverse Code 0건(파일 0개이므로 근거로 세지 않는다). 저장 순간 쓰인 Credential Manager blob(496 bytes)을 ASCII/UTF-8/UTF-16으로 읽어도 0건이고, %LOCALAPPDATA%·%APPDATA%의 Credentials/Protect 전체도 0건이다 — 이 줄이 '저장됐다'와 '평문이 없다'를 잇는다. 탐지기가 공허하지 않다는 대조도 함께 했다: 같은 디렉터리에 UTF-8과 UTF-16으로 카나리를 심자 2건을 찾아냈고, 지운 뒤 다시 0건이 됐다."
+    },
+    {
+      "group": "credentialStore",
+      "check": "productionStoreIsNotTheDevelopmentOne",
+      "observedAt": "2026-08-28",
+      "evidence": "기록 17.3절. 이 머신에서 open_credential_store()가 kind=WindowsCredentialManager, is_production=true, survives_restart=true, label=Windows Credential Manager (DPAPI)를 냈고 expected_kind_here()와 일치했다 — 조용한 폴백이 없었다. 구조도 컴파일러로 확인했다: 개발용 MemoryCredentialStore를 참조하는 한 줄을 core의 non-test 코드에 넣자 debug와 --release 양쪽에서 error[E0433]: cannot find MemoryCredentialStore in credentials로 거부됐다(cfg(any(test, not(windows)))) — 폴백이 설 자리 자체가 Windows 빌드에 없다. 화면 문구는 이 값에서 유도된다(session.rs의 isDevelopmentOnly = !kind.is_production(), credentialDraft.ts의 storeNotice가 프로덕션이면 null) — 배너를 눈으로 본 것은 아니고, 그 유도는 apps/desktop 테스트가 지킨다."
+    }
+  ],
+  "attestationHash": "8d4a2b88da17951096a736079e0f9a1c6271cd03240a49fcdb63a552a6491b52"
+}
