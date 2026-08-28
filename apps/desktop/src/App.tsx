@@ -46,6 +46,11 @@ import {
 import { summarizeContrast, type ContrastInput } from "./lib/contrastSummary";
 import { describeCallPlan } from "./lib/callPlan";
 import { ApprovalModal } from "./components/ApprovalModal";
+import { buildApprovalQueue } from "./lib/approvalQueue";
+// 화면의 예산 입력을 Rust가 받는 두 값으로 바꾸는 곳은 **여기 하나뿐이다** — Fleet은
+// 상한을 둘(작업당·합계) 받으므로 그 한 곳이 실제로 두 화면에서 쓰인다.
+import { budgetArgs, budgetLimitOf } from "./lib/budgetArgs";
+import { FleetPanel } from "./components/FleetPanel";
 import { DiffPanel } from "./components/DiffPanel";
 import { DisagreementCard } from "./components/DisagreementCard";
 import { SecretShapeWarning, useSecretShapeScan } from "./components/SecretShapeWarning";
@@ -132,18 +137,6 @@ function modelPins(executor: string, reviewer: string): { executor?: string; rev
   if (executor) pins.executor = executor;
   if (reviewer) pins.reviewer = reviewer;
   return Object.keys(pins).length > 0 ? pins : undefined;
-}
-
-function budgetArgs(text: string): { budgetUsd: number | null; budgetUnlimited: boolean } {
-  const trimmed = text.trim();
-  if (trimmed.length === 0) return { budgetUsd: null, budgetUnlimited: true };
-  const value = Number(trimmed);
-  if (!Number.isFinite(value) || value <= 0) {
-    // 잘못된 값을 "없음"으로 바꾸지 않는다. Rust가 거부하고 그 사유가 화면에 뜬다 —
-    // 여기서 조용히 무제한으로 바꾸면 오타 하나가 상한을 지운다.
-    return { budgetUsd: value, budgetUnlimited: false };
-  }
-  return { budgetUsd: value, budgetUnlimited: false };
 }
 
 export default function App() {
@@ -255,7 +248,17 @@ export default function App() {
   const [taskId, setTaskId] = useState<string | null>(null);
   const [phase, setPhase] = useState<TaskPhase>("CREATED");
   const [events, setEvents] = useState<TaskEvent[]>([]);
-  const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+  /**
+   * 밀려 있는 승인 요청들 — **하나가 아니다**(process-architecture 11.6①).
+   *
+   * 종전에는 `ApprovalRequest | null`이었고, 두 번째 요청이 도착하면 **첫 번째를 덮어썼다.**
+   * 덮인 요청은 사라지는 것이 아니라 호스트에서 타임아웃(10분)까지 매달리다 거부로 처리되고,
+   * 그 사이 그 작업은 멈춰 있는다 — 화면에는 아무 흔적도 없이. 태스크가 하나뿐일 때는 두 번째
+   * 요청이 생기지 않아 드러나지 않았고, Fleet에서는 매번 일어난다.
+   *
+   * 순서와 표시 규칙은 화면 밖 순수 함수에 있다(`lib/approvalQueue.ts`).
+   */
+  const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [finalResult, setFinalResult] = useState<FinalResult | null>(null);
   const [questions, setQuestions] = useState<string[] | null>(null);
   /**
@@ -309,10 +312,7 @@ export default function App() {
    * 상한이 한 호출의 최대 비용보다 작으면 첫 호출부터 거부된다 — 종전에는 스냅샷과 라우팅을
    * 마친 뒤에야 오류로 나왔다. 두 값을 같은 화면에서 받으므로 시작 전에 말할 수 있다.
    */
-  const budgetLimit = useMemo(() => {
-    const args = budgetArgs(budgetText);
-    return args.budgetUnlimited ? null : args.budgetUsd;
-  }, [budgetText]);
+  const budgetLimit = useMemo(() => budgetLimitOf(budgetText), [budgetText]);
   const budgetPrecheck = useMemo(
     () =>
       precheckBudget({
@@ -492,7 +492,11 @@ export default function App() {
       }
     });
     const unlistenApproval = listen<ApprovalRequest>("approval-required", (event) => {
-      setApproval(event.payload);
+      // **덮어쓰지 않고 줄을 세운다.** 같은 id가 두 번 오는 일은 없지만, 왔을 때 둘로 늘리면
+      // 하나는 영원히 답을 받지 못한다.
+      setApprovals((prev) =>
+        prev.some((a) => a.approvalId === event.payload.approvalId) ? prev : [...prev, event.payload]
+      );
     });
     return () => {
       void unlistenEvent.then((fn) => fn());
@@ -720,11 +724,38 @@ export default function App() {
     }
   }, [workspace, message, mode, taskId, refreshTasks, refreshBackend]);
 
+  /**
+   * 승인 큐 — **도착 순서대로 하나씩**(process-architecture 11.6①).
+   *
+   * 순서를 위험도순 같은 것으로 정하지 않는 이유는 `approvalQueue.ts`에 있다: 승인을
+   * 기다리는 태스크는 그동안 멈춰 있고, 순서를 우리가 정하면 어떤 태스크는 계속 뒤로 밀린다.
+   */
+  const approvalQueue = useMemo(
+    () =>
+      buildApprovalQueue(
+        approvals.map((request) => ({
+          approvalId: request.approvalId,
+          taskId: request.taskId,
+          workspaceRoot: request.workspaceRoot,
+          origin: request.origin,
+          createdAt: request.createdAt,
+        }))
+      ),
+    [approvals]
+  );
+  const activeApproval = useMemo(
+    () => approvals.find((request) => request.approvalId === approvalQueue.active?.approvalId) ?? null,
+    [approvals, approvalQueue]
+  );
+
   const respondApproval = useCallback(
     async (granted: boolean) => {
-      if (!approval) return;
-      const current = approval;
-      setApproval(null);
+      // **큐의 맨 앞에만 답한다.** 순서를 정하는 것은 `buildApprovalQueue`이고, 화면이 다시
+      // 고르면 사용자가 본 것과 답이 간 것이 달라진다.
+      const activeId = approvalQueue.active?.approvalId;
+      const current = approvals.find((a) => a.approvalId === activeId);
+      if (!current) return;
+      setApprovals((prev) => prev.filter((a) => a.approvalId !== current.approvalId));
       try {
         // **실패도 `Ok` 봉투로 온다**(ui-wireframes 6절). Tauri의 `Err`는 문자열 하나뿐이라
         // 구조가 들어갈 자리가 없고, 문자열에 구조를 실으면 화면이 문장을 파싱하게 된다.
@@ -742,7 +773,7 @@ export default function App() {
         setNotice(`승인 응답 실패: ${String(error)}`);
       }
     },
-    [approval]
+    [approvals, approvalQueue]
   );
 
   const cancel = useCallback(async () => {
@@ -1348,6 +1379,23 @@ export default function App() {
               {/* 격리 트리 (22.6·38절). **워크스페이스 수명**이라 여기 둔다 — 태스크 옵션
                   자리에 있으면 "이번 작업만 격리한다"로 읽히는데, 격리는 여는 시점에 정해진다. */}
               {workspace && <WorktreePanel isolatedPath={workspace.isolation?.path ?? null} />}
+              {/* Fleet (process-architecture 11.6절). **워크스페이스 수명**이라 여기 둔다 —
+                  태스크 옵션 자리에 있으면 "이번 작업을 N개로 돌린다"로 읽히는데, Fleet은
+                  구성원마다 **자기 요청**을 받는 별개의 작업들이다. */}
+              {workspace && (
+                <FleetPanel
+                  disabled={running}
+                  policy={{
+                    mode,
+                    allowGitCommit,
+                    unattended,
+                    autoApproveVerification,
+                    autoApproveWrites,
+                    deadlineSecs: readDeadline(deadlineText, unattended).secs,
+                    modelPins: modelPins(pinExecutor, pinReviewer),
+                  }}
+                />
+              )}
               {/* 무인 실행 (state-machine 24절). **켜도 승인 정책은 그대로다** — 달라지는 것은
                   승인이 필요한 지점에서 묻는 대신 멈춘다는 것뿐이고, 그 정지는 사용자 거부로
                   기록되지 않는다(24.2절). */}
@@ -1877,7 +1925,9 @@ export default function App() {
         </section>
       )}
 
-      {approval && <ApprovalModal request={approval} onRespond={respondApproval} />}
+      {activeApproval && (
+        <ApprovalModal request={activeApproval} queue={approvalQueue} onRespond={respondApproval} />
+      )}
     </main>
   );
 }

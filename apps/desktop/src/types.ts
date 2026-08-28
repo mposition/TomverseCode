@@ -175,6 +175,14 @@ export interface ApprovalItem {
   preview?: string;
 }
 
+export interface ApprovalOrigin {
+  fleetId: string;
+  /** 1부터 센다 — 화면에 "2/4"로 그대로 나간다. */
+  memberIndex: number;
+  fleetSize: number;
+  branch: string;
+}
+
 export interface ApprovalRequest {
   approvalId: string;
   taskId: string;
@@ -186,8 +194,65 @@ export interface ApprovalRequest {
    * 사용자는 자기가 어느 저장소에서 `git clean`을 승인하는지 알 수 없다.
    */
   workspaceRoot: string;
+  /**
+   * 어느 Fleet 구성원의 요청인가 (process-architecture 11.6①).
+   *
+   * **Rust가 실어 보낸다** — Node는 이 필드를 채울 수 없다(`skip_deserializing`). 그래서
+   * 화면은 경로로 구별하려 들지 않는다: `tomverse-feat-a`와 `tomverse-feat-b`는 한 글자만
+   * 다르고 화면에서 길이도 비슷하다. 사람이 읽을 수 있는 구별은 **자리**("2/3 · feat-b")다.
+   */
+  origin?: ApprovalOrigin;
   items: ApprovalItem[];
   createdAt: string;
+}
+
+/**
+ * 기록에서 유도한 Fleet 구성원 하나 (`fleet::collect_status`).
+ *
+ * **결말은 Rust가 판정한다.** 화면이 `finalStatus`를 다시 해석하면 "시작조차 못 한 것"과
+ * "거부된 것"이 다시 뭉쳐지고, 도는 것이 끝난 것과 같은 자리에 빈칸으로 그려진다.
+ */
+export interface FleetMemberStatus {
+  taskId: string;
+  branch: string;
+  /** 1부터 센다 — 화면에 "2/4"로 그대로 나간다. */
+  memberIndex: number;
+  fleetSize: number;
+  admitted: boolean;
+  status: string;
+  phase: string;
+  /** 이 구성원 **하나**의 지출. 합계가 아니다. */
+  costUsd: number;
+  unpricedCalls: number;
+  reservedUsd?: number;
+  worktreePath?: string;
+  createdAt: string;
+}
+
+export interface FleetStatus {
+  fleetId: string;
+  members: FleetMemberStatus[];
+  /** 구성원 지출의 **합**. */
+  fleetCostUsd: number;
+  fleetCapUsd?: number;
+  perTaskCapUsd?: number;
+  /**
+   * 상한을 **기록에서 읽을 수 있었는가.**
+   *
+   * 거짓이면 위 두 값이 없는 이유는 "상한이 없었다"가 아니라 "이 기록이 상한을 남기기 전의
+   * 것이다"이다 — 정반대의 사실이므로 화면이 뭉개면 안 된다.
+   */
+  capsRecorded: boolean;
+  unfinishedTaskIds: string[];
+  startedAt: string;
+}
+
+export interface FleetStatusView {
+  fleets: FleetStatus[];
+  /** 지금 이 프로세스가 돌리고 있는 Fleet. 기록만으로는 알 수 없는 사실이다. */
+  runningFleetId: string | null;
+  /** 크기 상한 — **Rust가 정한다.** 화면은 이 값을 받아 쓰고 자기 상수를 두지 않는다. */
+  maxFleetSize: number;
 }
 
 export type VerificationStatus = "PASSED" | "FAILED" | "NOT_CONFIGURED" | "SKIPPED_WITH_REASON" | "TIMED_OUT";
