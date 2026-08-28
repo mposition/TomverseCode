@@ -1,7 +1,7 @@
 import type { DependencyEdge, SymbolEntry } from "@tomverse/protocol";
 
 /**
- * 심볼 테이블·의존성 그래프 조회 — docs/design/context-engine.md 4·16절.
+ * 심볼 테이블·의존성 그래프 조회 — docs/design/context-engine.md 4·22절.
  *
  * 순수 함수만 둔다. 선정(`engine.ts`)은 이 함수들이 무엇을 돌려주는지에만 의존하고, 여기는
  * 브릿지도 인덱스 구축도 모른다 — 그래야 "1~2홉이 실제로 파일을 고르는가"를 파서 없이도
@@ -69,7 +69,7 @@ export function symbolMatchFiles(
  *
  * 4절 표가 `dependency`를 *"선정된 파일들의 import 대상"* 으로 정의했다. 들어오는 방향
  * (이 파일을 import하는 파일)도 쓸모 있어 보이지만 — 호출부는 실제로 관련이 있다 — 그건
- * 5절이 못박은 범위를 넓히는 결정이고 여기서 하지 않는다. 16절 "아직 하지 않은 것"에 적었다.
+ * 5절이 못박은 범위를 넓히는 결정이고 여기서 하지 않는다. 22절 "아직 하지 않은 것"에 적었다.
  *
  * # 왜 홉 수를 함께 주는가
  *

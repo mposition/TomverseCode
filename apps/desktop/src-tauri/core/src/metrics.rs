@@ -376,7 +376,7 @@ pub struct IndexCache {
     /// 구축한 인덱스의 파일 수 분포 — 느린 것이 저장소가 커서인지 디스크가 느려서인지 가른다.
     #[serde(rename = "p90FileCount")]
     pub p90_file_count: Option<u64>,
-    /// 캐시에 저장되는 payload 크기 분포(바이트) — context-engine 16절.
+    /// 캐시에 저장되는 payload 크기 분포(바이트) — context-engine 22절.
     ///
     /// 심볼/의존성이 차면서 이 값이 커졌다. **얼마나 커졌는지 모르는 것이 결함**이므로
     /// 여기서 잰다 — SQLite 한 행에 들어가는 크기이자 IPC 한 줄로 오가는 크기다.
@@ -384,7 +384,7 @@ pub struct IndexCache {
     pub p90_payload_bytes: Option<u64>,
 }
 
-/// 심볼 인덱스 층이 실제로 도는가 (context-engine.md 5·16절).
+/// 심볼 인덱스 층이 실제로 도는가 (context-engine.md 5·22절).
 ///
 /// **`indexCache`와 나눠 두는 이유**: 캐시의 질문은 "재사용이 이득인가"이고 여기의 질문은
 /// "파서가 돌기는 하는가"다. 후자가 아니오여도 태스크는 정상으로 보인다 — 폴백(ripgrep)이
@@ -783,6 +783,170 @@ pub struct OperationalCounts {
     pub policy_denials: u64,
 }
 
+/// 읽기 전용 경로가 **더 읽어 달라고 한 횟수** — state-machine 57.8절.
+///
+/// # 무엇에 답하는가
+///
+/// `contextRounds` 기본값이 1이다. 그 값은 관례가 아니라 판단이었지만(라운드마다 답 하나가
+/// 버려진다) **재본 적은 없다.** 늘려야 하는지는 이 숫자가 답한다.
+///
+/// # 분모가 라운드가 아니라 **답변/계획 태스크**다
+///
+/// 라운드로 세면 라운드를 돈 태스크만 분모에 들어와 "라운드를 돌면 대개 한 번 더 돈다"는
+/// 동어반복이 나온다. 물어야 하는 것은 *"읽기 전용 태스크 중 몇이 더 읽어 달라고 했는가"*다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ContextRounds {
+    /// 답변·계획 태스크 수. **비율의 분모다.**
+    #[serde(rename = "readOnlyTasks")]
+    pub read_only_tasks: u64,
+    /// 그중 라운드를 실제로 돈 태스크 수.
+    #[serde(rename = "tasksWithRound")]
+    pub tasks_with_round: u64,
+    /// 라운드에서 실제로 실은 파일 수의 합.
+    #[serde(rename = "filesFetched")]
+    pub files_fetched: u64,
+    /// 들어주지 못한 요청 수의 합. **크면 모델이 경로가 아닌 것을 요청하고 있다는 뜻이다.**
+    #[serde(rename = "requestsRefused")]
+    pub requests_refused: u64,
+    /// 상한에 걸려 라운드를 못 돈 태스크 수. **이 값이 크면 상한을 올릴 근거가 된다** —
+    /// 그게 이 집계가 존재하는 이유다.
+    #[serde(rename = "stoppedByLimit")]
+    pub stopped_by_limit: u64,
+    /// 돌 이유가 없어 건너뛴 수(가져올 것이 없거나 이미 갖고 있음). 상한과 **구별해야 한다**:
+    /// 이쪽이 크면 상한을 올려도 아무 일도 일어나지 않는다.
+    #[serde(rename = "skippedAsPointless")]
+    pub skipped_as_pointless: u64,
+}
+
+/// **우리가 못 본 채로 답한 태스크가 얼마나 되는가** — context-engine 19절.
+///
+/// # 왜 이 집계가 필요한가
+///
+/// 16·17·18절이 범위 노트를 만들었다. 그 노트는 모델에게도 사용자에게도 가지만, **얼마나
+/// 자주 그런 상태로 답하는지는 아무도 몰랐다.** 한 태스크에서 "검색이 못 본 것이 있다"는
+/// 주의를 주는 것과, 열 번 중 아홉 번이 그렇다는 것은 다른 사실이고 할 일도 다르다.
+///
+/// # 종류를 나누는 이유
+///
+/// 종류마다 **할 일이 다르다.** 목록이 잘린 것은 상한 문제, 검색 실패는 도구 문제,
+/// 비밀값 건너뜀은 고칠 것이 없는 정상 동작이다. 한 숫자로 세면 그 숫자로 할 수 있는 일이
+/// 없다.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ContextCoverage {
+    /// 스냅샷을 만든 태스크 수. **비율의 분모다** — 전체 태스크가 아니다(스냅샷 전에 끝난
+    /// 태스크에는 이 질문이 성립하지 않는다).
+    #[serde(rename = "tasksWithSnapshot")]
+    pub tasks_with_snapshot: u64,
+    /// 그중 범위 노트가 하나라도 있던 태스크 수.
+    #[serde(rename = "tasksWithGap")]
+    pub tasks_with_gap: u64,
+    /// 종류별 **태스크 수**(노트 수가 아니다). 한 태스크가 같은 종류의 노트를 여럿 남겨도
+    /// 하나로 센다 — 노트 수로 세면 키워드가 많은 요청 하나가 분포를 끌고 간다.
+    ///
+    /// **키를 우리가 정하지 않는다.** 기록에 있는 문자열을 그대로 쓴다 — 여기에 아는 종류
+    /// 목록을 두면 Node의 목록과 두 벌이 되고, 새 종류가 조용히 옛 칸에 섞인다.
+    #[serde(rename = "byKind")]
+    pub by_kind: BTreeMap<String, u64>,
+    /// 종류가 없는 노트가 있던 태스크 수 (이 필드가 생기기 전의 기록).
+    ///
+    /// **`byKind`에 섞지 않는다.** "모른다"를 아무 칸에나 넣으면 그 칸의 숫자가 무엇도
+    /// 뜻하지 않게 된다.
+    #[serde(rename = "tasksWithUnlabelledNote")]
+    pub tasks_with_unlabelled_note: u64,
+}
+
+/// 무인 실행 **예고가 얼마나 맞았는가** — state-machine 59.6절.
+///
+/// # 예고와 실제를 기록에서 잇는다
+///
+/// 59절이 화면에서 이었고, 그 판정 규칙(예고대로 / 어긋남 / 다루지 않음)은 거기 있다.
+/// 여기서는 같은 규칙을 **저장된 이벤트**에 적용해 빈도를 낸다 — 화면은 한 태스크를 보고
+/// 이 집계는 여러 태스크를 본다.
+///
+/// # `contradicted`가 이 집계의 목적이다
+///
+/// 미리보기가 "지나간다"고 한 자리에서 멈춘 횟수다. 0이 아니면 미리보기를 그대로 믿을 수
+/// 없다는 뜻이고, 그건 47절 기능의 신뢰도 자체다.
+///
+/// `notProbed`는 **다른 질문에 답한다**: probe 집합이 좁다는 뜻이지 예고가 틀렸다는 뜻이
+/// 아니다(47.9절 — 둘은 짝이지 대체재가 아니다). 뭉치면 어느 쪽으로든 거짓이 된다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct PreviewAccuracy {
+    /// 예고가 기록된 무인 태스크 수. **비율의 분모다.**
+    #[serde(rename = "tasksWithPreview")]
+    pub tasks_with_preview: u64,
+    /// 그중 실제로 멈춘 태스크 수.
+    #[serde(rename = "tasksThatStopped")]
+    pub tasks_that_stopped: u64,
+    /// 예고한 자리에서 멈춘 정지 수.
+    #[serde(rename = "asPreviewed")]
+    pub as_previewed: u64,
+    /// **예고가 "지나간다"고 한 자리에서 멈춘 정지 수.** 이 집계의 목적이다.
+    pub contradicted: u64,
+    /// 미리보기가 다루지 않은 규칙에서 멈춘 정지 수 — probe 집합의 넓이에 대한 값이다.
+    #[serde(rename = "notProbed")]
+    pub not_probed: u64,
+}
+
+/// 앵커 창 하나가 **얼마나 자주 모자랐는가** — context-engine 15.3·15.6절.
+///
+/// # 분모가 "잘린 파일"이 아니다
+///
+/// 15절은 창을 하나만 낸다(조각을 이으면 본문에 구멍이 생긴다). 그래서 앵커가 흩어져 있으면
+/// 일부는 창 밖에 남고, 15.6절은 그 대가를 재봐야 한다고 적어 두었다.
+///
+/// **앵커가 하나뿐인 파일은 분모에서 뺀다.** 거기서는 놓치는 일이 **구조적으로 불가능**하고,
+/// 넣으면 "우리는 거의 놓치지 않는다"가 참이 되도록 분모를 부풀리는 셈이다 — 60.2절이
+/// 말한 "잘못된 분모가 표본 부족보다 나쁘다"의 교과서적인 예다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct AnchorWindows {
+    /// 잘려 들어간 파일 중 **앵커가 둘 이상이었던** 것의 수. 비율의 분모다.
+    #[serde(rename = "filesWithMultipleAnchors")]
+    pub files_with_multiple_anchors: u64,
+    /// 그중 창 하나가 앵커를 **전부** 덮은 파일 수.
+    #[serde(rename = "fullyCovered")]
+    pub fully_covered: u64,
+    /// 창 밖에 남은 앵커의 총수. **창을 둘로 늘릴 근거는 이 숫자다.**
+    #[serde(rename = "anchorsMissed")]
+    pub anchors_missed: u64,
+    /// 분모에서 뺀 파일 수(앵커가 하나뿐이라 놓칠 수 없었던 것). **뺀 사실을 남긴다** —
+    /// 조용히 빼면 분모가 왜 작은지 알 수 없다.
+    #[serde(rename = "singleAnchorFiles")]
+    pub single_anchor_files: u64,
+}
+
+/// 실패한 테스트 **이름을 갈랐는가**, 그리고 갈라 보니 섞여 있었는가 — state-machine 54·55절.
+///
+/// # 두 질문이 한 집계에 있다
+///
+/// **① 파서 커버리지**(55절): 실패한 테스트 체크 중 이름을 가르지 못한 비율. 크면 러너를
+/// 더 붙일 근거다. 분모는 *"실패한 테스트 체크가 있는 post 리포트"* 다 — 실패가 없는 리포트를
+/// 넣으면 "대개 가른다"가 참이 되도록 분모가 부풀려진다.
+///
+/// **② 섞임 빈도**(54절): 가른 리포트 중 원래 실패와 새 실패가 **함께 있던** 비율. 54절이
+/// 고친 거짓말이 얼마나 자주 일어났는지이고, 분모는 *"가른 리포트"* 다 — 못 가른 것에
+/// 대해서는 섞였는지 알 수 없으므로 그쪽 분모에 넣을 수 없다.
+///
+/// 분모가 다르므로 한 비율로 합칠 수 없다. 합치면 둘 중 하나는 반드시 틀린 분모로 읽힌다.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct TestAttributionCoverage {
+    /// 실패한 테스트 체크가 있는 post 리포트 수. **① 의 분모다.**
+    #[serde(rename = "reportsWithFailingTests")]
+    pub reports_with_failing_tests: u64,
+    /// 그중 이름을 가른 리포트 수. **② 의 분모이기도 하다.**
+    #[serde(rename = "reportsSplit")]
+    pub reports_split: u64,
+    /// 가른 리포트 중 원래 실패와 새 실패가 **함께 있던** 수 — 54절이 고친 그 상황이다.
+    #[serde(rename = "reportsMixed")]
+    pub reports_mixed: u64,
+    /// 새로 실패한 테스트의 총수.
+    #[serde(rename = "newlyFailingTests")]
+    pub newly_failing_tests: u64,
+    /// 이번 변경으로 통과로 바뀐 테스트의 총수 (54.4절).
+    #[serde(rename = "fixedTests")]
+    pub fixed_tests: u64,
+}
+
 /// 예약이 실제 비용의 몇 배였는가 — multi-engine-routing.md 10.6절.
 ///
 /// # 문서가 "측정할 수 있다"고 적어둔 것이 측정되지 않고 있었다
@@ -1042,7 +1206,7 @@ pub struct Metrics {
     /// 인덱스 캐시의 이득 (context-engine.md 2.1절).
     #[serde(rename = "indexCache")]
     pub index_cache: IndexCache,
-    /// 심볼 인덱스 층이 실제로 도는가 (context-engine.md 16절).
+    /// 심볼 인덱스 층이 실제로 도는가 (context-engine.md 22절).
     #[serde(rename = "symbolIndex")]
     pub symbol_index: SymbolIndexHealth,
     /// IPC 한 줄 크기 분포 (process-architecture.md 3.1절).
@@ -1060,6 +1224,21 @@ pub struct Metrics {
     /// 14절 보조 지표의 순수 집계.
     #[serde(rename = "operational")]
     pub operational: OperationalCounts,
+    /// 읽기 전용 경로가 더 읽어 달라고 한 횟수 (state-machine 57.8절).
+    #[serde(rename = "contextRounds")]
+    pub context_rounds: ContextRounds,
+    /// 우리가 못 본 채로 답한 태스크의 비율 (context-engine 19절).
+    #[serde(rename = "contextCoverage")]
+    pub context_coverage: ContextCoverage,
+    /// 무인 예고가 얼마나 맞았는가 (state-machine 59.6절).
+    #[serde(rename = "previewAccuracy")]
+    pub preview_accuracy: PreviewAccuracy,
+    /// 앵커 창 하나가 얼마나 자주 모자랐는가 (context-engine 15.6절).
+    #[serde(rename = "anchorWindows")]
+    pub anchor_windows: AnchorWindows,
+    /// 실패한 테스트 이름을 갈랐는가, 갈라 보니 섞여 있었는가 (state-machine 54·55절).
+    #[serde(rename = "testAttribution")]
+    pub test_attribution: TestAttributionCoverage,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
@@ -1239,6 +1418,46 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "no_test_reference가 압도적이면 (a) 기준을 적을 때 테스트를 함께 적게 하거나 (b) 잇는 규칙을 넓힌다. **(b)를 먼저 하고 싶은 유혹을 경계할 것** — 늘어난 확인이 근거 있는지는 같은 규칙으로 검사할 수 없다. 다만 17.9.1절이 고친 것은 (b)가 아니라 **실재 판정의 오류**였다: 증거의 문턱은 그대로 두고 '이 파일이 있는가'에 잘못 답하던 것을 고쳤으므로, 그 변경 이전 기록과 이후 기록은 같은 축이 아니다",
         ),
         open_question(
+            "contextRounds",
+            "contextRounds",
+            "읽기 전용 경로의 라운드 상한 1이 맞는가 (state-machine 57.8절)",
+            "답변·계획 태스크 수",
+            m.context_rounds.read_only_tasks,
+            "stoppedByLimit가 크면 상한을 올릴 근거다. **skippedAsPointless가 크면 아니다** — 그건 돌 이유가 없었다는 뜻이라 상한을 올려도 아무 일도 일어나지 않는다. requestsRefused가 크면 상한이 아니라 프롬프트 문제다: 모델이 경로가 아닌 것을 요청하고 있다",
+        ),
+        open_question(
+            "contextCoverage",
+            "contextCoverage",
+            "우리가 못 본 채로 답하는 일이 얼마나 흔한가 (context-engine 19절)",
+            "스냅샷을 만든 태스크 수",
+            m.context_coverage.tasks_with_snapshot,
+            "byKind로 갈라서 읽어야 한다 — 종류마다 할 일이 다르다. listing_truncated가 크면 인덱싱 상한(또는 하위 경로로 나눠 부르는 방식)의 근거이고, search_truncated는 키워드당 상한 쪽이다. **search_secret_skipped는 고칠 것이 아니다** — 정상 동작이고, 이 칸이 커도 그건 저장소에 비밀값 파일이 많다는 뜻일 뿐이다. search_failed가 0이 아니면 도구 문제이므로 가장 먼저 본다. *_unknown 계열은 호스트가 사실을 말하지 않는 경우이며, 우리 코드에서는 나오지 않아야 한다 — 나오면 옛 호스트나 옛 캐시를 읽고 있다는 신호다",
+        ),
+        open_question(
+            "previewAccuracy",
+            "previewAccuracy",
+            "무인 실행 미리보기를 그대로 믿어도 되는가 (state-machine 59.6절)",
+            "예고가 기록된 무인 태스크 수",
+            m.preview_accuracy.tasks_with_preview,
+            "contradicted가 0이 아니면 미리보기가 47절의 약속을 지키지 못하는 것이고, 화면이 그것을 크게 말하는 것만으로는 부족하다 — 게이트 판정과 probe의 어긋남을 찾아야 한다. **notProbed는 다른 축이다**: probe 집합이 좁다는 뜻이므로 47.9절의 probe 목록을 넓히는 근거이지 예고가 틀렸다는 뜻이 아니다",
+        ),
+        open_question(
+            "anchorWindows",
+            "anchorWindows",
+            "창 하나로 충분한가 — 앵커가 얼마나 자주 창 밖에 남는가 (context-engine 15.6절)",
+            "앵커가 둘 이상이었던 잘린 파일 수",
+            m.anchor_windows.files_with_multiple_anchors,
+            "anchorsMissed가 크면 창을 둘로 늘릴 근거다. **그 대가는 본문의 구멍이고**(14절), 구멍은 표시하지 않으면 거짓이고 표시하면 모델이 patch context로 복사한다 — 그래서 늘리기 전에 '구멍을 어떻게 말할 것인가'가 먼저 풀려야 한다. singleAnchorFiles가 압도적이면 이 질문 자체가 드문 경우에 대한 것이다",
+        ),
+        open_question(
+            "testAttributionCoverage",
+            "testAttribution",
+            "러너 파서가 실제 프로젝트를 덮는가, 그리고 새 회귀가 원래 실패에 얼마나 자주 숨는가 (state-machine 54·55절)",
+            "실패한 테스트 체크가 있는 post 리포트 수",
+            m.test_attribution.reports_with_failing_tests,
+            "reportsSplit이 분모에 한참 못 미치면 55절의 러너 목록을 넓힌다 — 그때 실제 출력 없이 모양을 적으면 55.1절이 피하려던 것을 다시 만든다. reportsMixed가 크면 54절이 고친 거짓말이 흔했다는 뜻이고, 그건 체크 단위 귀속을 쓰는 다른 자리도 다시 봐야 한다는 신호다",
+        ),
+        open_question(
             "conflictOutcomes",
             "conflicts",
             "기준 충돌 게이트가 실제 문제를 잡는가, 프롬프트가 기준을 안 읽는 것인가 (17.10절 8)",
@@ -1331,12 +1550,12 @@ fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
             "인덱스 캐시가 이득인가 (context-engine 2.1절)",
             "구축 + 적중 횟수",
             m.index_cache.builds + m.index_cache.hits,
-            "적중률이 아니라 savedMsTotal을 본다. 구축이 원래 빨랐다면 캐시는 지우는 것이 맞다. **심볼 층이 붙으면서 구축이 비싸졌으므로 이 질문의 답이 뒤집힐 수 있다** — p90PayloadBytes가 함께 커졌는지도 본다(context-engine 16절)",
+            "적중률이 아니라 savedMsTotal을 본다. 구축이 원래 빨랐다면 캐시는 지우는 것이 맞다. **심볼 층이 붙으면서 구축이 비싸졌으므로 이 질문의 답이 뒤집힐 수 있다** — p90PayloadBytes가 함께 커졌는지도 본다(context-engine 22절)",
         ),
         open_question(
             "symbolIndex",
             "symbolIndex",
-            "Tree-sitter 심볼 층이 실제로 돌고 있는가, 그리고 파싱 실패가 얼마나 되는가 (context-engine 16절)",
+            "Tree-sitter 심볼 층이 실제로 돌고 있는가, 그리고 파싱 실패가 얼마나 되는가 (context-engine 22절)",
             "심볼 통계를 남긴 인덱스 구축 횟수",
             m.symbol_index.builds,
             "buildsWithGrammarFailure가 0이 아니면 **그 사용자에게 이 층은 없는 것**이고, 화면은 폴백으로 조용히 돌고 있다 — 고칠 자리는 grammar 번들이지 추출 규칙이 아니다. filesParseFailedTotal 비율이 높으면 grammar 버전이 소스 문법을 못 따라가는 것이다",
@@ -1810,6 +2029,19 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
         // ---- 카드 답변: 자리별 분포 ----
         collect_card_answers(&events, &mut metrics.card_answers);
 
+        // ---- 읽기 전용 경로의 컨텍스트 라운드 (57.8절) ----
+        collect_context_rounds(&events, &mut metrics.context_rounds);
+        collect_context_coverage(&events, &mut metrics.context_coverage);
+
+        // ---- 무인 예고가 맞았는가 (59.6절) ----
+        collect_preview_accuracy(&events, &mut metrics.preview_accuracy);
+
+        // ---- 앵커 창이 모자랐는가 (context-engine 15.6절) ----
+        collect_anchor_windows(&events, &mut metrics.anchor_windows);
+
+        // ---- 실패한 테스트 이름을 갈랐는가 (54·55절) ----
+        collect_test_attribution(&events, &mut metrics.test_attribution);
+
         // ---- 취소 소요: CANCELLATION_REQUESTED → 그 뒤 첫 터미널 ----
         collect_cancellation(&events, &mut metrics.cancellation, &mut latencies);
 
@@ -1885,6 +2117,228 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
 /// 3.4절 확인 필요 카드(모델이 스스로 모호하다고 말한 경우)에는 쟁점도 자리도 없다.
 /// 그건 **다른 화면**이므로 이 집계에 섞지 않는다 — 섞으면 자리 없는 답이 전부 `unknown`으로
 /// 쌓여 분모를 부풀린다.
+/// 읽기 전용 경로의 컨텍스트 라운드를 센다 — state-machine 57.8절.
+///
+/// **분모는 답변·계획 태스크다.** 라운드를 돈 태스크만 세면 "라운드를 돌면 대개 돈다"는
+/// 동어반복이 나온다.
+/// 앵커 창이 모자랐는가 — context-engine 15.6절.
+///
+/// **앵커가 하나뿐인 파일은 분모에서 뺀다.** 거기서는 놓치는 일이 구조적으로 불가능하다.
+fn collect_anchor_windows(events: &[crate::store::StoredEvent], out: &mut AnchorWindows) {
+    for event in events.iter().filter(|e| e.event_type == "SNAPSHOT_CREATED") {
+        let Some(files) = event.payload.get("relevantFiles").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for file in files {
+            // **`null`을 "덮개가 있다"로 읽지 않는다.** 기록하는 쪽이 없을 때 키를 빼는 것이
+            // 규칙이지만(61절), 규칙을 어긴 기록이 오면 여기서 `total: 0`이 되어 **잘리지도
+            // 않은 파일이 전부 `singleAnchorFiles`로 세어진다** — 분모에서 뺀 수가 부풀려져
+            // "이 질문은 드문 경우에 대한 것"이라는 잘못된 결론이 나온다.
+            // **`null`을 "덮개가 있다"로 읽지 않는다.** 기록하는 쪽이 없을 때 키를 빼는 것이
+            // 규칙이지만(61절), 규칙을 어긴 기록이 오면 여기서 `total: 0`이 되어 **잘리지도
+            // 않은 파일이 전부 `singleAnchorFiles`로 세어진다** — 분모에서 뺀 수가 부풀려져
+            // "이 질문은 드문 경우에 대한 것"이라는 잘못된 결론이 나온다.
+            let coverage = match file.get("anchorCoverage") {
+                Some(v) if !v.is_null() => v,
+                _ => continue,
+            };
+            let total = coverage.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+            let covered = coverage.get("covered").and_then(|v| v.as_u64()).unwrap_or(0);
+            if total < 2 {
+                out.single_anchor_files += 1;
+                continue;
+            }
+            out.files_with_multiple_anchors += 1;
+            if covered >= total {
+                out.fully_covered += 1;
+            } else {
+                out.anchors_missed += total - covered;
+            }
+        }
+    }
+}
+
+/// 실패한 테스트 이름을 갈랐는가, 갈라 보니 섞여 있었는가 — state-machine 54·55절.
+///
+/// **두 질문의 분모가 다르다.** ①은 "실패한 테스트 체크가 있는 리포트", ②는 "가른 리포트"다 —
+/// 못 가른 리포트에 대해서는 섞였는지 알 수 없으므로 ②의 분모에 넣을 수 없다.
+fn collect_test_attribution(events: &[crate::store::StoredEvent], out: &mut TestAttributionCoverage) {
+    for event in events.iter().filter(|e| e.event_type == "VERIFICATION_COMPLETED") {
+        let report = &event.payload;
+        if report.get("phase").and_then(|v| v.as_str()) != Some("post") {
+            continue;
+        }
+        let failing_test_check = report
+            .get("checks")
+            .and_then(|v| v.as_array())
+            .map(|checks| {
+                checks.iter().any(|c| {
+                    c.get("kind").and_then(|v| v.as_str()) == Some("test")
+                        && matches!(c.get("status").and_then(|v| v.as_str()), Some("FAILED") | Some("TIMED_OUT"))
+                })
+            })
+            .unwrap_or(false);
+        if !failing_test_check {
+            continue;
+        }
+        out.reports_with_failing_tests += 1;
+
+        let Some(attribution) = report.get("testAttribution").and_then(|v| v.as_array()) else {
+            // 가르지 못했다 — ②의 분모에 넣지 않는다.
+            continue;
+        };
+        out.reports_split += 1;
+
+        let mut mixed = false;
+        for entry in attribution {
+            let len = |key: &str| entry.get(key).and_then(|v| v.as_array()).map(|a| a.len() as u64).unwrap_or(0);
+            let newly = len("newlyFailing");
+            let pre = len("preexisting");
+            out.newly_failing_tests += newly;
+            out.fixed_tests += len("fixed");
+            if newly > 0 && pre > 0 {
+                mixed = true;
+            }
+        }
+        if mixed {
+            out.reports_mixed += 1;
+        }
+    }
+}
+
+/// 범위 노트를 **태스크 단위로** 센다 — context-engine 19절.
+///
+/// 마지막 `SNAPSHOT_CREATED`만 본다. 갱신 스냅샷이 노트를 물려받으므로(17절) 전부 세면 같은
+/// 사실이 라운드 수만큼 곱해진다 — `transmission.rs`가 같은 이유로 마지막 것을 읽는다.
+fn collect_context_coverage(events: &[crate::store::StoredEvent], out: &mut ContextCoverage) {
+    let Some(payload) = events
+        .iter()
+        .rev()
+        .find(|e| e.event_type == "SNAPSHOT_CREATED")
+        .map(|e| &e.payload)
+    else {
+        return;
+    };
+    out.tasks_with_snapshot += 1;
+
+    let Some(notes) = payload.get("coverageNotes").and_then(Value::as_array) else {
+        return;
+    };
+    if notes.is_empty() {
+        return;
+    }
+    out.tasks_with_gap += 1;
+
+    // **태스크당 한 번씩만 센다.** 노트 수로 세면 키워드가 많은 요청 하나가 분포를 끌고 간다.
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut unlabelled = false;
+    for note in notes {
+        match note.get("kind").and_then(Value::as_str) {
+            Some(kind) => {
+                kinds.insert(kind.to_string());
+            }
+            None => unlabelled = true,
+        }
+    }
+    for kind in kinds {
+        *out.by_kind.entry(kind).or_insert(0) += 1;
+    }
+    if unlabelled {
+        out.tasks_with_unlabelled_note += 1;
+    }
+}
+
+fn collect_context_rounds(events: &[crate::store::StoredEvent], out: &mut ContextRounds) {
+    let read_only = events
+        .iter()
+        .any(|e| matches!(e.event_type.as_str(), "QUESTION_ANSWERED" | "PLAN_OUTLINED"));
+    if !read_only {
+        return;
+    }
+    out.read_only_tasks += 1;
+
+    let mut ran = false;
+    for event in events {
+        match event.event_type.as_str() {
+            "CONTEXT_ROUND_COMPLETED" => {
+                ran = true;
+                out.files_fetched += array_len(&event.payload, "fetched");
+                out.requests_refused += array_len(&event.payload, "refused");
+            }
+            "CONTEXT_ROUND_SKIPPED" => {
+                let reason = event.payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                // **상한과 "돌 이유가 없음"을 구별한다.** 뭉치면 상한을 올릴 근거가 사라진다:
+                // 후자가 큰 것은 상한을 올려도 아무 일도 일어나지 않는다는 뜻이다.
+                if reason == "limit_reached" {
+                    out.stopped_by_limit += 1;
+                } else {
+                    out.skipped_as_pointless += 1;
+                }
+                out.requests_refused += array_len(&event.payload, "refused");
+            }
+            _ => {}
+        }
+    }
+    if ran {
+        out.tasks_with_round += 1;
+    }
+}
+
+fn array_len(payload: &Value, key: &str) -> u64 {
+    payload.get(key).and_then(|v| v.as_array()).map(|a| a.len() as u64).unwrap_or(0)
+}
+
+/// 예고와 실제를 **기록에서** 잇는다 — state-machine 59.6절.
+///
+/// 판정 규칙은 59.1절과 같다: 예고한 자리 / "지나간다"고 한 자리에서 멈춤 / 다루지 않은 규칙.
+/// **셋을 뭉개지 않는 이유도 같다** — 전부 "예고대로"면 어긋남이 사라지고, 전부 "틀렸다"면
+/// 없는 결함을 만든다.
+fn collect_preview_accuracy(events: &[crate::store::StoredEvent], out: &mut PreviewAccuracy) {
+    let Some(preview) = events
+        .iter()
+        .find(|e| e.event_type == "AUTOPILOT_PREVIEW_PINNED")
+        .map(|e| &e.payload)
+    else {
+        return;
+    };
+    out.tasks_with_preview += 1;
+
+    let rules_of = |key: &str| -> std::collections::BTreeSet<String> {
+        preview
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|p| p.get("matchedRule").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let previewed_stops = rules_of("stops");
+    let previewed_proceeds = rules_of("proceeds");
+
+    let mut stopped = false;
+    for event in events.iter().filter(|e| e.event_type == "APPROVAL_UNATTENDED") {
+        stopped = true;
+        let rule = event
+            .payload
+            .get("matchedRule")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if previewed_stops.contains(rule) {
+            out.as_previewed += 1;
+        } else if previewed_proceeds.contains(rule) {
+            out.contradicted += 1;
+        } else {
+            out.not_probed += 1;
+        }
+    }
+    if stopped {
+        out.tasks_that_stopped += 1;
+    }
+}
+
 fn collect_card_answers(events: &[crate::store::StoredEvent], out: &mut CardAnswers) {
     for event in events {
         if event.event_type != "USER_DECISION_RECORDED" {
@@ -3035,7 +3489,7 @@ mod tests {
         assert_eq!(m.index_cache.hits_without_saved_ms, 1);
     }
 
-    // ---- 심볼 인덱스 (context-engine.md 16절) ----
+    // ---- 심볼 인덱스 (context-engine.md 22절) ----
 
     #[test]
     fn the_symbol_layer_reports_what_it_actually_did() {
@@ -3066,7 +3520,7 @@ mod tests {
         assert_eq!(m.symbol_index.p90_symbol_count, Some(12_000));
         assert_eq!(m.symbol_index.p90_edge_count, Some(900));
         assert_eq!(m.symbol_index.p90_symbol_index_ms, Some(700));
-        // 캐시 payload 크기 — 심볼이 차면서 커진 값이고, 재는 자리가 여기다(16절).
+        // 캐시 payload 크기 — 심볼이 차면서 커진 값이고, 재는 자리가 여기다(22절).
         assert_eq!(m.index_cache.p90_payload_bytes, Some(1_500_000));
     }
 
@@ -3115,6 +3569,403 @@ mod tests {
 
     fn question<'a>(m: &'a Metrics, id: &str) -> &'a OpenQuestion {
         m.open_questions.iter().find(|q| q.id == id).expect(id)
+    }
+
+    // ---- 컨텍스트 라운드 (state-machine 57.8절) ----
+
+    /// **분모는 답변·계획 태스크다.** 라운드를 돈 태스크만 세면 "라운드를 돌면 대개 돈다"는
+    /// 동어반복이 나온다.
+    #[test]
+    fn a_change_task_is_not_in_the_context_round_denominator() {
+        let (_d, mut store) = seeded();
+        store.append_event("task-1", "TASK_COMPLETED", &json!({})).unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_rounds.read_only_tasks, 0);
+    }
+
+    #[test]
+    fn a_context_round_is_counted_with_what_it_fetched_and_refused() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "CONTEXT_ROUND_COMPLETED",
+                &json!({ "fetched": ["a.ts", "b.ts"], "refused": [{ "request": "설명", "reason": "x" }] }),
+            )
+            .unwrap();
+        store.append_event("task-1", "QUESTION_ANSWERED", &json!({})).unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_rounds.read_only_tasks, 1);
+        assert_eq!(m.context_rounds.tasks_with_round, 1);
+        assert_eq!(m.context_rounds.files_fetched, 2);
+        assert_eq!(m.context_rounds.requests_refused, 1);
+    }
+
+    /// **상한과 "돌 이유가 없음"을 구별한다.** 뭉치면 상한을 올릴 근거가 사라진다 —
+    /// 후자가 큰 것은 상한을 올려도 아무 일도 일어나지 않는다는 뜻이다.
+    #[test]
+    fn the_limit_and_a_pointless_round_are_counted_apart() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "CONTEXT_ROUND_SKIPPED", &json!({ "reason": "limit_reached" }))
+            .unwrap();
+        store
+            .append_event("task-1", "CONTEXT_ROUND_SKIPPED", &json!({ "reason": "nothing_fetchable" }))
+            .unwrap();
+        store
+            .append_event("task-1", "CONTEXT_ROUND_SKIPPED", &json!({ "reason": "already_in_context" }))
+            .unwrap();
+        store.append_event("task-1", "PLAN_OUTLINED", &json!({})).unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_rounds.stopped_by_limit, 1);
+        assert_eq!(m.context_rounds.skipped_as_pointless, 2);
+        // 건너뛰기만 있었으면 "라운드를 돈" 태스크가 아니다.
+        assert_eq!(m.context_rounds.tasks_with_round, 0);
+        assert_eq!(m.context_rounds.read_only_tasks, 1);
+    }
+
+    // ---- 못 본 채로 답했는가 (context-engine 19절) ----
+
+    fn snapshot_with_coverage(notes: Value) -> Value {
+        json!({ "snapshotId": "snap-1", "relevantFiles": [], "excludedNotes": [], "coverageNotes": notes })
+    }
+
+    /// **종류별로 태스크를 센다** — 종류마다 할 일이 다르므로 한 숫자로 세면 쓸 수 없다.
+    #[test]
+    fn coverage_gaps_are_counted_by_kind_once_per_task() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with_coverage(json!([
+                    { "kind": "search_secret_skipped", "scope": "본문 검색: a", "reason": "…" },
+                    // **같은 종류가 두 번** — 키워드마다 붙으므로 흔하다. 태스크는 하나로 세야 한다.
+                    { "kind": "search_secret_skipped", "scope": "본문 검색: b", "reason": "…" },
+                    { "kind": "listing_truncated", "scope": "파일 목록", "reason": "…" },
+                ])),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.tasks_with_snapshot, 1);
+        assert_eq!(m.context_coverage.tasks_with_gap, 1);
+        assert_eq!(m.context_coverage.by_kind.get("search_secret_skipped"), Some(&1), "{:?}", m.context_coverage);
+        assert_eq!(m.context_coverage.by_kind.get("listing_truncated"), Some(&1), "{:?}", m.context_coverage);
+        assert_eq!(m.context_coverage.tasks_with_unlabelled_note, 0);
+    }
+
+    /// **분모는 스냅샷을 만든 태스크다** — 전체 태스크가 아니다.
+    ///
+    /// 스냅샷 전에 끝난 태스크에는 이 질문이 성립하지 않는다. 분모에 넣으면 비율이 낮아지고,
+    /// 그건 우리가 더 잘 보고 있다는 뜻으로 읽힌다 — **잘못된 분모가 표본 부족보다 나쁘다.**
+    #[test]
+    fn a_task_without_a_snapshot_is_not_in_the_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .create_task("task-2", "sess-1", "ws-1", "/tmp/ws", "verified", "fix")
+            .unwrap();
+        // task-1만 스냅샷을 만든다. task-2는 그 전에 끝났다.
+        store
+            .append_event("task-1", "SNAPSHOT_CREATED", &snapshot_with_coverage(json!([])))
+            .unwrap();
+        store.append_event("task-2", "TASK_FAILED", &json!({})).unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.tasks_with_snapshot, 1, "{:?}", m.context_coverage);
+        // 노트가 없으면 "못 본 것이 없다" — 분자에 들어가지 않는다.
+        assert_eq!(m.context_coverage.tasks_with_gap, 0, "{:?}", m.context_coverage);
+    }
+
+    /// **갱신 스냅샷이 노트를 물려받아도 한 번만 센다.**
+    ///
+    /// 17절의 갱신 경로는 앞선 노트를 그대로 나른다. 전부 세면 같은 사실이 라운드 수만큼
+    /// 곱해지고, 그러면 fix loop를 많이 돈 태스크가 분포를 끌고 간다.
+    #[test]
+    fn only_the_last_snapshot_counts() {
+        let (_d, mut store) = seeded();
+        for _ in 0..3 {
+            store
+                .append_event(
+                    "task-1",
+                    "SNAPSHOT_CREATED",
+                    &snapshot_with_coverage(json!([{ "kind": "listing_truncated", "scope": "파일 목록", "reason": "…" }])),
+                )
+                .unwrap();
+        }
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.tasks_with_snapshot, 1, "{:?}", m.context_coverage);
+        assert_eq!(m.context_coverage.by_kind.get("listing_truncated"), Some(&1), "{:?}", m.context_coverage);
+    }
+
+    /// **종류가 없는 노트를 아무 칸에나 넣지 않는다.**
+    ///
+    /// 이 필드가 생기기 전의 기록이 그렇다. 아는 칸에 섞으면 그 칸의 숫자가 무엇도 뜻하지
+    /// 않게 되고, 버리면 "못 본 것이 없었다"가 된다 — 둘 다 틀리므로 따로 센다.
+    #[test]
+    fn an_unlabelled_note_is_counted_apart() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with_coverage(json!([{ "scope": "본문 검색: a", "reason": "옛 기록" }])),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.tasks_with_gap, 1);
+        assert_eq!(m.context_coverage.tasks_with_unlabelled_note, 1);
+        assert!(m.context_coverage.by_kind.is_empty(), "{:?}", m.context_coverage.by_kind);
+    }
+
+    /// **모르는 종류를 옛 칸에 접지 않는다.** Rust가 아는 종류 목록을 들면 Node의 목록과
+    /// 두 벌이 되고, 그때 새 종류는 조용히 사라지거나 엉뚱한 칸에 섞인다.
+    #[test]
+    fn an_unknown_kind_gets_its_own_bucket() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with_coverage(json!([{ "kind": "some_future_kind", "scope": "x", "reason": "…" }])),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.context_coverage.by_kind.get("some_future_kind"), Some(&1), "{:?}", m.context_coverage);
+        assert_eq!(m.context_coverage.tasks_with_unlabelled_note, 0);
+    }
+
+    // ---- 예고가 맞았는가 (state-machine 59.6절) ----
+
+    fn pinned_preview(stops: Vec<&str>, proceeds: Vec<&str>) -> Value {
+        let rule = |r: &str| json!({ "tool": "apply_patch", "probe": r, "decision": "require_user_approval", "matchedRule": r, "fate": { "kind": "unattended_stop" }, "rerunFlag": null });
+        json!({
+            "switches": { "unattended": true },
+            "stops": stops.iter().map(|r| rule(r)).collect::<Vec<_>>(),
+            "proceeds": proceeds.iter().map(|r| rule(r)).collect::<Vec<_>>(),
+            "denied": [],
+            "caveat": "한계",
+        })
+    }
+
+    /// **예고가 없으면 분모에 들어가지 않는다.** 들어가면 "예고가 맞은 비율"의 분모가
+    /// 예고를 받지 않은 태스크로 부풀려진다.
+    #[test]
+    fn a_task_without_a_pinned_preview_is_not_in_the_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "APPROVAL_UNATTENDED", &json!({ "matchedRule": "r" }))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.preview_accuracy.tasks_with_preview, 0);
+        assert_eq!(m.preview_accuracy.not_probed, 0);
+    }
+
+    /// **셋을 뭉개지 않는다**(59.1절). 전부 "예고대로"면 어긋남이 사라지고, 전부 "틀렸다"면
+    /// 없는 결함을 만든다.
+    #[test]
+    fn stops_are_split_three_ways_against_the_pinned_preview() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "AUTOPILOT_PREVIEW_PINNED", &pinned_preview(vec!["a"], vec!["b"]))
+            .unwrap();
+        for rule in ["a", "b", "c"] {
+            store
+                .append_event("task-1", "APPROVAL_UNATTENDED", &json!({ "matchedRule": rule }))
+                .unwrap();
+        }
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.preview_accuracy.tasks_with_preview, 1);
+        assert_eq!(m.preview_accuracy.tasks_that_stopped, 1);
+        assert_eq!(m.preview_accuracy.as_previewed, 1, "{:?}", m.preview_accuracy);
+        // **이 집계의 목적**: 예고가 "지나간다"고 한 자리에서 멈춘 횟수.
+        assert_eq!(m.preview_accuracy.contradicted, 1, "{:?}", m.preview_accuracy);
+        // probe 집합이 좁다는 뜻이지 예고가 틀렸다는 뜻이 아니다.
+        assert_eq!(m.preview_accuracy.not_probed, 1, "{:?}", m.preview_accuracy);
+    }
+
+    /// 예고를 받고 멈추지 않은 태스크도 분모에 남는다 — 그게 "얼마나 자주 어긋나는가"의 분모다.
+    #[test]
+    fn a_previewed_task_that_never_stopped_stays_in_the_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "AUTOPILOT_PREVIEW_PINNED", &pinned_preview(vec!["a"], vec![]))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.preview_accuracy.tasks_with_preview, 1);
+        assert_eq!(m.preview_accuracy.tasks_that_stopped, 0);
+    }
+
+    // ---- 앵커 창 (context-engine 15.6절) ----
+
+    fn snapshot_with(files: Value) -> Value {
+        json!({ "snapshotId": "s-1", "relevantFiles": files })
+    }
+
+    /// **앵커가 하나뿐인 파일은 분모에서 뺀다.** 거기서는 놓치는 일이 **구조적으로
+    /// 불가능**하고, 넣으면 "우리는 거의 놓치지 않는다"가 참이 되도록 분모를 부풀린다.
+    #[test]
+    fn a_single_anchor_file_is_not_in_the_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with(json!([{ "path": "a.ts", "anchorCoverage": { "covered": 1, "total": 1 } }])),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.anchor_windows.files_with_multiple_anchors, 0);
+        // **뺀 사실은 남긴다** — 조용히 빼면 분모가 왜 작은지 알 수 없다.
+        assert_eq!(m.anchor_windows.single_anchor_files, 1);
+    }
+
+    #[test]
+    fn missed_anchors_are_counted() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with(json!([
+                    { "path": "a.ts", "anchorCoverage": { "covered": 2, "total": 4 } },
+                    { "path": "b.ts", "anchorCoverage": { "covered": 3, "total": 3 } },
+                ])),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.anchor_windows.files_with_multiple_anchors, 2);
+        assert_eq!(m.anchor_windows.fully_covered, 1);
+        assert_eq!(m.anchor_windows.anchors_missed, 2, "{:?}", m.anchor_windows);
+    }
+
+    /// **`null`을 "덮개가 있다"로 읽지 않는다.**
+    ///
+    /// 기록하는 쪽은 없을 때 키를 뺀다(61절). 그런데 규칙을 어긴 기록이 오면 `total: 0`이
+    /// 되어 **잘리지도 않은 파일이 전부 `singleAnchorFiles`로 세어진다** — 분모에서 뺀 수가
+    /// 부풀려져 "이 질문은 드문 경우에 대한 것"이라는 잘못된 결론이 나온다.
+    ///
+    /// 프로브로 찾았다: 기록 쪽을 `null`을 싣도록 바꿔도 아무 검사도 실패하지 않았다.
+    #[test]
+    fn an_explicit_null_coverage_is_not_a_single_anchor_file() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "SNAPSHOT_CREATED",
+                &snapshot_with(json!([{ "path": "a.ts", "anchorCoverage": Value::Null }])),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.anchor_windows.single_anchor_files, 0, "{:?}", m.anchor_windows);
+        assert_eq!(m.anchor_windows.files_with_multiple_anchors, 0);
+    }
+
+    /// 잘리지 않은 파일에는 이 값이 없다 — 없는 것을 0으로 세면 "덮었다"가 부풀려진다.
+    #[test]
+    fn a_file_without_coverage_is_ignored_entirely() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "SNAPSHOT_CREATED", &snapshot_with(json!([{ "path": "a.ts" }])))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.anchor_windows.files_with_multiple_anchors, 0);
+        assert_eq!(m.anchor_windows.single_anchor_files, 0);
+        assert_eq!(m.anchor_windows.fully_covered, 0);
+    }
+
+    // ---- 테스트 이름 귀속 (state-machine 54·55절) ----
+
+    fn post_report(test_status: &str, attribution: Option<Value>) -> Value {
+        let mut report = json!({
+            "phase": "post",
+            "checks": [{ "kind": "test", "status": test_status }],
+        });
+        if let Some(a) = attribution {
+            report["testAttribution"] = a;
+        }
+        report
+    }
+
+    /// **분모는 "실패한 테스트 체크가 있는 리포트"다.** 실패가 없는 리포트를 넣으면
+    /// "대개 가른다"가 참이 되도록 분모가 부풀려진다.
+    #[test]
+    fn a_passing_report_is_not_in_the_parser_coverage_denominator() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "VERIFICATION_COMPLETED", &post_report("PASSED", None))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_with_failing_tests, 0);
+    }
+
+    /// **가르지 못한 리포트는 ② 의 분모에 넣지 않는다** — 섞였는지 알 수 없기 때문이다.
+    #[test]
+    fn an_unsplit_report_counts_for_coverage_but_not_for_mixing() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event("task-1", "VERIFICATION_COMPLETED", &post_report("FAILED", None))
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_with_failing_tests, 1);
+        assert_eq!(m.test_attribution.reports_split, 0);
+        assert_eq!(m.test_attribution.reports_mixed, 0);
+    }
+
+    /// 54절이 고친 그 상황 — 원래 실패와 새 실패가 **함께** 있는 체크.
+    #[test]
+    fn a_mixed_report_is_counted_as_mixed() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "VERIFICATION_COMPLETED",
+                &post_report(
+                    "FAILED",
+                    Some(json!([{ "kind": "test", "newlyFailing": ["a", "b"], "preexisting": ["c"], "fixed": ["d"] }])),
+                ),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_split, 1);
+        assert_eq!(m.test_attribution.reports_mixed, 1);
+        assert_eq!(m.test_attribution.newly_failing_tests, 2);
+        assert_eq!(m.test_attribution.fixed_tests, 1);
+    }
+
+    /// 순수한 새 실패는 **섞임이 아니다** — 뭉치면 54절이 물으려는 것이 사라진다.
+    #[test]
+    fn a_purely_new_failure_is_not_mixed() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "VERIFICATION_COMPLETED",
+                &post_report(
+                    "FAILED",
+                    Some(json!([{ "kind": "test", "newlyFailing": ["a"], "preexisting": [], "fixed": [] }])),
+                ),
+            )
+            .unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_split, 1);
+        assert_eq!(m.test_attribution.reports_mixed, 0);
+    }
+
+    /// baseline 리포트는 세지 않는다 — 대조할 것이 없으므로 귀속이라는 개념이 없다.
+    #[test]
+    fn a_baseline_report_is_not_counted() {
+        let (_d, mut store) = seeded();
+        let mut report = post_report("FAILED", None);
+        report["phase"] = json!("baseline");
+        store.append_event("task-1", "VERIFICATION_COMPLETED", &report).unwrap();
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.test_attribution.reports_with_failing_tests, 0);
     }
 
     #[test]

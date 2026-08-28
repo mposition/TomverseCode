@@ -32,12 +32,14 @@ use std::collections::BTreeSet;
 ///
 /// `program`은 러너를 고르는 데 쓴다(argv의 첫 항목). 확장자와 경로는 무시한다 —
 /// Windows에서 `npm`이 `npm.cmd`이고 venv 인터프리터는 절대경로다.
-pub fn failed_tests(program: &str, args: &[String], output: &str) -> Option<BTreeSet<String>> {
-    match runner_of(program, args)? {
+pub fn failed_tests(program: &str, args: &[String], declared: Option<&str>, output: &str) -> Option<BTreeSet<String>> {
+    match runner_of(program, args, declared)? {
         Runner::Pytest => Some(parse_pytest(output)),
         Runner::Cargo => Some(parse_cargo(output)),
         Runner::Dotnet => Some(parse_dotnet(output)),
         Runner::NodeTest => Some(parse_node_test(output)),
+        Runner::Vitest => Some(parse_vitest(output)),
+        Runner::Jest => Some(parse_jest(output)),
     }
 }
 
@@ -46,9 +48,10 @@ enum Runner {
     Pytest,
     Cargo,
     Dotnet,
-    /// `node --test`의 TAP 출력. vitest·jest도 `not ok` 줄을 내지 않으므로 여기 해당하지 않는다 —
-    /// 그건 아래 "아직 하지 않은 것"이다.
+    /// `node --test`의 TAP 출력.
     NodeTest,
+    Vitest,
+    Jest,
 }
 
 fn basename(program: &str) -> String {
@@ -57,7 +60,53 @@ fn basename(program: &str) -> String {
     stem.to_ascii_lowercase()
 }
 
-fn runner_of(program: &str, args: &[String]) -> Option<Runner> {
+/// 패키지 매니저를 거쳐 도는 명령의 러너는 **선언 본문에서 유도한다** (55절).
+///
+/// # 왜 출력 모양으로 추측하지 않는가
+///
+/// 54.7절이 이 항목을 미뤄 둔 이유가 그것이다: 출력을 보고 러너를 짐작하면, 짐작이 틀렸을 때
+/// **무관한 문자열이 테스트 이름이 된다.** 그러면 baseline 대조가 없는 회귀를 보고하고,
+/// 그건 "모른다"보다 나쁘다 — 우리가 만든 거짓 신호이기 때문이다.
+///
+/// 선언 본문은 짐작이 아니다. `package.json`의 `scripts.test`에 `vitest`라고 적혀 있으면
+/// 그 프로젝트는 vitest를 돌린다.
+///
+/// # 첫 토큰만 보지 않는다
+///
+/// `cross-env CI=1 vitest run`처럼 앞에 래퍼가 붙는 것이 흔하다. 그래서 **토큰 어디에든**
+/// 러너 이름이 있으면 인정한다. 대신 둘 이상이 보이면 `None`이다 — `vitest run && jest`
+/// 같은 본문에서 한쪽을 고르면 나머지 절반의 실패 이름을 조용히 잃는다.
+fn runner_from_declaration(declared: &str) -> Option<Runner> {
+    let mut found: Option<Runner> = None;
+    for token in declared.split(|c: char| c.is_whitespace() || c == '&' || c == '|' || c == ';') {
+        // `./node_modules/.bin/vitest`처럼 경로가 붙을 수 있다.
+        let name = basename(token);
+        let candidate = match name.as_str() {
+            "vitest" => Some(Runner::Vitest),
+            "jest" => Some(Runner::Jest),
+            "pytest" => Some(Runner::Pytest),
+            _ => None,
+        };
+        // `node --test`는 토큰 둘로 나뉜다.
+        let candidate = candidate.or_else(|| {
+            if name == "node" && declared.contains("--test") {
+                Some(Runner::NodeTest)
+            } else {
+                None
+            }
+        });
+        let Some(candidate) = candidate else { continue };
+        match found {
+            None => found = Some(candidate),
+            Some(existing) if existing == candidate => {}
+            // **둘 이상이면 모른다.** 한쪽을 고르면 나머지의 실패를 조용히 잃는다.
+            Some(_) => return None,
+        }
+    }
+    found
+}
+
+fn runner_of(program: &str, args: &[String], declared: Option<&str>) -> Option<Runner> {
     let name = basename(program);
     let first = args.first().map(String::as_str).unwrap_or("");
     let second = args.get(1).map(String::as_str).unwrap_or("");
@@ -67,9 +116,10 @@ fn runner_of(program: &str, args: &[String]) -> Option<Runner> {
         "python" | "python3" if first == "-m" && second == "pytest" => Some(Runner::Pytest),
         "cargo" if first == "test" => Some(Runner::Cargo),
         "dotnet" if first == "test" => Some(Runner::Dotnet),
-        // `node --test ...`. **`npm test`는 여기 오지 않는다** — 그 뒤에 무엇이 도는지는
-        // 매니페스트가 정하므로 argv만 보고는 알 수 없다(아래 `NODE_VIA_NPM` 참조).
         "node" if args.iter().any(|a| a == "--test") => Some(Runner::NodeTest),
+        // **패키지 매니저는 argv로 알 수 없다** — 뒤에 무엇이 도는지는 매니페스트가 정한다.
+        // 그래서 여기서만 선언 본문을 본다(55절).
+        "npm" | "pnpm" | "yarn" | "bun" => declared.and_then(runner_from_declaration),
         _ => None,
     }
 }
@@ -183,6 +233,95 @@ fn parse_node_test(output: &str) -> BTreeSet<String> {
     out
 }
 
+/// vitest: 실패 요약 블록의 `FAIL  <파일> > <이름>` 줄.
+///
+/// ```text
+///  FAIL  src/a.test.ts > 덧셈 > 두 수를 더한다
+/// ```
+///
+/// **파일 경로를 이름에 남긴다.** 다른 파일의 같은 이름이 한 이름으로 접히면 대조가
+/// 무관한 테스트를 "고쳐짐"으로 읽는다 — 이름의 목적은 사람이 읽는 것이 아니라
+/// baseline과 대조되는 것이다.
+///
+/// **파일만 있고 테스트 이름이 없는 줄은 받지 않는다.** vitest는 파일 단위 실패
+/// (수집 오류 등)에도 `FAIL  src/a.test.ts`를 내는데, 그걸 테스트 이름으로 세면
+/// 같은 파일의 개별 실패와 뒤섞인다.
+fn parse_vitest(output: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in output.lines() {
+        let line = strip_ansi(line);
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("FAIL ") else {
+            continue;
+        };
+        let rest = rest.trim();
+        // 테스트 이름이 붙어 있어야 한다.
+        if !rest.contains(" > ") {
+            continue;
+        }
+        if !rest.is_empty() {
+            out.insert(rest.to_string());
+        }
+    }
+    out
+}
+
+/// jest: 실패 상세의 `● <스위트> › <이름>` 줄.
+///
+/// ```text
+///   ● 덧셈 › 두 수를 더한다
+/// ```
+///
+/// **`✕` 줄을 쓰지 않는 이유**: 거기에는 소요 시간이 붙고(`✕ name (3 ms)`), 그건 실행마다
+/// 달라져 같은 테스트가 매번 다른 이름이 된다(54.2절이 dotnet에서 막은 것과 같은 함정).
+///
+/// jest는 훅 실패도 같은 모양으로 내는데(`● Test suite failed to run`) 그것도 실패이므로
+/// 뺄 이유가 없다. 다만 요약 블록의 화살표 줄(`● Console`)은 테스트가 아니라 섹션 머리글이라
+/// 제외한다.
+fn parse_jest(output: &str) -> BTreeSet<String> {
+    const SECTIONS: &[&str] = &["Console", "Deprecation Warning", "Validation Warning"];
+    let mut out = BTreeSet::new();
+    for line in output.lines() {
+        let line = strip_ansi(line);
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("● ") else {
+            continue;
+        };
+        let name = rest.trim();
+        if name.is_empty() || SECTIONS.contains(&name) {
+            continue;
+        }
+        out.insert(name.to_string());
+    }
+    out
+}
+
+/// ANSI 색 코드를 지운다.
+///
+/// **vitest와 jest만 이게 필요하다.** 둘은 TTY가 아니어도 색을 내는 설정이 흔하고, 색 코드가
+/// 이름에 남으면 같은 테스트가 설정에 따라 다른 이름이 된다. 다른 러너는 우리가 쓰는 모양에
+/// 색이 끼지 않으므로 부르지 않는다 — 부르면 비용만 든다.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // `ESC [ ... <letter>` 를 통째로 버린다.
+        if chars.next() != Some('[') {
+            continue;
+        }
+        for tail in chars.by_ref() {
+            if tail.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,10 +334,10 @@ mod tests {
     /// 되고, 이 모듈이 고치려는 거짓말이 더 조용한 모양으로 돌아온다.
     #[test]
     fn an_unknown_runner_returns_none_not_an_empty_set() {
-        assert_eq!(failed_tests("mocha", &args(&[]), "not ok 1 - x"), None);
-        assert_eq!(failed_tests("npm", &args(&["test"]), "FAILED tests/a.py::b"), None);
+        assert_eq!(failed_tests("mocha", &args(&[]), None, "not ok 1 - x"), None);
+        assert_eq!(failed_tests("npm", &args(&["test"]), None, "FAILED tests/a.py::b"), None);
         // 아는 러너인데 실패가 없으면 **빈 집합**이다 — None이 아니다.
-        assert_eq!(failed_tests("pytest", &args(&[]), "3 passed"), Some(BTreeSet::new()));
+        assert_eq!(failed_tests("pytest", &args(&[]), None, "3 passed"), Some(BTreeSet::new()));
     }
 
     #[test]
@@ -207,7 +346,7 @@ mod tests {
                    FAILED tests/test_a.py::test_two - AssertionError: 1 != 2\n\
                    ERROR tests/test_b.py::test_three\n\
                    1 failed, 1 passed";
-        let found = failed_tests("pytest", &args(&[]), out).unwrap();
+        let found = failed_tests("pytest", &args(&[]), None, out).unwrap();
         assert!(found.contains("tests/test_a.py::test_two"), "{found:?}");
         assert!(found.contains("tests/test_b.py::test_three"), "{found:?}");
         assert_eq!(found.len(), 2, "{found:?}");
@@ -219,13 +358,14 @@ mod tests {
         let found = failed_tests(
             "/work/.venv/bin/python",
             &args(&["-m", "pytest"]),
+            None,
             "FAILED tests/test_a.py::test_two - boom",
         );
         assert_eq!(found.unwrap().len(), 1);
         // Windows의 `python.exe`도 같다.
-        assert!(failed_tests(r"C:\venv\Scripts\python.exe", &args(&["-m", "pytest"]), "").is_some());
+        assert!(failed_tests(r"C:\venv\Scripts\python.exe", &args(&["-m", "pytest"]), None, "").is_some());
         // 그러나 `-m pip`은 pytest가 아니다 — 아는 척하지 않는다.
-        assert_eq!(failed_tests("python", &args(&["-m", "pip"]), "FAILED x"), None);
+        assert_eq!(failed_tests("python", &args(&["-m", "pip"]), None, "FAILED x"), None);
     }
 
     #[test]
@@ -244,7 +384,7 @@ mod tests {
                    \x20   tests::bad_two\n\
                    \n\
                    test result: FAILED. 1 passed; 2 failed";
-        let found = failed_tests("cargo", &args(&["test"]), out).unwrap();
+        let found = failed_tests("cargo", &args(&["test"]), None, out).unwrap();
         assert!(found.contains("tests::bad_one"), "{found:?}");
         assert!(found.contains("tests::bad_two"), "{found:?}");
         // 덤프 머리글은 이름이 아니다.
@@ -258,11 +398,12 @@ mod tests {
     fn dotnet_names_do_not_carry_the_duration() {
         let out = "  Failed Acme.Tests.WidgetTests.ItWorks [12 ms]\n\
                    Failed!  - Failed: 1, Passed: 4, Skipped: 0";
-        let found = failed_tests("dotnet", &args(&["test"]), out).unwrap();
+        let found = failed_tests("dotnet", &args(&["test"]), None, out).unwrap();
         assert_eq!(found.iter().next().map(String::as_str), Some("Acme.Tests.WidgetTests.ItWorks"));
         assert_eq!(found.len(), 1, "{found:?}");
 
-        let again = failed_tests("dotnet", &args(&["test"]), "  Failed Acme.Tests.WidgetTests.ItWorks [980 ms]").unwrap();
+        let again =
+            failed_tests("dotnet", &args(&["test"]), None, "  Failed Acme.Tests.WidgetTests.ItWorks [980 ms]").unwrap();
         assert_eq!(found, again, "소요 시간이 다르면 다른 테스트가 됩니다");
     }
 
@@ -270,16 +411,113 @@ mod tests {
     /// 남기면 무관한 테스트가 "새로 실패"로 보고된다.
     #[test]
     fn tap_numbers_are_not_part_of_the_name() {
-        let before = failed_tests("node", &args(&["--test", "a.js"]), "not ok 3 - 이름이 있는 검사").unwrap();
-        let after = failed_tests("node", &args(&["--test", "a.js"]), "not ok 9 - 이름이 있는 검사").unwrap();
+        let before = failed_tests("node", &args(&["--test", "a.js"]), None, "not ok 3 - 이름이 있는 검사").unwrap();
+        let after = failed_tests("node", &args(&["--test", "a.js"]), None, "not ok 9 - 이름이 있는 검사").unwrap();
         assert_eq!(before, after);
         assert_eq!(before.iter().next().map(String::as_str), Some("이름이 있는 검사"));
+    }
+
+    /// **패키지 매니저 뒤의 러너는 선언에서 유도한다** — 55절.
+    ///
+    /// 출력 모양으로 짐작하지 않는다: 짐작이 틀리면 무관한 문자열이 테스트 이름이 되고,
+    /// 그건 "모른다"보다 나쁘다(우리가 만든 거짓 신호이기 때문이다).
+    #[test]
+    fn a_declaration_picks_the_runner_behind_the_package_manager() {
+        let out = " FAIL  src/a.test.ts > 덧셈 > 두 수";
+        // 선언이 없으면 모른다 — 종전 그대로.
+        assert_eq!(failed_tests("npm", &args(&["test"]), None, out), None);
+        // 선언이 있으면 갈린다.
+        let found = failed_tests("npm", &args(&["test"]), Some("vitest run"), out).unwrap();
+        assert_eq!(found.iter().next().map(String::as_str), Some("src/a.test.ts > 덧셈 > 두 수"));
+        // 모르는 러너를 선언하면 여전히 모른다.
+        assert_eq!(failed_tests("npm", &args(&["test"]), Some("mocha"), out), None);
+    }
+
+    /// **래퍼가 앞에 붙는 것이 흔하다.** 첫 토큰만 보면 `cross-env`에서 멈춘다.
+    #[test]
+    fn a_wrapper_in_front_does_not_hide_the_runner() {
+        for declared in [
+            "cross-env CI=1 vitest run",
+            "NODE_OPTIONS=--experimental-vm-modules jest",
+            "./node_modules/.bin/vitest --run",
+        ] {
+            assert!(
+                failed_tests("npm", &args(&["test"]), Some(declared), "").is_some(),
+                "{declared}에서 러너를 찾지 못했습니다"
+            );
+        }
+    }
+
+    /// **둘 이상이 보이면 모른다.** 한쪽을 고르면 나머지의 실패 이름을 조용히 잃는다 —
+    /// 그러면 대조가 그 절반을 "고쳐짐"으로 읽는다.
+    #[test]
+    fn two_runners_in_one_script_means_we_do_not_know() {
+        assert_eq!(failed_tests("npm", &args(&["test"]), Some("vitest run && jest"), ""), None);
+        // 같은 러너가 두 번 나오는 것은 갈라짐이 아니다.
+        assert!(failed_tests("npm", &args(&["test"]), Some("vitest run a && vitest run b"), "").is_some());
+    }
+
+    #[test]
+    fn vitest_failures_carry_the_file_and_the_name() {
+        let out = " ❯ src/a.test.ts (3)\n\
+                   \x20FAIL  src/a.test.ts > 덧셈 > 두 수를 더한다\n\
+                   \x20FAIL  src/b.test.ts > 뺄셈 > 두 수를 뺀다\n\
+                   Tests  2 failed";
+        let found = failed_tests("npm", &args(&["test"]), Some("vitest"), out).unwrap();
+        assert!(found.contains("src/a.test.ts > 덧셈 > 두 수를 더한다"), "{found:?}");
+        assert!(found.contains("src/b.test.ts > 뺄셈 > 두 수를 뺀다"), "{found:?}");
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    /// **파일만 있고 테스트 이름이 없는 줄은 받지 않는다.** vitest는 수집 오류에도
+    /// `FAIL  <파일>`을 내는데, 그걸 테스트 이름으로 세면 같은 파일의 개별 실패와 뒤섞인다.
+    #[test]
+    fn a_vitest_file_level_failure_is_not_a_test_name() {
+        let out = " FAIL  src/a.test.ts\n FAIL  src/a.test.ts > 덧셈 > 두 수";
+        let found = failed_tests("npm", &args(&["test"]), Some("vitest"), out).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn jest_failures_come_from_the_bullet_lines() {
+        let out = "  ● 덧셈 › 두 수를 더한다\n\
+                   \x20   expect(received).toBe(expected)\n\
+                   \x20 ● Console\n\
+                   \x20 ● 뺄셈 › 두 수를 뺀다";
+        let found = failed_tests("npm", &args(&["test"]), Some("jest"), out).unwrap();
+        assert!(found.contains("덧셈 › 두 수를 더한다"), "{found:?}");
+        assert!(found.contains("뺄셈 › 두 수를 뺀다"), "{found:?}");
+        // 섹션 머리글은 테스트가 아니다.
+        assert!(!found.contains("Console"), "{found:?}");
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    /// **소요 시간이 붙는 줄을 쓰지 않는다.** jest의 `✕ name (3 ms)`를 쓰면 같은 테스트가
+    /// 실행마다 다른 이름이 되어 대조가 언제나 "새 실패"를 낸다(dotnet에서 막은 것과 같다).
+    #[test]
+    fn jest_names_do_not_come_from_the_timing_lines() {
+        let a = failed_tests("npm", &args(&["test"]), Some("jest"), "    ✕ 두 수를 더한다 (3 ms)\n  ● 덧셈 › 두 수를 더한다").unwrap();
+        let b = failed_tests("npm", &args(&["test"]), Some("jest"), "    ✕ 두 수를 더한다 (91 ms)\n  ● 덧셈 › 두 수를 더한다").unwrap();
+        assert_eq!(a, b, "소요 시간이 이름에 들어갔습니다");
+        assert_eq!(a.len(), 1, "{a:?}");
+    }
+
+    /// **색 코드가 이름에 남으면 안 된다.** vitest·jest는 TTY가 아니어도 색을 내는 설정이
+    /// 흔하고, 남기면 같은 테스트가 설정에 따라 다른 이름이 된다.
+    #[test]
+    fn ansi_colours_do_not_become_part_of_the_name() {
+        let coloured = "\u{1b}[31m FAIL \u{1b}[0m src/a.test.ts > 덧셈 > 두 수";
+        let plain = " FAIL  src/a.test.ts > 덧셈 > 두 수";
+        let a = failed_tests("npm", &args(&["test"]), Some("vitest"), coloured).unwrap();
+        let b = failed_tests("npm", &args(&["test"]), Some("vitest"), plain).unwrap();
+        assert_eq!(a, b, "{a:?} vs {b:?}");
+        assert_eq!(a.len(), 1, "{a:?}");
     }
 
     #[test]
     fn nested_tap_failures_are_counted() {
         let out = "not ok 1 - 바깥\n    not ok 1 - 안쪽\nok 2 - 통과";
-        let found = failed_tests("node", &args(&["--test", "a.js"]), out).unwrap();
+        let found = failed_tests("node", &args(&["--test", "a.js"]), None, out).unwrap();
         assert_eq!(found.len(), 2, "{found:?}");
     }
 }

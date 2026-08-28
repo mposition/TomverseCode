@@ -42,11 +42,44 @@ pub struct DetectedCommands {
     /// **명령이 없어도 근거는 남는다.** 파일을 읽었는데 선언이 없었다는 것도 사실이고,
     /// 나중에 그 파일에 선언이 **생기면** 판정이 달라진다 — 그것도 지문이 봐야 하는 변화다.
     pub evidence: std::collections::BTreeSet<String>,
+    /// 매니페스트가 **선언한 명령 본문** (state-machine 55절). 키는 `commands`와 같다.
+    ///
+    /// # 왜 `source`와 따로 두는가
+    ///
+    /// `source`는 *"이 판정의 근거가 어디에 있는가"*(`package.json scripts.test`)이고 이건
+    /// *"거기 뭐라고 적혀 있는가"*(`vitest run`)다. 두 사실을 한 값에 뭉개면 사람이 읽는
+    /// 문자열이 곧 파서의 입력이 되어, 문구를 다듬는 순간 러너 판정이 바뀐다.
+    ///
+    /// # 무엇에 쓰는가
+    ///
+    /// `npm test` 뒤에 무엇이 도는지는 argv로 알 수 없다(54.2절). **출력 모양으로 추측하지
+    /// 않고** 선언을 읽는다 — 추측이 틀리면 무관한 문자열이 테스트 이름이 되고, 그건
+    /// "모른다"보다 나쁘다.
+    pub declared: BTreeMap<&'static str, String>,
 }
 
 impl DetectedCommands {
     fn insert(&mut self, key: &'static str, kind: VerificationKind, cmd: RunCommandArgs, source: &str) {
         self.commands.entry(key).or_insert((kind, cmd, source.to_string()));
+    }
+
+    /// 매니페스트가 선언한 본문을 함께 기록한다 (55절).
+    ///
+    /// **`insert`와 같은 순서 규칙을 따른다**(`or_insert`) — 명령을 먼저 넣은 갈래가
+    /// 이기므로 본문도 그래야 한다. 갈라지면 `npm test`의 명령에 cargo의 본문이 붙는다.
+    fn insert_declared(
+        &mut self,
+        key: &'static str,
+        kind: VerificationKind,
+        cmd: RunCommandArgs,
+        source: &str,
+        body: &str,
+    ) {
+        let is_new = !self.commands.contains_key(key);
+        self.insert(key, kind, cmd, source);
+        if is_new {
+            self.declared.insert(key, body.to_string());
+        }
     }
 
     /// 이 파일을 근거로 읽었다. **판정 결과와 무관하게 부른다.**
@@ -81,13 +114,23 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
                 .cloned()
                 .unwrap_or_default();
             let has = |name: &str| scripts.contains_key(name);
+            let body = |name: &str| {
+                scripts
+                    .get(name)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
 
             if has("test") {
-                detected.insert(
+                // **선언 본문을 함께 나른다**(55절). `npm test` 뒤에 무엇이 도는지는
+                // argv로 알 수 없고, 출력 모양으로 추측하는 것은 "모른다"보다 나쁘다.
+                detected.insert_declared(
                     "test",
                     VerificationKind::Test,
                     cmd("npm", &["test"]),
                     "package.json scripts.test",
+                    &body("test"),
                 );
             }
             if has("build") {
@@ -361,7 +404,14 @@ impl<'a> VerificationRunner<'a> {
                     failed_tests: None,
                 }),
                 Some((kind, command, source)) => {
-                    checks.push(self.run_one(task_id, *kind, command, source, executor));
+                    checks.push(self.run_one(
+                        task_id,
+                        *kind,
+                        command,
+                        source,
+                        detected.declared.get(key).map(String::as_str),
+                        executor,
+                    ));
                 }
             }
         }
@@ -428,6 +478,8 @@ impl<'a> VerificationRunner<'a> {
         kind: VerificationKind,
         command: &RunCommandArgs,
         source: &str,
+        // `declared`: 매니페스트가 선언한 명령 본문 (55절). 러너를 고르는 **유일한 근거**다.
+        declared: Option<&str>,
         executor: &mut dyn CommandExecutor,
     ) -> VerificationCheck {
         let request = ToolRequest {
@@ -511,7 +563,7 @@ impl<'a> VerificationRunner<'a> {
         // 대조에 쓸 것이 없고, 러너가 "실패했던 것" 요약을 내면 오히려 잘못 센다.
         let failed_tests = match status {
             VerificationStatus::Failed | VerificationStatus::TimedOut => {
-                crate::testnames::failed_tests(&command.program, &command.args, &combined)
+                crate::testnames::failed_tests(&command.program, &command.args, declared, &combined)
                     .map(|set| set.into_iter().collect::<Vec<_>>())
             }
             _ => None,
@@ -730,6 +782,7 @@ mod tests {
                     duration_ms: 1,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 }
             }
         }
@@ -923,6 +976,7 @@ mod tests {
                 duration_ms: 10,
                 completed_at: now_iso(),
                 denial_kind: None,
+                file_failure: None,
             }
         }
     }
@@ -1098,13 +1152,15 @@ mod tests {
 
     /// **해석하지 못한 것을 "새 실패 없음"으로 적지 않는다.**
     ///
-    /// `npm test`는 매니페스트가 무엇을 돌리는지 argv만 보고는 알 수 없으므로 파서가
-    /// 러너를 고르지 못한다. 그때 이름 단위 귀속은 **없어야** 하고, 체크 단위 판정이
-    /// 종전 그대로 남아야 한다 — 조용히 "새 실패 없음"이 되면 이 절이 고치려는 거짓말이
-    /// 더 조용한 모양으로 돌아온다.
+    /// 선언 본문이 우리가 아는 러너가 아니면(여기서는 mocha) 파서가 러너를 고르지 못한다.
+    /// 그때 이름 단위 귀속은 **없어야** 하고 체크 단위 판정이 종전 그대로 남아야 한다 —
+    /// 조용히 "새 실패 없음"이 되면 54절이 고치려는 거짓말이 더 조용한 모양으로 돌아온다.
+    ///
+    /// (55절 전에는 이 fixture가 `vitest`였다. 그때는 그것도 해석 불가였고, 지금은 아니다 —
+    ///  fixture를 바꿔야 했다는 사실 자체가 55절이 실제로 무언가를 열었다는 증거다.)
     #[test]
     fn an_unparsable_runner_leaves_the_check_level_verdict_alone() {
-        let (_d, _a, root, artifacts) = setup(&[("package.json", r#"{ "scripts": { "test": "vitest" } }"#)]);
+        let (_d, _a, root, artifacts) = setup(&[("package.json", r#"{ "scripts": { "test": "mocha" } }"#)]);
         let runner = VerificationRunner::new(&root, &artifacts);
 
         let mut base_exec = FakeExecutor {
@@ -1125,6 +1181,60 @@ mod tests {
         // 그리고 체크에도 이름이 남지 않는다 — 빈 배열이 아니라 없음이다.
         let check = post.checks.iter().find(|c| c.kind == VerificationKind::Test).unwrap();
         assert!(check.failed_tests.is_none(), "{:?}", check.failed_tests);
+    }
+
+    /// **`npm test`도 선언을 읽으면 갈린다** — state-machine 55절.
+    ///
+    /// 54.7절은 이것을 "아직 하지 않은 것"으로 두었고, 그 이유는 출력 모양으로 러너를
+    /// 짐작하는 것이 위험하기 때문이었다. 짐작하지 않고 **매니페스트가 선언한 본문**을
+    /// 읽으면 그 위험이 없다.
+    #[test]
+    fn a_declared_vitest_script_is_split_by_name() {
+        let (_d, _a, root, artifacts) = setup(&[(
+            "package.json",
+            r#"{ "scripts": { "test": "cross-env CI=1 vitest run" } }"#,
+        )]);
+        let runner = VerificationRunner::new(&root, &artifacts);
+
+        let mut base_exec = FakeExecutor {
+            responses: vec![("npm test".to_string(), 1, " FAIL  src/a.test.ts > 덧셈 > 원래 깨짐".to_string())],
+            calls: vec![],
+        };
+        let baseline = runner.run("task-1", VerificationPhase::Baseline, 0, &mut base_exec, None);
+        let mut post_exec = FakeExecutor {
+            responses: vec![(
+                "npm test".to_string(),
+                1,
+                " FAIL  src/a.test.ts > 덧셈 > 원래 깨짐\n FAIL  src/b.test.ts > 뺄셈 > 새로 깨짐".to_string(),
+            )],
+            calls: vec![],
+        };
+        let post = runner.run("task-1", VerificationPhase::Post, 1, &mut post_exec, Some(&baseline));
+
+        let test = post
+            .test_attribution
+            .as_ref()
+            .expect("선언이 vitest인데 가르지 못했습니다")
+            .iter()
+            .find(|a| a.kind == VerificationKind::Test)
+            .unwrap();
+        assert_eq!(test.newly_failing, vec!["src/b.test.ts > 뺄셈 > 새로 깨짐"], "{test:?}");
+        assert_eq!(test.preexisting, vec!["src/a.test.ts > 덧셈 > 원래 깨짐"], "{test:?}");
+        // 그리고 체크 단위 이름표가 고쳐진다 — 54.3절의 방향 그대로.
+        assert!(post.newly_failing.as_ref().unwrap().contains(&VerificationKind::Test));
+    }
+
+    /// **선언 본문이 명령과 함께 실려야 한다.** 감지가 그것을 나르지 않으면 위 검사가
+    /// 통과할 방법이 없지만, 나르는 것 자체를 따로 고정해 둔다 — 나중에 감지를 고치다
+    /// 본문을 떨어뜨리면 증상이 "이 프로젝트만 갑자기 안 갈린다"로 나타난다.
+    #[test]
+    fn the_declared_script_body_travels_with_the_command() {
+        let (_d, _a, root, _art) = setup(&[("package.json", r#"{ "scripts": { "test": "vitest run" } }"#)]);
+        let detected = detect_commands(&root);
+        assert_eq!(detected.declared.get("test").map(String::as_str), Some("vitest run"));
+        // **`source`와 다른 값이다.** 뭉개면 사람이 읽는 문자열이 곧 파서의 입력이 된다.
+        let (_, _, source) = detected.commands.get("test").unwrap();
+        assert_ne!(source, "vitest run");
     }
 
     /// **baseline에서 통과했다면 지금의 실패는 전부 새 것이다.**
@@ -1348,6 +1458,7 @@ mod tests {
                     duration_ms: 0,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 }
             }
         }
@@ -1362,7 +1473,7 @@ mod tests {
         assert_eq!(report.overall, Overall::CouldNotRun);
     }
 
-    /// **시작하지 않은 명령은 실패가 아니다** — UNC 워크스페이스 결함(55절).
+    /// **시작하지 않은 명령은 실패가 아니다** — UNC 워크스페이스 결함(71절).
     ///
     /// 종전에는 `exit != 0 ⇒ FAILED` 한 줄뿐이라, cmd.exe가 UNC 작업 디렉터리를 거부해 러너가
     /// 테스트 파일을 **찾지도 못한** 실행이 "당신의 테스트가 실패했다"로 보고됐다. 장벽은
@@ -1384,6 +1495,8 @@ mod tests {
                     duration_ms: 0,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    // 파일 하나의 실패가 아니라 워크스페이스가 만드는 장벽이다(65절).
+                    file_failure: None,
                 }
             }
         }
@@ -1437,6 +1550,7 @@ mod tests {
                         duration_ms: 5,
                         completed_at: now_iso(),
                         denial_kind: None,
+                        file_failure: None,
                     };
                 }
                 ToolResult {
@@ -1447,6 +1561,7 @@ mod tests {
                     duration_ms: 1,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 }
             }
         }
@@ -1541,6 +1656,7 @@ mod tests {
                     duration_ms: 1000,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 }
             }
         }

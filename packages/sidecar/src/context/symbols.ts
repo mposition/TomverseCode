@@ -2,7 +2,7 @@ import type { DependencyEdge, SymbolEntry } from "@tomverse/protocol";
 import type { GrammarId, ParsedTree, SyntaxNode } from "./treeSitter.js";
 
 /**
- * Tree-sitter 구문 트리 → 심볼/의존성 — docs/design/context-engine.md 5·16절.
+ * Tree-sitter 구문 트리 → 심볼/의존성 — docs/design/context-engine.md 5·22절.
  *
  * # 범위는 5절이 못박았다. 넓히지 않는다
  *

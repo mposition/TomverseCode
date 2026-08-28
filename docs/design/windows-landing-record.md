@@ -214,12 +214,12 @@ Could not find 'paginate.test.js'
 CLAUDE.md가 npm shim에서 경계한 실패 모드("검증 없이 완료로 보고")의 사촌이며, 이쪽은
 **없는 실패를 지어내는** 방향이다.
 
-### 6.1 결정됨 — 고쳤다 (state-machine 55절)
+### 6.1 결정됨 — 고쳤다 (state-machine 71절)
 
 ~~**결정할 것**: 네트워크 드라이브 워크스페이스를 (a) UNC를 드라이브 문자로 매핑해 지원할지,
 (b) 시작 시 명확한 이유와 함께 거절할지.~~
 → **(c) + (d)로 결정했다.** 근거는
-[state-machine-and-protocol.md 55절](./state-machine-and-protocol.md).
+[state-machine-and-protocol.md 71절](./state-machine-and-protocol.md).
 
 조사하고 나니 질문이 둘이었고, 앞의 것이 (a)/(b)와 **독립적으로** 답을 갖고 있었다.
 
@@ -248,7 +248,7 @@ CLAUDE.md가 npm shim에서 경계한 실패 모드("검증 없이 완료로 보
 
 ### 6.2 실측 — 네 항목 모두 확인했다 ✅
 
-**이 머신에서 실제로 태웠고 네 항목 모두 통과했다.** 1절의 환경, 작업 트리는 55절 구현
+**이 머신에서 실제로 태웠고 네 항목 모두 통과했다.** 1절의 환경, 작업 트리는 71절 구현
 직후(커밋 전). 모델 호출은 없다 — e2e가 쓰는 fake 공급자로 돌렸으므로 판정 경로는 진짜이고
 LLM 응답만 가짜다.
 
@@ -260,7 +260,7 @@ LLM 응답만 가짜다.
 | `node --test t.test.js` (우리가 띄우는 방식) | **exit 0, 테스트 통과** |
 | `node npm-cli.js test` (npm이 cmd.exe로 넘김) | exit 1, `UNC paths are not supported.` → `Could not find 't.test.js'` |
 
-즉 **Win32는 UNC 작업 디렉터리를 받아들이고 거부하는 것은 cmd.exe 하나**라는 55절의 전제가
+즉 **Win32는 UNC 작업 디렉터리를 받아들이고 거부하는 것은 cmd.exe 하나**라는 71절의 전제가
 그대로 확인됐다. 장벽을 npm 계열로만 좁힌 근거가 이것이다.
 
 그다음 `tomverse-host run`을 두 워크스페이스에 대해 돌렸다(픽스처는 **둘** 만든다 — 하나를
@@ -379,7 +379,7 @@ try {
 - **② UNC**: `overall = could_not_run` (`fail`이 아니다), `mutatedPaths = ["paginate.js"]`
   (patch는 여전히 동작한다).
 - **③ UNC**: stderr 첫 줄에 배너. 데스크톱 앱은 워크스페이스를 열자마자 같은 문장을 노란
-  배너에 띄운다(55.4절이 다섯 가지를 열거한다).
+  배너에 띄운다(71.4절이 다섯 가지를 열거한다).
 
 기록된 도구 출력의 모양까지 보려면 `--db`를 지운 자리에 두고 `show`로 읽는다:
 
@@ -564,7 +564,7 @@ Remove-SmbShare -Name tomverse-unc -Force   # 위에서 만들었다면
 5. **강제 포기 경로**로 job 핸들 수명을 마저 확인한다(7절) — UI가 필요하다.
 6. **`processGroup` 둘**(12절). Ctrl+C 전파는 별도 콘솔에서, taskkill 폴백은 강제할 수단이 필요하다.
 7. ~~**UNC 워크스페이스를 어떻게 할지 결정한다**(6절).~~ → **결정하고, 고치고, 확인했다**
-   (6.1·6.2절, [state-machine 55절](./state-machine-and-protocol.md)). (c) 정직한
+   (6.1·6.2절, [state-machine 71절](./state-machine-and-protocol.md)). (c) 정직한
    `could_not_run` + (d) 열되 경고. 새 착지 묶음 `uncWorkspace`의 네 항목을 이 머신에서
    태워 전부 통과했고, 전제(Win32는 UNC cwd를 받아들이고 거부하는 것은 cmd.exe 하나)도
    재현했다. **이 항목에 남은 일은 없다** — 코드가 바뀌면 6.2절 절차로 다시 태울 것.

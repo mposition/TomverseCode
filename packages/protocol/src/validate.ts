@@ -405,6 +405,9 @@ export function validatePlanOutline(
     filesToChange: optionalStringArray(o.filesToChange, "planOutline.filesToChange") ?? [],
     risks: optionalStringArray(o.risks, "planOutline.risks") ?? [],
     openQuestions: optionalStringArray(o.openQuestions, "planOutline.openQuestions") ?? [],
+    ...(o.needsContext !== undefined
+      ? { needsContext: optionalStringArray(o.needsContext, "planOutline.needsContext") ?? [] }
+      : {}),
     model: ctx.model,
     createdAt: ctx.createdAt,
   };

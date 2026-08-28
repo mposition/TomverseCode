@@ -89,6 +89,28 @@ export interface ToolResult {
    * 그대로 진행된다. 뭉개면 최종 보고가 "사용자가 거부했다"고 거짓말한다.
    */
   denialKind?: "policy" | "user" | "unattended";
+  /**
+   * `status === "error"`일 때 **왜 실패했는가** — 우리가 아는 만큼만 (state-machine 65절).
+   *
+   * `denialKind`와 같은 이유로 값이다: OS의 오류 문장은 **로케일에 따라 번역되므로**
+   * 그것을 파싱하게 만들면 한국어 Windows에서만 분기가 조용히 사라진다.
+   *
+   * 없으면 그 실패에 대해 **더 말할 것이 없다**는 뜻이다 — "문제가 없다"가 아니다.
+   */
+  fileFailure?: {
+    kind: "locked" | "path_too_long" | "permission_denied";
+    /** 무슨 일이 일어났는가. */
+    fact: string;
+    /** 사람이 해 볼 수 있는 일. **우리가 모르는 것은 모른다고 적혀 있다.** */
+    tryThis: string;
+    /**
+     * 기다렸다 다시 하면 달라질 수 있는가.
+     *
+     * **재시도 상한을 늘리는 값이 아니다**(원칙 5). `false`일 때 상한을 기다리지 않고 일찍
+     * 끝내기 위한 값이며, 좁히는 방향으로만 쓴다.
+     */
+    retryable: boolean;
+  };
 }
 
 export type PolicyRiskLevel = "none" | "low" | "medium" | "high" | "prohibited";

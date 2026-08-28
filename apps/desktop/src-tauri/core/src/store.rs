@@ -2667,6 +2667,7 @@ mod tests {
                     duration_ms: 42,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 },
                 None,
                 "task-1",
@@ -3053,6 +3054,7 @@ mod tests {
                     duration_ms: 5,
                     completed_at: now_iso(),
                     denial_kind: None,
+                    file_failure: None,
                 },
                 None,
             )

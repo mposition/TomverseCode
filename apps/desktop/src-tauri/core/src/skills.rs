@@ -145,6 +145,37 @@ pub fn tools_for_question(from_skill: Option<Vec<ToolName>>) -> Option<Vec<ToolN
     )
 }
 
+/// 이 태스크의 허용 도구와 **무엇이 그것을 좁혔는가** — state-machine 70절.
+///
+/// # 왜 목록과 출처를 함께 내는가
+///
+/// 좁히는 주체가 둘이다: 스킬(26절)과 읽기 전용 종류(51·53절). 결과 목록만 나르면 화면은
+/// 짧은 목록을 보여주면서 **왜 짧은지 말하지 못한다.**
+///
+/// **결과를 후보와 비교해 되짚지 않는다.** 되짚을 수는 있지만 그건 좁히기 규칙이 바뀌는
+/// 순간 조용히 틀린 이름표를 붙인다(60절이 예고를 다시 계산하지 않기로 한 것과 같은 이유).
+/// 두 사실을 다 아는 자리는 여기뿐이므로 여기서 정한다.
+///
+/// # 좁히지 않은 것과 "전부 허용"을 구별한다
+///
+/// 스킬도 없고 읽기 전용도 아니면 `None`이고 출처는 비어 있다 — **빈 목록이 아니다.**
+/// 빈 목록은 "아무 도구도 못 쓴다"이고, 그 둘을 뭉개면 정반대로 읽힌다.
+pub fn narrow_tools(
+    from_skill: Option<Vec<ToolName>>,
+    read_only_kind: bool,
+) -> (Option<Vec<ToolName>>, Vec<crate::types::Narrowing>) {
+    use crate::types::Narrowing;
+    let mut sources = Vec::new();
+    if from_skill.is_some() {
+        sources.push(Narrowing::Skill);
+    }
+    if !read_only_kind {
+        return (from_skill, sources);
+    }
+    sources.push(Narrowing::ReadOnlyKind);
+    (tools_for_question(from_skill), sources)
+}
+
 /// 스킬 파일을 읽고 검증한다.
 /// 위치를 묻지 않고 파일 하나를 읽어 검증한다.
 ///
@@ -420,6 +451,46 @@ pub fn remove_from_library(state_dir: &Path, file: &str) -> Result<(), SkillErro
 
 #[cfg(test)]
 mod tests {
+    use crate::types::Narrowing;
+
+    /// **좁히지 않은 것과 "전부 허용"을 구별한다.** 빈 목록은 "아무 도구도 못 쓴다"이고,
+    /// `None`은 "좁히지 않았다"이다 — 뭉개면 정반대로 읽힌다.
+    #[test]
+    fn nothing_narrows_an_ordinary_task_without_a_skill() {
+        let (tools, sources) = narrow_tools(None, false);
+        assert!(tools.is_none(), "{tools:?}");
+        assert!(sources.is_empty(), "{sources:?}");
+    }
+
+    /// **출처를 유도하지 않고 기록한다.** 결과 목록을 후보와 비교해 되짚으면 좁히기 규칙이
+    /// 바뀌는 순간 조용히 틀린 이름표가 붙는다 — 그래서 두 사실을 다 아는 여기서 정한다.
+    #[test]
+    fn each_source_is_named_and_both_can_apply_at_once() {
+        let from_skill = Some(vec![ToolName::ReadFile, ToolName::ApplyPatch]);
+
+        let (_, only_skill) = narrow_tools(from_skill.clone(), false);
+        assert_eq!(only_skill, vec![Narrowing::Skill]);
+
+        let (_, only_kind) = narrow_tools(None, true);
+        assert_eq!(only_kind, vec![Narrowing::ReadOnlyKind]);
+
+        // **둘 다일 수 있다.** 하나만 말하면 사용자는 나머지를 자기 설정 탓으로 돌린다.
+        let (tools, both) = narrow_tools(from_skill, true);
+        assert_eq!(both, vec![Narrowing::Skill, Narrowing::ReadOnlyKind]);
+        // 그리고 결과는 여전히 교집합이다 — 출처를 붙이면서 판정이 바뀌면 안 된다.
+        assert_eq!(tools, Some(vec![ToolName::ReadFile]), "{tools:?}");
+    }
+
+    /// **출처가 판정을 바꾸지 않는다.** 같은 입력에 대해 목록은 종전 함수와 같아야 한다 —
+    /// 설명을 붙이려다 좁히기가 달라지면 그게 가장 나쁘다.
+    #[test]
+    fn adding_the_source_did_not_change_what_is_allowed() {
+        for from_skill in [None, Some(vec![ToolName::ReadFile, ToolName::RunTests])] {
+            assert_eq!(narrow_tools(from_skill.clone(), true).0, tools_for_question(from_skill.clone()));
+            assert_eq!(narrow_tools(from_skill.clone(), false).0, from_skill);
+        }
+    }
+
     use super::*;
 
     fn file(json: &str) -> Result<Skill, SkillError> {

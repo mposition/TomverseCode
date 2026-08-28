@@ -44,6 +44,18 @@ export type TaskEventType =
   | "POLICY_DECIDED"
   | "FILE_MUTATED"
   | "VERIFICATION_COMPLETED"
+  /**
+   * 검증 출력이 **프롬프트로 나갔다** (product-strategy 7.2절, state-machine 67절).
+   *
+   * 이 내용은 공급자로 가는데 전송 집계가 세지 못하고 있었다 — 값이 메모리에서 태어나
+   * 프롬프트로 들어갔다가 사라졌기 때문이다. 그리고 그 출력에는 실패한 테스트의 스택
+   * 트레이스와 **컨텍스트에 선정되지 않은 파일의 조각**이 들어간다.
+   *
+   * payload는 크기(섹션별)와 **우리가 알아본 경로**다. 내용 자체는 싣지 않는다 — 이벤트는
+   * 화면과 감사 기록으로 흐르고, 거기에 원문을 한 벌 더 두면 이미 artifact에 있는 것을
+   * 복제하는 것이다.
+   */
+  | "VERIFICATION_DIGEST_SENT"
   | "FIX_LOOP_STARTED"
   | "PROVIDER_USAGE"
   /**
@@ -198,6 +210,15 @@ export type TaskEventType =
    * 이벤트면, 나중에 "이 변경은 어떤 계획에서 나왔나"를 되짚을 수 없다.
    */
   | "PLAN_OUTLINED"
+  /**
+   * 모델의 요청으로 파일을 더 읽고 다시 물었다 — state-machine 57절.
+   *
+   * **무엇을 가져왔고 무엇을 거절했는지 함께 남긴다.** 거절을 기록하지 않으면, 나중에
+   * "왜 그 파일을 안 봤나"에 답할 수 없다 — 못 찾은 것과 일부러 뺀 것은 다른 사실이다.
+   */
+  | "CONTEXT_ROUND_COMPLETED"
+  /** 라운드를 돌지 않았다. **사유가 붙는다** — 상한인지, 가져올 것이 없었는지. */
+  | "CONTEXT_ROUND_SKIPPED"
   | "ROLLBACK_STARTED"
   | "ROLLBACK_COMPLETED"
   /**

@@ -219,7 +219,7 @@ mod tests {
     /// 우회할 수 있다. 게이트에 꽂히는 목록이 그때의 보장이다(원칙 2).
     #[test]
     fn a_question_is_narrowed_to_read_only_tools() {
-        let allowed = allowed_tools_for(&args_for("ask"), None).expect("좁혀지지 않았습니다");
+        let allowed = allowed_tools_for(&args_for("ask"), None).0.expect("좁혀지지 않았습니다");
         assert!(!allowed.is_empty());
         for tool in &allowed {
             assert!(tool.is_read_only(), "{}가 읽기 전용이 아닙니다", tool.as_str());
@@ -237,7 +237,7 @@ mod tests {
         std::fs::write(dir.path().join("a.ts"), "x").unwrap();
         let root = tomverse_core::paths::WorkspaceRoot::new(dir.path()).unwrap();
         let policy = TaskPolicy {
-            allowed_tools: allowed_tools_for(&args_for("ask"), None),
+            allowed_tools: allowed_tools_for(&args_for("ask"), None).0,
             ..TaskPolicy::default()
         };
         let gate = tomverse_core::policy::PolicyGate::new(&policy);
@@ -265,7 +265,7 @@ mod tests {
     /// `run`은 종전과 한 글자도 다르지 않다 — 기본값이 동작을 바꾸지 않는다.
     #[test]
     fn a_change_task_is_not_narrowed() {
-        assert_eq!(allowed_tools_for(&args_for("run"), None), None);
+        assert_eq!(allowed_tools_for(&args_for("run"), None).0, None);
     }
 }
 
@@ -751,7 +751,7 @@ fn real_main() -> Result<i32, String> {
     let root = WorkspaceRoot::new(&workspace_path)
         .map_err(|e| format!("워크스페이스 {workspace_path:?}를 열 수 없습니다: {e}"))?;
 
-    // **환경이 만드는 한계는 여는 자리에서 말한다**(`unc.rs`, 55.4절). 격리 공지와 같은
+    // **환경이 만드는 한계는 여는 자리에서 말한다**(`unc.rs`, 71.4절). 격리 공지와 같은
     // 규율이다 — 문장은 core가 만들고 헤드리스와 데스크톱이 같은 것을 낸다. 각자 적으면
     // 한쪽만 조용해지고, 그 경로의 사용자는 경고를 못 받는다.
     if let Some(notice) = tomverse_core::unc::workspace_notice(
@@ -795,7 +795,19 @@ fn real_main() -> Result<i32, String> {
     // reproduce·windows-landing과 같은 이유로 store를 만들기 전에 갈라진다.
     if args.command == "autopilot-preview" {
         let skill = load_skill(&args, &root)?;
-        let profile = tomverse_core::host::TaskProfile::new(&root, task_policy_from(&args, skill.as_ref()));
+        // **등록을 반영한다**(47.9절에서 남아 있던 절반, 64절). 화면 경로는 호스트에 붙은
+        // 풀을 쓰는데 CLI는 아무것도 붙이지 않고 있었고, 그래서 서버를 등록해 둔 사용자가
+        // 여기서 받는 답은 언제나 "등록 밖 거부"였다 — 틀린 규칙 이름이다.
+        //
+        // **풀을 만드는 것은 서버를 띄우는 것이 아니다**(`McpPool::new`는 검사만 한다).
+        // 그리고 미리보기가 받는 것은 띄울 수 없는 읽기 전용 뷰이므로, 여기서 `shutdown`을
+        // 부를 것도 없다 — 띄운 것이 없다는 사실이 타입에 적혀 있다.
+        let mcp = mcp_pool_from(&args)?;
+        let profile = tomverse_core::host::TaskProfile::with_mcp(
+            &root,
+            task_policy_from(&args, skill.as_ref()),
+            mcp,
+        );
         let hooks = tomverse_core::hooks::HookRegistry::new(args.hooks.clone());
         let report = tomverse_core::autopilot::preview(&root, &profile, &hooks);
         println!("{}", serde_json::to_string(&report).unwrap_or_default());
@@ -824,13 +836,14 @@ fn real_main() -> Result<i32, String> {
 fn allowed_tools_for(
     args: &Args,
     skill: Option<&tomverse_core::skills::Skill>,
-) -> Option<Vec<tomverse_core::types::ToolName>> {
+) -> (
+    Option<Vec<tomverse_core::types::ToolName>>,
+    Vec<tomverse_core::types::Narrowing>,
+) {
     let from_skill = skill.and_then(|s| s.allowed_tools.clone());
-    if !is_read_only_command(&args.command) {
-        return from_skill;
-    }
-    // 좁히기 자체는 코어에 있다 — 화면과 이 CLI가 **같은 함수**를 쓴다.
-    tomverse_core::skills::tools_for_question(from_skill)
+    // 좁히기와 **그 출처**가 함께 코어에 있다(70절) — 화면과 이 CLI가 같은 함수를 쓴다.
+    // 출처를 여기서 정하면 두 진입점이 다른 이름표를 붙일 수 있다.
+    tomverse_core::skills::narrow_tools(from_skill, is_read_only_command(&args.command))
 }
 
 /// 파일을 바꾸지 않는 하위 명령들 (51·53절).
@@ -856,13 +869,51 @@ fn load_skill(args: &Args, root: &WorkspaceRoot) -> Result<Option<tomverse_core:
 
 /// 플래그에서 이 태스크의 정책을 만든다.
 ///
+/// `--mcp-server`/`--mcp-tools`에서 등록 풀을 만든다.
+///
+/// **`run`과 `autopilot-preview`가 같은 함수를 쓴다**(64절). 두 벌로 두면 미리보기가 실행과
+/// 다른 등록에 대해 답하게 되고, 그 어긋남은 `task_policy_from`을 한 함수로 묶은 이유와
+/// 정확히 같은 종류다.
+///
+/// **띄우지 않는다.** `McpPool::new`는 목록을 검사할 뿐이고 spawn은 `catalog()`가 처음
+/// 부를 때 일어난다 — 그래서 미리보기가 이 함수를 불러도 프로세스가 생기지 않는다.
+///
+/// 허용목록을 등록에 접어 넣는다(32절). **알 수 없는 서버 이름은 오류다** — 조용히 넘기면
+/// 좁히려던 의도가 사라지고 서버 전체가 열린 채로 돈다.
+fn mcp_pool_from(args: &Args) -> Result<Option<Arc<tomverse_core::mcp::McpPool>>, String> {
+    let mut mcp_servers = args.mcp_servers.clone();
+    for (name, tools) in &args.mcp_tool_allowlists {
+        match mcp_servers.iter_mut().find(|s| &s.name == name) {
+            Some(server) => server.tools = Some(tools.clone()),
+            None => {
+                return Err(format!(
+                    "--mcp-tools가 가리키는 서버가 등록되어 있지 않습니다: {name} (등록된 것: {})",
+                    if mcp_servers.is_empty() {
+                        "없음".to_string()
+                    } else {
+                        mcp_servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                    }
+                ))
+            }
+        }
+    }
+    if mcp_servers.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(
+        tomverse_core::mcp::McpPool::new(mcp_servers).map_err(|e| e.to_string())?,
+    )))
+}
+
 /// **`run`과 `autopilot-preview`가 같은 함수를 쓴다**(47절). 두 벌로 두면 미리보기가 실행과
 /// 다른 정책에 대해 답하게 되고, 그 어긋남은 "미리보기가 틀렸다"가 아니라 "도구가 거짓말했다"로
 /// 읽힌다.
 fn task_policy_from(args: &Args, skill: Option<&tomverse_core::skills::Skill>) -> TaskPolicy {
+    let narrowed = allowed_tools_for(args, skill);
     TaskPolicy {
         // 도구 허용목록은 **게이트에 꽂힌다.** sidecar에 알려 주기는 하지만 지키는 것은 여기다.
-        allowed_tools: allowed_tools_for(args, skill),
+        allowed_tools: narrowed.0,
+        allowed_tools_narrowed_by: narrowed.1,
         auto_approve_workspace_writes: args.auto_approve_writes,
         auto_approve_verification: args.auto_approve_verification,
         allow_git_commit: args.allow_git_commit,
@@ -954,29 +1005,7 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
             // 그 서버의 도구를 쓸 수 있다고 믿고 계획을 세운 뒤다.
             // 허용목록을 등록에 접어 넣는다 (32절). **알 수 없는 서버 이름은 오류다** —
             // 조용히 넘기면 좁히려던 의도가 사라지고 서버 전체가 열린 채로 돈다.
-            let mut mcp_servers = args.mcp_servers.clone();
-            for (name, tools) in &args.mcp_tool_allowlists {
-                match mcp_servers.iter_mut().find(|s| &s.name == name) {
-                    Some(server) => server.tools = Some(tools.clone()),
-                    None => {
-                        return Err(format!(
-                            "--mcp-tools가 가리키는 서버가 등록되어 있지 않습니다: {name} (등록된 것: {})",
-                            if mcp_servers.is_empty() {
-                                "없음".to_string()
-                            } else {
-                                mcp_servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
-                            }
-                        ))
-                    }
-                }
-            }
-            let mcp = if mcp_servers.is_empty() {
-                None
-            } else {
-                Some(Arc::new(
-                    tomverse_core::mcp::McpPool::new(mcp_servers).map_err(|e| e.to_string())?,
-                ))
-            };
+            let mcp = mcp_pool_from(&args)?;
             let mut task_host = TaskHost::new(
                 root,
                 policy_for_task.clone(),
@@ -1610,6 +1639,7 @@ fn run_task(
             // **게이트에 꽂힌 값을 그대로 보낸다**(51절). 여기서 다시 계산하면 화면이 말하는
             // 허용목록과 실제로 좁혀진 목록이 갈릴 수 있고, 갈리면 화면이 거짓말한다.
             "allowedTools": allowed_tools_for(args, skill)
+                .0
                 .as_ref()
                 .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
         },

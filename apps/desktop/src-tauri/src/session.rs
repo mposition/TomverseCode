@@ -165,15 +165,16 @@ pub struct SessionState {
 fn allowed_tools_for(
     kind: &str,
     skill: Option<&tomverse_core::skills::Skill>,
-) -> Option<Vec<tomverse_core::types::ToolName>> {
+) -> (
+    Option<Vec<tomverse_core::types::ToolName>>,
+    Vec<tomverse_core::types::Narrowing>,
+) {
     let from_skill = skill.and_then(|s| s.allowed_tools.clone());
-    if !is_read_only_kind(kind) {
-        return from_skill;
-    }
-    // **좁히기 자체는 코어에 있다**(skills.rs `tools_for_question`). 이 크레이트는 이 환경에서
-    // 컴파일되지 않아 여기 로직을 두면 검사할 수단이 소스 문자열뿐이고, 그 검사는 좁히기가
-    // 살아 있는지가 아니라 글자가 남아 있는지만 본다.
-    tomverse_core::skills::tools_for_question(from_skill)
+    // **좁히기와 그 출처가 함께 코어에 있다**(skills.rs `narrow_tools`, 70절). 이 크레이트는
+    // 이 환경에서 컴파일되지 않아 여기 로직을 두면 검사할 수단이 소스 문자열뿐이고, 그 검사는
+    // 좁히기가 살아 있는지가 아니라 글자가 남아 있는지만 본다. 출처도 마찬가지라 여기서
+    // 정하지 않는다 — 정하면 두 진입점이 다른 이름표를 붙일 수 있다.
+    tomverse_core::skills::narrow_tools(from_skill, is_read_only_kind(kind))
 }
 
 /// 파일을 바꾸지 않는 요청 종류 (51·53절).
@@ -188,32 +189,55 @@ fn is_read_only_kind(kind: &str) -> bool {
     matches!(kind, "question" | "plan")
 }
 
+/// 화면의 스위치 한 벌 — `start_task`와 `autopilot_preview`가 **같은 값**을 넣는다.
+///
+/// # 왜 위치 인자가 아니라 구조체인가 (63절)
+///
+/// 종전에는 이 값들이 `task_policy_from`의 위치 인자 일곱 개였고 그중 넷이 `bool`/`&str`
+/// 이었다. 그 줄에서 미리보기가 **`kind` 자리에 `false`를 넣고 있었다.** 타입 오류인데,
+/// 이 크레이트는 이 환경에서 컴파일되지 않으므로(GUI 시스템 라이브러리 부재 — CLAUDE.md)
+/// `npm run verify`가 잡지 못했고, 소스를 읽는 검사는 **글자가 남아 있는지**만 본다.
+///
+/// 이름 붙은 필드로 바꾸면 그 자리에 잘못된 값을 **적을 수 없다.** 스위치가 하나 더 늘 때
+/// (여기서는 `auto_approve_workspace_writes`가 그랬다) 불리언 행렬이 길어지는 것도 막는다.
+pub struct ScreenSwitches<'a> {
+    pub mode: ExecutionMode,
+    pub allow_git_commit: bool,
+    pub unattended: bool,
+    pub auto_approve_verification: bool,
+    /// 워크스페이스 안의 파일 쓰기를 묻지 않고 승인한다 (63절).
+    ///
+    /// **넓히는 방향이고, 근거는 게이트에 물어서 세웠다** — 워크스페이스 밖은 여전히 거부,
+    /// 비밀값 파일은 `HumanOnly`, 쓴 것은 pre-image로 되돌아가고, 무인에서 `git commit`은
+    /// 어떤 조합으로도 지나가지 않는다. 넷 다 `tomverse-core`의 단위 테스트가 고정한다.
+    pub auto_approve_workspace_writes: bool,
+    pub skill: Option<&'a tomverse_core::skills::Skill>,
+    pub deadline_secs: Option<u64>,
+    /// 이 요청의 종류(`change`/`question`/`plan`). 읽기 전용 종류면 도구를 좁힌다.
+    pub kind: &'a str,
+}
+
 /// 화면의 스위치에서 이 태스크의 정책을 만든다.
 ///
 /// **`start_task`와 `autopilot_preview`가 같은 함수를 쓴다**(47절). 두 벌로 두면 미리보기가
 /// 실행과 다른 정책에 대해 답하게 되고, 그 어긋남은 "미리보기가 틀렸다"가 아니라
 /// "도구가 거짓말했다"로 읽힌다. 헤드리스 CLI도 같은 이유로 정책 조립을 한 함수에 둔다.
 ///
-/// **`auto_approve_workspace_writes`가 여기 없다**(48.3절). 화면에 그 스위치가 없기 때문이고,
-/// 그 사실은 실수가 아니라 아직 내리지 않은 결정이다 — 미리보기가 그것을 드러낸다.
-#[allow(clippy::too_many_arguments)]
-fn task_policy_from(
-    mode: ExecutionMode,
-    allow_git_commit: bool,
-    unattended: bool,
-    auto_approve_verification: bool,
-    skill: Option<&tomverse_core::skills::Skill>,
-    deadline_secs: Option<u64>,
-    kind: &str,
-) -> TaskPolicy {
+/// **같은 함수를 쓰는 것으로는 부족하다 — 같은 값을 넣어야 한다**(63절). 미리보기는
+/// `kind`를 넣지 않고 있었고, 그래서 질문 태스크를 쓰던 사용자가 받는 예고는 **변경
+/// 태스크에 대한 답**이었다.
+fn task_policy_from(switches: &ScreenSwitches<'_>) -> TaskPolicy {
+    let narrowed = allowed_tools_for(switches.kind, switches.skill);
     TaskPolicy {
-        execution_mode: mode,
-        allow_git_commit,
-        unattended,
-        auto_approve_verification,
-        allowed_tools: allowed_tools_for(kind, skill),
+        execution_mode: switches.mode,
+        allow_git_commit: switches.allow_git_commit,
+        unattended: switches.unattended,
+        auto_approve_verification: switches.auto_approve_verification,
+        auto_approve_workspace_writes: switches.auto_approve_workspace_writes,
+        allowed_tools: narrowed.0,
+        allowed_tools_narrowed_by: narrowed.1,
         // **sidecar로 가지 않는다**(39.1절). 시계도 판정도 Rust가 갖는다.
-        deadline_ms: deadline_secs.map(|s| s * 1_000),
+        deadline_ms: switches.deadline_secs.map(|s| s * 1_000),
         ..TaskPolicy::default()
     }
 }
@@ -636,16 +660,18 @@ impl SessionState {
         allow_git_commit: bool,
         unattended: bool,
         auto_approve_verification: bool,
+        auto_approve_workspace_writes: bool,
         skill_path: Option<&str>,
         deadline_secs: Option<u64>,
-        // 이 미리보기가 **어느 종류의 태스크에 대한 답인가**(51·53절).
+        // 이 미리보기가 **어느 종류의 태스크에 대한 답인가**(51·53·63절).
         //
         // 종전에는 여기에 `false`가 박혀 있었다 — `kind`가 종류로 바뀌기 전, 불리언이던
         // 시절의 잔재다. 그대로 `"change"`로 옮기면 미리보기가 거짓말을 한다: 무인 스위치는
         // 종류와 무관하게 켤 수 있는데(App.tsx에서 그 fieldset은 `taskKind` 게이트 밖에 있다),
         // 질문·계획 태스크의 도구는 `tools_for_question`이 좁힌다. 좁혀진 것을 모르고 물으면
         // 화면이 **실제로는 거부될 쓰기 도구를 "그냥 지나갑니다"로** 보고한다. 이 함수의 주석이
-        // 경계하는 "도구가 거짓말했다"가 바로 그 모양이다.
+        // 경계하는 "도구가 거짓말했다"가 바로 그 모양이다. 종류가 빠져 있던 동안 질문 태스크의
+        // 예고는 변경 태스크의 답이었다 — 같은 함수를 쓰는 것만으로는 부족하다.
         kind: &str,
     ) -> Result<Value, String> {
         let host = self.with_active(|active| Ok(active.host.clone()))?;
@@ -658,15 +684,16 @@ impl SessionState {
                     .map_err(|e| e.to_string())?,
             ),
         };
-        let policy = task_policy_from(
+        let policy = task_policy_from(&ScreenSwitches {
             mode,
             allow_git_commit,
             unattended,
             auto_approve_verification,
-            skill.as_ref(),
+            auto_approve_workspace_writes,
+            skill: skill.as_ref(),
             deadline_secs,
             kind,
-        );
+        });
         serde_json::to_value(host.autopilot_preview(policy)).map_err(|e| format!("직렬화: {e}"))
     }
 
@@ -674,6 +701,22 @@ impl SessionState {
     pub fn task_blocked(&self, task_id: &str) -> Result<Value, UiMessage> {
         let out = self.read_store(StoreOp::ReadBlocked, |s| tomverse_core::blocked::collect(s, task_id))?;
         serde_json::to_value(out).map_err(|e| StoreIssue::new(StoreOp::ReadBlocked, format!("직렬화: {e}")).ui())
+    }
+
+    /// **그 태스크가 돈 정책**으로 만든 무인 실행 미리보기 (state-machine 59절).
+    ///
+    /// `autopilot_preview`(화면의 지금 스위치)와 **다른 명령이다.** 이쪽은 `blocked`와
+    /// 나란히 놓기 위한 것이므로, 비교 대상이 그 태스크가 실제로 돈 정책이어야 한다 —
+    /// 지금 스위치로 만들면 다른 질문에 대한 답을 나란히 놓게 되고, 그 상태에서
+    /// "예고가 어긋났다"고 말하는 것은 우리가 만든 거짓 신호다.
+    ///
+    /// **기록이 없으면 `null`이다.** 다시 계산해서 대신하지 않는다 — 대신하면 "그때의 예고"라는
+    /// 이름표가 붙은 다른 값이 나오고, 그 위에서 "예고가 어긋났다"고 말하게 된다(60절).
+    pub fn task_autopilot_preview(&self, task_id: &str) -> Result<Value, String> {
+        let host = self.with_active(|active| Ok(active.host.clone()))?;
+        // **기록에서 읽는다**(60절). 지금 다시 계산하면 정책은 맞아도 **워크스페이스가 다르다** —
+        // 태스크가 파일을 바꿨으므로 그 답은 그 태스크가 받은 예고가 아니다.
+        Ok(host.recorded_autopilot_preview(task_id)?.unwrap_or(Value::Null))
     }
 
     /// 브랜치를 remote로 올리고 PR 폼 URL을 만든다 (state-machine 28절).
@@ -1049,7 +1092,7 @@ impl SessionState {
                 "repoPath": active.repo_display,
                 "isolation": active.isolation.clone(),
                 "isolationNotices": active.isolation.as_ref().map(|i| i.notices()).unwrap_or_default(),
-                // **환경이 만드는 한계는 열 때 말한다** (unc.rs, state-machine 55.4절).
+                // **환경이 만드는 한계는 열 때 말한다** (unc.rs, state-machine 71.4절).
                 // 격리 공지와 같은 배너 자리를 쓰되 필드를 나눈다: 출처가 다르고, 하나가
                 // 없다고 다른 하나가 없어지면 안 된다. 문장은 Rust가 만든다.
                 "environmentNotices": environment_notices(&active.root_display),
@@ -1081,9 +1124,14 @@ impl SessionState {
     ///  - `unattended`(Autopilot)는 넓히지도 좁히지도 않는다 — 승인을 *묻지 않고 멈춘다*(24.2절).
     ///  - `auto_approve_verification`은 **넓힌다.** 그런데도 받는 이유는 대상 집합을
     ///    **Rust가 매니페스트에서 유도해 태스크 시작 시점에 고정**하기 때문이다(24.5절).
+    ///  - `auto_approve_workspace_writes`도 **넓힌다**(63절). 통과하는 이유는 넓어진 자리가
+    ///    **되돌릴 수 있는 것뿐**이기 때문이고, 그 사실은 산문이 아니라 게이트에 물어서
+    ///    세웠다: 워크스페이스 밖은 거부, 비밀값 파일은 `HumanOnly`, 삭제·이동은 정책과
+    ///    무관하게 승인, 쓴 것은 pre-image로 되돌아가고, **무인에서 `git commit`은 어떤
+    ///    스위치 조합으로도 지나가지 않는다**(47.6절이 이미 찾아 둔 사실).
     ///
-    /// **넓히는 방향은 이것이 마지막이어야 한다.** 위 셋이 통과하는 이유는 각각 다르고,
-    /// 그 이유가 없는 필드는 통과하지 못한다.
+    /// **넓히는 방향은 이 넷이 전부다.** 각각 통과하는 이유가 다르고, 그 이유가 없는 필드는
+    /// 통과하지 못한다 — "이미 넷이나 있으니 하나 더"는 이유가 아니다.
     /// `budget_usd`가 `None`이면 **상한 없이** 실행한다 — 사용자가 명시적으로 고른 경우이거나
     /// (가격을 모르는 모델) 화면이 그렇게 보낸 경우다. 값을 우리가 대신 채워 넣지 않는다:
     /// 상한은 사용자의 승인이고, 코드가 만들어낸 승인은 승인이 아니다.
@@ -1103,6 +1151,8 @@ impl SessionState {
         unattended: bool,
         // 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
         auto_approve_verification: bool,
+        // 워크스페이스 안의 파일 쓰기를 묻지 않고 승인한다 (63절). 위 주석의 근거 참조.
+        auto_approve_workspace_writes: bool,
         // 스킬 파일 경로 (26절). **Rust가 읽는다** — 도구 허용목록의 출처가 UI가 되면
         // 장악당한 UI가 "허용목록은 전부입니다"라고 말할 수 있다.
         skill_path: Option<&str>,
@@ -1111,8 +1161,10 @@ impl SessionState {
         // 참이면 파일을 바꾸지 않는 경로를 탄다. 그 보장은 두 겹이다 — sidecar의 경로가
         // `EXECUTING`을 지나지 않고, 여기서 도구를 읽기 전용으로 좁혀 게이트에 꽂는다.
         kind: &str,
+        // 이 태스크가 이어받는 앞선 태스크 (state-machine 70절).
+        follows_up: Option<&str>,
         // 무인 실행의 **시한**(초) — state-machine 39절. `None`이면 상한이 없다.
-        // 
+        //
         // `timeout`과 다른 값이다: 저쪽은 이 호출이 기다리기를 그만두는 시각이고, 이쪽은
         // 태스크가 멈추는 시각이다(39.2절).
         deadline_secs: Option<u64>,
@@ -1166,15 +1218,16 @@ impl SessionState {
 
         // **이 태스크의 정책을 여기서 정하고, 여기서만 정한다.** 등록은 한 번뿐이므로
         // 진행 중에 바뀌지 않는다(3.16.2절).
-        let task_policy = task_policy_from(
+        let task_policy = task_policy_from(&ScreenSwitches {
             mode,
             allow_git_commit,
             unattended,
             auto_approve_verification,
-            skill.as_ref(),
+            auto_approve_workspace_writes,
+            skill: skill.as_ref(),
             deadline_secs,
             kind,
-        );
+        });
         host.begin_task(&task_id, task_policy, skill.as_ref())?;
 
         // 스킬의 모델 지정은 화면이 명시한 지정에 **진다** — 우선순위를 한 곳에서 정한다(26.1절).
@@ -1205,6 +1258,10 @@ impl SessionState {
                 // 알 수 없는 값은 `change`로 접는다 — 모르는 값을 읽기 전용으로 접으면
                 // 오타 하나가 실행을 조용히 막고, 사용자는 도구가 고장 났다고 읽는다.
                 "kind": if is_read_only_kind(kind) { kind } else { "change" },
+                // **어느 정지에서 이어졌는가**(62절). 연결일 뿐이고, 앞선 태스크의 무엇도
+                // 이 태스크의 근거로 쓰지 않는다 — 쓰면 "재개했다"는 주장이 성립하는
+                // 것처럼 보인다.
+                "followsUp": follows_up,
                 "createdAt": tomverse_core::time::now_iso(),
             },
             "policy": {
@@ -1218,10 +1275,15 @@ impl SessionState {
                 "modelPins": model_pins,
                 "unattended": unattended,
                 "autoApproveVerification": auto_approve_verification,
+                // **게이트에 꽂힌 값과 같은 값을 보낸다**(63절). Node가 이 값을 지키는 것은
+                // 아니지만(지키는 것은 Rust다), 보내지 않으면 sidecar가 보는 정책이 언제나
+                // "꺼짐"이라 기록과 화면이 서로 다른 설정을 말하게 된다.
+                "autoApproveWorkspaceWrites": auto_approve_workspace_writes,
                 // 화면은 이 목록을 **지키지 않는다** — 지키는 것은 Rust의 게이트다(26.1절).
                 // **게이트에 꽂힌 값을 그대로 보낸다**(51절) — 여기서 다시 계산하면 화면이
                 // 말하는 허용목록과 실제로 좁혀진 목록이 갈릴 수 있다.
                 "allowedTools": allowed_tools_for(kind, skill.as_ref())
+                    .0
                     .as_ref()
                     .map(|t| t.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
             },

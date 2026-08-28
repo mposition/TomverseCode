@@ -847,7 +847,7 @@ fn path_normalization_checks(obs: &Observations) -> Vec<Check> {
     ]
 }
 
-/// UNC 워크스페이스에서의 검증 정직성 (`unc.rs`, state-machine 55절).
+/// UNC 워크스페이스에서의 검증 정직성 (`unc.rs`, state-machine 71절).
 ///
 /// # 왜 별도 묶음인가
 ///
@@ -1029,6 +1029,56 @@ pub const WINDOWS_FILES_WITHOUT_LANDING: &[(&str, &str)] = &[(
 )];
 
 /// 관측을 기준에 대본다. **아무것도 실행하지 않고 아무것도 쓰지 않는다.**
+/// 파일 쓰기 실패의 판정 (`file_errors.rs`, state-machine 65절).
+///
+/// **판정 로직은 Linux에서 값으로 검증된다** — 플랫폼과 오류를 인자로 받기 때문이다.
+/// 그런데 그 인자가 **실제로 그 값으로 오는지**는 Windows에서만 알 수 있고, 그게 이 묶음이
+/// 있는 이유다. 코드가 맞아도 실제 오류가 다른 코드로 오면 판정은 조용히 사라진다.
+fn file_failure_checks(obs: &Observations) -> Vec<Check> {
+    let (status, detail) = if obs.os == "windows" {
+        (CheckStatus::NeedsHuman, "Windows에서 사람이 확인해야 한다.".to_string())
+    } else {
+        (
+            CheckStatus::NotCheckableHere,
+            format!("여기는 {} — 파일 잠금도 MAX_PATH도 이 플랫폼에 없다.", obs.os),
+        )
+    };
+    vec![
+        check(
+            "aLockedFileReportsSharingViolation",
+            "편집기가 열어 둔 파일에 쓰면 실제로 32번(공유 위반)이 온다.",
+            status.clone(),
+            format!(
+                "{detail} 판정은 이 코드에 걸려 있다. 다른 코드가 오면 처방이 조용히 사라지고,                  남는 것은 다시 OS의 문장 하나다 — 고치기 전과 같은 상태이면서 고쳤다고 믿는 상태다."
+            ),
+        ),
+        check(
+            "aTooLongPathReportsFilenameExcedRange",
+            "260자를 넘는 경로에 쓰면 206번이 온다 — 접근 거부(5번)가 아니라.",
+            status.clone(),
+            format!(
+                "{detail} 둘 중 무엇이 오는지에 따라 사용자가 받는 처방이 갈린다. 5번이 오면                  \"권한을 확인하세요\"가 나가는데, 그건 경로를 줄여야 하는 사용자에게 틀린 처방이다."
+            ),
+        ),
+        check(
+            "theLocaleDoesNotChangeTheVerdict",
+            "한국어 Windows에서도 같은 판정이 나온다.",
+            status.clone(),
+            format!(
+                "{detail} 코드로 판정하므로 성립해야 하지만, **그것이 이 판정을 만든 이유**다 —                  문자열로 판정했다면 영어 로케일에서만 동작하고 그 사실은 개발자의 기계에서 드러나지 않는다."
+            ),
+        ),
+        check(
+            "aPermanentFailureStopsTheRetryLoop",
+            "재시도할 값어치가 없는 실패에서 오케스트레이터가 상한을 기다리지 않는다.",
+            status,
+            format!(
+                "{detail} 판정이 Node까지 닿는지는 e2e가 보지만, **실제 Windows 오류로 그 경로가                  도는지**는 여기서만 확인된다."
+            ),
+        ),
+    ]
+}
+
 pub fn assess(obs: &Observations) -> LandingReport {
     let mut groups = vec![
         {
@@ -1107,7 +1157,16 @@ pub fn assess(obs: &Observations) -> LandingReport {
             let checks = unc_workspace_checks(obs);
             Group {
                 id: "uncWorkspace",
-                documented_at: "state-machine-and-protocol.md 55절 (`unc.rs`)",
+                documented_at: "state-machine-and-protocol.md 71절 (`unc.rs`)",
+                verdict: verdict_of(&checks),
+                checks,
+            }
+        },
+        {
+            let checks = file_failure_checks(obs);
+            Group {
+                id: "fileFailureDiagnosis",
+                documented_at: "state-machine-and-protocol.md 65절 (`file_errors.rs`)",
                 verdict: verdict_of(&checks),
                 checks,
             }

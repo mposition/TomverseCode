@@ -201,6 +201,13 @@ export default function App() {
    */
   const [taskKind, setTaskKind] = useState<TaskKind>("change");
   /**
+   * 이 실행이 이어받는 앞선 정지의 태스크 id (62절).
+   *
+   * **재개가 아니다** — 새 실행이고, 이 값은 감사 기록이 "어느 정지에서 이어졌나"에
+   * 답할 수 있게 하는 연결이다.
+   */
+  const [followsUp, setFollowsUp] = useState<string | null>(null);
+  /**
    * 무인 실행 (state-machine 24절)과 그 짝인 검증 명령 자동 승인(24.5절).
    *
    * **두 스위치를 따로 둔다.** 무인 실행만 켜면 태스크는 검증 명령 승인에서 멈추고, 그건
@@ -214,6 +221,10 @@ export default function App() {
    */
   const [deadlineText, setDeadlineText] = useState("");
   const [autoApproveVerification, setAutoApproveVerification] = useState(false);
+  // **넓히는 스위치이므로 기본값은 꺼짐이고, 실행이 끝나도 저절로 꺼지지 않는다**(63절).
+  // 그 사실은 라벨이 말한다 — 사용자는 "이 patch 하나" 때문에 켜는데 적용은 그 다음
+  // 실행들까지다(62.3절이 이어서 돌리기 버튼에서 배운 것과 같은 함정이다).
+  const [autoApproveWrites, setAutoApproveWrites] = useState(false);
   /** 스킬 파일 경로 (26절). **Rust가 읽는다** — 화면은 경로만 넘긴다. */
   const [skillPath, setSkillPath] = useState("");
   /**
@@ -674,11 +685,16 @@ export default function App() {
         modelPins: modelPins(pinExecutor, pinReviewer),
         unattended,
         autoApproveVerification,
+        // **워크스페이스 안의 쓰기를 묻지 않는다**(63절). 넓히는 방향이고, 근거는 게이트에
+        // 물어서 세웠다 — 넓어지는 자리가 되돌릴 수 있는 것뿐이다.
+        autoApproveWrites,
         // 빈 문자열은 "경로 없음"이지 "빈 경로"가 아니다.
         skillPath: skillPath.trim() === "" ? null : skillPath.trim(),
         // **질문인가**(51절). 이 값이 정하는 것은 경로만이 아니다 — Rust가 이걸 보고 도구를
         // 읽기 전용으로 좁혀 게이트에 꽂는다(51.2절).
         kind: taskKind,
+        // **어느 정지에서 이어졌는가**(62절). 재개가 아니라 연결이다.
+        followsUp: followsUp,
         // 시한의 판정은 화면 밖(src/lib)에 있다 — 계산이 화면 안에 있으면 검증할 방법이 없다.
         deadlineSecs: readDeadline(deadlineText, unattended).secs,
       });
@@ -1157,7 +1173,7 @@ export default function App() {
       {/* 격리 실행이 **말하지 않으면 정반대로 읽히는 것들**(22.5절). 배너 자리인 이유:
           "결과가 본체에 없다"는 사실은 결과를 볼 때가 아니라 **작업을 시작하기 전에** 알아야
           한다. 문장은 Rust가 만든다 — 헤드리스는 stderr로 같은 것을 낸다. */}
-      {/* 환경 경고(55.4절)를 같은 배너에 **함께** 싣는다. 두 목록을 따로 렌더하면 배너가
+      {/* 환경 경고(71.4절)를 같은 배너에 **함께** 싣는다. 두 목록을 따로 렌더하면 배너가
           둘 겹쳐 보이고, 사용자는 위쪽만 읽는다. 필드를 나눈 이유는 출처가 다르기 때문이지
           자리를 나누려는 것이 아니다. */}
       {[...(workspace?.environmentNotices ?? []), ...(workspace?.isolationNotices ?? [])].length > 0 && (
@@ -1283,6 +1299,32 @@ export default function App() {
                   )
                 )}
               </fieldset>
+              {/* 파일 쓰기 자동 승인 (63절). **무인 실행 칸에 두지 않는다** — 이 스위치는
+                  사람이 보고 있는 실행에도 적용되고, 무인 칸에 있으면 "무인일 때만"으로 읽힌다.
+
+                  넓히는 방향이라 근거가 필요했고, 그 근거는 산문이 아니라 게이트에 물어서
+                  세웠다: 워크스페이스 밖은 여전히 거부, 비밀값 파일은 어떤 스위치로도 못 열고,
+                  삭제·이동은 정책과 무관하게 승인이며, 쓴 것은 pre-image로 되돌아간다. 그리고
+                  **무인에서 `git commit`은 어떤 조합으로도 지나가지 않으므로**(47.6절) 이
+                  스위치가 되돌리기를 비싸게 만들지 못한다. 넷 다 core의 단위 테스트가 고정한다. */}
+              <fieldset className="modes" disabled={running}>
+                <legend>파일 쓰기</legend>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={autoApproveWrites}
+                    onChange={(e) => setAutoApproveWrites(e.target.checked)}
+                  />
+                  워크스페이스 안의 파일 변경을 묻지 않고 적용
+                </label>
+                {/* **무엇이 넓어지는지와 무엇이 안 넓어지는지를 함께 적는다.** 넓어지는 쪽만
+                    적으면 과하게 무섭고, 안 넓어지는 쪽만 적으면 안심시키는 문장이 된다. */}
+                <p className="muted small">
+                  이번 실행의 <strong>모든</strong> 파일 변경에 적용되고, 끄기 전까지 다음
+                  실행에도 남습니다. 비밀값 파일·삭제·이동·커밋은 이 스위치로 열리지 않고,
+                  적용된 변경은 되돌리기로 원래 내용으로 돌아갑니다.
+                </p>
+              </fieldset>
               {/* 커밋은 **되돌리기가 파일만 복원하고 커밋은 남기는** 유일한 단계라 별도 스위치다.
                   켜도 승인 없이 커밋되지 않는다 — 승인 모달이 실제 argv를 그대로 보여준다. */}
               <fieldset className="modes" disabled={running}>
@@ -1332,8 +1374,12 @@ export default function App() {
                   mode={mode}
                   allowGitCommit={allowGitCommit}
                   autoApproveVerification={autoApproveVerification}
+                  autoApproveWrites={autoApproveWrites}
                   skillPath={skillPath.trim() === "" ? null : skillPath.trim()}
                   deadlineSecs={deadline.secs}
+                  // **`start_task`에 보내는 것과 같은 값이다**(63절). 종류가 빠져 있던 동안
+                  // 질문 태스크의 예고는 변경 태스크의 답이었다 — 같은 함수를 쓰는 것만으로는
+                  // 부족하고 같은 값을 넣어야 한다.
                   kind={taskKind}
                   ready={Boolean(workspace)}
                 />
@@ -1743,7 +1789,19 @@ export default function App() {
               {finalResult && <AuditExportPanel taskId={finalResult.taskId} />}
               {/* 무인 정지의 처방(24.8절)과 PR 올리기(28절). 둘 다 **끝난 작업에 대한 질문**이라
                   결과 옆에 둔다 — 진행 중에는 답이 아직 없다. */}
-              {finalResult && <BlockedPanel taskId={finalResult.taskId} />}
+              {finalResult && (
+                <BlockedPanel
+                  taskId={finalResult.taskId}
+                  onFollowUp={(grant, previousTaskId) => {
+                    // **스위치를 켜 두고 시작 화면으로 보낸다** — 여기서 시작하지 않는다(62절).
+                    // 한 번의 클릭이 무엇을 넓히는지를 사용자가 읽어야 한다.
+                    if (grant.includes("--auto-approve-verification")) setAutoApproveVerification(true);
+                    if (grant.includes("--allow-git-commit")) setAllowGitCommit(true);
+                    setUnattended(true);
+                    setFollowsUp(previousTaskId);
+                  }}
+                />
+              )}
               {finalResult && <PullRequestPanel taskId={finalResult.taskId} />}
             </div>
 

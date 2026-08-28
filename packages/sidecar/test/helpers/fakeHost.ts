@@ -1,5 +1,46 @@
-import type { VerificationReport, VerificationStatus, VerificationKind, ToolRequest } from "@tomverse/protocol";
+import type { VerificationReport, VerificationStatus, VerificationKind, ToolRequest, ToolResult } from "@tomverse/protocol";
 import type { NdjsonTransport } from "../../src/ipc/transport.js";
+import { classifyFile } from "../../src/context/exclude.js";
+
+/**
+ * fake의 검색 결과 상한 — 실제 도구의 `MAX_SEARCH_MATCHES`에 대응한다 (58절).
+ *
+ * **값을 맞추지 않는다.** 실제는 200이고 여기는 훨씬 작다: 상한이 **있다**는 사실을
+ * 검사하려면 fixture로 200개를 만들어야 하는데, 그건 검사를 읽을 수 없게 만든다. 맞춰야
+ * 하는 것은 숫자가 아니라 **`truncated`가 참이 되는 경로가 존재한다**는 사실이다.
+ *
+ * **다만 아무 작은 값이나 되는 것은 아니다**(21절). 이 값이 `MAX_MATCHES_PER_KEYWORD`보다
+ * 크지 않으면 **엔진의 키워드당 상한에 걸리는 경로가 fake로는 도달할 수 없다** — 실제로
+ * 둘 다 3이라 그 상한이 fake로 한 번도 밟히지 않았고, 거기서 버려지는 파일은 어디에도
+ * 기록되지 않고 있었다. 낮춘 상한이 **다른 상한을 가린다**는 것이 여기서 배운 것이다.
+ * 그 관계는 주석이 아니라 `context.test.ts`가 확인한다.
+ */
+/**
+ * fake의 파일 목록 상한 (18절).
+ *
+ * 실제는 5000이다. **맞추지 않는 것이 의도다** — 자르는 경로가 존재한다는 사실만 있으면
+ * 되고, 5000개짜리 fixture는 읽을 수 없다. 기존 fixture는 전부 이보다 작으므로 걸리지 않는다.
+ */
+export const FAKE_MAX_LIST_ENTRIES = 50;
+
+export const FAKE_MAX_SEARCH_MATCHES = 8;
+
+/**
+ * 비밀값처럼 보이는 경로인가 — **`classifyFile`이 쓰는 것과 같은 규칙**을 지난다 (58절).
+ *
+ * 손으로 다시 적으면 실제 규칙이 늘 때 fake만 뒤처지고, 그러면 검사가 실제보다 넓은
+ * 세계를 지킨다(13.6절). 크기는 여기서 판정하지 않으므로 0을 넘긴다 — 크기 제외는
+ * 인덱싱의 일이고 검색 도구가 하는 일이 아니다.
+ */
+function isSecretLike(path: string): boolean {
+  const verdict = classifyFile(path, 0);
+  return verdict.excluded && (verdict.reason ?? "").includes("시크릿");
+}
+
+function isBinaryLike(path: string): boolean {
+  const verdict = classifyFile(path, 0);
+  return verdict.excluded && (verdict.reason ?? "").includes("바이너리");
+}
 
 /**
  * Orchestrator 단위 테스트용 인-프로세스 Rust 호스트 대역.
@@ -50,6 +91,8 @@ export interface FakeHostOptions {
     policyDecision?: string;
     /** 거부가 **요청의 모양** 때문인가 (state-machine 41.4절). Rust가 정하는 값이다. */
     redraftable?: boolean;
+    /** 왜 실패했는가 (state-machine 65절). **Rust가 정하는 값이다** — 여기서 다시 판정하지 않는다. */
+    fileFailure?: ToolResult["fileFailure"];
   }[];
   /**
    * 계획 프리플라이트 응답 override — 도구 이름별 (state-machine 42절).
@@ -227,8 +270,22 @@ export class FakeHost {
     });
 
     switch (request.tool) {
-      case "list_files":
-        return ok({ entries: this.options.files ?? [], truncated: false });
+      // **상한을 흉내 낸다**(18절). 자르는 경로가 fake에 없으면 `truncated`를 읽는 코드도,
+      // 그 값이 만드는 범위 노트도 단위 테스트로는 검증되지 않는다 — 16.2절이 검색에서
+      // 배운 것과 같다.
+      //
+      // **숫자는 실제(5000)와 맞추지 않는다.** 맞춰야 하는 것은 숫자가 아니라 자르는 경로가
+      // 존재한다는 사실이고, 5000개짜리 fixture는 검사를 읽을 수 없게 만든다. 기존
+      // fixture들이 걸리지 않을 만큼 크되 테스트로 넘길 수 있을 만큼 작게 잡는다.
+      case "list_files": {
+        const all = this.options.files ?? [];
+        const truncated = all.length > FAKE_MAX_LIST_ENTRIES;
+        return ok({
+          entries: truncated ? all.slice(0, FAKE_MAX_LIST_ENTRIES) : all,
+          truncated,
+          root: ".",
+        });
+      }
       case "read_file": {
         const path = String(request.args.path);
         const content = this.options.contents?.[path];
@@ -244,7 +301,16 @@ export class FakeHost {
             policy: { decision: "auto_approve", riskLevel: "none", reason: "", matchedRule: "", normalizedTarget: path },
           };
         }
-        return ok({ path, binary: false, content, sizeBytes: content.length, truncated: false });
+        // **실제 도구가 내는 키를 전부 낸다**(18절). Node가 읽지 않기로 한 값이라도 fake가
+        // 내지 않으면 "안 읽는다"와 "낼 수 없다"가 구별되지 않는다.
+        return ok({
+          path,
+          binary: false,
+          content,
+          sizeBytes: content.length,
+          includedBytes: content.length,
+          truncated: false,
+        });
       }
       // **진짜로 찾는다**(51절). 빈 배열을 돌려주면 본문 기반 선정이 "찾지 못했다"로 돌고,
       // 그 검사는 무엇도 검사하지 못한 채 통과한다 — fake가 게으르면 검사도 게을러진다.
@@ -264,14 +330,33 @@ export class FakeHost {
         }
         const pattern = new RegExp(String(request.args.pattern));
         const matches: { path: string; line: number; text: string }[] = [];
+        // **실제 도구가 내는 세 값을 모두 낸다**(58절). fake가 게으르면 검사도 게을러진다:
+        // `skippedSecretFiles`를 내지 않으면 "건너뛴 것이 있다"는 경로가 fake로는 검증되지
+        // 않고, 그러면 그 사실을 읽는 코드를 지워도 아무 검사도 실패하지 않는다.
+        let skippedSecretFiles = 0;
+        let truncated = false;
         for (const [path, content] of Object.entries(this.options.contents ?? {})) {
           // 비밀값 파일은 **읽기 전에** 건너뛴다 — 실제 도구가 그렇게 한다(tools/mod.rs).
-          if (/(^|\/)\.env($|\.)/.test(path)) continue;
-          content.split("\n").forEach((text, i) => {
-            if (pattern.test(text)) matches.push({ path, line: i + 1, text });
-          });
+          //
+          // **판정을 여기서 다시 적지 않는다.** 종전에는 `.env`만 보는 정규식이 손으로
+          // 적혀 있었고, 그러면 실제 규칙이 늘 때 fake만 뒤처져 **검사가 실제보다 넓은
+          // 세계를 지키게 된다**(13.6절이 적어 둔 갈림).
+          if (isSecretLike(path)) {
+            skippedSecretFiles += 1;
+            continue;
+          }
+          if (isBinaryLike(path)) continue;
+          for (const [i, text] of content.split("\n").entries()) {
+            if (!pattern.test(text)) continue;
+            if (matches.length >= FAKE_MAX_SEARCH_MATCHES) {
+              truncated = true;
+              break;
+            }
+            matches.push({ path, line: i + 1, text: text.slice(0, 400) });
+          }
+          if (truncated) break;
         }
-        return ok({ matches, truncated: false });
+        return ok({ matches, truncated, skippedSecretFiles });
       }
       case "git_status":
         return ok({ stdout: this.options.gitStatus ?? "## main", exitCode: 0 });
@@ -317,6 +402,9 @@ export class FakeHost {
             error: stub.error ?? "fake failure",
             durationMs: 1,
             completedAt: new Date().toISOString(),
+            // **없으면 키를 두지 않는다.** `undefined`를 실으면 "판정이 없다"와 "판정이
+            // undefined다"가 같아 보이는데, 전자가 뜻하는 것은 "더 말할 것이 없다"이다.
+            ...(stub.fileFailure ? { fileFailure: stub.fileFailure } : {}),
           },
           policy: {
             decision: stub.policyDecision ?? (stub.status === "denied" ? "deny" : "auto_approve"),

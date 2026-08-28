@@ -461,6 +461,20 @@ impl McpPool {
         }
     }
 
+    /// **띄우는 방법이 없는 읽기 전용 뷰** (state-machine 64절).
+    ///
+    /// 미리보기는 등록을 알아야 하지만 서버를 띄우면 안 된다 — "아무것도 쓰지 않는다"는
+    /// 약속(47절)은 프로세스를 하나 띄우는 것만으로도 깨진다. 그 규칙을 주석으로 두면
+    /// 언젠가 누가 더 정확한 탐침을 만들려고 `catalog()`를 부른다.
+    ///
+    /// 그래서 뷰를 따로 낸다. 이 타입에는 `spawn`으로 가는 길이 **없으므로**, 미리보기가
+    /// 서버를 띄우지 않는다는 것은 검사가 지키는 성질이 아니라 **컴파일러가 지키는 성질**이다.
+    ///
+    /// 복사본이 아니라 빌린 것이다(32절: "목록을 복사해 넣으면 등록과 게이트가 갈라진다").
+    pub fn registration(&self) -> Registration<'_> {
+        Registration { servers: &self.servers }
+    }
+
     /// 등록된 서버들이 **실제로 내놓는 도구 목록**을 모은다 (state-machine 31절).
     ///
     /// # 왜 이게 필요한가
@@ -521,6 +535,44 @@ impl McpPool {
             let _ = entry.child.kill();
             let _ = entry.child.wait();
         }
+    }
+}
+
+/// 등록을 **읽기만** 하는 뷰 — state-machine 64절.
+///
+/// `McpPool`을 그대로 넘기면 받는 쪽이 `catalog()`를 부를 수 있고, 그건 서버를 띄운다.
+/// 미리보기처럼 "아무것도 하지 않는다"를 약속한 자리에는 그 능력이 아예 없어야 한다.
+pub struct Registration<'a> {
+    servers: &'a [McpServerConfig],
+}
+
+impl Registration<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.servers.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// **`gate_check`를 통과하는 호출 하나** — 미리보기의 대표 요청에 쓴다.
+    ///
+    /// 등록된 서버가 없으면 `None`이다. 도구 허용목록이 있으면 그 안에서 고른다 — 목록 밖
+    /// 이름을 쓰면 그 탐침은 "등록 밖 거부"가 되어 **등록되지 않은 경우와 구별되지 않는다.**
+    ///
+    /// 허용목록이 없으면 아무 이름이나 통과하므로 대표적인 이름을 쓴다. 이 이름은 서버가
+    /// 실제로 내놓는 도구가 아닐 수 있다 — **그래도 상관없다**: 여기서 묻는 것은 "이 서버의
+    /// 도구를 부르면 무인에서 어떻게 되는가"이고, 게이트의 답은 도구 이름이 실재하는지에
+    /// 달려 있지 않다. 실재를 확인하려면 서버를 띄워야 하고, 그건 이 타입이 할 수 없는 일이다.
+    pub fn probe_call(&self) -> Option<(String, String)> {
+        let server = self.servers.first()?;
+        let tool = match &server.tools {
+            // 빈 허용목록은 `validate_servers`가 막지만, 막는 쪽이 바뀌어도 여기서 없는
+            // 이름을 지어내지 않는다 — 지어내면 그 탐침이 조용히 틀린 답을 보고한다.
+            Some(allowed) => allowed.first()?.clone(),
+            None => "any".to_string(),
+        };
+        Some((server.name.clone(), tool))
     }
 }
 
@@ -828,6 +880,43 @@ fn spawn_session(config: &McpServerConfig) -> Result<SpawnedSession, McpError> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    // ---- 등록 뷰 (64절) ----
+
+    fn config(name: &str, tools: Option<Vec<String>>) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            program: "node".to_string(),
+            args: vec!["s.js".to_string()],
+            env: Default::default(),
+            tools,
+        }
+    }
+
+    /// **허용목록이 있으면 그 안에서 고른다.** 밖의 이름을 쓰면 게이트가 `ToolNotAllowed`로
+    /// 거부하고, 그러면 그 탐침은 **등록되지 않은 경우와 같은 답**을 낸다 — 등록을 반영한
+    /// 것이 아니게 된다.
+    #[test]
+    fn the_probe_call_passes_its_own_gate_check() {
+        for tools in [None, Some(vec!["append".to_string(), "read".to_string()])] {
+            let pool = McpPool::new(vec![config("notes", tools.clone())]).unwrap();
+            let (server, tool) = pool.registration().probe_call().expect("탐침을 만들지 못했습니다");
+            assert_eq!(server, "notes");
+            // **게이트에 그대로 태워서 확인한다.** 이름 비교로 대신하면 규칙이 바뀔 때
+            // 검사가 따라가지 못한다.
+            let call = McpCall { server, tool, arguments: json!({}) };
+            assert!(pool.gate_check(&call).is_ok(), "{tools:?}에서 만든 탐침이 거부됩니다");
+        }
+    }
+
+    /// 등록이 없으면 **지어내지 않는다.** 없는 서버 이름으로 만든 탐침은 "등록 밖 거부"가
+    /// 되어 등록되지 않은 경우와 구별되지 않는다.
+    #[test]
+    fn an_empty_registration_has_no_probe_call() {
+        let pool = McpPool::new(Vec::new()).unwrap();
+        assert!(pool.registration().is_empty());
+        assert!(pool.registration().probe_call().is_none());
+    }
 
     // ---- 도구 카탈로그 (31절) ----
 

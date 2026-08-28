@@ -114,10 +114,17 @@ async fn start_task(
     unattended: Option<bool>,
     // 프로젝트가 매니페스트에 선언해 둔 검증 명령을 묻지 않고 실행한다 (24.5절).
     auto_approve_verification: Option<bool>,
+    // 워크스페이스 안의 파일 쓰기를 묻지 않고 승인한다 (63절).
+    //
+    // **넓히는 방향이라 기본값이 `false`다.** 화면이 인자를 빠뜨리면 켜지는 것이 아니라
+    // 꺼진다 — 넓히는 스위치의 기본값은 언제나 좁은 쪽이어야 한다.
+    auto_approve_writes: Option<bool>,
     // 스킬 파일 경로 (26절). **Rust가 읽는다.**
     skill_path: Option<String>,
     // 이 요청이 **질문인가** (state-machine 51절). 참이면 파일을 바꾸지 않는 경로를 탄다.
     kind: Option<String>,
+    // 이 태스크가 이어받는 앞선 태스크 (state-machine 70절).
+    follows_up: Option<String>,
     // 무인 실행의 시한(초) — state-machine 39절. 지나면 **태스크가 멈춘다.**
     // `timeout_secs`와 다르다: 저쪽은 기다리기를 그만두는 시각이다(39.2절).
     deadline_secs: Option<u64>,
@@ -139,8 +146,10 @@ async fn start_task(
             model_pins.unwrap_or(Value::Null),
             unattended.unwrap_or(false),
             auto_approve_verification.unwrap_or(false),
+            auto_approve_writes.unwrap_or(false),
             skill_path.as_deref(),
             kind.as_deref().unwrap_or(DEFAULT_TASK_KIND),
+            follows_up.as_deref(),
             // 0은 받지 않는다 — "즉시 멈춘다"를 시한으로 적을 이유가 없고, 받으면 시작하자마자
             // 멈추는 실행이 정상 동작처럼 보인다.
             deadline_secs.filter(|s| *s > 0),
@@ -358,6 +367,16 @@ fn task_blocked(state: tauri::State<'_, SessionState>, task_id: String) -> Resul
     Ok(envelope(state.task_blocked(&task_id)))
 }
 
+/// **그 태스크가 돈 정책**으로 만든 미리보기 (state-machine 59절). **읽기 전용이다.**
+///
+/// `autopilot_preview`와 나란히 두되 다른 명령이다 — 저쪽은 "지금 스위치로 돌리면"이고
+/// 이쪽은 "그 태스크는 어떤 예고를 받았나"다. 섞으면 `blocked`와의 비교가 다른 질문에
+/// 대한 답을 나란히 놓는다.
+#[tauri::command]
+fn task_autopilot_preview(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
+    state.task_autopilot_preview(&task_id)
+}
+
 /// 무인 실행이 지금 스위치로 무엇을 허용하는지 (state-machine 47·48절).
 ///
 /// **아무것도 쓰지 않는다.** 화면이 스위치를 바꿀 때마다 다시 물으므로 자주 불린다 —
@@ -369,11 +388,15 @@ fn autopilot_preview(
     allow_git_commit: Option<bool>,
     unattended: Option<bool>,
     auto_approve_verification: Option<bool>,
+    auto_approve_writes: Option<bool>,
     skill_path: Option<String>,
     deadline_secs: Option<u64>,
     // 무인 스위치는 종류와 무관하게 켤 수 있으므로(화면의 그 fieldset은 `taskKind` 게이트
     // 밖에 있다) 미리보기도 종류를 알아야 한다. 모르면 질문·계획 태스크에서 좁혀진 도구를
     // "그냥 지나갑니다"로 보고한다.
+    //
+    // **`start_task`와 같은 값을 받아야 한다**(63절). 종류가 빠져 있던 동안 질문 태스크의
+    // 예고는 변경 태스크의 답이었다 — 같은 함수를 쓰는 것만으로는 부족하다.
     kind: Option<String>,
 ) -> Result<Value, String> {
     state.autopilot_preview(
@@ -381,6 +404,7 @@ fn autopilot_preview(
         allow_git_commit.unwrap_or(false),
         unattended.unwrap_or(false),
         auto_approve_verification.unwrap_or(false),
+        auto_approve_writes.unwrap_or(false),
         skill_path.as_deref(),
         deadline_secs,
         kind.as_deref().unwrap_or(DEFAULT_TASK_KIND),
@@ -592,6 +616,7 @@ pub fn run() {
             skill_path,
             set_workspace_settings,
             open_pull_request,
+            task_autopilot_preview,
             task_export,
             list_models,
             set_allowed_providers,

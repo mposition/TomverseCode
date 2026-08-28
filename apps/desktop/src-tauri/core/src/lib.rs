@@ -22,6 +22,7 @@ pub mod credentials;
 pub mod deadline;
 pub mod decisions;
 pub mod export;
+pub mod file_errors;
 pub mod fleet;
 pub mod hooks;
 pub mod host;

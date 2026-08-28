@@ -64,6 +64,15 @@ impl PolicyGate {
         self
     }
 
+    /// 이 게이트가 아는 등록 — **읽기 전용 뷰**다 (state-machine 64절).
+    ///
+    /// 미리보기가 "등록된 서버를 부르면 어떻게 되는가"를 물으려면 서버 이름을 알아야 한다.
+    /// 풀 자체를 내주면 받는 쪽이 `catalog()`로 서버를 띄울 수 있으므로 뷰만 내준다 —
+    /// 그 타입에는 띄우는 길이 없다.
+    pub fn mcp_registration(&self) -> Option<crate::mcp::Registration<'_>> {
+        self.mcp.as_ref().map(|pool| pool.registration())
+    }
+
     /// 모든 도구 실행이 반드시 통과하는 단일 지점.
     pub fn evaluate(&self, request: &ToolRequest, root: &WorkspaceRoot, task_policy: &TaskPolicy) -> PolicyDecision {
         let outcome = self.classify(request, root, task_policy);
@@ -1092,6 +1101,61 @@ mod tests {
             }])
             .unwrap(),
         )
+    }
+
+    /// **워크스페이스 밖은 어떤 스위치 조합으로도 열리지 않는다** (63절).
+    ///
+    /// 쓰기 자동 승인을 화면에 올리기로 한 결정의 첫째 근거다(48.6절). 근거를 문서에만
+    /// 적어 두면 게이트가 바뀔 때 조용히 거짓이 되므로, 여기서 **조합을 다 돌며** 묻는다.
+    ///
+    /// 대조군을 함께 잰다 — 같은 파일 이름을 워크스페이스 안에서 물으면 스위치가 켜졌을 때
+    /// 자동 승인이 나와야 한다. 그것이 없으면 위 반복은 "모든 쓰기가 막힌다"를 확인한
+    /// 것이고, 그건 이 스위치에 대해 아무 말도 하지 않는다.
+    #[test]
+    fn no_switch_combination_lets_a_write_escape_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let outside = [
+            json!({ "path": "../outside.txt", "content": "x" }),
+            json!({ "path": "a/../../outside.txt", "content": "x" }),
+        ];
+        let mut auto_approved_inside = 0;
+
+        for writes in [false, true] {
+            for commit in [false, true] {
+                for verification in [false, true] {
+                    let policy = TaskPolicy {
+                        auto_approve_workspace_writes: writes,
+                        allow_git_commit: commit,
+                        auto_approve_verification: verification,
+                        ..TaskPolicy::default()
+                    };
+                    for tool in [ToolName::CreateFile, ToolName::ApplyPatch] {
+                        for args in &outside {
+                            let d = PolicyGate::new(&policy).evaluate(&request(tool, args.clone()), &root, &policy);
+                            assert_eq!(
+                                d.decision,
+                                Decision::Deny,
+                                "{tool:?} {args} — writes={writes}에서 워크스페이스 밖 쓰기가 막히지 않았습니다: {d:?}"
+                            );
+                        }
+                        // 대조군: 같은 도구, 워크스페이스 **안**.
+                        let inside = PolicyGate::new(&policy).evaluate(
+                            &request(tool, json!({ "path": "src/app.ts", "content": "x" })),
+                            &root,
+                            &policy,
+                        );
+                        if writes {
+                            assert_eq!(inside.decision, Decision::AutoApprove, "{inside:?}");
+                            auto_approved_inside += 1;
+                        } else {
+                            assert!(inside.requires_user_approval, "{inside:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(auto_approved_inside > 0, "대조군이 한 번도 자동 승인되지 않았습니다 — 위 단언이 공허합니다");
     }
 
     /// **어떤 정책으로도 자동 허용이 되지 않는다.**

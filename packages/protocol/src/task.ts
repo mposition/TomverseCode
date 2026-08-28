@@ -25,6 +25,20 @@ export interface TaskRequest {
    * "그럼 해 줘"이기 때문이다.
    */
   kind?: "change" | "question" | "plan";
+  /**
+   * 이 실행이 **어느 정지에서 이어졌는가** (state-machine 62절).
+   *
+   * # 왜 "재개"가 아니라 링크인가
+   *
+   * 무인 정지는 `FAILED`로 끝나고 그 시점의 초안·검수·계획은 sidecar의 메모리에 있었다 —
+   * 프로세스가 끝나면 사라진다. **재개할 상태가 없으므로** 이어서 도는 것은 새 태스크이고,
+   * 여기 담기는 것은 그 사실을 감사 기록이 답할 수 있게 하는 **연결**뿐이다.
+   *
+   * 이 값이 있어도 우리는 앞선 태스크의 무엇도 이 태스크의 근거로 쓰지 않는다. 쓰면
+   * "재개했다"는 주장이 성립하는 것처럼 보이고, 그건 27절이 세션 메모리에 대해 막은 것과
+   * 같은 종류의 미끄러짐이다(나른 것은 이 태스크의 기준이 아니다).
+   */
+  followsUp?: string;
   createdAt: ISODateTime;
 }
 
@@ -46,6 +60,15 @@ export interface TaskLoopLimits {
    * 곱셈을 걸지 않는다.
    */
   mcpRounds: number; // 기본 1
+  /**
+   * 질문·계획 경로가 **모델이 요청한 파일을 읽고 다시 묻는** 라운드 수 (state-machine 57절).
+   * 기본 1.
+   *
+   * `mcpRounds`와 같은 이유로 1이다: 라운드마다 답 하나가 버려지므로 비용과 지연이 라운드
+   * 수만큼 늘고, **이 기능의 이득은 아직 측정되지 않았다.** 측정되지 않은 이득에 곱셈을
+   * 걸지 않는다.
+   */
+  contextRounds: number; // 기본 1
 }
 
 export const DEFAULT_LOOP_LIMITS: TaskLoopLimits = {
@@ -55,6 +78,7 @@ export const DEFAULT_LOOP_LIMITS: TaskLoopLimits = {
   toolRetries: 2,
   providerRetries: 3,
   mcpRounds: 1,
+  contextRounds: 1,
 };
 
 /**
@@ -270,6 +294,8 @@ export interface TaskCounters {
   fixLoopRounds: number;
   /** 초안의 요청으로 MCP 도구를 실행한 라운드 수 (state-machine 31절). */
   mcpRounds: number;
+  /** 모델의 요청으로 파일을 더 읽고 다시 물은 라운드 수 (state-machine 57절). */
+  contextRounds: number;
   toolRetries: Record<string, number>;
   providerRetries: Record<string, number>;
 }
@@ -288,6 +314,14 @@ export type FailureReason =
   | "revise_exhausted"
   | "fix_loop_exhausted"
   | "tool_retry_exhausted"
+  /**
+   * 도구가 실패했고 **재시도할 값어치가 없었다** (state-machine 65절).
+   *
+   * `tool_retry_exhausted`와 뭉개지 않는다: 저쪽은 여러 번 해 봤는데 안 된 것이고 이쪽은
+   * 한 번 만에 "다시 해도 같다"를 안 것이다. 사용자가 할 일도 다르다 — 저쪽은 대개
+   * 기다리거나 다시 돌리면 되고, 이쪽은 **먼저 무언가를 고쳐야 한다.**
+   */
+  | "tool_failed_permanently"
   | "provider_retry_exhausted"
   | "provider_config_error"
   | "app_restart_interrupted"

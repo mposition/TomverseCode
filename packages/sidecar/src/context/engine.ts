@@ -1,4 +1,5 @@
 import type {
+  CoverageNote,
   DependencyEdge,
   DetectedCommand,
   ModelId,
@@ -32,7 +33,7 @@ import type { GrammarSet } from "./treeSitter.js";
  *  - `WorkspaceIndex`: **세션 스코프**. 파일 트리 + 프로젝트 메타. 비싼 작업을 여기서 1회.
  *  - `WorkspaceSnapshot`: **태스크 스코프**. 인덱스에서 관련 파일을 고르고 예산에 맞춰 패키징.
  *
- * **심볼 그래프가 생겼다**(16절). `symbols`/`dependencyEdges`를 Tree-sitter가 채우므로
+ * **심볼 그래프가 생겼다**(22절). `symbols`/`dependencyEdges`를 Tree-sitter가 채우므로
  * `symbol-match`(정의가 여기 있다)와 `dependency`(1~2홉 import 이웃) 선정이 실제로 동작한다.
  * 두 타입을 분리해 둔 덕분에 그 층을 채우면서 스냅샷 생성 쪽 **계약은 바뀌지 않았다.**
  *
@@ -86,7 +87,14 @@ interface Candidate {
 /** 본문 검색을 돌릴 키워드 수 상한 (원칙 5). 검색은 저장소 크기에 비례한다. */
 const MAX_SEARCHED_KEYWORDS = 4;
 /** 키워드 하나가 넣을 수 있는 후보 수 상한. 흔한 이름 하나가 예산을 다 먹는 것을 막는다. */
-const MAX_MATCHES_PER_KEYWORD = 3;
+/**
+ * 키워드 하나가 후보로 올릴 수 있는 파일 수의 상한.
+ *
+ * **내보내는 이유는 fake와의 관계를 테스트가 확인해야 하기 때문이다**(21절). fake의 검색
+ * 상한이 이 값보다 크지 않으면 이 상한에 걸리는 경로가 fake로는 **도달 불가능**해지고,
+ * 그러면 그 경로의 코드를 지워도 아무 검사도 실패하지 않는다. 실제로 둘 다 3이라 그랬다.
+ */
+export const MAX_MATCHES_PER_KEYWORD = 3;
 
 /**
  * "정의처럼 보이는 자리"의 앞부분.
@@ -233,14 +241,14 @@ export class ContextEngine {
     }
 
     const startedAt = Date.now();
-    const entries = await bridge.listFiles(".");
+    const listing = await bridge.listFiles(".");
     // porcelain을 한 번만 읽는다 — 증분 판정(어떤 파일이 더러운가)과 인덱스 지문이 같은
     // 출력을 쓰므로, 두 번 부르면 그 사이에 바뀐 상태로 서로 다른 답을 낼 수 있다.
     const porcelain = (await bridge.gitStatus().catch(() => ({ stdout: "", exitCode: null }))).stdout;
     const scanned: { path: string; language: string | null; sizeBytes: number }[] = [];
     const excluded: { path: string; reason: string }[] = [];
 
-    for (const entry of entries) {
+    for (const entry of listing.entries) {
       if (entry.isDir) continue;
       if (scanned.length >= this.maxIndexedFiles) {
         excluded.push({ path: entry.path, reason: `인덱싱 상한(${this.maxIndexedFiles}개) 초과` });
@@ -329,6 +337,10 @@ export class ContextEngine {
       projectMeta,
       excluded,
       symbolIndex: recountReport(graph.report, fileTree),
+      // **잘린 목록으로 만든 인덱스라는 사실이 인덱스에 남아야 한다**(18절). 스냅샷을 만들
+      // 때 다시 물을 수 없기 때문이다 — 인덱스는 캐시에서 올 수 있고, 그때는 `list_files`를
+      // 부르지도 않는다.
+      listingTruncated: listing.truncated,
       builtAt: incremental ? incremental.previous.builtAt : now,
       lastIncrementalUpdateAt: now,
     };
@@ -379,12 +391,28 @@ export class ContextEngine {
 
     // 명시 지목됐지만 제외 규칙에 걸린 파일은 사용자에게 알린다 (7절 마지막 문단).
     const excludedNotes = this.notesForMentionedButExcluded(index, input.userMessage);
+    // **파일에 대한 노트와 따로 모은다**(17절). 검색이 못 본 범위는 파일이 아니고, 같은
+    // 목록에 넣으면 `(search: foo)`가 파일 이름으로 프롬프트와 화면에 나간다.
+    const coverageNotes: CoverageNote[] = [];
+    // **인덱스가 전부를 봤는지 말한다**(18절). 이 노트가 없으면 잘린 목록으로 만든 인덱스와
+    // 온전한 인덱스가 프롬프트에서도 화면에서도 **똑같아 보인다** — 그리고 인덱스는
+    // 캐시되므로 그 침묵이 다음 태스크들로 이어진다.
+    const listingNote = listingCoverageNote(index.listingTruncated);
+    if (listingNote) coverageNotes.push(listingNote);
     // **grammar를 못 실었다는 사실은 침묵하면 안 된다.** 폴백(ripgrep)이 있으므로 태스크는
     // 정상으로 보이는데, 실제로는 `symbol-match`/`dependency`가 통째로 빠진 채 돈다.
-    // 스냅샷에 남겨야 화면과 프롬프트가 그 사실을 말할 수 있다(16절).
-    excludedNotes.push(...grammarNotes(index));
+    // 스냅샷에 남겨야 화면과 프롬프트가 그 사실을 말할 수 있다(22절).
+    //
+    // **커버리지 노트다 — 파일 노트가 아니다**(17절). 아래 `grammarNotes` 머리말 참조.
+    coverageNotes.push(...grammarNotes(index));
 
-    const candidates = await this.selectRelevantFiles(bridge, index, input.userMessage, excludedNotes);
+    const candidates = await this.selectRelevantFiles(
+      bridge,
+      index,
+      input.userMessage,
+      excludedNotes,
+      coverageNotes
+    );
 
     // 기본값은 **비용 추정과 같은 상수**를 읽는다. 여기에 숫자를 직접 적으면 예산 원장의
     // 보수적 추정이 실제 요청과 조용히 어긋난다 — 예약이 실제 청구를 감당하지 못하는 상태다.
@@ -417,6 +445,8 @@ export class ContextEngine {
       excludedNotes.push({ path: dropped.path, reason: dropped.reason });
     }
 
+    const folded = foldCoverageNotes(coverageNotes);
+
     return {
       snapshotId: `snap-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       workspaceId: input.workspaceId,
@@ -428,6 +458,9 @@ export class ContextEngine {
       projectMeta: index.projectMeta,
       tokenBudget: input.tokenBudgets.map((b) => ({ modelId: b.modelId as ModelId, maxTokens: b.maxTokens })),
       excludedNotes: excludedNotes.length > 0 ? excludedNotes : undefined,
+      // **한 자리에서 접는다**(21절). 노트를 만드는 곳은 여럿이고 앞으로 더 늘어난다 —
+      // 만드는 쪽마다 "이미 있나"를 묻게 하면 새 생산자가 그 물음을 빠뜨린다.
+      coverageNotes: folded.length > 0 ? folded : undefined,
       createdAt: new Date().toISOString(),
     };
   }
@@ -698,7 +731,8 @@ export class ContextEngine {
     bridge: ToolBridge,
     index: WorkspaceIndex,
     userMessage: string,
-    notes: { path: string; reason: string }[]
+    notes: { path: string; reason: string }[],
+    coverage: CoverageNote[]
   ): Promise<Candidate[]> {
     const selected = new Map<string, Candidate>();
 
@@ -756,7 +790,7 @@ export class ContextEngine {
       }
     }
 
-    // 4) **심볼 테이블을 본다** — 4절 `symbol-match`, 16절.
+    // 4) **심볼 테이블을 본다** — 4절 `symbol-match`, 22절.
     //
     //    여기까지는 파일 **이름**만 봤다. 심볼 인덱스는 "이 식별자의 정의가 여기 있다"를
     //    파서가 아는 근거이고, 그래서 다음 단계(정규식 본문 검색)보다 강하다 — 정규식은
@@ -775,9 +809,9 @@ export class ContextEngine {
     //
     //    `search_text` 도구는 처음부터 있었고 Rust가 구현하고 있었는데 **선정이 한 번도 부르지
     //    않았다.** 문은 있고 길이 없었다.
-    await this.addContentMatches(bridge, index, keywords, add, notes);
+    await this.addContentMatches(bridge, index, keywords, add, coverage);
 
-    // 6) **의존성을 1~2홉 따라간다** — 4절 `dependency`, 16절.
+    // 6) **의존성을 1~2홉 따라간다** — 4절 `dependency`, 22절.
     //
     //    지금까지 고른 파일이 import하는 것들이다. 4절이 적은 대로 "타입 정의, 유틸 등
     //    컴파일에 필요한 주변 맥락"이며, 직접 매치가 없으므로 우선순위는 가장 뒤다.
@@ -810,7 +844,7 @@ export class ContextEngine {
   }
 
   /**
-   * 심볼 테이블에서 후보를 더한다 — 4절 `symbol-match`, 16절.
+   * 심볼 테이블에서 후보를 더한다 — 4절 `symbol-match`, 22절.
    *
    * # 왜 `mentioned`보다 뒤인가
    *
@@ -867,7 +901,7 @@ export class ContextEngine {
     index: WorkspaceIndex,
     keywords: string[],
     add: (path: string, reason: RelevanceReason, reasonDetail: string, anchorLines?: number[]) => void,
-    notes: { path: string; reason: string }[]
+    coverage: CoverageNote[]
   ): Promise<void> {
     const indexed = new Set(index.fileTree.map((f) => f.path));
 
@@ -885,23 +919,75 @@ export class ContextEngine {
       ];
 
       for (const attempt of attempts) {
-        let hits: { path: string; line: number }[];
+        let found: Awaited<ReturnType<ToolBridge["searchText"]>>;
         try {
-          hits = await bridge.searchText(attempt.pattern);
+          found = await bridge.searchText(attempt.pattern);
         } catch (error) {
           // **실패를 "없음"으로 읽지 않는다.** 읽지 못한 것과 없는 것은 다른 사실이고,
           // 뭉개면 컨텍스트가 조용히 좁아진 채 모델이 불린다.
-          notes.push({
-            path: `(search: ${keyword})`,
-            reason: `본문 검색이 실패해 이 키워드로는 후보를 찾지 못했습니다: ${String(error)}`,
+          coverage.push({
+            kind: "search_failed",
+            scope: `본문 검색: ${keyword}`,
+            reason: `검색이 실패해 이 키워드로는 후보를 찾지 못했습니다: ${String(error)}`,
           });
           break;
         }
 
-        // **인덱스에 있는 파일만 받는다.** 검색은 제외 규칙(비밀값·크기·gitignore)을 우리와
-        // 똑같이 적용하지 않으므로, 여기서 거르지 않으면 제외했던 파일이 옆문으로 들어온다.
-        const paths = [...new Set(hits.map((h) => h.path))].filter((p) => indexed.has(p));
+        const hits = found.matches;
+
+        // **검색이 못 본 것을 기록한다**(58절). 실제 도구는 비밀값 파일을 읽기 전에 건너뛰고
+        // 그 개수를 돌려주는데, 종전에는 그 값을 아무도 읽지 않았다 — 그래서 "검색했는데
+        // 없다"와 "검색하지 않았다"가 호출부에서 같은 빈 배열이었다.
+        //
+        // 13절이 검색 **실패**를 "없음"으로 읽지 않게 만든 것과 같은 규율이고, 이쪽은
+        // **일부러 안 본** 경우다.
+        if (found.skippedSecretFiles !== null && found.skippedSecretFiles > 0) {
+          coverage.push({
+            kind: "search_secret_skipped",
+            scope: `본문 검색: ${keyword}`,
+            reason: `비밀값 파일 ${found.skippedSecretFiles}개는 검색하지 않았습니다 — 거기 있었다면 찾지 못했습니다.`,
+          });
+        }
+        // **`null`은 "잘리지 않았다"가 아니다**(18절). 모르는 것을 낙관으로 접지 않는다.
+        if (found.truncated !== false) {
+          coverage.push({
+            // **두 사실을 한 종류로 뭉개지 않는다**(19절). 문장이 다르면 종류도 달라야 한다 —
+            // 같은 칸에 세면 "상한을 올려라"와 "호스트를 고쳐라"가 한 숫자가 된다.
+            kind: found.truncated === true ? "search_truncated" : "search_unknown",
+            scope: `본문 검색: ${keyword}`,
+            reason:
+              found.truncated === true
+                ? "검색 결과가 상한에서 잘렸습니다 — 이 키워드로 찾은 것이 전부가 아닙니다."
+                : "검색 결과가 전부인지 호스트가 말하지 않았습니다 — 전부라고 가정할 수 없습니다.",
+          });
+        }
+
+        // **인덱스에 있는 파일만 받는다.** 검색은 우리 제외 규칙(크기 상한, 하드 제외 목록)을
+        // 적용하지 않으므로, 여기서 거르지 않으면 제외했던 파일이 옆문으로 들어온다.
+        // (gitignore는 20절 이후 양쪽이 같다 — 그래서 여기서 걸리는 것은 우리 규칙뿐이다.)
+        const unique = [...new Set(hits.map((h) => h.path))];
+        const paths = unique.filter((p) => indexed.has(p));
+        // **버린 것을 말한다**(21절). 검색이 맞혔는데 후보로 올리지 않았다는 것은
+        // "검색했는데 없다"와 다른 사실이고, 종전에는 그 차이가 호출부에서 빈 배열 하나로
+        // 뭉개졌다 — 16절이 `skippedSecretFiles`에서 본 것과 같은 모양이 한 칸 옆에 있었다.
+        const notIndexed = unique.length - paths.length;
+        if (notIndexed > 0) {
+          coverage.push({
+            kind: "search_hit_not_indexed",
+            scope: `본문 검색: ${keyword}`,
+            reason: `검색이 맞힌 파일 ${notIndexed}개는 인덱스에 없어 후보로 올리지 않았습니다 — 제외 규칙(크기·기본 제외 목록)에 걸린 파일입니다.`,
+          });
+        }
         if (paths.length === 0) continue;
+        // **상한에서 버린 것도 말한다**(21절). 상한이 3이므로 흔한 이름 하나면 바로 걸리는데,
+        // 종전에는 그 사실이 어디에도 남지 않아 "이 키워드로 찾은 것은 셋뿐"으로 읽혔다.
+        if (paths.length > MAX_MATCHES_PER_KEYWORD) {
+          coverage.push({
+            kind: "search_hits_capped",
+            scope: `본문 검색: ${keyword}`,
+            reason: `이 키워드가 맞힌 파일 ${paths.length}개 중 ${MAX_MATCHES_PER_KEYWORD}개만 후보로 올렸습니다 — 나머지는 보지 않았습니다.`,
+          });
+        }
         for (const path of paths.slice(0, MAX_MATCHES_PER_KEYWORD)) {
           // **줄 번호를 함께 나른다**(14절). 잘라 넣어야 할 때 어디를 남길지가 여기 걸려 있다 —
           // 없으면 앞에서부터 자르고, 파일 뒤쪽에 있는 정의는 찾아 놓고도 잘려 나간다.
@@ -1088,28 +1174,37 @@ export function extractKeywords(message: string): string[] {
 }
 
 /**
- * grammar 적재 실패를 스냅샷에 남긴다 — 16절.
+ * grammar 적재 실패를 스냅샷에 남긴다 — 22절.
  *
  * **그 언어의 파일이 실제로 있을 때만 적는다.** Python이 한 줄도 없는 저장소에서 "python
  * grammar를 못 실었습니다"는 사용자가 할 일이 없는 잡음이고, 잡음이 섞이면 정작 읽어야 할
  * 줄이 안 읽힌다.
+ *
+ * # 왜 `CoverageNote`인가 (17절)
+ *
+ * 이건 **파일이 아니라 범위**다. 종전에는 `excludedNotes`에 `path: "(symbol-index: python)"`로
+ * 들어갔는데, 그 목록은 프롬프트와 화면에서 **파일 이름으로 읽히는** 자리다 — 17절이 검색
+ * 노트에 대해 고친 것과 **글자 그대로 같은 결함**이고, 이 자리는 그 뒤에 갈라진 브랜치에서
+ * 새로 생겼다. 병합에서야 나란히 놓여 보였다: 한쪽 브랜치만 읽으면 각각은 옳아 보인다.
+ * 판정 기준을 사람이 아니라 종류 목록(`COVERAGE_NOTE_KINDS`)이 들고 있는 이유가 이것이다.
  */
-function grammarNotes(index: WorkspaceIndex): { path: string; reason: string }[] {
+function grammarNotes(index: WorkspaceIndex): CoverageNote[] {
   const affected = new Set(
     index.fileTree.filter((f) => f.symbolStatus === "grammar-unavailable").map((f) => f.language)
   );
   return index.symbolIndex.languages
     .filter((entry) => !entry.loaded && affected.has(entry.language))
     .map((entry) => ({
-      path: `(symbol-index: ${entry.language})`,
+      scope: `심볼 인덱스: ${entry.language}`,
       reason:
         `Tree-sitter ${entry.language} grammar를 싣지 못해 이 언어의 심볼/의존성 선정이 빠졌습니다` +
         ` — 본문 검색(ripgrep) 폴백만 동작합니다: ${entry.error ?? "사유 미상"}`,
+      kind: "symbol_grammar_unavailable" as const,
     }));
 }
 
 /**
- * 이미 고른 파일들이 **import하는** 파일을 더한다 — 4절 `dependency`, 16절.
+ * 이미 고른 파일들이 **import하는** 파일을 더한다 — 4절 `dependency`, 22절.
  *
  * # 씨앗은 직접 매치된 파일뿐이다
  *
@@ -1274,4 +1369,71 @@ function hashString(input: string): string {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36);
+}
+
+/**
+ * 인덱스가 **전부를 봤는지**에 대한 범위 노트 — context-engine 18절.
+ *
+ * 세 값이 세 문장이다. `false`만 침묵이고, `null`은 침묵이 아니다 — "말하지 않았다"를
+ * "안 잘렸다"로 접으면 우리가 모르는 것을 안다고 주장하게 된다(16절의 `null` vs `0` 규칙).
+ */
+export function listingCoverageNote(truncated: boolean | null | undefined): CoverageNote | null {
+  if (truncated === false) return null;
+  if (truncated === true) {
+    return {
+      kind: "listing_truncated",
+      scope: "파일 목록",
+      reason:
+        "워크스페이스 파일 목록이 호스트 상한에서 잘렸습니다 — 여기 없는 파일이 저장소에 있을 수 있습니다.",
+    };
+  }
+  return {
+    kind: "listing_unknown",
+    scope: "파일 목록",
+    reason: "파일 목록이 전부인지 호스트가 말하지 않았습니다 — 전부라고 가정할 수 없습니다.",
+  };
+}
+
+/**
+ * 범위 노트를 **똑같은 것끼리** 접는다 — context-engine 21절.
+ *
+ * # 왜 생기는가
+ *
+ * 키워드 하나에 검색 시도가 둘이다(정의 모양 → 아무 등장). 첫 시도가 인덱스에 있는 파일을
+ * 하나도 못 집으면 둘째 시도가 이어 돌고, **두 시도가 같은 워크스페이스를 훑으므로 같은
+ * 사실을 두 번 보고한다.** 실측으로 `비밀값 파일 1개는 검색하지 않았습니다`가 글자까지
+ * 똑같이 둘 나왔다.
+ *
+ * 파일 노트에는 경로당 하나로 접는 장치가 있었지만(`byPathNote`) 범위 쪽에는 없었다.
+ *
+ * # "같은 것"을 무엇으로 볼 것인가
+ *
+ * 17.5절은 이 결정을 어렵게 봤다 — *"`scope`가 같으면 접는 것이 자연스럽지만, '비밀값 3개를
+ * 건너뜀'과 '상한에서 잘림'은 같은 `scope`의 다른 사실이다."*
+ *
+ * **세 값이 모두 같을 때만 접는다**(`kind`·`scope`·`reason`). 그러면 그 걱정이 사라진다:
+ * 종류가 다르면 남고, 종류가 같아도 문장이 다르면 남는다. 접히는 것은 **글자까지 같은 중복**
+ * 뿐이고, 그건 정의상 사용자에게 새 사실이 아니다.
+ *
+ * 개수를 합치지 않는 이유도 같다. 두 시도가 각각 "비밀값 1개"를 보고했다고 2개를 건너뛴 것이
+ * 아니다 — **같은 파일을 두 번 지나친 것**이다. 합치면 없는 숫자가 생긴다.
+ *
+ * # 순서는 유지한다
+ *
+ * 노트는 프롬프트와 화면에 나온 순서대로 읽힌다. 목록 노트가 먼저, 검색 노트가 키워드
+ * 순서대로 오는 것이 지금의 배치이고, 접는 일이 그 배치를 바꾸면 안 된다.
+ */
+export function foldCoverageNotes(notes: CoverageNote[]): CoverageNote[] {
+  const seen = new Set<string>();
+  const folded: CoverageNote[] = [];
+  for (const note of notes) {
+    // 구분자는 사용자 문장에 나올 수 없는 값이어야 한다 — 공백으로 이으면 서로 다른 세 값이
+    // 우연히 같은 키가 될 수 있다. 소스에 리터럴 NUL을 박으면 그 파일이 grep에서 통째로
+    // 사라지므로 이스케이프로 쓴다(CLAUDE.md 함정 기록).
+    const key = [note.kind ?? "", note.scope, note.reason].join("\u0000");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    folded.push(note);
+  }
+  return folded;
 }

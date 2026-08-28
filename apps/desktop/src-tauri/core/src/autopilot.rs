@@ -40,7 +40,9 @@ pub struct Probe {
     pub tool: ToolName,
     /// 사람이 읽는 라벨. **무엇을 물었는지**가 답보다 먼저 보여야 한다.
     pub label: &'static str,
-    pub args: fn() -> Value,
+    /// **값이지 클로저가 아니다**(64절). 등록된 MCP 서버 이름처럼 목록을 만드는 시점에만
+    /// 아는 값이 인자에 들어가므로, `fn() -> Value`로는 담을 수 없다.
+    pub args: Value,
 }
 
 /// 탐침 하나에 대한 답.
@@ -114,68 +116,94 @@ const SECRET: &str = ".env";
 /// **이건 손으로 적은 목록이다.** 그래서 `ToolName`에 변형이 늘면 낡을 수 있고, 낡으면 새
 /// 도구는 미리보기에서 **그냥 사라진다** — 사용자는 그것을 "무인에서 아무 일도 안 한다"로
 /// 읽는다. 그래서 `every_tool_has_a_probe`가 `ALL_TOOLS`에서 유도해 대조한다.
-pub fn probes() -> Vec<Probe> {
-    vec![
-        Probe { tool: ToolName::ListFiles, label: "파일 목록 보기", args: || json!({ "path": "." }) },
-        Probe { tool: ToolName::SearchText, label: "본문 검색", args: || json!({ "query": "TODO" }) },
-        Probe { tool: ToolName::ReadFile, label: "워크스페이스 안의 파일 읽기", args: || json!({ "path": "." }) },
+///
+/// # 등록을 받는 이유 (64절)
+///
+/// `mcp_call`은 **등록 여부에 따라 판정이 갈리는 유일한 도구**다: 등록 밖이면 묻지 않고
+/// 거부하고(32절), 등록 안이면 언제나 승인을 요구한다(23.3절). 그런데 탐침이
+/// `server: "any"` 하나뿐이던 동안 미리보기는 **언제나 전자만** 보고했다 — 서버를 등록해 둔
+/// 사용자에게는 틀린 규칙 이름이고, 48.2절이 호스트에 미리보기를 둔 이유(등록된 풀이 거기
+/// 있다)가 아무것도 회수하지 못하고 있었다.
+///
+/// 그래서 `.env`/보통 파일을 둘로 나눈 것과 **같은 처리**를 한다: 갈리는 자리에는 탐침을 둘
+/// 둔다. 등록이 없으면 둘째 탐침을 만들 수 없으므로 목록에 넣지 않는다 — 없는 서버 이름을
+/// 지어내면 그 탐침은 "등록 밖 거부"가 되어 첫째와 구별되지 않는다.
+pub fn probes(registration: Option<crate::mcp::Registration<'_>>) -> Vec<Probe> {
+    let mut list = vec![
+        Probe { tool: ToolName::ListFiles, label: "파일 목록 보기", args: json!({ "path": "." }) },
+        Probe { tool: ToolName::SearchText, label: "본문 검색", args: json!({ "query": "TODO" }) },
+        Probe { tool: ToolName::ReadFile, label: "워크스페이스 안의 파일 읽기", args: json!({ "path": "." }) },
         Probe {
             tool: ToolName::ApplyPatch,
             label: "소스 파일 고치기",
-            args: || json!({ "path": ORDINARY, "patch": "" }),
+            args: json!({ "path": ORDINARY, "patch": "" }),
         },
         Probe {
             tool: ToolName::ApplyPatch,
             label: "비밀값 파일 고치기",
-            args: || json!({ "path": SECRET, "patch": "" }),
+            args: json!({ "path": SECRET, "patch": "" }),
         },
         Probe {
             tool: ToolName::CreateFile,
             label: "새 파일 만들기",
-            args: || json!({ "path": ORDINARY, "content": "" }),
+            args: json!({ "path": ORDINARY, "content": "" }),
         },
         // 삭제·이동은 원본이 **있어야** 해석된다(`resolve_existing`). 워크스페이스 루트는
         // 반드시 있으므로 그것을 대상으로 묻는다 — 게이트는 디렉터리 여부를 보지 않고,
         // 여기서 알고 싶은 것은 "삭제라는 종류가 무인에서 어떻게 되는가"다.
-        Probe { tool: ToolName::DeleteFile, label: "파일 지우기", args: || json!({ "path": "." }) },
+        Probe { tool: ToolName::DeleteFile, label: "파일 지우기", args: json!({ "path": "." }) },
         Probe {
             tool: ToolName::MoveFile,
             label: "파일 옮기기",
-            args: || json!({ "from": ".", "to": ORDINARY }),
+            args: json!({ "from": ".", "to": ORDINARY }),
         },
         Probe {
             tool: ToolName::RunCommand,
             label: "allowlist에 있는 명령 실행",
-            args: || json!({ "program": "git", "args": ["status"], "cwd": "." }),
+            args: json!({ "program": "git", "args": ["status"], "cwd": "." }),
         },
         Probe {
             tool: ToolName::RunCommand,
             label: "allowlist에 없는 명령 실행",
-            args: || json!({ "program": "curl", "args": ["https://example.com"], "cwd": "." }),
+            args: json!({ "program": "curl", "args": ["https://example.com"], "cwd": "." }),
         },
         Probe {
             tool: ToolName::RunCommand,
             label: "git commit 만들기",
-            args: || json!({ "program": "git", "args": ["commit", "-m", "msg"], "cwd": "." }),
+            args: json!({ "program": "git", "args": ["commit", "-m", "msg"], "cwd": "." }),
         },
         Probe {
             tool: ToolName::RunTests,
             label: "프로젝트가 선언한 검증 명령 실행",
-            args: || json!({ "program": "npm", "args": ["test"], "cwd": "." }),
+            args: json!({ "program": "npm", "args": ["test"], "cwd": "." }),
         },
-        Probe { tool: ToolName::GitStatus, label: "git 상태 보기", args: || json!({}) },
-        Probe { tool: ToolName::GitDiff, label: "git diff 보기", args: || json!({}) },
+        Probe { tool: ToolName::GitStatus, label: "git 상태 보기", args: json!({}) },
+        Probe { tool: ToolName::GitDiff, label: "git diff 보기", args: json!({}) },
+        // **등록 밖의 서버를 부르는 쪽.** 등록이 하나도 없어도 이 답은 뜻이 있다 —
+        // "MCP는 무인에서 어떻게 되는가"의 답이 여기 있다.
         Probe {
             tool: ToolName::McpCall,
-            label: "MCP 도구 부르기",
-            args: || json!({ "server": "any", "tool": "any", "arguments": {} }),
+            label: "등록되지 않은 MCP 도구 부르기",
+            args: json!({ "server": "not-registered", "tool": "any", "arguments": {} }),
         },
         Probe {
             tool: ToolName::GitPush,
             label: "remote로 push",
-            args: || json!({ "remote": "origin", "branch": "main" }),
+            args: json!({ "remote": "origin", "branch": "main" }),
         },
-    ]
+    ];
+
+    // **등록된 서버가 있으면 그쪽도 묻는다**(64절). 결말은 어느 쪽이든 정지이지만 규칙
+    // 이름이 다르고, 화면은 규칙 이름을 보여준다 — 서버를 등록해 둔 사용자에게
+    // "등록 밖 거부"만 보이면 자기 등록이 무시된 것으로 읽힌다.
+    if let Some((server, tool)) = registration.as_ref().and_then(|r| r.probe_call()) {
+        list.push(Probe {
+            tool: ToolName::McpCall,
+            label: "등록된 MCP 도구 부르기",
+            args: json!({ "server": server, "tool": tool, "arguments": {} }),
+        });
+    }
+    list
 }
 
 /// 정책과 워크스페이스를 받아 **아무것도 쓰지 않고** 보고서를 만든다.
@@ -187,12 +215,14 @@ pub fn preview(root: &WorkspaceRoot, profile: &TaskProfile, hooks: &HookRegistry
     let mut stops = Vec::new();
     let mut denied = Vec::new();
 
-    for probe in probes() {
+    // **게이트가 아는 등록으로 탐침을 만든다**(64절). 풀 자체가 아니라 읽기 전용 뷰를
+    // 받으므로, 이 함수는 서버를 띄울 수 **없다** — 검사가 아니라 타입이 그것을 지킨다.
+    for probe in probes(profile.gate().mcp_registration()) {
         let request = ToolRequest {
             request_id: format!("preview-{}", probe.label),
             task_id: "preview".to_string(),
             tool: probe.tool,
-            args: (probe.args)(),
+            args: probe.args.clone(),
             risk_tier: None,
             requested_by: json!({ "role": "preview" }),
             created_at: None,
@@ -313,7 +343,7 @@ mod tests {
     #[test]
     fn every_tool_has_a_probe() {
         use crate::skills::ALL_TOOLS;
-        let probed: Vec<ToolName> = probes().iter().map(|p| p.tool).collect();
+        let probed: Vec<ToolName> = probes(None).iter().map(|p| p.tool).collect();
         let missing: Vec<&str> = ALL_TOOLS
             .iter()
             .filter(|t| !probed.contains(t))
@@ -326,9 +356,13 @@ mod tests {
     fn unattended_preview_reports_every_probe_exactly_once() {
         let dir = workspace_with_manifest();
         let policy = TaskPolicy { unattended: true, ..TaskPolicy::default() };
-        let p = preview(&root(dir.path()), &profile(dir.path(), policy), &HookRegistry::default());
+        let prof = profile(dir.path(), policy);
+        let p = preview(&root(dir.path()), &prof, &HookRegistry::default());
         let total = p.proceeds.len() + p.stops.len() + p.denied.len();
-        assert_eq!(total, probes().len(), "탐침 하나가 어느 칸에도 없거나 두 칸에 있습니다");
+        // **같은 등록으로 센다**(64절). `probes(None)`으로 세면 풀이 붙은 프로필에서 이 검사가
+        // 조용히 틀려진다 — 늘어난 탐침 하나가 "어느 칸에도 없다"로 읽힌다.
+        let expected = probes(prof.gate().mcp_registration()).len();
+        assert_eq!(total, expected, "탐침 하나가 어느 칸에도 없거나 두 칸에 있습니다");
     }
 
     /// **스위치를 켜면 실제로 달라진다.** 달라지지 않으면 우리가 광고한 플래그가 거짓이다.
@@ -358,6 +392,118 @@ mod tests {
             assert_eq!(stop.rerun_flag, None, "{}에 없는 플래그를 붙였습니다", stop.probe);
         }
         assert!(!p.human_only.is_empty(), "사람만 지날 수 있는 정지가 하나도 없습니다");
+    }
+
+    fn pool(name: &str, tools: Option<Vec<String>>) -> std::sync::Arc<crate::mcp::McpPool> {
+        std::sync::Arc::new(
+            crate::mcp::McpPool::new(vec![crate::mcp::McpServerConfig {
+                name: name.to_string(),
+                program: "node".to_string(),
+                args: vec!["server.js".to_string()],
+                env: Default::default(),
+                tools,
+            }])
+            .unwrap(),
+        )
+    }
+
+    /// **등록된 서버를 부르는 쪽도 묻는다** — 64절.
+    ///
+    /// 탐침이 `server: "any"` 하나뿐이던 동안 미리보기는 **언제나 "등록 밖 거부"** 를
+    /// 보고했다. 풀이 붙어 있어도 그랬다 — 묻는 서버 이름이 등록에 없었기 때문이다.
+    /// 그래서 48.2절이 미리보기를 호스트에 둔 이유("등록된 풀이 거기 있다")가 아무것도
+    /// 회수하지 못하고 있었다: 옮겨도 답이 같았다.
+    ///
+    /// 두 답이 **동시에** 나와야 한다. 등록 밖 호출이 거부된다는 사실(32절)과 등록된
+    /// 호출도 사람을 요구한다는 사실(23.3절)은 사용자가 다음에 할 일이 서로 다르다.
+    #[test]
+    fn a_registered_server_gets_its_own_probe_with_a_different_rule() {
+        let dir = workspace_with_manifest();
+        let policy = TaskPolicy { unattended: true, ..TaskPolicy::default() };
+        let profile = TaskProfile::with_mcp(&root(dir.path()), policy, Some(pool("notes", None)));
+        let p = preview(&root(dir.path()), &profile, &HookRegistry::default());
+
+        let all: Vec<&Permission> = p.stops.iter().chain(p.denied.iter()).collect();
+        let outside = all
+            .iter()
+            .find(|x| x.probe == "등록되지 않은 MCP 도구 부르기")
+            .expect("등록 밖 탐침이 없습니다");
+        let inside = all
+            .iter()
+            .find(|x| x.probe == "등록된 MCP 도구 부르기")
+            .expect("등록된 탐침이 없습니다 — 풀을 붙였는데 목록이 그대로입니다");
+
+        // **규칙 이름이 갈린다.** 갈리지 않으면 탐침을 둘 둔 뜻이 없다.
+        assert_ne!(outside.matched_rule, inside.matched_rule, "{outside:?} / {inside:?}");
+        assert_eq!(inside.matched_rule, "mcp_always_requires_approval", "{inside:?}");
+        assert_eq!(inside.decision, Decision::RequireUserApproval, "{inside:?}");
+        assert_eq!(outside.decision, Decision::Deny, "{outside:?}");
+
+        // 그리고 **둘 다 사람 없이 지나가지 않는다**(23.3절).
+        assert!(!p.proceeds.iter().any(|x| x.tool == "mcp_call"), "{:?}", p.proceeds);
+    }
+
+    /// **등록이 없으면 둘째 탐침을 지어내지 않는다** — 64절.
+    ///
+    /// 없는 서버 이름으로 만들면 그 탐침은 "등록 밖 거부"가 되어 첫째와 구별되지 않는다.
+    /// 같은 답을 두 줄로 보여주는 것은 정보가 아니라 잡음이고, 사용자는 등록이 있는 줄 안다.
+    #[test]
+    fn without_a_registration_there_is_only_the_outside_probe() {
+        let dir = workspace_with_manifest();
+        let policy = TaskPolicy { unattended: true, ..TaskPolicy::default() };
+        let p = preview(&root(dir.path()), &profile(dir.path(), policy), &HookRegistry::default());
+        let mcp: Vec<&str> = p
+            .stops
+            .iter()
+            .chain(p.denied.iter())
+            .filter(|x| x.tool == "mcp_call")
+            .map(|x| x.probe)
+            .collect();
+        assert_eq!(mcp, vec!["등록되지 않은 MCP 도구 부르기"], "{mcp:?}");
+    }
+
+    /// **도구 허용목록 안에서 고른다** — 64절.
+    ///
+    /// 목록 밖 이름으로 물으면 게이트가 `ToolNotAllowed`로 거부하고, 그러면 이 탐침은
+    /// 등록되지 않은 경우와 같은 답을 낸다 — 즉 등록을 반영한 것이 아니게 된다.
+    #[test]
+    fn the_registered_probe_stays_inside_the_tool_allowlist() {
+        let dir = workspace_with_manifest();
+        let policy = TaskPolicy { unattended: true, ..TaskPolicy::default() };
+        let profile = TaskProfile::with_mcp(
+            &root(dir.path()),
+            policy,
+            Some(pool("notes", Some(vec!["append".to_string()]))),
+        );
+        let p = preview(&root(dir.path()), &profile, &HookRegistry::default());
+        let inside = p
+            .stops
+            .iter()
+            .find(|x| x.probe == "등록된 MCP 도구 부르기")
+            .expect("등록된 탐침이 정지 목록에 없습니다");
+        assert_eq!(inside.matched_rule, "mcp_always_requires_approval", "{inside:?}");
+        assert!(
+            p.denied.iter().all(|x| x.probe != "등록된 MCP 도구 부르기"),
+            "허용목록 밖 이름으로 물어 거부됐습니다: {:?}",
+            p.denied
+        );
+        // **대조군**: 같은 서버의 허용목록 밖 이름은 거부된다. 이것이 없으면 위 단언은
+        // "게이트가 허용목록을 아예 안 본다"일 때도 통과한다.
+        let outside_the_allowlist = profile.gate().evaluate(
+            &ToolRequest {
+                request_id: "x".to_string(),
+                task_id: "preview".to_string(),
+                tool: ToolName::McpCall,
+                args: json!({ "server": "notes", "tool": "delete", "arguments": {} }),
+                risk_tier: None,
+                requested_by: json!({}),
+                created_at: None,
+                injected_env: Default::default(),
+            },
+            &root(dir.path()),
+            &profile.policy,
+        );
+        assert_eq!(outside_the_allowlist.decision, Decision::Deny, "{outside_the_allowlist:?}");
     }
 
     /// **MCP 도구는 어떤 설정으로도 무인으로 실행되지 않는다**(23.3절).
@@ -478,6 +624,112 @@ mod tests {
         }
         // **빈 집합에 대한 전칭 명제는 언제나 참이다.**
         assert!(seen_lever_does_not_free, "`leverDoesNotFree`가 붙은 정지가 하나도 없습니다");
+    }
+
+    /// **이 스위치가 넓히는 것은 되돌릴 수 있는 쓰기뿐이다** (63절).
+    ///
+    /// `--auto-approve-writes`를 화면에 올리기로 한 결정의 근거가 이것이다. 근거를 산문으로
+    /// 적어 두면 게이트가 바뀔 때 조용히 거짓이 되므로, **게이트에 물어서 세운다.**
+    ///
+    /// # 재는 것은 절대량이 아니라 **차이**다
+    ///
+    /// 처음에는 "무인에서 사람 없이 지나가는 것은 전부 되돌릴 수 있는 것"으로 적었는데
+    /// 그건 틀린 명제였다 — 스위치를 다 끈 기본 설정에서도 `git status`가 지나간다
+    /// (allowlist의 `auto` 규칙이고, 그건 **워크스페이스 정책**이 넓혀 둔 것이지 이 스위치가
+    /// 아니다). 절대량으로 재면 남의 결정을 이 스위치의 책임으로 세게 되고, 그 검사는
+    /// 언젠가 무관한 이유로 실패해 약해진다.
+    ///
+    /// 그래서 **같은 설정에서 이 스위치만 켜 보고 늘어난 것**을 본다. 늘어난 것이
+    /// `create_file`/`apply_patch`뿐이면 이 스위치가 넓힌 자리는 전부 `capture_pre_image`가
+    /// 이전 내용을 남기는 자리다(19절) — 되돌리기가 복원할 수 있다.
+    #[test]
+    fn the_write_switch_widens_nothing_but_undoable_writes() {
+        let dir = workspace_with_manifest();
+        let hooks = HookRegistry::default();
+        // **pre-image가 남는 쓰기 도구.** 이 목록이 늘면 `tools/mod.rs`의 `capture_pre_image`
+        // 호출도 함께 늘어야 한다 — 늘리지 않으면 되돌릴 수 없는 것이 여기 통과한다.
+        let undoable_writes = [ToolName::CreateFile.as_str(), ToolName::ApplyPatch.as_str()];
+        let mut total_newly_allowed = 0;
+
+        for commit in [false, true] {
+            for verification in [false, true] {
+                let base = TaskPolicy {
+                    unattended: true,
+                    allow_git_commit: commit,
+                    auto_approve_verification: verification,
+                    ..TaskPolicy::default()
+                };
+                let with_writes = TaskPolicy { auto_approve_workspace_writes: true, ..base.clone() };
+                let before = preview(&root(dir.path()), &profile(dir.path(), base), &hooks);
+                let after = preview(&root(dir.path()), &profile(dir.path(), with_writes), &hooks);
+
+                let was: Vec<&str> = before.proceeds.iter().map(|p| p.probe).collect();
+                for done in after.proceeds.iter().filter(|p| !was.contains(&p.probe)) {
+                    total_newly_allowed += 1;
+                    assert!(
+                        undoable_writes.contains(&done.tool.as_str()),
+                        "이 스위치가 되돌릴 수 없는 자리를 열었습니다: {} ({}) — commit={commit} verification={verification}",
+                        done.probe,
+                        done.tool
+                    );
+                }
+                // **켜서 좁아지는 일은 없어야 한다.** 좁아졌다면 위 차집합이 그 사실을
+                // 놓치므로, 반대 방향도 함께 본다.
+                let now: Vec<&str> = after.proceeds.iter().map(|p| p.probe).collect();
+                let lost: Vec<&str> = was.iter().copied().filter(|p| !now.contains(p)).collect();
+                assert!(lost.is_empty(), "스위치를 켰는데 지나가던 것이 막혔습니다: {lost:?}");
+            }
+        }
+        // **빈 집합에 대한 전칭 명제는 언제나 참이다.** 늘어난 것이 하나도 없다면 위 반복은
+        // 아무것도 검사하지 않았고, 그건 이 스위치가 아무 일도 하지 않는다는 뜻이기도 하다.
+        assert!(
+            total_newly_allowed > 0,
+            "이 스위치를 켜도 새로 지나가는 것이 없습니다 — 위 단언이 공허합니다"
+        );
+    }
+
+    /// **되돌리기가 비싸지는 자리는 어떤 조합으로도 사람 없이 지나가지 않는다** (63절).
+    ///
+    /// 48.6절은 쓰기 자동 승인의 조건을 *"`git commit`이 꺼져 있어야 되돌리기가 싸다"* 로
+    /// 적고 **두 스위치의 조합이 결정의 대상**이라고 했다. 그런데 그 조건은 화면이 지킬
+    /// 것이 아니라 **게이트가 이미 지키고 있었다** — 47.6절이 찾아 둔 사실이 그것이다:
+    /// `--allow-git-commit`을 켜도 `git commit`은 무인에서 여전히 멈춘다.
+    ///
+    /// 그래서 화면에 두 스위치를 묶는 규칙을 만들지 않았다. 만들면 게이트가 가진 규칙의
+    /// **두 번째 사본**이 되고, 두 벌은 갈라진다(47절이 미리보기를 만든 이유와 같다).
+    /// 대신 그 사실을 여기서 고정한다.
+    #[test]
+    fn a_commit_never_proceeds_unattended_under_any_switch_combination() {
+        let dir = workspace_with_manifest();
+        let hooks = HookRegistry::default();
+        const COMMIT: &str = "git commit 만들기";
+        let mut seen = 0;
+
+        for writes in [false, true] {
+            for commit in [false, true] {
+                for verification in [false, true] {
+                    let policy = TaskPolicy {
+                        unattended: true,
+                        auto_approve_workspace_writes: writes,
+                        allow_git_commit: commit,
+                        auto_approve_verification: verification,
+                        ..TaskPolicy::default()
+                    };
+                    let p = preview(&root(dir.path()), &profile(dir.path(), policy), &hooks);
+                    assert!(
+                        !p.proceeds.iter().any(|x| x.probe == COMMIT),
+                        "writes={writes} commit={commit} verification={verification}에서 커밋이 사람 없이 지나갑니다"
+                    );
+                    // 탐침이 사라지면 위 단언은 공허해진다 — 어느 칸엔가는 있어야 한다.
+                    assert!(
+                        p.stops.iter().chain(p.denied.iter()).any(|x| x.probe == COMMIT),
+                        "커밋 탐침이 어느 칸에도 없습니다"
+                    );
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 8, "조합을 다 돌지 않았습니다");
     }
 
     /// **틀린 조언을 하나 찾았고, 그것을 지우지 않고 사실로 남긴다** (47.6절).

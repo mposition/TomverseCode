@@ -4,10 +4,10 @@ import type { ISODateTime, ModelId } from "./common.js";
 /**
  * 이 파일이 왜 골렸는가.
  *
- * # `symbol-match`와 `content-match`를 나눠 두는 이유 (context-engine 5·16절, state-machine 51절)
+ * # `symbol-match`와 `content-match`를 나눠 두는 이유 (context-engine 5·22절, state-machine 51절)
  *
  * `symbol-match`는 **심볼 그래프**가 있을 때의 근거다 — "이 식별자가 여기 정의돼 있다"를
- * Tree-sitter가 안다. 그 그래프는 16절에서 생겼고, 그래서 이 값은 이제 실제로 만들어진다.
+ * Tree-sitter가 안다. 그 그래프는 22절에서 생겼고, 그래서 이 값은 이제 실제로 만들어진다.
  *
  * `content-match`는 **본문 검색**이 찾은 것이다. 정의처럼 보이는 자리를 정규식으로 맞춘 것이라
  * 훨씬 약한 근거이고, 그 약함이 이름에 남아야 한다 — `symbol-match`로 적으면 화면과 감사
@@ -159,14 +159,93 @@ export interface WorkspaceSnapshot {
    * 말해야 한다(31.5절).
    */
   mcpResults?: { text: string; callCount: number };
+  /**
+   * **내용이 컨텍스트에 들어가지 않은 파일**과 그 사유.
+   *
+   * 경로와 사유는 프롬프트에 실린다 — 모델이 그 파일을 없다고 보고 내용을 추측하는 것을
+   * 막기 위해서다. 그러므로 여기 들어가는 `path`는 **실제 워크스페이스 경로여야 한다**:
+   * 파일이 아닌 것을 여기 넣으면 모델도 화면도 "그런 파일이 있다"고 읽는다(17절).
+   */
   excludedNotes?: { path: string; reason: string }[];
+  /**
+   * **우리가 보지 못한 영역** — context-engine.md 17절.
+   *
+   * `excludedNotes`와 다른 사실이다. 저쪽은 "이 파일의 내용을 넣지 않았다"이고 이쪽은
+   * "이 범위를 확인하지 못했으므로 여기 없다고 없는 것이 아니다"이다. 한동안 검색 쪽 노트가
+   * `excludedNotes`에 섞여 있었고, 그래서 `(search: foo)`가 **파일 이름으로** 프롬프트와
+   * 화면에 나갔다.
+   *
+   * `path`가 아니라 `scope`인 이유가 그것이다 — 이 값은 경로가 아니고, 경로인 척하면
+   * 읽는 쪽이 파일을 찾는다.
+   */
+  coverageNotes?: CoverageNote[];
   createdAt: ISODateTime;
+}
+
+/**
+ * 범위 노트의 **종류** — context-engine.md 19절.
+ *
+ * # 왜 문장 말고 값이 필요한가
+ *
+ * `reason`은 사람이 읽는 문장이라 집계의 열쇠가 될 수 없다. 문장으로 묶으면 표현을 다듬는
+ * 순간 계열이 갈라지고, **갈라진 계열은 "줄었다"로 읽힌다** — 잘못된 분모가 표본 부족보다
+ * 나쁘다는 규칙이 여기에도 그대로 적용된다.
+ *
+ * 그리고 종류마다 **할 일이 다르다**: 목록이 잘린 것은 상한 문제이고, 검색이 실패한 것은
+ * 도구 문제이며, 비밀값을 건너뛴 것은 고칠 것이 없는 정상 동작이다. 셋을 한 숫자로 세면
+ * 그 숫자로 할 수 있는 일이 없다.
+ *
+ * **배열이 정본이고 타입은 거기서 유도한다.** 둘을 따로 적으면 갈라지고, 갈라지면 런타임
+ * 검사가 타입에 없는 값을 통과시킨다.
+ */
+export const COVERAGE_NOTE_KINDS = [
+  /** 호스트의 파일 목록이 상한에서 잘렸다 (18절). */
+  "listing_truncated",
+  /** 목록이 전부인지 호스트가 말하지 않았다. **`listing_truncated`와 다른 사실이다.** */
+  "listing_unknown",
+  /** 본문 검색 호출 자체가 실패했다 (13절). */
+  "search_failed",
+  /** 검색이 비밀값 파일을 읽지 않고 건너뛰었다 (16절). */
+  "search_secret_skipped",
+  /** 검색 결과가 상한에서 잘렸다. */
+  "search_truncated",
+  /** 검색 결과가 전부인지 호스트가 말하지 않았다. */
+  "search_unknown",
+  /**
+   * 검색은 맞혔는데 **인덱스에 없어 후보로 올리지 않았다** (21절).
+   *
+   * `search_secret_skipped`와 다른 사실이다: 저쪽은 호스트가 읽지 않은 것이고 이쪽은
+   * 호스트가 읽어서 돌려줬는데 **우리가 버린** 것이다. 할 일도 다르다 — 저쪽은 그대로
+   * 두는 것이 맞고, 이쪽은 인덱스 제외 규칙을 볼 자리다.
+   */
+  "search_hit_not_indexed",
+  /** 한 키워드가 맞힌 파일이 상한보다 많아 뒤쪽을 버렸다 (21절). */
+  "search_hits_capped",
+  /**
+   * Tree-sitter grammar를 싣지 못해 그 언어의 심볼/의존성 선정이 빠졌다 (22절).
+   *
+   * **검색 계열과 할 일이 다르다.** 저쪽은 범위를 좁혀 답한 것이고 이쪽은 **층 하나가 통째로
+   * 빠진** 것이다 — 폴백(ripgrep)이 있어서 태스크는 정상으로 보이는데, `symbol-match`와
+   * `dependency`가 한 번도 후보를 올리지 못한다. 배포에 grammar가 빠졌는지 볼 자리다.
+   */
+  "symbol_grammar_unavailable",
+] as const;
+
+export type CoverageNoteKind = (typeof COVERAGE_NOTE_KINDS)[number];
+
+export interface CoverageNote {
+  /** 어느 범위인가. 사람이 읽는 이름이고 **경로가 아니다**(17절). */
+  scope: string;
+  /** 사람이 읽는 문장. **집계의 열쇠로 쓰지 않는다** — 다듬으면 계열이 갈라진다. */
+  reason: string;
+  /** 집계의 열쇠. 종류마다 할 일이 다르다(19절). */
+  kind: CoverageNoteKind;
 }
 
 // docs/design/context-engine.md 2절 — 세션 스코프로 유지되는 인덱스.
 // WorkspaceSnapshot과 달리 태스크 artifact가 아니며 SQLite workspace_index 테이블에 대응한다.
 //
-// `symbols`/`dependencyEdges`는 16절에서 채워졌다(Tree-sitter, MVP 3개 언어 — 9절).
+// `symbols`/`dependencyEdges`는 22절에서 채워졌다(Tree-sitter, MVP 3개 언어 — 9절).
 // 인터페이스를 WorkspaceSnapshot과 분리해 둔 덕분에 그 층을 채우면서 스냅샷 선택 로직의
 // **계약은 바뀌지 않았다** — 바뀐 것은 `relevantFiles[].reason`에 어떤 값이 나타나는가뿐이다.
 /**
@@ -242,6 +321,18 @@ export interface WorkspaceIndex {
   excluded: { path: string; reason: string }[];
   /** 심볼 인덱스 층이 무엇을 했는가 (context-engine.md 5절). */
   symbolIndex: SymbolIndexReport;
+  /**
+   * **호스트의 파일 목록이 상한에서 잘렸는가** — context-engine.md 18절.
+   *
+   * `excluded`와 다른 사실이다. 저쪽은 "봤고 일부러 뺐다"이고 이쪽은 **"보지도 못했다"**이다 —
+   * 잘린 뒤의 파일은 `fileTree`에도 `excluded`에도 없으므로, 이 값이 없으면 그 파일들은
+   * 어디에서도 언급되지 않는다.
+   *
+   * `null`/부재는 **"모른다"**이다(옛 호스트, 또는 이 필드가 생기기 전에 저장된 캐시).
+   * `false`로 접지 않는다 — 인덱스는 캐시에 저장되어 다음 태스크가 그대로 쓰므로, 여기서
+   * 한 번 접으면 그 거짓이 계속 재사용된다.
+   */
+  listingTruncated?: boolean | null;
   builtAt: ISODateTime;
   lastIncrementalUpdateAt: ISODateTime;
 }

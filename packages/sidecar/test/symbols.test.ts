@@ -20,7 +20,7 @@ import { ToolBridge } from "../src/tools/bridge.js";
 import { FakeHost } from "./helpers/fakeHost.js";
 
 /**
- * Tree-sitter 심볼/의존성 인덱스 — docs/design/context-engine.md 5·6·16절.
+ * Tree-sitter 심볼/의존성 인덱스 — docs/design/context-engine.md 5·6·22절.
  *
  * 이 파일이 지키는 것은 **그 층이 실제로 도는가**이지 "코드가 있는가"가 아니다. 그래서
  * 대부분의 검사가 진짜 grammar를 싣고 진짜 소스를 파싱한다 — fake로 심볼을 넣어 두면
@@ -404,10 +404,18 @@ test("grammar를 못 실으면 그 사실이 스냅샷에 남는다", async () =
     tokenBudgets: [{ modelId: "fake-executor", maxTokens: 50_000 }],
   });
 
-  const note = (snapshot.excludedNotes ?? []).find((n) => n.path.includes("symbol-index"));
-  assert.ok(note, `grammar 적재 실패가 어디에도 남지 않았습니다: ${JSON.stringify(snapshot.excludedNotes)}`);
+  // **`coverageNotes`다 — `excludedNotes`가 아니다**(17절). grammar를 못 실은 것은 파일이
+  // 아니라 **범위**이고, 파일 목록에 넣으면 `(symbol-index: python)`이 파일 이름으로
+  // 프롬프트와 화면에 나간다. 종전에는 그 자리에 있었다.
+  const note = (snapshot.coverageNotes ?? []).find((n) => n.kind === "symbol_grammar_unavailable");
+  assert.ok(note, `grammar 적재 실패가 어디에도 남지 않았습니다: ${JSON.stringify(snapshot.coverageNotes)}`);
   assert.match(note.reason, /grammar를 싣지 못해/);
   assert.match(note.reason, /테스트가 막았습니다/);
+  // 그리고 **파일 노트에는 없어야 한다.** 둘 다에 넣으면 옮긴 의미가 없다.
+  assert.ok(
+    !(snapshot.excludedNotes ?? []).some((n) => n.path.includes("symbol-index")),
+    JSON.stringify(snapshot.excludedNotes)
+  );
 
   // **빈 symbol-match를 만들어 "구현했다"고 보이게 하지 않는다.**
   assert.ok(!snapshot.relevantFiles.some((f) => f.reason === "symbol-match"));
@@ -430,7 +438,12 @@ test("그 언어의 파일이 없으면 grammar 실패를 알리지 않는다", 
     new ToolBridge(host.asTransport(), "task-1"),
     { workspaceId: "ws-1", userMessage: "무엇이든", tokenBudgets: [{ modelId: "fake-executor", maxTokens: 50_000 }] }
   );
-  assert.ok(!(snapshot.excludedNotes ?? []).some((n) => n.path.includes("symbol-index")));
+  // **노트가 옮겨 갔으므로 보는 자리도 옮긴다**(17절). 옛 자리를 그대로 보면 이 검사는
+  // 언제나 통과한다 — 실패할 수 없는 검사는 검사가 아니다.
+  assert.ok(
+    !(snapshot.coverageNotes ?? []).some((n) => n.kind === "symbol_grammar_unavailable"),
+    JSON.stringify(snapshot.coverageNotes)
+  );
 });
 
 // ---- 증분 갱신 (6절 표) ----

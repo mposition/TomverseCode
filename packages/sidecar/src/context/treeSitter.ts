@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import type { SymbolIndexReport } from "@tomverse/protocol";
 
 /**
- * Tree-sitter grammar 적재 — docs/design/context-engine.md 5·9·16절.
+ * Tree-sitter grammar 적재 — docs/design/context-engine.md 5·9·22절.
  *
  * # 왜 WASM인가 (되돌리기 비싼 결정)
  *
@@ -17,7 +17,7 @@ import type { SymbolIndexReport } from "@tomverse/protocol";
  *
  * 데스크톱 앱에 sidecar를 번들해 배포하는 제품에서 전자는 배포 실패 모드를 하나 더 만든다.
  * 그래서 **WASM을 쓴다.** 대가는 파싱 속도(네이티브보다 느리다)와 grammar 파일 크기(5개 약
- * 6.7MB)이고, 그 대가는 16절이 실측해서 적어 두었다.
+ * 6.7MB)이고, 그 대가는 22절이 실측해서 적어 두었다.
  *
  * # 버전을 고정한다 (rusqlite 0.37과 같은 이유)
  *

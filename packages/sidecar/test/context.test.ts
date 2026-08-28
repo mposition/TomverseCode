@@ -5,7 +5,10 @@ import {
   escapeRegExp,
   extractKeywords,
   extractMentions,
+  MAX_MATCHES_PER_KEYWORD,
   hasUncommittedChanges,
+  foldCoverageNotes,
+  listingCoverageNote,
   parseBranch,
   parseNpmScripts,
 } from "../src/context/engine.js";
@@ -16,10 +19,18 @@ import {
   truncateToTokens,
   windowAroundLines,
 } from "../src/context/budget.js";
-import { FakeHost } from "./helpers/fakeHost.js";
+import { FAKE_MAX_LIST_ENTRIES, FAKE_MAX_SEARCH_MATCHES, FakeHost } from "./helpers/fakeHost.js";
 import { ToolBridge } from "../src/tools/bridge.js";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import type { NdjsonTransport } from "../src/ipc/transport.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { makeRelevantFile, makeSnapshot } from "./helpers/fixtures.js";
-import { renderSnapshot } from "../src/providers/prompts.js";
+import { extractFileReferences } from "../src/verify/digest.js";
+import { snapshotPayload } from "../src/orchestrator/snapshotPayload.js";
+import { buildFixPrompt, digestSectionSizes, renderSnapshot } from "../src/providers/prompts.js";
 
 // ---- 제외 규칙 (secret / binary / 대용량) ----
 
@@ -693,7 +704,7 @@ test("본문 검색이 인덱스에서 제외된 파일을 되살리지 않는�
  * **검색 실패를 "없음"으로 읽지 않는다.** 읽지 못한 것과 없는 것은 다른 사실이고, 뭉개면
  * 컨텍스트가 조용히 좁아진 채 모델이 불린다.
  */
-test("본문 검색이 실패하면 그 사실이 제외 목록에 남는다", async () => {
+test("본문 검색이 실패하면 그 사실이 범위 노트에 남는다", async () => {
   const host = new FakeHost({
     files: [
       { path: "src/app.ts", isDir: false, sizeBytes: 40 },
@@ -710,8 +721,14 @@ test("본문 검색이 실패하면 그 사실이 제외 목록에 남는다", a
     tokenBudgets: [{ modelId: "fake-executor", maxTokens: 50_000 }],
   });
 
+  // **파일 노트가 아니다**(17절). 검색이 실패한 것은 파일의 성질이 아니라 우리 시야의 성질이고,
+  // 파일 목록에 넣으면 `(search: foo)`가 파일 이름으로 프롬프트와 화면에 나간다.
   assert.ok(
-    snapshot.excludedNotes?.some((n) => n.reason.includes("본문 검색이 실패")),
+    snapshot.coverageNotes?.some((n) => n.reason.includes("검색이 실패")),
+    JSON.stringify(snapshot.coverageNotes)
+  );
+  assert.ok(
+    !(snapshot.excludedNotes ?? []).some((n) => n.reason.includes("검색이 실패")),
     JSON.stringify(snapshot.excludedNotes)
   );
 });
@@ -965,6 +982,52 @@ test("전부 덮였으면 머리글에 그 문장이 없다", () => {
 });
 
 /**
+ * **모델에게도 두 사실을 갈라서 말한다** — context-engine 17절.
+ *
+ * 한동안 검색 쪽 노트가 `excludedNotes`에 섞여 있었고, 프롬프트는 그 목록을
+ * *"Files deliberately excluded from context"* 라는 제목 아래 내면서 *"필요하면 요청하라"*
+ * 고 덧붙였다. 그래서 모델이 읽은 것은 **`(search: foo)`라는 파일이 제외됐다**는 문장이었고,
+ * 있지도 않은 파일을 요청하라는 지시가 붙어 있었다.
+ *
+ * 두 문단은 하는 말이 다르다: 하나는 "이 파일의 내용을 넣지 않았다", 다른 하나는 "이 범위를
+ * 확인하지 못했으니 없다고 결론 내리지 말라"이다.
+ */
+test("프롬프트가 제외된 파일과 보지 못한 범위를 다른 문단으로 말한다", () => {
+  const rendered = renderSnapshot(
+    makeSnapshot({
+      excludedNotes: [{ path: ".env", reason: "비밀값 파일" }],
+      coverageNotes: [
+        { kind: "search_secret_skipped", scope: "본문 검색: resolveBudget", reason: "비밀값 파일 2개는 검색하지 않았습니다" },
+      ],
+    })
+  );
+
+  const excludedAt = rendered.indexOf("Files deliberately excluded");
+  const coverageAt = rendered.indexOf("did NOT cover");
+  assert.notEqual(excludedAt, -1, rendered);
+  assert.notEqual(coverageAt, -1, rendered);
+  assert.notEqual(excludedAt, coverageAt, "두 문단이 하나로 합쳐졌습니다");
+
+  // **파일 문단에 범위가 들어가지 않는다.** 이게 종전 상태다.
+  const excludedBlock = rendered.slice(excludedAt, coverageAt);
+  assert.ok(!excludedBlock.includes("본문 검색"), excludedBlock);
+  assert.ok(excludedBlock.includes(".env"), excludedBlock);
+
+  // 그리고 **지시문이 다르다.** "필요하면 요청하라"는 파일에만 붙는다.
+  const coverageBlock = rendered.slice(coverageAt);
+  assert.ok(excludedBlock.includes("ask instead"), excludedBlock);
+  assert.ok(!coverageBlock.includes("ask instead"), coverageBlock);
+  assert.match(coverageBlock, /not evidence of absence/);
+});
+
+/** 범위 노트가 없으면 **그 문단이 없다** — 언제나 붙으면 신호가 아니라 배경이 된다. */
+test("보지 못한 범위가 없으면 그 문단이 없다", () => {
+  const rendered = renderSnapshot(makeSnapshot({ excludedNotes: [{ path: ".env", reason: "비밀값 파일" }] }));
+  assert.ok(rendered.includes("Files deliberately excluded"), rendered);
+  assert.ok(!rendered.includes("did NOT cover"), rendered);
+});
+
+/**
  * **검색이 찾은 줄이 실제로 실린다** — context-engine 14절, 끝에서 끝까지.
  *
  * 위 단위 검사들은 `windowAroundLines`가 앵커를 존중한다는 것과 `packageFiles`가 범위를
@@ -1089,4 +1152,469 @@ test("여러 키워드가 같은 파일을 찾으면 앵커가 합쳐진다", as
   assert.ok(anchors.includes(521), `settleReservation의 줄이 없습니다: ${anchors.join(",")}`);
   assert.ok(ledger.anchorCoverage, "앵커 덮개가 없습니다");
   assert.equal(ledger.anchorCoverage.total, anchors.length);
+});
+
+// ---- 검색이 못 본 것 (state-machine 58절) ----
+
+/**
+ * **"검색했는데 없다"와 "검색하지 않았다"를 구별한다** — state-machine 58절.
+ *
+ * 실제 `search_text`는 비밀값 파일을 **읽기 전에** 건너뛰고 그 개수를 `skippedSecretFiles`로
+ * 돌려준다. `tools/mod.rs`의 주석이 그 값의 목적을 이렇게 적어 두었다:
+ * *"오케스트레이터가 '여기 없으니 없다'고 결론 내리는 것을 막고."*
+ *
+ * 그런데 **Node 쪽에서 그 값을 읽는 코드가 하나도 없었다.** 문은 있고 걸어 들어가는 길이
+ * 없는 자리이며, 13절이 검색 *실패*에 대해 세운 규율("실패를 없음으로 읽지 않는다")이
+ * *일부러 안 본* 경우에는 서 있지 않았던 것이다.
+ */
+test("검색이 건너뛴 비밀값 파일이 스냅샷 노트에 남는다", async () => {
+  const host = new FakeHost({
+    files: [
+      { path: "src/ledger.ts", isDir: false, sizeBytes: 40 },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+      // **인덱스에도 올린다.** 인덱스가 secret으로 제외하므로 지목하면 파일 노트가 하나
+      // 생기고, 그래야 아래 "파일 노트에는 없다"가 빈 목록에 대한 전칭 명제가 되지 않는다.
+      { path: ".env", isDir: false, sizeBytes: 20 },
+    ],
+    contents: {
+      "src/ledger.ts": "export const other = 1;\n",
+      "package.json": "{}",
+      // fake의 검색은 이 파일을 **읽기 전에 건너뛴다** — 실제 도구와 같다.
+      ".env": "resolveBudget=secret\n",
+    },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    // **`.env`를 지목한다.** 그래야 파일 노트가 하나 생기고, 아래 "파일 노트에는 없다"와
+    // "파일 노트의 경로는 실재한다"가 빈 목록에 대한 전칭 명제가 되지 않는다.
+    userMessage: "resolveBudget 이 이상합니다 (.env 도 봐주세요)",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+
+  // **`coverageNotes`다**(17절). 파일 노트와 같은 목록에 있으면 `(search: foo)`가 파일
+  // 이름으로 프롬프트와 화면에 나간다.
+  // **`find`가 아니라 `filter`다**(21절). 하나만 꺼내면 같은 노트가 몇 개 있든 통과한다 —
+  // 실제로 둘 있었고, 이 검사는 그걸 몇 절 동안 보지 못했다.
+  const secretNotes = (snapshot.coverageNotes ?? []).filter((n) =>
+    n.reason.includes("검색하지 않았습니다")
+  );
+  assert.equal(secretNotes.length, 1, JSON.stringify(snapshot.coverageNotes));
+  const note = secretNotes[0];
+  assert.match(note.reason, /비밀값 파일 1개/);
+  // **"찾지 못했습니다"로 끝나지 않는다** — 거기 있었을 수도 있다는 사실이 남아야 한다.
+  assert.match(note.reason, /거기 있었다면/);
+
+  // **파일 노트에는 없다.** 섞이면 화면의 "이름만 나간 파일" 개수가 파일 수가 아니게 된다.
+  assert.ok(
+    !(snapshot.excludedNotes ?? []).some((n) => n.reason.includes("검색하지 않았습니다")),
+    JSON.stringify(snapshot.excludedNotes)
+  );
+  // 그리고 **파일 노트의 경로는 전부 실재한다** — 판정 기준은 손으로 적은 모양이 아니라
+  // 이 워크스페이스가 아는 파일 목록이다. `(search: …)` 같은 것이 다시 섞이면 여기서 걸린다.
+  const known = new Set(["src/ledger.ts", "package.json", ".env"]);
+  assert.ok((snapshot.excludedNotes ?? []).some((n) => n.path === ".env"), JSON.stringify(snapshot.excludedNotes));
+  for (const n of snapshot.excludedNotes ?? []) {
+    assert.ok(known.has(n.path), `파일이 아닌 것이 파일 노트에 있습니다: ${n.path}`);
+  }
+  // 빈 목록이면 위 반복이 공허하다 — 이 시나리오에는 `.env` 노트가 있어야 한다.
+  assert.ok((snapshot.excludedNotes ?? []).length > 0, JSON.stringify(snapshot));
+});
+
+/** 건너뛴 것이 없으면 **그 노트도 없다** — 언제나 붙으면 신호가 아니라 배경이 된다. */
+test("건너뛴 것이 없으면 그 노트가 없다", async () => {
+  const host = new FakeHost({
+    files: [{ path: "src/ledger.ts", isDir: false, sizeBytes: 40 }],
+    contents: { "src/ledger.ts": "export function resolveBudget() {}\n" },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 이상합니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+  assert.ok(
+    !(snapshot.coverageNotes ?? []).some((n) => n.reason.includes("검색하지 않았습니다")),
+    JSON.stringify(snapshot.coverageNotes)
+  );
+});
+
+/**
+ * **결과가 잘렸으면 "여기 없다"는 결론이 성립하지 않는다.**
+ *
+ * 상한에 걸린 검색은 찾은 것이 전부가 아니고, 그 사실을 말하지 않으면 그 위의 판단이
+ * 조용히 틀린다 — 비밀값 건너뛰기와 같은 모양이다.
+ */
+test("검색 결과가 잘렸다는 사실이 노트에 남는다", async () => {
+  const files = Array.from({ length: FAKE_MAX_SEARCH_MATCHES + 2 }, (_u, i) => `src/f${i}.ts`);
+  const host = new FakeHost({
+    files: files.map((path) => ({ path, isDir: false, sizeBytes: 40 })),
+    contents: Object.fromEntries(files.map((path) => [path, "resolveBudget();\n"])),
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 이상합니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+  const truncatedNotes = (snapshot.coverageNotes ?? []).filter((n) =>
+    n.reason.includes("상한에서 잘렸습니다")
+  );
+  assert.equal(truncatedNotes.length, 1, JSON.stringify(snapshot.coverageNotes));
+  assert.match(truncatedNotes[0].reason, /전부가 아닙니다/);
+  // **범위이지 경로가 아니다.** 필드 이름이 `scope`인 것이 그 구별이다.
+  assert.match(truncatedNotes[0].scope, /본문 검색/);
+});
+
+/**
+ * **목록도 잘린다 — 그리고 아무도 그 사실을 읽지 않았다** — context-engine 18절.
+ *
+ * 실제 `list_files`는 5000개에서 자르고 `truncated`를 함께 내는데, 브리지가 배열만 꺼내면서
+ * 그 값을 버렸다. 그래서 인덱스가 워크스페이스의 **일부만** 담은 채 만들어져도 그 사실이
+ * 아무 데도 남지 않았다 — 16절이 검색에서 고친 것과 같은 모양이고, 이쪽이 더 넓게 퍼진다:
+ * 인덱스는 캐시에 저장되고 다음 태스크가 그대로 쓴다.
+ */
+test("파일 목록이 잘리면 그 사실이 범위 노트에 남는다", async () => {
+  const files = Array.from({ length: FAKE_MAX_LIST_ENTRIES + 2 }, (_u, i) => `src/f${i}.ts`);
+  const host = new FakeHost({
+    files: files.map((path) => ({ path, isDir: false, sizeBytes: 20 })),
+    contents: Object.fromEntries(files.map((path) => [path, "export const a = 1;\n"])),
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "무언가 고쳐주세요",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+
+  const note = (snapshot.coverageNotes ?? []).find((n) => n.scope === "파일 목록");
+  assert.ok(note, JSON.stringify(snapshot.coverageNotes));
+  assert.match(note.reason, /잘렸습니다/);
+  // **"여기 없으니 없다"를 막는 문장이어야 한다.** 잘렸다는 사실만으로는 읽는 쪽이 무엇을
+  // 하지 말아야 하는지 모른다.
+  assert.match(note.reason, /있을 수 있습니다/);
+});
+
+/** 안 잘렸으면 **그 노트가 없다** — 언제나 붙으면 신호가 아니라 배경이 된다. */
+test("파일 목록이 안 잘렸으면 그 노트가 없다", async () => {
+  const host = new FakeHost({
+    files: [{ path: "src/a.ts", isDir: false, sizeBytes: 20 }],
+    contents: { "src/a.ts": "export const a = 1;\n" },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "무언가 고쳐주세요",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+  });
+  assert.ok(
+    !(snapshot.coverageNotes ?? []).some((n) => n.scope === "파일 목록"),
+    JSON.stringify(snapshot.coverageNotes)
+  );
+});
+
+/**
+ * **세 값이 세 문장이다** — `false`만 침묵이다.
+ *
+ * 호스트가 말하지 않은 것(`null`)을 "안 잘렸다"로 접으면 우리가 모르는 것을 안다고 주장하게
+ * 된다. 16절이 개수에 대해 세운 규칙과 같고, 이 절은 그것을 불리언에도 적용한다.
+ */
+test("호스트가 말하지 않은 것과 안 잘린 것을 구별한다", () => {
+  assert.equal(listingCoverageNote(false), null);
+  const unknown = listingCoverageNote(null);
+  const cut = listingCoverageNote(true);
+  assert.ok(unknown && cut);
+  assert.notEqual(unknown.reason, cut.reason, "모르는 것과 잘린 것을 같은 문장으로 말합니다");
+  assert.match(unknown.reason, /말하지 않았습니다/);
+  // 필드가 아예 없는 경우(이 필드가 생기기 전에 저장된 캐시)도 "모른다"다.
+  assert.deepEqual(listingCoverageNote(undefined), unknown);
+});
+
+/**
+ * **`null`과 `0`을 뭉개지 않는다** — 호스트가 이 사실을 말하지 않은 것과 "건너뛴 것이 없다"는
+ * 다른 사실이다. 뭉개면 옛 호스트나 게으른 fake가 조용히 "건너뛴 것 없음"을 주장한다.
+ */
+test("호스트가 말하지 않으면 건너뛴 수는 null이다", async () => {
+  // **옛 호스트를 흉내낸다**: `matches`만 내고 나머지 필드를 아예 내지 않는다.
+  // FakeHost로는 이걸 만들 수 없다 — 그쪽은 이제 세 값을 모두 내기 때문이다(58절).
+  const transport = {
+    request: async () => ({
+      result: {
+        requestId: "r",
+        status: "ok",
+        output: { matches: [] },
+        durationMs: 1,
+        completedAt: "now",
+      },
+      policy: { decision: "auto_approve", riskLevel: "none", reason: "", matchedRule: "", normalizedTarget: "" },
+    }),
+  } as unknown as NdjsonTransport;
+
+  const found = await new ToolBridge(transport, "task-1").searchText("x");
+  assert.equal(found.skippedSecretFiles, null, "필드가 없는데 0으로 위장했습니다");
+  // **불리언도 같은 규칙이다**(18절). 16절은 이 규칙을 개수에만 적용하고 여기서는 `false`로
+  // 접었는데, 그건 말하지 않은 호스트가 "안 잘렸다"고 주장하는 것과 같다.
+  assert.equal(found.truncated, null, "필드가 없는데 false로 위장했습니다");
+});
+
+/**
+ * **재는 장치의 값이 기록에 닿아야 한다** — state-machine 61절.
+ *
+ * 15.3절이 `anchorCoverage`를 만든 이유는 "앵커 분포를 잰 적이 없다"였다. 그런데 그 값이
+ * 스냅샷에만 있고 이벤트에 없으면 **여전히 잰 적이 없다** — 값이 메모리에서 태어나 기록에
+ * 닿지 못한 채 사라진다.
+ *
+ * 16.1절이 본 것("값은 있는데 읽는 사람이 없다")보다 한 단계 앞이고, 증상은 더 조용하다:
+ * 읽는 코드를 나중에 만들어도 읽을 것이 없다.
+ */
+test("앵커 덮개가 SNAPSHOT_CREATED에 실린다", async () => {
+  const lines = Array.from({ length: 600 }, (_u, i) => {
+    if (i === 100) return "export function resolveBudget(limit) { return limit; }";
+    if (i === 520) return "export function resolveBudget2(id) { return id; }";
+    return `const filler${i} = ${i};`;
+  });
+  const content = lines.join("\n");
+
+  const host = new FakeHost({
+    files: [
+      { path: "src/ledger.ts", isDir: false, sizeBytes: content.length },
+      { path: "package.json", isDir: false, sizeBytes: 40 },
+    ],
+    contents: { "src/ledger.ts": content, "package.json": "{}" },
+    gitStatus: "## main",
+  });
+  const bridge = new ToolBridge(host.asTransport(), "task-1");
+  const snapshot = await new ContextEngine().createSnapshot(bridge, {
+    workspaceId: "ws-1",
+    userMessage: "resolveBudget 이 이상합니다",
+    tokenBudgets: [{ modelId: "fake-executor", maxTokens: 1_200 }],
+  });
+
+  const ledger = snapshot.relevantFiles.find((f) => f.path === "src/ledger.ts");
+  assert.ok(ledger?.anchorCoverage, "스냅샷에 앵커 덮개가 없습니다 — 이 검사가 공허합니다");
+
+  // 그리고 그 값이 **이벤트 payload로 살아남아야 한다.**
+  //
+  // 종전에는 이것을 오케스트레이터 소스에서 문자열로 확인했다 — payload를 만드는 코드가
+  // private 메서드라 부를 수 없었기 때문이다. 소스 검사는 **글자가 남아 있는지**만 안다.
+  // 68절이 그 함수를 값으로 부를 수 있는 자리로 옮겼으므로 이제 실제 값을 본다.
+  const files = snapshotPayload(snapshot).relevantFiles as { path: string; anchorCoverage?: unknown }[];
+  const recorded = files.find((f) => f.path === "src/ledger.ts");
+  assert.ok(recorded?.anchorCoverage, "SNAPSHOT_CREATED payload가 앵커 덮개를 싣지 않습니다");
+  assert.deepEqual(recorded.anchorCoverage, ledger.anchorCoverage, "실린 값이 스냅샷의 것과 다릅니다");
+});
+
+// ---- 검증 출력의 크기 (state-machine 67절) ----
+
+/**
+ * **재는 값과 나가는 값이 같은 함수에서 나온다.**
+ *
+ * 크기를 따로 계산하면 두 벌이 되고, 두 벌은 갈라진다 — 갈라진 집계는 실제보다 **적게**
+ * 보고하고, 전송 화면에서 적게 보고하는 것은 "안 나갔다"로 읽힌다.
+ */
+test("검증 출력의 크기가 실제 프롬프트에 실린 것과 같다", () => {
+  const digest = {
+    taskId: "task-1",
+    reportId: "r-1",
+    attemptNumber: 2,
+    failingChecks: [
+      {
+        kind: "test" as const,
+        command: "npm test",
+        exitCode: 1,
+        excerpt: "FAIL src/ledger.test.ts\n  at src/deep/helper.ts:41",
+        fileReferences: [{ path: "src/deep/helper.ts", line: 41 }],
+      },
+    ],
+    passingChecksSummary: "lint: pass",
+    preexistingFailuresSummary: undefined,
+  };
+  const applied = "src/ledger.ts (+3 -1)";
+
+  const prompt = buildFixPrompt({
+    userMessage: "고쳐주세요",
+    snapshot: makeSnapshot({}),
+    appliedChanges: applied,
+    digest,
+  });
+  const sizes = digestSectionSizes(digest, applied);
+
+  // 0개면 아래 비교가 공허하다.
+  assert.ok(sizes.length >= 4, `섹션을 ${sizes.length}개만 읽었습니다`);
+  for (const { section, bytes } of sizes) {
+    const head = `## ${section}`;
+    const at = prompt.indexOf(head);
+    assert.notEqual(at, -1, `프롬프트에 ${section} 섹션이 없습니다`);
+    // 그 섹션이 프롬프트에서 차지하는 실제 길이 — 다음 빈 줄 두 개까지.
+    const rest = prompt.slice(at);
+    const end = rest.indexOf("\n\n## ");
+    const actual = (end === -1 ? rest : rest.slice(0, end)).length;
+    assert.equal(bytes, actual, `${section}의 크기가 실제와 다릅니다`);
+  }
+});
+
+/**
+ * **경로 목록은 우리가 알아본 것이다.** 나간 것의 전부가 아니고, 그 사실을 화면이 말한다 —
+ * 여기서는 그 목록이 실제 출력에서 나온다는 것만 고정한다.
+ */
+test("실패 출력의 경로가 검증 출력에서 유도된다", () => {
+  const refs = extractFileReferences("FAIL\n  at src/deep/helper.ts:41\n  at src/other.ts:9");
+  assert.deepEqual(
+    refs.map((r) => r.path).sort(),
+    ["src/deep/helper.ts", "src/other.ts"]
+  );
+});
+
+/**
+ * **범위 노트가 두 번 나오고 있었다** — context-engine 21절.
+ *
+ * 키워드 하나에 검색 시도가 둘이다(정의 모양 → 아무 등장). 첫 시도가 인덱스에 있는 파일을
+ * 하나도 못 집으면 둘째 시도가 이어 돌고, 두 시도가 같은 워크스페이스를 훑으므로 같은
+ * 사실을 두 번 보고한다. 종전 검사가 이걸 못 본 이유는 `find`로 하나만 꺼냈기 때문이다 —
+ * **첫 번째가 맞으면 두 번째가 몇 개든 통과한다.**
+ */
+test("같은 사실을 두 번 보고하지 않는다", async () => {
+  const host = new FakeHost({
+    files: [
+      { path: "src/ledger.ts", isDir: false, sizeBytes: 40 },
+      { path: ".env", isDir: false, sizeBytes: 20 },
+    ],
+    contents: {
+      // **키워드가 인덱스된 파일에는 없다.** 그래야 첫 시도가 빈손이 되어 둘째 시도까지
+      // 돌고, 두 시도가 각각 노트를 남긴다 — 중복이 실제로 만들어지는 조건이다.
+      "src/ledger.ts": "export const other = 1;\n",
+      ".env": "resolveBudget=secret\n",
+    },
+    gitStatus: "## main",
+  });
+  const snapshot = await new ContextEngine().createSnapshot(
+    new ToolBridge(host.asTransport(), "task-1"),
+    {
+      workspaceId: "ws-1",
+      userMessage: "resolveBudget 이 이상합니다",
+      tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+    }
+  );
+
+  const notes = snapshot.coverageNotes ?? [];
+  const secretNotes = notes.filter((n) => n.kind === "search_secret_skipped");
+  // **`find`가 아니라 `filter`다.** 개수를 묻지 않으면 중복은 영원히 보이지 않는다.
+  assert.equal(secretNotes.length, 1, JSON.stringify(notes));
+  // 접혔다고 사실이 사라지지는 않는다.
+  assert.match(secretNotes[0].reason, /비밀값 파일 1개/);
+});
+
+/**
+ * **17.5절이 어렵게 봤던 경우** — 같은 `scope`의 서로 다른 사실은 접히면 안 된다.
+ *
+ * *"`scope`가 같으면 접는 것이 자연스럽지만, '비밀값 3개를 건너뜀'과 '상한에서 잘림'은
+ * 같은 `scope`의 다른 사실이다."* 세 값을 모두 비교하면 그 걱정이 사라진다.
+ */
+test("같은 범위라도 다른 사실이면 둘 다 남는다", () => {
+  const scope = "본문 검색: resolveBudget";
+  const folded = foldCoverageNotes([
+    { kind: "search_secret_skipped", scope, reason: "비밀값 파일 1개는 검색하지 않았습니다." },
+    { kind: "search_secret_skipped", scope, reason: "비밀값 파일 1개는 검색하지 않았습니다." },
+    { kind: "search_truncated", scope, reason: "검색 결과가 상한에서 잘렸습니다." },
+    // 종류가 같아도 **문장이 다르면** 다른 사실이다 — 개수가 다르면 여기 걸린다.
+    { kind: "search_secret_skipped", scope, reason: "비밀값 파일 3개는 검색하지 않았습니다." },
+  ]);
+  assert.deepEqual(
+    folded.map((n) => n.reason),
+    [
+      "비밀값 파일 1개는 검색하지 않았습니다.",
+      "검색 결과가 상한에서 잘렸습니다.",
+      "비밀값 파일 3개는 검색하지 않았습니다.",
+    ],
+    "접히면 안 되는 것이 접혔거나 순서가 바뀌었습니다"
+  );
+});
+
+/**
+ * **검색이 맞혔는데 우리가 버린 것도 말한다** — context-engine 21절.
+ *
+ * `skippedSecretFiles`와 다른 사실이다: 저쪽은 호스트가 읽지 않은 것이고, 이쪽은 호스트가
+ * 읽어서 돌려줬는데 **우리 인덱스 규칙이 버린** 것이다. 종전에는 그 차이가 호출부에서
+ * `filter` 한 줄에 삼켜져 아무 데도 남지 않았다.
+ */
+test("검색이 맞혔지만 인덱스에 없는 파일을 말한다", async () => {
+  const host = new FakeHost({
+    // **인덱스에는 없다.** 크기 상한이나 기본 제외 목록에 걸린 파일을 흉내낸다.
+    files: [{ path: "src/ledger.ts", isDir: false, sizeBytes: 40 }],
+    contents: {
+      "src/ledger.ts": "export const other = 1;\n",
+      "dist/bundle.js": "function resolveBudget() {}\n",
+    },
+    gitStatus: "## main",
+  });
+  const snapshot = await new ContextEngine().createSnapshot(
+    new ToolBridge(host.asTransport(), "task-1"),
+    {
+      workspaceId: "ws-1",
+      userMessage: "resolveBudget 이 이상합니다",
+      tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+    }
+  );
+
+  const notes = snapshot.coverageNotes ?? [];
+  const dropped = notes.filter((n) => n.kind === "search_hit_not_indexed");
+  assert.equal(dropped.length, 1, JSON.stringify(notes));
+  assert.match(dropped[0].reason, /1개는 인덱스에 없어/);
+  // 그리고 그 파일이 **후보로 들어오지도 않았다** — 노트만 붙이고 옆문을 열면 안 된다.
+  assert.ok(
+    !snapshot.relevantFiles.some((f) => f.path === "dist/bundle.js"),
+    JSON.stringify(snapshot.relevantFiles.map((f) => f.path))
+  );
+});
+
+/**
+ * **상한에서 버린 것도 말한다** — context-engine 21절.
+ *
+ * 키워드당 상한이 3이라 흔한 이름 하나면 바로 걸리는데, 종전에는 그 사실이 어디에도 남지
+ * 않아 "이 키워드로 찾은 것은 셋뿐"으로 읽혔다. 18절이 목록에 대해, 16절이 비밀값에 대해
+ * 세운 규율이 **우리가 스스로 자르는 자리**에는 서 있지 않았던 것이다.
+ */
+test("한 키워드가 상한보다 많이 맞으면 그 사실을 말한다", async () => {
+  const paths = Array.from({ length: MAX_MATCHES_PER_KEYWORD + 2 }, (_u, i) => `f${i}.ts`);
+  const host = new FakeHost({
+    files: paths.map((path) => ({ path, isDir: false, sizeBytes: 40 })),
+    contents: Object.fromEntries(paths.map((path) => [path, "function resolveBudget() {}\n"])),
+    gitStatus: "## main",
+  });
+  const snapshot = await new ContextEngine().createSnapshot(
+    new ToolBridge(host.asTransport(), "task-1"),
+    {
+      workspaceId: "ws-1",
+      userMessage: "resolveBudget 이 이상합니다",
+      tokenBudgets: [{ modelId: "fake-executor", maxTokens: 60_000 }],
+    }
+  );
+
+  const notes = snapshot.coverageNotes ?? [];
+  const capped = notes.filter((n) => n.kind === "search_hits_capped");
+  assert.equal(capped.length, 1, JSON.stringify(notes));
+  // **버린 개수가 아니라 둘 다 말한다** — 몇 개 중 몇 개인지가 있어야 사용자가 판단한다.
+  assert.match(capped[0].reason, new RegExp(`${paths.length}개 중 ${MAX_MATCHES_PER_KEYWORD}개만`));
+});
+
+/**
+ * **fake의 상한이 우리 상한을 가리면 안 된다** — context-engine 21절.
+ *
+ * fake의 검색 상한은 일부러 실제(200)보다 훨씬 작다 — 200개짜리 fixture는 읽을 수 없기
+ * 때문이다. 그런데 그 값이 엔진의 키워드당 상한보다 크지 않으면 **엔진 상한에 걸리는
+ * 경로가 fake로는 도달 불가능**해진다. 실제로 둘 다 3이라 그랬고, 그래서 그 상한이 버리는
+ * 파일은 어디에도 기록되지 않은 채로 남아 있었다.
+ *
+ * 주석으로 두면 다음에 누가 값을 낮출 때 알 수 없으므로 관계를 여기서 고정한다.
+ */
+test("fake의 검색 상한은 엔진의 키워드당 상한보다 크다", () => {
+  assert.ok(
+    FAKE_MAX_SEARCH_MATCHES > MAX_MATCHES_PER_KEYWORD,
+    `fake 상한 ${FAKE_MAX_SEARCH_MATCHES}가 엔진 상한 ${MAX_MATCHES_PER_KEYWORD} 이하입니다 — 엔진 상한에 걸리는 경로를 fake로 만들 수 없습니다`
+  );
 });

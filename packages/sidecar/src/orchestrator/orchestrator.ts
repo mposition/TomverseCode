@@ -14,6 +14,7 @@ import type {
   McpCallRequest,
   PlanOutline,
   QuestionAnswer,
+  RelevantFile,
   ReviewDecision,
   RoutingDecision,
   SingleModelFixResult,
@@ -48,6 +49,8 @@ import { ModelRegistry, providerKindOf } from "../routing/registry.js";
 import { Router, RoutingError, type RouterOptions } from "../routing/router.js";
 import { ToolBridge } from "../tools/bridge.js";
 import { buildDigest } from "../verify/digest.js";
+import { snapshotPayload } from "./snapshotPayload.js";
+import { digestSectionSizes } from "../providers/prompts.js";
 import { canonicalText, contrastDrafts, fieldLabel, planQuestionRound } from "./contrast.js";
 import {
   describeEvaluations,
@@ -58,6 +61,7 @@ import {
 } from "./criteria.js";
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
 import { buildCommitMessage, buildCommitPlan, buildExecutionPlan, planPaths, PlanningError } from "./planner.js";
+import { refusalNote, resolveRequests } from "../context/followUp.js";
 import { triage, type TriagePolicy, type TriageResult } from "../triage.js";
 import { BudgetRefused, TaskBudget } from "./budget.js";
 import type { BudgetEventType } from "../budget/ledger.js";
@@ -385,6 +389,7 @@ export class Orchestrator {
       counters: {
         clarificationRounds: 0,
         mcpRounds: 0,
+        contextRounds: 0,
         reviseRounds: 0,
         fixLoopRounds: 0,
         toolRetries: {},
@@ -536,7 +541,7 @@ export class Orchestrator {
     if (this.input.mcpTools) {
       this.snapshot.mcpTools = this.input.mcpTools;
     }
-    await this.emit("SNAPSHOT_CREATED", this.snapshotPayload(this.snapshot));
+    await this.emit("SNAPSHOT_CREATED", snapshotPayload(this.snapshot));
 
     // ---- 질문이면 여기서 갈라진다 (state-machine 51절) ----
     //
@@ -1665,6 +1670,9 @@ export class Orchestrator {
         ...this.contextEngine.knownFilePaths(),
         ...(this.snapshot?.relevantFiles.map((f) => f.path) ?? []),
         ...(this.snapshot?.excludedNotes?.map((n) => n.path) ?? []),
+        // **`coverageNotes`는 여기 들어가지 않는다**(context-engine 17절). 저건 경로가
+        // 아니라 우리가 보지 못한 범위이고, 실재의 증거가 될 수 없다. 한동안 검색 쪽 노트가
+        // `excludedNotes`에 섞여 있었으므로 `(search: foo)`가 **실재하는 경로**로 읽혔다.
         ...this.mutatedPaths,
       ],
     };
@@ -1746,6 +1754,27 @@ export class Orchestrator {
           };
         }
 
+        // **재시도할 값어치가 없는 실패는 여기서 끝낸다**(65절).
+        //
+        // 아래 백오프에는 근거가 있다 — *"파일 락 같은 일시적 원인이 있을 수 있어 짧게
+        // 기다린다."* 맞는 말이지만 **모든 실패에 대해 참은 아니다**: 경로가 길어서 실패한
+        // 쓰기는 2.2초를 기다린 뒤에도 같은 이유로 실패하고, 그동안 사용자는 도구가 무언가
+        // 하고 있다고 믿는다.
+        //
+        // **판정은 Rust가 준다.** 오류 문장으로 여기서 다시 판정하면 두 곳이 갈리고(24.3절),
+        // 그 문장은 로케일에 따라 번역되므로 한국어 Windows에서만 분기가 사라진다.
+        const failure = result.fileFailure;
+        if (failure && !failure.retryable) {
+          return {
+            kind: "final",
+            result: await this.finish(
+              "failed",
+              `${failure.fact} ${failure.tryThis}`,
+              "tool_failed_permanently"
+            ),
+          };
+        }
+
         // error / timeout — 재시도 대상
         attempt += 1;
         this.state.counters.toolRetries[request.requestId] = attempt;
@@ -1777,6 +1806,26 @@ export class Orchestrator {
   private async requestFix(report: VerificationReport): Promise<{ kind: "patch"; patch: string } | { kind: "final"; result: FinalResult }> {
     const adapters = this.requireAdapters();
     const digest = buildDigest(report);
+
+    // **나가는 것을 기록에 남긴다**(state-machine 67절, product-strategy 7.2절).
+    //
+    // 이 내용은 공급자로 나가는데 전송 집계가 세지 못하고 있었다 — 값이 메모리에서 태어나
+    // 프롬프트로 들어갔다가 사라졌기 때문이다(61절이 `anchorCoverage`에서 본 것과 같다).
+    // 그래서 화면의 "무엇이 나갔는가"는 검증 출력에 대해 **아무 말도 하지 않았고**, 그
+    // 출력에는 실패한 테스트의 스택 트레이스와 **컨텍스트에 없던 파일의 조각**이 들어간다.
+    //
+    // **호출 전에** 낸다: 호출이 실패해도 그 내용은 이미 나갔다.
+    await this.emit("VERIFICATION_DIGEST_SENT", {
+      reportId: digest.reportId,
+      attemptNumber: digest.attemptNumber,
+      // 재는 값과 나가는 값이 **같은 함수**에서 나온다.
+      sections: digestSectionSizes(digest, this.appliedChangeNotes.join("\n")),
+      // **우리가 알아본 경로다.** 나간 것의 전부가 아니다 — 출력은 텍스트이고 추출은
+      // 정규식이다. 그 한계를 화면이 함께 말한다.
+      recognizedPaths: [
+        ...new Set(digest.failingChecks.flatMap((c) => c.fileReferences.map((f) => f.path))),
+      ].sort(),
+    });
 
     // 여기가 결함이 실제로 나타나던 자리다 — 프롬프트가 "당신의 변경이 이미 반영되어 있다"고
     // 말하는 그 스냅샷이 패치 이전이었다.
@@ -2496,19 +2545,30 @@ export class Orchestrator {
     if (await this.cancelledHere()) return this.finish("cancelled", "ANSWERING 중 취소됨");
 
     const executor = this.adapters!.executor;
-    const response = await this.callProvider(executor, "executor", "answer:1", (ctx) =>
-      executor.answerQuestion(
-        {
-          snapshot: this.snapshot!,
-          userMessage: this.input.taskRequest.userMessage,
-          ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
-        },
-        ctx
-      )
-    );
-    if (response.kind === "final") return response.result;
+    let round = 0;
+    let answer: QuestionAnswer;
+    let refusalNote = "";
+    for (;;) {
+      const response = await this.callProvider(executor, "executor", `answer:${round + 1}`, (ctx) =>
+        executor.answerQuestion(
+          {
+            snapshot: this.snapshot!,
+            userMessage: this.input.taskRequest.userMessage,
+            ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
+            ...(refusalNote ? { contextNote: refusalNote } : {}),
+          },
+          ctx
+        )
+      );
+      if (response.kind === "final") return response.result;
+      answer = response.value;
 
-    const answer = response.value;
+      // **모델이 요청한 것을 읽고 다시 묻는다**(57절). 상한 안에서만.
+      const more = await this.fetchRequestedContext(answer.missingContext, round);
+      if (more === null) break;
+      refusalNote = more;
+      round += 1;
+    }
     await this.emit("DRAFT_RECEIVED", {
       model: answer.model,
       // 초안이 아니라는 것을 페이로드가 말한다 — 같은 이벤트 이름을 쓰되 모양이 다르다.
@@ -2569,6 +2629,101 @@ export class Orchestrator {
   }
 
   /**
+   * 모델이 요청한 파일을 읽어 스냅샷에 더한다 — state-machine 57절.
+   *
+   * 다음 라운드를 **돌아야 하면** 프롬프트에 붙일 거절 목록을 돌려주고, 돌 필요가 없거나
+   * 돌 수 없으면 `null`을 돌려준다. 반환형이 그 판정을 담는 이유는 호출부가 그것을 다시
+   * 계산하지 않게 하기 위해서다 — 두 곳에서 계산하면 상한이 한쪽에서만 지켜진다.
+   *
+   * # 우리가 판정한다
+   *
+   * `missingContext`는 자유 문장이므로 무엇이든 들어온다. `context/followUp.ts`가 인덱스와
+   * 대조해 **가져올 수 있는 것만** 고르고, 나머지는 사유와 함께 거절한다. 제외 규칙(7절)이
+   * 이 경로에서 우회되면 안 되기 때문이다 — 그게 이 함수가 존재하는 이유의 절반이다.
+   *
+   * # 왜 승인을 따로 묻지 않는가
+   *
+   * 읽기는 `read_file`이고 그것은 게이트를 그대로 지난다(도구는 이미 읽기 전용으로
+   * 좁혀져 있다 — 51.2절). 게이트가 승인을 요구하면 평소 경로로 승인을 묻고, 무인이면
+   * 거기서 멈춘다. **이 경로에 별도 승인 규칙을 만들지 않는다**: 만들면 같은 동작에 대한
+   * 규칙이 둘이 되고, 둘 중 느슨한 쪽이 우회로가 된다.
+   */
+  private async fetchRequestedContext(requests: readonly string[], round: number): Promise<string | null> {
+    if (requests.length === 0) return null;
+    if (round >= this.policy.limits.contextRounds) {
+      await this.emit("CONTEXT_ROUND_SKIPPED", {
+        reason: "limit_reached",
+        limit: this.policy.limits.contextRounds,
+        requested: requests.length,
+      });
+      return null;
+    }
+
+    const index = await this.contextEngine.ensureIndex(this.bridge!, this.input.taskRequest.workspaceId);
+    const resolution = resolveRequests(index, requests);
+    if (resolution.fetch.length === 0) {
+      // **가져올 것이 하나도 없으면 라운드를 쓰지 않는다.** 같은 스냅샷으로 다시 물으면
+      // 같은 답이 나오고 비용만 는다.
+      await this.emit("CONTEXT_ROUND_SKIPPED", {
+        reason: "nothing_fetchable",
+        refused: resolution.refused,
+      });
+      return null;
+    }
+
+    const added: RelevantFile[] = [];
+    for (const item of resolution.fetch) {
+      const read = await this.bridge!.readFile(item.path).catch(() => null);
+      if (read === null || read.content === null) {
+        resolution.refused.push({ request: item.request, reason: "파일을 읽지 못했습니다." });
+        continue;
+      }
+      added.push({
+        path: item.path,
+        reason: "mentioned",
+        reasonDetail: `모델이 ${JSON.stringify(item.request)}로 요청함 (57절)`,
+        content: read.content,
+        truncated: read.truncated,
+        sizeBytes: read.sizeBytes,
+      });
+    }
+    if (added.length === 0) {
+      await this.emit("CONTEXT_ROUND_SKIPPED", { reason: "nothing_readable", refused: resolution.refused });
+      return null;
+    }
+
+    // **이미 있는 파일은 덮지 않는다.** 선정이 고른 것에는 앵커와 창이 붙어 있고(15절),
+    // 여기서 통째로 갈아끼우면 그 정보를 잃는다.
+    const have = new Set(this.snapshot!.relevantFiles.map((f) => f.path));
+    const fresh = added.filter((f) => !have.has(f.path));
+    if (fresh.length === 0) {
+      // **새로 실린 것이 없으면 라운드를 쓰지 않는다.** 모델이 이미 갖고 있던 파일을
+      // 요청한 경우인데, 같은 스냅샷으로 다시 물으면 같은 답이 나오고 비용만 든다.
+      // 그리고 그 낭비는 기록에서 "라운드를 돌았다"로만 보여 원인이 드러나지 않는다.
+      await this.emit("CONTEXT_ROUND_SKIPPED", {
+        reason: "already_in_context",
+        requested: resolution.fetch.map((f) => f.path),
+        refused: resolution.refused,
+      });
+      return null;
+    }
+    this.snapshot = {
+      ...this.snapshot!,
+      relevantFiles: [...this.snapshot!.relevantFiles, ...fresh],
+    };
+    this.state.counters.contextRounds += 1;
+
+    await this.emit("CONTEXT_ROUND_COMPLETED", {
+      round: this.state.counters.contextRounds,
+      limit: this.policy.limits.contextRounds,
+      fetched: fresh.map((f) => f.path),
+      refused: resolution.refused,
+    });
+
+    return refusalNote(resolution.refused);
+  }
+
+  /**
    * 계획 경로 — state-machine 53절.
    *
    * `answerQuestion`과 **같은 모양이고, 같아야 한다.** 두 경로가 갈라지면 "파일을 바꾸지
@@ -2588,19 +2743,32 @@ export class Orchestrator {
     if (await this.cancelledHere()) return this.finish("cancelled", "OUTLINING 중 취소됨");
 
     const executor = this.adapters!.executor;
-    const response = await this.callProvider(executor, "executor", "plan:1", (ctx) =>
-      executor.outlinePlan(
-        {
-          snapshot: this.snapshot!,
-          userMessage: this.input.taskRequest.userMessage,
-          ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
-        },
-        ctx
-      )
-    );
-    if (response.kind === "final") return response.result;
+    let round = 0;
+    let plan: PlanOutline;
+    let refusal = "";
+    for (;;) {
+      const response = await this.callProvider(executor, "executor", `plan:${round + 1}`, (ctx) =>
+        executor.outlinePlan(
+          {
+            snapshot: this.snapshot!,
+            userMessage: this.input.taskRequest.userMessage,
+            ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
+            ...(refusal ? { contextNote: refusal } : {}),
+          },
+          ctx
+        )
+      );
+      if (response.kind === "final") return response.result;
+      plan = response.value;
 
-    const plan = response.value;
+      // **계획도 같은 길을 쓴다**(57절). 두 경로가 갈라지면 한쪽만 상한을 잃는다.
+      // 계획에서 "더 봐야 할 것"은 `risks`가 아니라 `openQuestions`도 아니다 — 그 둘은
+      // 사용자에게 하는 말이고, 컨텍스트 요청은 우리에게 하는 말이라 자리가 다르다.
+      const more = await this.fetchRequestedContext(plan.needsContext ?? [], round);
+      if (more === null) break;
+      refusal = more;
+      round += 1;
+    }
     await this.emit("DRAFT_RECEIVED", {
       model: plan.model,
       kind: "plan_outline",
@@ -2860,34 +3028,6 @@ export class Orchestrator {
    * 스냅샷 이벤트를 읽는다), 스냅샷을 내는 자리가 늘 때마다 필드를 손으로 맞추면 어느
    * 자리에서는 **나간 것을 나가지 않았다고** 말하게 된다.
    */
-  private snapshotPayload(snapshot: WorkspaceSnapshot): Record<string, unknown> {
-    return {
-      snapshotId: snapshot.snapshotId,
-      gitBranch: snapshot.gitBranch,
-      gitDirty: snapshot.gitDirty,
-      // **커밋되지 않은 변경 요약도 프롬프트에 실린다**(`renderSnapshot`의 Repository state).
-      // 이걸 이벤트에 넣지 않으면 전송 기록이 그것을 말할 수 없고, 화면은 "선정된 파일만
-      // 나갔다"로 읽힌다 — 이 요약에는 선정되지 않은 파일의 경로도 들어간다(7.2절).
-      gitDiffSummary: snapshot.gitDiffSummary ?? null,
-      // 스킬 지시문도 프롬프트에 실려 나간다 — 전송 집계가 세야 한다(7.2절).
-      skill: snapshot.skill ?? null,
-      // 앞선 태스크의 판정이 이 태스크의 프롬프트로 넘어간다는 사실도 마찬가지다(27.3절).
-      sessionMemory: snapshot.sessionMemory ?? null,
-      // MCP 도구 목록과 그 응답도 나간다(31.4절). 응답은 **외부 서버가 준 텍스트**라
-      // 특히 세야 한다 — 우리가 만든 것도 사용자가 쓴 것도 아니다.
-      mcpTools: snapshot.mcpTools ?? null,
-      mcpResults: snapshot.mcpResults ?? null,
-      // 어떤 파일이 어느 공급자에 갔는지 표시하기 위한 데이터 (README "데이터 전송 투명성").
-      relevantFiles: snapshot.relevantFiles.map((f) => ({
-        path: f.path,
-        reason: f.reason,
-        reasonDetail: f.reasonDetail,
-        truncated: f.truncated,
-      })),
-      excludedNotes: snapshot.excludedNotes ?? [],
-      projectMeta: snapshot.projectMeta,
-    };
-  }
 
   // ---- MCP 도구 라운드 (state-machine 31절) ----
 
@@ -3044,7 +3184,7 @@ export class Orchestrator {
       },
       createdAt: new Date().toISOString(),
     };
-    await this.emit("SNAPSHOT_CREATED", this.snapshotPayload(this.snapshot));
+    await this.emit("SNAPSHOT_CREATED", snapshotPayload(this.snapshot));
   }
 
   private async snapshotForPrompt(): Promise<WorkspaceSnapshot> {
@@ -3068,7 +3208,7 @@ export class Orchestrator {
       // 새 스냅샷은 새 전송이다. 전송 기록이 마지막 `SNAPSHOT_CREATED`를 읽으므로
       // (core/src/transmission.rs), 이 이벤트를 빠뜨리면 화면은 옛 목록을 계속 보여준다.
       await this.emit("SNAPSHOT_CREATED", {
-        ...this.snapshotPayload(refreshed.snapshot),
+        ...snapshotPayload(refreshed.snapshot),
         // 무엇이 달라져서 다시 만들었는지. 이게 없으면 같은 태스크에 SNAPSHOT_CREATED가
         // 여러 개 남은 이유를 로그만 보고는 알 수 없다.
         refreshedAfterMutation: {

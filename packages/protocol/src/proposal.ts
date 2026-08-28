@@ -189,6 +189,14 @@ export interface PlanOutline {
    * 되묻기 루프를 도는 것은 이 모드가 아끼려는 토큰을 도로 쓰는 일이다.
    */
   openQuestions: string[];
+  /**
+   * 계획을 세우려면 **더 봐야 하는 파일들** (state-machine 57절).
+   *
+   * `risks`·`openQuestions`와 자리가 다르다. 그 둘은 **사용자에게** 하는 말이고 이건
+   * **우리에게** 하는 말이다 — 뭉치면 화면이 "위험"이라며 파일 경로를 늘어놓고, 우리는
+   * 사용자에게 할 말에서 요청을 골라내야 한다.
+   */
+  needsContext?: string[];
   model: string;
   createdAt: ISODateTime;
 }

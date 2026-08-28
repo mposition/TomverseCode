@@ -905,7 +905,7 @@ test("[시나리오 F] 인덱스 캐시가 프로세스를 넘어 살아남는�
 });
 
 /**
- * 심볼 층이 **실제 실행에서** 도는가 (context-engine.md 16절).
+ * 심볼 층이 **실제 실행에서** 도는가 (context-engine.md 22절).
  *
  * # 왜 단위 테스트로 부족한가
  *
@@ -916,7 +916,7 @@ test("[시나리오 F] 인덱스 캐시가 프로세스를 넘어 살아남는�
  *
  * # 그리고 이 검사가 grammar 배포를 지킨다
  *
- * grammar를 못 실으면 오류가 아니라 **조용한 성능 저하**다(16.5절). `buildsWithGrammarFailure`가
+ * grammar를 못 실으면 오류가 아니라 **조용한 성능 저하**다(22.5절). `buildsWithGrammarFailure`가
  * 0이라는 것은 이 환경에서 wasm 5개가 실제로 실렸다는 뜻이고, 번들에서 빠지면 여기서 걸린다.
  */
 test("[시나리오 G] 실제 실행이 심볼 인덱스를 만들고 그 사실이 집계까지 간다", async () => {
@@ -964,7 +964,7 @@ test("[시나리오 G] 실제 실행이 심볼 인덱스를 만들고 그 사실
       (metrics.symbolIndex.p90SymbolCount ?? 0) > 0,
       `파싱은 했는데 심볼이 하나도 없습니다: ${JSON.stringify(metrics.symbolIndex)}`
     );
-    // payload 크기는 16절이 재기로 한 값이다 — 배선이 끊기면 null이 된다.
+    // payload 크기는 22절이 재기로 한 값이다 — 배선이 끊기면 null이 된다.
     assert.ok((metrics.indexCache.p90PayloadBytes ?? 0) > 0, JSON.stringify(metrics.indexCache));
     // 지표를 추가하면서 열린 질문에 넣지 않으면 아무도 읽지 않는 숫자가 된다(metrics.rs 모듈 주석).
     assert.ok(metrics.openQuestions.some((q) => q.id === "symbolIndex"), JSON.stringify(metrics.openQuestions));

@@ -1,7 +1,7 @@
 import type { RawImport } from "./symbols.js";
 
 /**
- * import 지정자 → **워크스페이스 안의 파일 경로** — docs/design/context-engine.md 5·16절.
+ * import 지정자 → **워크스페이스 안의 파일 경로** — docs/design/context-engine.md 5·22절.
  *
  * # 왜 `node:path`를 쓰지 않는가
  *
@@ -22,7 +22,7 @@ import type { RawImport } from "./symbols.js";
  *
  * - **bare 지정자**(`react`, `@tomverse/protocol`, `std::fmt`): 워크스페이스 패키지 해석은
  *   package.json workspaces·tsconfig paths·Cargo 워크스페이스를 읽어야 하고, 그건 5절이 정한
- *   "import/require 파싱으로 파일 단위 엣지" 범위 밖이다. 16절 "아직 하지 않은 것"에 적었다.
+ *   "import/require 파싱으로 파일 단위 엣지" 범위 밖이다. 22절 "아직 하지 않은 것"에 적었다.
  */
 
 export interface ResolveInput {
