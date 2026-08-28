@@ -1,0 +1,27 @@
+{
+  "//": [
+    "Node 릴리스 서명 키의 **allowlist**. `pin-node-runtime.mjs`가 SHASUMS256.txt의 서명을",
+    "검증할 때 서명자의 fingerprint가 이 목록에 있어야 한다.",
+    "",
+    "왜 목록인가: 키서버에서 받은 키로 검증하면 '서명이 있다'만 확인되고 '누가 서명했는가'는",
+    "확인되지 않는다 — 공격자의 키로 서명된 파일도 그 키를 받아오면 통과한다. 여기 적힌",
+    "fingerprint와 대조해야 비로소 Node 릴리스팀의 서명임이 성립한다.",
+    "",
+    "이 목록을 늘리는 것은 **코드 리뷰가 필요한 별도 변경**이다. 출처는 nodejs/node의 README",
+    "'Release keys' 절이고, 추가할 때 그 문서를 직접 확인한 사실을 커밋 메시지에 적을 것."
+  ],
+  "schemaVersion": 1,
+  "source": "https://github.com/nodejs/node/blob/main/README.md#release-keys",
+  "checkedAt": "2026-08-28",
+  "keys": [
+    { "fingerprint": "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356", "name": "Antoine du Hamel" },
+    { "fingerprint": "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7", "name": "Juan José Arboleda" },
+    { "fingerprint": "CC68F5A3106FF448322E48ED27F5E38D5B0A215F", "name": "Marco Ippolito" },
+    { "fingerprint": "8FCCA13FEF1D0C2E91008E09770F7A9A5AE15600", "name": "Michaël Zasso" },
+    { "fingerprint": "890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4", "name": "Rafael Gonzaga" },
+    { "fingerprint": "C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C", "name": "Richard Lau" },
+    { "fingerprint": "108F52B48DB57BB0CC439B2997B01419BD92F80A", "name": "Ruy Adorno" },
+    { "fingerprint": "655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD", "name": "Stewart X Addison" },
+    { "fingerprint": "A363A499291CBBC940DD62E41F10027AF002F8B0", "name": "Ulises Gascón" }
+  ]
+}

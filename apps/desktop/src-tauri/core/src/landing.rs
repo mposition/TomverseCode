@@ -474,14 +474,47 @@ fn job_object_checks(obs: &Observations) -> Vec<Check> {
     ]
 }
 
+/// 번들 안에서 sidecar가 놓이는 자리. `launcher.rs`가 찾는 것과 같아야 한다 —
+/// 그래서 상수를 다시 적지 않고 거기서 가져온다.
+fn sidecar_dir(bundle: &Path) -> PathBuf {
+    bundle.join(crate::launcher::BUNDLE_DIR)
+}
+
+/// **가리킨 곳이 설치본이 아니라 빌드 트리인가.**
+///
+/// 실측에서 `--bundle target/release`를 주는 바람에 `bundleSizeRecorded`가 1586.9 MiB를
+/// "기록됨"으로 통과시켰다(기록 5절). 그 숫자는 배포되는 크기가 아니라 **컴파일 중간
+/// 산출물의 크기**이고, 통과 표시가 붙어 있으니 아무도 다시 보지 않는다. cargo가 반드시
+/// 만드는 디렉터리로 그 상황을 구조적으로 가려낸다.
+fn looks_like_a_build_tree(dir: &Path) -> bool {
+    ["build", "deps", ".fingerprint", "incremental"]
+        .iter()
+        .filter(|name| dir.join(name).is_dir())
+        .count()
+        >= 2
+}
+
+/// 번들 안 `sidecar/manifest.json`이 적어 둔 런타임 해시.
+fn manifest_node_sha256(sidecar: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(sidecar.join("manifest.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("node")?.get("sha256")?.as_str().map(str::to_string)
+}
+
+fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("{:x}", Sha256::digest(&bytes)))
+}
+
 fn bundle_checks(obs: &Observations) -> Vec<Check> {
     let Some(dir) = obs.bundle_dir.as_ref() else {
         return vec![
             check(
                 "bundleContents",
-                "번들 안에 `sidecar/node.exe`와 `sidecar/index.js`가 있다.",
+                "번들 안에 `sidecar/node.exe`와 `sidecar/index.js`가 있고, 런타임이 핀된 해시와 일치한다.",
                 CheckStatus::NotCheckableHere,
-                "`--bundle <경로>`로 `tauri-build` 산출물을 가리키면 확인한다.",
+                "`--bundle <경로>`로 **설치된 앱 디렉터리**를 가리키면 확인한다.",
             ),
             check(
                 "runsWithoutNodeOnPath",
@@ -499,32 +532,70 @@ fn bundle_checks(obs: &Observations) -> Vec<Check> {
             .requiring(&[MachineFact::WindowsOs, MachineFact::InstalledBundle]),
             check(
                 "bundleSizeRecorded",
-                "번들 크기가 기록된다 — \"크기는 고려하지 않았다\"가 아니라 \"얼마인지 알고 받아들였다\"여야 한다.",
+                "**설치된 앱 디렉터리**의 크기가 기록된다 — \"크기는 고려하지 않았다\"가 아니라 \"얼마인지 알고 받아들였다\"여야 한다.",
                 CheckStatus::NotCheckableHere,
-                "`--bundle <경로>`를 주면 재서 적는다.",
+                "`--bundle <경로>`를 주면 재서 적는다. 빌드 트리(`target/release`)가 아니라 설치본을 가리킬 것.",
             ),
         ];
     };
 
-    let node_exe = dir.join("sidecar").join("node.exe");
-    let entry = dir.join("sidecar").join("index.js");
-    let has_both = node_exe.is_file() && entry.is_file();
+    let sidecar = sidecar_dir(dir);
+    let windows_runtime = crate::launcher::runtime_file_name(true);
+    let node_exe = sidecar.join(windows_runtime);
+    let entry = sidecar.join(crate::launcher::ENTRY_FILE);
+    // `package.json`이 빠지면 Node가 진입점을 CommonJS로 읽어 **첫 줄에서** 죽는다.
+    // 파일이 다 있는데도 sidecar가 안 뜨는 상태라 증상만으로는 원인에 닿기 어렵다.
+    let esm_anchor = sidecar.join("package.json");
+    let license = sidecar.join("node.LICENSE");
+    let present: Vec<(&str, bool)> = vec![
+        (windows_runtime, node_exe.is_file()),
+        (crate::launcher::ENTRY_FILE, entry.is_file()),
+        ("manifest.json", sidecar.join("manifest.json").is_file()),
+        ("package.json", esm_anchor.is_file()),
+        ("node.LICENSE", license.is_file()),
+    ];
+    let all_present = present.iter().all(|(_, ok)| *ok);
+
+    // **파일이 있다는 것과 그것이 우리가 승인한 바이트라는 것은 다른 사실이다.**
+    // manifest가 적어둔 해시로 실제 node.exe를 다시 잰다 — 스테이징이 핀을 검증한 것은
+    // 빌드 머신에서의 일이고, 설치본이 그 결과를 담고 있는지는 여기서만 확인된다.
+    let integrity = if !node_exe.is_file() {
+        None
+    } else {
+        match (manifest_node_sha256(&sidecar), sha256_file(&node_exe)) {
+            (Some(expected), Some(actual)) => Some((expected == actual, expected, actual)),
+            _ => None,
+        }
+    };
+    let contents_ok = all_present && matches!(integrity, Some((true, _, _)));
+
     let size = dir_size(dir);
+    let sidecar_size = if sidecar.is_dir() { dir_size(&sidecar) } else { 0 };
+    let build_tree = looks_like_a_build_tree(dir);
 
     vec![
         check(
             "bundleContents",
-            "번들 안에 `sidecar/node.exe`와 `sidecar/index.js`가 있다.",
-            if has_both {
+            "번들 안에 `sidecar/node.exe`와 `sidecar/index.js`가 있고, 런타임이 핀된 해시와 일치한다.",
+            if contents_ok {
                 CheckStatus::Passed
             } else {
                 CheckStatus::Failed
             },
             format!(
-                "node.exe={} index.js={} ({})",
-                node_exe.is_file(),
-                entry.is_file(),
-                dir.display()
+                "{} ({})\n  런타임 무결성: {}",
+                present
+                    .iter()
+                    .map(|(name, ok)| format!("{name}={ok}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                sidecar.display(),
+                match &integrity {
+                    Some((true, expected, _)) => format!("일치 (manifest {expected})"),
+                    Some((false, expected, actual)) =>
+                        format!("**불일치** — manifest {expected} / 실제 {actual}"),
+                    None => "확인 불가 (manifest.json 또는 node.exe를 읽지 못했습니다)".to_string(),
+                }
             ),
         ),
         check(
@@ -543,13 +614,29 @@ fn bundle_checks(obs: &Observations) -> Vec<Check> {
         .requiring(&[MachineFact::WindowsOs, MachineFact::InstalledBundle]),
         check(
             "bundleSizeRecorded",
-            "번들 크기가 기록된다 — \"크기는 고려하지 않았다\"가 아니라 \"얼마인지 알고 받아들였다\"여야 한다.",
-            if size > 0 {
-                CheckStatus::Passed
-            } else {
+            "**설치된 앱 디렉터리**의 크기가 기록된다 — \"크기는 고려하지 않았다\"가 아니라 \"얼마인지 알고 받아들였다\"여야 한다.",
+            if build_tree || size == 0 {
                 CheckStatus::Failed
+            } else {
+                CheckStatus::Passed
             },
-            format!("{size} 바이트 ({:.1} MiB)", size as f64 / (1024.0 * 1024.0)),
+            if build_tree {
+                // 실측에서 실제로 일어난 일이다(기록 5절). 통과로 두면 그 숫자를 아무도
+                // 다시 보지 않는다 — "얼마인지 알고 받아들였다"의 반대가 된다.
+                format!(
+                    "**빌드 트리를 가리키고 있습니다** ({}) — {:.1} MiB는 배포 크기가 아니라 \
+                     컴파일 중간 산출물입니다. 설치된 앱 디렉터리를 가리키세요.",
+                    dir.display(),
+                    size as f64 / (1024.0 * 1024.0)
+                )
+            } else {
+                format!(
+                    "앱 {size} 바이트 ({:.1} MiB) / 그중 sidecar 동봉 {:.1} MiB ({})",
+                    size as f64 / (1024.0 * 1024.0),
+                    sidecar_size as f64 / (1024.0 * 1024.0),
+                    dir.display()
+                )
+            },
         ),
     ]
 }
@@ -1093,13 +1180,30 @@ mod tests {
         assert_eq!(bundle.verdict, Verdict::NotLanded);
     }
 
+    /// `scripts/stage-sidecar.mjs`가 만드는 것과 같은 모양을 만든다.
+    /// `runtime`을 바꾸면 manifest에 적힌 해시와 어긋나게 할 수 있다.
+    fn staged_bundle(dir: &Path, runtime: &[u8], manifest_sha: Option<&str>) {
+        use sha2::{Digest, Sha256};
+        let sidecar = dir.join("sidecar");
+        std::fs::create_dir_all(&sidecar).unwrap();
+        std::fs::write(sidecar.join("node.exe"), runtime).unwrap();
+        std::fs::write(sidecar.join("index.js"), "console.log(1);").unwrap();
+        std::fs::write(sidecar.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(sidecar.join("node.LICENSE"), "MIT").unwrap();
+        let sha = manifest_sha
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{:x}", Sha256::digest(runtime)));
+        std::fs::write(
+            sidecar.join("manifest.json"),
+            format!(r#"{{"node":{{"version":"v24.20.0","sha256":"{sha}"}}}}"#),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn a_bundle_with_the_runtime_passes_and_records_its_size() {
         let dir = tempfile::tempdir().unwrap();
-        let sidecar = dir.path().join("sidecar");
-        std::fs::create_dir_all(&sidecar).unwrap();
-        std::fs::write(sidecar.join("node.exe"), vec![0u8; 2048]).unwrap();
-        std::fs::write(sidecar.join("index.js"), "console.log(1);").unwrap();
+        staged_bundle(dir.path(), &vec![0u8; 2048], None);
 
         let obs = Observations {
             os: "windows".to_string(),
@@ -1117,6 +1221,90 @@ mod tests {
         assert_eq!(size.status, CheckStatus::Passed);
         // 크기를 **적는다**. "기록된다"가 기준이므로 숫자가 없으면 통과가 아니다.
         assert!(size.detail.contains("2"), "{}", size.detail);
+        // 앱 전체와 동봉분을 **따로** 적는다 — 합계만 있으면 동봉이 얼마를 차지하는지 모른다.
+        assert!(size.detail.contains("sidecar 동봉"), "{}", size.detail);
+    }
+
+    /// **파일이 있다는 것과 그것이 우리가 승인한 바이트라는 것은 다른 사실이다.**
+    ///
+    /// 스테이징이 핀을 검증한 것은 빌드 머신에서의 일이고, 설치본이 그 결과를 담고 있는지는
+    /// 설치본을 봐야 안다. 여기가 갈라지는 경로는 실재한다 — 스테이징 후 `tauri build` 전에
+    /// 누가 파일을 갈아 끼우거나, 이전 빌드의 잔여물이 섞이는 것.
+    #[test]
+    fn a_runtime_that_does_not_match_the_manifest_is_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        staged_bundle(
+            dir.path(),
+            b"different bytes",
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        );
+
+        let obs = Observations {
+            os: "windows".to_string(),
+            bundle_dir: Some(dir.path().to_path_buf()),
+            head_commit: None,
+            attestation: None,
+        };
+        let report = assess(&obs);
+        let check = status_of(&report, "sidecarBundle", "bundleContents");
+        assert_eq!(check.status, CheckStatus::Failed);
+        assert!(check.detail.contains("불일치"), "{}", check.detail);
+    }
+
+    /// `package.json`이 없으면 Node가 진입점을 CommonJS로 읽어 **첫 줄에서** 죽는다.
+    /// 파일이 대부분 있으므로 "번들은 됐다"로 읽히기 쉬운 자리다.
+    #[test]
+    fn a_bundle_without_the_esm_anchor_is_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        staged_bundle(dir.path(), &vec![0u8; 16], None);
+        std::fs::remove_file(dir.path().join("sidecar").join("package.json")).unwrap();
+
+        let obs = Observations {
+            os: "windows".to_string(),
+            bundle_dir: Some(dir.path().to_path_buf()),
+            head_commit: None,
+            attestation: None,
+        };
+        let report = assess(&obs);
+        let check = status_of(&report, "sidecarBundle", "bundleContents");
+        assert_eq!(check.status, CheckStatus::Failed);
+        assert!(check.detail.contains("package.json=false"), "{}", check.detail);
+    }
+
+    /// **빌드 트리를 배포 크기로 세지 않는다.**
+    ///
+    /// 실측에서 `--bundle target/release`를 준 탓에 1586.9 MiB가 "기록됨"으로 통과했다
+    /// (기록 5절). 통과 표시가 붙으면 그 숫자를 아무도 다시 보지 않으므로,
+    /// "얼마인지 알고 받아들였다"라는 기준이 정확히 거꾸로 뒤집힌다.
+    #[test]
+    fn pointing_at_a_build_tree_is_not_a_recorded_bundle_size() {
+        let dir = tempfile::tempdir().unwrap();
+        staged_bundle(dir.path(), &vec![0u8; 64], None);
+        for name in ["build", "deps", ".fingerprint"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        std::fs::write(dir.path().join("deps").join("big.rlib"), vec![0u8; 4096]).unwrap();
+
+        let obs = Observations {
+            os: "windows".to_string(),
+            bundle_dir: Some(dir.path().to_path_buf()),
+            head_commit: None,
+            attestation: None,
+        };
+        let report = assess(&obs);
+        let size = status_of(&report, "sidecarBundle", "bundleSizeRecorded");
+        assert_eq!(size.status, CheckStatus::Failed);
+        assert!(size.detail.contains("빌드 트리"), "{}", size.detail);
+    }
+
+    /// 번들 안의 자리는 `launcher.rs`가 찾는 곳과 **같은 상수**에서 온다.
+    /// 여기서 문자열을 다시 적으면 갈라지고, 갈라진 결과는 조용하다.
+    #[test]
+    fn the_bundle_layout_comes_from_the_launcher_constants() {
+        let bundle = Path::new("/app");
+        assert_eq!(sidecar_dir(bundle), bundle.join(crate::launcher::BUNDLE_DIR));
+        assert_eq!(crate::launcher::ENTRY_FILE, "index.js");
+        assert_eq!(crate::launcher::runtime_file_name(true), "node.exe");
     }
 
     /// 만들지 않은 것은 실패가 아니다 — 다음에 할 일이 다르다.
