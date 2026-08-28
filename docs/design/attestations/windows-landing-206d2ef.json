@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "kind": "windows-landing-attestation",
+  "attestationId": "windows-landing-206d2ef",
+  "attestedBy": "Vyper (windows-landing-record.md 7~12절 실측)",
+  "createdAt": "2026-08-27T00:00:00Z",
+  "commit": "206d2ef",
+  "machine": {
+    "os": "windows",
+    "osVersion": "10.0.19045",
+    "nodeVersion": "v22.22.2",
+    "npmShim": "C:\\nvm4w\\nodejs\\npm.CMD",
+    "visualStudio": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools",
+    "gitForWindows": "C:\\Program Files\\Git",
+    "gitAutocrlf": "true",
+    "python": null,
+    "installedBundle": null
+  },
+  "checks": [
+    {
+      "group": "jobObject",
+      "check": "e2eScenarioA",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 7절. Windows에서 `npm run test:e2e`를 돌려 시나리오 A가 통과했다 — 손자 프로세스(slow-test.pid = 11108)가 취소 후 실제로 죽었고, 실행 전후로 tomverse 관련 잔여 node.exe가 없었다."
+    },
+    {
+      "group": "jobObject",
+      "check": "treeGuaranteedTrue",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 7절. 실제 취소 실행의 기록이 `\"treeKill\": { \"guaranteed\": true, \"method\": \"TerminateJobObject\", \"survivingPid\": null }`였다. method가 TerminateJobObject이므로 taskkill 폴백이 아니라 Job Object 경로를 탔다."
+    },
+    {
+      "group": "commandResolution",
+      "check": "npmResolvesToNodeCli",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 8절. TOOL_COMPLETED의 resolvedCommand가 executable=C:\\nvm4w\\nodejs\\node.exe, args=[C:\\nvm4w\\nodejs\\node_modules\\npm\\bin\\npm-cli.js, test], kind=node-cli-shim, shimPath=C:\\nvm4w\\nodejs\\npm.CMD였다. cmd.exe /c 없이 argv 그대로이며, landing.rs가 \"구조가 다를 수 있다\"고 경고한 nvm4w 설치인데도 올바르게 해석했다."
+    },
+    {
+      "group": "commandResolution",
+      "check": "verificationIsNotSilentlySkipped",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 8절. 종합 판정이 could_not_run이 아니었다 — baseline exit 1(버그 있음) → post exit 0(고쳐짐)으로 테스트가 실제로 돌았다."
+    },
+    {
+      "group": "commandResolution",
+      "check": "unknownShimIsRefusedNotGuessed",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 8절. 실제 파일 시스템·실제 PATHEXT로 확인했고, 같은 디렉터리의 .exe는 통과하는 것도 함께 봤다(거부가 공허하지 않다). 이제 program.rs의 #[cfg(windows)] 테스트가 매 실행마다 확인한다."
+    },
+    {
+      "group": "developerEnv",
+      "check": "vcvarsallIsFoundOnARealMachine",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 9절. `npm run msvc:doctor`. 이 머신이 정확히 문서의 실측 사례다 — 설치 2개 중 최신(D:\\Program Files\\Microsoft Visual Studio\\18\\Enterprise)에 vcvarsall.bat이 없고, 쓸 수 있는 것은 더 오래된 2022 BuildTools였다. -latest였다면 실패했을 자리다."
+    },
+    {
+      "group": "developerEnv",
+      "check": "cargoBuildLinksWithoutADeveloperShell",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 9절. INCLUDE/LIB/VSINSTALLDIR이 모두 빈 평범한 PowerShell에서 `npm run core:build`가 링크까지 성공했다."
+    },
+    {
+      "group": "developerEnv",
+      "check": "msvcLinkWinsOverGitLink",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 9절. GNU coreutils link.exe(C:\\Program Files\\Git\\usr\\bin, \"link (GNU coreutils) 8.32\")를 PATH 선두에 둔 채 cargo clean(1420 파일 / 1.0 GiB 제거) 후 전체 재빌드가 성공해 동작하는 10.6 MB 바이너리가 나왔다."
+    },
+    {
+      "group": "pathNormalization",
+      "check": "verbatimPrefixStripped",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 11절. `--workspace \\\\?\\C:\\...\\tomverse-fixture-XXXX`로 실제 실행: 태스크가 completed로 끝났고 mutatedPaths = [\"paginate.js\"]였다. 게이트가 정상 경로를 경계 밖으로 판정하지 않았고, 결과 JSON에 verbatim 프리픽스가 남지 않았다."
+    },
+    {
+      "group": "pathNormalization",
+      "check": "uncPathsUntouched",
+      "observedAt": "2026-08-27",
+      "evidence": "기록 11절. \\\\localhost\\Users\\...와 \\\\?\\UNC\\localhost\\... 둘 다 접근이 실패하지 않았고 파일이 실제로 바뀌었다 — 이 기준이 경계하는 \"잘못 벗기면 경로가 깨져 접근 자체가 실패한다\"는 일어나지 않았다. 같은 실행에서 드러난 별개 결함(기록 6절: npm이 lifecycle 스크립트를 cmd.exe로 돌려 UNC 작업 디렉터리를 쓰지 못한다)은 이 기준이 아니라 검증 러너의 문제이며 미해결로 남아 있다."
+    }
+  ],
+  "attestationHash": "52378da3399e1c49f632d5ed4195cacd995e903ca552606297d4316f911c388a"
+}

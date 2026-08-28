@@ -19,6 +19,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::landing_attest::{self, AttestationSource, MachineFact};
+
 /// 기준 하나의 상태.
 ///
 /// **다섯 값인 것이 요점이다.** 넷으로 줄이면 "확인할 수 없었다"와 "아직 만들지 않았다"가
@@ -52,6 +54,29 @@ pub struct Check {
     pub status: CheckStatus,
     /// 무엇을 보고 그렇게 판정했는가, 또는 사람이 무엇을 해야 하는가.
     pub detail: String,
+    /// 이 기준을 **사람이 확인하려면** 그 머신에 무엇이 있어야 하는가 (`landing_attest.rs`).
+    ///
+    /// 기준 옆에 두는 것이 요점이다 — 별도 표로 몰아두면 기준을 고칠 때 요구를 함께
+    /// 고치지 않게 되고, 그러면 없는 것으로 확인했다는 기록이 통과한다. 기록 1·10절이
+    /// 그 실패를 실제로 보여준다: Python이 없는 머신에서 `pythonEnv`는 확인될 수 없다.
+    pub requires: &'static [MachineFact],
+    /// 사람의 확인으로 통과했다면 **그 확인의 출처**. 기계가 본 통과와 구별되어야 한다 —
+    /// 목적은 숫자를 줄이는 것이 아니라 누가·어디서·언제 확인했는지가 남는 것이다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<AttestedBy>,
+}
+
+/// 한 기준이 **사람의 확인으로** 통과했다는 사실과 그 출처.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestedBy {
+    pub attestation_id: String,
+    pub attested_by: String,
+    /// 확인이 이루어진 머신 한 줄 요약.
+    pub machine: String,
+    pub commit: String,
+    pub observed_at: String,
+    pub evidence: String,
 }
 
 /// 한 항목(= 문서 한 절)의 결말.
@@ -86,16 +111,82 @@ pub struct Group {
     pub verdict: Verdict,
 }
 
+/// attestation 파일이 이번 판정에서 어떻게 됐는가.
+///
+/// **네 값인 것이 요점이다.** 셋으로 줄이면 다음에 할 일이 다른 상태들이 뭉개진다 —
+/// 만료는 "새 커밋에서 다시 확인하라", 거부는 "파일을 고쳐라", 적용 불가는 "저장소 안에서
+/// 돌려라"이고, 부분 수용은 "적은 것 중 일부가 통과하지 못했으니 그 줄을 보라"다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationStatus {
+    /// 적힌 것이 전부 반영됐다.
+    Accepted,
+    /// 일부만 반영됐다. **나머지가 왜 반영되지 않았는지가 `rejections`에 있다.**
+    PartiallyAccepted,
+    /// 다른 커밋에서 확인한 기록이다. **아무것도 반영하지 않는다** —
+    /// 옛 확인이 새 코드를 통과시키면 이 도구는 착시를 만드는 쪽이 된다.
+    Expired,
+    /// 지금 커밋을 알 수 없어 만료 여부를 판정할 수 없다. 모르면 반영하지 않는다.
+    Inapplicable,
+    /// 파일 자체가 기록으로 성립하지 않는다 (해시·모양·빈 근거).
+    Rejected,
+}
+
+/// 반영하지 **않은** 줄과 그 이유. 조용히 버리지 않는다 — 사람이 적은 것이 반영되지 않았다면
+/// 그 사실이 가장 먼저 보여야 한다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestationRejection {
+    /// `그룹/기준`. 파일 전체가 거부된 경우에는 `-`다.
+    pub target: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestationReport {
+    pub file: String,
+    pub status: AttestationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attested_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    /// 확인이 이루어진 커밋.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// 지금 워크스페이스의 커밋. 둘이 다르면 만료다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
+    /// 반영된 `그룹/기준` 목록.
+    pub accepted: Vec<String>,
+    pub rejections: Vec<AttestationRejection>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LandingReport {
     /// 이 판정이 어느 OS에서 나왔는가. **Windows가 아니면 대부분 볼 수 없다**는 사실이
     /// 보고서 안에 남아야 한다.
     pub platform: String,
+    /// 지금 워크스페이스의 커밋. attestation의 만료를 판정하는 기준이다.
+    #[serde(rename = "headCommit", skip_serializing_if = "Option::is_none")]
+    pub head_commit: Option<String>,
     pub groups: Vec<Group>,
     /// 전체 결말 — 항목 중 하나라도 `Landed`가 아니면 `Landed`가 아니다.
     pub verdict: Verdict,
+    /// 통과 중 **사람의 확인으로** 통과한 것의 수.
+    ///
+    /// 기계가 본 통과와 같은 칸에 넣지 않는 이유: `remaining`이 줄어드는 것이 이 기능의
+    /// 목적이 아니다. 목적은 **누가·어디서·언제 확인했는지가 남는 것**이고, 그러려면
+    /// "그중 몇 개가 종이인가"가 보고서 표면에 있어야 한다.
+    #[serde(rename = "attestedPasses")]
+    pub attested_passes: usize,
     /// 사람이 아직 해야 하는 일. 비어 있지 않으면 그게 다음 할 일 목록이다.
     pub remaining: Vec<String>,
+    /// `--attest`를 준 경우에만 있다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<AttestationReport>,
 }
 
 /// 판정에 쓰는 관측. **판정 로직을 순수하게 두기 위해** 입력으로 받는다 —
@@ -105,6 +196,11 @@ pub struct Observations {
     pub os: String,
     /// `tauri-build`이 만든 번들 디렉터리. 없으면 번들 기준을 볼 수 없다.
     pub bundle_dir: Option<PathBuf>,
+    /// 지금 워크스페이스의 커밋. **`None`이면 만료를 판정할 수 없다** —
+    /// 그때는 attestation을 반영하지 않는다(모르는 것을 통과로 세지 않는다).
+    pub head_commit: Option<String>,
+    /// 사람이 확인한 기록. 읽기(IO)는 호출자가 하고 여기는 판정만 한다.
+    pub attestation: Option<AttestationSource>,
 }
 
 impl Observations {
@@ -112,7 +208,17 @@ impl Observations {
         Self {
             os: std::env::consts::OS.to_string(),
             bundle_dir,
+            head_commit: None,
+            attestation: None,
         }
+    }
+
+    /// 지금 커밋과 attestation 파일을 붙인다. 둘은 **함께** 온다 —
+    /// 커밋 없이 attestation만 주면 만료를 판정할 수 없고, 그 상태를 기본으로 만들지 않는다.
+    pub fn with_attestation(mut self, head_commit: Option<String>, attestation: Option<AttestationSource>) -> Self {
+        self.head_commit = head_commit;
+        self.attestation = attestation;
+        self
     }
 
     fn on_windows(&self) -> bool {
@@ -120,12 +226,185 @@ impl Observations {
     }
 }
 
+/// 사람의 확인을 기준에 **반영한다.** 반영하지 못한 것은 전부 이유와 함께 남는다.
+///
+/// # 무엇을 덮을 수 있고 무엇을 덮을 수 없는가
+///
+/// | 관측한 상태 | attestation |
+/// |---|---|
+/// | `NeedsHuman` | **통과로 바꾼다** — 애초에 사람을 기다리던 자리다 |
+/// | `NotCheckableHere` | **통과로 바꾼다** — "여기서는 볼 수 없다"에 대한 답이 바로 다른 머신의 확인이다 |
+/// | `Failed` | **덮지 못한다.** 도구가 실제로 관측한 실패를 사람의 종이가 지우지 못한다 |
+/// | `NotImplemented` | **덮지 못한다.** 없는 기능을 확인할 수는 없다 |
+/// | `Passed` | 덮을 것이 없다. 적혀 있으면 아무 일도 하지 않았다고 알린다 |
+fn apply_attestation(groups: &mut [Group], obs: &Observations) -> Option<AttestationReport> {
+    let source = obs.attestation.as_ref()?;
+
+    let attestation = match &source.parsed {
+        Ok(a) => a,
+        Err(reasons) => {
+            return Some(AttestationReport {
+                file: source.file.clone(),
+                status: AttestationStatus::Rejected,
+                attestation_id: None,
+                attested_by: None,
+                machine: None,
+                commit: None,
+                head_commit: obs.head_commit.clone(),
+                accepted: Vec::new(),
+                rejections: reasons
+                    .iter()
+                    .map(|reason| AttestationRejection {
+                        target: "-".to_string(),
+                        reason: reason.clone(),
+                    })
+                    .collect(),
+            })
+        }
+    };
+
+    let mut report = AttestationReport {
+        file: source.file.clone(),
+        status: AttestationStatus::Accepted,
+        attestation_id: Some(attestation.attestation_id.clone()),
+        attested_by: Some(attestation.attested_by.clone()),
+        machine: Some(attestation.machine.summary()),
+        commit: Some(attestation.commit.clone()),
+        head_commit: obs.head_commit.clone(),
+        accepted: Vec::new(),
+        rejections: Vec::new(),
+    };
+
+    // **만료가 먼저다.** 다른 커밋의 확인은 이 코드에 대한 확인이 아니므로, 항목별로
+    // 따질 것도 없이 통째로 반영하지 않는다.
+    let Some(head) = obs.head_commit.as_deref() else {
+        report.status = AttestationStatus::Inapplicable;
+        report.rejections.push(AttestationRejection {
+            target: "-".to_string(),
+            reason: "지금 커밋을 알 수 없어 만료 여부를 판정할 수 없습니다 — git 저장소 안에서 \
+                     돌리세요. 모르는 것을 통과로 세지 않습니다."
+                .to_string(),
+        });
+        return Some(report);
+    };
+    if !landing_attest::commit_matches(&attestation.commit, head) {
+        report.status = AttestationStatus::Expired;
+        report.rejections.push(AttestationRejection {
+            target: "-".to_string(),
+            reason: format!(
+                "{}에서 확인한 기록인데 지금은 {}입니다 — 만료되었습니다. 옛 확인이 새 코드를 \
+                 통과시키면 이 도구는 착시를 만드는 쪽이 됩니다. 이 커밋에서 다시 확인하세요.",
+                attestation.commit, head
+            ),
+        });
+        return Some(report);
+    }
+
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for attested in &attestation.checks {
+        let target = format!("{}/{}", attested.group, attested.check);
+        // 클로저로 감싸지 않는다 — `report`를 빌려 잡은 채로 아래에서 다시 쓰게 되고,
+        // 그걸 피하려고 구조를 비트는 것보다 이 편이 읽기 쉽다.
+        macro_rules! reject {
+            ($reason:expr) => {{
+                report.rejections.push(AttestationRejection {
+                    target: target.clone(),
+                    reason: $reason,
+                });
+                continue;
+            }};
+        }
+
+        if !seen.insert(target.clone()) {
+            reject!("같은 기준이 두 번 적혀 있습니다".to_string());
+        }
+
+        let Some(group) = groups.iter_mut().find(|g| g.id == attested.group) else {
+            reject!(format!("그런 그룹이 없습니다: {}", attested.group));
+        };
+        let Some(check) = group.checks.iter_mut().find(|c| c.id == attested.check) else {
+            reject!(format!("{} 그룹에 그런 기준이 없습니다: {}", attested.group, attested.check));
+        };
+
+        match check.status {
+            CheckStatus::Failed => reject!("도구가 **실패로 관측한** 기준입니다 — 사람의 확인은 \
+                 확인하지 못한 것을 통과로 바꿀 뿐, 관측된 실패를 지우지 않습니다."
+                .to_string()),
+            CheckStatus::NotImplemented => {
+                reject!("기능이 아직 없습니다 — 확인할 대상이 없는 기준입니다.".to_string())
+            }
+            CheckStatus::Passed => {
+                reject!("이미 기계가 통과로 판정했습니다 — 이 줄은 아무것도 바꾸지 않았습니다.".to_string())
+            }
+            CheckStatus::NeedsHuman | CheckStatus::NotCheckableHere => {}
+        }
+
+        // **머신 사양이 판정에 반영되는 자리.** "Python으로 확인했다"는 Python이 있는
+        // 머신에서만 뜻이 있다(기록 1·10절).
+        let missing = attestation.machine.missing(check.requires);
+        if !missing.is_empty() {
+            let names: Vec<&str> = missing.iter().map(|f| f.label()).collect();
+            reject!(format!(
+                "확인한 머신에 없는 것으로 확인할 수는 없습니다: {} (기록된 머신: {})",
+                names.join(", "),
+                attestation.machine.summary()
+            ));
+        }
+
+        // **`detail`도 함께 바꾼다.** 상태만 통과로 바꾸고 "Windows에서 사람이 확인해야
+        // 한다"를 그대로 두면, 보고서를 읽는 사람이 통과와 남은 일을 동시에 읽게 된다.
+        // 도구가 여전히 보지 못한다는 사실은 지우지 않고 뒤에 남긴다 — 그게 사람의 확인이
+        // 기계의 관측과 다른 종류라는 표시다.
+        check.detail = format!(
+            "사람이 확인함 — {} / {} / 커밋 {} / {}. 근거: {} (도구가 본 것은 그대로다: {})",
+            attestation.attested_by,
+            attestation.machine.summary(),
+            attestation.commit,
+            attested.observed_at,
+            attested.evidence,
+            check.detail
+        );
+        check.status = CheckStatus::Passed;
+        check.attestation = Some(AttestedBy {
+            attestation_id: attestation.attestation_id.clone(),
+            attested_by: attestation.attested_by.clone(),
+            machine: attestation.machine.summary(),
+            commit: attestation.commit.clone(),
+            observed_at: attested.observed_at.clone(),
+            evidence: attested.evidence.clone(),
+        });
+        report.accepted.push(target);
+    }
+
+    for group in groups.iter_mut() {
+        group.verdict = verdict_of(&group.checks);
+    }
+
+    if !report.rejections.is_empty() {
+        report.status = AttestationStatus::PartiallyAccepted;
+    }
+    Some(report)
+}
+
+/// 기본 요구는 **Windows 하나다.** 이 모듈의 모든 기준이 Windows에서만 확인되므로,
+/// 요구를 적지 않아도 "아무 머신에서나 확인했다고 적을 수 있다"가 되지는 않는다.
 fn check(id: &'static str, criterion: &'static str, status: CheckStatus, detail: impl Into<String>) -> Check {
     Check {
         id,
         criterion,
         status,
         detail: detail.into(),
+        requires: &[MachineFact::WindowsOs],
+        attestation: None,
+    }
+}
+
+impl Check {
+    /// Windows 외에 **더** 필요한 것을 적는다. 목록에 `WindowsOs`도 함께 적어야 한다 —
+    /// 여기서 조용히 더해 주면 "이 기준의 요구가 무엇인가"를 한 자리에서 읽을 수 없다.
+    fn requiring(mut self, facts: &'static [MachineFact]) -> Self {
+        self.requires = facts;
+        self
     }
 }
 
@@ -167,7 +446,8 @@ fn job_object_checks(obs: &Observations) -> Vec<Check> {
             CheckStatus::NeedsHuman,
             "Windows에서 `npm run test:e2e`를 돌리고 시나리오 A가 통과하는지 볼 것. \
              종료 코드만으로는 이 기준을 알 수 없다 — 다른 시나리오가 실패해도 같은 코드다.",
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::NodeAndNpm]),
         check(
             "treeGuaranteedTrue",
             "`TreeKillOutcome.tree_guaranteed`가 Windows에서 true가 되고, 그 값이 UI 문구를 실제로 바꾼다.",
@@ -175,7 +455,8 @@ fn job_object_checks(obs: &Observations) -> Vec<Check> {
             "**절반은 여기서 이미 지킨다** — 값에 따라 문구가 갈리는 것은 플랫폼과 무관한 \
              순수 분기이고 `tools/mod.rs`의 단위 테스트가 그 분기를 태운다. Windows에서 확인할 \
              나머지 절반은 '실제 취소에서 그 값이 true가 되는가'다.",
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::NodeAndNpm]),
         check(
             "appNotInJob",
             "앱 자신이 job에 들어가지 않는다 — `AssignProcessToJobObject`는 자식 핸들에만 부른다.",
@@ -207,13 +488,15 @@ fn bundle_checks(obs: &Observations) -> Vec<Check> {
                 "설치된 앱을 PATH에 node가 없는 머신에서 실행해 sidecar가 뜬다.",
                 CheckStatus::NeedsHuman,
                 "설치본을 node 없는 Windows에서 실행할 것.",
-            ),
+            )
+            .requiring(&[MachineFact::WindowsOs, MachineFact::InstalledBundle]),
             check(
                 "sourcesAreBundled",
                 "그 실행에서 `ProgramSource`/`EntrySource`가 둘 다 `Bundled`다.",
                 CheckStatus::NeedsHuman,
                 "앱이 번들이 아닐 때 stderr로 알린다(session.rs) — 그 줄이 없어야 한다.",
-            ),
+            )
+            .requiring(&[MachineFact::WindowsOs, MachineFact::InstalledBundle]),
             check(
                 "bundleSizeRecorded",
                 "번들 크기가 기록된다 — \"크기는 고려하지 않았다\"가 아니라 \"얼마인지 알고 받아들였다\"여야 한다.",
@@ -249,13 +532,15 @@ fn bundle_checks(obs: &Observations) -> Vec<Check> {
             "설치된 앱을 PATH에 node가 없는 머신에서 실행해 sidecar가 뜬다.",
             CheckStatus::NeedsHuman,
             "번들에 파일이 있다는 것과 그것으로 뜬다는 것은 다른 사실이다.",
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::InstalledBundle]),
         check(
             "sourcesAreBundled",
             "그 실행에서 `ProgramSource`/`EntrySource`가 둘 다 `Bundled`다.",
             CheckStatus::NeedsHuman,
             "앱이 번들이 아닐 때 stderr로 알린다(session.rs) — 그 줄이 없어야 한다.",
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::InstalledBundle]),
         check(
             "bundleSizeRecorded",
             "번들 크기가 기록된다 — \"크기는 고려하지 않았다\"가 아니라 \"얼마인지 알고 받아들였다\"여야 한다.",
@@ -342,7 +627,8 @@ fn command_resolution_checks(obs: &Observations) -> Vec<Check> {
                 "{npm_detail} 실행 결과의 `resolvedCommand`에 node.exe와 npm-cli.js가 보여야 한다. \
                  nvm/volta/fnm/Scoop 설치는 구조가 다를 수 있고, 다르면 **추측하지 않고 실패하는** 것이 맞다."
             ),
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::NodeAndNpm]),
         check(
             "verificationIsNotSilentlySkipped",
             "그 태스크의 종합 판정이 `could_not_run`이 아니다.",
@@ -351,7 +637,8 @@ fn command_resolution_checks(obs: &Observations) -> Vec<Check> {
                 "{skip_detail} 이게 이 함정의 **유일하게 눈에 보이는 증상**이다 — \
                  해석이 실패하면 검증이 SKIPPED_WITH_REASON이 되고 작업이 검증 없이 완료로 보고된다."
             ),
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::NodeAndNpm]),
         check(
             "unknownShimIsRefusedNotGuessed",
             "알려지지 않은 `.cmd`/`.bat`는 셸로 감싸지 않고 실패한다.",
@@ -360,7 +647,8 @@ fn command_resolution_checks(obs: &Observations) -> Vec<Check> {
                 "{unknown_detail} `cmd.exe /c`로 감싸면 인자의 `&`/`|`/`%`가 재해석되어 \
                  원칙 6(승인 화면의 argv = 실제 실행)이 무너진다."
             ),
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::NodeAndNpm]),
     ]
 }
 
@@ -447,7 +735,8 @@ fn python_env_checks(obs: &Observations) -> Vec<Check> {
             format!(
                 "{detail} 이 기능의 전제가 그것이다 — 활성화가 하는 일은 PATH 조작뿐이므로                  인터프리터를 직접 부르면 같은 결과가 나온다는 것. 틀리면 증상은                  `No module named pytest`이고, 그 문장은 사용자의 설치 문제로 읽힌다."
             ),
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::Python]),
         check(
             "pythonOnPathIsNotTheStoreAlias",
             "PATH의 python이 Microsoft Store 별칭이 아니다.",
@@ -455,7 +744,8 @@ fn python_env_checks(obs: &Observations) -> Vec<Check> {
             format!(
                 "{detail} Windows는 `python`/`python3`를 Store 설치 별칭으로 두는 경우가 있고,                  그것을 실행하면 프로그램이 아니라 **스토어 창이 뜬다** — 명령은 걸린 채로 끝나지 않는다.                  그래서 PATH 후보에서 `python3`를 뺐지만, `python` 쪽은 같은 위험이 남는다."
             ),
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::Python]),
         check(
             "venvPathWithSpacesOrDriveLetterSurvives",
             "공백이나 드라이브 문자가 든 가상환경 경로가 그대로 실행된다.",
@@ -463,7 +753,8 @@ fn python_env_checks(obs: &Observations) -> Vec<Check> {
             format!(
                 "{detail} C:/Users/내 문서/proj/.venv 처럼 공백이 든 경로가 흔하고,                  argv로 넘기므로 인용이 필요 없지만 **그 사실이 실제로 성립하는지는 실행해야 안다**."
             ),
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::Python]),
     ]
 }
 
@@ -491,7 +782,8 @@ fn developer_env_checks(obs: &Observations) -> Vec<Check> {
             format!(
                 "{detail} 탐지 순서(override → vswhere → VSINSTALLDIR → 서브트리 검색)는 Linux에서 검증되지만,                  **실제 설치 구조는 여기서 볼 수 없다** — 실측 머신의 경로는 드라이브도 버전 디렉터리도                  하드코딩 후보와 전부 달랐다."
             ),
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::VisualStudioWithCxx]),
         check(
             "cargoBuildLinksWithoutADeveloperShell",
             "개발자 셸이 아닌 곳에서 시작한 앱이 `cargo build`를 링크까지 성공시킨다.",
@@ -499,7 +791,8 @@ fn developer_env_checks(obs: &Observations) -> Vec<Check> {
             format!(
                 "{detail} 이게 이 기능의 **유일하게 눈에 보이는 증상**이다 — 준비가 안 되면                  `stdarg.h: No such file or directory`로 실패하고, 그 문장은 \"C 컴파일러가 없다\"로 읽힌다."
             ),
-        ),
+        )
+        .requiring(&[MachineFact::WindowsOs, MachineFact::VisualStudioWithCxx]),
         check(
             "msvcLinkWinsOverGitLink",
             "Git for Windows가 PATH에 있어도 `link.exe`가 MSVC의 것으로 해석된다.",
@@ -507,7 +800,12 @@ fn developer_env_checks(obs: &Observations) -> Vec<Check> {
             format!(
                 "{detail} 준비한 PATH가 우리 PATH **앞에** 와야 성립한다. 증상은                  `link: extra operand`이고, rustc가 붙이는 힌트는 이 경우 오도한다."
             ),
-        ),
+        )
+        .requiring(&[
+            MachineFact::WindowsOs,
+            MachineFact::VisualStudioWithCxx,
+            MachineFact::GitForWindows,
+        ]),
         check(
             "aFailedPreparationDoesNotBlockTheCommand",
             "준비하지 못해도 명령은 그대로 실행되고, 확인 목록이 결과에 남는다.",
@@ -531,7 +829,7 @@ pub const WINDOWS_FILES_WITHOUT_LANDING: &[(&str, &str)] = &[(
 
 /// 관측을 기준에 대본다. **아무것도 실행하지 않고 아무것도 쓰지 않는다.**
 pub fn assess(obs: &Observations) -> LandingReport {
-    let groups = vec![
+    let mut groups = vec![
         {
             let checks = job_object_checks(obs);
             Group {
@@ -606,6 +904,10 @@ pub fn assess(obs: &Observations) -> LandingReport {
         },
     ];
 
+    // **사람의 확인은 기계의 관측 다음에 온다.** 순서가 반대면 관측이 확인을 덮게 되고,
+    // 그러면 `Failed`가 통과로 바뀌는 길이 열린다.
+    let attestation = apply_attestation(&mut groups, obs);
+
     let all: Vec<&Check> = groups.iter().flat_map(|g| g.checks.iter()).collect();
     let verdict = if all.iter().any(|c| c.status == CheckStatus::Failed) {
         Verdict::NotLanded
@@ -615,6 +917,7 @@ pub fn assess(obs: &Observations) -> LandingReport {
         Verdict::Incomplete
     };
 
+    let attested_passes = all.iter().filter(|c| c.attestation.is_some()).count();
     let remaining = all
         .iter()
         .filter(|c| !c.status.is_pass())
@@ -623,9 +926,12 @@ pub fn assess(obs: &Observations) -> LandingReport {
 
     LandingReport {
         platform: obs.os.clone(),
+        head_commit: obs.head_commit.clone(),
         groups,
         verdict,
+        attested_passes,
         remaining,
+        attestation,
     }
 }
 
@@ -637,6 +943,8 @@ mod tests {
         Observations {
             os: "linux".to_string(),
             bundle_dir: None,
+            head_commit: None,
+            attestation: None,
         }
     }
 
@@ -699,6 +1007,8 @@ mod tests {
         let obs = Observations {
             os: "windows".to_string(),
             bundle_dir: Some(dir.path().to_path_buf()),
+            head_commit: None,
+            attestation: None,
         };
         let report = assess(&obs);
         let bundle = report.groups.iter().find(|g| g.id == "sidecarBundle").unwrap();
@@ -718,6 +1028,8 @@ mod tests {
         let obs = Observations {
             os: "windows".to_string(),
             bundle_dir: Some(dir.path().to_path_buf()),
+            head_commit: None,
+            attestation: None,
         };
         let report = assess(&obs);
         let bundle = report.groups.iter().find(|g| g.id == "sidecarBundle").unwrap();
@@ -884,4 +1196,355 @@ mod tests {
         }
     }
 
+    // ---- 사람의 확인을 받아들이는 입구 (기록 15절) ----
+    //
+    // 여기서 지키는 것은 "숫자가 줄어든다"가 아니다. **줄어들면 안 되는 자리에서 줄어들지
+    // 않는 것**이다 — 관측된 실패, 없는 기능, 없는 머신, 다른 커밋.
+
+    use crate::landing_attest::{AttestationSource, MachineSpec};
+    use serde_json::{json, Value};
+
+    const HEAD: &str = "206d2ef3678c13722f29cb025693f2e6ad8b8307";
+
+    /// 실측 머신(기록 1절)을 그대로 옮긴 사양 — **Python이 없다.**
+    fn measured_machine() -> Value {
+        json!({
+            "os": "windows",
+            "osVersion": "10.0.19045",
+            "nodeVersion": "v22.22.2",
+            "npmShim": "C:\\nvm4w\\nodejs\\npm.CMD",
+            "visualStudio": "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools",
+            "gitForWindows": "C:\\Program Files\\Git",
+            "gitAutocrlf": "true",
+            "python": null,
+            "installedBundle": null
+        })
+    }
+
+    fn attestation_for(commit: &str, machine: Value, checks: Value) -> AttestationSource {
+        let mut raw = json!({
+            "schemaVersion": crate::landing_attest::SCHEMA_VERSION,
+            "kind": crate::landing_attest::KIND,
+            "attestationId": "test",
+            "attestedBy": "Vyper",
+            "createdAt": "2026-08-27T00:00:00Z",
+            "commit": commit,
+            "machine": machine,
+            "checks": checks,
+            "attestationHash": ""
+        });
+        let hash = crate::landing_attest::hash_excluding_field(&raw, crate::landing_attest::HASH_FIELD).expect("해시");
+        raw[crate::landing_attest::HASH_FIELD] = json!(hash);
+        AttestationSource {
+            file: "test.json".to_string(),
+            parsed: crate::landing_attest::parse(&raw),
+        }
+    }
+
+    fn attested(group: &str, check: &str) -> Value {
+        json!([{
+            "group": group,
+            "check": check,
+            "observedAt": "2026-08-27T00:00:00Z",
+            "evidence": "실행 기록에서 직접 확인했다"
+        }])
+    }
+
+    fn windows_with(attestation: AttestationSource, head: Option<&str>) -> Observations {
+        Observations {
+            os: "windows".to_string(),
+            bundle_dir: None,
+            head_commit: head.map(|h| h.to_string()),
+            attestation: Some(attestation),
+        }
+    }
+
+    fn status_of<'a>(report: &'a LandingReport, group: &str, check: &str) -> &'a Check {
+        report
+            .groups
+            .iter()
+            .find(|g| g.id == group)
+            .unwrap_or_else(|| panic!("그룹이 없습니다: {group}"))
+            .checks
+            .iter()
+            .find(|c| c.id == check)
+            .unwrap_or_else(|| panic!("기준이 없습니다: {check}"))
+    }
+
+    /// **입구가 실제로 열린다.** 사람이 확인한 것은 통과가 되고, **누가·어디서·언제·무엇을
+    /// 보고** 확인했는지가 보고서에 남는다 — 숫자가 줄어드는 것이 아니라 이게 목적이다.
+    #[test]
+    fn a_human_check_lands_with_its_provenance_attached() {
+        let obs = windows_with(
+            attestation_for(HEAD, measured_machine(), attested("commandResolution", "npmResolvesToNodeCli")),
+            Some(HEAD),
+        );
+        let report = assess(&obs);
+
+        let check = status_of(&report, "commandResolution", "npmResolvesToNodeCli");
+        assert_eq!(check.status, CheckStatus::Passed);
+        let by = check.attestation.as_ref().expect("출처가 남지 않았습니다");
+        assert_eq!(by.attested_by, "Vyper");
+        assert_eq!(by.commit, HEAD);
+        assert!(by.machine.contains("10.0.19045"), "{}", by.machine);
+        assert!(!by.evidence.trim().is_empty());
+
+        // 기계가 본 통과와 **같은 칸에 넣지 않는다.**
+        assert_eq!(report.attested_passes, 1);
+        let att = report.attestation.as_ref().expect("attestation 보고가 없습니다");
+        assert_eq!(att.status, AttestationStatus::Accepted);
+        assert_eq!(att.accepted, vec!["commandResolution/npmResolvesToNodeCli".to_string()]);
+    }
+
+    /// **커밋이 바뀌면 만료된다.** 옛 확인이 새 코드를 통과시키면 이 도구가 착시를 만든다.
+    #[test]
+    fn an_attestation_from_another_commit_expires_and_changes_nothing() {
+        let old = "206d2ef";
+        let now = "f9767a3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let obs = windows_with(
+            attestation_for(old, measured_machine(), attested("commandResolution", "npmResolvesToNodeCli")),
+            Some(now),
+        );
+        let report = assess(&obs);
+
+        assert_eq!(status_of(&report, "commandResolution", "npmResolvesToNodeCli").status, CheckStatus::NeedsHuman);
+        assert_eq!(report.attested_passes, 0);
+        let att = report.attestation.as_ref().unwrap();
+        assert_eq!(att.status, AttestationStatus::Expired);
+        assert!(att.accepted.is_empty());
+        assert!(att.rejections[0].reason.contains("만료"), "{:?}", att.rejections);
+    }
+
+    /// 짧게 적은 커밋이 지금 커밋의 접두사면 같은 커밋이다 — 사람은 7자리로 적는다.
+    #[test]
+    fn a_short_commit_that_prefixes_head_is_not_expired() {
+        let obs = windows_with(
+            attestation_for("206d2ef", measured_machine(), attested("commandResolution", "npmResolvesToNodeCli")),
+            Some(HEAD),
+        );
+        let report = assess(&obs);
+        assert_eq!(report.attestation.as_ref().unwrap().status, AttestationStatus::Accepted);
+    }
+
+    /// 지금 커밋을 모르면 **반영하지 않는다.** 만료 여부를 판정할 수 없는데 통과시키면
+    /// 만료가 있으나 마나다.
+    #[test]
+    fn without_a_head_commit_nothing_is_applied() {
+        let obs = windows_with(
+            attestation_for(HEAD, measured_machine(), attested("commandResolution", "npmResolvesToNodeCli")),
+            None,
+        );
+        let report = assess(&obs);
+        assert_eq!(report.attested_passes, 0);
+        assert_eq!(report.attestation.as_ref().unwrap().status, AttestationStatus::Inapplicable);
+    }
+
+    /// **attestation은 `Failed`를 덮지 못한다.**
+    ///
+    /// 기록 5절이 바로 이 자리다: 번들에 sidecar가 없다는 것은 도구가 **봤고**, 그 사실을
+    /// 사람의 종이가 지워서는 안 된다.
+    #[test]
+    fn an_attestation_cannot_erase_an_observed_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let obs = Observations {
+            os: "windows".to_string(),
+            bundle_dir: Some(dir.path().to_path_buf()),
+            head_commit: Some(HEAD.to_string()),
+            attestation: Some(attestation_for(
+                HEAD,
+                measured_machine(),
+                attested("sidecarBundle", "bundleContents"),
+            )),
+        };
+        let report = assess(&obs);
+
+        let check = status_of(&report, "sidecarBundle", "bundleContents");
+        assert_eq!(check.status, CheckStatus::Failed);
+        assert!(check.attestation.is_none());
+        assert_eq!(report.verdict, Verdict::NotLanded);
+
+        let att = report.attestation.as_ref().unwrap();
+        assert_eq!(att.status, AttestationStatus::PartiallyAccepted);
+        assert!(att.rejections[0].reason.contains("실패로 관측"), "{:?}", att.rejections);
+    }
+
+    /// **없는 기능은 확인할 수 없다.** `NotImplemented`도 덮이지 않는다 —
+    /// 덮이면 "만들었는데 확인했다"가 되고, credentialStore는 아직 만들지 않았다.
+    #[test]
+    fn an_attestation_cannot_pass_an_unbuilt_feature() {
+        let obs = windows_with(
+            attestation_for(HEAD, measured_machine(), attested("credentialStore", "storedThroughDpapi")),
+            Some(HEAD),
+        );
+        let report = assess(&obs);
+        assert_eq!(status_of(&report, "credentialStore", "storedThroughDpapi").status, CheckStatus::NotImplemented);
+        assert!(report.attestation.as_ref().unwrap().rejections[0]
+            .reason
+            .contains("기능이 아직 없습니다"));
+    }
+
+    /// **머신 사양이 판정에 반영된다.**
+    ///
+    /// 실측 머신에는 Python이 없었다(기록 1·10절). "Python으로 확인했다"는 Python이 있는
+    /// 머신에서만 뜻이 있으므로, 같은 문장을 적어도 그 머신에서는 통과하지 않는다.
+    #[test]
+    fn a_machine_without_python_cannot_attest_the_python_criteria() {
+        let obs = windows_with(
+            attestation_for(
+                HEAD,
+                measured_machine(),
+                attested("pythonEnv", "venvInterpreterRunsWithoutActivation"),
+            ),
+            Some(HEAD),
+        );
+        let report = assess(&obs);
+
+        assert_eq!(
+            status_of(&report, "pythonEnv", "venvInterpreterRunsWithoutActivation").status,
+            CheckStatus::NeedsHuman
+        );
+        assert_eq!(report.attested_passes, 0);
+        let rejection = &report.attestation.as_ref().unwrap().rejections[0];
+        assert!(rejection.reason.contains("Python"), "{}", rejection.reason);
+
+        // **같은 문장이 Python이 있는 머신에서는 통과한다.** 아니면 이 검사는 "pythonEnv는
+        // 영원히 통과하지 못한다"를 확인한 것이지 머신 사양을 확인한 것이 아니다.
+        let mut with_python = measured_machine();
+        with_python["python"] = json!("C:\\Python312\\python.exe");
+        let ok = windows_with(
+            attestation_for(HEAD, with_python, attested("pythonEnv", "venvInterpreterRunsWithoutActivation")),
+            Some(HEAD),
+        );
+        assert_eq!(assess(&ok).attested_passes, 1);
+    }
+
+    /// Windows가 아닌 머신의 확인은 Windows 기준의 확인이 아니다 — 기본 요구가 그것이다.
+    #[test]
+    fn a_non_windows_machine_cannot_attest_anything_here() {
+        let mut linux_machine = measured_machine();
+        linux_machine["os"] = json!("linux");
+        let obs = windows_with(
+            attestation_for(HEAD, linux_machine, attested("processGroup", "childGetsItsOwnProcessGroup")),
+            Some(HEAD),
+        );
+        let report = assess(&obs);
+        assert_eq!(report.attested_passes, 0);
+        assert!(report.attestation.as_ref().unwrap().rejections[0].reason.contains("Windows"));
+    }
+
+    /// **모든 기준에 요구가 붙어 있고, 그 요구는 Windows를 포함한다.**
+    ///
+    /// 빈 목록을 허용하면 새 기준을 추가할 때 요구를 적지 않는 것이 가장 쉬운 길이 되고,
+    /// 그러면 아무 머신에서 확인했다고 적어도 통과한다.
+    #[test]
+    fn every_criterion_declares_what_the_machine_must_have() {
+        let report = assess(&linux());
+        for group in &report.groups {
+            for check in &group.checks {
+                assert!(
+                    check.requires.contains(&crate::landing_attest::MachineFact::WindowsOs),
+                    "{}/{}의 요구에 Windows가 없습니다: {:?}",
+                    group.id,
+                    check.id,
+                    check.requires
+                );
+            }
+        }
+    }
+
+    /// 여기서는 볼 수 없는 것(`NotCheckableHere`)이 다른 머신의 확인으로 채워진다 —
+    /// 그게 이 입구의 용도다. Linux에서 Windows 기준을 판정하는 유일한 정당한 길이다.
+    #[test]
+    fn an_attestation_answers_what_this_platform_cannot_see() {
+        let obs = Observations {
+            os: "linux".to_string(),
+            bundle_dir: None,
+            head_commit: Some(HEAD.to_string()),
+            attestation: Some(attestation_for(
+                HEAD,
+                measured_machine(),
+                attested("pathNormalization", "verbatimPrefixStripped"),
+            )),
+        };
+        let report = assess(&obs);
+        let check = status_of(&report, "pathNormalization", "verbatimPrefixStripped");
+        assert_eq!(check.status, CheckStatus::Passed);
+        assert_eq!(check.attestation.as_ref().unwrap().attested_by, "Vyper");
+    }
+
+    /// 없는 기준을 적으면 **조용히 넘어가지 않는다.** 오타 하나가 아무 말 없이 사라지면
+    /// 사람은 확인이 반영된 줄 안다.
+    #[test]
+    fn an_unknown_criterion_is_reported_not_ignored() {
+        let obs = windows_with(
+            attestation_for(HEAD, measured_machine(), attested("commandResolution", "noSuchCheck")),
+            Some(HEAD),
+        );
+        let att = assess(&obs).attestation.expect("보고가 없습니다");
+        assert_eq!(att.status, AttestationStatus::PartiallyAccepted);
+        assert!(att.rejections[0].reason.contains("그런 기준이 없습니다"), "{:?}", att.rejections);
+    }
+
+    /// 읽히지 않는 파일은 **없는 것으로 치지 않는다** — 왜 못 읽었는지가 남는다.
+    #[test]
+    fn a_broken_file_is_reported_not_treated_as_absent() {
+        let obs = windows_with(
+            AttestationSource {
+                file: "broken.json".to_string(),
+                parsed: Err(vec!["attestation이 JSON이 아닙니다".to_string()]),
+            },
+            Some(HEAD),
+        );
+        let att = assess(&obs).attestation.expect("보고가 없습니다");
+        assert_eq!(att.status, AttestationStatus::Rejected);
+        assert_eq!(att.rejections.len(), 1);
+    }
+
+    /// **저장소에 커밋된 실측 기록**(기록 8~12절을 옮긴 것)이 형식으로 성립한다.
+    ///
+    /// 그리고 그 파일은 지금 커밋에서 **만료**다 — `206d2ef`에서 확인한 것이기 때문이다.
+    /// 그게 정상이고, 만료가 실제로 동작한다는 증거다.
+    #[test]
+    fn the_recorded_measurement_parses_and_is_scoped_to_its_commit() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../docs/design/attestations/windows-landing-206d2ef.json");
+        let source = crate::landing_attest::read_file(&file);
+        let attestation = match &source.parsed {
+            Ok(a) => a,
+            Err(reasons) => panic!("커밋된 실측 기록이 읽히지 않습니다 ({}): {reasons:?}", file.display()),
+        };
+        assert_eq!(attestation.commit, "206d2ef");
+
+        // 실측 머신에는 Python이 없었다. **그러므로 pythonEnv를 적어서는 안 된다** —
+        // 적혀 있으면 이 기록이 실측과 어긋난 것이다.
+        let machine: &MachineSpec = &attestation.machine;
+        assert!(machine.python.is_none(), "실측 머신에는 Python이 없었습니다");
+        assert!(
+            !attestation.checks.iter().any(|c| c.group == "pythonEnv"),
+            "확인할 수 없었던 pythonEnv가 기록에 들어 있습니다"
+        );
+
+        // 그 커밋에서는 반영되고, 다른 커밋에서는 만료된다.
+        let at_206 = assess(&Observations {
+            os: "windows".to_string(),
+            bundle_dir: None,
+            head_commit: Some("206d2ef3678c13722f29cb025693f2e6ad8b8307".to_string()),
+            attestation: Some(source.clone()),
+        });
+        // **적은 것이 전부 반영되어야 한다.** `> 0`으로 두면 id 오타 하나가 조용히 지나간다 —
+        // 거부는 보고서에 남지만, 테스트가 그것을 보지 않으면 아무도 보지 않는다.
+        let applied = at_206.attestation.as_ref().expect("보고가 없습니다");
+        assert_eq!(applied.status, AttestationStatus::Accepted, "{:?}", applied.rejections);
+        assert_eq!(applied.accepted.len(), attestation.checks.len());
+        assert_eq!(at_206.attested_passes, attestation.checks.len());
+
+        let elsewhere = assess(&Observations {
+            os: "windows".to_string(),
+            bundle_dir: None,
+            head_commit: Some("0000000000000000000000000000000000000000".to_string()),
+            attestation: Some(source),
+        });
+        assert_eq!(elsewhere.attested_passes, 0);
+        assert_eq!(elsewhere.attestation.unwrap().status, AttestationStatus::Expired);
+    }
 }

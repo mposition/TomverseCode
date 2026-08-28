@@ -24,6 +24,7 @@ pub mod export;
 pub mod hooks;
 pub mod host;
 pub mod landing;
+pub mod landing_attest;
 pub mod launcher;
 pub mod mcp;
 pub mod metrics;
