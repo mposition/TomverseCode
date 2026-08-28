@@ -836,12 +836,28 @@ mod tests {
 
     /// 계측이 **언제나 는다.** 태스크가 하나뿐이어도 레인을 지나므로, "Fleet일 때만 도는 코드"가
     /// 되지 않는다 — 조건부로 두면 평소에 검증되지 않는 경로가 생긴다.
+    ///
+    /// # 왜 `==`가 아니라 `>=`인가
+    ///
+    /// `LANE_ACQUISITIONS`는 **프로세스 전역**이고 `cargo test`는 한 프로세스 안에서 테스트를
+    /// 병렬로 돌린다. 그래서 `before`를 읽고 `enter_lane()`을 부르는 사이에 다른 테스트가
+    /// 레인을 지날 수 있다 — 실측으로 `left: 4 / right: 3`으로 실패했다(위
+    /// `the_lane_serializes_...`가 스레드 4개로 레인을 지나므로 겹치면 그렇게 된다).
+    /// 이 테스트가 확인하려는 것은 **"이 호출이 계측을 지났는가"**이지 "그 사이에 아무도
+    /// 지나지 않았는가"가 아니다. 카운터는 줄지 않으므로 `>=`가 그 사실을 정확히 말한다.
+    ///
+    /// 이 종류의 실패는 **간헐적이라서 더 나쁘다**: `verify`가 가끔 빨간색이 되면 사람이
+    /// "다시 돌려 보자"를 배우고, 그 습관이 진짜 회귀를 지나가게 만든다.
     #[test]
     fn a_single_verification_also_goes_through_the_lane() {
         let before = lane_stats().acquisitions;
         let guard = enter_lane();
         drop(guard);
-        assert_eq!(lane_stats().acquisitions, before + 1);
+        assert!(
+            lane_stats().acquisitions >= before + 1,
+            "레인을 지났는데 계측이 늘지 않았습니다: {before} → {}",
+            lane_stats().acquisitions
+        );
     }
 
     /// **우리가 만든 검증 명령을 우리 게이트가 거부하지 않는다** (49.4절).

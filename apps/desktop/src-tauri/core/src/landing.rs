@@ -1904,51 +1904,80 @@ mod tests {
         assert_eq!(att.rejections.len(), 1);
     }
 
-    /// **저장소에 커밋된 실측 기록**(기록 8~12절을 옮긴 것)이 형식으로 성립한다.
+    /// **저장소에 커밋된 실측 기록이 전부** 형식으로 성립하고, 각자의 커밋에서만 유효하다.
     ///
-    /// 그리고 그 파일은 지금 커밋에서 **만료**다 — `206d2ef`에서 확인한 것이기 때문이다.
-    /// 그게 정상이고, 만료가 실제로 동작한다는 증거다.
+    /// # 왜 파일 이름을 적지 않는가
+    ///
+    /// 종전에는 `windows-landing-206d2ef.json` 하나를 이름으로 가리켰다. 그러면 나중에 추가된
+    /// 기록은 **아무 검사도 받지 않고**, 검사받지 않는 파일은 실패하지 않으므로 빠졌다는 사실이
+    /// 드러나지 않는다(루트 `test`에 워크스페이스를 빠뜨리는 것과 같은 종류의 구멍이다).
+    /// 디렉터리에서 유도한다.
+    ///
+    /// 각 파일은 자기 커밋에서 **전부** 반영되어야 한다. `> 0`으로 두면 id 오타 하나가 조용히
+    /// 지나간다 — 거부는 보고서에 남지만, 테스트가 그것을 보지 않으면 아무도 보지 않는다.
     #[test]
-    fn the_recorded_measurement_parses_and_is_scoped_to_its_commit() {
-        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../docs/design/attestations/windows-landing-206d2ef.json");
-        let source = crate::landing_attest::read_file(&file);
-        let attestation = match &source.parsed {
-            Ok(a) => a,
-            Err(reasons) => panic!("커밋된 실측 기록이 읽히지 않습니다 ({}): {reasons:?}", file.display()),
-        };
-        assert_eq!(attestation.commit, "206d2ef");
+    fn every_recorded_measurement_parses_and_is_scoped_to_its_commit() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../docs/design/attestations");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}를 읽을 수 없습니다: {e}", dir.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect();
+        files.sort();
+        // **빈 집합에 대해 통과하지 않는다.** 경로가 어긋나면 검사가 0개가 되고, 0개는 언제나
+        // 통과한다 — 그게 이 종류의 테스트가 고장 나는 방식이다.
+        assert!(!files.is_empty(), "attestation 파일을 하나도 찾지 못했습니다: {}", dir.display());
 
-        // 실측 머신에는 Python이 없었다. **그러므로 pythonEnv를 적어서는 안 된다** —
-        // 적혀 있으면 이 기록이 실측과 어긋난 것이다.
-        let machine: &MachineSpec = &attestation.machine;
-        assert!(machine.python.is_none(), "실측 머신에는 Python이 없었습니다");
-        assert!(
-            !attestation.checks.iter().any(|c| c.group == "pythonEnv"),
-            "확인할 수 없었던 pythonEnv가 기록에 들어 있습니다"
-        );
+        for file in files {
+            let source = crate::landing_attest::read_file(&file);
+            let attestation = match &source.parsed {
+                Ok(a) => a,
+                Err(reasons) => panic!("커밋된 실측 기록이 읽히지 않습니다 ({}): {reasons:?}", file.display()),
+            };
+            let name = file.display().to_string();
 
-        // 그 커밋에서는 반영되고, 다른 커밋에서는 만료된다.
-        let at_206 = assess(&Observations {
-            os: "windows".to_string(),
-            bundle_dir: None,
-            head_commit: Some("206d2ef3678c13722f29cb025693f2e6ad8b8307".to_string()),
-            attestation: Some(source.clone()),
-        });
-        // **적은 것이 전부 반영되어야 한다.** `> 0`으로 두면 id 오타 하나가 조용히 지나간다 —
-        // 거부는 보고서에 남지만, 테스트가 그것을 보지 않으면 아무도 보지 않는다.
-        let applied = at_206.attestation.as_ref().expect("보고가 없습니다");
-        assert_eq!(applied.status, AttestationStatus::Accepted, "{:?}", applied.rejections);
-        assert_eq!(applied.accepted.len(), attestation.checks.len());
-        assert_eq!(at_206.attested_passes, attestation.checks.len());
+            // **머신에 없는 것으로 확인했다고 적을 수 없다.** 판정 쪽(`apply_attestation`)이
+            // 거부하므로 아래 `accepted.len()` 비교가 이미 잡지만, 어긋났을 때 무엇이
+            // 잘못됐는지를 이 자리에서 말해 주는 편이 원인에 가깝다.
+            let machine: &MachineSpec = &attestation.machine;
+            if machine.python.is_none() {
+                assert!(
+                    !attestation.checks.iter().any(|c| c.group == "pythonEnv"),
+                    "{name}: Python이 없는 머신인데 pythonEnv가 기록에 들어 있습니다"
+                );
+            }
 
-        let elsewhere = assess(&Observations {
-            os: "windows".to_string(),
-            bundle_dir: None,
-            head_commit: Some("0000000000000000000000000000000000000000".to_string()),
-            attestation: Some(source),
-        });
-        assert_eq!(elsewhere.attested_passes, 0);
-        assert_eq!(elsewhere.attestation.unwrap().status, AttestationStatus::Expired);
+            // 짧게 적은 커밋을 그대로 쓰므로 40자리로 채워 HEAD를 만든다.
+            let at_its_commit = format!("{:0<40}", attestation.commit);
+            let applied = assess(&Observations {
+                os: "windows".to_string(),
+                bundle_dir: None,
+                head_commit: Some(at_its_commit),
+                attestation: Some(source.clone()),
+            });
+            let report = applied.attestation.as_ref().expect("보고가 없습니다");
+            assert_eq!(report.status, AttestationStatus::Accepted, "{name}: {:?}", report.rejections);
+            assert_eq!(report.accepted.len(), attestation.checks.len(), "{name}");
+            assert_eq!(applied.attested_passes, attestation.checks.len(), "{name}");
+
+            // 다른 커밋에서는 만료된다. 접두사가 우연히 겹치지 않는 값을 고른다.
+            let elsewhere_head = if attestation.commit.starts_with('f') {
+                "0".repeat(40)
+            } else {
+                "f".repeat(40)
+            };
+            let elsewhere = assess(&Observations {
+                os: "windows".to_string(),
+                bundle_dir: None,
+                head_commit: Some(elsewhere_head),
+                attestation: Some(source),
+            });
+            assert_eq!(elsewhere.attested_passes, 0, "{name}");
+            assert_eq!(
+                elsewhere.attestation.unwrap().status,
+                AttestationStatus::Expired,
+                "{name}"
+            );
+        }
     }
 }

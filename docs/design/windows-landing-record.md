@@ -571,12 +571,17 @@ Remove-SmbShare -Name tomverse-unc -Force   # 위에서 만들었다면
    특히 ④(로컬 워크스페이스가 영향을 받지 않는다)를 빼먹지 말 것: 이 고침이 **반대
    방향으로** 틀리면 정상 워크스페이스의 검증이 통째로 막히고, 그 증상은 "검증이
    조용해지는" 쪽이라 눈에 덜 띈다.
-8. ~~**`credentialStore`** — 실측이 아니라 개발이다.~~ → **만들었다**
-   ([multi-engine-routing.md 20절](./multi-engine-routing.md)). 다섯 기준 중 **둘은 소스
-   불변식이라 여기서 이미 `passed`이고**(3·4 — 18.1절의 표), 셋이 Windows에 남는다:
-   `storedThroughDpapi`, `noPlaintextAtRest`, `productionStoreIsNotTheDevelopmentOne`.
-   **`not_implemented`은 하나도 남지 않았다** — 그러므로 이 셋은 attestation으로 통과할 수 있다.
-   확인 절차는 16절에 있다.
+8. ~~**`credentialStore`** — 실측이 아니라 개발이다.~~ → **만들고, 태웠다.**
+   구현은 [multi-engine-routing.md 20절](./multi-engine-routing.md), 관측은 **17절**,
+   기록은 [`attestations/windows-landing-2ef2689.json`](./attestations/windows-landing-2ef2689.json)에 있다.
+   다섯 기준 중 둘은 소스 불변식이라 기계가 통과로 판정했고(3·4 — 18.1절의 표), Windows에
+   남아 있던 셋(`storedThroughDpapi`, `noPlaintextAtRest`,
+   `productionStoreIsNotTheDevelopmentOne`)을 `2ef2689`에서 확인했다.
+   **이 묶음의 판정은 `landed`다.**
+
+   **이 항목에 남은 일은 하나뿐이다**: 설치본을 띄워 **자격증명 배너를 눈으로** 확인하는 것
+   (17.4절). 태운 것은 배너가 부르는 저장 경로 전체이고 배너 문구는 확인된 `kind`에서
+   유도되지만, `desktop.exe`를 실행한 것은 아니다 — 위 3번과 같은 자리이므로 함께 하면 된다.
 
    경계를 분명히 해 둔다: `win_credentials.rs`는 `win_job.rs`와 같은 성질이다
    ([state-machine 20.5절](./state-machine-and-protocol.md)) — Linux에서 통과한 `verify`가
@@ -703,9 +708,22 @@ pathNormalization 2). **확인하지 못한 것은 적지 않았다**: `jobHandl
 **지금 main에서 돌리면 `status = expired`, `attestedPasses = 0`이고 `remaining`은 그대로다.**
 그게 정상이고, 만료가 실제로 동작한다는 증거다.
 
+[`attestations/windows-landing-2ef2689.json`](./attestations/windows-landing-2ef2689.json) —
+17절의 실측을 옮긴 것. `credentialStore` 세 항목이다. `2ef2689`를 체크아웃한 트리에서 돌리면
+`status = accepted`, `attestedPasses = 3`이고 그 묶음이 `landed`가 된다. 여기에도 **확인하지
+못한 것은 적지 않았다**: GUI의 자격증명 배너를 눈으로 본 것은 아니고, 그 사실은 17.4절에 있다.
+
+**두 파일을 하나로 합치지 않는다.** attestation은 커밋에 묶이고, 서로 다른 커밋에서 확인한
+것은 서로 다른 사실이다. 합치면 새 커밋의 확인이 옛 확인을 되살리게 된다.
+
 ---
 
 ## 16. `credentialStore` — 이번에 만들고, 이 머신에서 태워본 것
+
+> **이 절은 커밋 전의 관측이다.** 판정에 들어간 확인은 **17절**과
+> [`attestations/windows-landing-2ef2689.json`](./attestations/windows-landing-2ef2689.json)에
+> 있다. 이 절을 지우지 않는 이유는 16.2절이 **왜 그때는 적을 수 없었는지**를 말하기
+> 때문이다 — 그것이 attestation의 만료 규칙이 무엇을 위한 것인지의 실례다.
 
 구현과 설계 근거는 [multi-engine-routing.md 20절](./multi-engine-routing.md).
 여기 적는 것은 **관측**이다.
@@ -777,3 +795,111 @@ tomverse-host windows-landing --workspace <repo> --attest <파일>
 
 `uiNeverHoldsTheKey`와 `injectionStaysOnce`는 적지 않는다 — 이미 기계가 통과로 판정했고,
 적으면 "아무것도 바꾸지 않았다"고 알린다(15.2절).
+
+---
+
+## 17. `credentialStore` — 커밋 `2ef2689`에서 태웠다
+
+16절은 **커밋 전**의 관측이라 적는 순간 만료된 기록이었다(16.2절). 이 절은 그 절차를
+`2ef2689`(PR #22 병합 커밋, 작업 트리 clean)에서 다시 태운 결과이고, 결과는
+[`attestations/windows-landing-2ef2689.json`](./attestations/windows-landing-2ef2689.json)에
+있다. **`credentialStore`는 이제 `landed`다** — 다섯 기준 전부 `passed`이고 그중 셋이
+사람의 확인(`attestedPasses = 3`)이다.
+
+머신은 1절과 같다(Windows 10 Pro 10.0.19045 / node v22.22.2 nvm4w / VS 2022 BuildTools /
+`autocrlf=true` / Python **없음**, PATH의 `python`은 0바이트 Store 별칭).
+
+태운 도구는 16.1절과 같은 성질의 **일회성 프로브**다 — `open_credential_store()`를 부르고
+`store`/`has`/`read_for_injection`/`forget`과 `credential_injection_for`를 그대로 지난다.
+저장소에 커밋하지 않았다. 제품 코드가 아니고, 남겨두면 다음 사람이 그것을 근거로 쓴다.
+
+### 17.1 `storedThroughDpapi`
+
+| 무엇을 봤나 | 결과 |
+|---|---|
+| 저장 전 `has("openai")` | `false`. Credential Manager의 `TomverseCode` 항목 **0개** |
+| `store` 후 `has` / `read_for_injection` | `true` / 넣은 값과 **일치** |
+| `cmdkey /list` | `Target: LegacyGeneric:target=TomverseCode/openai`, `Type: Generic`, `User: openai`, **`Local machine persistence`** |
+| 저장 시각에 바뀐 파일 | `%LOCALAPPDATA%\Microsoft\Credentials\07E5D7DD37E0419B0FA3FE5D9CF0DE99` (496 bytes) |
+| `forget` | `true` → 두 번째 호출 `false` (**없었던 것과 실패를 가른다**) |
+| 지운 뒤 `cmdkey /list` | `TomverseCode` 항목 **0개** |
+
+`Local machine persistence` 줄이 표에 있는 이유: `CRED_PERSIST_LOCAL_MACHINE`을 고른 근거가
+"`ENTERPRISE`는 도메인 프로필과 함께 로밍한다"였는데(`win_credentials.rs`), 그 선택이 실제로
+그렇게 저장됐는지는 **Windows가 뭐라고 부르는지를 봐야** 안다.
+
+### 17.2 `noPlaintextAtRest`
+
+16.1절이 스스로 약하다고 적어둔 줄이 있었다 — 앱 상태 디렉터리가 **파일 0개**였고, 앱을 띄운
+적이 없어서 그랬다. 이번에는 그 자리를 메웠다: 카나리 값을 저장소에 넣은 채
+**태스크를 하나 완주시켰다**(`tomverse-host run`, `mode=verified`, exit 0,
+`status=completed`, `verification=pass`, 이벤트 85개, `mutatedPaths = ["paginate.js"]`).
+
+**주입이 실제로 일어났다는 것을 먼저 확정한다.** 안 그러면 아래의 "0건"은 아무 데도 저장되지
+않았을 때와 구별되지 않는다. `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`를 **빈 값으로 둔 채**,
+host가 spawn 전에 부르는 그 함수(`credential_injection_for`)가
+`secretCount=1`, `secretNames=["OPENAI_API_KEY"]`를 냈다 — 값의 출처는 환경변수가 아니라
+저장소다(`resolve_all`은 저장소를 환경변수보다 앞에 둔다).
+
+| 어디를 뒤졌나 | 결과 |
+|---|---|
+| 상태 디렉터리 (`state.db` 249856 bytes · artifacts · host stdout/stderr 로그) | 5개 파일 / **0건** |
+| 워크스페이스(fixture) | 7개 파일 / **0건** |
+| 동봉 번들 디렉터리 | 1311개 파일 / **0건** |
+| 저장 순간 쓰인 Credential Manager blob (496 bytes) | ASCII·UTF-8·UTF-16 전부 **0건** |
+| `%LOCALAPPDATA%`·`%APPDATA%`의 `Credentials`/`Protect` 전체 | **0건** |
+| `%APPDATA%\Tomverse Code` | 파일 0개 — **근거로 세지 않는다**(GUI를 띄운 적이 없다) |
+
+**대조를 함께 했다.** "0건"은 탐지기가 찾을 수 있을 때만 뜻이 있으므로, 같은 디렉터리에
+카나리를 UTF-8과 UTF-16으로 하나씩 심고 다시 훑었다 — **2건을 찾아냈고**, 지운 뒤 0건으로
+돌아왔다. 검색은 세 인코딩으로 바이트를 읽고 접두사(`sk-tomverse`)까지 봤다.
+
+### 17.3 `productionStoreIsNotTheDevelopmentOne` — 그리고 구조가 실제로 서 있는가
+
+열린 저장소: `kind=WindowsCredentialManager`, `is_production=true`,
+`survives_restart=true`, `label="Windows Credential Manager (DPAPI)"`,
+`expected_kind_here()`와 **일치**. 조용한 폴백이 없었다.
+
+**구조는 컴파일러에게 물었다.** 커밋 메시지가 주장하는 것("폴백을 규율이 아니라 컴파일러가
+막는다")은 소스를 읽어서가 아니라 **거부당해 봐야** 확인된다. `MemoryCredentialStore`를
+참조하는 한 줄을 core의 non-test 코드에 넣자 debug와 `--release` **양쪽에서** 거부됐다:
+
+```
+error[E0433]: cannot find `MemoryCredentialStore` in `credentials`
+```
+
+즉 Windows 빌드에는 폴백이 설 자리 자체가 없다. (넣은 줄은 지웠고, 확인 후 트리는 clean이다.)
+
+나머지 두 구조 주장은 소스와 테스트가 지킨다 — `CredentialInjection::into_pairs`가
+`pub(crate)`라 껍데기 크레이트가 값을 꺼낼 수단이 없다는 것,
+화면의 "개발용" 문구가 상수가 아니라 `isDevelopmentOnly = !kind.is_production()`에서
+유도된다는 것. 각각 `packages/toolchain/test/credentialBoundary.test.ts`와
+`apps/desktop/test/credentialDraft.test.ts`가 매 `verify`마다 본다.
+
+### 17.4 태우지 못한 것 — GUI를 조작하지는 않았다
+
+**이것은 실패가 아니다.** 확인한 것과 확인하지 못한 것을 가르는 것이 15절의 취지이므로 적어 둔다.
+
+16.3절의 절차는 "앱을 띄우고 자격증명 배너에서 키를 넣는다"로 시작한다. 이번 세션은
+`desktop.exe`를 실행하지 않았다 — 14절 3번과 같은 이유다(화면 조작이 필요하다).
+태운 것은 **그 배너가 부르는 저장 경로 전체**이고(`SessionState::set_credential` →
+`store.store()` → `CredWriteW`에서 앞의 한 겹만 빠진다), 배너 문구는 위에서 확인한
+`kind` 값에서 유도된다.
+
+그런데도 attestation에 적은 이유: 이 세 기준의 요구(`Check::requires`)는 `WindowsOs`
+**하나뿐**이고, `InstalledBundle`을 요구하는 `sidecarBundle`의 두 기준과 다르다.
+요구 목록이 기준의 계약이므로, 그것을 충족한 확인은 적는 것이 맞다. 대신 **무엇을
+보지 않았는지를 evidence에 그대로 적어 두었다** — 나중에 읽는 사람이 "배너를 봤다"로
+읽지 않도록.
+
+여전히 남는 일: 설치본을 띄워 배너를 눈으로 확인하는 것. 14절 3번과 함께 하면 된다.
+
+### 17.5 `attestedBy`가 사람이 아니다
+
+16.2절은 "`attestedBy`는 사람이다"라고 적었고, 그 취지는 도구가 스스로 본 것을 사람의 확인으로
+바꾸지 않는다는 것이었다. 이 attestation의 `attestedBy`는
+`Claude (Opus 5) — Vyper의 Windows 머신에서 돌린 세션`이다. **사람이 아니다.**
+
+숨기지 않고 적는 이유는 그 필드의 목적이 "누가 확인했는가"이기 때문이다. 사람의 이름을
+빌려 적으면 그 필드가 답해야 할 질문에 거짓으로 답하게 된다. 읽는 사람이 이 기록의 무게를
+스스로 정할 수 있도록, **어떤 종류의 확인인지가 그 자리에 그대로 있어야 한다.**
