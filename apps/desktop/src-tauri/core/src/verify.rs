@@ -23,6 +23,8 @@ use crate::types::{
 };
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// 감지된 검증 명령 세트. `WorkspaceSnapshot.projectMeta`와 같은 정보를 Rust 쪽에서 독립적으로
 /// 만든다 — Node가 넘긴 명령을 그대로 실행하면 "검증 명령을 바꿔치기해 통과시키는" 경로가 열린다.
@@ -227,6 +229,80 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
     detected
 }
 
+/// 검증 레인 — **결정론적 판정자를 옆 태스크의 부하에서 지킨다.**
+///
+/// # 왜 필요한가 (process-architecture.md 11.2③)
+///
+/// `npm test` N개가 같은 머신에서 경합하면 타임아웃이 늘고, 타임아웃은 `TIMED_OUT`이라는
+/// **판정**이 된다. 원칙 1이 지키려는 것은 "결과가 최종 판정자"인데, 그 판정이 옆 태스크의
+/// 부하에 따라 달라지면 판정자가 흔들린다. 그러면 같은 코드가 혼자 돌 때는 통과하고 Fleet에서는
+/// 실패하는데, **어느 쪽도 코드에 대한 사실이 아니다.**
+///
+/// # 왜 직렬화를 골랐는가 — 실측 대신
+///
+/// 다른 선택지는 "경합으로 늘어난 시간이 판정을 바꾸지 않는다"를 실측으로 보이는 것이다.
+/// 그 근거는 **머신마다 다르다** — 코어 수·디스크·다른 프로세스에 따라 달라지므로, 우리
+/// 머신에서 만든 실측은 사용자 머신에 대해 아무것도 말하지 않는다. 즉 그 길은 근거를 만드는
+/// 비용이 클 뿐 아니라 **만든 근거가 옮겨지지 않는다.** 직렬화는 그 질문을 아예 없앤다.
+///
+/// 대가는 대기 시간인데, **모델 호출은 여전히 병렬로 남는다.** Fleet의 이득 대부분이 거기
+/// 있으므로(공급자 왕복이 검증보다 오래 걸린다) 잃는 것이 크지 않다.
+///
+/// # "Fleet 모드"라는 분기를 만들지 않는다
+///
+/// 레인은 **언제나** 켜져 있다. 태스크가 하나뿐이면 경합이 없으므로 비용이 없고, 조건을 달면
+/// 그 조건이 곧 우회 지점이 된다(22.1절이 Policy Gate에서 한 결정과 같다). 그리고 조건부로
+/// 두면 "Fleet일 때만 도는 코드"가 생겨 평소에 검증되지 않는다.
+///
+/// # 이것이 프로세스 안의 레인인 이유
+///
+/// Fleet 구성원은 **한 프로세스 안의 스레드**로 돈다(`bin/host.rs`의 `fleet`). 그래서 레인은
+/// 프로세스 전역 뮤텍스면 충분하다. 파일 잠금으로 프로세스 간까지 넓히지 않은 이유는 그것이
+/// 플랫폼별 코드를 요구하고, 그 코드는 이 환경에서 **동작을 검증할 수 없기 때문이다**
+/// (`win_job.rs`가 남긴 교훈). 넓혀야 할 때가 오면 그때가 그 대가를 치를 자리다.
+static VERIFICATION_LANE: Mutex<()> = Mutex::new(());
+
+/// 레인 계측. **직렬화했다는 주장의 관측 근거**이며, 결과 JSON에 실려 나간다.
+static LANE_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+static LANE_CONTENDED: AtomicU64 = AtomicU64::new(0);
+static LANE_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 레인 통계 — 몇 번 지났고, 그중 몇 번이 기다렸고, 총 얼마를 기다렸나.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneStats {
+    /// 레인을 지난 검증 실행 횟수. **구성원 수보다 적으면 누군가 레인을 지나지 않았다.**
+    pub acquisitions: u64,
+    /// 그중 다른 검증을 기다려야 했던 횟수. 0이면 경합이 없었을 뿐, 레인이 없다는 뜻이 아니다.
+    pub contended: u64,
+    pub total_wait_ms: u64,
+}
+
+pub fn lane_stats() -> LaneStats {
+    LaneStats {
+        acquisitions: LANE_ACQUISITIONS.load(Ordering::Relaxed),
+        contended: LANE_CONTENDED.load(Ordering::Relaxed),
+        total_wait_ms: LANE_WAIT_MS.load(Ordering::Relaxed),
+    }
+}
+
+/// 레인에 들어간다. 반환된 가드가 살아 있는 동안 **이 프로세스에서 다른 검증이 돌지 않는다.**
+///
+/// 잠금이 poison되어도 계속 진행한다 — 이 뮤텍스는 데이터를 지키는 것이 아니라 **순서를**
+/// 지킨다. 한 검증 스레드가 패닉했다고 이후 모든 검증을 영구히 막으면, 그 자체가 판정을
+/// 바꾸는 일이 된다.
+fn enter_lane() -> std::sync::MutexGuard<'static, ()> {
+    let started = std::time::Instant::now();
+    let contended = VERIFICATION_LANE.try_lock().is_err();
+    let guard = VERIFICATION_LANE.lock().unwrap_or_else(|e| e.into_inner());
+    LANE_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+    if contended {
+        LANE_CONTENDED.fetch_add(1, Ordering::Relaxed);
+        LANE_WAIT_MS.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+    guard
+}
+
 /// 검증 실행자. Tool Runtime을 통해 명령을 돌리는 콜백을 받는다 —
 /// 이렇게 하면 검증 명령도 예외 없이 Tool Runtime과 이벤트 로그를 거친다
 /// (감사 추적에 예외가 없어야 한다는 원칙).
@@ -256,6 +332,9 @@ impl<'a> VerificationRunner<'a> {
         executor: &mut dyn CommandExecutor,
         baseline: Option<&VerificationReport>,
     ) -> VerificationReport {
+        // **검증 하나를 통째로 잡는다.** 체크 단위로 잡으면 build와 test 사이에 옆 태스크의
+        // 검증이 끼어들 수 있고, 그러면 한 리포트 안의 체크들이 서로 다른 부하에서 측정된다.
+        let _lane = enter_lane();
         let detected = detect_commands(self.root);
         let mut checks: Vec<VerificationCheck> = Vec::new();
 
@@ -620,6 +699,97 @@ fn first_meaningful_line(text: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// **검증이 실제로 직렬로 돈다.** (process-architecture 11.2③ / 11.6③)
+    ///
+    /// 레인을 만들어 두고 부르지 않으면 아무것도 지켜지지 않는다. 그래서 판정 기준을
+    /// "뮤텍스가 있다"가 아니라 **"두 실행의 시간 구간이 겹치지 않는다"**로 둔다 — 그 사실이
+    /// 곧 옆 태스크의 부하가 이 태스크의 판정에 들어오지 않는다는 뜻이다.
+    #[test]
+    fn two_verifications_never_overlap() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        /// 검증 명령이 도는 동안 **동시에 몇 개가 안에 있었는지** 센다.
+        struct Counting {
+            inside: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+        }
+        impl CommandExecutor for Counting {
+            fn execute(&mut self, request: &ToolRequest) -> ToolResult {
+                let now = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_seen.fetch_max(now, Ordering::SeqCst);
+                // 겹칠 기회를 실제로 준다 — 즉시 반환하면 겹치지 않는 것이 우연일 수 있다.
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                self.inside.fetch_sub(1, Ordering::SeqCst);
+                ToolResult {
+                    request_id: request.request_id.clone(),
+                    status: ToolStatus::Ok,
+                    output: Some(json!({ "exitCode": 0, "stdout": "", "stderr": "", "durationMs": 1 })),
+                    error: None,
+                    duration_ms: 1,
+                    completed_at: now_iso(),
+                    denial_kind: None,
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // 검증 명령이 하나라도 있어야 executor가 불린다.
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        let root = WorkspaceRoot::new(dir.path()).unwrap();
+        let artifacts_dir = tempfile::tempdir().unwrap();
+        let artifacts = ArtifactStore::new(artifacts_dir.path()).unwrap();
+
+        let inside = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let before = lane_stats();
+
+        std::thread::scope(|scope| {
+            for i in 0..4 {
+                let inside = inside.clone();
+                let max_seen = max_seen.clone();
+                let root = &root;
+                let artifacts = &artifacts;
+                scope.spawn(move || {
+                    let runner = VerificationRunner::new(root, artifacts);
+                    let mut exec = Counting { inside, max_seen };
+                    runner.run(
+                        &format!("task-{i}"),
+                        VerificationPhase::Post,
+                        1,
+                        &mut exec,
+                        None,
+                    );
+                });
+            }
+        });
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "검증 명령이 동시에 둘 이상 돌았습니다 — 레인이 실제로 잠그지 않고 있습니다"
+        );
+        let after = lane_stats();
+        assert!(
+            after.acquisitions >= before.acquisitions + 4,
+            "레인을 지나지 않은 검증이 있습니다: {before:?} → {after:?}"
+        );
+    }
+
+    /// 계측이 **언제나 는다.** 태스크가 하나뿐이어도 레인을 지나므로, "Fleet일 때만 도는 코드"가
+    /// 되지 않는다 — 조건부로 두면 평소에 검증되지 않는 경로가 생긴다.
+    #[test]
+    fn a_single_verification_also_goes_through_the_lane() {
+        let before = lane_stats().acquisitions;
+        let guard = enter_lane();
+        drop(guard);
+        assert_eq!(lane_stats().acquisitions, before + 1);
+    }
 
     /// **우리가 만든 검증 명령을 우리 게이트가 거부하지 않는다** (49.4절).
     ///

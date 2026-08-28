@@ -21,6 +21,7 @@ pub mod cancel;
 pub mod deadline;
 pub mod decisions;
 pub mod export;
+pub mod fleet;
 pub mod hooks;
 pub mod host;
 pub mod landing;
