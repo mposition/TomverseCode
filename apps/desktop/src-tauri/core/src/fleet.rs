@@ -37,6 +37,7 @@
 //! 기록할 수도 없다.** 모델이 병렬 실행을 띄울 수 있으면 예산 상한도 승인도 우회 가능해진다.
 
 use serde::Serialize;
+use serde_json::{json, Value};
 
 /// 한 Fleet의 최대 구성원 수 (원칙 5).
 ///
@@ -108,6 +109,83 @@ pub struct FleetPlan {
     pub cap_usd: Option<f64>,
     /// 태스크당 상한(USD). `None`이면 태스크당 상한 없음.
     pub per_task_usd: Option<f64>,
+}
+
+impl FleetPlan {
+    /// 이 Fleet에 실제로 걸린 상한. **기록에 남길 값이다.**
+    pub fn caps(&self) -> FleetCaps {
+        FleetCaps {
+            fleet_cap_usd: self.cap_usd,
+            per_task_cap_usd: self.per_task_usd,
+        }
+    }
+}
+
+/// 이 Fleet에 걸린 상한 — **기록에 남는다.**
+///
+/// # 왜 이벤트에 적는가
+///
+/// 화면이 "합계 상한이 강제됐는가"에 답하려면 **적용된 값**을 알아야 하고, 그 값은 화면의
+/// 폼이 아니라 Rust가 고정한 이벤트에서 와야 한다(state-machine 37절). 요청한 것과 적용된
+/// 것은 갈릴 수 있고, 폼으로 만들면 화면이 틀린 답을 자신 있게 말한다.
+///
+/// 그리고 남기지 않으면 기록을 읽는 쪽은 **"상한이 없었다"와 "상한을 모른다"를 구별할 수
+/// 없다.** 그 둘은 정반대의 사실이다 — 앞은 사용자가 고른 것이고 뒤는 우리가 답할 수 없는
+/// 것이다(`BudgetPanel`과 같은 규율).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetCaps {
+    pub fleet_cap_usd: Option<f64>,
+    pub per_task_cap_usd: Option<f64>,
+}
+
+/// `FLEET_ENROLLED` 페이로드 — **두 진입점이 같은 것을 쓴다.**
+///
+/// 헤드리스 호스트와 데스크톱이 각자 `json!`을 적으면 키가 갈라지고, 갈라진 쪽을 읽는 화면은
+/// 한쪽 경로에서만 조용히 빈 값을 본다. 그리고 그 빈 값은 "상한이 없었다"로 읽힌다 —
+/// 위 `FleetCaps` 주석이 말하는 바로 그 혼동이다.
+pub struct Enrollment<'a> {
+    pub fleet_id: &'a str,
+    pub spec: &'a MemberSpec,
+    /// 0부터 세는 색인. 페이로드에는 **1부터**로 나간다 — 화면에 "2/4"로 그대로 실린다.
+    pub index: usize,
+    pub fleet_size: usize,
+    pub caps: FleetCaps,
+    /// 실제로 들어갔는가. `false`면 아래 `reason`이 왜 못 들어갔는지 말한다.
+    pub admitted: bool,
+    pub reserved_usd: Option<f64>,
+    pub worktree_path: Option<String>,
+    /// 이미 있던 트리를 다시 쓴 것인가. 새로 만든 것과 다른 사실이다(worktree.rs).
+    pub reused_tree: bool,
+    /// 들어가지 못한 이유. 들어간 구성원에는 없다.
+    pub reason: Option<&'a str>,
+}
+
+impl Enrollment<'_> {
+    pub fn payload(&self) -> Value {
+        let mut payload = json!({
+            "fleetId": self.fleet_id,
+            "branch": self.spec.branch,
+            "memberIndex": self.index + 1,
+            "fleetSize": self.fleet_size,
+            "admitted": self.admitted,
+            // **객체가 있다는 것 자체가 "기록됐다"이다.** 값이 `null`인 것과 키가 없는 것을
+            // 화면이 구별해야 하므로, 두 값을 최상위에 흩뿌리지 않고 한 객체로 묶는다.
+            "caps": self.caps,
+        });
+        let object = payload.as_object_mut().expect("방금 만든 객체");
+        if let Some(reserved) = self.reserved_usd {
+            object.insert("reservedUsd".to_string(), json!(reserved));
+        }
+        if let Some(path) = &self.worktree_path {
+            object.insert("worktreePath".to_string(), json!(path));
+            object.insert("reusedTree".to_string(), json!(self.reused_tree));
+        }
+        if let Some(reason) = self.reason {
+            object.insert("reason".to_string(), json!(reason));
+        }
+        payload
+    }
 }
 
 /// Fleet을 계획한다. 실패하면 **아무것도 시작하지 않는다** — worktree도 만들지 않는다.
@@ -434,6 +512,154 @@ impl FleetReport {
     }
 }
 
+/// 한 구성원의 결말을 **하나의 값으로** 부른다.
+///
+/// # 왜 `final_status`를 그대로 쓰지 않는가
+///
+/// 두 가지가 빠지기 때문이다. ① 시작조차 못 한 구성원은 `REJECTED`로 확정되지만 **거부가
+/// 아니다** — 사용자가 다음에 할 일이 다르다(`admitted`가 그것을 가른다). ② 아직 끝나지
+/// 않은 구성원은 `final_status`가 없는데, 그것을 "결말 없음"으로 화면에 흘리면 **끝난 것과
+/// 같은 자리에 빈칸으로** 그려진다. 도는 것은 결말이 아니라 진행이고, 그 사실이 값에
+/// 있어야 화면이 "완료"로 접지 않는다.
+pub fn member_status(admitted: bool, final_status: Option<&str>) -> &'static str {
+    if !admitted {
+        return "not_started";
+    }
+    match final_status {
+        None => "running",
+        Some("COMPLETED") => "completed",
+        Some("FAILED") => "failed",
+        Some("CANCELLED") => "cancelled",
+        Some("REJECTED") => "rejected",
+        Some("INTERRUPTED") => "interrupted",
+        // 모르는 값을 "실패"로 접지 않는다 — 접으면 새 종착지가 생길 때마다 화면이
+        // **말없이 틀린 답**을 한다.
+        Some(_) => "unknown",
+    }
+}
+
+/// 기록에서 유도한 구성원 하나.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemberStatus {
+    pub task_id: String,
+    pub branch: String,
+    pub member_index: usize,
+    pub fleet_size: usize,
+    pub admitted: bool,
+    /// `completed`|`failed`|`cancelled`|`rejected`|`interrupted`|`not_started`|`running`|`unknown`
+    pub status: String,
+    pub phase: String,
+    /// **이 구성원 하나의 지출.** 합계가 아니다 — 이름이 그것을 말한다.
+    pub cost_usd: f64,
+    /// 가격을 모르는 모델로 나간 호출 수. 있으면 위 금액은 **하한이다.**
+    pub unpriced_calls: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserved_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    pub created_at: String,
+}
+
+/// 기록에서 유도한 Fleet 하나 — **화면과 CLI가 같은 함수를 읽는다.**
+///
+/// 종전에는 `fleet-status`가 CLI 안에서 구성원 비용을 더했다. 화면이 같은 것을 물으려면
+/// 그 덧셈이 한 벌 더 생기고, **두 벌은 갈라진다.** 갈라진 쪽이 합계 상한을 말하지 않으면
+/// 화면은 "상한 안에서 끝났다"를 근거 없이 말하게 된다.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FleetStatus {
+    pub fleet_id: String,
+    pub members: Vec<MemberStatus>,
+    /// 구성원 지출의 **합**. 어느 한 태스크의 지출이 아니다.
+    pub fleet_cost_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fleet_cap_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_task_cap_usd: Option<f64>,
+    /// 상한을 **기록에서 읽을 수 있었는가.** 거짓이면 위 두 값이 없는 이유는 "상한이
+    /// 없었다"가 아니라 "이 기록이 상한을 남기기 전의 것이다"이다.
+    pub caps_recorded: bool,
+    /// 아직 확정되지 않은 구성원. 크래시로 죽은 것은 `recover`가 `INTERRUPTED`로 확정하며,
+    /// 그전까지는 "확정되지 않았다"가 정직한 답이다.
+    pub unfinished_task_ids: Vec<String>,
+    /// 첫 구성원이 등록된 시각. 목록을 최신순으로 세우는 기준이다.
+    pub started_at: String,
+}
+
+/// 저장소에서 Fleet 상태를 읽는다. **최신 Fleet이 앞에 온다.**
+///
+/// 비용은 `provider_usage` 행에서 온다 — Node의 주장이 아니다(11.7①).
+pub fn collect_status(
+    store: &crate::store::Store,
+    fleet_id: Option<&str>,
+) -> Result<Vec<FleetStatus>, String> {
+    let rows = store
+        .fleet_members(fleet_id)
+        .map_err(|e| format!("Fleet 기록을 읽을 수 없습니다: {e}"))?;
+
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: std::collections::HashMap<String, FleetStatus> = std::collections::HashMap::new();
+    for row in rows {
+        let entry = grouped.entry(row.fleet_id.clone()).or_insert_with(|| {
+            order.push(row.fleet_id.clone());
+            FleetStatus {
+                fleet_id: row.fleet_id.clone(),
+                members: Vec::new(),
+                fleet_cost_usd: 0.0,
+                fleet_cap_usd: None,
+                per_task_cap_usd: None,
+                caps_recorded: false,
+                unfinished_task_ids: Vec::new(),
+                started_at: row.created_at.clone(),
+            }
+        });
+        // **비용을 읽지 못한 것을 0으로 적지 않는다.** 0은 "안 썼다"이고, 여기서 필요한 것은
+        // "모른다"이다 — 그래서 읽기 실패는 가격 미상 호출과 같은 취급을 받는다(하한 표시).
+        let (cost_usd, _, unpriced) = match store.task_cost_usd(&row.task_id) {
+            Ok(v) => v,
+            Err(_) => (0.0, 0, 1),
+        };
+        if let Some(caps) = row.caps {
+            entry.caps_recorded = true;
+            entry.fleet_cap_usd = caps.fleet_cap_usd;
+            entry.per_task_cap_usd = caps.per_task_cap_usd;
+        }
+        if row.final_status.is_none() {
+            entry.unfinished_task_ids.push(row.task_id.clone());
+        }
+        entry.fleet_cost_usd += cost_usd;
+        if row.created_at < entry.started_at {
+            entry.started_at = row.created_at.clone();
+        }
+        entry.members.push(MemberStatus {
+            status: member_status(row.admitted, row.final_status.as_deref()).to_string(),
+            task_id: row.task_id,
+            branch: row.branch,
+            member_index: row.member_index,
+            fleet_size: row.fleet_size,
+            admitted: row.admitted,
+            phase: row.phase,
+            cost_usd,
+            unpriced_calls: unpriced,
+            reserved_usd: row.reserved_usd,
+            worktree_path: row.worktree_path,
+            created_at: row.created_at,
+        });
+    }
+
+    let mut out: Vec<FleetStatus> = order
+        .into_iter()
+        .filter_map(|id| grouped.remove(&id))
+        .collect();
+    for status in &mut out {
+        status.members.sort_by_key(|m| m.member_index);
+    }
+    // 최신이 앞이다 — 화면은 방금 돌린 것을 먼저 본다.
+    out.reverse();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +673,215 @@ mod tests {
 
     fn specs(n: usize) -> Vec<MemberSpec> {
         (0..n).map(|i| spec(&format!("m{i}"))).collect()
+    }
+
+    fn caps(fleet: Option<f64>, per_task: Option<f64>) -> FleetCaps {
+        FleetCaps {
+            fleet_cap_usd: fleet,
+            per_task_cap_usd: per_task,
+        }
+    }
+
+    /// **상한이 기록에 남는다.** 남기지 않으면 화면은 "상한이 없었다"와 "모른다"를 구별할 수
+    /// 없고, 그 둘은 정반대의 사실이다.
+    #[test]
+    fn the_enrollment_records_the_caps_that_were_applied() {
+        let member = spec("feat-a");
+        let payload = Enrollment {
+            fleet_id: "f1",
+            spec: &member,
+            index: 1,
+            fleet_size: 3,
+            caps: caps(Some(6.0), Some(2.0)),
+            admitted: true,
+            reserved_usd: Some(2.0),
+            worktree_path: Some("/tmp/t".to_string()),
+            reused_tree: false,
+            reason: None,
+        }
+        .payload();
+        assert_eq!(payload["caps"]["fleetCapUsd"], json!(6.0));
+        assert_eq!(payload["caps"]["perTaskCapUsd"], json!(2.0));
+        // 화면에 "2/3"으로 나가는 값이다 — 0부터 세는 색인을 그대로 흘리지 않는다.
+        assert_eq!(payload["memberIndex"], json!(2));
+        assert_eq!(payload["admitted"], json!(true));
+        assert_eq!(payload["reusedTree"], json!(false));
+        assert!(payload.get("reason").is_none(), "들어간 구성원에는 사유가 없다");
+    }
+
+    /// 상한이 **없었다**는 것도 기록이다. 키가 사라지면 옛 기록과 구별되지 않는다.
+    #[test]
+    fn no_cap_is_still_recorded_as_a_fact() {
+        let member = spec("feat-a");
+        let payload = Enrollment {
+            fleet_id: "f1",
+            spec: &member,
+            index: 0,
+            fleet_size: 1,
+            caps: caps(None, None),
+            admitted: false,
+            reserved_usd: None,
+            worktree_path: None,
+            reused_tree: false,
+            reason: Some("Fleet이 취소되어 시작하지 않았습니다"),
+        }
+        .payload();
+        assert!(payload["caps"].is_object(), "상한 객체는 언제나 있다");
+        assert_eq!(payload["caps"]["fleetCapUsd"], Value::Null);
+        assert!(
+            payload.get("worktreePath").is_none(),
+            "시작하지 않은 구성원에는 트리가 없다 — 없는 경로를 기록에 적으면 그 기록을 여는 사람이 없는 디렉터리를 찾는다"
+        );
+        assert_eq!(payload["reason"], json!("Fleet이 취소되어 시작하지 않았습니다"));
+    }
+
+    // ---- 기록에서 유도한 Fleet 상태 (collect_status) ----
+
+    fn store_with_fleet() -> (tempfile::TempDir, crate::store::Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = crate::artifacts::ArtifactStore::new(dir.path()).unwrap();
+        let mut store = crate::store::Store::open_in_memory(artifacts).unwrap();
+        store.upsert_workspace("ws-1", "/tmp/ws", "ws").unwrap();
+        store.upsert_session("sess-1", "ws-1", None).unwrap();
+        (dir, store)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enroll(
+        store: &mut crate::store::Store,
+        task_id: &str,
+        branch: &str,
+        index: usize,
+        size: usize,
+        caps: FleetCaps,
+        admitted: bool,
+        terminal: Option<&str>,
+        cost_usd: Option<f64>,
+    ) {
+        let member = spec(branch);
+        store
+            .create_task(task_id, "sess-1", "ws-1", "/tmp/ws", "verified", &member.message)
+            .unwrap();
+        store
+            .append_event(
+                task_id,
+                "FLEET_ENROLLED",
+                &Enrollment {
+                    fleet_id: "f1",
+                    spec: &member,
+                    index,
+                    fleet_size: size,
+                    caps,
+                    admitted,
+                    reserved_usd: caps.per_task_cap_usd.filter(|_| admitted),
+                    worktree_path: admitted.then(|| format!("/tmp/wt/{branch}")),
+                    reused_tree: false,
+                    reason: (!admitted).then_some("합계 상한이 남지 않았습니다"),
+                }
+                .payload(),
+            )
+            .unwrap();
+        if let Some(cost) = cost_usd {
+            store
+                .record_provider_usage(&json!({
+                    "taskId": task_id,
+                    "callId": format!("call-{task_id}"),
+                    "role": "executor",
+                    "providerId": "anthropic",
+                    "modelId": "m",
+                    "costUsd": cost,
+                }))
+                .unwrap();
+        }
+        if let Some(status) = terminal {
+            store
+                .finish_task(task_id, status, &format!("TASK_{status}"), None, &json!({}))
+                .unwrap();
+        }
+    }
+
+    /// **합계는 합계라고 말한다** — 그리고 그 합계는 저장소가 센 값이다(Node의 주장이 아니다).
+    #[test]
+    fn the_status_sums_member_costs_and_never_multiplies_by_member_count() {
+        let (_dir, mut store) = store_with_fleet();
+        enroll(&mut store, "t1", "a", 0, 3, caps(Some(6.0), Some(2.0)), true, Some("COMPLETED"), Some(0.5));
+        enroll(&mut store, "t2", "b", 1, 3, caps(Some(6.0), Some(2.0)), true, Some("FAILED"), Some(0.25));
+        enroll(&mut store, "t3", "c", 2, 3, caps(Some(6.0), Some(2.0)), false, Some("REJECTED"), None);
+
+        let fleets = collect_status(&store, None).unwrap();
+        assert_eq!(fleets.len(), 1);
+        let fleet = &fleets[0];
+        assert_eq!(fleet.members.len(), 3);
+        // 구성원 셋의 **합**이다 — 구성원 수만큼 곱해지지 않는다.
+        assert!((fleet.fleet_cost_usd - 0.75).abs() < 1e-9, "{}", fleet.fleet_cost_usd);
+        assert_eq!(fleet.fleet_cap_usd, Some(6.0));
+        assert_eq!(fleet.per_task_cap_usd, Some(2.0));
+        assert!(fleet.caps_recorded);
+    }
+
+    /// **부분 실패가 개별로 보인다.** 결말을 하나로 접으면 이 제품이 파는 것을 파는 행위다.
+    #[test]
+    fn every_member_keeps_its_own_outcome() {
+        let (_dir, mut store) = store_with_fleet();
+        enroll(&mut store, "t1", "a", 0, 3, caps(None, None), true, Some("COMPLETED"), Some(0.1));
+        enroll(&mut store, "t2", "b", 1, 3, caps(None, None), true, Some("FAILED"), Some(0.1));
+        enroll(&mut store, "t3", "c", 2, 3, caps(None, None), false, Some("REJECTED"), None);
+
+        let fleet = &collect_status(&store, None).unwrap()[0];
+        let statuses: Vec<&str> = fleet.members.iter().map(|m| m.status.as_str()).collect();
+        // **미시작은 거부가 아니다** — 셋째는 `REJECTED`로 확정됐지만 들어간 적이 없다.
+        assert_eq!(statuses, vec!["completed", "failed", "not_started"]);
+        // 그리고 순서는 구성원 번호다 — 화면이 "2/3"으로 읽는 그 번호다.
+        assert_eq!(
+            fleet.members.iter().map(|m| m.member_index).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// 아직 도는 구성원은 **결말이 없다**는 사실이 값으로 남는다.
+    #[test]
+    fn a_running_member_is_not_an_outcome() {
+        let (_dir, mut store) = store_with_fleet();
+        enroll(&mut store, "t1", "a", 0, 2, caps(None, None), true, Some("COMPLETED"), Some(0.1));
+        enroll(&mut store, "t2", "b", 1, 2, caps(None, None), true, None, None);
+
+        let fleet = &collect_status(&store, None).unwrap()[0];
+        assert_eq!(fleet.members[1].status, "running");
+        assert_eq!(fleet.unfinished_task_ids, vec!["t2".to_string()]);
+    }
+
+    /// **상한이 없었던 것과 기록에 없는 것은 다른 사실이다.** 옛 기록에는 `caps`가 없다.
+    #[test]
+    fn a_record_without_caps_does_not_claim_there_was_no_cap() {
+        let (_dir, mut store) = store_with_fleet();
+        let member = spec("a");
+        store
+            .create_task("t1", "sess-1", "ws-1", "/tmp/ws", "verified", &member.message)
+            .unwrap();
+        store
+            .append_event(
+                "t1",
+                "FLEET_ENROLLED",
+                // 상한 필드가 생기기 전의 페이로드.
+                &json!({ "fleetId": "f1", "branch": "a", "memberIndex": 1, "fleetSize": 1, "admitted": true }),
+            )
+            .unwrap();
+
+        let fleet = &collect_status(&store, None).unwrap()[0];
+        assert!(!fleet.caps_recorded, "읽지 못한 것을 '상한 없음'으로 단정하지 않는다");
+        assert_eq!(fleet.fleet_cap_usd, None);
+    }
+
+    /// **미시작은 거부가 아니고, 도는 것은 결말이 아니다.**
+    #[test]
+    fn the_member_status_separates_never_started_and_still_running() {
+        // 시작조차 못 한 구성원은 `REJECTED`로 확정되지만 거부가 아니다.
+        assert_eq!(member_status(false, Some("REJECTED")), "not_started");
+        assert_eq!(member_status(true, Some("REJECTED")), "rejected");
+        assert_eq!(member_status(true, None), "running");
+        assert_eq!(member_status(true, Some("COMPLETED")), "completed");
+        // 모르는 값을 실패로 접지 않는다 — 접으면 새 종착지가 생길 때 화면이 말없이 틀린다.
+        assert_eq!(member_status(true, Some("ANSWERED")), "unknown");
     }
 
     /// **크기 상한이 강제된다** (원칙 5). 상한 없이 N을 받으면 오타 하나가 비용을 폭발시킨다.

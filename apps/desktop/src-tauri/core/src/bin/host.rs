@@ -1172,31 +1172,12 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
         // Fleet 조회 — **DB만 읽는다.** 크래시 후 "무엇이 돌고 있었나"에 답하는 자리이므로
         // 실행 중인 프로세스가 아니라 이벤트에서 유도한다(원칙 7).
         "fleet-status" => {
+            // **집계는 core가 한다**(fleet.rs `collect_status`). 화면도 같은 함수를 부르므로
+            // 여기서 다시 더하면 두 벌이 되고, 두 벌은 갈라진다 — 갈라진 쪽이 합계 상한을
+            // 말하지 않으면 그쪽 사용자는 "상한 안에서 끝났다"를 근거 없이 읽는다.
             let guard = store.lock().unwrap();
-            let members = guard
-                .fleet_members(args.fleet_id.as_deref())
-                .map_err(|e| format!("Fleet 조회 실패: {e}"))?;
-            let mut cost = 0.0;
-            for member in &members {
-                cost += guard.task_cost_usd(&member.task_id).map(|(c, _, _)| c).unwrap_or(0.0);
-            }
-            // **`final_status`가 없으면 돌고 있었다.** 크래시로 죽은 것은 `recover`가
-            // `INTERRUPTED`로 확정하며, 그전까지는 "확정되지 않았다"가 정직한 답이다.
-            let unfinished: Vec<&str> = members
-                .iter()
-                .filter(|m| m.final_status.is_none())
-                .map(|m| m.task_id.as_str())
-                .collect();
-            println!(
-                "{}",
-                json!({
-                    "members": members,
-                    // 이름이 `fleetCostUsd`인 이유: 태스크 하나의 지출과 같은 이름으로 부르면
-                    // 화면이 둘을 구별할 수 없고, 그러면 참인 숫자가 답이 아니게 된다.
-                    "fleetCostUsd": cost,
-                    "unfinishedTaskIds": unfinished,
-                })
-            );
+            let fleets = tomverse_core::fleet::collect_status(&guard, args.fleet_id.as_deref())?;
+            println!("{}", json!({ "fleets": fleets }));
             Ok(0)
         }
 
@@ -1891,7 +1872,7 @@ fn run_fleet(
                 eprintln!("구성원 미시작({}): {reason}", spec.branch);
                 let task_id = format!("task-{}", uuid::Uuid::new_v4());
                 if let Err(message) = record_unstarted_member(
-                    &store, &repo, &session_id, &fleet_id, size, index, spec, &task_id,
+                    &store, &repo, &session_id, &fleet_id, size, index, spec, &task_id, plan.caps(),
                     "fleet_cancelled", &reason,
                 ) {
                     eprintln!("미시작 구성원 기록 실패: {message}");
@@ -1920,6 +1901,7 @@ fn run_fleet(
                         index,
                         &spec,
                         &session_id,
+                        plan.caps(),
                         reserved_usd,
                         tx.clone(),
                     ) {
@@ -1989,7 +1971,7 @@ fn run_fleet(
                     eprintln!("구성원 미시작({}): {reason}", spec.branch);
                     let task_id = format!("task-{}", uuid::Uuid::new_v4());
                     if let Err(message) = record_unstarted_member(
-                        &store, &repo, &session_id, &fleet_id, size, index, spec, &task_id,
+                        &store, &repo, &session_id, &fleet_id, size, index, spec, &task_id, plan.caps(),
                         "fleet_budget_exhausted", &reason,
                     ) {
                         eprintln!("미시작 구성원 기록 실패: {message}");
@@ -2094,6 +2076,7 @@ fn record_unstarted_member(
     index: usize,
     spec: &tomverse_core::fleet::MemberSpec,
     task_id: &str,
+    caps: tomverse_core::fleet::FleetCaps,
     // 사유 **코드**. 문장과 따로 두는 이유: 기록을 읽는 쪽이 문장을 다시 뜯게 하지 않는다.
     reason_code: &str,
     reason: &str,
@@ -2112,14 +2095,22 @@ fn record_unstarted_member(
         .append_event(
             task_id,
             "FLEET_ENROLLED",
-            &json!({
-                "fleetId": fleet_id,
-                "branch": spec.branch,
-                "memberIndex": index + 1,
-                "fleetSize": fleet_size,
-                "admitted": false,
-                "reason": reason,
-            }),
+            // **페이로드를 여기서 적지 않는다**(fleet.rs `Enrollment`). 두 진입점이 각자
+            // `json!`을 적으면 키가 갈라지고, 갈라진 쪽을 읽는 화면은 한쪽 경로에서만
+            // 조용히 빈 값을 본다.
+            &tomverse_core::fleet::Enrollment {
+                fleet_id,
+                spec,
+                index,
+                fleet_size,
+                caps,
+                admitted: false,
+                reserved_usd: None,
+                worktree_path: None,
+                reused_tree: false,
+                reason: Some(reason),
+            }
+            .payload(),
         )
         .map_err(|e| e.to_string())?;
     guard
@@ -2152,6 +2143,7 @@ fn start_member(
     index: usize,
     spec: &tomverse_core::fleet::MemberSpec,
     session_id: &str,
+    caps: tomverse_core::fleet::FleetCaps,
     reserved_usd: Option<f64>,
     tx: std::sync::mpsc::Sender<MemberDone>,
 ) -> Result<RunningMember, String> {
@@ -2226,16 +2218,19 @@ fn start_member(
     host.append_event(
         &task_id,
         "FLEET_ENROLLED",
-        json!({
-            "fleetId": fleet_id,
-            "branch": spec.branch,
-            "memberIndex": index + 1,
-            "fleetSize": fleet_size,
-            "admitted": true,
-            "reservedUsd": reserved_usd,
-            "worktreePath": wt.path.to_string_lossy(),
-            "reusedTree": !wt.created,
-        }),
+        tomverse_core::fleet::Enrollment {
+            fleet_id,
+            spec,
+            index,
+            fleet_size,
+            caps,
+            admitted: true,
+            reserved_usd,
+            worktree_path: Some(wt.path.to_string_lossy().to_string()),
+            reused_tree: !wt.created,
+            reason: None,
+        }
+        .payload(),
     )?;
 
     let control = Arc::new(MemberControl::default());
