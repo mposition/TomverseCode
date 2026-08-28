@@ -656,6 +656,16 @@ fn real_main() -> Result<i32, String> {
     let root = WorkspaceRoot::new(&workspace_path)
         .map_err(|e| format!("워크스페이스 {workspace_path:?}를 열 수 없습니다: {e}"))?;
 
+    // **환경이 만드는 한계는 여는 자리에서 말한다**(`unc.rs`, 55.4절). 격리 공지와 같은
+    // 규율이다 — 문장은 core가 만들고 헤드리스와 데스크톱이 같은 것을 낸다. 각자 적으면
+    // 한쪽만 조용해지고, 그 경로의 사용자는 경고를 못 받는다.
+    if let Some(notice) = tomverse_core::unc::workspace_notice(
+        tomverse_core::tools::program::Platform::current(),
+        &root.display(),
+    ) {
+        eprintln!("{notice}");
+    }
+
     // **재현 검사는 DB를 열지 않는다.** 감사자에게는 DB가 없다 — 그래서 export 파일이 있는
     // 것이고, 여기서 store를 열면 없던 state.db가 생긴다. "아무것도 쓰지 않는다"는 약속은
     // 그 파일 하나로 깨진다. 그래서 store를 만들기 **전에** 갈라진다.

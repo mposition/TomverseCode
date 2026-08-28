@@ -46,6 +46,7 @@ pub mod tools;
 pub mod transmission;
 pub mod types;
 pub mod uimsg;
+pub mod unc;
 pub mod worktree;
 pub mod verify;
 #[cfg(windows)]

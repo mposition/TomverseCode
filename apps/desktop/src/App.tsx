@@ -1033,10 +1033,13 @@ export default function App() {
       {/* 격리 실행이 **말하지 않으면 정반대로 읽히는 것들**(22.5절). 배너 자리인 이유:
           "결과가 본체에 없다"는 사실은 결과를 볼 때가 아니라 **작업을 시작하기 전에** 알아야
           한다. 문장은 Rust가 만든다 — 헤드리스는 stderr로 같은 것을 낸다. */}
-      {(workspace?.isolationNotices?.length ?? 0) > 0 && (
+      {/* 환경 경고(55.4절)를 같은 배너에 **함께** 싣는다. 두 목록을 따로 렌더하면 배너가
+          둘 겹쳐 보이고, 사용자는 위쪽만 읽는다. 필드를 나눈 이유는 출처가 다르기 때문이지
+          자리를 나누려는 것이 아니다. */}
+      {[...(workspace?.environmentNotices ?? []), ...(workspace?.isolationNotices ?? [])].length > 0 && (
         <section className="banner banner-warn">
           <ul className="small">
-            {workspace?.isolationNotices?.map((notice) => (
+            {[...(workspace?.environmentNotices ?? []), ...(workspace?.isolationNotices ?? [])].map((notice) => (
               <li key={notice}>{notice}</li>
             ))}
           </ul>
