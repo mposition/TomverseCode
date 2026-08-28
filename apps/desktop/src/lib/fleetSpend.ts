@@ -154,6 +154,19 @@ const OUTCOME_LABELS: Record<string, string> = {
   unknown: "알 수 없음",
 };
 
+/**
+ * 결말 하나를 사람이 읽는 이름으로. **모르는 값은 코드를 그대로 낸다.**
+ *
+ * 빈 문자열이나 "알 수 없음"으로 접으면 새 종착지가 생겼을 때 화면에서 **사라진다** —
+ * 코드가 그대로 보이면 적어도 사용자가 그것을 우리에게 말할 수 있다.
+ *
+ * 목록 줄과 배지가 같은 이름을 써야 하므로 그 표를 여기서 내보낸다: 화면이 자기 표를
+ * 따로 들면 같은 결말이 두 이름으로 보인다.
+ */
+export function outcomeLabel(status: string): string {
+  return OUTCOME_LABELS[status] ?? status;
+}
+
 export function summarizeFleetOutcome(members: readonly FleetMemberSpend[]): FleetOutcomeSummary {
   const counts: Record<string, number> = {};
   for (const member of members) counts[member.status] = (counts[member.status] ?? 0) + 1;
@@ -167,9 +180,7 @@ export function summarizeFleetOutcome(members: readonly FleetMemberSpend[]): Fle
   const extra = Object.keys(counts)
     .filter((status) => !always.includes(status))
     .sort();
-  const parts = [...always, ...extra].map(
-    (status) => `${OUTCOME_LABELS[status] ?? status} ${counts[status] ?? 0}`
-  );
+  const parts = [...always, ...extra].map((status) => `${outcomeLabel(status)} ${counts[status] ?? 0}`);
   return {
     allCompleted,
     stillRunning,

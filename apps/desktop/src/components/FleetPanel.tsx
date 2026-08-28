@@ -4,8 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import { unwrap, type Envelope } from "../lib/envelope";
 import { budgetArgs } from "../lib/budgetArgs";
 import { reviewFleetDraft, type FleetMemberDraft } from "../lib/fleetDraft";
-import { summarizeFleetOutcome, summarizeFleetSpend } from "../lib/fleetSpend";
-import type { FleetStatus, FleetStatusView } from "../types";
+import { outcomeLabel, summarizeFleetOutcome, summarizeFleetSpend } from "../lib/fleetSpend";
+import { phaseToStage, type FleetStatus, type FleetStatusView, type TaskPhase } from "../types";
 
 /**
  * Fleet — **worktree 격리 기반 N개 병렬 실행**(product-strategy 8.2절, process-architecture 11.6절).
@@ -280,7 +280,12 @@ function FleetOutcome({
             <strong>
               {member.memberIndex}/{member.fleetSize} · {member.branch}
             </strong>{" "}
-            — {member.status} ({member.phase}) · ${member.costUsd.toFixed(4)}
+            {/* **결말과 단계를 같은 이름 체계로 쓴다.** 목록 줄만 코드를 그대로 내면
+                배지의 "미시작 1"과 줄의 `not_started`가 같은 것으로 읽히지 않는다.
+                단계는 도는 동안에만 뜻이 있다 — 끝난 구성원의 phase는 결말과 같은 말이다. */}
+            — {outcomeLabel(member.status)}
+            {member.status === "running" ? ` · ${phaseToStage(member.phase as TaskPhase)}` : ""} · $
+            {member.costUsd.toFixed(4)}
             {member.status === "running" && (
               <button
                 type="button"
