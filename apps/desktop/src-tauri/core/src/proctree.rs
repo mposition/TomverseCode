@@ -44,7 +44,54 @@
 //! 바꿔버려 "사용자의 환경에서 통과했다"는 판정의 의미를 약하게 만든다.
 
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// **Job Object 생성을 끄는 스위치** — `taskkill` 폴백을 강제로 태우기 위한 것이다.
+///
+/// # 왜 필요한가
+///
+/// 착지 기준 `processGroup/taskkillFallbackStillWorks`는 "Job Object가 없는 경로에서도
+/// `taskkill /T /F`가 트리를 거둔다"를 확인한다. 그런데 그 경로는
+/// `JobHandle::create_and_assign`이 **실패해야만** 탄다. 실측에서는 언제나
+/// `TerminateJobObject`를 탔고(기록 7·12절), 실패를 강제할 수단이 없어서 폴백은 한 번도
+/// 실행된 적이 없다 — 즉 그 기준은 확인할 방법 자체가 없었다.
+///
+/// **이 기준이 확인하려는 것은 폴백의 완전함이 아니라 한계다.** taskkill은 스냅샷 기반이라
+/// 이미 고아가 된 손자를 놓칠 수 있고, 그 사실이 그대로 드러나는 것이 정답이다.
+///
+/// # 켜는 자리는 하나뿐이다
+///
+/// `tomverse-host --no-job-object`. **GUI(`apps/desktop/src-tauri`)에서는 켤 수 없다** —
+/// 켤 수 있으면 제품 경로의 종료 보장을 무력화하는 수단이 되고, 그건 이 기능이 존재하는
+/// 이유를 지운다. 그 불변식은 사람이 지키는 규칙이 아니라
+/// `the_job_object_switch_never_leaks_into_the_gui`가 소스에서 지킨다.
+///
+/// **환경변수를 쓰지 않는다.** 환경은 자식 프로세스로 상속되므로, 한 번 켜지면 어디서 켜졌는지
+/// 추적할 수 없고 우리가 띄운 프로세스까지 함께 물든다. 명령행 인자는 그 프로세스에서 끝난다.
+///
+/// # 판정 경로를 건드리지 않는다
+///
+/// 이 스위치는 Tool Runtime에도 Policy Gate에도 분기를 만들지 않는다. `adopt`가 job을
+/// 만들지 않을 뿐이고, 그 뒤는 job 생성이 **실패했을 때와 똑같은 코드**가 돈다 — 그래야
+/// 여기서 태운 것이 실제 폴백 경로를 태운 것이 된다.
+///
+/// # 한 방향이다
+///
+/// 켜기만 하고 끄지 못한다. 되돌릴 수 있게 하면 "제품 경로에서 잠깐 껐다가 켠다"가 가능해지고,
+/// 그 순간 이 값은 진단 스위치가 아니라 우회 수단이 된다.
+static JOB_OBJECT_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// 이 프로세스에서 Job Object를 만들지 않는다. **`tomverse-host`의 명령행 인자에서만 부른다.**
+pub fn disable_job_object() {
+    JOB_OBJECT_DISABLED.store(true, Ordering::SeqCst);
+}
+
+/// 스위치가 켜져 있는가. 결과에 함께 실어 **"만들지 못했다"와 "일부러 껐다"를 구별한다** —
+/// 둘 다 `method`가 `taskkill …`이 되므로, 그 값만으로는 같은 사실로 읽힌다.
+pub fn job_object_disabled() -> bool {
+    JOB_OBJECT_DISABLED.load(Ordering::SeqCst)
+}
 
 /// 종료 유예 — 이 시간 안에 스스로 끝나면 강제 종료하지 않는다.
 /// Unix 전용 — Windows에는 SIGTERM에 해당하는 단계가 없다(Job Object는 즉시 종료한다).
@@ -163,6 +210,11 @@ pub struct ProcessGuard {
 /// 어느 쪽이든 taskkill보다 나빠지지 않는다.
 #[cfg(windows)]
 pub fn adopt(child: &std::process::Child) -> ProcessGuard {
+    // 스위치가 켜져 있으면 **job을 만들지 않는다.** 생성·배정이 실패했을 때와 같은 상태이며,
+    // 그 뒤로는 같은 코드가 돈다 — 폴백을 태우려면 그래야 한다(`JOB_OBJECT_DISABLED`).
+    if job_object_disabled() {
+        return ProcessGuard { job: None };
+    }
     ProcessGuard {
         job: crate::win_job::JobHandle::create_and_assign(child),
     }
@@ -209,6 +261,9 @@ pub fn terminate_tree(child: &mut Child, guard: &ProcessGuard) -> TreeKillOutcom
             Some(job) if job.terminate() => (true, "TerminateJobObject"),
             // job은 있는데 종료 요청이 거절된 경우. 보장을 말할 수 없으므로 taskkill을 겹쳐 쓴다.
             Some(_) => (false, taskkill_method(windows_taskkill_tree(pid))),
+            // **`None`의 원인이 둘이다**: 생성·배정 실패, 또는 `--no-job-object`로 일부러 끈 것.
+            // 여기서 갈라 놓지 않는 것이 요점이다 — 폴백을 태우려면 두 경우가 같은 코드를
+            // 지나야 한다. 어느 쪽이었는지는 `TreeKillOutcome::job_object_disabled`가 말한다.
             None => (false, taskkill_method(windows_taskkill_tree(pid))),
         };
         let _ = child.kill();
@@ -259,6 +314,15 @@ pub struct TreeKillOutcome {
     /// **직접 세우지 말고 `TreeKillOutcome::new`를 쓸 것** — 이유는 그 함수 주석에.
     pub tree_guaranteed: bool,
     pub method: &'static str,
+    /// Job Object를 **일부러 끄고** 돌렸는가(`--no-job-object`).
+    ///
+    /// # 왜 `method`로 부족한가
+    ///
+    /// 스위치가 켜지면 `method`는 `taskkill …`이 되는데, 그건 **job 생성이 실패했을 때와
+    /// 같은 값**이다. 둘을 구별하지 못하면 실측 기록을 나중에 읽는 사람이 "이 머신에서는
+    /// job을 만들지 못한다"로 읽을 수 있고, 그건 이 머신에 대한 틀린 사실이다.
+    /// 폴백을 태웠다는 기록은 **일부러 태웠다는 사실과 함께** 남아야 근거가 된다.
+    pub job_object_disabled: bool,
 }
 
 impl TreeKillOutcome {
@@ -280,12 +344,26 @@ impl TreeKillOutcome {
     /// 그래서 두 조건의 결합을 호출자에게 맡기지 않고 여기서 강제한다. 호출자는 자기가 아는
     /// 것(1번)만 말하면 된다.
     fn new(pid: u32, reaped: bool, mechanism_covers_tree: bool, method: &'static str) -> Self {
+        Self::combine(pid, reaped, mechanism_covers_tree, method, job_object_disabled())
+    }
+
+    /// 결합 규칙 자체. **전역 상태를 읽지 않는다** — 그래야 테스트가 프로세스 전역 스위치를
+    /// 세우지 않고 규칙을 검사할 수 있고, 병렬로 도는 이웃 테스트에 흔들리지도 않는다
+    /// (CLAUDE.md: 프로세스 전역 값을 `==`로 비교하는 테스트는 병렬 실행에서 깨진다).
+    fn combine(
+        pid: u32,
+        reaped: bool,
+        mechanism_covers_tree: bool,
+        method: &'static str,
+        job_object_disabled: bool,
+    ) -> Self {
         Self {
             direct_child_terminated: reaped,
             child_still_running: !reaped,
             surviving_pid: if reaped { None } else { Some(pid) },
             tree_guaranteed: mechanism_covers_tree && reaped,
             method,
+            job_object_disabled,
         }
     }
 }
@@ -593,6 +671,108 @@ mod tests {
         // 취소 경로는 경쟁 상황에서 늘 이 상태를 만난다.
         let outcome = terminate_tree(&mut child, &ProcessGuard::default());
         assert!(outcome.direct_child_terminated);
+    }
+
+    // ---- Job Object를 끄는 스위치 (`--no-job-object`) ----
+    //
+    // # 여기서 검증되는 것과 되지 않는 것
+    //
+    // `win_job.rs`는 Linux에서 **컴파일되지 않는다.** 그러므로 여기서 통과한 `verify`는 이
+    // 스위치가 Windows에서 실제로 폴백을 태우는지에 대해 **아무것도 말해주지 않는다.**
+    // 이 환경에서 확인할 수 있는 것은 셋뿐이다:
+    //   (a) 인자 파싱 (`bin/host.rs`의 테스트)
+    //   (b) 스위치가 GUI로 새어들지 않았다는 **소스 불변식** (아래)
+    //   (c) `TreeKillOutcome::combine`의 결합 규칙 (아래)
+    // 나머지 — job이 실제로 만들어지지 않는가, taskkill이 트리를 어디까지 거두는가 — 는
+    // Windows에서 태워야 하고, 그 절차는 `landing.rs`의 `taskkillFallbackStillWorks`에 있다.
+
+    /// **스위치를 켜는 코드가 GUI 쪽에 없다.**
+    ///
+    /// 켤 수 있으면 제품 경로의 종료 보장을 무력화하는 수단이 되고, 그건 이 기능이 존재하는
+    /// 이유를 지운다. 껍데기 크레이트는 이 환경에서 `cargo test`가 컴파일하지 않으므로
+    /// 컴파일러가 잡아주지 않는다 — `worktree.rs`가 같은 이유로 같은 모양의 검사를 한다.
+    #[test]
+    fn the_job_object_switch_never_leaks_into_the_gui() {
+        // needle을 **런타임에 조립한다** — 그대로 적으면 이 파일이 자기 자신에 걸린다
+        // (CLAUDE.md: 소스를 검사하는 테스트는 자기 자신을 센다).
+        let needle = "disable_job".to_string() + "_object";
+
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        // 껍데기·GUI(`apps/desktop/src-tauri/src`). core는 그 아래의 별도 크레이트이므로
+        // 여기 포함되지 않는다.
+        let shell = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src");
+        let mut shell_files = Vec::new();
+        collect_rs(&shell, &mut shell_files);
+        // 빈 집합에 대해 통과하는 검사를 허용하지 않는다 — 스캔이 깨지면 "위반 없음"과
+        // "파일 없음"이 같은 초록색으로 보인다.
+        assert!(
+            shell_files.len() >= 3,
+            "껍데기 소스를 읽지 못했습니다: {}개",
+            shell_files.len()
+        );
+        let leaked: Vec<String> = shell_files
+            .iter()
+            .filter(|f| std::fs::read_to_string(f).unwrap_or_default().contains(&needle))
+            .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "GUI에서 Job Object 스위치를 켤 수 있습니다: {leaked:?} — 진입점은 tomverse-host의 \
+             --no-job-object 하나여야 합니다"
+        );
+
+        // **대조군**: 켜는 자리가 실제로 하나 있다. 없으면 위 단언은 아무것도 증명하지 않는다
+        // (이름을 바꾸면 검색이 조용히 0을 세게 되고, 그 침묵이 통과로 보인다).
+        let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("bin")
+            .join("host.rs");
+        let host_source = std::fs::read_to_string(&host).expect("bin/host.rs를 읽지 못했습니다");
+        let call = "proctree::".to_string() + &needle + "(";
+        assert_eq!(
+            host_source.matches(&call).count(),
+            1,
+            "스위치를 켜는 자리가 tomverse-host에 하나가 아닙니다"
+        );
+    }
+
+    /// **결합 규칙**: 스위치를 켰다는 사실은 보장 판정을 바꾸지 않고 **따로 남는다.**
+    ///
+    /// 둘을 뭉치면 "job을 만들지 못했다"와 "일부러 껐다"가 같은 기록이 되고, 실측을 나중에
+    /// 읽는 사람이 후자를 전자로 읽는다 — 그건 그 머신에 대한 틀린 사실이다.
+    #[test]
+    fn a_deliberately_disabled_job_object_is_recorded_as_such() {
+        // **전역 스위치를 세우지 않는다.** `combine`이 순수 함수인 이유가 이것이다 —
+        // 프로세스 전역 값을 건드리면 병렬로 도는 이웃 테스트가 흔들린다.
+        let off = TreeKillOutcome::combine(1, true, false, "taskkill /T /F (best-effort)", true);
+        assert!(off.job_object_disabled);
+        // 껐다는 사실이 "거뒀다"를 바꾸지는 않는다.
+        assert!(off.direct_child_terminated);
+        assert!(!off.tree_guaranteed, "폴백 경로가 트리 보장을 말했습니다");
+
+        // 같은 결말인데 스위치는 꺼져 있는 경우 — 값이 갈린다.
+        let failed_to_create = TreeKillOutcome::combine(1, true, false, "taskkill /T /F (best-effort)", false);
+        assert!(!failed_to_create.job_object_disabled);
+        assert_eq!(off.method, failed_to_create.method, "method만으로는 둘이 구별되지 않는다");
+    }
+
+    /// 그리고 **기본값은 꺼짐이다.** 이 테스트가 전역 스위치를 읽는 유일한 자리이며,
+    /// 켜는 테스트를 두지 않는 이유가 그것이다 — 스위치는 한 방향이라 되돌릴 수 없고,
+    /// 켜 버리면 같은 프로세스의 다른 테스트가 그 값을 보게 된다.
+    #[test]
+    fn the_job_object_switch_is_off_unless_asked() {
+        assert!(!job_object_disabled());
     }
 
     #[test]

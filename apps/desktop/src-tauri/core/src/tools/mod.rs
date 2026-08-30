@@ -1011,6 +1011,9 @@ impl ToolRuntime {
                 tree_guaranteed,
                 method,
                 surviving_pid,
+                // 이 문장에는 싣지 않는다 — 사용자에게 필요한 것은 "무엇이 남았을 수 있는가"이고,
+                // 스위치는 실측하는 사람이 읽는 사실이라 결과 JSON에 남는다.
+                job_object_disabled: _,
             } => (
                 ToolStatus::Cancelled,
                 Some(match (surviving_pid, tree_guaranteed) {
@@ -1050,8 +1053,15 @@ impl ToolRuntime {
             "timedOut": matches!(execution.termination, Termination::TimedOut),
             "cancelled": matches!(execution.termination, Termination::Cancelled { .. }),
             "treeKill": match &execution.termination {
-                Termination::Cancelled { tree_guaranteed, method, surviving_pid } => {
-                    json!({ "guaranteed": tree_guaranteed, "method": method, "survivingPid": surviving_pid })
+                Termination::Cancelled { tree_guaranteed, method, surviving_pid, job_object_disabled } => {
+                    json!({
+                        "guaranteed": tree_guaranteed,
+                        "method": method,
+                        "survivingPid": surviving_pid,
+                        // **폴백을 왜 탔는가.** 생략하면 실측 기록을 읽는 사람이 이 머신에서
+                        // job을 만들지 못한다고 읽는다 — 그건 이 머신에 대한 틀린 사실이다.
+                        "jobObjectDisabled": job_object_disabled,
+                    })
                 }
                 _ => serde_json::Value::Null,
             },
@@ -1177,6 +1187,11 @@ enum Termination {
         /// 이걸 남기는 이유: "취소했습니다"만 말하고 프로세스가 계속 도는 것이 이 기능에서 할
         /// 수 있는 가장 나쁜 일이다. 무엇이 남았는지 알려줘야 사용자가 직접 정리할 수 있다.
         surviving_pid: Option<u32>,
+        /// Job Object를 **일부러 끄고** 돌렸는가(`tomverse-host --no-job-object`).
+        ///
+        /// `method`만으로는 "만들지 못했다"와 "일부러 껐다"가 같은 값이 된다(proctree.rs).
+        /// 폴백을 태운 기록은 그 구별과 함께 남아야 근거가 되므로 결과에 싣는다.
+        job_object_disabled: bool,
     },
 }
 
@@ -1400,6 +1415,9 @@ fn run_process(
                 tree_guaranteed: true, // 아예 시작하지 않았으므로 남은 프로세스가 없다
                 method: "not-started",
                 surviving_pid: None,
+                // 종료 수단을 쓴 적이 없다 — 스위치와 무관하게 `false`가 맞다.
+                // 여기에 전역 상태를 읽어 넣으면 "job을 껐더니 시작도 안 했다"로 읽힌다.
+                job_object_disabled: false,
             },
             duration_ms: 0,
             resolved,
@@ -1491,6 +1509,7 @@ fn run_process(
                         tree_guaranteed: outcome.tree_guaranteed,
                         method: outcome.method,
                         surviving_pid: outcome.surviving_pid,
+                        job_object_disabled: outcome.job_object_disabled,
                     };
                     break None;
                 }

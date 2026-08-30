@@ -420,8 +420,9 @@ Remove-SmbShare -Name tomverse-unc -Force   # 위에서 만들었다면
 - 실행 전후로 tomverse 관련 잔여 `node.exe`가 없다.
 
 `jobHandleLifetime`은 **절반만** 확인됐다. 취소 경로는 위와 같이 확인했지만, 착지 기준이
-함께 요구하는 **강제 포기** 경로는 태우지 못했다 — 헤드리스 호스트(`tomverse-host`)에 그
-하위 명령이 없고, 강제 포기는 UI 탈출구다.
+함께 요구하는 **강제 포기** 경로는 태우지 못했다 — 관측 당시 헤드리스 호스트(`tomverse-host`)에
+그 하위 명령이 없었고, 강제 포기는 UI 탈출구였다. **지금은 `tomverse-host abandon`이 있다**
+(14절 5번). 그것으로 다시 태운 기록은 아직 없다.
 
 ---
 
@@ -471,7 +472,11 @@ Remove-SmbShare -Name tomverse-unc -Force   # 위에서 만들었다면
 
 ## 10. `pythonEnv` — 하나는 실패, 둘은 확인 불가
 
-- **`pythonOnPathIsNotTheStoreAlias`** ❌ **실패.** 이 머신의 PATH `python`은
+- **`pythonOnPathIsNotTheStoreAlias`** ❌ **실패.**
+  (이 기준은 이후 `storeAliasIsReportedAsCouldNotRun`으로 **다시 쓰였다** — 머신의 성질에서
+  코드의 성질로. 아래 관측은 그대로이고, 바뀐 것은 그 관측에 대해 우리가 무엇을 보고하는지다:
+  [state-machine 49.9절](./state-machine-and-protocol.md). 다시 태운 기록은 아직 없다.)
+  이 머신의 PATH `python`은
   `C:\Users\<user>\AppData\Local\Microsoft\WindowsApps\python.exe`이고 **크기가 0바이트**인
   Store 실행 별칭이다. `python --version`은 `Python `만 출력하고 **exit 9009**로 끝난다
   (Python이 실행되지 않는다). `python3`도 같은 자리에 있다.
@@ -509,7 +514,9 @@ Remove-SmbShare -Name tomverse-unc -Force   # 위에서 만들었다면
   앱에 전파되지 않는지를 실제로 보려면 콘솔 그룹에 Ctrl+C를 보내야 하는데, 그러면 실측을
   돌리고 있는 셸 자신이 죽을 수 있어 하지 않았다.
 - **`taskkillFallbackStillWorks`** ❔ — 폴백은 Job Object **생성·배정이 실패해야** 타는
-  경로이고, 그것을 강제하는 스위치가 없다. 7절의 실측은 언제나 `TerminateJobObject`를 탔다.
+  경로이고, 7절의 실측은 언제나 `TerminateJobObject`를 탔다. **관측 당시에는 그것을 강제하는
+  스위치가 없었다** — 지금은 `tomverse-host --no-job-object`가 있다(14절 6번). 그것으로 다시
+  태운 기록은 아직 없다.
 
 ---
 
@@ -566,9 +573,30 @@ Remove-SmbShare -Name tomverse-unc -Force   # 위에서 만들었다면
    # 설치본을 node 없는 Windows에 설치하고 실행 → 워크스페이스를 연다
    # stderr에 "[sidecar] 동봉 런타임이 아닙니다"가 **없어야** 한다 (session.rs)
    ```
-4. **Python이 있는 머신에서 `pythonEnv` 셋을 태운다**(10절). 이 머신에는 Python이 없다.
-5. **강제 포기 경로**로 job 핸들 수명을 마저 확인한다(7절) — UI가 필요하다.
-6. **`processGroup` 둘**(12절). Ctrl+C 전파는 별도 콘솔에서, taskkill 폴백은 강제할 수단이 필요하다.
+4. **`pythonEnv`를 태운다**(10절). 이제 **둘로 갈린다.**
+   - `venvInterpreterRunsWithoutActivation`·`venvPathWithSpacesOrDriveLetterSurvives` —
+     여전히 **Python이 있는 머신이 필요하다.** 이 머신에는 없다.
+   - `storeAliasIsReportedAsCouldNotRun`(옛 `pythonOnPathIsNotTheStoreAlias`) — **막혀 있던
+     이유가 사라졌다.** 기준이 머신의 성질("PATH의 python이 별칭이 아니다")에서 코드의
+     성질("별칭뿐일 때 `FAILED`가 아니라 `could_not_run`으로 보고된다")로 바뀌었고, 그 결말을
+     내는 코드가 생겼다([state-machine 49.9절](./state-machine-and-protocol.md)). 확인은
+     **별칭이 있는 머신**에서 하므로 이 머신이 바로 그 머신이다 — 요구 사실에서 실행 가능한
+     Python을 뺀 이유가 그것이다. **아직 태우지 않았다**; 절차는 `landing.rs`의 기준 문구에 있다.
+5. **강제 포기 경로**로 job 핸들 수명을 마저 확인한다(7절).
+   **막혀 있던 이유가 사라졌다**: 헤드리스 호스트에 하위 명령이 없어서 UI가 필요했는데,
+   이제 `tomverse-host abandon --workspace <ws> --task <id> --db <db>`가 있다. 화면의 버튼과
+   **같은 함수**(`TaskHost::force_abandon`)를 타므로 이 명령으로 태운 것이 제품 경로를 태운
+   것이다. **아직 태우지 않았다**; 두 경로(취소·강제 포기)의 절차는 `landing.rs`의
+   `jobHandleLifetime` 문구에 적어 두었다.
+6. **`processGroup` 둘**(12절).
+   - `childGetsItsOwnProcessGroup` — 여전히 **별도 콘솔이 필요하다.** Ctrl+C를 콘솔 그룹에
+     보내면 실측을 돌리는 셸 자신이 죽을 수 있다.
+   - `taskkillFallbackStillWorks` — **막혀 있던 이유가 사라졌다.** "폴백을 강제할 수단이
+     없다"가 유일한 차단이었는데, `tomverse-host run --no-job-object …`가 그 수단이다:
+     `proctree::adopt`가 job을 만들지 않으므로 **생성이 실패했을 때와 같은 코드**를 탄다.
+     진입점은 이 인자 하나뿐이고 GUI에는 없다(소스 검사 테스트가 지킨다). 결과의
+     `treeKill.jobObjectDisabled`가 "만들지 못했다"와 "일부러 껐다"를 가른다.
+     **아직 태우지 않았다**; 절차는 `landing.rs`의 그 기준 문구에 있다.
 7. ~~**UNC 워크스페이스를 어떻게 할지 결정한다**(6절).~~ → **결정하고, 고치고, 확인했다**
    (6.1·6.2절, [state-machine 71절](./state-machine-and-protocol.md)). (c) 정직한
    `could_not_run` + (d) 열되 경고. 새 착지 묶음 `uncWorkspace`의 네 항목을 이 머신에서

@@ -78,6 +78,20 @@ pub struct Interpreter {
     pub workspace_relative: bool,
 }
 
+/// PATH에서 찾은 실행 파일 하나. **판정에 필요한 사실만 담는다.**
+///
+/// 자리와 크기를 함께 받는 이유는 Store 별칭 판별 때문이다(아래 `is_store_alias`).
+/// **판정은 여기서 하지 않는다** — 이 구조체는 바깥 세계가 관측한 것을 나르기만 하고,
+/// 그래야 그 판정을 Linux에서 검증할 수 있다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundOnPath {
+    /// 해석된 경로. **대상 플랫폼의 규칙으로 다룬다**(`std::path`는 실행 중인 OS만 안다).
+    pub path: String,
+    /// 파일 크기. **모르면 `None`이다** — 알 수 없는 것을 0으로 채우면 그 순간 별칭 판정이
+    /// 참이 되어, 멀쩡한 인터프리터를 별칭으로 몰게 된다.
+    pub size_bytes: Option<u64>,
+}
+
 /// 바깥 세계. **전부 인자로 받는다** — 그래야 Linux에서 Windows 분기를 검증할 수 있다.
 pub struct Probe<'a> {
     pub platform: Platform,
@@ -87,8 +101,86 @@ pub struct Probe<'a> {
     pub read: &'a dyn Fn(&str) -> Option<String>,
     /// 환경변수. `VIRTUAL_ENV`를 읽는 데만 쓴다.
     pub env: &'a dyn Fn(&str) -> Option<String>,
-    /// 이 프로그램 이름이 PATH에 있는가.
-    pub on_path: &'a dyn Fn(&str) -> bool,
+    /// 이 프로그램 이름을 PATH에서 찾으면 **무엇이 나오는가.** 없으면 `None`.
+    ///
+    /// 종전에는 `bool`이었다. 있는지 없는지만으로는 **Store 별칭을 가려낼 수 없어서**
+    /// 자리와 크기를 함께 받도록 넓혔다(기록 10절).
+    pub on_path: &'a dyn Fn(&str) -> Option<FoundOnPath>,
+}
+
+/// Microsoft Store **실행 별칭**인가 (기록 10절, state-machine 49.9절).
+///
+/// # 왜 실행해서 판별하지 않는가
+///
+/// 별칭을 실행하면 프로그램이 아니라 **스토어 창이 뜬다** — 그게 이 별칭의 동작이다.
+/// 감지 단계에서 프로그램을 띄우는 것은 그 자체로 사용자의 화면을 건드리는 일이고,
+/// 실측 머신에서는 `python --version`이 `Python `만 출력하고 exit 9009로 끝났다.
+/// 즉 실행은 판별의 수단이 되지 못하면서 부작용만 있다.
+///
+/// # 무엇을 근거로 삼는가
+///
+/// **① 0바이트.** 실측이 확인한 사실이고 가장 단순하다 — 실행 별칭은 내용이 없는 재분석
+/// 지점이며, **실체가 있는 인터프리터는 0바이트일 수 없다.** 다만 "0바이트인 python.exe"가
+/// 별칭의 정의는 아니므로, 이걸 유일한 근거로 두면 크기를 못 읽는 경우에 판정이 사라진다.
+///
+/// **② `\Microsoft\WindowsApps\` 아래.** 자리로 판단하는 것이라 경로 하드코딩의 냄새가
+/// 나지만, 이건 사용자가 고르는 값이 아니라 **OS가 정한 자리**다(`_env.bat`이 Visual Studio
+/// 설치 경로를 후보 목록으로 쫓아가면 안 되는 것과 정반대의 성질이다). 크기를 읽지 못했을
+/// 때의 근거로만 쓴다.
+///
+/// # 반대 방향으로 틀리지 않는 쪽을 골랐다
+///
+/// 크기가 0보다 크면 **별칭이 아니라고 본다** — WindowsApps 아래에 있더라도. Microsoft
+/// Store로 Python을 진짜 설치한 사용자의 별칭은 동작하는데, 그것까지 막으면 멀쩡한 검증이
+/// 통째로 `could_not_run`이 된다. 이 고침이 반대로 틀리면 증상은 "검증이 조용해지는" 쪽이라
+/// 눈에 덜 띈다(기록 14절 7번이 UNC에서 같은 함정을 적어두었다).
+///
+/// Windows 밖에서는 언제나 거짓이다. 이 별칭은 Windows에만 있는 물건이다.
+pub fn is_store_alias(platform: Platform, found: &FoundOnPath) -> bool {
+    if platform != Platform::Windows {
+        return false;
+    }
+    match found.size_bytes {
+        Some(0) => true,
+        Some(_) => false,
+        // 크기를 읽지 못했다. 자리가 남은 근거다 — 구분자를 둘 다 보는 이유는 PATH 항목이
+        // 슬래시로 적혀 오는 경우가 있기 때문이다.
+        None => {
+            let lower = found.path.to_lowercase().replace('/', "\\");
+            lower.contains("\\microsoft\\windowsapps\\")
+        }
+    }
+}
+
+/// 인터프리터를 **고르지 못한 이유**. `interpreter`가 없을 때만 의미가 있다.
+///
+/// # 왜 "없다"로 뭉치지 않는가
+///
+/// "인터프리터가 없다"와 "있는데 쓸 수 없다"는 사용자가 할 일이 다르고, 우리가 보고해야 하는
+/// 것도 다르다. 앞은 `NOT_CONFIGURED`에 가깝고(돌릴 것이 없다), 뒤는 **돌릴 것이 선언되어
+/// 있는데 돌릴 수단이 없는** 경우다 — UNC 워크스페이스와 같은 모양이므로 같은 답을 준다
+/// (71절: 정직한 `could_not_run`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unusable {
+    /// PATH의 python이 Microsoft Store 실행 별칭뿐이다.
+    StoreAlias { path: String },
+}
+
+impl Unusable {
+    /// 사용자에게 그대로 나가는 문장. **무엇을 하면 되는지가 있어야 한다** — 거부만 하고
+    /// 침묵하면 사용자가 할 수 있는 일이 없다(`unc.rs`의 문장과 같은 규율이다).
+    pub fn message(&self) -> String {
+        match self {
+            Unusable::StoreAlias { path } => format!(
+                "PATH의 python이 Microsoft Store 실행 별칭입니다({path}). 실행하면 프로그램이 \
+                 아니라 스토어 창이 뜨므로 검증 명령을 시작하지 않았습니다 — \
+                 검증 안 됨(could_not_run)이며 **검증 실패가 아닙니다.** \
+                 검증되지 않은 변경을 merge·commit·PR 자동화로 넘기지 마십시오. \
+                 해결: python.org 설치본을 설치하거나, 이 워크스페이스에 가상환경을 만드십시오 \
+                 (설치 후 `python -m venv .venv`)."
+            ),
+        }
+    }
 }
 
 /// 가상환경 디렉터리 안에서 인터프리터의 자리. **조립을 한 곳에 둔다.**
@@ -128,27 +220,52 @@ fn path_candidates(platform: Platform) -> &'static [&'static str] {
 /// PATH는 마지막이다. 가상환경이 아니므로 선언된 도구가 거기 없을 수 있고, 그 사실을
 /// `How::Path`가 말한다.
 pub fn interpreter(probe: &Probe) -> Option<Interpreter> {
+    resolve(probe).0
+}
+
+/// 인터프리터와 **고르지 못한 이유**를 함께 돌려준다.
+///
+/// 이유를 따로 나르는 까닭은 `Unusable`의 주석에 있다: "없다"와 "있는데 쓸 수 없다"는
+/// 사용자가 할 일이 다르고, 뭉치면 뒤가 앞으로 보고된다.
+pub fn resolve(probe: &Probe) -> (Option<Interpreter>, Option<Unusable>) {
     for (dir, how) in [(".venv", How::DotVenv), ("venv", How::Venv)] {
         let candidate = interpreter_in(dir, probe.platform);
         if (probe.is_file)(&candidate) {
-            return Some(Interpreter { program: candidate, how, workspace_relative: true });
+            return (Some(Interpreter { program: candidate, how, workspace_relative: true }), None);
         }
     }
     // `VIRTUAL_ENV`는 **우리 프로세스의 환경**이다 — Node도 모델도 채울 수 없다. PATH를
     // 신뢰하는 것과 같은 등급이며, 그보다 구체적이다.
     if let Some(active) = (probe.env)("VIRTUAL_ENV").filter(|v| !v.trim().is_empty()) {
-        return Some(Interpreter {
-            program: interpreter_in(&active, probe.platform),
-            how: How::ActivatedEnv,
-            workspace_relative: false,
-        });
+        return (
+            Some(Interpreter {
+                program: interpreter_in(&active, probe.platform),
+                how: How::ActivatedEnv,
+                workspace_relative: false,
+            }),
+            None,
+        );
     }
+    // **별칭은 인터프리터로 세지 않는다.** 골라 두면 그 명령이 exit 9009로 끝나고, 종합
+    // 판정이 `FAILED`가 된다 — "실행할 수 없었다"가 "테스트가 실패했다"로 보고되는 것이고,
+    // 사용자는 자기 코드가 깨졌다고 읽는다(기록 10절). 대신 **왜 못 골랐는지**를 남긴다.
+    let mut alias: Option<Unusable> = None;
     for name in path_candidates(probe.platform) {
-        if (probe.on_path)(name) {
-            return Some(Interpreter { program: (*name).to_string(), how: How::Path, workspace_relative: false });
+        let Some(found) = (probe.on_path)(name) else {
+            continue;
+        };
+        if is_store_alias(probe.platform, &found) {
+            // 처음 만난 별칭만 기록한다 — 사용자가 고쳐야 할 것은 PATH에서 **먼저 잡히는**
+            // 그것이고, 뒤에 있는 같은 종류를 나열해 봐야 할 일이 늘지 않는다.
+            alias.get_or_insert(Unusable::StoreAlias { path: found.path });
+            continue;
         }
+        return (
+            Some(Interpreter { program: (*name).to_string(), how: How::Path, workspace_relative: false }),
+            None,
+        );
     }
-    None
+    (None, alias)
 }
 
 /// 한 도구가 **선언된 근거**. 문자열은 사용자에게 그대로 보여준다.
@@ -213,6 +330,11 @@ pub struct Check {
 pub struct Detection {
     pub interpreter: Option<Interpreter>,
     pub checks: Vec<Check>,
+    /// 선언은 있는데 **인터프리터를 쓸 수 없는** 이유. `interpreter`가 없을 때만 채워진다.
+    ///
+    /// `verify.rs`가 이걸 보고 `NOT_CONFIGURED`가 아니라 `could_not_run`으로 보고한다 —
+    /// 둘을 섞으면 "돌릴 것이 없다"와 "돌릴 수단이 없다"가 같은 말이 된다.
+    pub unusable: Option<Unusable>,
 }
 
 /// **`build`가 없다.** `python -m build`는 패키징이지 검증이 아니고, 대부분의 프로젝트에서
@@ -260,30 +382,53 @@ pub fn detect(probe: &Probe) -> Detection {
     if checks.is_empty() {
         return Detection::default();
     }
-    Detection { interpreter: interpreter(probe), checks }
+    let (interpreter, unusable) = resolve(probe);
+    Detection { interpreter, checks, unusable }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     struct World {
         files: BTreeMap<String, String>,
-        path: BTreeSet<String>,
+        /// 이름 → PATH에서 찾은 것. **크기가 판정 재료이므로** 존재 여부만으로는 부족하다.
+        path: BTreeMap<String, FoundOnPath>,
         env: BTreeMap<String, String>,
     }
 
     impl World {
         fn new() -> Self {
-            Self { files: BTreeMap::new(), path: BTreeSet::new(), env: BTreeMap::new() }
+            Self { files: BTreeMap::new(), path: BTreeMap::new(), env: BTreeMap::new() }
         }
         fn file(mut self, name: &str, body: &str) -> Self {
             self.files.insert(name.to_string(), body.to_string());
             self
         }
+        /// 평범한 인터프리터가 PATH에 있다. 크기는 **0이 아니다** — 실체가 있는 실행 파일이다.
         fn on_path(mut self, name: &str) -> Self {
-            self.path.insert(name.to_string());
+            self.path.insert(
+                name.to_string(),
+                FoundOnPath { path: format!("/usr/bin/{name}"), size_bytes: Some(12_345) },
+            );
+            self
+        }
+        /// 그 자리에 **Microsoft Store 실행 별칭**이 있다 (기록 10절의 실측 그대로).
+        ///
+        /// 경로 조립을 **대상 플랫폼 기준**으로 한다 — `std::path`는 실행 중인 OS의 구분자만
+        /// 알므로, Linux에서 `join`으로 만들면 Windows에 존재하지 않는 경로가 된다(CLAUDE.md).
+        fn store_alias(mut self, name: &str) -> Self {
+            self.path.insert(
+                name.to_string(),
+                FoundOnPath {
+                    path: format!(
+                        "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\{name}.exe"
+                    ),
+                    // 실측에서 확인한 사실: 0바이트다.
+                    size_bytes: Some(0),
+                },
+            );
             self
         }
         fn env(mut self, key: &str, value: &str) -> Self {
@@ -298,7 +443,7 @@ mod tests {
             is_file: Box::leak(Box::new(move |p: &str| world.files.contains_key(p))),
             read: Box::leak(Box::new(move |p: &str| world.files.get(p).cloned())),
             env: Box::leak(Box::new(move |k: &str| world.env.get(k).cloned())),
-            on_path: Box::leak(Box::new(move |n: &str| world.path.contains(n))),
+            on_path: Box::leak(Box::new(move |n: &str| world.path.get(n).cloned())),
         }
     }
 
@@ -441,6 +586,94 @@ mod tests {
         assert_eq!(by("test"), vec!["-m", "pytest"]);
         assert_eq!(by("lint"), vec!["-m", "ruff", "check", "."]);
         assert_eq!(by("typecheck"), vec!["-m", "mypy", "."]);
+    }
+
+    // ---- Microsoft Store 실행 별칭 (기록 10절) ----
+    //
+    // 이 갈래가 없을 때 무슨 일이 일어났는가: `.venv`가 없는 Python 프로젝트에서 감지가 PATH의
+    // `python`으로 폴백하고, 그 명령이 exit 9009로 끝나고, 종합 판정이 `FAILED`가 됐다.
+    // 즉 **"실행할 수 없었다"가 "테스트가 실패했다"로 보고**된다 — UNC에서 겪은 것과 정확히
+    // 같은 모양이고, 그래서 같은 답을 쓴다(정직한 `could_not_run`).
+
+    /// **별칭을 인터프리터로 고르지 않는다.** 고르면 그 명령이 9009로 끝나고 검증 실패가 된다.
+    #[test]
+    fn a_store_alias_is_not_counted_as_an_interpreter() {
+        let world = World::new().file("pytest.ini", "[pytest]\n").store_alias("python");
+        let d = detect(&probe(&world, Platform::Windows));
+        assert_eq!(d.interpreter, None, "별칭을 골랐습니다: {:?}", d.interpreter);
+        // 선언은 그대로 남는다 — 돌릴 것은 있고, 돌릴 수단이 없는 것이다.
+        assert_eq!(d.checks.len(), 1);
+    }
+
+    /// 그리고 **왜 못 골랐는지가 값으로 남는다.** 이게 없으면 `verify.rs`가 "명령이 없다"와
+    /// 구별하지 못하고, 사용자는 `NOT_CONFIGURED`라는 엉뚱한 안내를 받는다.
+    #[test]
+    fn the_reason_says_it_was_the_store_alias_and_what_to_do() {
+        let world = World::new().file("pytest.ini", "[pytest]\n").store_alias("python");
+        let d = detect(&probe(&world, Platform::Windows));
+        let Some(Unusable::StoreAlias { path }) = d.unusable.clone() else {
+            panic!("이유가 남지 않았습니다: {:?}", d.unusable);
+        };
+        assert!(path.ends_with("WindowsApps\\python.exe"), "{path}");
+
+        let message = d.unusable.unwrap().message();
+        // **검증 실패가 아니라는 것**을 말한다 — 이 결함의 전부가 그것이다.
+        assert!(message.contains("검증 실패가 아닙니다"), "{message}");
+        // 그리고 **무엇을 하면 되는지**가 있다. 거부만 하고 침묵하면 사용자가 할 일이 없다.
+        assert!(message.contains("python.org"), "{message}");
+        assert!(message.contains(".venv"), "{message}");
+    }
+
+    /// **반대 방향**: 정상 PATH python은 여전히 골라진다.
+    ///
+    /// 이 고침이 반대로 틀리면 정상 사용자의 검증이 통째로 막히고, 그 증상은 "검증이
+    /// 조용해지는" 쪽이라 눈에 덜 띈다(기록 14절 7번이 UNC에서 같은 함정을 적어두었다).
+    #[test]
+    fn a_real_python_on_path_is_still_chosen() {
+        let world = World::new().file("pytest.ini", "[pytest]\n").on_path("python");
+        let d = detect(&probe(&world, Platform::Windows));
+        assert_eq!(d.interpreter.as_ref().map(|i| i.how), Some(How::Path));
+        assert_eq!(d.unusable, None);
+    }
+
+    /// 별칭이 있어도 **워크스페이스의 가상환경이 있으면 그것을 쓴다.** 순서는 그대로다.
+    #[test]
+    fn a_workspace_venv_wins_over_a_store_alias() {
+        let world = World::new()
+            .file("pytest.ini", "[pytest]\n")
+            .file(".venv\\Scripts\\python.exe", "")
+            .store_alias("python");
+        let d = detect(&probe(&world, Platform::Windows));
+        assert_eq!(d.interpreter.map(|i| i.how), Some(How::DotVenv));
+        // 쓸 인터프리터를 찾았으므로 이유를 남기지 않는다 — 남기면 화면이 없는 문제를 말한다.
+        assert_eq!(d.unusable, None);
+    }
+
+    /// 판별 규칙 자체. **크기가 0보다 크면 별칭이 아니다** — WindowsApps 아래에 있더라도.
+    /// Store로 Python을 진짜 설치한 사용자를 막지 않기 위한 선택이고, 그 근거는
+    /// `is_store_alias`의 주석에 있다.
+    #[test]
+    fn the_alias_rule_is_size_first_then_place() {
+        let apps = "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe";
+        let zero = FoundOnPath { path: apps.to_string(), size_bytes: Some(0) };
+        assert!(is_store_alias(Platform::Windows, &zero));
+
+        // 자리는 같은데 실체가 있다 → 별칭으로 몰지 않는다.
+        let real = FoundOnPath { path: apps.to_string(), size_bytes: Some(64_000) };
+        assert!(!is_store_alias(Platform::Windows, &real));
+
+        // 크기를 못 읽었으면 자리가 근거다.
+        let unknown = FoundOnPath { path: apps.to_string(), size_bytes: None };
+        assert!(is_store_alias(Platform::Windows, &unknown));
+        let elsewhere = FoundOnPath {
+            path: "C:\\Python312\\python.exe".to_string(),
+            size_bytes: None,
+        };
+        assert!(!is_store_alias(Platform::Windows, &elsewhere));
+
+        // **Unix에서는 언제나 거짓이다.** 이 별칭은 Windows에만 있는 물건이고, 0바이트
+        // 실행 파일을 별칭으로 읽으면 다른 플랫폼에서 없는 문제를 만든다.
+        assert!(!is_store_alias(Platform::Unix, &zero));
     }
 
     /// `[tool.ruff.lint]`만 있는 프로젝트도 ruff를 선언한 것이다 — 접두사로 본다.

@@ -469,7 +469,15 @@ fn job_object_checks(obs: &Observations) -> Vec<Check> {
             "job 핸들의 수명이 태스크와 같다 — 끝나면 닫히고, 닫히면 남은 프로세스가 죽는다.",
             CheckStatus::NeedsHuman,
             "핸들 수명은 **실행해야만 드러나는 종류**다(CLAUDE.md: 타입 검증은 동작 검증이 \
-             아니다). Windows에서 취소·강제 포기를 각각 한 번씩 돌리고 남은 프로세스를 확인할 것.",
+             아니다). Windows에서 두 경로를 각각 한 번씩 돌리고 남은 프로세스를 확인할 것. \
+             (1) 취소: `npm run test:e2e`의 시나리오 A(`--cancel-after-ms`)를 태운다. \
+             (2) 강제 포기: `tomverse-host run --workspace <ws> --task t1 --message ... \
+             --timeout-secs 120`을 띄워 두고 **다른 창에서** \
+             `tomverse-host abandon --workspace <ws> --task t1 --db <db>`를 부른다 — \
+             화면의 버튼과 같은 함수(`TaskHost::force_abandon`)를 탄다. \
+             각각 끝난 뒤 tomverse가 띄운 `node.exe`가 남지 않았는지 볼 것 \
+             (강제 포기는 프로세스를 죽이지 않는다고 선언한 경로이므로, 정리하는 것은 \
+             job 핸들의 Drop이다 — 그게 이 기준이 보려는 것이다).",
         ),
     ]
 }
@@ -811,8 +819,15 @@ fn process_group_checks(obs: &Observations) -> Vec<Check> {
             "Job Object가 없는 경로에서도 `taskkill /T /F`가 트리를 거둔다.",
             status,
             format!(
-                "{detail} taskkill은 **스냅샷 기반**이라 이미 고아가 된 손자를 놓칠 수 있다 — \
-                 그 한계를 확인하는 것이지 완전함을 확인하는 것이 아니다."
+                "{detail} **태우는 법**: `tomverse-host run --no-job-object … --cancel-after-ms 2500`. \
+                 그 인자가 `proctree::adopt`를 job 없이 돌게 만들어 폴백을 강제한다 — \
+                 job 생성이 실패했을 때와 **같은 코드**를 탄다(진입점은 이 명령 하나뿐이고 \
+                 GUI에는 없다). 확인할 것: 결과 JSON의 `treeKill.method`가 `taskkill …`이고 \
+                 `treeKill.jobObjectDisabled`가 true인가(그래야 '만들지 못했다'와 구별된다), \
+                 그리고 시나리오 A의 손자 PID(`slow-test.pid`)가 죽었는가. \
+                 **남아 있어도 이 기준의 실패가 아니다**: taskkill은 **스냅샷 기반**이라 이미 \
+                 고아가 된 손자를 놓칠 수 있고, 이 기준은 그 한계를 확인하는 것이지 완전함을 \
+                 확인하는 것이 아니다. 관측한 것을 그대로 적을 것."
             ),
         ),
     ]
@@ -938,15 +953,40 @@ fn python_env_checks(obs: &Observations) -> Vec<Check> {
             ),
         )
         .requiring(&[MachineFact::WindowsOs, MachineFact::Python]),
+        // **머신의 성질이 아니라 코드의 성질을 묻는다.**
+        //
+        // 종전 기준은 "PATH의 python이 Microsoft Store 별칭이 아니다"였다. 그건 우리 코드에
+        // 대한 문장이 아니라 그 머신에 대한 문장이라, Python이 제대로 설치된 머신에서 태우면
+        // 당연히 통과하는데 **그 통과가 Store 별칭을 가진 사용자에 대해 아무것도 말해주지
+        // 않았다.** 그래서 기준을 뒤집었다: 별칭뿐인 머신에서 우리가 무엇이라고 보고하는가.
+        //
+        // 요구 사실도 함께 바꿨다. `MachineFact::Python`(실행 가능한 Python)은 이 기준에
+        // 맞지 않는다 — 여기서 필요한 것은 **별칭이 있는 머신**이고, 그건 실행 가능한 Python이
+        // 있다는 사실과 정반대에 가깝다. 그런 축은 `MachineSpec`에 없으므로(있다면 새 필드를
+        // 요구하게 되고 기존 attestation이 만료된다) 요구는 Windows 하나로 두고, **무엇을
+        // 보고 확인했는지를 evidence에 적게** 한다 — 그 자리에 별칭의 경로가 없으면 이
+        // 기준을 확인한 것이 아니다.
         check(
-            "pythonOnPathIsNotTheStoreAlias",
-            "PATH의 python이 Microsoft Store 별칭이 아니다.",
+            "storeAliasIsReportedAsCouldNotRun",
+            "PATH의 python이 Microsoft Store 별칭뿐일 때, 검증이 `FAILED`가 아니라 `could_not_run`으로 보고된다.",
             status.clone(),
             format!(
-                "{detail} Windows는 `python`/`python3`를 Store 설치 별칭으로 두는 경우가 있고,                  그것을 실행하면 프로그램이 아니라 **스토어 창이 뜬다** — 명령은 걸린 채로 끝나지 않는다.                  그래서 PATH 후보에서 `python3`를 뺐지만, `python` 쪽은 같은 위험이 남는다."
+                "{detail} **이 기준이 없으면 실행 불가가 테스트 실패로 위장된다** — 실측이 그랬다: \
+                 별칭은 0바이트라 실행하면 프로그램이 아니라 스토어 창이 뜨고, `python --version`이 \
+                 exit 9009로 끝나 종합 판정이 `FAILED`가 됐다(기록 10절). 사용자는 자기 코드가 \
+                 깨졌다고 읽고 모델은 고칠 것 없는 문제로 보내진다 — UNC에서 고친 것과 같은 \
+                 거짓말이고 같은 답을 쓴다(정직한 `could_not_run`, 71절). \
+                 **태우는 법**: 별칭이 PATH에 있는 머신(`where python` → \
+                 `…\\Microsoft\\WindowsApps\\python.exe`, 크기 0)에서 `.venv` 없이 \
+                 `pytest.ini`만 있는 워크스페이스에 `tomverse-host run`을 돌린다. \
+                 확인할 것: 검증 리포트의 `overall`이 `could_not_run`이고 test 체크가 \
+                 `SKIPPED_WITH_REASON`이며, 문장이 **무엇을 하면 되는지**를 말하는가 \
+                 (python.org 설치본 또는 `.venv`). evidence에 그 별칭의 경로를 적을 것. \
+                 별칭 판별은 `python.rs`(순수 함수라 Linux에서 검증된다)이고 판정을 만드는 \
+                 자리는 `verify.rs`의 python 갈래(`merge_python`)다 — 여기서 확인하는 것은 \
+                 **그 규칙이 실제 머신에서 그 결말을 내는가**뿐이다."
             ),
-        )
-        .requiring(&[MachineFact::WindowsOs, MachineFact::Python]),
+        ),
         check(
             "venvPathWithSpacesOrDriveLetterSurvives",
             "공백이나 드라이브 문자가 든 가상환경 경로가 그대로 실행된다.",
@@ -1820,6 +1860,47 @@ mod tests {
             Some(HEAD),
         );
         assert_eq!(assess(&ok).attested_passes, 1);
+    }
+
+    /// **별칭이 있는 머신에서 확인할 수 있어야 한다** — 그게 이 기준의 유일한 확인 장소다.
+    ///
+    /// 실행 가능한 Python을 요구하면(`MachineFact::Python`) 이 기준은 **확인할 수 있는
+    /// 머신에서 영원히 거부된다**: 실측 머신의 PATH python은 0바이트 Store 별칭이었고,
+    /// 그래서 `machine.python`은 `null`이다(그건 Python이 아니다). 요구를 잘못 적으면
+    /// 그 사실이 "기록을 거부한다"로 나타나고, 거부는 조용하다.
+    #[test]
+    fn the_store_alias_criterion_is_attestable_on_a_machine_without_python() {
+        let obs = windows_with(
+            attestation_for(
+                HEAD,
+                // 기록 1절의 실측 머신 그대로 — `python`이 `null`이다.
+                measured_machine(),
+                attested("pythonEnv", "storeAliasIsReportedAsCouldNotRun"),
+            ),
+            Some(HEAD),
+        );
+        let report = assess(&obs);
+        assert_eq!(report.attested_passes, 1, "{:?}", report.attestation);
+        assert_eq!(
+            status_of(&report, "pythonEnv", "storeAliasIsReportedAsCouldNotRun").status,
+            CheckStatus::Passed
+        );
+
+        // **그래도 Windows는 요구한다.** 별칭은 Windows에만 있는 물건이므로, 다른 OS의
+        // 확인은 이 기준의 확인이 아니다 — 그 규칙은 기본 요구가 지킨다.
+        let checks = assess(&linux())
+            .groups
+            .iter()
+            .find(|g| g.id == "pythonEnv")
+            .map(|g| g.checks.clone())
+            .expect("pythonEnv 묶음이 없습니다");
+        let alias = checks
+            .iter()
+            .find(|c| c.id == "storeAliasIsReportedAsCouldNotRun")
+            .expect("기준이 없습니다");
+        assert!(alias.requires.contains(&MachineFact::WindowsOs));
+        // 그리고 **실행 가능한 Python은 요구하지 않는다** — 요구하면 위 확인이 거부된다.
+        assert!(!alias.requires.contains(&MachineFact::Python), "{:?}", alias.requires);
     }
 
     /// Windows가 아닌 머신의 확인은 Windows 기준의 확인이 아니다 — 기본 요구가 그것이다.

@@ -56,6 +56,20 @@ pub struct DetectedCommands {
     /// 않고** 선언을 읽는다 — 추측이 틀리면 무관한 문자열이 테스트 이름이 되고, 그건
     /// "모른다"보다 나쁘다.
     pub declared: BTreeMap<&'static str, String>,
+    /// **돌릴 것이 선언되어 있는데 돌릴 수단이 없는** 체크와 그 이유 (기록 10절).
+    ///
+    /// # 왜 "명령 없음"과 나누는가
+    ///
+    /// `commands`에 없다는 사실은 두 가지를 뜻할 수 있다. 하나는 이 프로젝트에 그 명령이
+    /// 없다는 것이고(`NOT_CONFIGURED` — 통과가 아니라 "돌릴 것이 없다"), 다른 하나는
+    /// **선언은 있는데 실행할 수단이 없다**는 것이다. 뭉치면 뒤가 앞으로 보고되어, 사용자는
+    /// "이 프로젝트에는 테스트가 없습니다"라는 틀린 안내를 받는다.
+    ///
+    /// 여기 담긴 체크는 `SKIPPED_WITH_REASON`이 되고 종합 판정은 `could_not_run`이 된다 —
+    /// UNC 워크스페이스에서 쓴 답과 같다(71절). **`FAILED`로 만들지 않는 것이 요점이다**:
+    /// 실행할 수 없었던 것을 테스트 실패로 보고하면 사용자는 자기 코드가 깨졌다고 읽고,
+    /// 모델은 고칠 것이 없는 문제로 보내진다.
+    pub unrunnable: BTreeMap<&'static str, String>,
 }
 
 impl DetectedCommands {
@@ -80,6 +94,18 @@ impl DetectedCommands {
         if is_new {
             self.declared.insert(key, body.to_string());
         }
+    }
+
+    /// 실행할 수단이 없는 체크를 사유와 함께 기록한다.
+    ///
+    /// **명령을 이미 넣은 갈래를 이기지 않는다**(`insert`와 같은 규칙). 다국어 저장소에서
+    /// npm이 `test`를 채웠는데 Python이 인터프리터를 못 찾았다고 그 체크를 못 돌린 것으로
+    /// 만들면, 실제로는 돌아가는 검증이 `could_not_run`이 된다.
+    fn insert_unrunnable(&mut self, key: &'static str, reason: String) {
+        if self.commands.contains_key(key) {
+            return;
+        }
+        self.unrunnable.entry(key).or_insert(reason);
     }
 
     /// 이 파일을 근거로 읽었다. **판정 결과와 무관하게 부른다.**
@@ -220,6 +246,10 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
         env: &|key| std::env::var(key).ok(),
         // **실행 경로가 쓰는 것과 같은 해석기를 쓴다.** 여기서 따로 PATH를 뒤지면 "찾았다고
         // 해 놓고 실행에서 못 찾는" 갈림이 생긴다 — Windows의 `PATHEXT`가 정확히 그 자리다.
+        //
+        // 찾은 것의 **자리와 크기까지** 넘긴다. 있는지 없는지만으로는 Microsoft Store 실행
+        // 별칭을 가려낼 수 없고, 그 별칭을 인터프리터로 세면 exit 9009가 검증 실패로 보고된다
+        // (기록 10절). **판정은 여기서 하지 않는다** — `python.rs`의 순수 함수가 한다.
         on_path: &|name| {
             let path = std::env::var("PATH").unwrap_or_default();
             let pathext = std::env::var("PATHEXT").unwrap_or_default();
@@ -233,14 +263,38 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
                     is_file: &is_file,
                 },
             )
-            .is_some()
+            .map(|found| crate::python::FoundOnPath {
+                path: found.to_string_lossy().to_string(),
+                // **못 읽으면 `None`이다.** 0으로 채우면 그 순간 별칭 판정이 참이 되어
+                // 멀쩡한 인터프리터를 별칭으로 몰게 된다.
+                size_bytes: std::fs::metadata(&found).ok().map(|m| m.len()),
+            })
         },
     };
-    let py = crate::python::detect(&py_probe);
+    merge_python(&mut detected, root, &crate::python::detect(&py_probe));
+
+    detected
+}
+
+/// Python 감지 결과를 명령 세트에 합친다.
+///
+/// **따로 떼어 둔 이유는 검증이다.** `detect_commands`는 진짜 PATH와 진짜 파일시스템을 보므로
+/// Linux에서 Windows의 경우(Store 별칭뿐인 세계)를 만들 수 없다. 합치는 규칙만 순수 함수로
+/// 두면 그 규칙은 이 환경에서 검증되고, 남는 것은 "그 세계를 실제로 관측하는가"뿐이다 —
+/// 그건 `python.rs`의 `Probe`가 답하고 Windows에서 태운다.
+fn merge_python(detected: &mut DetectedCommands, root: &WorkspaceRoot, py: &crate::python::Detection) {
     // **선언 파일은 명령이 만들어지지 않아도 근거다**(50절). 인터프리터를 못 찾아 명령이
     // 비어도 그 파일의 변화는 판정을 바꿀 수 있다.
     for check in &py.checks {
         detected.read_evidence(&check.evidence);
+    }
+    // **인터프리터를 쓸 수 없는 경우**(지금은 Microsoft Store 실행 별칭뿐일 때). 선언은
+    // 있으므로 "명령이 없다"가 아니고, 실행하면 스토어 창이 뜨므로 명령을 만들지도 않는다.
+    // 그 사이의 정직한 답이 `could_not_run`이다 — 사유를 여기 남기고 `run`이 그걸 보고한다.
+    if let (None, Some(unusable)) = (&py.interpreter, &py.unusable) {
+        for check in &py.checks {
+            detected.insert_unrunnable(check.key, unusable.message());
+        }
     }
     if let Some(interpreter) = &py.interpreter {
         // **워크스페이스 안의 인터프리터는 절대경로로 바꾼다.** 상대 프로그램 경로는
@@ -268,8 +322,6 @@ pub fn detect_commands(root: &WorkspaceRoot) -> DetectedCommands {
             );
         }
     }
-
-    detected
 }
 
 /// 검증 레인 — **결정론적 판정자를 옆 태스크의 부하에서 지킨다.**
@@ -392,17 +444,11 @@ impl<'a> VerificationRunner<'a> {
                 _ => VerificationKind::Lint,
             };
             match detected.commands.get(key) {
-                None => checks.push(VerificationCheck {
+                None => checks.push(check_without_command(
                     kind,
-                    command: None,
-                    status: VerificationStatus::NotConfigured,
-                    summary: format!("이 프로젝트에 {key} 명령이 없음 — 실행하지 않았고, 통과로 간주하지 않음"),
-                    detail: None,
-                    detail_ref: None,
-                    exit_code: None,
-                    duration_ms: None,
-                    failed_tests: None,
-                }),
+                    key,
+                    detected.unrunnable.get(key).map(String::as_str),
+                )),
                 Some((kind, command, source)) => {
                     checks.push(self.run_one(
                         task_id,
@@ -699,6 +745,43 @@ fn refine_attribution(
 ///
 /// `NotConfigured`는 여기 해당하지 않는다. 그건 "돌릴 것이 없었다"이지 "돌리지 못했다"가
 /// 아니고, lint 스크립트가 없는 프로젝트를 영원히 pass 불가로 만들면 규칙이 쓸모없어진다.
+/// 실행하지 않은 체크 하나. **두 경우를 가른다.**
+///
+/// - 이 프로젝트에 그 명령이 없다 → `NOT_CONFIGURED`. 통과가 아니라 "돌릴 것이 없다"이다.
+/// - 선언은 있는데 **돌릴 수단이 없다**(`unrunnable`) → 사유를 명시한 스킵.
+///   종합 판정은 `could_not_run`이 되고, **`FAILED`가 아니다** — 실행할 수 없었던 것을
+///   테스트 실패로 보고하면 사용자는 자기 코드가 깨졌다고 읽는다(기록 10절, 71절).
+///
+/// `run`과 테스트가 **같은 함수**를 쓴다. 두 벌로 두면 테스트가 검사하는 모양이 제품이 내는
+/// 것과 갈라지고, 그 갈림은 조용하다.
+fn check_without_command(
+    kind: VerificationKind,
+    key: &str,
+    unrunnable: Option<&str>,
+) -> VerificationCheck {
+    let (status, summary) = match unrunnable {
+        Some(reason) => (
+            VerificationStatus::SkippedWithReason,
+            format!("{key} 실행하지 못함: {reason}"),
+        ),
+        None => (
+            VerificationStatus::NotConfigured,
+            format!("이 프로젝트에 {key} 명령이 없음 — 실행하지 않았고, 통과로 간주하지 않음"),
+        ),
+    };
+    VerificationCheck {
+        kind,
+        command: None,
+        status,
+        summary,
+        detail: None,
+        detail_ref: None,
+        exit_code: None,
+        duration_ms: None,
+        failed_tests: None,
+    }
+}
+
 fn compute_overall(checks: &[VerificationCheck], _newly_failing: Option<&[VerificationKind]>) -> Overall {
     let executed = checks
         .iter()
@@ -1545,6 +1628,143 @@ mod tests {
 
     /// Windows 결함이 만든 상황 그대로: build는 돌아서 통과했는데 test는 프로그램 해석 실패로
     /// 실행조차 못했다. 예전 규칙이면 `pass`가 나오고, 작업이 검증 없이 완료로 보고된다.
+    // ---- PATH의 python이 Microsoft Store 별칭뿐일 때 (기록 10절) ----
+    //
+    // **이 환경에서 검증되는 것과 되지 않는 것.** `detect_commands`는 진짜 PATH를 보므로
+    // Linux에서 "Store 별칭뿐인 세계"를 만들 수 없다. 그래서 관측(`python::Probe`)과 합치는
+    // 규칙(`merge_python`)을 나눠 두었고, 여기서 검증하는 것은 **규칙**이다:
+    // 별칭뿐이라는 관측이 주어졌을 때 판정이 `FAILED`가 아니라 `could_not_run`이 되는가.
+    // 관측 자체("그 파일이 별칭인가")는 `python.rs`의 단위 테스트가, 실제 머신에서의 동작은
+    // `landing.rs`의 `storeAliasIsReportedAsCouldNotRun`이 맡는다.
+
+    /// Store 별칭뿐인 Python 워크스페이스의 판정은 **`FAILED`가 아니다.**
+    ///
+    /// 이 갈래가 없을 때 어떻게 됐는가: 감지가 PATH의 별칭을 인터프리터로 골랐고, 그 명령이
+    /// exit 9009로 끝났고, 종합 판정이 `FAILED`가 됐다. 사용자는 자기 코드가 깨졌다고 읽고
+    /// 모델은 고칠 것이 없는 문제로 보내진다 — UNC에서 고친 것과 같은 거짓말이다.
+    #[test]
+    fn a_store_alias_only_world_is_reported_as_could_not_run_not_failed() {
+        let (_d, _a, root, _artifacts) = setup(&[("pytest.ini", "[pytest]\n")]);
+
+        // 별칭뿐인 세계를 **관측 결과로** 준다 — 경로는 대상 플랫폼(Windows) 기준으로 조립한다.
+        let alias = crate::python::FoundOnPath {
+            path: "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe".to_string(),
+            size_bytes: Some(0),
+        };
+        let files = |p: &str| p == "pytest.ini";
+        let read = |p: &str| (p == "pytest.ini").then(|| "[pytest]\n".to_string());
+        let none = |_: &str| None;
+        let on_path = |name: &str| (name == "python").then(|| alias.clone());
+        let py = crate::python::detect(&crate::python::Probe {
+            platform: crate::tools::program::Platform::Windows,
+            is_file: &files,
+            read: &read,
+            env: &none,
+            on_path: &on_path,
+        });
+        assert_eq!(py.interpreter, None, "별칭을 인터프리터로 골랐습니다");
+
+        let mut detected = DetectedCommands::default();
+        merge_python(&mut detected, &root, &py);
+        // 명령은 만들지 않는다 — 실행하면 스토어 창이 뜬다.
+        assert!(detected.commands.is_empty(), "{:?}", detected.commands);
+        // 그러나 **"명령이 없다"가 아니다.** 선언은 있고 돌릴 수단이 없는 것이다.
+        let reason = detected.unrunnable.get("test").expect("사유가 없습니다");
+        assert!(reason.contains("검증 실패가 아닙니다"), "{reason}");
+
+        // `run`이 쓰는 것과 **같은 함수**로 체크를 만든다 — 두 벌로 두면 여기서 통과한 모양이
+        // 제품이 내는 모양과 갈라진다.
+        let checks: Vec<VerificationCheck> = ["build", "typecheck", "test", "lint"]
+            .into_iter()
+            .map(|key| {
+                let kind = match key {
+                    "build" => VerificationKind::Build,
+                    "typecheck" => VerificationKind::Typecheck,
+                    "test" => VerificationKind::Test,
+                    _ => VerificationKind::Lint,
+                };
+                check_without_command(kind, key, detected.unrunnable.get(key).map(String::as_str))
+            })
+            .collect();
+
+        let test_check = checks.iter().find(|c| c.kind == VerificationKind::Test).unwrap();
+        assert_eq!(test_check.status, VerificationStatus::SkippedWithReason);
+        // **화면에 뜨는 문장이 실패라고 말하지 않는다.**
+        assert!(!test_check.summary.contains("실패 (exit"), "{}", test_check.summary);
+        // 없는 exit code를 지어내지 않는다 — 0이나 1로 채우면 그 순간 다시 거짓말이다.
+        assert_eq!(test_check.exit_code, None);
+
+        assert_eq!(compute_overall(&checks, None), Overall::CouldNotRun);
+        // **`NOT_CONFIGURED`와도 섞이지 않는다.** 선언하지 않은 build·lint는 그쪽으로 남는다.
+        let build = checks.iter().find(|c| c.kind == VerificationKind::Build).unwrap();
+        assert_eq!(build.status, VerificationStatus::NotConfigured);
+    }
+
+    /// **반대 방향**: 인터프리터를 찾은 세계에서는 아무것도 막히지 않는다.
+    ///
+    /// 이 고침이 반대로 틀리면 정상 사용자의 검증이 통째로 `could_not_run`이 되고, 그 증상은
+    /// "검증이 조용해지는" 쪽이라 눈에 덜 띈다(기록 14절 7번).
+    #[test]
+    fn a_workspace_with_a_real_interpreter_is_not_marked_unrunnable() {
+        let (_d, _a, root, _artifacts) = setup(&[("pytest.ini", "[pytest]\n")]);
+        let files = |p: &str| p == "pytest.ini";
+        let read = |p: &str| (p == "pytest.ini").then(|| "[pytest]\n".to_string());
+        let none = |_: &str| None;
+        let on_path = |name: &str| {
+            (name == "python3").then(|| crate::python::FoundOnPath {
+                path: "/usr/bin/python3".to_string(),
+                size_bytes: Some(12_345),
+            })
+        };
+        let py = crate::python::detect(&crate::python::Probe {
+            platform: crate::tools::program::Platform::Unix,
+            is_file: &files,
+            read: &read,
+            env: &none,
+            on_path: &on_path,
+        });
+        let mut detected = DetectedCommands::default();
+        merge_python(&mut detected, &root, &py);
+        assert!(detected.unrunnable.is_empty(), "{:?}", detected.unrunnable);
+        assert!(detected.commands.contains_key("test"), "{:?}", detected.commands);
+    }
+
+    /// **먼저 넣은 갈래를 이기지 않는다.** npm이 `test`를 채운 다국어 저장소에서 Python이
+    /// 인터프리터를 못 찾았다고 그 체크를 못 돌린 것으로 만들면, 실제로는 돌아가는 검증이
+    /// `could_not_run`이 된다 — 그것도 거짓말이고, 방향만 반대다.
+    #[test]
+    fn an_unrunnable_python_never_overrides_a_command_another_language_provided() {
+        let (_d, _a, root, _artifacts) = setup(&[
+            ("package.json", r#"{ "scripts": { "test": "node --test" } }"#),
+            ("pytest.ini", "[pytest]\n"),
+        ]);
+        let mut detected = detect_commands(&root);
+        assert!(detected.commands.contains_key("test"));
+
+        let alias = crate::python::FoundOnPath {
+            path: "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe".to_string(),
+            size_bytes: Some(0),
+        };
+        let files = |p: &str| p == "pytest.ini";
+        let read = |p: &str| (p == "pytest.ini").then(|| "[pytest]\n".to_string());
+        let none = |_: &str| None;
+        let on_path = |name: &str| (name == "python").then(|| alias.clone());
+        let py = crate::python::detect(&crate::python::Probe {
+            platform: crate::tools::program::Platform::Windows,
+            is_file: &files,
+            read: &read,
+            env: &none,
+            on_path: &on_path,
+        });
+        merge_python(&mut detected, &root, &py);
+        assert!(detected.unrunnable.is_empty(), "{:?}", detected.unrunnable);
+        assert_eq!(
+            check_without_command(VerificationKind::Test, "test", detected.unrunnable.get("test").map(String::as_str)).status,
+            VerificationStatus::NotConfigured,
+            "npm이 답할 수 있는 체크가 못 돌린 것으로 바뀌었습니다"
+        );
+    }
+
     #[test]
     fn a_check_that_could_not_run_blocks_pass_even_if_another_check_passed() {
         struct PartialExecutor;
