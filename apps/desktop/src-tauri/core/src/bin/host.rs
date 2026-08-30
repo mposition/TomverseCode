@@ -20,6 +20,7 @@
 //! tomverse-host recover  --workspace <path> --db <path>
 //! tomverse-host tasks    --workspace <path> --db <path>
 //! tomverse-host show     --workspace <path> --task <taskId> --db <path>
+//! tomverse-host abandon  --workspace <path> --task <taskId> --db <path>
 //! ```
 //!
 //! M0.1에서 `recover`/`tasks`/`show`가 추가된 이유: 영속화가 실제로 되는지 검증하려면
@@ -199,6 +200,19 @@ struct Args {
     cancel_fleet_after_ms: Option<u64>,
     /// `--cancel-member-after-ms <branch>=<ms>` — **구성원 하나만** 취소한다.
     cancel_member_after_ms: Vec<(String, u64)>,
+    /// `--no-job-object` — Windows에서 **Job Object를 만들지 않는다.** 진단용이다.
+    ///
+    /// # 왜 여기에만 있는가
+    ///
+    /// 착지 기준 `processGroup/taskkillFallbackStillWorks`가 확인하려는 폴백은 job 생성이
+    /// **실패해야만** 타는 경로라, 실측에서 한 번도 실행된 적이 없다(기록 12절). 그것을
+    /// 강제하는 유일한 수단이 이 인자다.
+    ///
+    /// **GUI에는 이 스위치가 없다.** 켤 수 있으면 제품 경로의 종료 보장을 무력화하는 수단이
+    /// 되고, 그건 이 기능이 존재하는 이유를 지운다 — 그 불변식을
+    /// `proctree.rs`의 소스 검사 테스트가 지킨다. 환경변수로 두지 않은 이유도 같다:
+    /// 환경은 상속되므로 어디서 켜졌는지 추적할 수 없다.
+    no_job_object: bool,
 }
 
 #[cfg(test)]
@@ -267,6 +281,158 @@ mod tests {
     fn a_change_task_is_not_narrowed() {
         assert_eq!(allowed_tools_for(&args_for("run"), None).0, None);
     }
+
+    // ---- `--no-job-object` — taskkill 폴백을 강제하는 진단 스위치 ----
+    //
+    // **여기서 확인하는 것은 파싱뿐이다.** 스위치가 Windows에서 실제로 폴백을 태우는지는
+    // 이 환경에서 알 수 없고(`win_job.rs`는 Linux에서 컴파일되지 않는다), 그 경계는
+    // `proctree.rs`의 테스트 머리말에 적어 두었다.
+
+    /// 기본은 꺼짐이고, 인자를 주면 켜진다. **`run`이 아닌 명령에서도 읽힌다** —
+    /// 취소는 어느 명령에서든 일어날 수 있으므로 명령별로 다르게 읽지 않는다.
+    #[test]
+    fn the_job_object_switch_is_opt_in() {
+        assert!(!args_for("run").no_job_object);
+        let args = parse_args_from(["run", "--no-job-object"].into_iter().map(str::to_string)).expect("args");
+        assert!(args.no_job_object);
+    }
+
+    /// **환경변수로는 켜지지 않는다.** 환경은 자식에게 상속되므로 어디서 켜졌는지 추적할 수
+    /// 없고, 우리가 띄운 프로세스까지 함께 물든다 — 그래서 인자 하나로만 둔다.
+    #[test]
+    fn no_environment_variable_turns_the_job_object_switch_on() {
+        // needle을 런타임에 조립한다 — 그대로 적으면 이 파일이 자기 자신에 걸린다.
+        let switch = "no_job".to_string() + "_object";
+        let source = include_str!("host.rs");
+        for line in source.lines().filter(|l| l.contains(&switch)) {
+            assert!(
+                !line.contains("env::var") && !line.contains("std::env"),
+                "환경변수로 스위치를 읽고 있습니다: {line}"
+            );
+        }
+    }
+
+    // ---- `abandon` — 강제 포기를 헤드리스에서 부른다 (12절, 기록 7절) ----
+    //
+    // **하위 명령을 통째로 태운다.** `TaskHost::force_abandon`의 단위 테스트는 `host.rs`에
+    // 따로 있으므로 여기서 확인할 것은 그 함수가 아니라 **배관**이다 — 인자를 어떻게 읽고,
+    // 무엇을 종료 코드로 내고, 이벤트가 실제로 DB에 남는가.
+
+    /// 실제 DB 파일을 쓰는 워크스페이스 하나. **인메모리가 아니다** — 이 명령은 `--db`로
+    /// 받은 파일을 여는 것이 일이고, 그 배관이 이 테스트가 보려는 것이다.
+    fn workspace_with_task(task_id: &str) -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let ws = tempfile::tempdir().unwrap();
+        let art = tempfile::tempdir().unwrap();
+        let db = art.path().join("state.db");
+        let artifacts = ArtifactStore::new(art.path()).unwrap();
+        let mut store = Store::open(&db, artifacts).unwrap();
+        let root = ws.path().to_string_lossy().to_string();
+        let workspace_id = tomverse_core::paths::workspace_id_for(&root);
+        store.upsert_workspace(&workspace_id, &root, "ws").unwrap();
+        store.upsert_session("sess-1", &workspace_id, Some("headless")).unwrap();
+        store
+            .create_task(task_id, "sess-1", &workspace_id, &root, "verified", "fix")
+            .unwrap();
+        // **닫는다.** 다음 프로세스가 이 파일을 여는 것과 같은 상황을 만든다.
+        drop(store);
+        (ws, art, db)
+    }
+
+    fn run_abandon(ws: &Path, art: &Path, db: &Path, task_id: &str) -> Result<i32, String> {
+        let args = parse_args_from(
+            [
+                "abandon",
+                "--workspace",
+                &ws.to_string_lossy(),
+                "--task",
+                task_id,
+                "--db",
+                &db.to_string_lossy(),
+                "--artifacts",
+                &art.to_string_lossy(),
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )?;
+        let root = tomverse_core::paths::WorkspaceRoot::new(ws).map_err(|e| e.to_string())?;
+        run_with_store(args, root, None)
+    }
+
+    fn events_of(db: &Path, art: &Path, task_id: &str) -> Vec<(String, Value)> {
+        let artifacts = ArtifactStore::new(art).unwrap();
+        let store = Store::open(db, artifacts).unwrap();
+        store
+            .events(task_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.event_type, e.payload))
+            .collect()
+    }
+
+    /// 돌고 있던 태스크를 확정하고, **그 사실이 이벤트에 남는다.**
+    ///
+    /// `source: "force-abandon"`를 보는 이유: 이 종료는 사용자 취소(`user`)와도 시한
+    /// (`deadline`)과도 다른 사유이고, 착지 판정에서 "강제 포기를 태웠다"의 근거가 그 값이다.
+    /// 사유가 뭉개지면 실측 기록이 어느 경로를 태웠는지 말할 수 없다.
+    #[test]
+    fn abandon_terminalizes_a_running_task_and_records_why() {
+        let (ws, art, db) = workspace_with_task("task-1");
+        assert_eq!(run_abandon(ws.path(), art.path(), &db, "task-1"), Ok(0));
+
+        let events = events_of(&db, art.path(), "task-1");
+        let (_, payload) = events
+            .iter()
+            .find(|(t, _)| t == "TASK_CANCELLED")
+            .expect("TASK_CANCELLED가 없습니다");
+        assert_eq!(payload.get("source").and_then(Value::as_str), Some("force-abandon"));
+        // **"정리됐다"고 말하지 않는다** — 남은 프로세스가 있을 수 있다는 것이 이 경로의 정의다.
+        assert_eq!(payload.get("forceAbandoned").and_then(Value::as_bool), Some(true));
+    }
+
+    /// 이미 끝난 태스크: `abandoned:false`이고 **종료 코드는 0이다.**
+    ///
+    /// 기다리는 사이에 정상 종료한 것이므로 실패가 아니다. 종료 코드에 실으면 스크립트가
+    /// 좋은 소식을 실패로 읽고, 그 오해는 되돌리기 어렵다 — 이미 끝난 태스크를 다시 죽이려 든다.
+    #[test]
+    fn abandoning_a_finished_task_is_not_a_failure() {
+        let (ws, art, db) = workspace_with_task("task-2");
+        {
+            let artifacts = ArtifactStore::new(art.path()).unwrap();
+            let mut store = Store::open(&db, artifacts).unwrap();
+            store
+                .finish_task(
+                    "task-2",
+                    "COMPLETED",
+                    "TASK_COMPLETED",
+                    None,
+                    &json!({ "status": "completed" }),
+                )
+                .unwrap();
+        }
+        assert_eq!(run_abandon(ws.path(), art.path(), &db, "task-2"), Ok(0));
+
+        // 완료를 취소로 덮어쓰지 않는다 — 먼저 확정된 쪽이 남는다.
+        let events = events_of(&db, art.path(), "task-2");
+        assert!(!events.iter().any(|(t, _)| t == "TASK_CANCELLED"), "{events:?}");
+    }
+
+    /// 없는 태스크 id. **오류로 만들지 않는다** — `force_abandon`의 계약이 그렇고, 여기서
+    /// 다르게 답하면 헤드리스와 화면이 같은 요청에 다른 사실을 말하게 된다.
+    ///
+    /// 그 대신 이 테스트가 **무슨 일이 일어나는지를 고정한다**: 아무것도 기록되지 않고
+    /// 종료 코드는 0이다. DB를 한 번 더 읽어 "없는 id"를 가려내지 않는 이유는 그 읽기가
+    /// 확정과 경쟁하기 때문이다 — 그 사이에 태스크가 생기면 우리가 읽은 사실이 이미 낡는다.
+    #[test]
+    fn abandoning_an_unknown_task_id_writes_nothing() {
+        let (ws, art, db) = workspace_with_task("task-3");
+        assert_eq!(run_abandon(ws.path(), art.path(), &db, "task-없음"), Ok(0));
+
+        assert!(events_of(&db, art.path(), "task-없음").is_empty());
+        // 그리고 **다른 태스크를 건드리지 않는다.**
+        assert!(!events_of(&db, art.path(), "task-3")
+            .iter()
+            .any(|(t, _)| t == "TASK_CANCELLED"));
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -297,6 +463,7 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         pin_executor: None,
         pin_reviewer: None,
         timeout_secs: 600,
+        no_job_object: false,
         verbose: false,
         cancel_after_ms: None,
         mcp_servers: Vec::new(),
@@ -431,6 +598,7 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "--file" => args.file = Some(PathBuf::from(value()?)),
             "--accept-fingerprint" => args.accept_fingerprint = Some(value()?),
             "--apply" => args.apply = true,
+            "--no-job-object" => args.no_job_object = true,
             "--verbose" => args.verbose = true,
             "--all-workspaces" => args.all_workspaces = true,
             "--bundle" => args.bundle = Some(PathBuf::from(value()?)),
@@ -489,7 +657,7 @@ fn reproduce_check(args: &Args, root: &WorkspaceRoot) -> Result<i32, String> {
 }
 
 fn usage() -> String {
-    "usage: tomverse-host <run|ask|rollback|revert|pr|recover|tasks|show|blocked|autopilot-preview|decisions|withdraw|metrics|transmission|export|reproduce|worktree|fleet|fleet-status|windows-landing> --workspace <path> [--message <text>] \
+    "usage: tomverse-host <run|ask|rollback|revert|abandon|pr|recover|tasks|show|blocked|autopilot-preview|decisions|withdraw|metrics|transmission|export|reproduce|worktree|fleet|fleet-status|windows-landing> --workspace <path> [--message <text>] \
      [--task <id>] [--mode fast|verified] [--approve auto|deny|autopilot] [--db <path>] [--artifacts <path>] \
      [--sidecar <index.js>] [--skill <파일.json>] [--session <id>]\n\
      [--auto-approve-writes] [--auto-approve-verification]\n\
@@ -548,6 +716,17 @@ fn usage() -> String {
                  도구도 같이 읽기 전용으로 좁힌다. `COMPLETED`가 아니라 `OUTLINED`로 끝나며\n\
                  `ANSWERED`와도 다르다: 계획을 읽은 사용자의 다음 걸음은 \"그럼 해 줘\"이고\n\
                  그건 새 태스크다(53절)\n\
+     --no-job-object — **Windows에서 Job Object를 만들지 않는다(진단 전용).** 취소가 taskkill\n\
+                 폴백을 타게 만들어 착지 기준 `taskkillFallbackStillWorks`를 태우는 유일한\n\
+                 수단이다. 켜면 **트리 전체 종료를 보장하지 않는다** — 이미 고아가 된 손자를\n\
+                 놓칠 수 있고, 그 한계를 보는 것이 이 스위치의 목적이다.\n\
+                 이 프로세스에서만 유효하며(환경변수가 아니다) GUI에는 없다.\n\
+                 결과 JSON의 `treeKill.jobObjectDisabled`에 남는다\n\
+     abandon --task <id> — **강제 포기.** \"취소 중\"에서 기다리기를 그만두고 태스크를 CANCELLED로\n\
+                 확정한다. **프로세스를 죽이지 않는다** — 죽일 수 있었으면 이 명령이 필요하지\n\
+                 않았다. 남은 프로세스가 있을 수 있다는 사실이 결과에 함께 남는다.\n\
+                 이미 끝난 태스크에는 `abandoned:false`를 내고 **종료 코드는 0이다**(그건 실패가\n\
+                 아니라 기다리는 사이에 정상 종료했다는 좋은 소식이다)\n\
      recover — 앱 재시작 시나리오: 터미널이 아닌 태스크를 INTERRUPTED로 확정한다\n\
      pr      — 현재 브랜치를 remote로 올리고 **PR 생성 폼 URL**을 낸다. [--remote origin]\n\
                  [--base main]. **우리는 GitHub에 요청을 보내지 않는다** — 폼을 여는 것은\n\
@@ -714,6 +893,21 @@ fn worktree_parent_dir(args: &Args) -> PathBuf {
 
 fn real_main() -> Result<i32, String> {
     let args = parse_args()?;
+
+    // **Job Object를 끄는 것은 여기서만 할 수 있다**(proctree.rs). 착지 기준
+    // `taskkillFallbackStillWorks`가 확인하려는 폴백은 job 생성이 실패해야만 타는 경로이고,
+    // 그것을 강제하는 수단이 이 인자다 — 없는 동안 그 기준은 확인할 방법 자체가 없었다.
+    //
+    // **켰다는 사실을 조용히 두지 않는다.** 이 프로세스의 취소는 트리 종료를 보장하지
+    // 못하게 되므로, 그것을 모르고 돌린 사람이 결과를 이 머신의 성질로 읽으면 안 된다.
+    if args.no_job_object {
+        tomverse_core::proctree::disable_job_object();
+        eprintln!(
+            "--no-job-object: 이 프로세스는 Job Object를 만들지 않습니다. 취소는 taskkill \
+             폴백을 타며 **트리 전체 종료를 보장하지 않습니다**(고아가 된 손자를 놓칠 수 \
+             있습니다). 진단 전용이며, 결과의 treeKill.jobObjectDisabled에 이 사실이 남습니다."
+        );
+    }
 
     // **격리 실행은 루트를 바꾸는 것이 전부다.** worktree를 만들고 그 경로를 루트로 준다 —
     // Policy Gate에 "worktree 모드"라는 분기를 만들지 않는다. 분기를 만들면 그 분기가 곧
@@ -1187,6 +1381,40 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
                 .list_tasks(Some(&root.display()), 200, None)
                 .map_err(|e| format!("작업 목록 조회 실패: {e}"))?;
             println!("{}", json!({ "tasks": rows }));
+            Ok(0)
+        }
+
+        // **강제 포기** — 사용자가 "취소 중"에서 기다리기를 그만두는 탈출구(12절).
+        //
+        // # 왜 헤드리스에도 있는가
+        //
+        // 이건 UI 탈출구지만, `jobHandleLifetime`의 착지 기준은 **취소와 강제 포기를 각각 한 번씩**
+        // 돌려 job 핸들이 닫히는지 보라고 요구한다(landing.rs). 그런데 강제 포기를 부를 수 있는
+        // 자리가 화면뿐이라 그 절반이 실측에서 멈춰 있었다(기록 7절). 명령이 없어서 확인하지
+        // 못한 것을 "확인하지 못했다"로 남기는 대신, 부를 수 있게 한다.
+        //
+        // **`TaskHost::force_abandon`을 그대로 부른다.** 여기서 로직을 복제하면 이 명령으로
+        // 태운 것이 제품 경로를 태운 것이 아니게 되고, 그러면 착지 판정의 근거가 사라진다 —
+        // 화면의 버튼(`session.rs`의 `force_abandon_task`)이 부르는 것과 같은 함수여야 한다.
+        "abandon" => {
+            let task_id = args
+                .task_id
+                .clone()
+                .ok_or_else(|| "abandon에는 --task가 필요합니다".to_string())?;
+            let host = TaskHost::new(
+                root,
+                policy_for_task.clone(),
+                store,
+                artifacts,
+                approvals,
+                sink,
+                Arc::new(CancellationRegistry::new()),
+            );
+            let result = host.force_abandon(&task_id)?;
+            println!("{result}");
+            // **`abandoned: false`를 오류로 바꾸지 않는다.** 그건 기다리는 사이에 태스크가
+            // 정상적으로 끝났다는 뜻이고, 실패가 아니라 **좋은 소식**이다(`force_abandon` 주석).
+            // 종료 코드에 실으면 스크립트가 좋은 소식을 실패로 읽는다.
             Ok(0)
         }
 

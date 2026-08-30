@@ -92,6 +92,17 @@ apps/desktop/        Tauri 2 + React
                      `packages/toolchain/test/credentialBoundary.test.ts`가 소스에서 지킨다
       src/bin/host.rs  tomverse-host — GUI 없이 코어 루프를 돌리는 헤드리스 호스트(e2e 테스트가 사용).
                      `run` 외에 읽기 전용 하위 명령이 있다: `tasks`/`show`/`metrics`/`transmission`/`export`/`reproduce`/`fleet-status`/`windows-landing`.
+                     `abandon --task <id>`는 읽기 전용이 아니다 — **강제 포기**(화면의 탈출구)를 헤드리스에서
+                     부른다. 화면과 **같은 함수**(`TaskHost::force_abandon`)를 타므로 이 명령으로 태운 것이
+                     제품 경로를 태운 것이며, 그게 `jobHandleLifetime`의 나머지 절반을 실측할 수 있게 한 이유다.
+                     프로세스를 죽이지 않는다(죽일 수 있었으면 이 경로가 필요 없었다). 이미 끝난 태스크에는
+                     `abandoned:false`를 내고 **종료 코드는 0이다** — 그건 실패가 아니라 좋은 소식이다.
+                     `--no-job-object`는 **Windows에서 Job Object를 만들지 않게 하는 진단 스위치**다.
+                     `taskkill` 폴백은 job 생성이 실패해야만 타는 경로라 한 번도 실행된 적이 없었고
+                     (기록 12절), 그것을 강제하는 유일한 수단이다. **GUI에는 없고 만들지 말 것** — 켤 수
+                     있으면 제품 경로의 종료 보장을 무력화하는 수단이 된다(`proctree.rs`의 소스 검사 테스트가
+                     지킨다). 환경변수가 아닌 이유는 상속 때문이다. 켰다는 사실은 결과의
+                     `treeKill.jobObjectDisabled`에 남는다 — 그래야 "만들지 못했다"와 구별된다.
                      `fleet`은 **N개 병렬 실행**이다(구성원마다 worktree 하나). 각 구성원은 자기 트리를 게이트
                      루트로 받는 **평범한 태스크**이며 Policy Gate에 분기가 없다. 어려운 것은 병렬 실행이 아니라
                      process-architecture 11.2절의 셋이었다 — 승인 큐(`approvals.rs`), **합계 예산의 예약**
