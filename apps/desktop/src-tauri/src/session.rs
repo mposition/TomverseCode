@@ -18,7 +18,10 @@ use tomverse_core::host::{ApprovalGateway, ApprovalOutcome, EventSink, TaskHost}
 use tomverse_core::sidecar::{RespawnOutcome, SidecarClient, SidecarSupervisor, MAX_SIDECAR_RESPAWNS};
 use tomverse_core::store::{Store, StoreIssue, StoreOp, TaskRow};
 use tomverse_core::uimsg::{UiMessage, UserFacing};
-use tomverse_core::types::{ApprovalRequest, ExecutionMode, TaskPolicy};
+use tomverse_core::types::{
+    ApprovalRequest, ExecutionMode, PlanApprovalChoice, TaskPolicy, UserGateOutcome, UserGateRequest, UserGateway,
+    VerificationChoice,
+};
 // `available_providers`(허용 목록을 적용하지 않는 판)는 **일부러 들여오지 않는다.**
 // 이 파일의 모든 자리는 `available_providers_for`로 워크스페이스 허용 목록을 적용한다 —
 // 목록 밖 공급자의 모델을 고를 수 있게 보여주면, 고른 뒤 "키가 없다"는 오류를 만나게 된다.
@@ -28,7 +31,7 @@ use tomverse_core::{
     available_providers_for, credential_injection_for, credential_presence, providers_blocked_by_policy,
     CancellationRegistry, WorkspaceRoot, PROTOCOL_VERSION,
 };
-use tomverse_core::approvals::PendingApprovals;
+use tomverse_core::approvals::{PendingApprovals, PendingGates};
 
 /// UI에 승인 요청을 emit하고 사용자 응답을 기다린다.
 ///
@@ -88,6 +91,60 @@ impl ApprovalGateway for UiApprovalGateway {
     }
 }
 
+/// 72절 **사용자 게이트 둘**의 UI 왕복 — state-machine 72.4·72.12절.
+///
+/// `UiApprovalGateway`와 나란히 두지만 **타임아웃이 없다.** 그 한 줄이 두 게이트웨이를
+/// 나눈 이유 전부다:
+///
+/// - 72.5절은 *"사용자가 계획을 승인하고 **자리를 비운 사이**"*를 명시적으로 전제하고,
+///   그 경우를 위해 지문 만료를 설계했다. 10분 뒤 자동 거부되면 그 설계가 걸릴 일이 없다.
+/// - 72.12절은 그 대기 동안 **구현 예산 예약을 잡아 둔다.** 10분마다 거부로 끝나면 예약과
+///   해제가 반복될 뿐이다.
+/// - **거부는 결말이다.** 도구 하나의 거부와 달리 계획 승인의 거부는 태스크를 `REJECTED`로
+///   끝낸다 — 점심 먹으러 간 사이에 작업이 사라지는 것은 사용자가 고른 적 없는 결말이다.
+///
+/// **그러면 상한 없는 대기가 아닌가**(원칙 5)? 아니다. 상한은 여기가 아니라 **사용자의
+/// 탈출구**가 진다: 취소는 새 다섯 phase 전부에서 들어오고(72.11절), 무인 실행에서는
+/// 39절의 시한이 그 정지를 다룬다. 그리고 앱을 닫으면 `PendingGates::drain`이 닫는다 —
+/// **거부가 아니라 `Unavailable`로** 닫는 것이 72.12절의 요점이다.
+pub struct UiUserGateway {
+    app: AppHandle,
+    pending: Arc<PendingGates>,
+}
+
+impl UiUserGateway {
+    pub fn new(app: AppHandle, pending: Arc<PendingGates>) -> Self {
+        Self { app, pending }
+    }
+}
+
+impl UserGateway for UiUserGateway {
+    fn request_gate(&self, request: &UserGateRequest) -> UserGateOutcome {
+        let task_id = request.task_id().to_string();
+        let rx = self.pending.register(&task_id);
+        let channel = match request {
+            UserGateRequest::Plan { .. } => "plan-approval-required",
+            UserGateRequest::Verification { .. } => "verification-required",
+        };
+        if self
+            .app
+            .emit(channel, serde_json::to_value(request).unwrap_or(Value::Null))
+            .is_err()
+        {
+            self.pending.forget(&task_id);
+            // **거부가 아니다.** UI에 전달하지 못한 것은 오류이지 사용자의 판정이 아니며,
+            // 거부로 접으면 최종 보고가 "사용자가 거부했다"고 거짓말한다.
+            return UserGateOutcome::Unavailable("UI에 게이트 카드를 전달할 수 없었습니다".to_string());
+        }
+        // **`recv_timeout`이 아니다.** 시한을 여기 붙이는 순간 위 세 근거가 전부 무효가 된다.
+        let outcome = rx
+            .recv()
+            .unwrap_or_else(|_| UserGateOutcome::Unavailable("게이트 대기가 끊어졌습니다".to_string()));
+        self.pending.forget(&task_id);
+        outcome
+    }
+}
+
 /// Rust → UI 이벤트 릴레이. process-architecture.md 4절대로 내용을 해석하지 않고 그대로 emit한다.
 struct TauriSink {
     app: AppHandle,
@@ -125,6 +182,8 @@ pub struct ActiveWorkspace {
 pub struct SessionState {
     inner: Mutex<Option<ActiveWorkspace>>,
     pub pending_approvals: Arc<PendingApprovals>,
+    /// 대기 중인 **사용자 게이트**(72절). 도구 승인과 나누는 이유는 `PendingGates` 참조.
+    pub pending_gates: Arc<PendingGates>,
     /// 저장 계층은 **워크스페이스와 독립적으로** 살아 있어야 한다.
     ///
     /// 앱을 켜자마자(워크스페이스를 열기 전) 최근 작업 목록과 중단된 작업을 보여줘야 하기 때문이다.
@@ -1057,6 +1116,7 @@ impl SessionState {
             .map_err(|e| format!("워크스페이스 설정: {e}"))?;
 
         let approvals = Arc::new(UiApprovalGateway::new(app.clone(), self.pending_approvals.clone()));
+        let gates = Arc::new(UiUserGateway::new(app.clone(), self.pending_gates.clone()));
         let sink = Arc::new(TauriSink { app: app.clone() });
         let mut task_host = TaskHost::new(
             root.clone(),
@@ -1066,7 +1126,8 @@ impl SessionState {
             approvals,
             sink,
             self.cancels.clone(),
-        );
+        )
+        .with_gates(gates);
         let mcp = if servers.is_empty() {
             None
         } else {
@@ -1967,6 +2028,7 @@ impl SessionState {
             branch: spec.branch.clone(),
         };
         let approvals = Arc::new(UiApprovalGateway::new(context.app.clone(), self.pending_approvals.clone()));
+        let gates = Arc::new(UiUserGateway::new(context.app.clone(), self.pending_gates.clone()));
         // **구성원 이벤트는 화면의 다른 채널로 간다.** `task-event`로 흘리면 활성 태스크의
         // 로그와 단계 표시가 남의 태스크를 따라간다 — 화면이 조용히 거짓말하는 자리다.
         let sink = Arc::new(FleetSink {
@@ -2005,6 +2067,10 @@ impl SessionState {
                 sink,
                 self.cancels.clone(),
             )
+            // **Fleet 구성원마다 게이트 둘을 갖는다**(72.12절). 승인 큐가 이미 요청이 여러
+            // 개여도 덮이지 않게 하므로 큐 구조는 그대로 쓰지만, **타임아웃 정책은 그대로
+            // 쓸 수 없다** — 그래서 게이트 등록부가 따로 있다.
+            .with_gates(gates.clone())
             .with_isolation(isolation)
             .with_fleet_member(origin),
         );
@@ -2320,6 +2386,33 @@ impl SessionState {
     /// 전환으로 정리된 항목이 화면에만 남는다. 그 목록은 **등록부가 정본이다.**
     pub fn pending_approvals(&self) -> Value {
         json!({ "pending": self.pending_approvals.pending() })
+    }
+
+    /// 대기 중인 사용자 게이트 목록. 화면이 "무엇을 기다리고 있는가"에 답할 수 있어야 한다.
+    pub fn pending_gates(&self) -> Value {
+        json!({ "waiting": self.pending_gates.waiting() })
+    }
+
+    /// 계획 승인 카드 / 검증 체크리스트의 답 — state-machine 72.4·72.8절.
+    ///
+    /// **Node를 거치지 않는다.** 승인 이벤트가 `NODE_MAY_NOT_EMIT`이므로 왕복 전체가 Rust
+    /// 소유이고, 기록은 `TaskHost::request_user_gate`가 남긴다.
+    pub fn respond_gate(&self, task_id: &str, gate: &str, choice: &str) -> Result<Value, String> {
+        let outcome = match (gate, choice) {
+            ("plan", "approve_with_review") => UserGateOutcome::Plan(PlanApprovalChoice::ApproveWithReview),
+            ("plan", "approve_skip_review") => UserGateOutcome::Plan(PlanApprovalChoice::ApproveSkipReview),
+            ("plan", "revise") => UserGateOutcome::Plan(PlanApprovalChoice::Revise),
+            ("plan", "reject") => UserGateOutcome::Plan(PlanApprovalChoice::Reject),
+            ("verification", "approve") => UserGateOutcome::Verification(VerificationChoice::Approve),
+            ("verification", "refix") => UserGateOutcome::Verification(VerificationChoice::Refix),
+            ("verification", "replan") => UserGateOutcome::Verification(VerificationChoice::Replan),
+            ("verification", "revert_and_stop") => UserGateOutcome::Verification(VerificationChoice::RevertAndStop),
+            _ => return Err(format!("알 수 없는 게이트 응답: {gate}/{choice}")),
+        };
+        // **전달 실패는 오류가 아니라 값이다.** 낡은 화면에서 누른 경우이고, 화면이
+        // "이미 지나갔습니다"라고 말할 수 있어야 한다 — 오류로 내면 그 문장이 스택 트레이스가 된다.
+        let delivered = self.pending_gates.respond(task_id, outcome);
+        Ok(json!({ "delivered": delivered }))
     }
 
     pub fn respond_approval(&self, approval_id: &str, granted: bool, note: Option<String>) -> Result<Value, String> {

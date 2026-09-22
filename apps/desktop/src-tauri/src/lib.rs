@@ -269,6 +269,28 @@ fn respond_approval(
     state.respond_approval(&approval_id, granted, note)
 }
 
+/// 대기 중인 사용자 게이트 목록 (72절).
+#[tauri::command]
+fn pending_gates(state: tauri::State<'_, SessionState>) -> Value {
+    state.pending_gates()
+}
+
+/// 계획 승인 카드 / 검증 체크리스트의 답 — state-machine 72.4·72.8절.
+///
+/// `respond_approval`과 나누는 이유는 **답의 모양이 다르기 때문**이다: 도구 승인은
+/// 허용/거부 둘이고, 이쪽은 선택지 넷이다(카드마다 다른 넷). 한 명령으로 뭉치면
+/// `granted: bool`에 넷을 욱여넣게 되고, 그 순간 화면이 "승인 + 검토 생략"과
+/// "승인 + 독립 검토"를 구별해 보낼 수 없다.
+#[tauri::command]
+fn respond_gate(
+    state: tauri::State<'_, SessionState>,
+    task_id: String,
+    gate: String,
+    choice: String,
+) -> Result<Value, String> {
+    state.respond_gate(&task_id, &gate, &choice)
+}
+
 #[tauri::command]
 fn cancel_task(state: tauri::State<'_, SessionState>, task_id: String) -> Result<Value, String> {
     state.cancel_task(&task_id)
@@ -692,6 +714,8 @@ pub fn run() {
             start_task,
             respond_approval,
             pending_approvals,
+            respond_gate,
+            pending_gates,
             start_fleet,
             cancel_fleet,
             cancel_fleet_member,

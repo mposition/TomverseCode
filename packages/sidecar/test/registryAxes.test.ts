@@ -262,3 +262,32 @@ test("B·C 자리는 없을 때 dropped가 아니라 not_applicable이다", asyn
   assert.equal(decision.planReviewIndependence, "not_applicable");
   assert.equal(decision.resultReviewIndependence, "not_applicable");
 });
+
+/**
+ * **실제 공급자는 측정 전까지 `unmeasured`다** — multi-engine-routing.md 21.4·21.8절.
+ *
+ * 등급은 "이 모델이 fixture를 몇 % 통과하는가"이고 **우리가 실제로 잰 값**이 근거다.
+ * 측정 없이 등급을 붙이면 21.6절의 A·B·C 기본 배정 금지가 그 추측 위에서 풀린다 —
+ * 독립성 주장이 검증되지 않은 것 위에 서게 되는 바로 그 경우다.
+ *
+ * `fake-*`는 예외다. 모델이 아니라 하네스이므로 잴 능력이 없고, 붙어 있는 값은 능력에 대한
+ * 주장이 아니라 고정된 fixture다(`registry.ts`의 fake 머리말). 예외를 여기 적어 두지
+ * 않으면 다음 사람이 그 값을 "이미 측정했다"로 읽는다.
+ */
+test("측정하지 않은 실제 공급자에 등급을 붙이지 않는다", () => {
+  const real = BUILTIN_MODELS.filter((e) => providerKindOf(e) === "real");
+  assert.ok(real.length > 0);
+  for (const entry of real) {
+    assert.equal(
+      entry.grade,
+      "unmeasured",
+      `${entry.modelId}에 등급이 붙어 있습니다 — 게이트 fixture 세트로 잰 뒤에만 붙습니다(21.8절 5단계)`
+    );
+  }
+  // fake에는 붙어 있어야 한다 — 없으면 B·C 경로를 아무도 태워볼 수 없다.
+  const fake = BUILTIN_MODELS.filter((e) => providerKindOf(e) === "fake");
+  assert.ok(
+    fake.some((e) => e.grade === "frontier"),
+    "하네스에 frontier fixture가 없어 결과 검토(C) 경로를 태워볼 수 없습니다"
+  );
+});
