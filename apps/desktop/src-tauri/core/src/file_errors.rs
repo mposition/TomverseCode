@@ -47,6 +47,12 @@ pub enum FileFailureKind {
     PathTooLong,
     /// 쓸 권한이 없다. **왜인지는 모른다** — 읽기 전용 속성, 폴더 권한, 백신이 다 이 코드를 낸다.
     PermissionDenied,
+    /// 파일 시스템이 이 **이름**을 받지 않는다 — 길이 때문이 아니다.
+    ///
+    /// Windows의 `ERROR_INVALID_NAME`은 금지 문자(`< > : " / \ | ? *`), 예약 이름(`CON`·`PRN`
+    /// 계열), 끝의 공백·마침표에서도 나온다. **어느 것인지는 코드만으로 판정하지 못하므로**
+    /// 후보를 나열하되 단정하지 않는다(`PermissionDenied`와 같은 규율).
+    InvalidName,
 }
 
 /// 실패 하나에 대해 우리가 말할 수 있는 것.
@@ -71,11 +77,35 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 const ERROR_SHARING_VIOLATION: i32 = 32;
 const ERROR_LOCK_VIOLATION: i32 = 33;
 const ERROR_FILENAME_EXCED_RANGE: i32 = 206;
+/// Windows `ERROR_INVALID_NAME` — **길이도 이 코드로 온다.**
+///
+/// 실측(Windows 10, NTFS): 300자짜리 이름 한 칸은 206이 아니라 **123**을 낸다. 206은 경로
+/// 전체가 `MAX_PATH`를 넘을 때 일부 API가 내는 값이고, 한 칸이 255를 넘는 흔한 경우는 여기로
+/// 온다 — 그래서 206만 알던 동안 **가장 흔한 "이름이 길다"가 판정되지 않았고**, 오케스트레이터는
+/// 달라질 리 없는 실패를 `toolRetries`만큼 재시도했다(이 모듈이 막으려던 바로 그것이다).
+const ERROR_INVALID_NAME: i32 = 123;
+/// 파일 이름 한 칸의 상한 — NTFS·FAT 모두 255(UTF-16 코드 단위)다.
+///
+/// **이 값으로 길이와 그 밖의 원인을 가른다.** 123은 금지 문자·예약 이름에서도 오므로,
+/// 코드만 보고 "길어서 실패했다"고 말하면 `a<b.ts`에 *"짧은 경로로 옮기세요"*라는 틀린
+/// 처방이 나간다 — 길이는 우리가 **직접 셀 수 있는** 사실이므로 세서 판정한다.
+const MAX_COMPONENT_UTF16: usize = 255;
 /// Unix `ENAMETOOLONG`.
 const ENAMETOOLONG: i32 = 36;
 /// Unix `EACCES` / `EPERM`.
 const EACCES: i32 = 13;
 const EPERM: i32 = 1;
+
+/// 이름 한 칸이 파일 시스템 상한을 넘는가 — **우리가 직접 세는 사실이다.**
+///
+/// 구분자는 둘 다 본다: 인자로 받은 플랫폼과 무관하게, 모델이 낸 경로는 어느 쪽 구분자든
+/// 쓸 수 있다. UTF-16 코드 단위로 세는 이유는 Windows가 그 단위로 상한을 두기 때문이다 —
+/// 바이트로 세면 한글 이름이 실제보다 길게 계산된다.
+fn has_overlong_component(target: &str) -> bool {
+    target
+        .split(['/', '\\'])
+        .any(|part| part.encode_utf16().count() > MAX_COMPONENT_UTF16)
+}
 
 /// 실패의 원인을 **아는 만큼만** 말한다. 모르면 `None`이다.
 ///
@@ -87,8 +117,14 @@ pub fn diagnose(platform: Platform, target: &str, err: &std::io::Error) -> Optio
 
     // **경로 길이가 먼저다.** Windows는 긴 경로에 대해 `ERROR_ACCESS_DENIED`를 내는 경우도
     // 있어서, 권한 판정을 먼저 하면 "권한이 없습니다"라는 틀린 처방이 나간다.
+    let overlong_component = has_overlong_component(target);
     let too_long = match platform {
-        Platform::Windows => code == Some(ERROR_FILENAME_EXCED_RANGE),
+        // `ERROR_INVALID_NAME`은 길이 **외의** 원인으로도 오므로 코드만으로 단정하지 않는다.
+        // 길이는 직접 셀 수 있으니 세서 가른다(아래 `InvalidName` 분기가 나머지를 받는다).
+        Platform::Windows => {
+            code == Some(ERROR_FILENAME_EXCED_RANGE)
+                || (code == Some(ERROR_INVALID_NAME) && overlong_component)
+        }
         Platform::Unix => code == Some(ENAMETOOLONG),
     };
     if too_long {
@@ -101,6 +137,17 @@ pub fn diagnose(platform: Platform, target: &str, err: &std::io::Error) -> Optio
                         .to_string(),
                 Platform::Unix => "더 짧은 경로로 옮기세요. 재시도해도 같은 결과입니다.".to_string(),
             },
+            retryable: false,
+        });
+    }
+
+    // 길이가 설명하지 못하는 `ERROR_INVALID_NAME`. **후보를 나열하되 단정하지 않는다.**
+    if platform == Platform::Windows && code == Some(ERROR_INVALID_NAME) {
+        return Some(FileFailure {
+            kind: FileFailureKind::InvalidName,
+            fact: format!("이 이름을 파일 시스템이 받지 않습니다: {target}"),
+            try_this: "금지 문자, 예약 이름(CON·PRN·AUX·NUL·COM1~9·LPT1~9), 끝의 공백이나 마침표 중 하나일 수 있습니다 — 어느 것인지는 우리가 판정하지 못합니다. 재시도해도 같은 결과입니다."
+                .to_string(),
             retryable: false,
         });
     }
@@ -129,13 +176,32 @@ pub fn diagnose(platform: Platform, target: &str, err: &std::io::Error) -> Optio
     // (5는 Linux에서 `EIO`다) 판정이 사라진다 — 이 모듈의 전제("인자만으로 판정한다")가
     // 절반만 참이 되고, Windows 분기를 여기서 검증할 수 없게 된다. 검사가 그것을 잡았다.
     //
-    // 그래서 **둘 다** 본다: 실제 실행에서는 `ErrorKind`가 맞고, 인자로 재구성한 오류에서는
-    // 코드가 맞는다.
+    // 그래서 **둘 다** 보되, `ErrorKind`를 믿어도 되는 조건을 정확히 적는다.
+    //
+    // # 언제 `ErrorKind`가 인자와 무관한 사실인가
+    //
+    // `ErrorKind`에는 출처가 둘이다:
+    //
+    // - **원시 코드에서 유도된 것.** 유도를 하는 것은 인자로 받은 플랫폼이 아니라 **지금 도는
+    //   OS**다. 그러므로 이 경우의 `kind()`는 인자에 대한 사실이 아니다.
+    // - **직접 만든 것**(`Error::new(ErrorKind::PermissionDenied, …)`). 원시 코드가 없고
+    //   플랫폼 매핑이 끼어들지 않으므로 **어느 인자에 대해서도 그대로 참이다.**
+    //
+    // 조건 없이 보면 이 함수가 **인자에 대해 순수하지 않다**: 같은 `(platform, code)`가
+    // 도는 OS에 따라 다른 답을 낸다. 실측으로 그랬다 — `diagnose(Unix, os(5))`는 Linux에서
+    // `None`인데 Windows에서는 `PermissionDenied`였다(도는 OS가 5를 그렇게 매핑하므로).
+    // 그러면 *"바깥 세계를 인자로 받으면 Windows 분기를 Linux에서 값으로 검증할 수 있다"*는
+    // 이 모듈 머리말의 주장이 **한쪽 OS에서만 참**이 되고, 그 사실은 반대쪽 OS에서 검사를
+    // 돌릴 때만 드러난다(그리고 실제로 Windows에서만 빨갛게 드러났다).
+    //
+    // 프로덕션은 언제나 `Platform::current()`로 부르므로 **동작은 달라지지 않는다** —
+    // 조건이 좁아지는 경우는 교차 플랫폼 검사뿐이고, 거기서는 코드만 보는 것이 맞다.
     let denied_code = match platform {
         Platform::Windows => code == Some(ERROR_ACCESS_DENIED),
         Platform::Unix => matches!(code, Some(EACCES) | Some(EPERM)),
     };
-    if denied_code || err.kind() == std::io::ErrorKind::PermissionDenied {
+    let kind_is_about_the_argument = code.is_none() || platform == Platform::current();
+    if denied_code || (kind_is_about_the_argument && err.kind() == std::io::ErrorKind::PermissionDenied) {
         return Some(FileFailure {
             kind: FileFailureKind::PermissionDenied,
             fact: format!("쓰기 권한이 없습니다: {target}"),
@@ -215,7 +281,8 @@ mod tests {
             assert!(!f.retryable, "{f:?}");
         }
 
-        // ② 코드가 없는 오류 — `ErrorKind`가 잡는다.
+        // ② 코드가 없는 오류 — `ErrorKind`가 잡는다. **인자와 무관하게 참이다**:
+        //    원시 코드가 없으면 플랫폼 매핑이 끼어들 자리가 없다.
         for platform in [Platform::Windows, Platform::Unix] {
             let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
             assert_eq!(err.raw_os_error(), None, "이 테스트의 전제가 깨졌습니다");
@@ -224,7 +291,57 @@ mod tests {
         }
 
         // ③ 그리고 플랫폼이 갈린다 — Windows의 5번은 Unix에서 `EIO`이고 우리는 그것을 모른다.
+        //
+        // **이 단언이 도는 OS와 무관하게 참이어야 한다.** 한때는 아니었다: `ErrorKind`를
+        // 조건 없이 보던 동안 Windows에서 이 호출이 `PermissionDenied`를 냈고(도는 OS가 5를
+        // 그렇게 매핑한다), 그래서 같은 검사가 Linux에서는 초록색, Windows에서는 빨간색이었다.
+        // 교차 플랫폼 판정을 값으로 검증한다는 이 모듈의 목적이 그때 절반만 참이었다.
         assert_eq!(diagnose(Platform::Unix, "a.ts", &os(ERROR_ACCESS_DENIED)), None);
+        // 반대 방향도 같다 — Unix의 `EACCES`(13)는 Windows에서 우리가 아는 코드가 아니다.
+        // 도는 OS가 그것을 어떻게 매핑하든 인자가 Windows면 답은 하나여야 한다.
+        assert_eq!(diagnose(Platform::Windows, "a.ts", &os(EACCES)), None);
+    }
+
+    /// **Windows에서 이름이 길면 `206`이 아니라 `123`이 온다** — 실측으로 확인한 사실이고,
+    /// 그 코드를 모르는 동안 **가장 흔한 "이름이 길다"가 판정되지 않았다.** 그때 증상은
+    /// 조용하다: 오케스트레이터가 달라질 리 없는 실패를 `toolRetries`만큼 재시도하고,
+    /// 사용자는 번역된 OS 문장 하나를 받는다.
+    #[test]
+    fn windows_reports_a_long_name_as_invalid_name_not_exceeded_range() {
+        let long = "z".repeat(300);
+        let f = diagnose(Platform::Windows, &format!("src/{long}.ts"), &os(ERROR_INVALID_NAME))
+            .expect("판정이 없습니다");
+        assert_eq!(f.kind, FileFailureKind::PathTooLong, "{f:?}");
+        assert!(!f.retryable, "{f:?}");
+    }
+
+    /// **같은 코드가 길이 아닌 이유로도 온다.** 코드만 보고 "길어서"라고 말하면
+    /// `a<b.ts`에 *"짧은 경로로 옮기세요"*라는 틀린 처방이 나간다 — 길이는 우리가 셀 수
+    /// 있는 사실이므로 세서 가른다.
+    #[test]
+    fn an_invalid_name_that_is_short_is_not_reported_as_too_long() {
+        let f = diagnose(Platform::Windows, "src/a<b.ts", &os(ERROR_INVALID_NAME)).expect("판정이 없습니다");
+        assert_eq!(f.kind, FileFailureKind::InvalidName, "{f:?}");
+        assert!(!f.retryable, "{f:?}");
+        // **단정하지 않는다** — 어느 원인인지 우리는 모른다.
+        assert!(f.try_this.contains("판정하지 못합니다"), "{f:?}");
+    }
+
+    /// 길이 판정은 **경로 전체가 아니라 한 칸**을 본다. 전체로 세면 깊은 디렉터리에 있는
+    /// 짧은 이름이 "길다"로 잡히고, 그 처방("짧은 경로로 옮기세요")은 이 경우에도 맞지만
+    /// **이유가 틀린다** — 그리고 틀린 이유는 다음 사람이 그 위에 쌓는다.
+    #[test]
+    fn length_is_measured_per_component_and_in_utf16_units() {
+        let deep = format!("{}/a.ts", vec!["dir"; 200].join("/"));
+        assert_eq!(diagnose(Platform::Windows, &deep, &os(ERROR_INVALID_NAME)).map(|f| f.kind),
+                   Some(FileFailureKind::InvalidName));
+        // 한글 이름은 UTF-16 코드 단위로 센다 — 바이트로 세면 실제보다 길게 계산된다.
+        let korean = "가".repeat(200);
+        assert_eq!(diagnose(Platform::Windows, &korean, &os(ERROR_INVALID_NAME)).map(|f| f.kind),
+                   Some(FileFailureKind::InvalidName));
+        let korean_long = "가".repeat(256);
+        assert_eq!(diagnose(Platform::Windows, &korean_long, &os(ERROR_INVALID_NAME)).map(|f| f.kind),
+                   Some(FileFailureKind::PathTooLong));
     }
 
     /// **모르면 `None`이다.** "문제가 없다"가 아니라 "더 말할 것이 없다"이고, 호출부는
