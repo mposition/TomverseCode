@@ -139,6 +139,7 @@ stateDiagram-v2
 | `toolRetries[requestId]` | ToolResult.status = timeout/transient error | 2 (지수 백오프) | 해당 ToolRequest를 `error`로 확정, EXECUTING 전체를 FAILED로 전이 |
 | `planRounds` | `OUTLINING` 재진입 시 (**경로 셋** — 72.11절) | 2 | 계획을 다시 세우지 않는다. **남는 선택지는 서 있는 자리에 따라 다르다** — 72.11절 |
 | `maxSubtasks` | 계획이 서브태스크를 선언할 때 | 8 | 계획을 거부하고 사용자에게 쪼개 달라고 올린다 |
+| `escalationCalls` | 런타임 에스컬레이션을 **실제로 부를 때**(72.10.2절) | 승인 카드의 `escalationAllowance.maxCalls` | **초과 요청을 거절한다.** 서브태스크는 원래 등급으로 계속 간다 — 중간에 봉투를 늘리지 않는다 |
 
 
 > **`fixLoopRounds`의 증가 지점이 바뀐 이유**: 종전 정의 *"`VERIFYING` → fail 판정 시"*는
@@ -599,7 +600,9 @@ CREATE TABLE tasks (
   workspace_id   TEXT NOT NULL REFERENCES workspaces(workspace_id),
   user_message   TEXT NOT NULL,
   phase          TEXT NOT NULL,       -- TaskPhase
-  counters_json  TEXT NOT NULL,       -- { clarificationRounds, reviseRounds, fixLoopRounds, toolRetries }
+  counters_json  TEXT NOT NULL,       -- 2.2절 표의 카운터 전부. 표가 정본이고 여기는 그 사본이다
+                                      -- (지금: clarificationRounds, reviseRounds, fixLoopRounds,
+                                      --  toolRetries, planRounds, maxSubtasks, escalationCalls)
   final_status   TEXT,                -- null 이면 아직 진행 중
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL
@@ -671,6 +674,13 @@ CREATE INDEX idx_file_mutations_request ON file_mutations(request_id);
 롤백(10절)은 `tool_requests.task_id`로 해당 태스크의 모든 `request_id`를 찾고, `file_mutations`를 조인해 `path`별 최신 `pre_image`를 역방향 patch로 변환한다.
 
 `task_events.event_type` 값: `TASK_CREATED`, `SNAPSHOT_CREATED`, `DRAFT_RECEIVED`, `REVIEW_RECEIVED`, `PLAN_CREATED`, `APPROVAL_REQUESTED`, `APPROVAL_GRANTED`, `APPROVAL_DENIED`, `TOOL_REQUESTED`, `TOOL_COMPLETED`, `VERIFICATION_COMPLETED`, `FIX_LOOP_STARTED`, `PHASE_CHANGED`, `USER_MESSAGE_RECEIVED`, `TASK_COMPLETED`, `TASK_FAILED`, `TASK_CANCELLED`, `TASK_REJECTED`, `DISAGREEMENT_DETECTED`, `USER_DECISION_RECORDED`(17.3절).
+
+**72절의 `standard` 흐름이 넷을 더한다**: `PLAN_APPROVED`, `USER_VERIFICATION_APPROVED`(72.4절 —
+**둘 다 `NODE_MAY_NOT_EMIT`이다**), `PLAN_REVIEW_COMPLETED`, `RESULT_REVIEW_COMPLETED`(72.14절).
+그리고 에스컬레이션이 둘 더 필요하다: 실제로 부른 것과 **봉투를 넘어 거절된 요청**
+(72.10.2절 — 거절을 남기지 않으면 "요청이 없었다"와 구별되지 않고, 남발 계측이 셀 것을 잃는다).
+`NODE_MAY_NOT_EMIT`의 구현은 `apps/desktop/src-tauri/core/src/host.rs`에 있고
+`packages/toolchain/test/rustOnlyEvents.test.ts`가 지킨다 — 72.15절 목록에 있다.
 
 공급자 호출의 생애주기는 세 이벤트로 남는다: `PROVIDER_CALL_STARTED`(adapter 호출 **직전**),
 `PROVIDER_USAGE`(usage를 받은 성공), `PROVIDER_CALL_FAILED`(실패 + 어댑터가 아는 dispatch 사실).
@@ -1452,8 +1462,12 @@ multi-engine-routing.md 6절과 같은 결론이다. 바뀌는 것은 **`DRAFTIN
 > 맞다. 그러나 72절이 `standard` 흐름을 재설계하며 **phase 다섯이 늘었고**, 아래 표의
 > `DRAFTING`·`REVIEWING` 행은 `standard`에서 그 경로를 타지 않는다. **대조가 일어나는 자리도
 > `DRAFTING`에서 `OUTLINING`으로 옮겨갔다**(72.9절) — "executor N회"가 "계획자 N회"가 된다.
-> `AWAITING_USER_INPUT`을 blocking 불일치의 진입 사유로 넓힌 것은 그대로 유효하고, 계획 대조의
-> 불일치 카드가 그 자리를 쓴다(72.11절).
+> `AWAITING_USER_INPUT`을 blocking 불일치의 진입 사유로 넓힌 것은 **초안 경로(`DRAFTING`)에
+> 한정해서** 유효하다. 계획 대조의 불일치는 **이 phase를 쓰지 않는다** — 카드가 계획 승인
+> 게이트에 붙는다(72.9·72.11절). **이 문장은 한때 "그 자리를 쓴다"고 적혀 있었고, 그때는
+> 맞았다**: 별도 정지를 두는 설계였다. 72.9절이 그 정지를 없애면서 뒤집혔는데 이 자리가
+> 같이 고쳐지지 않았다 — 고치지 않으면 다음 사람이 2.1절 표에 없는 전이
+> (`OUTLINING → AWAITING_USER_INPUT`)를 만들게 된다.
 
 | Phase | 기존 | 변경 후 |
 |---|---|---|
@@ -8526,6 +8540,11 @@ PlanSubtask = { intent, files, proposedGrade }
 **병렬 검토는 선택지가 아니다.** 승인 대기 중에 검토를 미리 돌리면 그건 곧 사용자에게 고를
 기회를 주지 않는 것이다. 지연을 아끼려다 선택권을 없애는 교환은 하지 않는다.
 
+**기본값을 두지 않는 이유는 `autoApproveVerification`과 같다** — *"프로젝트가 선언했다"*는 것이
+안전의 근거이지 사용자가 그렇게 하기로 정했다는 뜻은 아니다. 여기서는 "우리가 권한다"가
+사용자가 골랐다는 뜻이 아니다. **이 문단은 한때 아래 비용 카드 명세 뒤에 있었는데**, 그러면
+"비용 카드의 기본값" 이야기로 읽힌다 — 받는 대상이 이 표다.
+
 #### 카드가 **무엇을 보여주는가** — 이 명세가 비어 있었다
 
 *"사용자가 비용을 보고 승인한다"*는 이 절 전체와 product-strategy 13.0.2의 뒤집기를 떠받치는
@@ -8541,6 +8560,8 @@ PlanSubtask = { intent, files, proposedGrade }
 | **에스컬레이션이 결과 검토(C)를 드롭시킬 수 있다는 사실** | 72.10.2절. 비용만 보여주고 이 대가를 감추면 승인이 반쪽이다 |
 | 계획자가 `unmeasured` 등급이면 **그 사실** | multi-engine 21.6절 |
 | **고른 `EffortLevel`** — 그리고 그것이 금액을 **얼마나** 늘리는지는 모른다는 것 | 72.9절 |
+| 배정된 모델 중 **effort를 무시하는 것이 있으면 그 사실** | 72.9절·multi-engine 21.4절이 요구한 공개. 모델과 등급을 보여주는 화면이 여기이므로 자리도 여기다 |
+| **봉투를 넘는 요청은 거절되며 중간에 늘릴 수 없다는 것** | 72.10.2절. 이 문장이 없으면 사용자는 나중에 물어볼 기회가 있다고 읽는다 |
 | 검토 생략을 골랐을 때 **그 기록이 체크리스트에 남는다는 것** | 위 표 |
 
 #### 추정을 실측처럼 보여주지 않는다
@@ -8566,9 +8587,16 @@ effort는 **방향만 아는 입력**이라는 점에서 나머지와 다르다.
 **그래서 카드의 금액은 하나가 아니라 셋이다**: 계량 과금분(추정), 포함된 용량분(환산 불가),
 그리고 에스컬레이션 봉투(상한). 하나로 합치면 셋 중 어느 것도 정확히 말하지 못한다.
 
-기본값을 두지 않는 이유는 `autoApproveVerification`과 같다 — **"프로젝트가 선언했다"는 것이
-안전의 근거이지 사용자가 그렇게 하기로 정했다는 뜻은 아니다.** 여기서는 "우리가 권한다"가
-사용자가 골랐다는 뜻이 아니다.
+#### 이것은 product-strategy 8.6절이 금지한 "두 번째 승인 모달"이 아니다
+
+그 절은 *"Arena 전용 승인 모달을 만들지 않는다 — 만들면 승인이 둘이 되고, 모달에서 승인한
+금액과 실제 예약 합계가 갈리는 순간 그 모달은 보장이 아니라 장식이다"*라고 못박았다. 겹쳐
+보이므로 구별을 적어 둔다.
+
+**금지된 것은 비용 전용 승인 자리를 하나 더 만드는 것이다.** 여기서 하는 일은 반대다 —
+**이미 있는 유일한 계획 게이트**에 금액을 싣는다. 그리고 그 절이 걱정한 "승인한 금액과 실제
+예약이 갈리는 것"은 72.12절이 **예약을 이 승인에 묶어서** 구조적으로 막는다. 즉 그 절의
+목적이 여기서 더 잘 지켜지고, 금지한 형태는 여전히 만들지 않는다.
 
 #### 두 승인 이벤트는 `NODE_MAY_NOT_EMIT`이다
 
@@ -8648,9 +8676,15 @@ effort는 **방향만 아는 입력**이라는 점에서 나머지와 다르다.
 | 검증 출력 (신규 실패 / 원래 실패 구분) | 앞 단계 모델의 이름·공급자 |
 | `AcceptanceCriterion` 목록 | |
 
-product-strategy 4.1절 실측이 blind를 철회한 근거는 **수리 행동을 억제했기 때문**인데,
-C는 수리하지 않으므로 그 대가가 발생하지 않는다. 숨기는 것은 모델의 산문이고 보여주는 것은 사용자가 승인한 것이다 —
-성질이 다르다.
+product-strategy 4.1절 실측이 blind를 철회한 근거는 **②"정보를 숨긴 대가"** 였다 — blind는
+세 케이스를 전부 REJECT하고 **아무것도 만들지 않은** 반면 informed는 지적한 뒤 고쳐서
+통과시켰다. C는 **수리하지 않으므로 그 대가가 발생하지 않는다.** 숨기는 것은 모델의 산문이고
+보여주는 것은 사용자가 승인한 것이다 — 성질이 다르다.
+
+(초안은 이 근거를 *"수리 행동을 억제했기 때문"*이라고 적었는데, **그 표현은 4.1절이 스스로
+무효화한 문단의 것이다** — 첫 실행에서 blind에만 *"judge only whether…"*라고 쓴 **프롬프트
+불일치**를 가리키는 말이고, 프레이밍을 맞추자 그 차이는 사라졌다. 결론은 ②로 그대로
+지탱되지만, **폐기된 관측을 근거로 인용하면 다음 사람이 그 위에 쌓는다.**)
 
 **`ReviewMode`에 세 번째 값을 얹지 않는다.** 그 타입은 "초안 검수자가 초안 저자의 설명을
 보는가"를 뜻하는데 C는 검수 대상 자체가 다르다. 별도 축으로 둔다.
@@ -8742,10 +8776,16 @@ EffortLevel        : 그 모델이 얼마나 하는가 (같은 모델, 추론 �
 
 #### 어디에 실리는가 — 태스크 하나에 값 하나
 
-역할별로 나누지 않는다(계획자만 `high` 같은 것을 두지 않는다). 나누면 사용자가 고를 것이
-넷이 되고, 그중 셋(B·C·구현자)은 **애초에 사용자가 고르지 못하게 한 자리**다(72.10.3절 표:
-고르게 하면 같게 만들 수 있고 그 순간 독립성이 착시가 된다). 효과가 확인되면 그때 역할별로
-쪼갤 수 있고, 지금 쪼개면 되돌리기가 더 비싸다.
+역할별로 나누지 않는다(계획자만 `high` 같은 것을 두지 않는다). **근거는 "그 자리들을
+사용자가 못 고르니까"가 아니다** — 이 절의 초안이 그렇게 적었는데 **틀렸다.** 검수자는
+지정할 수 있고(multi-engine 15.1절), 독립성을 깨는 지정은 막히는 것이 아니라 **역할 드롭으로
+귀결된다**(15.2절). 지정할 수 없는 것은 **대조용 두 번째 하나뿐**이고(15.3절), 구현 모델은
+`modelPins.executor`로 이미 지정된다 — 그 필드는 지금 코드에 있다.
+
+진짜 근거는 더 단순하다. **축 하나를 넷으로 쪼개는 값어치를 우리가 모른다.** 역할별 effort가
+결과를 바꾸는지는 재지 않았고(72.16절), 축은 늘리기보다 줄이기가 비싸다 — 13.4.2절이
+`complexityTier`를 넷으로 늘리는 것을 거부한 것과 같은 자리다. 다만 그 절과 다른 점이 있다:
+**여기서 미루는 것은 축 자체가 아니라 축의 분해능**이다. 효과가 확인되면 그때 쪼갠다.
 
 **기본값은 `medium`이다.** `balanced`를 기본으로 고른 것과 같은 이유다 — 항등에 가장 가까운
 값이고, 기본값 공백과 동작이 같더라도 **적어 두어야 나중에 누가 바꿀 때 그것이 변경인지
@@ -8906,7 +8946,18 @@ Anthropic 단독 / 교차검증 informed / blind였고, executor를 둘 부른 a
 ```
 1순위: PerformanceProfile이 clamp한 등급 (72.10절)
 2순위: 같은 등급 안에서 — 포함된 용량 > 계량 과금
+        단, CLI 경로는 사용자가 그 CLI를 켠 경우에만 후보에 든다
 ```
+
+**그 단서가 없으면 이 규칙이 21.7절을 무효로 만든다.** `accounting: "subscription"`은 정의상
+CLI 경로뿐이므로(21.4절), 단서 없는 2순위는 **동점이 생기는 순간 CLI를 기본으로 앉힌다** —
+21.7절이 *"기본 경로가 아니다. 각 사 약관이 허용하는지 불확실하고 그 리스크는 사용자가
+진다"*고 적은 바로 그 경로를, 사용자에게 묻지 않고 라우터가 고르게 된다. 켜지 않았으면
+동점은 계량 과금 쪽으로 간다.
+
+**부수 효과 하나가 더 있다.** 이 tie-break가 먹을수록 카드의 금액이 "환산 불가" 쪽으로
+넘어가는데, *"사용자가 비용을 보고 승인한다"*가 product-strategy 13.0.2 뒤집기의 근거이므로
+그 근거가 옅어진다. 옵트인이면 **사용자가 그 교환을 알고 고른 것**이 되어 근거가 유지된다.
 
 **순서를 뒤집지 않는 것이 핵심이다.** 뒤집으면 "포함되어 있다"가 "쓸 만하다"로 번지고, 그건
 21.4절이 `unmeasured`를 `economy`로 접지 않은 것과 같은 종류의 오류다 — **가격에 대한 사실을
@@ -8940,15 +8991,45 @@ frontier를 부를 수 있으면 승인 카드의 금액이 **승인 직후부�
 |---|---|---|
 | **요청** | 구현 모델 | `escalationRequest { reason, proposedGrade }`를 산출물에 싣는다. **실행되지 않는다** — `mcpCalls`가 요청이고 실행은 게이트가 정하는 것과 같은 모양이다(31절) |
 | **허락** | **계획 승인 카드** | `escalationAllowance { maxCalls, grade, budgetUsd }`를 계획과 **함께** 승인한다 |
-| **판정** | 오케스트레이터 | 요청이 봉투 안이면 부르고, 넘으면 `AWAITING_PLAN_APPROVAL`로 올린다 |
+| **판정** | 오케스트레이터 | 요청이 봉투 안이면 부르고, **넘으면 거절한다**(아래) |
 
 **봉투를 미리 승인하는 것이 핵심이다.** 그래야 "계획을 승인한 금액"이 상한으로서 참이 되고,
 동시에 계획이 못 내다본 자리에서 흐름이 멈추지 않는다. 사용자가 보는 것은
 *"이 계획은 $X이고, 예상 못 한 자리에서 최대 N회·$Y까지 더 쓸 수 있습니다"*이며,
 **둘 다 승인의 대상**이다.
 
-`maxCalls`가 상한이다(원칙 5). 봉투를 다 쓰면 다음 요청은 사용자에게 올라간다 —
-**막다른 길이 아니라 되묻는 자리**다.
+#### 봉투를 다 쓰면 **거절한다** — 중간에 다시 묻지 않는다
+
+이 절의 초안은 *"봉투를 다 쓰면 다음 요청은 사용자에게 올라간다 — 막다른 길이 아니라 되묻는
+자리다"*라고 적고, 그 자리를 `AWAITING_PLAN_APPROVAL`로 두었다. **셋이 동시에 깨진다.**
+
+**① 원칙 5.** 그 자리에서 새 봉투를 받을 수 있으면 `구현 → 초과 요청 → 승인 → 구현`이
+**어떤 카운터도 세지 않는 고리**가 된다. `planRounds`는 계획을 고칠 때만 오르고(72.11절),
+`maxCalls`는 봉투 **하나**를 막을 뿐이라 봉투를 계속 새로 열면 상한이 상한이 아니다.
+
+**② 72.12절의 예약 해제 근거.** 승인으로 되돌아갈 때 연 예약을 닫아도 되는 이유가
+*"그 사이에 구현이 돌지 않았다"*인데, 이 경로에서는 **이미 돌았다.** 그대로 두면 그 절이
+스스로 경계한 실패("이미 쓴 것을 해제")가 정확히 일어난다.
+
+**③ 진행바가 뒤로 간다.** 72.2.3절이 "같은 칸을 두 번 지나면 사용자는 되돌아간 것으로
+읽는다"고 금지한 현상이 `실행 → 계획 승인`으로 일어난다.
+
+그래서 **`maxCalls`가 진짜 상한이다.** 카운터 이름은 `escalationCalls`이고 2.2절과 72.11절
+상한 표에 들어간다. 초과 요청은 그 자리에서 거절되고, 서브태스크는 원래 배정된 등급으로 계속
+간다. **거절도 이벤트로 남는다** — 남기지 않으면 "요청이 없었다"와 구별되지 않고, 아래
+남발 계측이 셀 것을 잃는다.
+
+**막다른 길이 아닌 이유는 되묻는 자리가 뒤에 있기 때문이다.** 등급이 모자랐다면 결정론적
+검증이 잡고(원칙 1), 잡지 못한 것은 **검증 체크리스트**가 사용자 앞에 놓는다 — 거기에
+되돌아가는 경로 셋이 이미 있다(72.8절). 즉 되묻는 자리를 **구현 한복판이 아니라 게이트로**
+미룬 것이고, 그 게이트는 이미 존재하므로 새 정지도 새 phase도 늘지 않는다.
+
+**대신 봉투를 처음부터 넉넉히 정하는 것이 사용자의 몫이 된다.** 그 대가를 승인 카드가 적어야
+한다 — *"봉투를 넘는 요청은 거절되며, 중간에 늘릴 수 없습니다."* 이 문장이 없으면 사용자는
+나중에 물어볼 기회가 있다고 읽는다.
+
+`maxCalls`는 2.2절 루프 상한 표에 들어가고 `TaskPolicy`에서 읽는다 — **하드코딩하지 않는다**는
+그 절의 규칙이 이 값에도 그대로 걸린다.
 
 #### 에스컬레이션 모델은 **구현자 집합에 든다**
 
@@ -8978,9 +9059,20 @@ frontier를 부를 수 있으면 승인 카드의 금액이 **승인 직후부�
 |---|---|---|---|
 | **역할 분담** | Devin의 `Lead`(frontier) / `Sidekick`(cost-efficient) | A(계획, frontier) / 구현(등급별) | **같다.** 이름만 다르다 |
 | **다른 풀로 넘기기** | Cursor: 메인이 런타임에 다른 풀의 모델을 부른다 | 요청은 모델, 허락은 승인 카드 | 모델이 예산을 늘릴 수 있으면 승인이 거짓이 된다(위) |
-| **사용자가 고르는 슬롯** | Devin: `Lead`·`Sidekick` 둘 | 계획자와 **구현 등급** 둘. **B·C는 고를 수 없다** | 15.3절이 co-executor에 대해 정한 그대로 — 고르게 하면 같게 만들 수 있고, 그 순간 독립성이 착시가 된다 |
+| **사용자가 고르는 슬롯** | Devin: `Lead`·`Sidekick` 둘 | 계획자와 **구현 등급** 둘. B·C도 **지정할 수는 있다** | 지정 불가는 **대조용 두 번째 하나뿐**이다(multi-engine 15.3절 — 고르게 하면 같게 만들 수 있고 그 순간 독립성이 착시가 된다). 검수자 지정은 허용되고, 독립성을 깨면 **역할이 드롭된다**(15.2절) |
 | **비용 표시** | Devin: 단가(input/cached/output)와 "effort가 비용을 늘린다" | **이 계획의 예상 금액**(72.4절) | 우리는 계획이 나온 뒤라 개수와 등급을 안다. 단가보다 구체적일 수 있고, 그래서 **추정임을 더 분명히** 말해야 한다 |
 | **effort 축** | Devin: 슬라이더로 노출 | **같이 노출한다** — 72.9절의 네 번째 축 | 아래 |
+
+**이 표의 "그쪽" 칸은 확인하지 않은 사실이다.** Devin의 `Lead`/`Sidekick`, 단가 표시, effort
+슬라이더, Cursor의 런타임 풀 전환 — 전부 화면을 보고 적은 인상이며 저장소 안에 근거도 확인
+날짜도 없다. product-strategy 10절이 경쟁사 기능 주장에 대해 **실제 제품 확인 뒤에 적으라**고
+정했으므로 같은 규칙이 걸린다.
+
+**그러나 우리 쪽 결정은 그 인상 위에 서 있지 않다.** 요청과 허락을 나눈 근거는 "Cursor가
+그렇게 한다"가 아니라 *"모델이 예산을 늘릴 수 있으면 승인이 거짓이 된다"*이고, 그 문장은
+우리 승인 게이트의 성질에서 나온다. 저 칸이 틀린 것으로 밝혀지면 **비교가 지워질 뿐 결정은
+남는다.** 비교를 적어 두는 이유는 "왜 저쪽처럼 안 했나"에 답하기 위해서이지 근거로 쓰기
+위해서가 아니다.
 
 **우리 쪽에만 있는 것이 이 표의 요점이다.** 저 둘에는 결정론적 검증도, 승인 게이트도, 배정
 기록도 없다. 그래서 같은 기능이 우리에게서는 **"모델이 고르고 사용자가 확인한다"가 아니라
@@ -9011,6 +9103,7 @@ effort에만 요구한 것이 일관되지 않았다.
 | `maxSubtasks` | **8** | 계획이 만들 수 있는 서브태스크 수 |
 | `fixLoopRounds` | 3 (기존값) | **`FIX_LOOP` 진입 횟수 — 태스크 하나에 대해 센다.** 값은 그대로이고 **증가 지점만** 바뀐다 |
 | `planRounds` | **2** | 계획을 다시 세우는 횟수 — **계획으로 돌아오는 경로 셋이 같은 카운터를 쓴다** |
+| `escalationCalls` | 승인 카드의 `maxCalls` | 런타임 에스컬레이션 호출 수(72.10.2절). **값을 여기 적지 않는 유일한 줄**이다 — 사용자가 봉투를 정하므로 제품이 고르는 기본 상한이 아니다. 그래도 `TaskPolicy`가 **천장**은 갖는다: 봉투가 무제한이면 상한이 아니다 |
 
 #### 서브태스크별 `FIX_LOOP`는 없다 — 그래서 상한도 하나다
 
@@ -9054,6 +9147,17 @@ effort에만 요구한 것이 일관되지 않았다.
 
 **어느 쪽도 막다른 길이 아니라는 것이 조건이다.** 상한은 반복을 끊으려는 것이지 태스크를
 가두려는 것이 아니고, 가두면 사용자는 강제 포기 말고 할 수 있는 일이 없어진다.
+
+##### 새 phase 다섯에서도 **취소는 된다** — 한 줄로 적어 둔다
+
+2절 대체 경로 표기가 "취소·중단·터미널 구조는 그대로다"라고 적었지만, 그 절의 다이어그램은
+취소 간선을 **phase마다 열거하는 모양**이라 새 다섯이 거기 없다. 16.1절의
+*"취소 가능한 모든 phase에서 들어온다"*가 덮어주기는 한다.
+
+그래도 명시하는 이유는 72.12절이 **두 사용자 게이트를 타임아웃 없이 기다리게** 만들었기
+때문이다. 무한히 기다리는 자리에서 **취소가 유일한 탈출구**이고, 유일한 탈출구가 "덮어주는
+문장"에만 의존하면 안 된다. `AWAITING_PLAN_APPROVAL`·`AWAITING_USER_VERIFICATION`을 포함한
+새 다섯 전부에서 `CANCELLING`으로 간다.
 
 **계획 대조의 불일치는 별도 경로가 아니다.** 72.9절대로 그 카드는 승인 카드에 붙고, 사용자가
 계획을 고쳐야 한다고 판단하면 **경로 1로 들어온다.** 앞선 초안은 이것을 넷째 경로로 적었는데,
@@ -9212,19 +9316,25 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | multi-engine 10절 | "planner/executor 분리 실행" 미채택 | 취소선 |
 | multi-engine 13.4절 | 호출 수 표, 대조의 대상 | 취소선 + 전후 대조 |
 | [ui-wireframes 2절](./ui-wireframes.md) | 5단계 매핑이 `standard`를 못 덮음 | 주석 + 정본 이관 |
-| ui-wireframes 3절 화면 인벤토리 | 계획 승인·검증 체크리스트 화면이 목록에 없다 | **아직 안 함** — 화면을 그릴 때 함께 |
+| ui-wireframes 3절 화면 인벤토리 | 계획 승인·검증 체크리스트 화면, 그리고 **`PerformanceProfile`·`EffortLevel`을 고르는 자리**(시작 화면의 실행 정책 옆)가 목록에 없다 | **아직 안 함** — 화면을 그릴 때 함께 |
 | [product-strategy 8.2절](./product-strategy.md) Autopilot 행 | 72.12절이 "제품 설명이 그렇게 바뀌어야 한다"고 적었다 | **아직 안 함** — 마커가 붙는 행이라 구현 뒤에 |
 | product-strategy 5절 `public API 변경` 항목 | "Tree-sitter가 아직 없고" | 취소선 + 후속 링크 |
 | `packages/sidecar/src/triage.ts` 주석 | 같은 문장이 코드에 남아 있었다 | **고쳤다**(문서만 고치면 다음 사람은 주석을 읽는다) |
 | [product-strategy 13.0.1·13.0.2](./product-strategy.md) | 게이트 결론 인용문, 보류 두 항목 | 취소선 + 근거 |
 | multi-engine 21.4절 레지스트리 키 | `modelId` 단일 키 → **경로 키**(같은 모델에 HTTP·CLI 둘) | 21.7절에 근거, 21.4절에 규칙 |
 | multi-engine 10.5절 출력 토큰 상한 | 상한 계산의 입력에 `EffortLevel`이 들어간다 | **아직 안 함** — 21.4절이 요구만 적었다 |
-| multi-engine 14절 적합성 스위트 | effort 파라미터 수용 + **추론 토큰 보고** 두 항목 추가 | 21.4절에 근거 |
+| multi-engine 14절 적합성 스위트 | effort 파라미터 수용 + **추론 토큰 보고** 두 항목 | **아직 안 함** — 21.4절이 요구만 적었다 |
+| multi-engine 15.3절 co-executor 지정 금지 | 대조가 계획으로 옮겨가 **co-planner**에 걸린다 | 취소선 + 대상 교체 |
+| [product-strategy 8.6절](./product-strategy.md) 호출 수 | "실행자 2 + 검수자 1 = 3"과 "verified는 실행자를 하나 더 부른다" | 취소선 + 근거 |
+| [ui-wireframes 3.11절](./ui-wireframes.md) | 같은 문장이 화면 쪽에도 있었다 | 취소선 + 근거 |
 
 **아직 바꾸지 않았고, 구현 시점에 반드시 함께 바꿔야 하는 것:**
 
 - `packages/protocol/src/task.ts`의 `ExecutionMode` 주석 — *"verified: TRIAGE 결과와 무관하게
-  항상 standard"*. **지금은 그 주석이 코드를 정확히 설명한다**(구현이 아직 그렇게 동작한다).
+  항상 standard"*, 그리고 **같은 주석의 뒷부분** *"대조(executor ×2)는 이 축이 정한다 … tier는
+  교차검증을, 이 축은 대조를 켠다"*. **72.9절은 둘 다 뒤집는다** — 앞은 "모드가 tier를 정하지
+  않는다", 뒤는 "둘이 되는 것이 executor가 아니라 계획자"다. 앞만 고치면 뒷문장이 남아 옛
+  설계를 계속 말한다. **지금은 그 주석이 코드를 정확히 설명한다**(구현이 아직 그렇게 동작한다).
   72.9절을 구현하는 순간 거짓이 되므로 같은 커밋에서 고쳐야 한다. product-strategy 4.2절이
   **문서만 고치고 코드에 남은 예고를 지우지 않아 다음 사람이 문서가 아니라 그 주석을 읽게 된**
   사례를 이미 기록했다.
@@ -9241,8 +9351,9 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   파급을 보고 정한다.**
   **(b)** `ModelEntry`의 키가 `modelId`라서 같은 모델의 HTTP 경로와 CLI 경로를 **동시에 적을
   수 없다**(multi-engine 21.4·21.7절). `apiBaseUrl: string` 필수도 같은 자리에서 걸린다.
-  **(c)** `grade`·`accounting`·`transport`·`cliVendor`·effort 매핑·경로상 관할 목록이 전부
-  없는 축이다.
+  **(c)** `grade`·`accounting`·`transport`·`cliVendor`·effort 매핑·경로상 관할 목록·
+  `gradeInheritedFrom`(CLI 경로가 어느 HTTP 경로의 등급을 물려받았는지 — 21.7절이 "가정 위에
+  선다는 사실이 화면에 있어야 한다"고 정했는데 그 사실을 실을 필드가 없다)이 전부 없는 축이다.
   **(b)는 (a)보다 파급이 넓다** — 키가 바뀌면 레지스트리를 조회하는 모든 자리가 바뀌므로,
   둘을 한 커밋에 섞으면 독립성 타입 변경이 키 변경의 노이즈에 묻힌다.
 - `packages/protocol/src/task.ts` — `PerformanceProfile`과 `EffortLevel`이 **아직 타입에
@@ -9264,6 +9375,34 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   없다. **시그니처를 바꾸면 이 호출자가 넘길 값이 없다.** 구성원 상태에 그 둘을 싣거나 화면이
   다른 표시를 쓰도록 정해야 하며, **둘 중 어느 쪽인지는 정하지 않았다** — Fleet 화면이 구성원별
   진행 단계를 얼마나 자세히 보여야 하는지가 먼저 정해져야 하는 질문이다.
+- **`apps/desktop/src/lib/callPlan.ts`와 `apps/desktop/test/callPlan.test.ts`** —
+  `planFor("verified")`가 `{ perRoundMax: 3, parts: ["실행자 2 (대조)", "검수자 1"] }`를 내고,
+  테스트 이름이 *"verified는 실행자를 둘 부른다"*로 **옛 계약을 초록색으로 지키고 있다.**
+  `fast`의 2도 같이 틀린다 — `fast`인데 TRIAGE가 `standard`로 분류하면 `REVIEWING`이 아니라
+  72절 흐름 전체가 돈다. `orchestrator.ts`의 문자열과 **같은 실패 모드이고 더 나쁘다**:
+  이 숫자는 사용자에게 보여주는 비용 설명이라, 그 파일 머리말이 적은 대로 *"청구서에서 처음
+  알게 되는 종류의 실패"*다. 그리고 테스트가 옛 계약을 지키므로 **구현자는 이 수정을 회귀로
+  읽게 된다** — 커밋 메시지가 그 사실을 적어야 한다.
+- **`packages/protocol/src/events.ts`의 `TaskEventType`과
+  `apps/desktop/src-tauri/core/src/host.rs`의 `NODE_MAY_NOT_EMIT`** — 새 이벤트 여섯(위 7절
+  목록)이 둘 다에 없다. 그중 `PLAN_APPROVED`·`USER_VERIFICATION_APPROVED`는 **`NODE_MAY_NOT_EMIT`에
+  들어가야 하고**(72.4절), 빠지면 장악당한 sidecar가 자기 계획을 스스로 승인한다 — 72.12절이
+  예산 예약을 그 승인에 묶은 뒤로는 **구멍 하나가 둘을 뚫는다.**
+  `packages/toolchain/test/rustOnlyEvents.test.ts`가 함께 움직인다.
+- **`packages/protocol/src/task.ts`의 `TaskLoopLimits`·`DEFAULT_LOOP_LIMITS`·`TaskCounters`** —
+  `planRounds`·`maxSubtasks`·`escalationCalls`가 없다. 그 타입 주석이 *"state-machine 2.2절 —
+  모든 루프 상한은 여기서 읽는다. CLAUDE.md 원칙 5"*라고 적으므로, 빠지면 **원칙 5가 요구하는
+  "하드코딩하지 않는다"가 새 상한 셋에 대해서만 깨진다.**
+- **`packages/protocol/src/proposal.ts`·`validate.ts`·`decision.ts`** — `PlanOutline`에
+  `doneCriteria`·`requiredTests`·`subtasks`와 새 `PlanSubtask` 타입(72.2.1·72.2.2),
+  `standard`에서 빈 `subtasks`를 **실패로** 다루는 검증(72.2.2), `AcceptanceCriterion.source`에
+  `plan_outline`(72.2.1).
+- **`apps/desktop/src-tauri/core/src/store.rs`** — `ORDER BY (source = 'user_decision') DESC`가
+  두 곳에 있고 72.2.1절이 그 SQL을 직접 인용하며 교체를 요구한다. source enum 주석도 같다.
+- **`packages/protocol/src/task.ts`의 `modelPins` 주석** — *"지정 가능한 것은 primary executor와
+  reviewer뿐"*이 **co-executor 기준으로만** 적혀 있다. 대조가 계획으로 옮겨갔으므로 금지 대상이
+  co-planner가 된다(multi-engine 15.3절). 필드 모양이 바뀌는지(계획자 자리 지정)는
+  `RoleAssignment` 변경과 함께 정한다.
 - product-strategy 3절 자기 진단 표와 8.2절 출시 기준 표 — 마커(`<!-- present: -->`)가 붙는
   행들이라 **파일이 생긴 뒤에** 고친다. 지금 고치면 `docStatus.test.ts`가 없는 파일을 가리켜
   실패한다.
