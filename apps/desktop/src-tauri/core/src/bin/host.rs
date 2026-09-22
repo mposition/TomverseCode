@@ -1480,6 +1480,7 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
             store,
             artifacts,
             approvals,
+            gates,
             sink,
             skill,
             policy_for_task,
@@ -2155,6 +2156,7 @@ fn run_fleet(
     store: Arc<Mutex<Store>>,
     artifacts: ArtifactStore,
     approvals: Arc<dyn ApprovalGateway>,
+    gates: Arc<dyn tomverse_core::types::UserGateway>,
     sink: Arc<dyn EventSink>,
     skill: Option<tomverse_core::skills::Skill>,
     policy: TaskPolicy,
@@ -2280,6 +2282,7 @@ fn run_fleet(
                         &store,
                         &artifacts,
                         &approvals,
+                        &gates,
                         &sink,
                         &cancels,
                         skill.clone(),
@@ -2379,7 +2382,7 @@ fn run_fleet(
             // 있는 것은 계획 한 번 값뿐이 된다.
             MemberSignal::PlanApproved(approved) => {
                 let index = approved.index;
-                if let ImplementationStage::Staged { held_usd, freed_usd, priced } = budget
+                if let ImplementationStage::Staged { held_usd, card_usd, priced } = budget
                     .reserve_implementation(index, approved.estimated_cost_usd, approved.priced)
                 {
                     if let Some(member) = running.get(&index) {
@@ -2393,7 +2396,7 @@ fn run_fleet(
                                 "branch": member.branch,
                                 "memberIndex": index + 1,
                                 "heldUsd": held_usd,
-                                "freedUsd": freed_usd,
+                                "cardUsd": card_usd,
                                 // **카드가 금액으로 말했는가.** 거짓이면 줄이지 않았고,
                                 // 그 사실이 없으면 "0이 열렸다"와 구별되지 않는다.
                                 "priced": priced,
@@ -2558,6 +2561,7 @@ fn start_member(
     store: &Arc<Mutex<Store>>,
     artifacts: &ArtifactStore,
     approvals: &Arc<dyn ApprovalGateway>,
+    gates: &Arc<dyn tomverse_core::types::UserGateway>,
     sink: &Arc<dyn EventSink>,
     cancels: &Arc<CancellationRegistry>,
     skill: Option<tomverse_core::skills::Skill>,
@@ -2645,7 +2649,11 @@ fn start_member(
         .with_isolation(isolation)
         // **승인 화면이 어느 트리의 것인지 말할 수 있어야 한다**(11.6①). 게이트는 이 값을
         // 보지 않는다 — 보게 되면 "Fleet일 때만 다른 규칙"이 생긴다.
-        .with_fleet_member(origin),
+        .with_fleet_member(origin)
+        // **구성원도 사용자 게이트 둘을 갖는다**(72.12절). 빠뜨리면 `standard`로 분류된
+        // 구성원이 전부 계획 승인 앞에서 `unattended_stop`으로 죽는다 — 물을 사람이
+        // 있는데도 없다고 말하는 상태고, 화면 쪽은 이미 붙여 있었으므로 **둘이 갈라져 있었다.**
+        .with_gates(gates.clone()),
     );
     host.begin_task(&task_id, policy, skill.as_ref())?;
     // **등록을 이벤트로 남긴다**(원칙 7). Fleet 단위 상태를 메모리에만 두면 크래시 후

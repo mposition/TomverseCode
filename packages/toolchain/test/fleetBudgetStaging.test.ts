@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
  *    문자열을 직접 찾지 않는다. 직접 찾기 시작하면 payload를 읽는 규칙(`unpricedAssignments`를
  *    "모르는 것"으로 다루는 것)이 두 벌이 되고, 둘 중 하나는 언젠가 덜 조심스러워진다.
  * 2. 두 루프 모두 `reserve_implementation`을 부른다 — 예약 산수를 자기 자리에서 하지 않는다.
+ *    (그 함수 자체는 **금액을 움직이지 않는다** — 아래 마지막 검사와 72.12.1절.)
  * 3. 어느 루프도 `PLANNING_SHARE`를 직접 쓰지 않는다. 쓰기 시작하면 비율이 상한의 뜻을
  *    정하게 되고, 그것이 이 분할의 첫 판이 실패한 이유다(`fleet.rs`의 머리말).
  *
@@ -117,11 +118,23 @@ test("상한 판정은 계획 몫이 아니라 태스크당 상한 전부를 본
   );
 });
 
-test("구현 예약은 거절하지 않는다 — 승인된 작업을 예산으로 멈추지 않기 때문이다(72.12절)", () => {
+test("승인은 예약을 움직이지 않는다 — 움직이면 합계 상한이 깨진다(72.12.1절)", () => {
+  // **독립 검토가 잡은 P0이 이 자리다.** 한때 여기서 구현 몫을 카드 금액으로 줄였고,
+  // 그러자 합계 $8 / 태스크당 $2에 여섯이 들어가 실제 지출이 $12까지 갈 수 있었다 —
+  // 합계 원장을 줄여도 구성원의 `TaskBudget` 상한은 태스크당 상한 그대로이기 때문이다.
+  //
+  // 숫자 불변식은 `fleet.rs`의 단위 테스트가 지킨다. 여기서 지키는 것은 **그 함수가 다시
+  // 금액을 쓰는 함수가 되지 않는 것**이다 — 줄이는 코드는 한 줄이면 돌아온다.
   const source = read(FLEET_RS);
   const fn = source.slice(source.indexOf("pub fn reserve_implementation("));
-  const body = fn.slice(0, fn.indexOf("\n    }\n"));
-  // 거절 경로가 생기면 그 자리에 교착이 함께 생긴다(모두가 서로의 정산을 기다린다).
+  const body = codeOnly(fn.slice(0, fn.indexOf("\n    }\n")));
+  for (const forbidden of ["remainder_usd =", "planning_usd =", "committed_usd +="]) {
+    assert.ok(
+      !body.includes(forbidden),
+      `승인이 예약을 다시 움직입니다(${forbidden}) — 합계 상한이 깨집니다(72.12.1절)`
+    );
+  }
+  // 거절 경로가 생기면 그 자리에 교착도 함께 생긴다(모두가 서로의 정산을 기다린다).
   assert.ok(
     !body.includes("Refused"),
     "구현 예약이 거절할 수 있게 됐습니다 — 승인된 작업이 서고, 교착이 생깁니다"

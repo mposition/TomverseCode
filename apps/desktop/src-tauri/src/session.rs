@@ -1901,7 +1901,7 @@ impl SessionState {
                         let index = approved.index;
                         if let tomverse_core::fleet::ImplementationStage::Staged {
                             held_usd,
-                            freed_usd,
+                            card_usd,
                             priced,
                         } = budget.reserve_implementation(
                             index,
@@ -1926,7 +1926,7 @@ impl SessionState {
                                         "branch": branch,
                                         "memberIndex": index + 1,
                                         "heldUsd": held_usd,
-                                        "freedUsd": freed_usd,
+                                        "cardUsd": card_usd,
                                         // **카드가 금액으로 말했는가.** 거짓이면 줄이지 않았고,
                                         // 그 사실이 없으면 "0이 열렸다"와 구별되지 않는다.
                                         "priced": priced,

@@ -58,6 +58,8 @@ interface FleetRun {
       fleetCapUsd?: number;
       perTaskCapUsd?: number;
       capEnforced: boolean;
+      /** 사용자 게이트를 지나 구현 단계까지 간 구성원의 수 — 72.12.1절. **금액이 아니다.** */
+      stagedMembers: number;
     };
     verificationLane: { acquisitions: number; contended: number; totalWaitMs: number };
   };
@@ -73,6 +75,14 @@ interface FleetOptions {
   cancelFleetAfterMs?: number;
   cancelMemberAfterMs?: { branch: string; ms: number }[];
   timeoutSecs?: number;
+  /**
+   * 사용자 게이트 둘에 대한 응답(`--gate`). 생략하면 주지 않는다 — `fast` 경로는 게이트를
+   * 지나지 않으므로 값이 필요 없고, **필요 없는 자리에 기본값을 주면** 어느 테스트가 실제로
+   * 게이트를 태우는지 목록에서 읽을 수 없게 된다.
+   */
+  gate?: "approve" | "approve-skip-review" | "revise" | "reject";
+  /** 생략하면 `fast`. `standard` 경로를 태우려면 TRIAGE가 그렇게 분류할 메시지가 필요하다. */
+  mode?: "fast" | "verified";
 }
 
 function requireArtifacts(): void {
@@ -86,7 +96,7 @@ function fleetArgs(repo: FixtureRepo, stateDir: string, options: FleetOptions): 
     "--workspace",
     repo.root,
     "--mode",
-    "fast",
+    options.mode ?? "fast",
     "--approve",
     "auto",
     "--db",
@@ -98,6 +108,7 @@ function fleetArgs(repo: FixtureRepo, stateDir: string, options: FleetOptions): 
     "--timeout-secs",
     String(options.timeoutSecs ?? 180),
   ];
+  if (options.gate) args.push("--gate", options.gate);
   for (const member of options.members) args.push("--member", `${member.branch}=${member.message}`);
   if (options.fleetBudgetUsd !== undefined) args.push("--fleet-budget-usd", String(options.fleetBudgetUsd));
   else if ((options.budgetMode ?? "unlimited") === "unlimited") args.push("--fleet-budget-unlimited");
@@ -482,5 +493,63 @@ test("[Fleet] Fleet 단위 상태가 task_events에 남아 새 프로세스가 �
     assert.equal(typeof fleet.fleetCostUsd, "number");
     // **상한이 기록에 남는다.** 남기지 않으면 화면은 "상한이 없었다"와 "모른다"를 구별할 수 없다.
     assert.equal(fleet.capsRecorded, true);
+  });
+});
+
+
+// ---- ⑦ 합계 예약의 단계 분할: 승인이 다른 구성원의 자리를 연다 (72.12.1절) ----
+
+/**
+ * **이 경로는 승인을 실제로 지나야만 태워진다.** `fast`로 도는 나머지 Fleet 테스트는
+ * 사용자 게이트를 지나지 않으므로 `PLAN_APPROVED`가 없고, 따라서 분할도 일어나지 않는다.
+ *
+ * TRIAGE는 규칙이므로 메시지에 위험 키워드가 있으면 `standard`로 분류된다(`triage.ts`).
+ * 그래서 여기서는 모델을 다르게 부르는 것이 아니라 **같은 규칙에 다른 입력**을 준다.
+ *
+ * 무엇을 확인하는가: 감시(`PlanApprovalWatch`) → 스케줄러 신호 → `reserve_implementation`이
+ * **실제 바이너리에서** 이어져 있다는 것. 산수는 `fleet.rs`의 단위 테스트가 지킨다.
+ */
+test("[Fleet] 계획 승인이 합계 원장까지 닿는다 — 예약을 움직이지 않은 채로", () => {
+  withRepo((repo, stateDir) => {
+    const run = runFleet(repo, stateDir, {
+      // "보안"이 TRIAGE의 위험 키워드다 — 규칙이 이 메시지를 `standard`로 분류한다.
+      members: [{ branch: "fleet-gate", message: "paginate.js 의 오프바이원은 보안 문제입니다. 고쳐주세요." }],
+      mode: "verified",
+      gate: "approve",
+      fleetBudgetUsd: 5,
+      perTaskBudgetUsd: 2,
+    });
+
+    assert.equal(run.exitCode, 0, `Fleet이 완료되지 않았습니다:\n${run.stderr.slice(-6000)}`);
+
+    const events = hostQuery(stateDir, [
+      "show",
+      "--workspace",
+      repo.root,
+      "--task",
+      run.fleet.members[0]!.taskId,
+    ]) as { events?: { type: string; payload?: Record<string, unknown> }[] };
+    const types = (events.events ?? []).map((e) => e.type);
+
+    // 승인을 실제로 지났는가. 지나지 않았다면 아래 확인은 **빈 집합에 대해** 통과한다.
+    assert.ok(
+      types.includes("PLAN_APPROVED"),
+      `계획 승인을 지나지 않았습니다 — 이 테스트는 그 경로를 태우지 못했습니다: ${types.join(", ")}`
+    );
+
+    // 그리고 그 승인이 합계 원장까지 닿았다.
+    const staged = (events.events ?? []).find((e) => e.type === "FLEET_IMPLEMENTATION_RESERVED");
+    assert.ok(
+      staged,
+      `승인이 합계 예약에 닿지 않았습니다 — 감시나 신호가 끊겼습니다: ${types.join(", ")}`
+    );
+    // **`priced`가 없으면 "0달러다"와 "금액으로 말할 수 없다"가 구별되지 않는다.**
+    assert.equal(typeof staged.payload?.priced, "boolean", JSON.stringify(staged.payload));
+    // **잡은 금액은 태스크당 상한 그대로다**(72.12.1절). 줄었다면 합계 상한이 깨진 것이다 —
+    // 구성원은 여전히 자기 `TaskBudget`으로 태스크당 상한까지 쓸 수 있기 때문이다.
+    assert.equal(staged.payload?.heldUsd, 2, JSON.stringify(staged.payload));
+
+    // 결과가 "몇이 구현까지 갔는가"를 말한다 — 금액이 아니다.
+    assert.equal(run.fleet.totals.stagedMembers, 1, JSON.stringify(run.fleet.totals));
   });
 });
