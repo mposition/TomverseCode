@@ -36,8 +36,13 @@ status: draft
 >
 > **② 그래서 순서를 빌리지 않고 자기 순서를 갖는다.** 질문 경로(`QUESTION_STAGE_ORDER`)와
 > 계획 경로(`PLAN_STAGE_ORDER`)가 각각 그렇게 한 것과 같다. `standard` 경로의 단계 순서와
-> phase 매핑의 정본은 **state-machine 72.2.1절**이며, 여기 표는 `simple` 경로와 공통 골격의
+> phase 매핑의 정본은 **state-machine 72.2.3절**이며, 여기 표는 `simple` 경로와 공통 골격의
 > 정본으로 남는다.
+>
+> **그 절이 `phaseToStage`의 시그니처도 바꾼다.** `AWAITING_APPROVAL`이 변경 경로에서는
+> `승인 대기`라는 칸이고 `standard`에서는 실행 구간 안에서 반복되는 상태라, **같은 phase가
+> 경로마다 다른 단계**가 된다 — `phase` 하나를 받는 순수 함수로 표현되지 않는다. 매핑을
+> 순서와 같은 자리에 둔다.
 >
 > 그 절이 함께 정한 것 둘: `AWAITING_USER_VERIFICATION`을 기존 `확인 필요`에 **접지 않는다**
 > (모델이 막혀서 묻는 것과 끝났으니 확인해 달라는 것은 다르다), 그리고 순서를 고르는 축이

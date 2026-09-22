@@ -94,8 +94,9 @@ stateDiagram-v2
 > - `DRAFTING`·`REVIEWING`은 **`standard`에서 진입하지 않는다.** phase와 타입은 지우지 않는다
 >   — 과거 태스크의 기록이 그 이름을 쓰고 있다(72.3절).
 > - 새 phase 다섯이 늘어난다: `AWAITING_PLAN_APPROVAL` · `PLAN_REVIEWING` · **`IMPLEMENTING`** ·
->   `RESULT_REVIEWING` · `AWAITING_USER_VERIFICATION`. `OUTLINING`/`OUTLINED`는 53절 것을
->   재사용하고(72.2절), **`PLANNING`·`AWAITING_APPROVAL`·`EXECUTING`은 뜻 그대로 쓴다**(72.2.2절).
+>   `RESULT_REVIEWING` · `AWAITING_USER_VERIFICATION`. **`OUTLINING`은 53절 것을 재사용하고**
+>   (72.2절) — `OUTLINED`는 계획 모드의 종착지라 `standard`는 지나지 않는다 —
+>   **`PLANNING`·`AWAITING_APPROVAL`·`EXECUTING`은 뜻 그대로 쓴다**(72.2.2절).
 > - 루프 상한 셋이 늘어난다 — 2.2절 표에 있다.
 >
 > **다이어그램을 한 장으로 합치지 않는 이유**: 두 경로를 한 그림에 넣으면 스무 개가 넘는
@@ -114,7 +115,7 @@ stateDiagram-v2
 | `REVIEWING` | 검수자 Provider | DraftProposal + 동일 Snapshot | ReviewDecision.verdict에 따라 4갈래 분기. **`standard` 경로에서 물러났다(72.3절)** — 그 일은 B·결정론적 검증·C가 나눠 가진다 |
 | `OUTLINING` | 계획자 Provider | Snapshot (53절 계획 모드 / 72절 standard 경로) | `PlanOutline` 수신 → 계획 모드면 `OUTLINED`(터미널), standard면 `AWAITING_PLAN_APPROVAL` |
 | `AWAITING_PLAN_APPROVAL` | UI | `PlanOutline` 확정 | 사용자 선택 넷(72.4절): 승인+검토 → PLAN_REVIEWING / 승인+검토생략 → **IMPLEMENTING** / 수정 요청 → OUTLINING(`planRounds++`) / 거부 → REJECTED |
-| `PLAN_REVIEWING` | 계획 검토자(B) | 승인된 `PlanOutline` | 쟁점 없음 → IMPLEMENTING, 쟁점 있음 → 불일치 카드 → 사용자 |
+| `PLAN_REVIEWING` | 계획 검토자(B) | 승인된 `PlanOutline` | 쟁점 없음 → IMPLEMENTING, 쟁점 있음 → **AWAITING_PLAN_APPROVAL**(승인의 근거가 바뀌었으므로 다시 묻는다, 72.11절) |
 | `IMPLEMENTING` | 구현 Provider (등급은 72.10절) | 서브태스크 하나 | `DraftProposal`(patch·moves·deletions) 수신 → PLANNING. 남은 서브태스크가 있으면 EXECUTING 뒤 다시 여기로, 없으면 VERIFYING (72.2.2절) |
 | `RESULT_REVIEWING` | 결과 검토자(C) | **`VERIFYING` 통과 후에만** | 계획 일치 판정 넷(72.7절)을 체크리스트로 → AWAITING_USER_VERIFICATION |
 | `AWAITING_USER_VERIFICATION` | UI | 체크리스트 생성 완료 | 승인 → 커밋 → COMPLETED / 거부 → 72.8절 귀환 경로 셋 중 사용자 선택 |
@@ -140,7 +141,13 @@ stateDiagram-v2
 | `maxSubtasks` | 계획이 서브태스크를 선언할 때 | 8 | 계획을 거부하고 사용자에게 쪼개 달라고 올린다 |
 | `fixLoopRoundsTotal` | `fixLoopRounds`와 **함께** 증가 | 12 | 서브태스크별 상한이 남아 있어도 태스크 전체를 FAILED로 |
 
-아래 셋은 72절의 `standard` 흐름에서만 쓰인다. `simple` 경로는 위 넷만 쓴다.
+아래 셋은 72절의 `standard` 흐름에서만 쓰인다.
+
+> **`reviseRounds`는 증가시키는 경로가 남지 않았다.** 그 카운터는 `REVISE` verdict에서 오르는데,
+> `SINGLE_MODEL_FIX`에는 `REVISE`가 없고(14.1절) `standard`에서는 `REVIEWING`이 물러났다(72.3절).
+> **지우지 않는다** — 과거 태스크의 `counters_json`에 그 값이 들어 있고, `REVIEWING`을 phase
+> 목록에 남겨 둔 것과 같은 이유다. 다만 **새 태스크에서는 언제나 0이므로**, 이 값이 0이 아닌
+> 것을 보면 그건 72절 이전의 기록이라는 뜻이다.
 
 모든 상한 값은 `TaskPolicy` 설정(워크스페이스별 override 가능)에서 읽는다. 하드코딩하지 않는다.
 
@@ -1434,6 +1441,13 @@ TRIAGE가 추가되면서 생긴 구멍: `SINGLE_MODEL_FIX`가 verdict 개념이
 ### 17.1 상태는 하나도 추가되지 않는다
 
 multi-engine-routing.md 6절과 같은 결론이다. 바뀌는 것은 **`DRAFTING`이 executor를 몇 번 부르는가**와 **`AWAITING_USER_INPUT`이 무엇 때문에 진입하는가** 둘뿐이다.
+
+> **대조 도입에 한정해서 참이었다(72절).** 대조 자체는 상태를 늘리지 않았고 그 말은 지금도
+> 맞다. 그러나 72절이 `standard` 흐름을 재설계하며 **phase 다섯이 늘었고**, 아래 표의
+> `DRAFTING`·`REVIEWING` 행은 `standard`에서 그 경로를 타지 않는다. **대조가 일어나는 자리도
+> `DRAFTING`에서 `OUTLINING`으로 옮겨갔다**(72.9절) — "executor N회"가 "계획자 N회"가 된다.
+> `AWAITING_USER_INPUT`을 blocking 불일치의 진입 사유로 넓힌 것은 그대로 유효하고, 계획 대조의
+> 불일치 카드가 그 자리를 쓴다(72.11절).
 
 | Phase | 기존 | 변경 후 |
 |---|---|---|
@@ -8190,8 +8204,9 @@ SNAPSHOTTING → TRIAGE
 갈릴 여지가 생기고, 그 순간 "모델 차이"와 "프롬프트 차이"가 섞인다 —
 multi-engine-routing 13.1절이 co-executor에 새 역할 이름을 주지 않은 것과 같은 이유다.
 
-새 phase는 넷이다: `AWAITING_PLAN_APPROVAL`, `PLAN_REVIEWING`, `RESULT_REVIEWING`,
-`AWAITING_USER_VERIFICATION`. **`PLANNING`과 `AWAITING_APPROVAL`을 재사용하지 않는다** —
+새 phase는 **다섯**이다: `AWAITING_PLAN_APPROVAL`, `PLAN_REVIEWING`, **`IMPLEMENTING`**(72.2.2절),
+`RESULT_REVIEWING`, `AWAITING_USER_VERIFICATION`. **`PLANNING`과 `AWAITING_APPROVAL`을 계획 승인
+게이트의 이름으로 재사용하지 않는다** —
 그 둘은 "patch를 도구 호출로 쪼개는" 단계와 "도구 실행 승인"이고, 여기 얹으면 한 이름이 두
 가지를 뜻하게 된다. 17.5절이 tier와 실행 모드를 뭉갠 대가를 이미 치렀다(비용 2배 결함).
 
@@ -8290,9 +8305,9 @@ AWAITING_APPROVAL / EXECUTING   기존 뜻 그대로
 두면 모델이 말을 바꾸는 것이 곧 실행을 바꾸는 것이 된다.** 서브태스크는 계획에서 **유도**되고,
 유도가 일어나는 시점은 사용자 승인 뒤다.
 
-#### 화면 단계는 **변경 경로의 순서를 빌리지 않는다**
+### 72.2.3 화면 단계는 **변경 경로의 순서를 빌리지 않는다**
 
-새 phase 넷은 `phaseToStage`(ui-wireframes 2절)에 자리가 없다. 그런데 기존 순서에 끼워 넣을
+새 phase 다섯은 `phaseToStage`(ui-wireframes 2절)에 자리가 없다. 그런데 기존 순서에 끼워 넣을
 수도 없다 — **같은 단계가 두 번 나타나기 때문**이다(승인이 둘, 검토가 둘). 단계 목록은 진행
 막대이므로 같은 칸을 두 번 지나면 사용자는 되돌아간 것으로 읽는다.
 
@@ -8305,10 +8320,28 @@ AWAITING_APPROVAL / EXECUTING   기존 뜻 그대로
 | `OUTLINING` | 계획 |
 | `AWAITING_PLAN_APPROVAL` | 계획 승인 |
 | `PLAN_REVIEWING` | 계획 검토 |
-| `IMPLEMENTING` / `PLANNING` / `AWAITING_APPROVAL` / `EXECUTING` | 실행 |
+| `IMPLEMENTING` / `PLANNING` / `EXECUTING` | 실행 |
+| `AWAITING_APPROVAL` | **진행바에서 이탈** — 아래 참조 |
 | `VERIFYING` / `FIX_LOOP` | 검증 |
 | `RESULT_REVIEWING` | 결과 검토 |
 | `AWAITING_USER_VERIFICATION` | 최종 확인 |
+
+##### `phaseToStage(phase)`는 더 이상 순수 함수일 수 없다
+
+`AWAITING_APPROVAL`이 그 증거다. 변경 경로에서는 **승인 대기**라는 단계이고 여기서는 실행
+구간 안에서 서브태스크마다 들락거리는 상태다 — **같은 phase가 경로마다 다른 단계**가 되므로
+`phase` 하나를 받는 함수로는 표현할 수 없다. `stagesFor`가 이미 경로별로 순서를 돌려주므로,
+**매핑도 순서와 함께** 그 자리에 둔다(순서와 매핑은 같은 사실의 두 면이고, 떼어 놓으면 한쪽만
+갱신되는 자리가 하나 더 생긴다).
+
+**그리고 `AWAITING_APPROVAL`은 이 경로에서 진행바의 칸이 아니다.** 실행 구간 안에서 서브태스크
+개수만큼 반복되므로 칸으로 두면 진행바가 앞뒤로 움직인다. `확인 필요`가 이미 같은 처리를 받고
+있다 — *"진행바에서 이탈해 사용자 입력 대기 카드로 전환"*(ui-wireframes 2절). 승인 모달이 그
+자리를 대신하고, 진행바는 `실행`에 머문다.
+
+**"실행 중이라고 말하면서 실제로는 기다린다"가 되지 않게 하는 것이 조건이다.** 진행바가
+`실행`에 머무는 동안 **승인 모달이 떠 있어야** 사용자가 무엇을 기다리는지 안다. 모달 없이
+진행바만 `실행`이면 그건 거짓말이므로, 이 매핑은 승인 모달과 **함께** 구현되어야 한다.
 
 `AWAITING_USER_VERIFICATION`을 기존 `확인 필요`(= `AWAITING_USER_INPUT`)에 접지 않는다.
 그쪽은 **모델이 막혀서 묻는 것**이고 이쪽은 **끝났으니 확인해 달라는 것**이다 — 51절이
@@ -8581,9 +8614,28 @@ Anthropic 단독 / 교차검증 informed / blind였고, executor를 둘 부른 a
 ### 72.10 등급은 계획 모델이 정한다 — 하한선까지만
 
 ```
-서브태스크 등급 = 계획 모델의 판정
+서브태스크 등급 = clamp( 계획 모델의 판정 , PerformanceProfile )
                   단, 경로 기반 위험 하한선 아래로는 내려가지 않는다
 ```
+
+`PerformanceProfile`이 **clamp**로 작동한다 — 등급을 직접 정하지 않고 계획 모델의 판정을
+어느 범위로 가두는지만 정한다.
+
+| 프로파일 | clamp | 뜻 |
+|---|---|---|
+| `economy` | 위를 `economy`로 막는다 | 계획이 `frontier`라 해도 `economy`로 내린다. **단 위험 하한선은 그대로** — 결제 코드는 여전히 올라간다 |
+| `balanced` | **막지 않는다** | 계획 모델의 판정을 그대로 쓴다. 쉬운 조각은 `economy`, 어려운 조각은 `frontier` |
+| `max` | 아래를 `frontier`로 막는다 | 전부 `frontier` |
+
+**그래서 `grade`는 두 값으로 충분하다.** 21.9절이 그 항목을 닫으며 *"`balanced`는 tier가
+가른다"*고 적었는데 **그 근거는 틀렸다** — tier(`simple`/`standard`)는 프로파일과 직교하는
+축이라 서브태스크 등급을 가르지 못한다. 그 문장은 서브태스크 분해가 들어오기 전의 설계에서
+온 것이고, 지금 `balanced`를 정의하는 것은 tier가 아니라 **"계획 모델의 판정을 그대로 쓴다"**이다.
+값이 둘이어도 되는 이유는 그대로다: clamp의 양 끝이 그 둘이면 된다.
+
+**위험 하한선은 clamp보다 세다.** `economy`를 골라도 `auth/`·`payment/` 경로의 서브태스크는
+내려가지 않는다 — 사용자가 고르는 것은 비용이지 위험 감수 수준이 아니고, 후자를 비용 선택에
+딸려 보내면 그 선택의 뜻이 달라진다.
 
 하한선은 TRIAGE의 `riskPathSegments`(auth·payment·crypto·migration)다. 결제 코드를 건드리는
 서브태스크는 계획 모델이 "쉬움"이라 해도 frontier로 간다.
@@ -8618,11 +8670,28 @@ Anthropic 단독 / 교차검증 informed / blind였고, executor를 둘 부른 a
 | `fixLoopRoundsTotal` | **12** | 서브태스크별 상한과 **별개로** 태스크 전체에 건다 |
 | `planRounds` | **2** | 계획을 다시 세우는 횟수 — **계획으로 돌아오는 경로 셋이 같은 카운터를 쓴다** |
 
-`planRounds`를 소비하는 경로는 셋이고 **하나도 빠뜨리면 안 된다**: 72.4의 수정 요청,
-72.8의 거부 경로 2, 그리고 **B의 불일치 카드를 보고 사용자가 계획을 고치는 것**(72.6).
-셋째가 특히 빠지기 쉽다 — 앞의 둘은 사용자가 먼저 움직이지만 이것은 모델이 올린 쟁점에서
-시작하므로 "사용자가 요청한 수정"의 목록에 안 들어간다. 그러나 돌아가는 자리는 같은
+`planRounds`를 소비하는 경로는 **넷이고 하나도 빠뜨리면 안 된다.**
+
+| # | 경로 | 시작점 | 카드가 가는 phase |
+|---|---|---|---|
+| 1 | 72.4의 **수정 요청** | 사용자 | — (승인 카드에서 바로) |
+| 2 | 72.8의 **거부 경로 2** (계획으로 되돌아감) | 사용자 | — (체크리스트에서) |
+| 3 | **B의 쟁점 카드**를 보고 계획을 고침 (72.6) | 모델(B) | `AWAITING_PLAN_APPROVAL` |
+| 4 | **계획 대조 불일치 카드**에 답한 뒤 재계획 (72.9) | 모델(대조) | `AWAITING_USER_INPUT` |
+
+**3·4가 빠지기 쉽다** — 앞의 둘은 사용자가 먼저 움직이지만 뒤의 둘은 모델이 올린 쟁점에서
+시작하므로 "사용자가 요청한 수정"의 목록에 안 들어간다. 그러나 돌아가는 자리는 모두 같은
 `OUTLINING`이고, 카운터가 다르면 그 고리만 상한 없이 돈다.
+
+**4는 17.8①을 "그대로" 적용한 결과다.** 그 절의 채택 결론이 *"사용자 답변 후 항상 재진입하고
+재초안의 primary가 살아남는다"*이므로, 계획에도 같은 규칙을 쓴다고 적은 이상(72.9절) 재진입이
+따라온다 — **재진입이 없으면 사용자가 고정한 기준이 계획에 반영될 자리가 없다.** 그러니
+"그대로 쓴다"와 "넷째 고리는 없다"를 동시에 말할 수 없고, 여기서는 전자를 택한다.
+
+**카드가 가는 phase도 정한다.** 대조 불일치는 기존 `AWAITING_USER_INPUT`이다(17.1절이 이미
+"해소되지 않은 blocking 불일치"를 그 phase의 진입 사유로 넓혔다). B의 쟁점은 다르다 —
+**사용자가 이미 승인한 뒤**에 올라오므로 `AWAITING_PLAN_APPROVAL`로 돌아간다. 승인의 근거가
+바뀌었으니 승인을 다시 묻는 것이고, 지문이 바뀌면 승인이 만료되는 것(72.5절)과 같은 모양이다.
 
 **`planRounds`를 `reviseRounds`와 나눈 이유**: 후자는 *초안*을 고치는 횟수이고(≤2), 계획을 다시
 세우는 것은 다른 일이다. 한 카운터를 공유하면 초안 수정을 두 번 한 태스크가 계획을 한 번도
@@ -8712,6 +8781,7 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | 2.1절 phase 표 | `TRIAGE` 분기, `DRAFTING`·`REVIEWING` 퇴장, 새 phase 다섯 | 갱신 |
 | 2.2절 루프 상한 표 | `planRounds`·`maxSubtasks`·`fixLoopRoundsTotal` | 추가 |
 | 14.1절 tier 승격 규칙 | 승격 목적지가 `DRAFTING` → `OUTLINING` | 취소선 + 근거 유지 |
+| 17.1절 | "상태는 하나도 추가되지 않는다", 대조가 일어나는 자리 | 주석 + 범위 구별 |
 | 17.5절 | `verified`가 tier를 강제하던 것 | 취소선 + 대체 축 |
 | [multi-engine 1절](./multi-engine-routing.md) 보류 표 | xAI / planner·executor 분리 | 취소선 + 근거 |
 | multi-engine 4절 | `planner` 기본 비활성, `reviewer` = `REVIEWING` | 취소선 + 대체 |
@@ -8731,7 +8801,9 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   사례를 이미 기록했다.
 - `apps/desktop/src/types.ts` — `UserStage`·`STAGE_ORDER`·`stagesFor`·`phaseToStage`.
   `phaseToStage`는 **전수 switch**라 새 phase 다섯을 더하면 컴파일이 막고, ui-wireframes 2절이
-  `standard` 순서의 정본을 72.2.1절로 넘겼으므로 **이 코드가 그 매핑의 유일한 소비자**다.
+  `standard` 순서의 정본을 72.2.3절로 넘겼으므로 **이 코드가 그 매핑의 유일한 소비자**다.
+  그리고 `phaseToStage`는 **시그니처가 바뀐다** — `AWAITING_APPROVAL`이 경로마다 다른 단계라
+  `phase` 하나로는 표현되지 않는다(72.2.3절).
 - product-strategy 3절 자기 진단 표와 8.2절 출시 기준 표 — 마커(`<!-- present: -->`)가 붙는
   행들이라 **파일이 생긴 뒤에** 고친다. 지금 고치면 `docStatus.test.ts`가 없는 파일을 가리켜
   실패한다.
