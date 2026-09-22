@@ -62,9 +62,15 @@ export const DEFAULT_TRIAGE_POLICY: TriagePolicy = {
     "payment",
     "delete",
   ],
-  // 인증·결제·암호화 경로와 DB migration. **"public API 변경"은 넣지 않았다** — 그건 심볼
-  // 분석이 있어야 판정할 수 있고(Tree-sitter는 아직 없다, context-engine 9절), 경로 이름으로
-  // 흉내 내면 맞을 때보다 틀릴 때가 많다. 없는 신호를 있는 척하지 않는다.
+  // 인증·결제·암호화 경로와 DB migration. **"public API 변경"은 아직 넣지 않았다** — 그건 심볼
+  // 분석이 있어야 판정할 수 있고, 경로 이름으로 흉내 내면 맞을 때보다 틀릴 때가 많다.
+  // 없는 신호를 있는 척하지 않는다.
+  //
+  // **이 주석은 "Tree-sitter는 아직 없다"고 적고 있었다. 그건 더 이상 사실이 아니다** —
+  // 심볼·의존성 그래프는 JS/TS·Python·Rust에서 돈다(context-engine 22절). 차단 사유는
+  // 사라졌고 신호는 여전히 들어가지 않았을 뿐이며, 후속은 state-machine 13.4.3절이다
+  // (`impactRadius`). 문서만 고치고 이 주석을 남기면 다음 사람이 만나는 것은 문서가 아니라
+  // 이 주석이다 — product-strategy 4.2절이 기록한 그 실패다.
   riskPathSegments: [
     "auth",
     "login",
