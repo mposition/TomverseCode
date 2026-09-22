@@ -141,7 +141,7 @@ stateDiagram-v2
 | `toolRetries[requestId]` | ToolResult.status = timeout/transient error | 2 (지수 백오프) | 해당 ToolRequest를 `error`로 확정, EXECUTING 전체를 FAILED로 전이 |
 | `planRounds` | `OUTLINING` 재진입 시 (**경로 셋** — 72.11절) | 2 | 계획을 다시 세우지 않는다. **남는 선택지는 서 있는 자리에 따라 다르다** — 72.11절 |
 | `maxSubtasks` | 계획이 서브태스크를 선언할 때 | 8 | 계획을 거부하고 사용자에게 쪼개 달라고 올린다 |
-| `escalationCalls` | 런타임 에스컬레이션을 **실제로 부를 때**(72.10.2절) | 승인 카드의 `escalationAllowance.maxCalls`, **단 `TaskPolicy`의 천장 안에서** — 사용자가 정한 값이 유일한 상한이면 상한이 아니다 | **초과 요청을 거절한다.** 서브태스크는 원래 등급으로 계속 간다 — 중간에 봉투를 늘리지 않는다 |
+| `escalationCalls` | 런타임 에스컬레이션을 **실제로 부를 때**(72.10.2절) | **`TaskPolicy`의 제안값에서 시작해 사용자가 카드에서 확정한 `escalationAllowance.maxCalls`. 천장도 `TaskPolicy`에 있다** — 이 표에서 기본값이 최종값이 아닌 유일한 줄이다 | **초과 요청을 거절한다.** 서브태스크는 원래 등급으로 계속 간다 — 중간에 봉투를 늘리지 않는다 |
 
 
 > **`fixLoopRounds`의 증가 지점이 바뀐 이유**: 종전 정의 *"`VERIFYING` → fail 판정 시"*는
@@ -9121,7 +9121,7 @@ effort에만 요구한 것이 일관되지 않았다.
 | `maxSubtasks` | **8** | 계획이 만들 수 있는 서브태스크 수 |
 | `fixLoopRounds` | 3 (기존값) | **`FIX_LOOP` 진입 횟수 — 태스크 하나에 대해 센다.** 값은 그대로이고 **증가 지점만** 바뀐다 |
 | `planRounds` | **2** | 계획을 다시 세우는 횟수 — **계획으로 돌아오는 경로 셋이 같은 카운터를 쓴다** |
-| `escalationCalls` | 승인 카드의 `maxCalls` | 런타임 에스컬레이션 호출 수(72.10.2절). **값을 여기 적지 않는 유일한 줄**이다 — 사용자가 봉투를 정하므로 제품이 고르는 기본 상한이 아니다. 그래도 `TaskPolicy`가 **천장**은 갖는다: 봉투가 무제한이면 상한이 아니다 |
+| `escalationCalls` | 사용자가 확정한 `maxCalls` | 런타임 에스컬레이션 호출 수(72.10.2절). **값을 여기 적지 않는 유일한 줄**이다 — 제품이 제안하고 사용자가 확정하므로 최종값이 태스크마다 다르다. 제안값도 천장도 `TaskPolicy`에 있다: 봉투가 무제한이면 상한이 아니다 |
 
 #### 서브태스크별 `FIX_LOOP`는 없다 — 그래서 상한도 하나다
 
@@ -9306,9 +9306,15 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | `PLAN_REVIEW_COMPLETED` | B가 계획을 **실제로 바꿨는가**, 무엇이 바뀌었는가, 카드로 올라갔을 때 사용자가 어느 쪽을 골랐는가 |
 | `RESULT_REVIEW_COMPLETED` | C가 올린 항목 수, 그중 사용자가 **문제로 판정한** 수, 그 때문에 거부·재작업을 골랐는가 |
 | 계획 대조 (`verified`) | 두 계획이 갈렸는가, 사용자가 그 때문에 계획을 고쳤는가 |
+| 에스컬레이션 (72.10.2절) | **요청 수 / 그중 부른 수 / 봉투를 넘어 거절된 수**, 그리고 부른 것이 **결과를 바꿨는가** |
 
-셋 다 **실사용에서 공짜로 쌓인다.** 유료 실험 없이 "이 단계가 사용자 판단을 바꾼 적이 있는가"에
-답할 수 있고, 답이 "없다"면 그 단계를 드롭할 근거가 된다. 라우팅 결정을 처음부터 전부 기록해 둔
+**넷 다 실사용에서 공짜로 쌓인다.** 유료 실험 없이 "이 단계가 사용자 판단을 바꾼 적이 있는가"에
+답할 수 있고, 답이 "없다"면 그 단계를 드롭할 근거가 된다.
+
+**에스컬레이션 행은 분모가 셋이라는 점이 중요하다.** 72.10.2절이 *"요청이 늘 봉투를 채우는데
+결과가 달라진 적이 없으면 그건 신호가 아니라 습관이다"*라고 적었는데, 거절된 요청을 세지
+않으면 "요청 수"가 곧 "부른 수"가 되어 **남발이 상한에 가려 보이지 않는다.** 거절을 이벤트로
+남기기로 한 이유가 이것이다(7절 목록). 라우팅 결정을 처음부터 전부 기록해 둔
 것과 같은 수법이다(multi-engine-routing 8절).
 
 ### 72.15 이 절이 바꾸는 **정본 목록** — 한곳에 모아 둔다
@@ -9342,7 +9348,8 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | multi-engine 21.4절 레지스트리 키 | `modelId` 단일 키 → **경로 키**(같은 모델에 HTTP·CLI 둘) | 21.7절에 근거, 21.4절에 규칙 |
 | multi-engine 10.5절 출력 토큰 상한 | 상한 계산에 `EffortLevel`이 들어갈 **자리**가 필요하다(해당 공급자가 있는지는 **미확인** — 21.4절) | **아직 안 함** |
 | multi-engine 14절 적합성 스위트 | effort 파라미터 수용 + **추론 토큰 보고** 두 항목 | **아직 안 함** — 21.4절이 요구만 적었다 |
-| multi-engine 15.3절 co-executor 지정 금지 | 대조가 계획으로 옮겨가 **co-planner**에 걸린다 | 취소선 + 대상 교체 |
+| multi-engine 15.3절 co-executor 지정 금지 | 대조가 계획으로 옮겨가 **co-planner**에 걸린다. `simple`·`fast`에 남는 co-executor는 **없다** | 취소선 + 대상 교체 + 자기정정 |
+| 72.14절 계측 표 | 에스컬레이션 행(요청/호출/거절 셋을 센다) | 갱신 |
 | [product-strategy 8.6절](./product-strategy.md) 호출 수 | "실행자 2 + 검수자 1 = 3"과 "verified는 실행자를 하나 더 부른다" | 취소선 + 근거 |
 | [ui-wireframes 3.11절](./ui-wireframes.md) | 같은 문장이 화면 쪽에도 있었다 | 취소선 + 근거 |
 
@@ -9425,7 +9432,9 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   `standard`에서 빈 `subtasks`를 **실패로** 다루는 검증(72.2.2), `AcceptanceCriterion.source`에
   `plan_outline`(72.2.1).
 - **`apps/desktop/src-tauri/core/src/store.rs`** — `ORDER BY (source = 'user_decision') DESC`가
-  두 곳에 있고 72.2.1절이 그 SQL을 직접 인용하며 교체를 요구한다. source enum 주석도 같다.
+  **한 곳**에 있고(72.2.1절이 그 SQL을 직접 인용하며 교체를 요구한다), source enum 주석도 같다.
+  같은 파일에서 `source = 'user_decision'`으로 **좁히는** 질의들은 정렬 규칙이 아니므로 대상이
+  아니다 — 그 차이는 그 파일 주석이 이미 적어 두었다.
 - **`packages/protocol/src/task.ts`의 `modelPins` 주석** — *"지정 가능한 것은 primary executor와
   reviewer뿐"*이 **co-executor 기준으로만** 적혀 있다. 대조가 계획으로 옮겨갔으므로 금지 대상이
   co-planner가 된다(multi-engine 15.3절).

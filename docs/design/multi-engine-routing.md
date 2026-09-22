@@ -995,11 +995,19 @@ fake는 요구하지 않는다. 실전 어댑터가 아니고, 요구하면 표�
 둘을 같게 만들 수 있고, 그 순간 "불일치 없음"은 정보가 아니라 착시가 된다. 그래서 지정 가능한
 것은 primary와 reviewer뿐이며, 화면이 그 이유를 적는다.
 
-**~~co-executor~~ → `standard` 경로에서는 co-planner다.** [state-machine 72.9절](./state-machine-and-protocol.md)이
+**~~co-executor~~ → co-planner다.** [state-machine 72.9절](./state-machine-and-protocol.md)이
 대조를 `DRAFTING`에서 `OUTLINING`으로 옮겼으므로 이 규칙이 거는 자리가 바뀐다 — **규칙은
-그대로이고 대상만 바뀐다.** 초안 경로가 남아 있는 한(`simple`·`fast`) co-executor에도 계속
-걸린다. `packages/protocol/src/task.ts`의 `modelPins` 주석이 아직 co-executor만 말하므로
-구현 때 함께 고친다(state-machine 72.15절 목록).
+그대로이고 대상만 바뀐다.**
+
+**"`simple`·`fast`에는 co-executor가 남는다"고 적지 않는다.** 이 절의 초안이 그렇게 적었는데
+**틀렸다**: 지금 코드에서도 대조는 `contrastRequested()`가 `tier === "standard"` **그리고**
+`executionMode === "verified"`일 때만 켜지므로 그 둘에서는 한 번도 켜지지 않았고, 72.9절의
+축 표에서도 `simple`은 단일 모델 1회, `fast`는 계획자 1명이라 **executor가 둘이 되는 조합이
+아예 없다.** 즉 이 규칙은 **전부** co-planner로 옮겨간다.
+
+**구현 전까지는 코드가 아직 co-executor를 뽑는다**(`router.ts`의 `input.contrast` 분기).
+그러므로 이 교체는 72절 구현과 같은 자리에서 일어나야 하고, `packages/protocol/src/task.ts`의
+`modelPins` 주석도 함께 고친다(state-machine 72.15절 목록).
 
 **그리고 reviewer는 지정할 수 있다.** 이 절이 막는 것은 대조용 두 번째 하나뿐이고, 검수자
 지정은 15.1절이 허용하되 독립성을 깨면 15.2절이 **역할을 드롭한다.** `standard` 경로의 B·C도
@@ -1357,7 +1365,7 @@ A(계획) ≠ B(계획 검토),  그리고 C ∉ 구현자 공급자,  소프트
 | 축 | 값 | 왜 필요한가 |
 |---|---|---|
 | `grade` | `economy` \| `frontier` \| `unmeasured` | `PerformanceProfile`이 고를 대상. **추측이 아니라 우리 측정으로 붙는다** |
-| `accounting` | `metered` \| `subscription` | **비용 출처.** CLI 로그인 경로(21.7절)는 토큰 단가가 없다. 라우팅에서는 **같은 등급 안의 동점을 가르는 축**이지 등급을 바꾸지 않는다([state-machine 72.10.1절](./state-machine-and-protocol.md)) |
+| `accounting` | `metered` \| `subscription` | **비용 출처.** `subscription`은 **CLI 로그인 경로에서만 나온다**(`transport: "cli"` ⟺ `accounting: "subscription"`, 21.7절) — 역방향도 참이라는 것이 72.10.1절 tie-break 단서의 전제다. 라우팅에서는 **같은 등급 안의 동점을 가르는 축**이지 등급을 바꾸지 않는다([state-machine 72.10.1절](./state-machine-and-protocol.md)) |
 | `transport` | `http` \| `cli` | **누가 어떻게 부르는가.** `cli`면 Rust가 spawn한다(21.7절). `providerId`는 이 축과 **무관하게** 실제 공급자를 가리킨다 — 나누면 독립성 불변식이 속는다 |
 | `endpointRegion` / `providerJurisdiction` | 21.5절 | 소스 코드가 어디로 나가는지 |
 | `effort` 지원 | `none` \| 매핑표 | **사용자가 고르는 네 번째 축**([state-machine 72.9절](./state-machine-and-protocol.md))을 이 모델의 어느 파라미터로 옮기는가. 지원하지 않는 모델이 있다는 사실도 축의 일부다 |
@@ -1366,10 +1374,11 @@ A(계획) ≠ B(계획 검토),  그리고 C ∉ 구현자 공급자,  소프트
 때문이다(21.7절: Grok을 xAI API 키로도 Cursor 구독으로도 부른다). 키는
 `(providerId, modelId, transport, cliVendor?)`다.
 
-**그렇다고 독립성 비교의 축이 바뀌는 것은 아니다.** 비교는 여전히 `providerId`로 한다
-(원칙 4, `router.ts`의 `c.providerId !== executor.providerId`). `(providerId, modelId)`는
-비교 키가 아니라 **동일 참가자를 두 번 세지 않기 위한 동일성 키**다 — 같은 모델에 경로가
-둘이면 두 엔트리는 **한 참가자**로 접힌다.
+**그렇다고 독립성 비교의 축이 바뀌는 것은 아니다.** 원칙 4의 비교는 여전히 `providerId`
+하나로 한다 — `router.ts`가 실행자들의 `providerId`를 Set으로 모아 후보에서 빼고
+(`candidates.filter((c) => !executorProviders.has(c.providerId))`), **`modelId`는 보지
+않는다.** `(providerId, modelId)`는 비교 키가 아니라 **동일 참가자를 두 번 세지 않기 위한
+동일성 키**다 — 같은 모델에 경로가 둘이면 두 엔트리는 **한 참가자**로 접힌다.
 
 **이 초안은 한때 "독립성 계산만은 `(providerId, modelId)`로 접는다"고 적었고, 그건 위험한
 문장이었다.** 글자 그대로 구현하면 `openai/gpt-5`와 `openai/gpt-4.1`이 **서로 다른 키라서
@@ -1377,7 +1386,10 @@ A(계획) ≠ B(계획 검토),  그리고 C ∉ 구현자 공급자,  소프트
 **키를 넓히는 쪽으로** 돌아온다. 그리고 이 오독은 조용하다: 원칙 4가 깨져도 화면은 "독립
 검증함"을 표시한다. 두 규칙은 **함께** 성립해야 한다 — 서로 다른 자리에 앉는 둘은
 `providerId`가 달라야 하고(원칙 4), 같은 `(providerId, modelId)`는 경로가 달라도 하나로 센다
-(13.5절의 "같은 모델 ID를 두 자리에 넣지 않는다"가 이미 모델 층위에서 하던 일이다).
+**13.5절이 이미 하고 있다고 읽지 않는다.** 그 절의 규칙은 *"같은 모델 ID를 **두 executor
+자리에** 넣지 않는다"*이고 구현도 **대조 후보 필터 하나**다(`router.ts`의 `input.contrast`
+분기에서 `c.providerId !== executor.providerId && c.modelId !== executor.modelId`). 검수자
+선택은 `modelId`를 전혀 보지 않으므로, **검수 자리에는 동일성 접기가 아직 없다.**
 
 **`apiBaseUrl`이 필수 `string`이 아니게 된다.** `transport: "cli"` 엔트리에는 URL이 없기
 때문이다(21.7절). 타입을 `transport`에 따라 갈라야 하며, **`""`로 채우지 않는다** — 빈 문자열은
@@ -1415,8 +1427,10 @@ enum이고 어떤 곳은 **토큰 예산 숫자**이며, 아예 없는 모델도
 
 **10.5절(출력 토큰 상한)과 부딪힐 수 있다 — 그리고 그게 어느 공급자인지 확인하지 않았다.**
 추론 토큰이 출력 예산에서 나가는 공급자가 있다면, 상한을 고정해 두고 effort만 올리면
-**답이 조용히 잘린다.** 확인은 위 적합성 스위트 (b)가 겸한다(보고된 토큰 수가 출력 상한에
-대해 어떻게 세어지는지를 거기서 관측할 수 있다). **확인 전에는 "그렇다"고 적지 않되 계산에
+**답이 조용히 잘린다.** 확인은 위 적합성 스위트 (b)에 **항목으로 더해야 한다** —
+"추론 토큰이 보고되는가"와 "그것이 출력 상한에 대해 세어지는가"는 다른 질문이고, 뒤는
+**상한에 가깝게 요청해 잘리는지 보는 것**이 가장 직접적인 관측이다. (b)가 앞을 겸한다고
+적었던 초안은 뒤까지 답한다고 읽혔다. **확인 전에는 "그렇다"고 적지 않되 계산에
 자리는 비워 둔다** — 나중에 그런 공급자가 하나라도 나오면 10.5절의 계산(*"모델 최대치를
 요청하지 않는다"*)에 effort가 입력으로 들어가야 하고, 그때 자리가 없으면 상한이 고정된 채
 남는다. **증상이 고약한 이유는 잘린 patch가 실패로 읽히지 않는다**는 점이다 — "모델이 못
@@ -1662,11 +1676,17 @@ claude-code-cli 를 별도 providerId로 두면
 **이 표의 값은 아직 확인하지 않았다.** 실행 파일 이름도, "Cursor가 여러 공급자를 중개한다"도,
 "Cursor 구독으로 Grok을 부를 수 있다"도 **저장소 안에 근거가 없다.** 21.3절이 모델 ID·단가에
 대해 정한 규칙(*"기억이나 인상으로 채우지 않는다"* + 확인 날짜)이 여기에도 그대로 걸린다 —
-구현 전에 실제 CLI로 확인하고 확인 날짜와 함께 다시 적는다. **다만 아래 세 결론은 이 값들에
-의존하지 않는다**: "중개자가 있으면 경로가 둘이 된다", "응답 envelope이 없으면 exact-model
-검증이 성립하지 않는다", "중개자는 관할을 한 겹 늘린다"는 **중개자라는 성질**에서 나오지
-특정 제품의 사실에서 나오지 않는다. 확인 결과 Cursor가 중개자가 아니라면 그 세 결론은
-Cursor에 적용되지 않을 뿐 틀린 것이 되지는 않는다.
+구현 전에 실제 CLI로 확인하고 확인 날짜와 함께 다시 적는다. **다만 아래 세 결론은 이 값들에 의존하지
+않는다** — 그리고 **셋이 기대는 성질이 서로 다르다.** 초안은 셋 다 "중개자라는 성질"에서
+나온다고 적었는데 그건 하나에만 맞다.
+
+| 결론 | 어디서 나오는가 | Cursor가 중개자가 아니라면 |
+|---|---|---|
+| ① 같은 모델에 경로가 둘이 된다 | **CLI 로그인이 존재한다**는 것만으로 성립 — Claude Code CLI와 Anthropic HTTP만으로 이미 둘이다 | 그대로 성립 |
+| ② 응답 envelope이 없어 exact-model 검증이 성립하지 않는다 | **CLI 전송이라는 성질.** Codex·Claude Code에도 똑같이 걸린다 | 그대로 성립 |
+| ③ 관할이 한 겹 는다 | **중개자라는 성질** | 이 결론만 Cursor에 적용되지 않는다 |
+
+즉 저 표가 틀린 것으로 밝혀져도 ①②는 남고 ③만 빠진다.
 
 ##### 같은 모델에 경로가 둘 생긴다 — 그래서 레지스트리 키가 모델이 아니다
 
