@@ -162,7 +162,7 @@ stateDiagram-v2
 
 **이 표는 "카운터"라는 이름으로 두 가지를 담고 있다.** 대부분은 세는 값이지만 `maxSubtasks`는
 **한 번 검사하는 상한**이라 셀 것이 없다 — 그래서 `counters_json`에 들어가지 않고
-`TaskPolicy`에 **둔다**(아직 `TaskLoopLimits`에 없다 — 72.15절 목록). 표를 나누지 않는 이유는
+`TaskPolicy`의 `TaskLoopLimits`에 **둔다**. 표를 나누지 않는 이유는
 **원칙 5가 묻는 질문이 하나이기 때문이다**: "이 루프/개수에 상한이 있는가". 다만 저장 위치가
 갈리므로 그 사실을 여기 적어 둔다.
 
@@ -407,11 +407,18 @@ interface TaskState {
   taskId: string;
   phase: TaskPhase;
   complexityTier: ComplexityTier | null; // TRIAGE 완료 전에는 null
+  // **카운터 집합에는 사본이 셋 있다**(2.2절): 이 블록, `packages/protocol/src/task.ts`의
+  // `TaskCounters`, 그리고 `core/src/types.rs`의 `TaskCounters`다. 쓰기 경로가 payload를
+  // 그대로 넣으므로 갈려도 오류가 나지 않는다 — 새 카운터는 **셋 모두에** 더한다.
+  // 9절 블록이 이 집합의 정본 모양이고, 여기서는 이 절이 설명하는 것만 보여준다.
   counters: {
     clarificationRounds: number;
     reviseRounds: number;
     fixLoopRounds: number;
+    planRounds: number;      // 72.11절
+    escalationCalls: number; // 72.10.2절
     toolRetries: Record<string, number>;
+    // mcpRounds·contextRounds·providerRetries는 9절 블록 참조.
   };
 }
 
@@ -821,9 +828,13 @@ interface TaskState {
     fixLoopRounds: number;
     toolRetries: Record<string, number>;
     providerRetries: Record<string, number>; // key = "draft:1", "review:2", "fix:1" 등 호출 식별자
-    // 이 블록은 **카운터 집합의 세 번째 사본**이고 이미 낡았다 — mcpRounds·contextRounds가
-    // 빠져 있고(TS 타입에는 있다), 2.2절이 더한 planRounds·escalationCalls도 없다.
-    // 세 사본이 갈리는 문제는 2.2절이 적었고 72.15절 목록이 함께 다룬다.
+    mcpRounds: number;                       // 31절
+    contextRounds: number;                   // 57절
+    planRounds: number;                      // 72.11절 — 경로 셋이 같은 카운터를 쓴다
+    escalationCalls: number;                 // 72.10.2절 — **부른** 수다. 요청/거절은 이벤트
+    // `maxSubtasks`는 여기 없다. **상한이지 카운터가 아니라서** 셀 것이 없고, 그래서
+    // `TaskLoopLimits`에만 있다(2.2절). 뭉뚱그리면 `counters_json`이 원칙 7의 파생 캐시라는
+    // 성질과 어긋난다.
   };
 }
 ```

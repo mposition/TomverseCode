@@ -392,6 +392,8 @@ export class Orchestrator {
         contextRounds: 0,
         reviseRounds: 0,
         fixLoopRounds: 0,
+        planRounds: 0,
+        escalationCalls: 0,
         toolRetries: {},
         providerRetries: {},
       },

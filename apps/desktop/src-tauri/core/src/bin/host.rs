@@ -37,7 +37,7 @@ use tomverse_core::artifacts::ArtifactStore;
 use tomverse_core::host::{AlwaysDeny, ApprovalGateway, AutoApprove, EventSink, TaskHost};
 use tomverse_core::sidecar::SidecarClient;
 use tomverse_core::store::{Store, TerminalOutcome};
-use tomverse_core::types::{ExecutionMode, TaskPolicy};
+use tomverse_core::types::{EffortLevel, ExecutionMode, PerformanceProfile, TaskPolicy};
 use tomverse_core::CancellationRegistry;
 use tomverse_core::{
     available_providers_for, credential_injection_for, credentials, WorkspaceRoot, PROTOCOL_VERSION,
@@ -81,6 +81,10 @@ struct Args {
     message: String,
     task_id: Option<String>,
     mode: ExecutionMode,
+    /// 어느 등급의 모델이 구현하는가 (72.9절). `--profile economy|balanced|max`.
+    profile: PerformanceProfile,
+    /// 고른 모델을 얼마나 깊게 굴리는가 (72.9절). `--effort low|medium|high`.
+    effort: EffortLevel,
     approve: String,
     db: Option<PathBuf>,
     artifacts: Option<PathBuf>,
@@ -451,6 +455,8 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         message: String::new(),
         task_id: None,
         mode: ExecutionMode::Verified,
+        profile: PerformanceProfile::Balanced,
+        effort: EffortLevel::Medium,
         approve: "auto".to_string(),
         db: None,
         artifacts: None,
@@ -506,6 +512,24 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                     "fast" => ExecutionMode::Fast,
                     "verified" => ExecutionMode::Verified,
                     other => return Err(format!("알 수 없는 --mode: {other} (fast|verified)")),
+                }
+            }
+            // 72.9절의 축 둘. **기본값이 있고 사용자가 고르는 값**이라 인자가 없어도 돈다 —
+            // 기본값이 없는 것은 축이 아니라 계획 승인 게이트의 선택지 넷이다(72.4절).
+            "--profile" => {
+                args.profile = match value()?.as_str() {
+                    "economy" => PerformanceProfile::Economy,
+                    "balanced" => PerformanceProfile::Balanced,
+                    "max" => PerformanceProfile::Max,
+                    other => return Err(format!("알 수 없는 --profile: {other} (economy|balanced|max)")),
+                }
+            }
+            "--effort" => {
+                args.effort = match value()?.as_str() {
+                    "low" => EffortLevel::Low,
+                    "medium" => EffortLevel::Medium,
+                    "high" => EffortLevel::High,
+                    other => return Err(format!("알 수 없는 --effort: {other} (low|medium|high)")),
                 }
             }
             "--approve" => args.approve = value()?,
@@ -1839,6 +1863,19 @@ fn run_task(
             "budgetUsd": args.budget_usd,
             "modelPins": model_pins,
             "executionMode": match args.mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
+            // 72.9절의 축 둘. **함께 보낸다** — 하나만 도달하면 sidecar가 나머지에 대해
+            // 자기 기본값을 쓰게 되고, 그건 `unattended`가 "그럴듯한 기본값"으로 도착했던
+            // 것과 같은 실패다(아래 주석).
+            "performanceProfile": match args.profile {
+                PerformanceProfile::Economy => "economy",
+                PerformanceProfile::Balanced => "balanced",
+                PerformanceProfile::Max => "max",
+            },
+            "effortLevel": match args.effort {
+                EffortLevel::Low => "low",
+                EffortLevel::Medium => "medium",
+                EffortLevel::High => "high",
+            },
             // **이 map은 Rust의 `TaskPolicy`가 아니라 TS의 `TaskPolicy`를 향해 손으로 조립된다.**
             // 그래서 Rust 구조체에 필드를 더해도 여기 넣지 않으면 sidecar에 도달하지 않는다 —
             // 실제로 `unattended`를 추가하고 그렇게 빠뜨렸고, e2e가 잡았다.

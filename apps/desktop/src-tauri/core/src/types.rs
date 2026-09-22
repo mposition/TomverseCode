@@ -359,6 +359,14 @@ pub struct CommandPolicy {
     pub allow: Vec<CommandRule>,
 }
 
+/// 모든 루프 상한 — state-machine 2.2절, CLAUDE.md 원칙 5.
+///
+/// # 이 집합에는 사본이 셋 있다
+///
+/// TS의 `TaskLoopLimits`, 이 구조체, 그리고 문서 9절의 `TaskState.counters` 블록이다.
+/// **쓰기 경로가 payload를 그대로 넣으므로 이 불일치는 오류 없이 지나간다** — 실제로
+/// `mcpRounds`·`contextRounds`가 TS에만 있는 채로 오래 있었다(72.15절). 새 상한은 셋 모두에
+/// 더하고, 지금 갈린 것도 그때 맞춘다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskLoopLimits {
     #[serde(rename = "clarificationRounds", default = "two")]
@@ -371,13 +379,38 @@ pub struct TaskLoopLimits {
     pub tool_retries: u32,
     #[serde(rename = "providerRetries", default = "three")]
     pub provider_retries: u32,
+    /// 초안이 MCP 도구를 요청해 DRAFTING을 다시 도는 횟수 (31절).
+    #[serde(rename = "mcpRounds", default = "one")]
+    pub mcp_rounds: u32,
+    /// 질문·계획 경로가 파일을 더 읽고 다시 묻는 라운드 수 (57절).
+    #[serde(rename = "contextRounds", default = "one")]
+    pub context_rounds: u32,
+    /// 계획을 다시 세우는 횟수 (72.11절). 소비 경로가 셋이고 하나도 빠뜨리면 안 된다.
+    #[serde(rename = "planRounds", default = "two")]
+    pub plan_rounds: u32,
+    /// 계획이 만들 수 있는 서브태스크 수 (72.11절). **상한이지 카운터가 아니다.**
+    #[serde(rename = "maxSubtasks", default = "eight")]
+    pub max_subtasks: u32,
+    /// 런타임 에스컬레이션 호출 수의 **천장** (72.10.2절).
+    ///
+    /// 실제 상한은 사용자가 승인 카드에서 확정한 `maxCalls`이고, 이 값은 제품이 제안하는
+    /// 값이자 그 제안의 천장이다. 둘 다 있어야 하는 이유는 원칙 5다 — 사용자가 정한 값이
+    /// 유일한 상한이면 상한이 사용자 입력에 의존하게 되고, 봉투가 무제한이면 상한이 아니다.
+    #[serde(rename = "escalationCalls", default = "two")]
+    pub escalation_calls: u32,
 }
 
+fn one() -> u32 {
+    1
+}
 fn two() -> u32 {
     2
 }
 fn three() -> u32 {
     3
+}
+fn eight() -> u32 {
+    8
 }
 
 impl Default for TaskLoopLimits {
@@ -388,15 +421,51 @@ impl Default for TaskLoopLimits {
             fix_loop_rounds: 3,
             tool_retries: 2,
             provider_retries: 3,
+            mcp_rounds: 1,
+            context_rounds: 1,
+            plan_rounds: 2,
+            max_subtasks: 8,
+            escalation_calls: 2,
         }
     }
 }
 
+/// 사용자가 고르는 실행 정책 — state-machine 72.9절.
+///
+/// `fast`는 계획자를 하나, `verified`는 **둘** 부른다(대조). **이 축은 `complexityTier`를
+/// 정하지 않는다** — 72.9절이 종전 정의를 뒤집었다. `verified`인 태스크도 TRIAGE가
+/// `simple`로 분류하면 단일 모델 한 번으로 끝난다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMode {
     Fast,
     Verified,
+}
+
+/// 어느 등급의 모델이 **구현**하는가 — 72.9·72.10절. clamp이지 선택이 아니다.
+///
+/// `balanced`가 기본이고 **clamp를 걸지 않는 항등**이다. 기본값 공백과 동작이 같지만
+/// 적어 두는 이유는 나중에 누가 기본을 바꿀 때 그것이 **기본값 변경인지 공백 채우기인지**
+/// 구별하기 위해서다 — 그 둘은 되돌리기 비용이 다르다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PerformanceProfile {
+    Economy,
+    Balanced,
+    Max,
+}
+
+/// 고른 모델을 **얼마나 깊게** 굴리는가 — 72.9절. `PerformanceProfile`과 직교한다.
+///
+/// **닫힌 enum인 것이 중요하다**(multi-engine 21.4절): CLI 경로에서 effort는 명령줄
+/// 플래그가 되고, 값의 집합이 유한해야 "실행될 수 있는 argv의 집합이 열거 가능하다"가
+/// 유지된다. 여기를 문자열로 열면 원칙 6의 보장이 이 경로에서만 사라진다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,6 +517,13 @@ pub struct TaskPolicy {
     pub command_timeout_ms: u64,
     #[serde(rename = "executionMode", default = "default_mode")]
     pub execution_mode: ExecutionMode,
+    /// 어느 등급이 구현하는가 (72.9절). **`effort_level`과 함께 들어왔다** — 축을 하나만
+    /// 먼저 넣으면 화면이 "나머지는 어디 있나"를 묻는 상태가 된다.
+    #[serde(rename = "performanceProfile", default = "default_profile")]
+    pub performance_profile: PerformanceProfile,
+    /// 고른 모델을 얼마나 깊게 굴리는가 (72.9절). 태스크 하나에 값 하나다.
+    #[serde(rename = "effortLevel", default = "default_effort")]
+    pub effort_level: EffortLevel,
     /// 무인 실행의 **시한** (state-machine 39절). `None`이면 상한이 없다.
     ///
     /// # sidecar로 보내지 않는다
@@ -469,6 +545,12 @@ fn default_timeout() -> u64 {
 fn default_mode() -> ExecutionMode {
     ExecutionMode::Verified
 }
+fn default_profile() -> PerformanceProfile {
+    PerformanceProfile::Balanced
+}
+fn default_effort() -> EffortLevel {
+    EffortLevel::Medium
+}
 
 impl Default for TaskPolicy {
     fn default() -> Self {
@@ -484,6 +566,8 @@ impl Default for TaskPolicy {
             allow_git_commit: false,
             command_timeout_ms: default_timeout(),
             execution_mode: ExecutionMode::Verified,
+            performance_profile: PerformanceProfile::Balanced,
+            effort_level: EffortLevel::Medium,
             // **기본 시한을 만들지 않는다.** 예산 상한과 같은 규칙이다 — 코드가 만들어낸
             // 승인은 승인이 아니다.
             deadline_ms: None,
@@ -712,8 +796,29 @@ pub struct TaskCounters {
     pub clarification_rounds: u32,
     #[serde(rename = "reviseRounds", default)]
     pub revise_rounds: u32,
+    /// **`FIX_LOOP`에 진입한 횟수**다 — `VERIFYING`의 fail 판정 수가 아니다(72.11절).
+    ///
+    /// 값(3)은 그대로이고 증가 지점만 바뀌었다. 72.8절 귀환 경로 1은 검증이 **통과한 뒤**
+    /// 체크리스트에서 `FIX_LOOP`로 돌아가므로 fail 판정을 한 번도 만들지 않는다 — 판정을
+    /// 세면 영원히 오르지 않고, 진입을 세면 잡힌다. 기존 경로(검증 실패)에 대해서는 두
+    /// 정의가 같은 값을 내므로 회귀가 없다.
     #[serde(rename = "fixLoopRounds", default)]
     pub fix_loop_rounds: u32,
+    /// 초안의 요청으로 MCP 도구를 실행한 라운드 수 (31절).
+    #[serde(rename = "mcpRounds", default)]
+    pub mcp_rounds: u32,
+    /// 모델의 요청으로 파일을 더 읽고 다시 물은 라운드 수 (57절).
+    #[serde(rename = "contextRounds", default)]
+    pub context_rounds: u32,
+    /// 계획을 다시 세운 횟수 (72.11절). 경로 셋이 같은 카운터를 쓴다.
+    #[serde(rename = "planRounds", default)]
+    pub plan_rounds: u32,
+    /// 런타임 에스컬레이션을 **실제로 부른** 횟수 (72.10.2절).
+    ///
+    /// 요청 수가 아니다 — 거절을 세지 않으면 "요청 수"가 곧 "부른 수"가 되어 남발이
+    /// 상한에 가려 보이지 않는다(72.14절). 요청과 거절은 이벤트로 남는다.
+    #[serde(rename = "escalationCalls", default)]
+    pub escalation_calls: u32,
     #[serde(rename = "toolRetries", default)]
     pub tool_retries: BTreeMap<String, u32>,
     #[serde(rename = "providerRetries", default)]

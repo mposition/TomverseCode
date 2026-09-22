@@ -1,4 +1,4 @@
-import type { ComplexityTier, ISODateTime } from "./common.js";
+import type { ComplexityTier, EffortLevel, ISODateTime } from "./common.js";
 import type { AcceptanceCriterion, CriterionEvaluation } from "./decision.js";
 import type { PlanOutline, QuestionAnswer } from "./proposal.js";
 import type { RoutingDecision } from "./registry.js";
@@ -69,6 +69,37 @@ export interface TaskLoopLimits {
    * 걸지 않는다.
    */
   contextRounds: number; // 기본 1
+  /**
+   * **계획을 다시 세우는 횟수** (state-machine 72.11절). 기본 2.
+   *
+   * `reviseRounds`와 나누는 이유: 후자는 *초안*을 고치는 횟수이고 계획을 다시 세우는 것은
+   * 다른 일이다. 한 카운터를 공유하면 초안 수정을 두 번 한 태스크가 계획을 한 번도 고치지
+   * 못하게 되는데, 그 둘은 서로를 제약할 이유가 없다.
+   *
+   * **소비 경로가 셋이고 하나도 빠뜨리면 안 된다**: 계획 승인 카드의 "수정 요청",
+   * 검증 체크리스트의 거부 경로 2, 그리고 **B의 쟁점 카드를 보고 계획을 고치는 것.**
+   * 셋째가 빠지기 쉽다 — 앞의 둘은 사용자가 먼저 움직이지만 이것은 모델이 올린 쟁점에서
+   * 시작하므로 "사용자가 요청한 수정"의 목록에 안 들어간다. 그러나 돌아가는 자리는 같은
+   * `OUTLINING`이고, 카운터가 다르면 그 고리만 상한 없이 돈다.
+   */
+  planRounds: number; // 기본 2
+  /**
+   * 계획이 만들 수 있는 **서브태스크 수**의 상한 (72.11절). 기본 8.
+   *
+   * **상한이지 카운터가 아니다** — `TaskCounters`에 대응하는 항목이 없는 유일한 줄이다.
+   * 서브태스크는 계획 산출물의 길이이지 반복 횟수가 아니므로 "몇 번 돌았는가"를 셀 것이
+   * 없다. 셋을 한 자리에 뭉뚱그리면 `counters_json`이 원칙 7의 파생 캐시라는 성질과 어긋난다.
+   */
+  maxSubtasks: number; // 기본 8
+  /**
+   * 런타임 에스컬레이션 호출 수의 **천장** (72.10.2절). 기본 2.
+   *
+   * **2.2절 표가 값을 적지 않는 유일한 줄에 대응한다** — 실제 상한은 사용자가 승인 카드에서
+   * 확정한 `maxCalls`이고, 여기 있는 것은 **제품이 제안하는 값이자 그 제안의 천장**이다.
+   * 둘 다 여기 있어야 하는 이유는 원칙 5다: 사용자가 정한 값이 유일한 상한이면 상한이
+   * 사용자 입력에 의존하게 되고, **봉투가 무제한이면 상한이 아니다.**
+   */
+  escalationCalls: number; // 기본 2
 }
 
 export const DEFAULT_LOOP_LIMITS: TaskLoopLimits = {
@@ -79,21 +110,78 @@ export const DEFAULT_LOOP_LIMITS: TaskLoopLimits = {
   providerRetries: 3,
   mcpRounds: 1,
   contextRounds: 1,
+  planRounds: 2,
+  maxSubtasks: 8,
+  escalationCalls: 2,
 };
 
 /**
- * 사용자가 UI에서 고르는 실행 정책 (ui-wireframes.md / 작업 지침 4.9절).
- * - fast: TRIAGE가 simple로 분류하면 단일 모델 경로를 그대로 쓴다.
- * - verified: TRIAGE 결과와 무관하게 항상 standard(교차검증) 경로 — forceComplexityTier와 같다.
+ * 사용자가 UI에서 고르는 실행 정책 (state-machine 72.9절, ui-wireframes.md).
  *
- * 둘 중 어느 쪽이든 VERIFYING은 생략되지 않는다(CLAUDE.md 원칙 1).
+ * - `fast`: 계획자를 **하나** 부른다.
+ * - `verified`: 계획자를 **둘** 부르고 갈린 지점을 계획 승인 카드에 올린다(대조).
  *
- * **대조(executor ×2)는 이 축이 정한다.** `complexityTier`가 아니다 — `standard`는 사용자가
- * `verified`를 고른 경우와 `fast`인데 TRIAGE가 그렇게 분류한 경우 **둘 다**에서 나오고,
- * 후자에서 executor를 하나 더 부르면 `fast`를 고른 뜻이 사라진다
- * (state-machine-and-protocol.md 17.5절). tier는 교차검증을, 이 축은 대조를 켠다.
+ * 둘 중 어느 쪽이든 `VERIFYING`은 생략되지 않는다(CLAUDE.md 원칙 1).
+ *
+ * # 이 축은 `complexityTier`를 정하지 않는다
+ *
+ * 종전 주석은 *"verified: TRIAGE 결과와 무관하게 항상 standard"*라고 적었고 구현도 그랬다.
+ * **72.9절이 그것을 뒤집었다.** `verified`인 태스크도 TRIAGE가 `simple`로 분류하면
+ * `SINGLE_MODEL_FIX` 한 번으로 끝난다 — `verified`는 **"계획자를 둘 부르라"**는 지시이지
+ * "이 태스크를 어렵게 다루라"는 지시가 아니다.
+ *
+ * 사용자가 tier를 올리고 싶으면 **tier 축에서 올린다**(`forceComplexityTier`와 같은 축).
+ * 그 수단을 모드 축에 얹지 않는 것이 요점이다 — 얹으면 17.5절이 고친 혼동이 이름만 바꿔
+ * 돌아온다.
+ *
+ * # 둘이 되는 것은 executor가 아니라 계획자다
+ *
+ * 종전 주석의 뒷부분(*"대조(executor ×2)는 이 축이 정한다 … tier는 교차검증을, 이 축은
+ * 대조를 켠다"*)도 함께 뒤집힌다. 대조가 patch 단계에 있으면 서브태스크 분해가 들어오는
+ * 순간 **서브태스크마다 executor ×2**가 되어 N배가 되고, 불일치 카드를 붙일 게이트도 없다.
+ * 계획 단계로 옮기면 추가 호출은 1회, **추가 정지는 0**이다("마찰 0"이 아니다 — 카드가
+ * 붙으면 읽을 것이 는다).
+ *
+ * **기본값은 `verified`를 유지한다.** 바꾸지 않는 근거가 아니라 **뜻이 바뀌었다는 것이
+ * 근거다**: 종전 기본값은 TRIAGE 판정을 버리고, 게이트가 부정한 단계(patch 검수)를 켜고,
+ * 미측정 단계(대조)를 켰다. 재정의 뒤에는 TRIAGE가 살아나고, 부정된 단계는 물러났으며,
+ * 켜지는 것은 미측정 단계 하나에 호출 1회다.
  */
 export type ExecutionMode = "fast" | "verified";
+
+/**
+ * 사용자가 고르는 세 번째 축 — **어느 등급의 모델이 구현하는가**(72.9·72.10절).
+ *
+ * `EffortLevel`과 직교한다: 이쪽은 **모델 교체**, 저쪽은 **같은 모델의 추론 예산**이다.
+ *
+ * # clamp이지 선택이 아니다
+ *
+ * 등급을 직접 정하지 않고 **계획 모델의 판정을 어느 범위로 가두는지**만 정한다.
+ *
+ * - `economy`  위를 `economy`로 막는다 — 계획이 `frontier`라 해도 내린다
+ * - `balanced` **막지 않는다** — 계획 모델의 판정을 그대로 쓴다(항등)
+ * - `max`      아래를 `frontier`로 막는다 — 전부 `frontier`
+ *
+ * **위험 하한선은 clamp보다 세다.** `economy`를 골라도 `auth/`·`payment/` 경로의
+ * 서브태스크는 내려가지 않는다 — 사용자가 고르는 것은 **비용이지 위험 감수 수준이 아니고**,
+ * 후자를 비용 선택에 딸려 보내면 그 선택의 뜻이 달라진다.
+ *
+ * **계획은 이 축과 무관하게 frontier다.** 계획 호출은 한 번이고 출력이 작은데 그 한 번이
+ * 분해·등급·N개의 구현 호출을 전부 결정한다. 그리고 논리가 뒤집혀 있다 — **좋은 계획이 싼
+ * 구현을 가능하게 한다.** 계획자는 `economy` 프로파일의 희생자가 아니라 전제 조건이다.
+ *
+ * **기본값은 `balanced`다.** clamp를 걸지 않는 항등이라 기본값 공백과 동작이 같지만,
+ * **동작이 같다는 것이 적지 않아도 된다는 뜻은 아니다** — 적지 않으면 나중에 누가 기본을
+ * `economy`로 바꿀 때 그것이 기본값 변경인지 공백을 채우는 것인지 구별할 수 없고, 그 둘은
+ * 되돌리기 비용이 다르다. `balanced`를 고른 근거: 등급 판정을 계획 모델에게 맡긴다는 것이
+ * 이 설계의 입장이고, 기본값이 clamp를 걸면 제품이 그 입장을 스스로 뒤집는다.
+ */
+export type PerformanceProfile = "economy" | "balanced" | "max";
+
+/** 72.9절 기본값. 축 둘을 **함께** 넣는다 — 하나만 먼저 넣으면 화면이 "나머지는 어디 있나"를 묻는다. */
+export const DEFAULT_PERFORMANCE_PROFILE: PerformanceProfile = "balanced";
+/** 72.9절 기본값. 항등에 가장 가까운 값이다. */
+export const DEFAULT_EFFORT_LEVEL: EffortLevel = "medium";
 
 export interface TaskPolicy {
   limits: TaskLoopLimits;
@@ -108,6 +196,30 @@ export interface TaskPolicy {
   /** 단일 명령 실행 상한 (ms) */
   commandTimeoutMs: number;
   executionMode: ExecutionMode;
+  /**
+   * 어느 등급의 모델이 **구현**하는가 (72.9절). 기본 `balanced`.
+   *
+   * **`effortLevel`과 함께 들어왔다.** 축을 하나만 먼저 넣지 않는 이유는 화면이
+   * "나머지는 어디 있나"를 묻는 상태로 커밋되기 때문이다(72.15절).
+   */
+  performanceProfile: PerformanceProfile;
+  /**
+   * 고른 모델을 **얼마나 깊게** 굴리는가 (72.9절). 기본 `medium`.
+   *
+   * **역할별로 나누지 않는다 — 태스크 하나에 값 하나다.** 근거는 "그 자리들을 사용자가 못
+   * 고르니까"가 **아니다**(검수자는 지정할 수 있다). 진짜 근거는 더 단순하다: **축 하나를
+   * 넷으로 쪼개는 값어치를 우리가 모른다.** 역할별 effort가 결과를 바꾸는지는 재지 않았고,
+   * 축은 늘리기보다 줄이기가 비싸다. 여기서 미루는 것은 축 자체가 아니라 **축의 분해능**이다.
+   *
+   * **손잡이가 없는 모델이 있다**(`ModelEntry.effort`가 `{ kind: "none" }`). 그 경우 이 축은
+   * 아무것도 하지 않으며, **그 사실이 화면에 있어야 한다** — 없으면 사용자는 올린 슬라이더만큼
+   * 더 생각한 결과를 받았다고 읽는다.
+   *
+   * **비용에 대해 말할 수 있는 것은 방향뿐이다.** effort를 올리면 추론 토큰이 늘어 비용이
+   * 늘지만 **얼마나 느는지는 호출 전에 모른다.** 그래서 승인 카드는 이 축을 금액에 곱하지
+   * 않는다 — 모르는 배수를 지어내 곱하면 카드가 정확해 보이는 만큼 정확히 틀린다.
+   */
+  effortLevel: EffortLevel;
   /**
    * **무인 실행인가** (Autopilot — product-strategy 8.2절, state-machine 24절).
    *
@@ -221,6 +333,11 @@ export const DEFAULT_TASK_POLICY: TaskPolicy = {
   allowGitCommit: false,
   commandTimeoutMs: 120_000,
   executionMode: "verified",
+  // 72.9절의 축 둘. **함께 적는다** — `balanced`/`medium`은 항등에 가장 가까운 값이고,
+  // 기본값 공백과 동작이 같더라도 적어 두어야 나중에 누가 바꿀 때 그것이 **변경인지
+  // 공백 채우기인지** 구별된다. 그 둘은 되돌리기 비용이 다르다.
+  performanceProfile: DEFAULT_PERFORMANCE_PROFILE,
+  effortLevel: DEFAULT_EFFORT_LEVEL,
   // **기본은 사람이 있다고 본다.** 무인이 기본이면 UI 경로가 실수로 무인 규칙을 타게 되고,
   // 그건 완료로 보고돼야 할 것을 실패로 만든다.
   unattended: false,
@@ -320,6 +437,22 @@ export interface TaskCounters {
   mcpRounds: number;
   /** 모델의 요청으로 파일을 더 읽고 다시 물은 라운드 수 (state-machine 57절). */
   contextRounds: number;
+  /**
+   * 계획을 다시 세운 횟수 (72.11절). **경로 셋이 같은 카운터를 쓴다.**
+   *
+   * 계획을 **고치지 않고** 다시 승인하는 고리는 이 값을 올리지 않는다 — `OUTLINING`을
+   * 지나지 않기 때문이다. 그 고리가 B 호출만 늘리는 것은 "계획이 바뀌지 않았으면 B를 다시
+   * 부르지 않는다"가 막는다(계획 지문으로 판정한다).
+   */
+  planRounds: number;
+  /**
+   * 런타임 에스컬레이션을 **실제로 부른** 횟수 (72.10.2절).
+   *
+   * **요청 수가 아니다.** 요청/호출/거절 셋은 서로 다른 수이고, 거절을 세지 않으면
+   * "요청 수"가 곧 "부른 수"가 되어 **남발이 상한에 가려 보이지 않는다**(72.14절).
+   * 요청과 거절은 이벤트로 남고 이 카운터는 **봉투와 비교되는 값**이라 호출만 센다.
+   */
+  escalationCalls: number;
   toolRetries: Record<string, number>;
   providerRetries: Record<string, number>;
 }
