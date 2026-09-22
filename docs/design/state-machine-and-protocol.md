@@ -78,16 +78,46 @@ stateDiagram-v2
 
 `TRIAGE`/`SINGLE_MODEL_FIX`는 13절(Phase 0 스파이크 결과 반영)에서 추가된 상태다 — 원래 설계에는 없었고, 스파이크가 "쉬운 태스크에서는 교차검증이 정확도 이득 없이 비용/지연만 늘린다"는 걸 실측으로 보여준 뒤 반영되었다. `SINGLE_MODEL_FIX`의 verdict 처리(REJECT/NEED_USER_INPUT 분기, tier 승격 규칙)는 14.1절에서 마무리했다.
 
+> ### 이 다이어그램의 `standard` 경로는 72절에서 재정의됐다
+>
+> 위 그림에서 **`TRIAGE → DRAFTING → REVIEWING → PLANNING`** 구간은 `complexityTier = standard`
+> 일 때의 경로이고, **72절**이 그 구간을 통째로 바꾼다. **`simple` 경로(`TRIAGE → SINGLE_MODEL_FIX → PLANNING → …`)와 취소·중단·터미널
+> 구조는 그대로다.**
+>
+> ```
+> TRIAGE ──standard──→ OUTLINING → AWAITING_PLAN_APPROVAL → PLAN_REVIEWING
+>                         → [IMPLEMENTING → PLANNING → AWAITING_APPROVAL → EXECUTING] × 서브태스크
+>                         → VERIFYING ⇄ FIX_LOOP
+>                         → RESULT_REVIEWING → AWAITING_USER_VERIFICATION → COMPLETED
+> ```
+>
+> - `DRAFTING`·`REVIEWING`은 **`standard`에서 진입하지 않는다.** phase와 타입은 지우지 않는다
+>   — 과거 태스크의 기록이 그 이름을 쓰고 있다(72.3절).
+> - 새 phase 다섯이 늘어난다: `AWAITING_PLAN_APPROVAL` · `PLAN_REVIEWING` · **`IMPLEMENTING`** ·
+>   `RESULT_REVIEWING` · `AWAITING_USER_VERIFICATION`. `OUTLINING`/`OUTLINED`는 53절 것을
+>   재사용하고(72.2절), **`PLANNING`·`AWAITING_APPROVAL`·`EXECUTING`은 뜻 그대로 쓴다**(72.2.2절).
+> - 루프 상한 셋이 늘어난다 — 2.2절 표에 있다.
+>
+> **다이어그램을 한 장으로 합치지 않는 이유**: 두 경로를 한 그림에 넣으면 스무 개가 넘는
+> 상태가 얽혀 읽을 수 없게 된다. 이 그림은 `simple`과 공통 골격의 정본이고, `standard`
+> 경로의 정본은 72.2절이다.
+
 ### 2.1 Phase 설명 및 종료 조건
 
 | Phase | 담당 | 진입 조건 | 종료/전이 |
 |---|---|---|---|
 | `CREATED` | Orchestrator | TaskRequest 수신 | 즉시 SNAPSHOTTING |
 | `SNAPSHOTTING` | Context Engine | - | WorkspaceSnapshot 생성 완료 → TRIAGE |
-| `TRIAGE` | Orchestrator | WorkspaceSnapshot 완료 | 13.2절 규칙으로 `complexityTier` 결정 → standard면 DRAFTING, simple이면 SINGLE_MODEL_FIX |
-| `DRAFTING` | OpenAI Provider | Snapshot + (재질문 시) 사용자 답변 | DraftProposal 수신 → REVIEWING |
-| `SINGLE_MODEL_FIX` | Claude Provider | Snapshot (OpenAI 초안 없음) | `SingleModelFixResult.verdict`(REVISE 없이 ACCEPT/NEED_USER_INPUT/REJECT 중 하나)에 따라 PLANNING/AWAITING_USER_INPUT/REJECTED로 분기 |
-| `REVIEWING` | Claude Provider | DraftProposal + 동일 Snapshot | ReviewDecision.verdict에 따라 4갈래 분기 |
+| `TRIAGE` | Orchestrator | WorkspaceSnapshot 완료 | 13.2절 규칙으로 `complexityTier` 결정 → ~~standard면 DRAFTING~~ **standard면 `OUTLINING`(72절)**, simple이면 SINGLE_MODEL_FIX |
+| `DRAFTING` | 실행자 Provider | Snapshot + (재질문 시) 사용자 답변 | DraftProposal 수신 → REVIEWING. **`standard` 경로에서는 진입하지 않는다(72.3절).** 과거 기록이 이 이름을 쓰므로 지우지 않는다 |
+| `SINGLE_MODEL_FIX` | 단일 Provider | Snapshot (대조 초안 없음) | `SingleModelFixResult.verdict`(REVISE 없이 ACCEPT/NEED_USER_INPUT/REJECT 중 하나)에 따라 PLANNING/AWAITING_USER_INPUT/REJECTED로 분기 |
+| `REVIEWING` | 검수자 Provider | DraftProposal + 동일 Snapshot | ReviewDecision.verdict에 따라 4갈래 분기. **`standard` 경로에서 물러났다(72.3절)** — 그 일은 B·결정론적 검증·C가 나눠 가진다 |
+| `OUTLINING` | 계획자 Provider | Snapshot (53절 계획 모드 / 72절 standard 경로) | `PlanOutline` 수신 → 계획 모드면 `OUTLINED`(터미널), standard면 `AWAITING_PLAN_APPROVAL` |
+| `AWAITING_PLAN_APPROVAL` | UI | `PlanOutline` 확정 | 사용자 선택 넷(72.4절): 승인+검토 → PLAN_REVIEWING / 승인+검토생략 → EXECUTING / 수정 요청 → OUTLINING(`planRounds++`) / 거부 → REJECTED |
+| `PLAN_REVIEWING` | 계획 검토자(B) | 승인된 `PlanOutline` | 쟁점 없음 → IMPLEMENTING, 쟁점 있음 → 불일치 카드 → 사용자 |
+| `IMPLEMENTING` | 구현 Provider (등급은 72.10절) | 서브태스크 하나 | `DraftProposal`(patch·moves·deletions) 수신 → PLANNING. 남은 서브태스크가 있으면 EXECUTING 뒤 다시 여기로, 없으면 VERIFYING (72.2.2절) |
+| `RESULT_REVIEWING` | 결과 검토자(C) | **`VERIFYING` 통과 후에만** | 계획 일치 판정 넷(72.7절)을 체크리스트로 → AWAITING_USER_VERIFICATION |
+| `AWAITING_USER_VERIFICATION` | UI | 체크리스트 생성 완료 | 승인 → 커밋 → COMPLETED / 거부 → 72.8절 귀환 경로 셋 중 사용자 선택 |
 | `AWAITING_USER_INPUT` | UI | verdict = NEED_USER_INPUT (REVIEWING 또는 SINGLE_MODEL_FIX 양쪽에서 진입 가능) | 사용자 응답 → DRAFTING(항상 standard 경로, 14.1절), 취소 → CANCELLED |
 | `PLANNING` | Orchestrator | ACCEPT/REVISE 확정, SINGLE_MODEL_FIX 완료, 또는 FIX_LOOP에서 복귀 | 결과를 ExecutionPlan(ToolRequest[])으로 변환 |
 | `AWAITING_APPROVAL` | Policy Gate + UI | ExecutionPlan 내 riskTier != auto | 사용자 승인/거부 |
@@ -106,6 +136,11 @@ stateDiagram-v2
 | `reviseRounds` | REVISE verdict 수신 시 (실행 전 단계) | 2 | 강제로 REJECTED 처리, "OpenAI/Claude가 계획에 합의하지 못함" 사유 기록 |
 | `fixLoopRounds` | VERIFYING → fail 판정 시 | 3 | FAILED, 마지막 diff/로그를 사용자에게 제시하고 수동 개입 요청 |
 | `toolRetries[requestId]` | ToolResult.status = timeout/transient error | 2 (지수 백오프) | 해당 ToolRequest를 `error`로 확정, EXECUTING 전체를 FAILED로 전이 |
+| `planRounds` | `OUTLINING` 재진입 시 (**경로 셋** — 72.11절) | 2 | 계획을 다시 세우지 않는다. 남는 선택지는 `FIX_LOOP` 재진입과 되돌리기뿐 |
+| `maxSubtasks` | 계획이 서브태스크를 선언할 때 | 8 | 계획을 거부하고 사용자에게 쪼개 달라고 올린다 |
+| `fixLoopRoundsTotal` | `fixLoopRounds`와 **함께** 증가 | 12 | 서브태스크별 상한이 남아 있어도 태스크 전체를 FAILED로 |
+
+아래 셋은 72절의 `standard` 흐름에서만 쓰인다. `simple` 경로는 위 넷만 쓴다.
 
 모든 상한 값은 `TaskPolicy` 설정(워크스페이스별 override 가능)에서 읽는다. 하드코딩하지 않는다.
 
@@ -1192,7 +1227,8 @@ process-architecture.md 2절의 신뢰 모델("Node가 완전히 장악당해도
 
 > **이 결론은 조건부였고, 그 조건이 사라졌다(72절).**
 >
-> 게이트는 실제로 이득 없음을 확인했다(2.1절 FAIL). 그러므로 위 문단의 논리대로면 오분류
+> 게이트는 실제로 이득 없음을 확인했다(product-strategy 13.0절, Protocol v1 FAIL). 그러므로
+> 위 문단의 논리대로면 오분류
 > 20건은 절약이고 이 항목은 닫힌다. **그런데 그 논리가 서 있던 전제는 `standard`가
 > 곧 교차검증이라는 것이었다.**
 >
@@ -1232,8 +1268,8 @@ product-strategy 5절이 이미 후보를 적어두었다: *"TRIAGE 판정 신�
 잡음이 섞이면 이 신호는 "전부 standard"로 수렴하고, 그건 TRIAGE를 죽이는 것과 같다. 디렉터리
 조각이 정확히 같거나 파일명을 `.`/`-`/`_`로 자른 조각이 같을 때만 인정한다.
 
-**`public API 변경`은 넣지 않았다.** ~~심볼 분석이 있어야 판정할 수 있는데 Tree-sitter는 아직
-없다(context-engine 9절).~~ 경로 이름으로 그것을 흉내 내면 맞을 때보다 틀릴 때가 많다 —
+**`public API 변경`은 넣지 않았다.** 심볼 분석이 있어야 판정할 수 있는데 ~~Tree-sitter는 아직
+없다(context-engine 9절)~~. 경로 이름으로 그것을 흉내 내면 맞을 때보다 틀릴 때가 많다 —
 없는 신호를 있는 척하지 않는다.
 
 > **취소선은 보류 *사유*에만 걸린다. 결론은 아직 참이다.** Tree-sitter 심볼·의존성 그래프는
@@ -8128,8 +8164,12 @@ SNAPSHOTTING → TRIAGE
                        ↓
                    PLAN_REVIEWING             B (≠ 계획자 공급자)
                        ↓                        쟁점 → 불일치 카드 → 사용자
-                   EXECUTING ⇄ AWAITING_APPROVAL   서브태스크별 등급 배정
-                       ↓
+                   ┌─ 서브태스크마다 (72.2.2절) ────────────────┐
+                   │  IMPLEMENTING   구현 모델 호출 (등급별)     │
+                   │      ↓                                     │
+                   │  PLANNING → AWAITING_APPROVAL → EXECUTING  │
+                   └────────────────────────────────────────────┘
+                       ↓ 전부 끝나면
                    VERIFYING ⇄ FIX_LOOP       ← 최종 판정자 (원칙 1)
                        ↓ 통과했을 때만
                    RESULT_REVIEWING           C (∉ 구현자 공급자)
@@ -8171,9 +8211,20 @@ multi-engine-routing 13.1절이 co-executor에 새 역할 이름을 주지 않�
   `draft_proposal` / `user_message`)에 접어 넣지 않는 이유는 그 필드의 존재 이유 그대로다 —
   **출처마다 권위가 다르고**, 사용자 승인을 지난 계획에서 온 기준은 초안이 스스로 적은 기준과
   같은 무게가 아니다. 뭉개면 체크리스트가 그 차이를 말하지 못한다.
-- 계획 대조의 판정 가능한 필드는 `doneCriteria`와 **`PlanOutline.filesToChange`**다.
-  `targetPaths`는 `PlanStep`의 필드라 이 경로에 없다 — 같은 질문("어디를 고칠 것인가")에
-  대응하는 자리가 `filesToChange`이므로 `DisagreementField`가 그것을 가리켜야 한다.
+- **`PlanOutline.requiredTests: string[]`** — `DisagreementField` 셋 중 하나이고 계획 경로에
+  생산자가 없었다. 계획 단계에서 답할 수 있는 질문이며(무엇으로 판정할 것인가), 17.9절의
+  기준↔테스트 연결이 그 값을 쓴다.
+
+- **`DisagreementField`는 질문의 이름이지 소스 필드의 이름이 아니다.** 타입을 갈라 계획용
+  세트를 새로 만들지 않는다 — 갈리면 `DISAGREEMENT_FIELD_RANK`와 17.4절 질문 예산이 경로마다
+  달라지고, 그 둘은 "무엇을 먼저 물을 것인가"를 정하는 규칙이라 경로별로 다르면 사용자가
+  받는 질문의 순서가 이유 없이 갈린다.
+
+  | 질문 (`DisagreementField`) | 초안 경로의 소스 | 계획 경로의 소스 |
+  |---|---|---|
+  | `doneCriteria` | `DraftProposal.doneCriteria` | `PlanOutline.doneCriteria` |
+  | `requiredTests` | `DraftProposal.requiredTests` | `PlanOutline.requiredTests` |
+  | `targetPaths` | `DraftProposal.plan[].targetPaths` | **`PlanOutline.filesToChange`** |
 
   **`PlanOutlineStep.files`를 쓰지 않는 이유**: 독립으로 만든 두 계획은 **단계가 정렬되지
   않는다.** 한쪽의 3단계와 다른 쪽의 2단계가 같은 일일 수 있으므로 step 단위로 비교하면
@@ -8183,6 +8234,56 @@ multi-engine-routing 13.1절이 co-executor에 새 역할 이름을 주지 않�
 
 **`patch` 자리는 여전히 두지 않는다**(53.5절). 완료 기준은 서술이고 patch는 산출물이다 —
 전자를 더한다고 후자를 더할 이유가 되지 않으며, 계획 모드가 아끼려는 토큰이 바로 후자다.
+
+### 72.2.2 그러면 **patch는 누가 만드는가** — 구현 단계에 phase가 없었다
+
+72.2.1은 `doneCriteria`의 생산자가 사라진 것을 잡았지만 **같은 구멍이 하나 더 있었다.**
+종전 `standard` 경로에서 patch를 만든 것은 `DRAFTING`이고 그것을 `ToolRequest[]`로 바꾼 것은
+`PLANNING`이다. `DRAFTING`이 물러났는데(72.3절) **그 일을 넘겨받은 자리를 적지 않았다.**
+72.2의 흐름도가 `EXECUTING` 한 칸에 "서브태스크별 등급 배정"이라고만 적어 **모델을 부르는
+일과 도구를 실행하는 일을 한 이름에 뭉개고 있었다.**
+
+#### `PLANNING`과 `AWAITING_APPROVAL`은 **뜻 그대로 계속 쓴다**
+
+72.2절의 *"`PLANNING`과 `AWAITING_APPROVAL`을 재사용하지 않는다"*는 **계획 승인 게이트의
+이름으로 쓰지 않는다**는 뜻이지 그 단계를 없앤다는 뜻이 아니다. 둘은 각각 "patch를 도구
+호출로 쪼갠다"와 "도구 실행 승인"을 그대로 한다 — 오히려 그 뜻을 지키려고 새 이름을 만든
+것이다. 초안의 문장이 그 구별을 하지 않아 "그 단계가 흐름에 없다"로 읽혔다.
+
+#### 서브태스크 하나가 도는 주기
+
+```
+IMPLEMENTING  구현 모델 호출 (서브태스크 하나, 등급은 72.10절이 정한다)
+     ↓        → DraftProposal (patch·moves·deletions). 대조하지 않으므로 초안은 하나다
+PLANNING      ExecutionPlan(ToolRequest[])으로 변환 — 기존 뜻 그대로
+     ↓
+AWAITING_APPROVAL / EXECUTING   기존 뜻 그대로
+     ↓
+다음 서브태스크로, 전부 끝나면 VERIFYING
+```
+
+**`IMPLEMENTING`이 새 phase다.** `DRAFTING`을 재사용하지 않는 이유는 그 이름이 **대조를 전제**
+하기 때문이다(`DRAFTING → REVIEWING`, 초안 둘). 여기서는 초안이 하나이고 검토는 이미 계획
+단계에서 끝났다. `SINGLE_MODEL_FIX`도 쓰지 않는다 — 그건 `simple` tier의 경로 이름이라
+`standard` 태스크의 기록에 그 이름이 남으면 tier 집계가 오염된다.
+
+#### 서브태스크 타입을 선언한다
+
+`Subtask`류 타입은 저장소에 없다. 새로 선언해야 하며, **계획이 만들고 B가 검토하고 라우터가
+등급을 배정하는 그 단위**다.
+
+| 필드 | 왜 필요한가 |
+|---|---|
+| `subtaskId` | 이벤트·서브태스크별 상한·부분 실패 보고가 가리킬 키 |
+| `intent` | 무엇을 하는가 (`PlanOutlineStep.intent`에서 온다) |
+| `files` | 건드릴 것으로 보이는 파일 — 등급 하한선 판정(72.10절)의 입력 |
+| `grade` | 계획 모델의 판정 + 경로 기반 하한선을 적용한 **최종** 등급 |
+
+**`PlanOutlineStep`을 그대로 쓰지 않는 이유**: 그 타입은 **사용자에게 보여주는 서술**이고
+(53절), 여기 `grade`를 얹으면 화면용 타입이 라우팅과 비용을 정하게 된다. 45.2절이
+`PlanStep.toolHint`를 실행 근거에서 떼어낸 것과 같은 이유다 — **서술과 실행 단위를 한 타입에
+두면 모델이 말을 바꾸는 것이 곧 실행을 바꾸는 것이 된다.** 서브태스크는 계획에서 **유도**되고,
+유도가 일어나는 시점은 사용자 승인 뒤다.
 
 #### 화면 단계는 **변경 경로의 순서를 빌리지 않는다**
 
@@ -8306,8 +8407,10 @@ multi-engine-routing 13.1절이 co-executor에 새 역할 이름을 주지 않�
 
 ### 72.6 B — 계획 독립 검토
 
-- **공급자가 계획자와 다르다.** multi-engine-routing 5절 불변식의 적용 대상이 patch에서 계획으로
-  옮겨온 것이다.
+- **공급자가 살아남은 계획의 저자와 다르다.** multi-engine-routing 5절 불변식의 적용 대상이
+  patch에서 계획으로 옮겨온 것이다. **"계획자와 다르다"가 아니다** — 대조가 켜지면 계획자가
+  둘이고, 요건을 그렇게 적으면 공급자 2개에서 B가 언제나 드롭된다. 배정 규칙과 그 대가의
+  표시는 [multi-engine-routing 21.6절](./multi-engine-routing.md)이 정본이다.
 - **검토 항목에 분해와 등급 배정을 명시적으로 포함한다.** 거기서 돈과 품질이 동시에
   결정되는데(72.10절), 아무도 보지 않으면 그 결정만 검토 밖에 남는다.
 - 산출물은 verdict가 아니라 **쟁점 목록**이다. 카드로 올라가거나 주석으로 남는다.
@@ -8590,7 +8693,39 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 답할 수 있고, 답이 "없다"면 그 단계를 드롭할 근거가 된다. 라우팅 결정을 처음부터 전부 기록해 둔
 것과 같은 수법이다(multi-engine-routing 8절).
 
-### 72.15 다음으로 구체화할 것
+### 72.15 이 절이 바꾸는 **정본 목록** — 한곳에 모아 둔다
+
+이 절은 핵심 흐름을 바꾸므로 여러 문서의 **정본 목록**(상태 다이어그램, phase 표, 상한 표,
+역할 표, 화면 매핑)이 동시에 낡는다. 검토에서 그 자리가 **한 라운드에 하나씩** 발견됐고,
+그 이유는 분명하다 — 바뀌는 자리의 목록이 없으면 완결성을 확인할 방법이 사람의 기억뿐이다.
+
+그래서 목록을 여기 둔다. **새 자리를 발견하면 고치는 것으로 끝내지 말고 이 표에 줄을 더할 것.**
+
+| 정본 | 무엇이 바뀌었나 | 상태 |
+|---|---|---|
+| 2절 상태 다이어그램 | `standard` 구간이 통째로 대체됨 | 주석 + 대체 경로 표기 |
+| 2.1절 phase 표 | `TRIAGE` 분기, `DRAFTING`·`REVIEWING` 퇴장, 새 phase 다섯 | 갱신 |
+| 2.2절 루프 상한 표 | `planRounds`·`maxSubtasks`·`fixLoopRoundsTotal` | 추가 |
+| 17.5절 | `verified`가 tier를 강제하던 것 | 취소선 + 대체 축 |
+| [multi-engine 1절](./multi-engine-routing.md) 보류 표 | xAI / planner·executor 분리 | 취소선 + 근거 |
+| multi-engine 4절 | `planner` 기본 비활성, `reviewer` = `REVIEWING` | 취소선 + 대체 |
+| multi-engine 10절 | "planner/executor 분리 실행" 미채택 | 취소선 |
+| multi-engine 13.4절 | 호출 수 표, 대조의 대상 | 취소선 + 전후 대조 |
+| [ui-wireframes 2절](./ui-wireframes.md) | 5단계 매핑이 `standard`를 못 덮음 | 주석 + 정본 이관 |
+| [product-strategy 13.0.1·13.0.2](./product-strategy.md) | 게이트 결론 인용문, 보류 두 항목 | 취소선 + 근거 |
+
+**아직 바꾸지 않았고, 구현 시점에 반드시 함께 바꿔야 하는 것:**
+
+- `packages/protocol/src/task.ts`의 `ExecutionMode` 주석 — *"verified: TRIAGE 결과와 무관하게
+  항상 standard"*. **지금은 그 주석이 코드를 정확히 설명한다**(구현이 아직 그렇게 동작한다).
+  72.9절을 구현하는 순간 거짓이 되므로 같은 커밋에서 고쳐야 한다. product-strategy 4.2절이
+  **문서만 고치고 코드에 남은 예고를 지우지 않아 다음 사람이 문서가 아니라 그 주석을 읽게 된**
+  사례를 이미 기록했다.
+- product-strategy 3절 자기 진단 표와 8.2절 출시 기준 표 — 마커(`<!-- present: -->`)가 붙는
+  행들이라 **파일이 생긴 뒤에** 고친다. 지금 고치면 `docStatus.test.ts`가 없는 파일을 가리켜
+  실패한다.
+
+### 72.16 다음으로 구체화할 것
 
 - **배포 단계.** 시장 분석 뒤에 정한다(72.13절). 정의가 서기 전에는 phase를 만들지 않는다.
 - **TRIAGE의 판돈이 커졌는데 잴 세트가 없다.** 오분류의 대가가 `FIX_LOOP` 1회에서 **사용자
