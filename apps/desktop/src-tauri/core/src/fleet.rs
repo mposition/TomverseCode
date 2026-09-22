@@ -255,7 +255,10 @@ pub fn plan(
 /// 구성원 하나를 시작해도 되는가에 대한 답.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Admission {
-    /// 시작해도 된다. 예약된 금액(합계 상한이 없으면 `None`).
+    /// 시작해도 된다. **지금 잡은 금액**(합계 상한이 없으면 `None`).
+    ///
+    /// 72.12절 뒤로 이 값은 태스크당 상한 전부가 아니라 **계획 단계 몫**이다. 나머지는
+    /// 계획이 승인될 때 [`FleetBudget::reserve_implementation`]이 잡는다.
     Admitted { reserved_usd: Option<f64> },
     /// 시작할 수 없다. **지금 도는 구성원이 정산되면 달라질 수 있다.**
     Refused {
@@ -266,6 +269,52 @@ pub enum Admission {
     },
 }
 
+/// 계획 승인 시점에 나머지를 **확정한** 결과 — 72.12절.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImplementationStage {
+    /// 확정할 것이 없다: 합계 상한이 없거나, 이 구성원이 예약을 갖고 있지 않다.
+    /// **"0을 잡았다"가 아니다** — 없는 것과 0은 다른 사실이다(`budget.rs`의 같은 규율).
+    NotTracked,
+    /// 나머지를 카드 금액으로 줄였다. `freed_usd`는 **다른 구성원이 쓸 수 있게 된 금액**이다.
+    ///
+    /// `priced`가 거짓이면 카드가 금액으로 말하지 못한 배정이 있었다는 뜻이고, 그 경우
+    /// 나머지를 **줄이지 않는다** — 모르는 것을 0으로 보는 것이 가장 위험하다.
+    Staged {
+        held_usd: f64,
+        freed_usd: f64,
+        priced: bool,
+    },
+    /// 이미 확정돼 다시 하지 않았다. 같은 승인이 두 번 관측돼도 예약이 두 번 움직이지 않는다.
+    AlreadyStaged,
+}
+
+/// 구성원 하나가 **계획 단계에** 잡는 몫의 비율 — 72.12절의 "예약을 단계로 나눈다".
+///
+/// **측정값이 아니다.** `PlanOutline`에는 patch가 없으므로 계획 호출이 구현보다 싸다는 것만
+/// 확실하고, 얼마나 싼지는 모델·분해 수에 따라 달라진다. 가설 게이트가 실제 계획/구현 비용
+/// 비를 낼 수 있는 자리다(72.16절).
+///
+/// 이 값이 틀려도 **상한은 깨지지 않는다.** 입장 판정은 두 몫의 **합**(= 태스크당 상한)을
+/// 보기 때문이다 — 비율은 *어디까지가 계획 몫인가*만 가른다.
+pub const PLANNING_SHARE: f64 = 0.25;
+
+/// 구성원 하나가 잡고 있는 금액. 단계로 나뉘어 있고, **둘의 합이 이 구성원의 노출**이다.
+#[derive(Debug, Clone, Copy, Default)]
+struct Held {
+    planning_usd: f64,
+    /// 아직 확정되지 않은 구현 몫. 입장 시점에는 *태스크당 상한 − 계획 몫*이고, 계획이
+    /// 승인되면 **승인 카드가 보여준 금액으로 줄어든다.**
+    remainder_usd: f64,
+    /// 승인 시점에 확정됐는가. 두 번 확정하지 않기 위한 표시다.
+    staged: bool,
+}
+
+impl Held {
+    fn total(&self) -> f64 {
+        self.planning_usd + self.remainder_usd
+    }
+}
+
 /// Fleet 합계 예산 원장 — **예약 후 정산**.
 ///
 /// # 왜 합계 비교만으로 부족한가
@@ -274,16 +323,49 @@ pub enum Admission {
 /// 구성원들이 아직 쓰지 않은 돈이 없는 것처럼 보여 새 구성원을 들여보내게 된다. 그 순간 상한은
 /// **동시에 도는 구성원 수만큼** 초과될 수 있다. (같은 실수를 가설 게이트에서 한 번 했다 —
 /// multi-engine-routing.md 10.7절.)
+///
+/// # 예약은 **단계로** 나뉜다 (72.12절)
+///
+/// 구성원이 사용자 게이트 앞에서 사람을 기다리는 동안 태스크당 상한 전부가 잠겨 있으면,
+/// Fleet 병렬성이 사람의 대기 시간만큼 죽는다. 그래서 예약을 계획 몫과 구현 몫으로 나눈다.
+///
+/// ## 나누되 **합은 줄이지 않는다** — 입장 판정에서는
+///
+/// 처음 쓴 것은 "입장 시점에 계획 몫만 잡는다"였고, `the_aggregate_cap_is_never_exceeded…`가
+/// 그것을 즉시 잡았다: 상한 $10 / 태스크당 $3에 구성원이 **10개** 들어갔다. 잡아 둔 금액만
+/// 세면 아직 오지 않은 구현 비용이 없는 것처럼 보이고, 그건 이 모듈 머리말이 경계한 바로 그
+/// 실수를 한 층 위에서 되풀이하는 것이다. **측정하지 않은 상수(`PLANNING_SHARE`)가 상한의
+/// 뜻을 정하게 두지 않는다.**
+///
+/// 그래서 입장 판정이 보는 것은 두 몫의 **합**, 즉 태스크당 상한 전부다. 이 점에서 판정은
+/// 분할 이전과 한 글자도 다르지 않고, **합계 상한은 그대로 딱딱하다.**
+///
+/// ## 그러면 분할이 실제로 버는 것은 무엇인가
+///
+/// **태스크당 상한과 계획의 실제 비용 사이의 차액이다.** 승인 카드는 그 계획이 얼마나 들지를
+/// 금액으로 말하고([`ImplementationStage`]), 그 금액은 거의 언제나 태스크당 상한보다 훨씬
+/// 작다. 승인 시점에 구현 몫을 **카드 금액으로 줄이면** 그 차액이 즉시 다른 구성원에게
+/// 열린다 — 분할 이전에는 그 돈이 태스크가 끝날 때까지 잠겨 있었다.
+///
+/// 이 방향은 [`reserve_implementation`](Self::reserve_implementation)이 노출을 **줄이기만**
+/// 한다는 뜻이기도 하다. 그래서 그 함수는 거절할 일이 없고(72.12절: *"사용자가 승인한 작업이
+/// 돈이 없어 멈추는 것은 잠기는 것보다 나쁘다"*), 승인된 작업이 예산 때문에 서는 경로도,
+/// 서로의 정산을 기다리는 교착도 생기지 않는다.
+///
+/// **카드가 금액으로 말하지 못하면 줄이지 않는다.** 가격을 모르는 배정이 섞인 카드에서
+/// 모르는 부분을 0으로 보면, 그 순간 상한이 조용히 사라진다.
 #[derive(Debug, Clone)]
 pub struct FleetBudget {
     cap_usd: Option<f64>,
     per_task_usd: Option<f64>,
     /// 정산이 끝난 지출의 누적.
     committed_usd: f64,
-    /// 지금 도는 구성원들이 잡아 둔 예약의 합.
-    reserved_usd: f64,
-    /// 열린 예약 수. 0인데 거부되면 **기다려도 달라지지 않는다.**
-    outstanding: usize,
+    /// 구성원별로 지금 잡고 있는 금액. **스케줄러가 금액을 들고 다니지 않는다** — 화면과
+    /// 헤드리스 두 루프가 각자 더하면 언젠가 갈리고, 갈린 예산은 화면에서 드러나지 않는다.
+    held: std::collections::BTreeMap<usize, Held>,
+    /// 승인 시점에 **다른 구성원에게 열어준** 금액의 누적. 이 분할이 실제로 무언가를 했다는
+    /// 유일한 관측 근거다 — 0이면 아무것도 벌지 못했다는 뜻이고, 그 사실도 사실이다.
+    staging_freed_usd: f64,
 }
 
 impl FleetBudget {
@@ -292,8 +374,8 @@ impl FleetBudget {
             cap_usd,
             per_task_usd,
             committed_usd: 0.0,
-            reserved_usd: 0.0,
-            outstanding: 0,
+            held: std::collections::BTreeMap::new(),
+            staging_freed_usd: 0.0,
         }
     }
 
@@ -320,32 +402,98 @@ impl FleetBudget {
     }
 
     pub fn reserved_usd(&self) -> f64 {
-        self.reserved_usd
+        self.held.values().map(Held::total).sum()
+    }
+
+    /// 승인 시점의 확정으로 다른 구성원에게 열어준 금액의 누적. **결과가 이걸 말해야 한다** —
+    /// 0이면 단계 분할이 이 Fleet에서는 아무것도 벌지 못했다는 뜻이다.
+    pub fn staging_freed_usd(&self) -> f64 {
+        self.staging_freed_usd
     }
 
     pub fn outstanding(&self) -> usize {
-        self.outstanding
+        self.held.len()
+    }
+
+    /// 이 구성원이 지금 잡고 있는 금액. 정산 이벤트와 보고서가 **여기서** 읽는다.
+    pub fn held_for(&self, member: usize) -> Option<f64> {
+        self.held.get(&member).map(Held::total)
     }
 
     /// 구성원 하나를 들여보낼 수 있는가. 가능하면 **그 자리에서 예약한다.**
-    pub fn try_admit(&mut self) -> Admission {
+    ///
+    /// 판정도 예약도 태스크당 상한 **전부**다 — 위 머리말의 이유. 나뉘는 것은 그 금액이
+    /// 계획 몫과 구현 몫으로 **표시되는 방식**이고, 구현 몫은 승인 때 줄어든다.
+    pub fn try_admit(&mut self, member: usize) -> Admission {
         let (Some(cap), Some(per_task)) = (self.cap_usd, self.per_task_usd) else {
-            // 합계 상한이 없으면 예약할 것이 없다. 열린 예약 수는 세지 않는다 — 세면
+            // 합계 상한이 없으면 예약할 것이 없다. 열린 예약으로 세지 않는다 — 세면
             // "기다리면 달라지는가"의 답이 흐려진다(상한이 없으므로 언제나 들어간다).
             return Admission::Admitted { reserved_usd: None };
         };
-        if self.committed_usd + self.reserved_usd + per_task > cap {
+        let reserved = self.reserved_usd();
+        if self.committed_usd + reserved + per_task > cap {
             return Admission::Refused {
                 cap_usd: cap,
                 committed_usd: self.committed_usd,
-                reserved_usd: self.reserved_usd,
+                reserved_usd: reserved,
                 per_task_usd: per_task,
             };
         }
-        self.reserved_usd += per_task;
-        self.outstanding += 1;
+        let planning = per_task * PLANNING_SHARE;
+        self.held.insert(
+            member,
+            Held {
+                planning_usd: planning,
+                remainder_usd: per_task - planning,
+                staged: false,
+            },
+        );
         Admission::Admitted {
             reserved_usd: Some(per_task),
+        }
+    }
+
+    /// 계획이 승인됐다 — **구현 몫을 카드 금액으로 확정한다**(72.12절).
+    ///
+    /// `estimated_usd`는 승인 카드가 보여준 금액이고, `priced`는 그 카드의 모든 배정이
+    /// 금액으로 환산됐는가다(`unpricedAssignments`가 비어 있는가). **거절하지 않는다** —
+    /// 이 함수는 노출을 줄이기만 하므로 거절할 일이 없고, 그래서 72.12절이 거부한 결말
+    /// (*"승인한 작업이 돈이 없어 멈춘다"*)도 교착도 생기지 않는다.
+    ///
+    /// 줄이지 않는 경우가 둘이다: 카드가 금액으로 말하지 못했을 때(`priced == false`),
+    /// 그리고 카드 금액이 남은 몫보다 클 때. 뒤쪽은 **올려 잡지 않는다**는 뜻이기도 하다 —
+    /// 구성원 하나의 지출은 자기 `TaskBudget`이 태스크당 상한으로 막는다.
+    pub fn reserve_implementation(
+        &mut self,
+        member: usize,
+        estimated_usd: Option<f64>,
+        priced: bool,
+    ) -> ImplementationStage {
+        if self.cap_usd.is_none() || self.per_task_usd.is_none() {
+            return ImplementationStage::NotTracked;
+        }
+        let Some(held) = self.held.get_mut(&member) else {
+            return ImplementationStage::NotTracked;
+        };
+        if held.staged {
+            return ImplementationStage::AlreadyStaged;
+        }
+        held.staged = true;
+        let before = held.remainder_usd;
+        // **모르는 것을 0으로 보지 않는다.** 그 순간 상한이 조용히 사라진다.
+        let target = match estimated_usd {
+            Some(usd) if priced && usd.is_finite() && usd >= 0.0 => usd.min(before),
+            _ => before,
+        };
+        held.remainder_usd = target;
+        let freed = before - target;
+        if freed > 0.0 {
+            self.staging_freed_usd += freed;
+        }
+        ImplementationStage::Staged {
+            held_usd: held.total(),
+            freed_usd: freed,
+            priced,
         }
     }
 
@@ -354,11 +502,8 @@ impl FleetBudget {
     /// `actual_usd`는 저장소가 집계한 값이다(**Node의 주장이 아니라 `provider_usage` 행**).
     /// 예약보다 클 수 없지만, 가격을 모르는 모델처럼 집계가 커질 여지가 있는 경우를 위해
     /// 잘라내지 않고 그대로 누적한다 — 상한을 넘긴 사실을 지우는 것이 가장 나쁘다.
-    pub fn settle(&mut self, reserved_usd: Option<f64>, actual_usd: f64) {
-        if let Some(reserved) = reserved_usd {
-            self.reserved_usd = (self.reserved_usd - reserved).max(0.0);
-            self.outstanding = self.outstanding.saturating_sub(1);
-        }
+    pub fn settle(&mut self, member: usize, actual_usd: f64) {
+        self.held.remove(&member);
         if actual_usd.is_finite() && actual_usd > 0.0 {
             self.committed_usd += actual_usd;
         }
@@ -366,7 +511,86 @@ impl FleetBudget {
 
     /// 지금 거부됐다면, **기다리면 달라지는가.** 열린 예약이 없으면 달라지지 않는다.
     pub fn waiting_could_help(&self) -> bool {
-        self.outstanding > 0
+        !self.held.is_empty()
+    }
+}
+
+/// 구성원의 이벤트 흐름에서 `PLAN_APPROVED` **하나만** 골라 스케줄러에 알린다 — 72.12절.
+///
+/// # 왜 이 자리가 공유 코드인가
+///
+/// 합계 예약을 단계로 나누려면 스케줄러가 "이 구성원이 승인을 받았다"를 알아야 하는데, 그
+/// 사실이 흐르는 곳은 구성원마다 하나씩인 `EventSink`다. 그 감시를 화면(`session.rs`)과
+/// 헤드리스(`bin/host.rs`) 두 루프에 각각 적으면 **둘이 갈리고, 갈린 예산은 화면에서 드러나지
+/// 않는다**(72.16절이 이 변경을 한 번에 하라고 적은 이유). 그래서 감시는 여기 하나뿐이고 두
+/// 루프는 알림 콜백만 다르게 준다.
+///
+/// # 왜 이 신호를 믿어도 되는가
+///
+/// `PLAN_APPROVED`는 `NODE_MAY_NOT_EMIT`이다(`host.rs`) — Rust만 기록할 수 있으므로,
+/// 장악당한 sidecar가 승인을 꾸며 **구현 예산을 스스로 열 수 없다.** 신호의 출처가 곧
+/// 승인 자체의 출처다.
+pub struct PlanApprovalWatch {
+    inner: std::sync::Arc<dyn crate::host::EventSink>,
+    index: usize,
+    notify: Box<dyn Fn(PlanApproved) + Send + Sync>,
+}
+
+/// 감시가 스케줄러에 건네는 것 — **승인 카드가 말한 금액**까지 함께다.
+///
+/// 금액이 없으면 `FleetBudget`이 구현 몫을 줄이지 않는다. 그래서 "얼마인지 모른다"와
+/// "0달러다"를 여기서부터 구별해 둔다.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanApproved {
+    pub index: usize,
+    pub estimated_cost_usd: Option<f64>,
+    /// 카드의 모든 배정이 금액으로 환산됐는가(`unpricedAssignments`가 비어 있는가).
+    pub priced: bool,
+}
+
+impl PlanApprovalWatch {
+    pub fn new(
+        inner: std::sync::Arc<dyn crate::host::EventSink>,
+        index: usize,
+        notify: Box<dyn Fn(PlanApproved) + Send + Sync>,
+    ) -> Self {
+        Self { inner, index, notify }
+    }
+
+    /// 이 payload가 계획 승인인가. **채널과 타입을 둘 다 본다** — 타입만 보면 다른 채널의
+    /// 같은 이름이 예산을 열 수 있다.
+    fn plan_approved(&self, channel: &str, payload: &Value) -> Option<PlanApproved> {
+        if channel != "task-event" {
+            return None;
+        }
+        if payload.get("type").and_then(Value::as_str) != Some("PLAN_APPROVED") {
+            return None;
+        }
+        let body = payload.get("payload").unwrap_or(payload);
+        // **환산되지 않은 배정이 하나라도 있으면 금액으로 말할 수 없다**(72.4절의 카드와
+        // 같은 규율). 목록을 읽지 못한 경우도 같게 다룬다 — 모르는 것을 "없음"으로 보지 않는다.
+        let priced = match body.get("unpricedAssignments") {
+            Some(Value::Array(items)) => items.is_empty(),
+            Some(Value::Null) | None => false,
+            _ => false,
+        };
+        Some(PlanApproved {
+            index: self.index,
+            estimated_cost_usd: body.get("estimatedCostUsd").and_then(Value::as_f64),
+            priced,
+        })
+    }
+}
+
+impl crate::host::EventSink for PlanApprovalWatch {
+    fn emit(&self, channel: &str, payload: &Value) {
+        // **먼저 흘려보낸다.** 알림이 스케줄러를 깨워 이 구성원의 상태를 읽을 수 있으므로,
+        // 이벤트가 화면에 닿기 전에 깨우면 화면과 예산이 서로 다른 순간을 말한다.
+        self.inner.emit(channel, payload);
+        if let Some(approved) = self.plan_approved(channel, payload) {
+            // 두 번 와도 안전하다 — `FleetBudget::reserve_implementation`이 멱등이다.
+            (self.notify)(approved);
+        }
     }
 }
 
@@ -435,6 +659,10 @@ pub struct FleetTotals {
     pub per_task_cap_usd: Option<f64>,
     /// 합계 상한을 실제로 강제했는가. 없었으면 위 금액은 **집계일 뿐 제약이 아니었다.**
     pub cap_enforced: bool,
+    /// 계획 승인 때 구현 몫을 카드 금액으로 확정하며 **다른 구성원에게 열어준** 금액의
+    /// 누적(72.12절). 0이면 단계 분할이 이 Fleet에서는 아무것도 벌지 못했다는 뜻이고,
+    /// 그 사실도 사실이다 — **예약이지 지출이 아니다.**
+    pub fleet_staging_freed_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -472,6 +700,7 @@ impl FleetReport {
             fleet_cap_usd: budget.cap_usd(),
             per_task_cap_usd: budget.per_task_usd(),
             cap_enforced: budget.enforced(),
+            fleet_staging_freed_usd: budget.staging_freed_usd(),
         };
         Self {
             fleet_id: fleet_id.to_string(),
@@ -502,6 +731,13 @@ impl FleetReport {
                 "**이 Fleet에는 합계 상한이 없었습니다.** 위 금액은 집계한 지출이며, 무언가가 그것을 막고 있었다는 뜻이 아닙니다."
                     .to_string(),
             ),
+        }
+        if t.fleet_staging_freed_usd > 0.0 {
+            out.push(format!(
+                "계획이 승인될 때 구현 예산을 카드 금액으로 확정해 ${:.4}을 다른 구성원에게 열어주었습니다 \
+(72.12절). **예약이지 지출이 아닙니다** — 합계 상한은 그대로 강제됐습니다.",
+                t.fleet_staging_freed_usd
+            ));
         }
         if t.not_started > 0 {
             out.push(format!(
@@ -974,52 +1210,246 @@ mod tests {
     fn the_aggregate_cap_is_never_exceeded_even_when_everyone_spends_the_maximum() {
         let mut budget = FleetBudget::new(Some(10.0), Some(3.0));
         let mut admitted = Vec::new();
-        // 들여보낼 수 있는 만큼 들여보낸다.
+        // 들여보낼 수 있는 만큼 들여보낸다. **단계 분할 뒤로도 판정은 태스크당 상한 전부를
+        // 본다** — 그렇지 않으면 이 불변식이 `PLANNING_SHARE`만큼 느슨해진다.
+        let mut index = 0usize;
         loop {
-            match budget.try_admit() {
-                Admission::Admitted { reserved_usd } => admitted.push(reserved_usd),
+            match budget.try_admit(index) {
+                Admission::Admitted { .. } => {
+                    admitted.push(index);
+                    index += 1;
+                }
                 Admission::Refused { .. } => break,
             }
         }
         assert_eq!(admitted.len(), 3, "10 / 3 = 3개까지만 동시에 들어간다");
         // 전원이 상한을 꽉 채워 쓴다.
-        for reserved in admitted {
-            budget.settle(reserved, 3.0);
+        for member in admitted {
+            budget.settle(member, 3.0);
         }
         assert!((budget.committed_usd() - 9.0).abs() < 1e-9, "{}", budget.committed_usd());
         assert!(budget.committed_usd() <= 10.0);
         // 남은 $1로는 태스크당 상한 $3을 예약할 수 없다 — **새 구성원이 시작되지 않는다.**
-        assert!(matches!(budget.try_admit(), Admission::Refused { .. }));
+        assert!(matches!(budget.try_admit(index), Admission::Refused { .. }));
         assert!(!budget.waiting_could_help(), "열린 예약이 없으므로 기다려도 달라지지 않는다");
+    }
+
+    /// **입장 판정은 분할 전과 한 글자도 다르지 않다.** 이 사실이 합계 상한을 딱딱하게 유지한다.
+    ///
+    /// 처음 쓴 분할은 입장 시점에 계획 몫만 세었고, `the_aggregate_cap_is_never_exceeded…`가
+    /// 즉시 잡았다(상한 $10 / 태스크당 $3에 구성원 10개가 들어갔다). 잡아 둔 금액만 세면
+    /// 아직 오지 않은 구현 비용이 없는 것처럼 보이는데, 그것이 이 모듈이 경계한 실수다.
+    #[test]
+    fn admission_still_counts_the_whole_per_task_cap() {
+        let mut budget = FleetBudget::new(Some(6.0), Some(3.0));
+        match budget.try_admit(0) {
+            // **예약은 태스크당 상한 전부다.** 계획 몫은 그 안에서의 구분일 뿐이다.
+            Admission::Admitted { reserved_usd } => assert_eq!(reserved_usd, Some(3.0)),
+            other => panic!("{other:?}"),
+        }
+        assert!((budget.reserved_usd() - 3.0).abs() < 1e-9);
+        assert!(matches!(budget.try_admit(1), Admission::Admitted { .. }));
+        // $6이 전부 잡혔다 — 셋째는 들어가지 못한다. 분할이 이것을 느슨하게 만들지 않는다.
+        assert!(matches!(budget.try_admit(2), Admission::Refused { .. }));
+    }
+
+    /// **분할이 버는 것은 상한과 실제 비용의 차액이다** — 72.12절의 Fleet 쪽 절반.
+    ///
+    /// 승인 카드가 이 계획이 얼마인지 말하므로, 그 금액으로 구현 몫을 줄이면 나머지가 즉시
+    /// 다른 구성원에게 열린다. 분할 이전에는 그 돈이 태스크가 끝날 때까지 잠겨 있었다.
+    #[test]
+    fn approving_a_plan_frees_the_gap_between_the_cap_and_the_card() {
+        // 상한 $8 / 태스크당 $3 — 둘은 들어가고 셋째는 $2가 모자라 들어가지 못한다.
+        let mut budget = FleetBudget::new(Some(8.0), Some(3.0));
+        budget.try_admit(0);
+        budget.try_admit(1);
+        // 둘이 상한을 다 잡고 있으므로 셋째는 들어가지 못한다.
+        assert!(matches!(budget.try_admit(2), Admission::Refused { .. }));
+
+        // 0번의 계획이 승인됐고, 카드가 말한 금액은 $0.40이다.
+        let planning = 3.0 * PLANNING_SHARE;
+        match budget.reserve_implementation(0, Some(0.40), true) {
+            ImplementationStage::Staged { held_usd, freed_usd, priced } => {
+                assert!(priced);
+                assert!((held_usd - (planning + 0.40)).abs() < 1e-9, "{held_usd}");
+                assert!((freed_usd - (3.0 - planning - 0.40)).abs() < 1e-9, "{freed_usd}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // **그 차액으로 셋째가 들어간다.** 이것이 분할이 실제로 버는 것이다.
+        assert!(matches!(budget.try_admit(2), Admission::Admitted { .. }));
+        // 그리고 결과가 그 사실을 말한다.
+        let report = FleetReport::build("f", vec![], &budget, crate::verify::LaneStats::default());
+        assert!(report.totals.fleet_staging_freed_usd > 0.0);
+        assert!(
+            report.notices().iter().any(|n| n.contains("다른 구성원에게 열어주었습니다")),
+            "{:?}",
+            report.notices()
+        );
+    }
+
+    /// **카드가 금액으로 말하지 못하면 줄이지 않는다.** 모르는 것을 0으로 보면 상한이 사라진다.
+    #[test]
+    fn an_unpriced_card_never_shrinks_the_reservation() {
+        let mut budget = FleetBudget::new(Some(6.0), Some(3.0));
+        budget.try_admit(0);
+        // 환산되지 않은 배정이 있었다 — 금액은 있지만 그것이 전부가 아니다.
+        match budget.reserve_implementation(0, Some(0.10), false) {
+            ImplementationStage::Staged { freed_usd, priced, .. } => {
+                assert!(!priced);
+                assert_eq!(freed_usd, 0.0, "모르면 줄이지 않는다");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!((budget.reserved_usd() - 3.0).abs() < 1e-9);
+        assert_eq!(budget.staging_freed_usd(), 0.0);
+    }
+
+    /// **올려 잡지 않는다.** 카드가 남은 몫보다 큰 금액을 말해도 노출은 커지지 않는다 —
+    /// 구성원 하나의 지출은 자기 `TaskBudget`이 태스크당 상한으로 막는다.
+    #[test]
+    fn a_card_larger_than_the_remainder_never_raises_the_exposure() {
+        let mut budget = FleetBudget::new(Some(6.0), Some(3.0));
+        budget.try_admit(0);
+        budget.reserve_implementation(0, Some(99.0), true);
+        assert!((budget.reserved_usd() - 3.0).abs() < 1e-9, "{}", budget.reserved_usd());
+        assert_eq!(budget.staging_freed_usd(), 0.0);
+    }
+
+    /// 같은 승인이 두 번 관측돼도 예약이 두 번 움직이지 않는다.
+    #[test]
+    fn staging_happens_exactly_once_per_member() {
+        let mut budget = FleetBudget::new(Some(10.0), Some(4.0));
+        budget.try_admit(0);
+        assert!(matches!(
+            budget.reserve_implementation(0, Some(0.5), true),
+            ImplementationStage::Staged { .. }
+        ));
+        let after = budget.reserved_usd();
+        assert_eq!(
+            budget.reserve_implementation(0, Some(0.1), true),
+            ImplementationStage::AlreadyStaged
+        );
+        assert_eq!(budget.reserved_usd(), after, "두 번째 승인은 예약을 움직이지 않는다");
+    }
+
+    /// 합계 상한이 없으면 **확정할 것도 없다.** "0을 잡았다"와 "잡을 것이 없다"는 다르다.
+    #[test]
+    fn without_an_aggregate_cap_there_is_nothing_to_stage() {
+        let mut budget = FleetBudget::new(None, Some(3.0));
+        budget.try_admit(0);
+        assert_eq!(
+            budget.reserve_implementation(0, Some(0.5), true),
+            ImplementationStage::NotTracked
+        );
+        // 들어간 적 없는 구성원의 승인도 잡을 것이 없다 — 있지도 않은 예약을 열지 않는다.
+        let mut capped = FleetBudget::new(Some(6.0), Some(3.0));
+        assert_eq!(
+            capped.reserve_implementation(7, Some(0.5), true),
+            ImplementationStage::NotTracked
+        );
+        assert_eq!(capped.reserved_usd(), 0.0);
+    }
+
+    /// **정산은 단계를 함께 닫는다.** 계획 몫만 닫으면 구현 예약이 영원히 떠 있다.
+    #[test]
+    fn settling_closes_both_stages_of_one_member() {
+        let mut budget = FleetBudget::new(Some(10.0), Some(4.0));
+        budget.try_admit(0);
+        budget.reserve_implementation(0, Some(1.0), true);
+        let planning = 4.0 * PLANNING_SHARE;
+        assert!((budget.held_for(0).unwrap() - (planning + 1.0)).abs() < 1e-9);
+        budget.settle(0, 1.25);
+        assert_eq!(budget.held_for(0), None);
+        assert_eq!(budget.reserved_usd(), 0.0);
+        assert_eq!(budget.outstanding(), 0);
+        assert!((budget.committed_usd() - 1.25).abs() < 1e-9);
+        assert!(!budget.waiting_could_help());
+    }
+
+    /// 감시는 **`PLAN_APPROVED`만** 고른다. 다른 이벤트가 예산을 열면 승인의 뜻이 사라진다.
+    #[test]
+    fn the_watch_only_fires_on_a_plan_approval_task_event() {
+        use crate::host::EventSink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let seen: Arc<std::sync::Mutex<Vec<PlanApproved>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = fired.clone();
+        let collected = seen.clone();
+        let watch = PlanApprovalWatch::new(
+            Arc::new(crate::host::NullSink),
+            2,
+            Box::new(move |approved| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                collected.lock().unwrap().push(approved);
+            }),
+        );
+        watch.emit("task-event", &json!({ "type": "PLAN_REVIEW_COMPLETED" }));
+        watch.emit("task-event", &json!({ "type": "USER_VERIFICATION_APPROVED" }));
+        // 채널이 다르면 이름이 같아도 열리지 않는다.
+        watch.emit("approval-request", &json!({ "type": "PLAN_APPROVED" }));
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+
+        watch.emit(
+            "task-event",
+            &json!({
+                "type": "PLAN_APPROVED",
+                "payload": { "estimatedCostUsd": 0.42, "unpricedAssignments": [] }
+            }),
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            PlanApproved {
+                index: 2,
+                estimated_cost_usd: Some(0.42),
+                priced: true
+            }
+        );
+
+        // **환산되지 않은 배정이 하나라도 있으면 금액으로 말할 수 없다.**
+        watch.emit(
+            "task-event",
+            &json!({
+                "type": "PLAN_APPROVED",
+                "payload": { "estimatedCostUsd": 0.42, "unpricedAssignments": ["reviewer"] }
+            }),
+        );
+        assert!(!seen.lock().unwrap()[1].priced);
+
+        // 목록 자체가 없으면 **모르는 것**이다 — "없음"으로 읽지 않는다.
+        watch.emit(
+            "task-event",
+            &json!({ "type": "PLAN_APPROVED", "payload": { "estimatedCostUsd": 0.42 } }),
+        );
+        assert!(!seen.lock().unwrap()[2].priced);
     }
 
     /// 거부의 두 가지를 구별한다: **지금 자리가 없다**와 **영원히 자리가 없다**.
     #[test]
     fn a_refusal_says_whether_waiting_would_help() {
         let mut budget = FleetBudget::new(Some(6.0), Some(3.0));
-        let a = match budget.try_admit() {
-            Admission::Admitted { reserved_usd } => reserved_usd,
-            other => panic!("{other:?}"),
-        };
-        let b = match budget.try_admit() {
-            Admission::Admitted { reserved_usd } => reserved_usd,
-            other => panic!("{other:?}"),
-        };
-        assert!(matches!(budget.try_admit(), Admission::Refused { .. }));
+        assert!(matches!(budget.try_admit(0), Admission::Admitted { .. }));
+        assert!(matches!(budget.try_admit(1), Admission::Admitted { .. }));
+        // 둘이 $6을 전부 잡고 있다 — 입장 시점에 태스크당 상한 전부를 잡기 때문이다.
+        assert!(matches!(budget.try_admit(2), Admission::Refused { .. }));
         // 둘이 도는 동안은 기다리면 달라진다.
         assert!(budget.waiting_could_help());
         // 싸게 끝나면 자리가 생긴다 — 예약은 최대치였고 실제는 그보다 작을 수 있다.
-        budget.settle(a, 0.5);
-        budget.settle(b, 0.5);
-        assert!(matches!(budget.try_admit(), Admission::Admitted { .. }));
+        budget.settle(0, 0.5);
+        budget.settle(1, 0.5);
+        assert!(matches!(budget.try_admit(2), Admission::Admitted { .. }));
     }
 
     /// 합계 상한이 없으면 **예약도 없다.** 그리고 그 사실이 결과에 남는다.
     #[test]
     fn without_an_aggregate_cap_nothing_is_reserved_and_the_report_says_so() {
         let mut budget = FleetBudget::new(None, Some(3.0));
-        for _ in 0..MAX_FLEET_SIZE {
-            assert_eq!(budget.try_admit(), Admission::Admitted { reserved_usd: None });
+        for member in 0..MAX_FLEET_SIZE {
+            assert_eq!(budget.try_admit(member), Admission::Admitted { reserved_usd: None });
         }
         assert!(!budget.enforced());
         let report = FleetReport::build("f", vec![], &budget, crate::verify::LaneStats::default());

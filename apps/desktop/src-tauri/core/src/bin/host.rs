@@ -2099,6 +2099,16 @@ struct MemberDone {
     finished_at: String,
 }
 
+/// 스케줄러가 받는 소식 — 구성원이 끝났거나, **계획이 승인됐거나**(72.12절).
+///
+/// `session.rs`의 같은 이름과 **같은 모양이어야 한다.** 둘이 갈리면 화면과 헤드리스의 예산이
+/// 갈리고, 갈린 예산은 화면에서 드러나지 않는다(72.16절이 한 번에 하라고 적은 이유).
+enum MemberSignal {
+    /// 이 구성원이 `PLAN_APPROVED`를 받았다 — 구현 몫을 **카드 금액으로 확정한다.**
+    PlanApproved(tomverse_core::fleet::PlanApproved),
+    Done(MemberDone),
+}
+
 /// 도는 중인 구성원.
 struct RunningMember {
     branch: String,
@@ -2150,7 +2160,7 @@ fn run_fleet(
     policy: TaskPolicy,
     db_path: &Path,
 ) -> Result<i32, String> {
-    use tomverse_core::fleet::{Admission, FleetBudget, MemberReport};
+    use tomverse_core::fleet::{Admission, FleetBudget, ImplementationStage, MemberReport};
 
     if args.worktree.is_some() {
         // 격리 트리는 구성원마다 하나씩 만들어진다. 여기에 또 하나를 주면 "어느 트리에서
@@ -2203,7 +2213,7 @@ fn run_fleet(
         cap_usd.map(|v| format!("${v}")).unwrap_or_else(|| "없음".into()),
     );
 
-    let (tx, rx) = std::sync::mpsc::channel::<MemberDone>();
+    let (tx, rx) = std::sync::mpsc::channel::<MemberSignal>();
     let mut reports: Vec<Option<MemberReport>> = (0..size).map(|_| None).collect();
     let mut running: std::collections::HashMap<usize, RunningMember> = std::collections::HashMap::new();
     let mut next = 0usize;
@@ -2258,7 +2268,7 @@ fn run_fleet(
                 reports[index] = Some(MemberReport::not_started(index, &spec.branch, &task_id, reason));
                 continue;
             }
-            match budget.try_admit() {
+            match budget.try_admit(next) {
                 Admission::Admitted { reserved_usd } => {
                     let index = next;
                     next += 1;
@@ -2310,7 +2320,7 @@ fn run_fleet(
                         Err(message) => {
                             // **시작에 실패한 것도 결말이다.** 예약을 돌려주지 않으면 남은
                             // 구성원들이 있지도 않은 지출에 막힌다.
-                            budget.settle(reserved_usd, 0.0);
+                            budget.settle(index, 0.0);
                             eprintln!("구성원 시작 실패({}): {message}", spec.branch);
                             reports[index] = Some(MemberReport {
                                 index,
@@ -2364,7 +2374,40 @@ fn run_fleet(
         }
 
         // ---- 하나가 끝나기를 기다린다 ----
-        let done = rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))?;
+        let done = match rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))? {
+            // **승인 순간이 곧 구현 예약 시점이다**(72.12절). 사람을 기다리는 동안 잠겨
+            // 있는 것은 계획 한 번 값뿐이 된다.
+            MemberSignal::PlanApproved(approved) => {
+                let index = approved.index;
+                if let ImplementationStage::Staged { held_usd, freed_usd, priced } = budget
+                    .reserve_implementation(index, approved.estimated_cost_usd, approved.priced)
+                {
+                    if let Some(member) = running.get(&index) {
+                        // **예약도 기록으로 남는다.** 남기지 않으면 "왜 상한이 밀렸는가"를
+                        // 나중에 대답할 수 없다.
+                        let _ = member.host.append_event(
+                            &member.task_id,
+                            "FLEET_IMPLEMENTATION_RESERVED",
+                            json!({
+                                "fleetId": fleet_id,
+                                "branch": member.branch,
+                                "memberIndex": index + 1,
+                                "heldUsd": held_usd,
+                                "freedUsd": freed_usd,
+                                // **카드가 금액으로 말했는가.** 거짓이면 줄이지 않았고,
+                                // 그 사실이 없으면 "0이 열렸다"와 구별되지 않는다.
+                                "priced": priced,
+                                "estimatedCostUsd": approved.estimated_cost_usd,
+                                "fleetReservedUsd": budget.reserved_usd(),
+                            }),
+                        );
+                    }
+                }
+                // **끝난 것이 아니다.** 여기서 `running`에서 빼면 도는 구성원을 잃는다.
+                continue;
+            }
+            MemberSignal::Done(done) => done,
+        };
         let member = running.remove(&done.index).expect("도는 구성원");
         let _ = member.handle.join();
         // **비용은 저장소가 말한다.** Node의 주장이 아니라 `provider_usage` 행이다 —
@@ -2374,7 +2417,10 @@ fn run_fleet(
             .unwrap()
             .task_cost_usd(&member.task_id)
             .unwrap_or((0.0, 0, 0));
-        budget.settle(member.reserved_usd, cost_usd);
+        // **지금 잡고 있는 금액은 원장이 말한다** — 단계 분할 뒤로 입장 시점의 값은
+        // 계획 몫뿐이라, 그것을 정산 기록에 쓰면 구현 예약이 없었던 것처럼 읽힌다.
+        let held_usd = budget.held_for(done.index).or(member.reserved_usd);
+        budget.settle(done.index, cost_usd);
         let _ = member.host.append_event(
             &member.task_id,
             "FLEET_MEMBER_SETTLED",
@@ -2384,7 +2430,7 @@ fn run_fleet(
                 "memberIndex": done.index + 1,
                 "status": done.status,
                 "costUsd": cost_usd,
-                "reservedUsd": member.reserved_usd,
+                "reservedUsd": held_usd,
                 "fleetCommittedUsd": budget.committed_usd(),
             }),
         );
@@ -2403,7 +2449,7 @@ fn run_fleet(
             status: done.status,
             summary: done.summary,
             cost_usd,
-            reserved_usd: member.reserved_usd,
+            reserved_usd: held_usd,
             started_at: Some(member.started_at),
             finished_at: Some(done.finished_at),
         });
@@ -2523,7 +2569,7 @@ fn start_member(
     session_id: &str,
     caps: tomverse_core::fleet::FleetCaps,
     reserved_usd: Option<f64>,
-    tx: std::sync::mpsc::Sender<MemberDone>,
+    tx: std::sync::mpsc::Sender<MemberSignal>,
 ) -> Result<RunningMember, String> {
     // **격리는 루트를 바꾸는 것이 전부다**(22.1절). 구성원은 자기 트리를 루트로 받는
     // 평범한 태스크가 된다.
@@ -2574,6 +2620,18 @@ fn start_member(
         inner: sink.clone(),
         label: spec.branch.clone(),
     });
+    // **계획 승인을 스케줄러에 알린다**(72.12절). 감시는 `MemberSink` **바깥**에 있어야
+    // 한다 — 안쪽에 두면 채널 이름이 이미 `<branch>·task-event`로 바뀐 뒤라 걸리지 않는다.
+    let signal_tx = std::sync::Mutex::new(tx.clone());
+    let member_sink: Arc<dyn EventSink> = Arc::new(tomverse_core::fleet::PlanApprovalWatch::new(
+        member_sink,
+        index,
+        Box::new(move |approved| {
+            if let Ok(tx) = signal_tx.lock() {
+                let _ = tx.send(MemberSignal::PlanApproved(approved));
+            }
+        }),
+    ));
     let host = Arc::new(
         TaskHost::new(
             member_root,
@@ -2643,12 +2701,12 @@ fn start_member(
         };
         // **보내지 못하면 스케줄러가 영원히 기다린다.** 받는 쪽이 사라지는 경우는 스케줄러가
         // 이미 끝난 때뿐이고, 그때는 보낼 곳이 없는 것이 맞다.
-        let _ = tx.send(MemberDone {
+        let _ = tx.send(MemberSignal::Done(MemberDone {
             index,
             status,
             summary,
             finished_at: tomverse_core::time::now_iso(),
-        });
+        }));
     });
 
     Ok(RunningMember {
