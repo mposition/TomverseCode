@@ -177,6 +177,11 @@ stateDiagram-v2
 | `mcpRounds` | 31절 | 같음 |
 | `contextRounds` | 57절 | 같음 |
 
+**`escalationCalls`만 예외로 싣는다.** 그 줄도 값을 여기서 정하지 않지만(태스크마다 사용자가
+확정한다), **옮겨 적을 숫자가 아예 없다** — 위 셋은 다른 절에 숫자가 있어 중복이 생기는데
+이것은 중복될 값이 없다. 그리고 빼면 *"이 루프에 상한이 있는가"*라는 원칙 5의 질문에 이 표가
+답하지 못한다. **규칙이 막으려는 것은 숫자의 중복이지 행의 존재가 아니다.**
+
 **`providerRetries`가 원칙 5의 다섯 중 하나인데 이 표에 없는 것이 그래서 결함이 아니다** —
 다만 그 사실을 적어두지 않으면 결함처럼 보인다. 원칙 5가 이름을 적은 다섯 중 **넷**은 여기서
 값을 정하고, `providerRetries` 하나만 9절에서 정한다.
@@ -797,6 +802,9 @@ interface TaskState {
     fixLoopRounds: number;
     toolRetries: Record<string, number>;
     providerRetries: Record<string, number>; // key = "draft:1", "review:2", "fix:1" 등 호출 식별자
+    // 이 블록은 **카운터 집합의 세 번째 사본**이고 이미 낡았다 — mcpRounds·contextRounds가
+    // 빠져 있고(TS 타입에는 있다), 2.2절이 더한 planRounds·escalationCalls도 없다.
+    // 세 사본이 갈리는 문제는 2.2절이 적었고 72.15절 목록이 함께 다룬다.
   };
 }
 ```
@@ -812,7 +820,24 @@ interface TaskState {
 
 ## 10. REJECTED/FAILED 종료 시 롤백 UX
 
-**REJECTED는 되돌릴 파일이 없다** — REJECT 판정은 REVIEWING 단계(PLANNING/EXECUTING 이전)에서만 나오므로 아직 아무 파일도 건드리지 않은 상태다. 롤백이 실제로 필요한 건 `FAILED`(EXECUTING/VERIFYING 중 발생 가능)와 `CANCELLED`(EXECUTING 도중 취소) 뿐이다.
+~~**REJECTED는 되돌릴 파일이 없다** — REJECT 판정은 REVIEWING 단계(PLANNING/EXECUTING 이전)에서만 나오므로 아직 아무 파일도 건드리지 않은 상태다. 롤백이 실제로 필요한 건 `FAILED`와 `CANCELLED` 뿐이다.~~
+
+**72절이 이 문장의 근거와 결론을 둘 다 뒤집는다.**
+
+근거가 먼저 낡았다: REJECT가 `REVIEWING`에서만 나온다는 것이 전제였는데 72.3절에서 `REVIEWING`이
+물러났다. 그리고 `standard` 경로에는 **코드가 이미 쓰인 뒤에 `REJECTED`로 가는 길**이 생겼다 —
+72.8절 귀환 경로 3의 **"되돌리고 종료"**다.
+
+**그 경로의 터미널은 `REJECTED`다.** `CANCELLED`가 아닌 이유는 사용자가 중단한 것이 아니라
+**결과를 거부한 것**이기 때문이고, `FAILED`가 아닌 이유는 실패한 것이 없기 때문이다 —
+검증은 통과했고 사용자가 받지 않기로 정했다. 이름이 뜻을 말해야 결말 집계가 쓸모 있다
+(2절이 `CANCELLED`/`REJECTED`를 가르는 집계를 요구한 것과 같은 자리다).
+
+**그러므로 롤백이 필요한 결말은 셋이다**: `FAILED`, `CANCELLED`, 그리고 **`REJECTED` 중
+"되돌리고 종료"로 온 것.** 계획 승인 카드에서 거부해 온 `REJECTED`는 여전히 되돌릴 파일이
+없다 — **같은 터미널인데 롤백 대상이 갈린다.** 그래서 아래 UX는 "터미널 이름"이 아니라
+**`file_mutations`에 이 태스크의 기록이 있는가**로 판단해야 한다. 이름으로 판단하면 방금
+쓴 코드를 되돌릴 기회를 잃는다.
 
 **git stash 대신 태스크 단위 파일 되돌리기를 쓴다.** git stash는 사용자가 Tomverse Code와 무관하게 작업 중이던 uncommitted 변경사항까지 전부 쓸어담아 혼란을 준다. 대신 Tool Runtime이 파일을 변경하는 모든 `ToolRequest`(`apply_patch`/`create_file`/`delete_file`) 결과에 이미 diff 표시를 위해 필요한 pre-image/post-image를 남기므로, 이걸 재사용해 **이 태스크가 건드린 파일만** 정확히 원상복구한다.
 
@@ -8638,7 +8663,8 @@ effort는 **방향만 아는 입력**이라는 점에서 나머지와 다르다.
 
 #### 일부는 금액으로 말할 수 없다
 
-`accounting: subscription`인 모델(CLI 로그인)에는 **토큰 단가가 없다.** 그 부분을 0으로 합산하면
+`accounting: "subscription"`인 모델(지금은 CLI 로그인뿐이지만 **그 둘은 파생 관계가 아니다** —
+multi-engine 21.4절)에는 **토큰 단가가 없다.** 그 부분을 0으로 합산하면
 카드가 "이만큼만 듭니다"라고 거짓을 말한다. 금액과 **"구독에 포함되어 금액으로 환산되지
 않음"**을 나눠 적는다 — 72.10.1절과 21.7절이 같은 규칙을 쓴다.
 
@@ -8789,7 +8815,10 @@ product-strategy 4.1절 실측이 blind를 철회한 근거는 **②"정보를 �
 
 1. 지적한 항목으로 **`FIX_LOOP` 재진입** (**`fixLoopRounds` 안에서** — 아래)
 2. **계획으로 되돌아간다** — 승인이 무효화되고 다시 세운다 (**`planRounds` 안에서**)
-3. **변경을 되돌리고 종료**
+3. **변경을 되돌리고 종료** — 터미널은 **`REJECTED`**다. 사용자가 중단한 것이 아니라
+   **결과를 거부한 것**이라 `CANCELLED`가 아니고, 실패한 것이 없어 `FAILED`도 아니다.
+   **이 경로는 되돌릴 파일이 있다** — 10절이 "`REJECTED`는 되돌릴 파일이 없다"고 적은 것이
+   그래서 낡았고, 그 자리에 근거를 바꿔 적었다.
 
 **둘 다 상한 없는 루프를 만들 뻔했고, 위험한 쪽은 1번이었다**(원칙 5).
 
@@ -9415,7 +9444,8 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | multi-engine 15.3절 co-executor 지정 금지 | 대조가 계획으로 옮겨가 **co-planner**에 걸린다. `simple`·`fast`에 남는 co-executor는 **없다** | 취소선 + 대상 교체 + 자기정정 |
 | 72.14절 계측 표 | 에스컬레이션 행(요청/호출/거절 셋을 센다) | 갱신 |
 | `apps/desktop/src-tauri/core/src/metrics.rs` | **태스크 결말 집계가 없다** — `CANCELLED`/`REJECTED`를 가르지 못한다(2절). 게이트가 둘이 되면서 "사용자가 그만둔 방식"이 처음 의미를 갖는다 | **아직 안 함** — 72.14 계측과 함께 |
-| **`TaskCounters`/`TaskLoopLimits`의 TS↔Rust 불일치** | `mcpRounds`·`contextRounds`가 TS에만 있다. 새 카운터 셋을 더할 때 **양쪽에 더해야 하고**, 지금 갈린 둘도 그때 맞춘다 — 쓰기 경로가 payload를 그대로 넣어서 이 불일치가 오류 없이 지나간다(2.2절) | **아직 안 함** |
+| **카운터 집합의 사본이 셋** | `TaskCounters`/`TaskLoopLimits`가 TS↔Rust로 갈려 있고(`mcpRounds`·`contextRounds`가 TS에만), **문서 9절의 `TaskState.counters` 블록이 세 번째 사본**이다. 새 카운터는 셋 모두에 더해야 하고 지금 갈린 것도 그때 맞춘다 — 쓰기 경로가 payload를 그대로 넣어서 이 불일치가 오류 없이 지나간다(2.2절) | 9절 블록에 **주석 달았다** / 타입 둘은 **아직 안 함** |
+| **10절 "REJECTED는 되돌릴 파일이 없다"** | 근거(*"REJECT는 `REVIEWING`에서만 나온다"*)가 72.3절로 낡았고, 72.8 귀환 경로 3의 **"되돌리고 종료"**가 그 결론을 뒤집는다 | 취소선 + 근거 교체 |
 | 2.2절 표의 완결성 | 표에 없는 상한 셋(`providerRetries`·`mcpRounds`·`contextRounds`)이 "상한이 없다"로 읽혔다 | **범위를 좁혔다** — 싣는 규칙("여기서 값을 정하는 것만")과 나머지가 어디 있는지를 표 아래 적었다. 값을 옮겨 적지는 **않았다** |
 | [product-strategy 8.6절](./product-strategy.md) 호출 수 | "실행자 2 + 검수자 1 = 3"과 "verified는 실행자를 하나 더 부른다" | 취소선 + 근거 |
 | [ui-wireframes 3.11절](./ui-wireframes.md) | 같은 문장이 화면 쪽에도 있었다 | 취소선 + 근거 |
