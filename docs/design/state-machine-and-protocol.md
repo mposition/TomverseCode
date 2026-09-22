@@ -113,12 +113,12 @@ stateDiagram-v2
 | `SINGLE_MODEL_FIX` | 단일 Provider | Snapshot (대조 초안 없음) | `SingleModelFixResult.verdict`(REVISE 없이 ACCEPT/NEED_USER_INPUT/REJECT 중 하나)에 따라 PLANNING/AWAITING_USER_INPUT/REJECTED로 분기 |
 | `REVIEWING` | 검수자 Provider | DraftProposal + 동일 Snapshot | ReviewDecision.verdict에 따라 4갈래 분기. **`standard` 경로에서 물러났다(72.3절)** — 그 일은 B·결정론적 검증·C가 나눠 가진다 |
 | `OUTLINING` | 계획자 Provider | Snapshot (53절 계획 모드 / 72절 standard 경로) | `PlanOutline` 수신 → 계획 모드면 `OUTLINED`(터미널), standard면 `AWAITING_PLAN_APPROVAL` |
-| `AWAITING_PLAN_APPROVAL` | UI | `PlanOutline` 확정 | 사용자 선택 넷(72.4절): 승인+검토 → PLAN_REVIEWING / 승인+검토생략 → EXECUTING / 수정 요청 → OUTLINING(`planRounds++`) / 거부 → REJECTED |
+| `AWAITING_PLAN_APPROVAL` | UI | `PlanOutline` 확정 | 사용자 선택 넷(72.4절): 승인+검토 → PLAN_REVIEWING / 승인+검토생략 → **IMPLEMENTING** / 수정 요청 → OUTLINING(`planRounds++`) / 거부 → REJECTED |
 | `PLAN_REVIEWING` | 계획 검토자(B) | 승인된 `PlanOutline` | 쟁점 없음 → IMPLEMENTING, 쟁점 있음 → 불일치 카드 → 사용자 |
 | `IMPLEMENTING` | 구현 Provider (등급은 72.10절) | 서브태스크 하나 | `DraftProposal`(patch·moves·deletions) 수신 → PLANNING. 남은 서브태스크가 있으면 EXECUTING 뒤 다시 여기로, 없으면 VERIFYING (72.2.2절) |
 | `RESULT_REVIEWING` | 결과 검토자(C) | **`VERIFYING` 통과 후에만** | 계획 일치 판정 넷(72.7절)을 체크리스트로 → AWAITING_USER_VERIFICATION |
 | `AWAITING_USER_VERIFICATION` | UI | 체크리스트 생성 완료 | 승인 → 커밋 → COMPLETED / 거부 → 72.8절 귀환 경로 셋 중 사용자 선택 |
-| `AWAITING_USER_INPUT` | UI | verdict = NEED_USER_INPUT (REVIEWING 또는 SINGLE_MODEL_FIX 양쪽에서 진입 가능) | 사용자 응답 → DRAFTING(항상 standard 경로, 14.1절), 취소 → CANCELLED |
+| `AWAITING_USER_INPUT` | UI | verdict = NEED_USER_INPUT (REVIEWING 또는 SINGLE_MODEL_FIX 양쪽에서 진입 가능) | 사용자 응답 → ~~DRAFTING~~ **`OUTLINING`**(항상 standard 경로, 14.1절 + 72.3절), 취소 → CANCELLED |
 | `PLANNING` | Orchestrator | ACCEPT/REVISE 확정, SINGLE_MODEL_FIX 완료, 또는 FIX_LOOP에서 복귀 | 결과를 ExecutionPlan(ToolRequest[])으로 변환 |
 | `AWAITING_APPROVAL` | Policy Gate + UI | ExecutionPlan 내 riskTier != auto | 사용자 승인/거부 |
 | `EXECUTING` | Tool Runtime | 승인 완료 | 각 ToolRequest 순차 실행, 전부 완료 시 VERIFYING |
@@ -1416,7 +1416,12 @@ TRIAGE가 추가되면서 생긴 구멍: `SINGLE_MODEL_FIX`가 verdict 개념이
 
 **해결:** `SINGLE_MODEL_FIX`도 3절의 `SingleModelFixResult`를 통해 `REVIEWING`과 동일한 3가지 종결 방식을 갖는다 — `ACCEPT`(수정안 확정 → PLANNING), `NEED_USER_INPUT`(모호함 → AWAITING_USER_INPUT), `REJECT`(불가능/위험한 요청 → REJECTED). `REVISE`만 없다 — 검토 대상 초안이 없으므로 "수정 요청"이 성립하지 않는다(2절 상태 다이어그램 갱신 완료).
 
-**tier 승격 규칙:** 일단 `NEED_USER_INPUT`을 거치면(REVIEWING에서든 SINGLE_MODEL_FIX에서든), 사용자 응답 후 재시도는 항상 `DRAFTING`(즉 `standard` 경로)으로 간다 — `TRIAGE`로 돌아가 재분류하지 않는다. 근거: 사용자에게 재질문이 필요할 정도로 모호했다는 사실 자체가 "이 태스크는 애초에 simple이 아니었다"는 강한 신호이므로, 같은 휴리스틱으로 다시 TRIAGE했다가 또 simple로 잘못 분류될 위험을 감수할 이유가 없다. 이 규칙은 `TaskState`에 별도 필드 없이도 구현 가능하다 — `AWAITING_USER_INPUT`에서 나가는 전이가 항상 `DRAFTING` 하나뿐이므로(2절), tier를 명시적으로 덮어쓸 필요 없이 상태 머신 구조 자체가 승격을 강제한다.
+**tier 승격 규칙:** 일단 `NEED_USER_INPUT`을 거치면(REVIEWING에서든 SINGLE_MODEL_FIX에서든), 사용자 응답 후 재시도는 항상 ~~`DRAFTING`~~ **`OUTLINING`**(즉 `standard` 경로)으로 간다 — `TRIAGE`로 돌아가 재분류하지 않는다. 근거: 사용자에게 재질문이 필요할 정도로 모호했다는 사실 자체가 "이 태스크는 애초에 simple이 아니었다"는 강한 신호이므로, 같은 휴리스틱으로 다시 TRIAGE했다가 또 simple로 잘못 분류될 위험을 감수할 이유가 없다. 이 규칙은 `TaskState`에 별도 필드 없이도 구현 가능하다 — `AWAITING_USER_INPUT`에서 나가는 전이가 항상 **하나뿐이므로**(2절), tier를 명시적으로 덮어쓸 필요 없이 상태 머신 구조 자체가 승격을 강제한다.
+
+> **승격의 목적지가 바뀌었다(72.3절).** `standard` 경로의 입구가 `DRAFTING`에서 `OUTLINING`으로
+> 옮겨갔으므로 이 규칙의 목적지도 따라간다. **규칙과 그 근거는 그대로다** — 바뀐 것은
+> "standard 경로로 간다"가 어느 phase를 뜻하는가뿐이고, "나가는 전이가 하나뿐이라 구조가
+> 승격을 강제한다"는 성질도 유지된다(여전히 하나다).
 
 ### 14.2 `file_mutations` 테이블
 
@@ -8300,7 +8305,7 @@ AWAITING_APPROVAL / EXECUTING   기존 뜻 그대로
 | `OUTLINING` | 계획 |
 | `AWAITING_PLAN_APPROVAL` | 계획 승인 |
 | `PLAN_REVIEWING` | 계획 검토 |
-| `EXECUTING` / `AWAITING_APPROVAL` | 실행 |
+| `IMPLEMENTING` / `PLANNING` / `AWAITING_APPROVAL` / `EXECUTING` | 실행 |
 | `VERIFYING` / `FIX_LOOP` | 검증 |
 | `RESULT_REVIEWING` | 결과 검토 |
 | `AWAITING_USER_VERIFICATION` | 최종 확인 |
@@ -8367,7 +8372,7 @@ AWAITING_APPROVAL / EXECUTING   기존 뜻 그대로
 | 선택 | 다음 |
 |---|---|
 | 승인 + 독립 검토 | `PLAN_REVIEWING` |
-| 승인 + 검토 생략 | `EXECUTING` (생략 사실이 기록되고 체크리스트에 적힌다) |
+| 승인 + 검토 생략 | **`IMPLEMENTING`** (생략 사실이 기록되고 체크리스트에 적힌다) |
 | 수정 요청 | `OUTLINING` 재진입 (`planRounds` 상한 안에서 — 72.11절) |
 | 거부 | `REJECTED` |
 
@@ -8706,9 +8711,12 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | 2절 상태 다이어그램 | `standard` 구간이 통째로 대체됨 | 주석 + 대체 경로 표기 |
 | 2.1절 phase 표 | `TRIAGE` 분기, `DRAFTING`·`REVIEWING` 퇴장, 새 phase 다섯 | 갱신 |
 | 2.2절 루프 상한 표 | `planRounds`·`maxSubtasks`·`fixLoopRoundsTotal` | 추가 |
+| 14.1절 tier 승격 규칙 | 승격 목적지가 `DRAFTING` → `OUTLINING` | 취소선 + 근거 유지 |
 | 17.5절 | `verified`가 tier를 강제하던 것 | 취소선 + 대체 축 |
 | [multi-engine 1절](./multi-engine-routing.md) 보류 표 | xAI / planner·executor 분리 | 취소선 + 근거 |
 | multi-engine 4절 | `planner` 기본 비활성, `reviewer` = `REVIEWING` | 취소선 + 대체 |
+| multi-engine 5절 | 검수자 드롭이 tier를 `simple`로 격하시키던 것 | 취소선 + 근거 |
+| multi-engine 6절 | "상태는 하나도 추가되지 않는다" | 취소선 + phase 다섯 |
 | multi-engine 10절 | "planner/executor 분리 실행" 미채택 | 취소선 |
 | multi-engine 13.4절 | 호출 수 표, 대조의 대상 | 취소선 + 전후 대조 |
 | [ui-wireframes 2절](./ui-wireframes.md) | 5단계 매핑이 `standard`를 못 덮음 | 주석 + 정본 이관 |
@@ -8721,6 +8729,9 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   72.9절을 구현하는 순간 거짓이 되므로 같은 커밋에서 고쳐야 한다. product-strategy 4.2절이
   **문서만 고치고 코드에 남은 예고를 지우지 않아 다음 사람이 문서가 아니라 그 주석을 읽게 된**
   사례를 이미 기록했다.
+- `apps/desktop/src/types.ts` — `UserStage`·`STAGE_ORDER`·`stagesFor`·`phaseToStage`.
+  `phaseToStage`는 **전수 switch**라 새 phase 다섯을 더하면 컴파일이 막고, ui-wireframes 2절이
+  `standard` 순서의 정본을 72.2.1절로 넘겼으므로 **이 코드가 그 매핑의 유일한 소비자**다.
 - product-strategy 3절 자기 진단 표와 8.2절 출시 기준 표 — 마커(`<!-- present: -->`)가 붙는
   행들이라 **파일이 생긴 뒤에** 고친다. 지금 고치면 `docStatus.test.ts`가 없는 파일을 가리켜
   실패한다.
@@ -8735,6 +8746,11 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   가진 것이 6건뿐이라 임계값을 정할 표본이 되지 못한다(13.4.3절). 그리고 엣지를 TRIAGE의 손에
   쥐여주려면 `WorkspaceSnapshot`/`WorkspaceIndex` 경계를 건드려야 한다. **근거 없이 켜지도,
   못 잰다고 버리지도 않는다.**
+- **`FIX_LOOP`가 어느 등급·공급자로 도는가.** 서브태스크마다 등급이 다른데 검증은 태스크
+  전체에 대해 한 번 돌므로, 실패를 고치는 모델을 무엇으로 고를지 정하지 않았다. 그리고 그
+  모델이 **C의 "구현자 공급자" 집합에 드는지**도 정해야 한다 — 들지 않으면 C가 고치지 않은
+  코드를 검토하는 셈이고, 든다면 공급자가 하나 더 소비된다(multi-engine 21.6절의 사다리에
+  영향).
 - **서브태스크가 N개일 때 `tasks.phase`가 무엇을 뜻하는가.** 파생 캐시는 값 하나인데 구현은
   여러 갈래로 진행된다. 이벤트(진실의 원천)가 서브태스크별로 남는 것은 분명하나, 캐시가
   무엇으로 접히는지는 정하지 않았다 — 접는 규칙이 없으면 화면이 "무엇을 하는 중인가"에
