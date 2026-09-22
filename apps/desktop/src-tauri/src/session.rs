@@ -119,6 +119,14 @@ impl UiUserGateway {
 }
 
 impl UserGateway for UiUserGateway {
+    /// 게이트에서 기다리는 태스크를 깨운다 — `TaskHost::cancel_task`가 부른다(72.12.2절).
+    ///
+    /// **여기 있는 이유**: 이 구현만 사람을 기다린다. 헤드리스 게이트웨이는 고정된 답을 즉시
+    /// 내므로 깨울 대기가 없고, 그래서 트레이트의 기본 구현은 `false`다.
+    fn cancel_waiting(&self, task_id: &str, reason: &str) -> bool {
+        self.pending.cancel_waiting(task_id, reason)
+    }
+
     fn request_gate(&self, request: &UserGateRequest) -> UserGateOutcome {
         let task_id = request.task_id().to_string();
         let rx = self.pending.register(&task_id);
@@ -1693,17 +1701,14 @@ impl SessionState {
         let mut woken: Vec<String> = Vec::new();
         for member in &members {
             // 순서: Rust 먼저. 토큰이 켜져야 진행 중인 프로세스가 죽고 새 도구가 시작되지 않는다.
-            if member.host.cancel_task(&member.task_id).is_ok() {
+            if let Ok(outcome) = member.host.cancel_task(&member.task_id) {
                 reached.push(member.branch.clone());
+                if outcome.get("gateWoken").and_then(Value::as_bool).unwrap_or(false) {
+                    woken.push(member.branch.clone());
+                }
             }
-            // **게이트에서 기다리는 구성원을 깨운다.** 깨우지 않으면 타임아웃이 없는 `recv()`가
-            // 영원히 기다리고, 그 구성원은 `Done`을 보내지 않아 Fleet 전체가 끝나지 않는다.
-            if self
-                .pending_gates
-                .cancel_waiting(&member.task_id, "Fleet이 취소되었습니다")
-            {
-                woken.push(member.branch.clone());
-            }
+            // 게이트 대기를 깨우는 것은 `cancel_task` 안에서 일어난다 — 여기서는 **그 답을
+            // 읽기만 한다.** 규칙을 호출자마다 적으면 언젠가 한 곳이 빠진다(72.12.2절 ①).
             let _ = member
                 .sidecar
                 .request("task.cancel", json!({ "taskId": member.task_id }), Duration::from_secs(5));
@@ -1728,11 +1733,11 @@ impl SessionState {
                 .ok_or_else(|| "그 구성원은 지금 도는 Fleet에 없습니다.".to_string())?
         };
         let rust_outcome = member.host.cancel_task(task_id)?;
-        // **게이트에서 기다리는 구성원을 깨운다** — `cancel_task`와 같은 이유(72.12절).
-        // 없으면 카드 앞에 선 구성원이 취소에 반응하지 않고, Fleet 전체가 끝나지 않는다.
-        let gate_woken = self
-            .pending_gates
-            .cancel_waiting(task_id, "사용자가 구성원을 취소했습니다");
+        // 깨우는 것은 `cancel_task`가 한다 — 여기서는 그 답을 읽는다(72.12.2절 ①).
+        let gate_woken = rust_outcome
+            .get("gateWoken")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let node_outcome = member
             .sidecar
             .request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5))
@@ -2475,13 +2480,13 @@ impl SessionState {
 
         // **대기 중인 사용자 게이트를 깨운다** — state-machine 72.11절.
         //
-        // 게이트 둘에는 타임아웃이 없다(72.12절). 그래서 자리를 뜬 사용자에게 남는 탈출구는
-        // **취소뿐**인데, 그 취소가 여기 닿지 않으면 `UiUserGateway::request_gate`의
-        // `recv()`가 영원히 기다리고 **태스크는 터미널 이벤트 없이 매달린다.**
-        // 타임아웃을 없앤 결정이 탈출구를 함께 없애면 안 된다.
-        let gate_woken = self
-            .pending_gates
-            .cancel_waiting(task_id, "사용자가 태스크를 취소했습니다");
+        // **게이트 대기를 깨우는 것은 `TaskHost::cancel_task`가 한다**(72.12.2절). 한때
+        // 이 세 곳(태스크 취소·Fleet 취소·강제 포기)이 각자 기억해야 했고, 그러자 둘이
+        // 빠졌다 — 빠진 쪽은 **성공을 돌려주었다.** 화면은 이제 그 답을 읽어 전할 뿐이다.
+        let gate_woken = rust_outcome
+            .get("gateWoken")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let node_outcome = sidecar
             .request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5))
             .unwrap_or(Value::Null);
@@ -2540,13 +2545,11 @@ impl SessionState {
         drop(guard);
 
         // 취소 토큰을 확실히 켠다. 이미 켜져 있으면 idempotent다.
+        //
+        // **게이트 대기도 여기서 깨어난다** — `cancel_task` 안에서 일어나므로 이 함수가
+        // 따로 기억할 것이 없다. 강제 포기는 마지막 탈출구이고, 카드 앞에서 기다리는
+        // 스레드를 깨우지 않으면 **포기한 뒤에도 영원히 서 있는다**(72.12.2절 ①).
         let _ = host.cancel_task(task_id);
-        // **게이트 대기도 깨운다.** 강제 포기는 마지막 탈출구인데, 카드 앞에서 기다리는
-        // 스레드를 깨우지 않으면 그 스레드는 **포기한 뒤에도 영원히 서 있는다**
-        // (게이트 둘에는 타임아웃이 없다 — 72.12절). `cancel_task`와 같은 이유다.
-        let _ = self
-            .pending_gates
-            .cancel_waiting(task_id, "사용자가 태스크를 강제 포기했습니다");
         // sidecar 응답을 **기다리지 않는다** — 응답하지 않는 것이 이 경로의 전제다.
         // 짧은 타임아웃으로 한 번만 밀어 넣고, 실패해도 진행한다.
         let _ = sidecar.request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(1));

@@ -9564,9 +9564,16 @@ Rust만 기록할 수 있으므로 장악당한 sidecar가 승인을 꾸며 **�
 같은 검사가 **셋째 자리**를 함께 찾았다: `force_abandon_task`(강제 포기)도 깨우지 않고 있었다.
 마지막 탈출구인데 카드 앞의 스레드를 그대로 두면 **포기한 뒤에도 영원히 서 있는다.**
 
-세 곳이 같은 규칙을 손으로 지키고 있었고 둘이 빠져 있었다. 그래서 사람이 지키는 규칙을
-검사로 바꿨다 — `packages/toolchain/test/gateEscape.test.ts`가 `session.rs`에서 태스크를
-취소하는 **모든** 함수 본문에 `cancel_waiting`이 있는지 본다.
+세 곳이 같은 규칙을 손으로 지키고 있었고 둘이 빠져 있었다.
+
+**그래서 규칙을 검사로 바꾸는 것으로 끝내지 않았다.** 검사는 다음에 빠뜨리는 것을 잡아 줄
+뿐이고, 규칙 자체는 여전히 호출자마다 적어야 한다 — 진입점이 넷째가 되면 또 적어야 한다.
+탈출구를 **`TaskHost::cancel_task` 하나로** 옮겼다: 취소가 지나는 길은 거기 하나이므로 새
+진입점이 생겨도 따라온다. `UserGateway` 트레이트가 `cancel_waiting`을 갖고, 기본 구현은
+`false`다(헤드리스 게이트웨이는 고정된 답을 즉시 내므로 깨울 대기가 없다).
+
+`packages/toolchain/test/gateEscape.test.ts`가 그 자리를 지킨다 — core의 `cancel_task`가
+깨우는가, 그리고 **다시 호출자들로 흩어지지 않았는가**(화면이 직접 부르지 않는가).
 
 #### ② 지출을 읽지 못한 것을 $0으로 접고 있었다
 
@@ -9682,7 +9689,7 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | `apps/desktop/src/types.ts` `FleetMemberStatus` | `kind`·`complexityTier`를 싣는다 — 구성원은 **평범한 태스크**이므로 화면마다 다른 매핑을 쓰면 그 구조적 사실이 화면에서 거짓이 된다 | **더했다** |
 | `core/src/fleet.rs` `FLEET_ENROLLED` payload | 같은 이유로 `kind`를 값으로 적는다. 추측하지 않는다 | **더했다** |
 | **72.12절의 Fleet 쪽 절반** | `FleetBudget`이 예약을 계획 몫과 구현 몫으로 나누고, 승인이 **넘어간 사실과 카드 금액을 기록한다**. 감시(`PlanApprovalWatch`)는 한 곳뿐이고 화면·헤드리스 두 루프가 같은 것을 쓴다 | **부분적으로만 구현했다** — 72.12.1절: 합계 예약은 나눌 수 있어도 **줄일 수 없다**(두 번 틀렸고 두 번째는 독립 검토가 잡았다). 그래서 게이트 대기 중 점유는 그대로다 |
-| `session.rs` `cancel_fleet`/`cancel_fleet_member`/`force_abandon_task` | 셋 다 `PendingGates::cancel_waiting`까지 닿는다 — **타임아웃 없는 게이트의 탈출구**(72.12.2절 ①). 규칙을 세 곳에 손으로 지키다 둘이 빠져 있었고, 이제 `gateEscape.test.ts`가 지킨다 | **고쳤다** |
+| `core/src/types.rs` `UserGateway::cancel_waiting` + `core/src/host.rs` `cancel_task` | **타임아웃 없는 게이트의 탈출구를 한 곳으로 모았다**(72.12.2절 ①). 세 호출자가 각자 기억하다 둘이 빠져 있었다 — 이제 취소가 지나는 길 하나가 깨우고, 새 진입점도 따라온다. 화면은 `gateWoken`을 읽기만 한다 | **고쳤다** |
 | `core/src/fleet.rs` `settle_with_unknown_cost` | 지출을 읽지 못한 구성원은 **예약만큼 썼다고 친다**(72.12.2절 ②). $0으로 접으면 원장에 자리가 열린다 | **더했다** |
 | `core/src/bin/host.rs` `start_member` | 구성원 `TaskHost`에 `with_gates` — **헤드리스 Fleet에 사용자 게이트가 없었다.** `standard`로 분류된 구성원이 전부 `unattended_stop`으로 죽었고, 화면 쪽은 이미 붙어 있었으므로 둘이 갈려 있었다 | **고쳤다** — 그 경로를 태우는 e2e를 함께 |
 

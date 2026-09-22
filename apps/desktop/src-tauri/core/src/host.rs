@@ -933,6 +933,17 @@ impl TaskHost {
 
         let outcome = self.cancels.request(task_id, terminal.clone());
 
+        // **게이트에서 기다리는 태스크를 깨운다** — 72.12·72.12.2절.
+        //
+        // 취소가 지나는 길은 여기 하나다. 호출자들이 각자 기억하게 두었더니 셋 중 둘이
+        // 빠졌고, 빠진 쪽은 성공을 돌려주었다. 여기 두면 새 취소 진입점이 생겨도 따라온다.
+        // **돌려받은 값을 버리지 않는다** — "깨울 것이 없었다"와 "깨웠다"는 사용자가
+        // 다음에 할 일이 다른 사실이고, 화면이 그 둘을 구별해야 한다.
+        let gate_woken = self
+            .gates
+            .as_ref()
+            .is_some_and(|gates| gates.cancel_waiting(task_id, "취소되었습니다"));
+
         // 취소가 새로 확정된 경우에만 이벤트를 남긴다 (연타가 로그를 채우지 않게).
         if let CancelOutcome::Requested { .. } = &outcome {
             match self.with_store(|s| s.record_cancellation_request(task_id, "사용자 요청")) {
@@ -943,13 +954,16 @@ impl TaskHost {
                 Ok(None) => {}
                 // DB가 터미널이라고 하면 그쪽이 진실이다 — 메모리 토큰보다 DB를 믿는다.
                 Err(StoreError::TerminalAlreadySet { status }) => {
-                    return Ok(json!({ "accepted": true, "outcome": "already_terminal", "status": status }));
+                    return Ok(json!({
+                        "accepted": true, "outcome": "already_terminal",
+                        "status": status, "gateWoken": gate_woken
+                    }));
                 }
                 Err(e) => return Err(format!("취소 요청을 기록할 수 없습니다: {e}")),
             }
         }
 
-        Ok(match outcome {
+        let mut value = match outcome {
             CancelOutcome::Requested { requested_at } => {
                 json!({ "accepted": true, "outcome": "requested", "requestedAt": requested_at })
             }
@@ -960,7 +974,11 @@ impl TaskHost {
                 json!({ "accepted": true, "outcome": "already_terminal", "status": status })
             }
             CancelOutcome::UnknownTask => json!({ "accepted": false, "outcome": "unknown_task" }),
-        })
+        };
+        // **게이트에서 기다리던 태스크였는가.** 화면이 "취소를 눌렀는데 카드가
+        // 그대로다"와 "카드에서 기다리다 취소됐다"를 구별하는 데 쓴다.
+        value["gateWoken"] = Value::Bool(gate_woken);
+        Ok(value)
     }
 
     /// 백엔드가 시한 안에 답하지 않았다 (state-machine 39.2절).

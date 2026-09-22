@@ -553,7 +553,10 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
   (`cancel_fleet`, `cancel_fleet_member`, 그리고 검사를 쓰자 `force_abandon_task`까지).
   증상이 고약한 이유: 취소 명령은 **성공을 돌려주고** 화면에는 "취소했습니다"라고 적히는데,
   태스크는 카드 앞에 그대로 서 있고 Fleet 전체가 끝나지 않는다. 진입점이 셋 이상이 되는
-  규칙은 **함수 본문을 훑는 검사**로 바꿀 것(`packages/toolchain/test/gateEscape.test.ts`).
+  규칙을 검사로 바꿀 수는 있지만(`packages/toolchain/test/gateEscape.test.ts`),
+  그것은 **다음에 빠뜨리는 것을 잡을 뿐** 규칙 자체는 여전히 호출자마다 적어야 한다.
+  가능하면 **그 규칙이 지나는 길 하나로 옮길 것** — 이 경우는 `TaskHost::cancel_task`였고,
+  그러자 새 진입점이 생겨도 따라오게 됐다. 검사는 그 자리가 다시 흔어지지 않는지를 본다.
 - **집계 조회의 실패를 0으로 접으면 예산에 자리가 열린다.** `task_cost_usd`를 못 읽었을 때
   `unwrap_or(0.0)`은 "한 푼도 안 썼다"와 같아지고, 그 0이 **다음 구성원을 들여보낸다** —
   합계 $6 / 태스크당 $3에서 실제 지출이 $9가 된다. `readEvents`의 빈 배열과 같은 뿌리이며,
