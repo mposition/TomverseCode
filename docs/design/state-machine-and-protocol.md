@@ -117,13 +117,13 @@ stateDiagram-v2
 | `AWAITING_PLAN_APPROVAL` | UI | `PlanOutline` 확정 | 사용자 선택 넷(72.4절): 승인+검토 → PLAN_REVIEWING / 승인+검토생략 → **IMPLEMENTING** / 수정 요청 → OUTLINING(`planRounds++`) / 거부 → REJECTED |
 | `PLAN_REVIEWING` | 계획 검토자(B) | 승인된 `PlanOutline` | 쟁점 없음 → IMPLEMENTING, 쟁점 있음 → **AWAITING_PLAN_APPROVAL**(승인의 근거가 바뀌었으므로 다시 묻는다, 72.11절) |
 | `IMPLEMENTING` | 구현 Provider (등급은 72.10절) | 서브태스크 하나 | `DraftProposal`(patch·moves·deletions) 수신 → PLANNING. 남은 서브태스크가 있으면 EXECUTING 뒤 다시 여기로, 없으면 VERIFYING (72.2.2절) |
-| `RESULT_REVIEWING` | 결과 검토자(C) | **`VERIFYING` 통과 후에만** | 계획 일치 판정 넷(72.7절)을 체크리스트로 → AWAITING_USER_VERIFICATION |
+| `RESULT_REVIEWING` | 결과 검토자(C) | **`VERIFYING` 통과 후에만**, 그리고 **C가 배정된 경우에만** | 계획 일치 판정 넷(72.7절)을 체크리스트로 → AWAITING_USER_VERIFICATION |
 | `AWAITING_USER_VERIFICATION` | UI | 체크리스트 생성 완료 | 승인 → 커밋 → COMPLETED / 거부 → 72.8절 귀환 경로 셋 중 사용자 선택 |
 | `AWAITING_USER_INPUT` | UI | verdict = NEED_USER_INPUT (REVIEWING 또는 SINGLE_MODEL_FIX 양쪽에서 진입 가능) | 사용자 응답 → ~~DRAFTING~~ **`OUTLINING`**(항상 standard 경로, 14.1절 + 72.3절), 취소 → CANCELLED |
-| `PLANNING` | Orchestrator | ACCEPT/REVISE 확정, SINGLE_MODEL_FIX 완료, 또는 FIX_LOOP에서 복귀 | 결과를 ExecutionPlan(ToolRequest[])으로 변환 |
+| `PLANNING` | Orchestrator | ACCEPT/REVISE 확정, SINGLE_MODEL_FIX 완료, **`IMPLEMENTING` 완료(standard)**, 또는 FIX_LOOP에서 복귀 | 결과를 ExecutionPlan(ToolRequest[])으로 변환 |
 | `AWAITING_APPROVAL` | Policy Gate + UI | ExecutionPlan 내 riskTier != auto | 사용자 승인/거부 |
-| `EXECUTING` | Tool Runtime | 승인 완료 | 각 ToolRequest 순차 실행, 전부 완료 시 VERIFYING |
-| `VERIFYING` | Verify 서브시스템 | ExecutionPlan 적용 완료 | build/test/lint/diff 결과 종합 |
+| `EXECUTING` | Tool Runtime | 승인 완료 | 각 ToolRequest 순차 실행 → **`standard`이고 남은 서브태스크가 있으면 `IMPLEMENTING`으로, 없으면 VERIFYING**(72.2.2절). `simple`은 종전대로 바로 VERIFYING |
+| `VERIFYING` | Verify 서브시스템 | ExecutionPlan 적용 완료 | build/test/lint/diff 결과 종합. **`standard`에서 통과하면 → `RESULT_REVIEWING`, 단 C가 드롭됐으면 → `AWAITING_USER_VERIFICATION` 직행**(체크리스트의 결정론적 절반은 그대로 만들어진다 — 72.7절) |
 | `FIX_LOOP` | Claude Provider | VerificationReport.overall = fail | VerificationReport를 Claude에 다시 전달, 수정된 결과 요청 (원래 tier와 무관하게 항상 Claude 단독 호출이므로 tier 재분류 불필요) |
 | `CANCELLING` | Orchestrator + Rust | 취소 요청 접수 | 자식 프로세스 트리 종료·남은 단계 건너뛰기 완료 → CANCELLED (정리 중 오류면 FAILED) |
 | `COMPLETED` / `FAILED` / `CANCELLED` / `REJECTED` | - | 터미널 상태 | FinalResult 생성, UI에 전달 |
@@ -137,9 +137,14 @@ stateDiagram-v2
 | `reviseRounds` | REVISE verdict 수신 시 (실행 전 단계) | 2 | 강제로 REJECTED 처리, "OpenAI/Claude가 계획에 합의하지 못함" 사유 기록 |
 | `fixLoopRounds` | VERIFYING → fail 판정 시 | 3 | FAILED, 마지막 diff/로그를 사용자에게 제시하고 수동 개입 요청 |
 | `toolRetries[requestId]` | ToolResult.status = timeout/transient error | 2 (지수 백오프) | 해당 ToolRequest를 `error`로 확정, EXECUTING 전체를 FAILED로 전이 |
-| `planRounds` | `OUTLINING` 재진입 시 (**경로 셋** — 72.11절) | 2 | 계획을 다시 세우지 않는다. 남는 선택지는 `FIX_LOOP` 재진입과 되돌리기뿐 |
+| `planRounds` | `OUTLINING` 재진입 시 (**경로 넷** — 72.11절) | 2 | 계획을 다시 세우지 않는다. 남는 선택지는 `FIX_LOOP` 재진입과 되돌리기뿐 |
 | `maxSubtasks` | 계획이 서브태스크를 선언할 때 | 8 | 계획을 거부하고 사용자에게 쪼개 달라고 올린다 |
-| `fixLoopRoundsTotal` | `fixLoopRounds`와 **함께** 증가 | 12 | 서브태스크별 상한이 남아 있어도 태스크 전체를 FAILED로 |
+| `fixLoopRoundsTotal` | **`FIX_LOOP`에 진입할 때마다** | 12 | 서브태스크별 상한이 남아 있어도 태스크 전체를 FAILED로 |
+
+> **`fixLoopRoundsTotal`의 증가 지점을 `fixLoopRounds`와 다르게 적는 이유**: 후자는
+> *"`VERIFYING` → fail 판정 시"* 오르는데, 72.8절의 **귀환 경로 1**은 `VERIFYING`이 **통과한 뒤**
+> 체크리스트에서 `FIX_LOOP`로 되돌아간다. 그 경로에서는 매 바퀴 검증이 통과하므로 `fixLoopRounds`가
+> 오르지 않고, **상한이 걸리지 않는다**(원칙 5). 진입을 세면 두 경로가 모두 잡힌다.
 
 아래 셋은 72절의 `standard` 흐름에서만 쓰인다.
 
@@ -8302,8 +8307,42 @@ AWAITING_APPROVAL / EXECUTING   기존 뜻 그대로
 **`PlanOutlineStep`을 그대로 쓰지 않는 이유**: 그 타입은 **사용자에게 보여주는 서술**이고
 (53절), 여기 `grade`를 얹으면 화면용 타입이 라우팅과 비용을 정하게 된다. 45.2절이
 `PlanStep.toolHint`를 실행 근거에서 떼어낸 것과 같은 이유다 — **서술과 실행 단위를 한 타입에
-두면 모델이 말을 바꾸는 것이 곧 실행을 바꾸는 것이 된다.** 서브태스크는 계획에서 **유도**되고,
-유도가 일어나는 시점은 사용자 승인 뒤다.
+두면 모델이 말을 바꾸는 것이 곧 실행을 바꾸는 것이 된다.**
+
+#### 그래서 서브태스크는 **계획의 산출물**이고, 승인 **전에** 나온다
+
+초안은 *"서브태스크는 계획에서 유도되고, 유도가 일어나는 시점은 사용자 승인 뒤다"*라고
+적었다. **그러면 순환이 생긴다.**
+
+```
+72.12절: 구현 예산을 계획 승인 시점에 예약하고, 승인 카드가 그 금액을 보여준다
+72.10절: 금액은 서브태스크 개수와 등급이 정한다
+초안:    서브태스크는 승인 뒤에 유도된다
+         → 승인 시점에 보여줄 금액을 알 수 없다
+```
+
+그리고 이 순환은 문서 하나의 결함이 아니다. **"사용자가 비용을 보고 승인한다"가
+product-strategy 13.0.2의 보류를 뒤집은 근거**이므로(72.14절도 같은 문장을 쓴다), 금액을
+낼 수 없으면 그 뒤집기의 근거가 함께 무너진다.
+
+**따라서 `PlanOutline`이 서브태스크를 낸다.**
+
+```
+PlanOutline.subtasks: PlanSubtask[]     // standard 경로에서 필수
+PlanSubtask = { intent, files, proposedGrade }
+```
+
+- **`steps`와 다른 자리에 둔다.** `steps`는 사람이 읽는 서술이고 `subtasks`는 실행 단위다 —
+  한 타입에 얹지 않는다는 위 문단의 규칙은 **필드를 나눔으로써** 지켜지지, 시점을 미룸으로써
+  지켜지는 것이 아니었다. 초안은 그 둘을 헷갈렸다.
+- **`proposedGrade`는 이름 그대로 제안이다.** 최종 등급은 72.10절의 clamp와 위험 하한선을
+  지난 값이고, 그 계산은 **규칙이라 모델을 부르지 않는다** — 승인 카드가 보여주는 것은 계산이
+  끝난 최종 등급이다.
+- **B가 이것을 검토한다**(72.6절이 "분해와 등급 배정을 검토 항목에 포함한다"고 적은 대상이
+  바로 이 필드다). 검토가 승인 뒤인 것은 그대로이며, B가 이견을 내면 승인으로 되돌아간다
+  (72.11절 경로 3).
+- 계획 모드(53절)는 `subtasks`를 내지 않는다. 그 경로는 실행으로 이어지지 않으므로 실행
+  단위가 필요 없고, **없는 것을 내게 하면 그 모드가 아끼려는 토큰을 도로 쓴다.**
 
 ### 72.2.3 화면 단계는 **변경 경로의 순서를 빌리지 않는다**
 
@@ -8325,6 +8364,24 @@ AWAITING_APPROVAL / EXECUTING   기존 뜻 그대로
 | `VERIFYING` / `FIX_LOOP` | 검증 |
 | `RESULT_REVIEWING` | 결과 검토 |
 | `AWAITING_USER_VERIFICATION` | 최종 확인 |
+| `COMPLETED` / `FAILED` / `CANCELLED` / `REJECTED` / `INTERRUPTED` | 완료/실패 (공통) |
+| `AWAITING_USER_INPUT` | **칸이 아니다** — 기존 `확인 필요`대로 진행바를 카드로 전환한다. 72.11절 경로 4(계획 대조 불일치)의 도착지다 |
+| `CANCELLING` | 취소 중 (공통) |
+
+##### 먼저: 이 매핑에는 **안전망이 없다**
+
+초안은 *"`phaseToStage`는 전수 switch라 새 phase를 더하면 컴파일이 막는다"*고 적었다.
+**거짓이다.** `apps/desktop/src/types.ts`의 그 함수에는 `default: return "완료"`가 있다.
+
+그래서 새 phase를 더하고 매핑을 잊으면 **컴파일이 통과하고 `AWAITING_PLAN_APPROVAL`과
+`AWAITING_USER_VERIFICATION`이 "완료"로 표시된다** — **승인을 기다리는 태스크가 끝난 것으로
+보인다.** 사용자가 승인해야 진행되는 흐름에서 이보다 나쁜 오표시가 없고, 아무도 신고하지
+않는 종류다(화면이 더 좋은 소식을 말하기 때문이다).
+
+**`default`를 없앤다.** 53.4절이 결말 표를 `Record`로 합치며 *"새 결말을 더하면 컴파일이
+막는다"*를 얻은 것과 같은 수법이고, 그 절이 "이 저장소가 여러 번 밟은 함정을 타입으로 닫을 수
+있는 드문 자리"라고 적은 것이 여기에도 해당한다. 없애면 새 phase마다 컴파일이 멈추고,
+그때 이 표를 보게 된다.
 
 ##### `phaseToStage(phase)`는 더 이상 순수 함수일 수 없다
 
@@ -8549,13 +8606,21 @@ C는 수리하지 않으므로 그 대가가 발생하지 않는다. 숨기는 �
 사용자가 고른다(19절이 되돌리기에서 "묻는다"로 답한 것과 같다). 선택지는 우리가 안전하게 할
 수 있는 것만:
 
-1. 지적한 항목으로 **`FIX_LOOP` 재진입** (`fixLoopRounds` 안에서)
+1. 지적한 항목으로 **`FIX_LOOP` 재진입** (**`fixLoopRoundsTotal` 안에서** — 아래)
 2. **계획으로 되돌아간다** — 승인이 무효화되고 다시 세운다 (**`planRounds` 안에서**)
 3. **변경을 되돌리고 종료**
 
-**2번이 상한 없는 루프를 만들 뻔했다**(원칙 5). 계획 → 승인 → 구현 → 검증 → C → 거부 →
-계획으로 돌아오는 고리이고, 한 바퀴가 이 흐름에서 가장 비싼 한 바퀴다. 상한에 걸리면 남는
-선택지는 1번과 3번뿐이다 — **막다른 길을 만들지 않되 무한히 돌지도 않는다.**
+**둘 다 상한 없는 루프를 만들 뻔했고, 위험한 쪽은 1번이었다**(원칙 5).
+
+2번은 계획 → 승인 → 구현 → 검증 → C → 거부 → 계획으로 돌아오는 고리이고 한 바퀴가 이 흐름에서
+가장 비싸다. 초안은 이것만 보고 `planRounds`를 걸었다.
+
+**1번이 더 조용하다.** 이 경로는 `VERIFYING`이 **통과한 뒤** 체크리스트에서 되돌아가므로
+`fixLoopRounds`의 증가 조건(*"`VERIFYING` → fail 판정 시"*)을 **한 번도 만족시키지 않는다** —
+매 바퀴 검증이 통과한다. 카운터를 걸어 두고도 오르지 않는 상태였고, 그래서 2.2절의
+`fixLoopRoundsTotal`은 판정이 아니라 **`FIX_LOOP` 진입**을 센다.
+
+상한에 걸리면 남는 선택지는 3번뿐이다 — **막다른 길을 만들지 않되 무한히 돌지도 않는다.**
 
 ### 72.9 세 축 — 합치지 않는다
 
@@ -8685,7 +8750,7 @@ Anthropic 단독 / 교차검증 informed / blind였고, executor를 둘 부른 a
 | `maxSubtasks` | **8** | 계획이 만들 수 있는 서브태스크 수 |
 | `fixLoopRounds` (서브태스크) | 3 (기존값) | 서브태스크 하나가 도는 수정 횟수 |
 | `fixLoopRoundsTotal` | **12** | 서브태스크별 상한과 **별개로** 태스크 전체에 건다 |
-| `planRounds` | **2** | 계획을 다시 세우는 횟수 — **계획으로 돌아오는 경로 셋이 같은 카운터를 쓴다** |
+| `planRounds` | **2** | 계획을 다시 세우는 횟수 — **계획으로 돌아오는 경로 넷이 같은 카운터를 쓴다** |
 
 `planRounds`를 소비하는 경로는 **넷이고 하나도 빠뜨리면 안 된다.**
 
@@ -8815,6 +8880,10 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | multi-engine 10절 | "planner/executor 분리 실행" 미채택 | 취소선 |
 | multi-engine 13.4절 | 호출 수 표, 대조의 대상 | 취소선 + 전후 대조 |
 | [ui-wireframes 2절](./ui-wireframes.md) | 5단계 매핑이 `standard`를 못 덮음 | 주석 + 정본 이관 |
+| ui-wireframes 3절 화면 인벤토리 | 계획 승인·검증 체크리스트 화면이 목록에 없다 | **아직 안 함** — 화면을 그릴 때 함께 |
+| [product-strategy 8.2절](./product-strategy.md) Autopilot 행 | 72.12절이 "제품 설명이 그렇게 바뀌어야 한다"고 적었다 | **아직 안 함** — 마커가 붙는 행이라 구현 뒤에 |
+| product-strategy 5절 `public API 변경` 항목 | "Tree-sitter가 아직 없고" | 취소선 + 후속 링크 |
+| `packages/sidecar/src/triage.ts` 주석 | 같은 문장이 코드에 남아 있었다 | **고쳤다**(문서만 고치면 다음 사람은 주석을 읽는다) |
 | [product-strategy 13.0.1·13.0.2](./product-strategy.md) | 게이트 결론 인용문, 보류 두 항목 | 취소선 + 근거 |
 
 **아직 바꾸지 않았고, 구현 시점에 반드시 함께 바꿔야 하는 것:**
@@ -8825,8 +8894,10 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   **문서만 고치고 코드에 남은 예고를 지우지 않아 다음 사람이 문서가 아니라 그 주석을 읽게 된**
   사례를 이미 기록했다.
 - `apps/desktop/src/types.ts` — `UserStage`·`STAGE_ORDER`·`stagesFor`·`phaseToStage`.
-  `phaseToStage`는 **전수 switch**라 새 phase 다섯을 더하면 컴파일이 막고, ui-wireframes 2절이
-  `standard` 순서의 정본을 72.2.3절로 넘겼으므로 **이 코드가 그 매핑의 유일한 소비자**다.
+  `phaseToStage`에는 **`default: return "완료"`가 있어 안전망이 없다** — 새 phase를 더하고
+  매핑을 잊으면 승인 대기 중인 태스크가 "완료"로 표시된다(72.2.3절). `default`를 없애는 것이
+  이 항목의 첫 작업이고, ui-wireframes 2절이 `standard` 순서의 정본을 72.2.3절로 넘겼으므로
+  **이 코드가 그 매핑의 유일한 소비자**다.
   그리고 `phaseToStage`는 **시그니처가 바뀐다** — `AWAITING_APPROVAL`이 경로마다 다른 단계라
   `phase` 하나로는 표현되지 않는다(72.2.3절).
 - **`apps/desktop/src/components/FleetPanel.tsx`와 `FleetMemberStatus`** — 그 화면이
