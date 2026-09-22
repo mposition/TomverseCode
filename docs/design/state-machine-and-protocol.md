@@ -162,8 +162,28 @@ stateDiagram-v2
 
 **이 표는 "카운터"라는 이름으로 두 가지를 담고 있다.** 대부분은 세는 값이지만 `maxSubtasks`는
 **한 번 검사하는 상한**이라 셀 것이 없다 — 그래서 `counters_json`에 들어가지 않고
-`TaskPolicy`에만 산다. 표를 나누지 않는 이유는 **원칙 5가 묻는 질문이 하나이기 때문이다**:
-"이 루프/개수에 상한이 있는가". 다만 저장 위치가 갈리므로 그 사실을 여기 적어 둔다.
+`TaskPolicy`에 **둔다**(아직 `TaskLoopLimits`에 없다 — 72.15절 목록). 표를 나누지 않는 이유는
+**원칙 5가 묻는 질문이 하나이기 때문이다**: "이 루프/개수에 상한이 있는가". 다만 저장 위치가
+갈리므로 그 사실을 여기 적어 둔다.
+
+#### 이 표는 **여기서 값을 정하는 상한**만 싣는다 — 전수 목록이 아니다
+
+상한이 이 표에만 있다고 읽히면 **없는 것이 곧 상한이 없다는 뜻**이 되는데, 사실이 아니다.
+다른 절이 값을 정하는 상한이 셋 더 있고, 그것들도 `TaskCounters`·`TaskLoopLimits`에 산다.
+
+| 카운터 | 값의 정본 | 왜 여기 옮겨 적지 않는가 |
+|---|---|---|
+| `providerRetries[callId]` | **9절** 재시도 정책 표(429·5xx 각각 3) | 같은 값이 두 곳에 살면 언젠가 갈린다 |
+| `mcpRounds` | 31절 | 같음 |
+| `contextRounds` | 57절 | 같음 |
+
+**`providerRetries`가 원칙 5의 다섯 중 하나인데 이 표에 없는 것이 그래서 결함이 아니다** —
+다만 그 사실을 적어두지 않으면 결함처럼 보인다. 원칙 5가 이름을 적은 다섯 중 **넷**은 여기서
+값을 정하고, `providerRetries` 하나만 9절에서 정한다.
+
+**규칙을 하나로 두는 것이 요점이다.** "원칙 5가 이름을 적었으니 싣는다"로 하면 `mcpRounds`와
+`contextRounds`를 뺀 근거가 무너지고, 셋 다 실으면 값이 네 절에 흩어진다. **"여기서 값을
+정하는 것만 싣고, 나머지는 어디서 정하는지 가리킨다"**가 셋 모두를 같은 말로 설명한다.
 
 > **`reviseRounds`는 증가시키는 경로가 남지 않았다.** 그 카운터는 `REVISE` verdict에서 오르는데,
 > `SINGLE_MODEL_FIX`에는 `REVISE`가 없고(14.1절) `standard`에서는 `REVIEWING`이 물러났다(72.3절).
@@ -615,10 +635,11 @@ CREATE TABLE tasks (
   workspace_id   TEXT NOT NULL REFERENCES workspaces(workspace_id),
   user_message   TEXT NOT NULL,
   phase          TEXT NOT NULL,       -- TaskPhase
-  counters_json  TEXT NOT NULL,       -- 2.2절 표에서 **세는 것**만. 표가 정본이고 여기는 그 사본이다
-                                      -- (지금: clarificationRounds, reviseRounds, fixLoopRounds,
-                                      --  toolRetries, planRounds, escalationCalls)
-                                      -- maxSubtasks는 상한이지 카운터가 아니다 — TaskPolicy에 산다
+  counters_json  TEXT NOT NULL,       -- TaskCounters를 그대로 직렬화한다. **세는 것만** 들어간다:
+                                      -- maxSubtasks처럼 한 번 검사하는 상한은 여기가 아니라
+                                      -- TaskPolicy에 산다. 어떤 카운터가 있는지의 정본은 타입이고
+                                      -- (protocol / core의 TaskCounters), 상한값의 정본은 그
+                                      -- 카운터를 정의한 절이다 — 2.2절은 전수 목록이 아니다
   final_status   TEXT,                -- null 이면 아직 진행 중
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL
@@ -9373,7 +9394,7 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | multi-engine 15.3절 co-executor 지정 금지 | 대조가 계획으로 옮겨가 **co-planner**에 걸린다. `simple`·`fast`에 남는 co-executor는 **없다** | 취소선 + 대상 교체 + 자기정정 |
 | 72.14절 계측 표 | 에스컬레이션 행(요청/호출/거절 셋을 센다) | 갱신 |
 | `apps/desktop/src-tauri/core/src/metrics.rs` | **태스크 결말 집계가 없다** — `CANCELLED`/`REJECTED`를 가르지 못한다(2절). 게이트가 둘이 되면서 "사용자가 그만둔 방식"이 처음 의미를 갖는다 | **아직 안 함** — 72.14 계측과 함께 |
-| 2.2절 표의 `providerRetries` | 원칙 5가 이름까지 적은 다섯 중 하나인데 표에 없었다(코드에는 있었다) | **고쳤다** |
+| 2.2절 표의 완결성 | 표에 없는 상한 셋(`providerRetries`·`mcpRounds`·`contextRounds`)이 "상한이 없다"로 읽혔다 | **범위를 좁혔다** — 싣는 규칙("여기서 값을 정하는 것만")과 나머지가 어디 있는지를 표 아래 적었다. 값을 옮겨 적지는 **않았다** |
 | [product-strategy 8.6절](./product-strategy.md) 호출 수 | "실행자 2 + 검수자 1 = 3"과 "verified는 실행자를 하나 더 부른다" | 취소선 + 근거 |
 | [ui-wireframes 3.11절](./ui-wireframes.md) | 같은 문장이 화면 쪽에도 있었다 | 취소선 + 근거 |
 
