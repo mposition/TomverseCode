@@ -174,7 +174,9 @@ export function runHost(options: HostRunOptions): HostRunResult {
      *
      * **새 흐름을 재려면 새 프로토콜이 필요하다** — 같은 봉인 아래에서 대상을 바꾸지 않는다.
      */
-    ...(options.pipeline === "rule" ? [] : ["--pipeline", "legacy-cross-verification"]),
+    // **`--experiment-harness`를 함께 준다.** `--pipeline`은 측정 도구 전용이고, 선언 없이
+    // 켤 수 있으면 "production에 누출될 수 없다"가 성립하지 않는다(72.3절).
+    ...(options.pipeline === "rule" ? [] : ["--experiment-harness", "--pipeline", "legacy-cross-verification"]),
     "--approve",
     "auto",
     "--db",

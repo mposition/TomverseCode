@@ -122,6 +122,15 @@ export function buildPlanApprovalCard(input: {
   plan: PlanOutline;
   grades: readonly GradeDecision[];
   routing: RoutingDecision;
+  /**
+   * 서브태스크 **하나**를 구현하는 호출의 추정 비용 — 등급별로 다르다.
+   *
+   * 라우터의 `estimatedCostUsd`는 **역할 배정마다 대표 호출 한 번**을 더한 값이다. 서브태스크
+   * 개수는 라우팅 시점에 존재하지 않으므로(72.2.2절: 계획의 산출물이다) 거기 들어갈 수 없고,
+   * 그대로 카드에 실으면 **N개짜리 계획의 금액이 1개짜리와 같아진다.** 72.12절이 예약을 이
+   * 금액에 묶은 뒤로는 그 차이가 그대로 "승인한 금액과 실제 지출의 간극"이 된다.
+   */
+  implementationCostPerSubtaskUsd: (grade: ModelGrade) => number | null;
   escalation: EscalationAllowance;
   effortLevel: string;
   /** 승인 시점의 워크스페이스 지문 (72.5절). 못 찍었으면 `null`이다. */
@@ -168,6 +177,21 @@ export function buildPlanApprovalCard(input: {
       "그와 다른 검토자를 찾지 못할 수 있기 때문입니다."
   );
 
+  // **서브태스크 개수와 등급이 금액을 정한다**(72.10절). 라우터의 추정에 구현 호출분을
+  // 더한다 — 라우터는 대표 호출 한 번만 더했고 그 자리에는 분해가 없었다.
+  let implementationUsd = 0;
+  const unpriced = [...input.routing.unpricedAssignments];
+  for (const g of input.grades) {
+    const per = input.implementationCostPerSubtaskUsd(g.final);
+    if (per === null) {
+      // **0으로 더하지 않는다.** 모르는 것을 0으로 합산하면 카드가 "이만큼만 듭니다"라고
+      // 거짓을 말한다 — 환산 불가 배정과 같은 규칙이다.
+      unpriced.push(`구현(${g.subtaskId}, 등급 ${g.final}): 단가를 알 수 없습니다`);
+      continue;
+    }
+    implementationUsd += per;
+  }
+
   return {
     summary: input.plan.summary,
     steps: input.plan.steps.map((s) => s.intent),
@@ -177,8 +201,8 @@ export function buildPlanApprovalCard(input: {
       grade: g.final,
       riskSegments: g.riskSegments,
     })),
-    estimatedCostUsd: input.routing.estimatedCostUsd,
-    unpricedAssignments: [...input.routing.unpricedAssignments],
+    estimatedCostUsd: input.routing.estimatedCostUsd + implementationUsd,
+    unpricedAssignments: unpriced,
     // **effort는 금액에 곱하지 않는다.** 승인 시점에 "얼마나 늘어난다"를 말할 근거가 없다 —
     // 추론 토큰 수는 호출 전에 알 수 없다. 모르는 배수를 지어내 곱하면 카드가 정확해 보이는
     // 만큼 정확히 틀린다(72.4절).

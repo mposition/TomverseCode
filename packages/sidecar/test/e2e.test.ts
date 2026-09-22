@@ -132,7 +132,8 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
     "--timeout-secs",
     String(options.timeoutSecs ?? 180),
   ];
-  if (options.legacyPipeline) args.push("--pipeline", "legacy-cross-verification");
+  // 물러난 경로는 측정 도구 전용이므로 선언을 함께 준다(72.3절).
+  if (options.legacyPipeline) args.push("--experiment-harness", "--pipeline", "legacy-cross-verification");
   if (options.contrast) args.push("--contrast");
   if (options.worktree) args.push("--worktree", options.worktree);
   for (const hook of options.hooks ?? []) args.push("--hook", hook);

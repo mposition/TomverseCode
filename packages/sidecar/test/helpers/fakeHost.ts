@@ -116,6 +116,14 @@ export interface FakeHostOptions {
   /** 게이트에 물을 사람이 없다(무인 실행) / UI에 닿지 않았다를 흉내낸다. */
   gateOutcome?: "unattended" | { unavailable: string };
   /**
+   * `revert_and_stop`을 골랐을 때 Rust가 실어 보내는 **되돌리기 결과** — 72.8절 귀환 경로 3.
+   *
+   * 실제 Rust는 게이트 왕복 안에서 `TaskHost::rollback`을 부르고 그 결과를 응답에 싣는다.
+   * fake가 이 값을 내지 않으면 **"되돌리기 결과를 받지 못했다"는 경로**를 태우게 되므로,
+   * 그 경로와 성공 경로를 검사가 구별할 수 있도록 값으로 둔다.
+   */
+  rollbackResult?: { restored?: unknown[]; failed?: unknown[]; ok?: boolean; reason?: string } | null;
+  /**
    * 호출마다 답을 바꿔야 하는 경우 — 되돌린 뒤 두 번째 계획은 지나가야 "되돌린 것이 쓸모
    * 있었다"가 성립한다. `undefined`를 주면 기본값(자동 승인)이다.
    */
@@ -156,6 +164,9 @@ export class FakeHost {
   readonly gateRequests: { gate: "plan" | "verification"; taskId: string; card: unknown }[] = [];
   /** `workspace.fingerprint`를 몇 번 찍으라고 했는가 (72.5절). */
   fingerprintRequests = 0;
+
+  /** 되돌리기를 몇 번 수행했는가 — 검사가 "실제로 되돌렸는가"를 물을 수 있어야 한다. */
+  rollbackCalls = 0;
 
   private planGateCursor = 0;
   private verificationGateCursor = 0;
@@ -271,6 +282,11 @@ export class FakeHost {
           type: choice === "approve" ? "USER_VERIFICATION_APPROVED" : "APPROVAL_DENIED",
           payload: { gate: "verification", choice },
         });
+        // 실제 Rust는 되돌리기를 **여기서** 수행하고 결과를 응답에 싣는다(신뢰 경계의 일이다).
+        if (choice === "revert_and_stop") {
+          this.rollbackCalls += 1;
+          return { outcome: "verification", choice, rollback: this.options.rollbackResult ?? null };
+        }
         return { outcome: "verification", choice };
       }
 

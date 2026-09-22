@@ -190,7 +190,20 @@ export type UserGateRequest =
  */
 export type UserGateResponse =
   | { outcome: "plan"; choice: PlanApprovalChoice }
-  | { outcome: "verification"; choice: VerificationChoice }
+  | {
+      outcome: "verification";
+      choice: VerificationChoice;
+      /**
+       * `revert_and_stop`을 골랐을 때 **실제로 되돌린 결과** — 72.8절 귀환 경로 3.
+       *
+       * 이 선택지의 이름이 약속하는 것이 되돌리기이고, Rust가 게이트 왕복 안에서 수행한다
+       * (파일을 되돌리는 것은 신뢰 경계의 일이다 — 원칙 2). **되돌리지 못한 파일이 있으면
+       * 그 사실이 여기 실려 온다**: 삼키면 최종 보고가 "되돌렸습니다"라고 거짓을 말한다.
+       *
+       * 다른 선택지에서는 `null`이다.
+       */
+      rollback?: { restored?: unknown[]; failed?: unknown[]; ok?: boolean; reason?: string } | null;
+    }
   /**
    * **물을 사람이 없다** — 무인 실행(Autopilot)이 이 게이트에 닿았다.
    *

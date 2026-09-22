@@ -498,6 +498,12 @@ export class Orchestrator {
     this.adapters?.executor.cancel();
     this.adapters?.coExecutor?.cancel();
     this.adapters?.reviewer?.cancel();
+    // **72절의 역할 넷도 취소한다.** 빠뜨리면 계획이나 검토 호출이 취소 뒤에도 끝까지
+    // 돌고, 그 호출은 **취소된 태스크의 돈**이다.
+    this.adapters?.planner?.cancel();
+    this.adapters?.coPlanner?.cancel();
+    this.adapters?.planReviewer?.cancel();
+    this.adapters?.resultReviewer?.cancel();
     this.pendingQuestion?.resolve({ message: "" });
     return true;
   }
@@ -1790,6 +1796,15 @@ export class Orchestrator {
           const applied = describeApplied(result.output);
           if (applied) this.appliedChangeNotes.push(applied);
           const path = (request.args as { path?: unknown }).path;
+          // **이동은 `path`를 쓰지 않는다**(44절: `from`/`to`로 받는다). `path`만 보면
+          // 이름을 바꾼 파일이 변경 목록에서 통째로 빠지고, 그러면 72.7절의 범위 이탈
+          // 판정이 **모델 없이 낼 수 있다고 한 절반**에서 파일을 놓친다.
+          for (const key of ["from", "to"] as const) {
+            const moved = (request.args as Record<string, unknown>)[key];
+            if (typeof moved === "string" && moved.length > 0 && !this.mutatedPaths.includes(moved)) {
+              this.mutatedPaths.push(moved);
+            }
+          }
           if (typeof path === "string" && path.length > 0) {
             if (!this.mutatedPaths.includes(path)) this.mutatedPaths.push(path);
             // 이 순간부터 스냅샷의 파일 내용은 디스크와 다르다.
@@ -3179,6 +3194,9 @@ export class Orchestrator {
         plan,
         grades,
         routing: this.requireRouting(),
+        // **등급별 구현 모델의 단가로 센다.** 라우터의 추정에는 서브태스크가 없다 —
+        // 그 시점에 분해가 존재하지 않기 때문이다(72.2.2절).
+        implementationCostPerSubtaskUsd: (grade) => this.implementationCostFor(grade),
         escalation,
         effortLevel: this.policy.effortLevel,
         // **Node가 지문을 만들지 않는다.** Rust가 찍고 Rust가 기록하며(72.5절), 승인 이벤트에
@@ -3223,6 +3241,8 @@ export class Orchestrator {
         // 쟁점은 계획과 함께 낡는다. 남겨두면 새 계획에 옛 지적이 붙는다.
         this.planReviewIssues = [];
         this.issuesShownFor = null;
+        // 기준도 같다 — 승인하지 않은 계획의 요구를 들고 가지 않는다(위 경로와 같은 규칙).
+        this.acceptanceCriteria = this.acceptanceCriteria.filter((c) => c.source !== "plan_outline");
         // 이 경로에서는 아직 열린 예약이 없지만(승인 전이다) **규칙을 두 경로에 같이
         // 둔다** — 10.7절이 경계한 자리가 정확히 "되돌아가는 경로가 둘인데 한쪽만 보고
         // 규칙을 적는 것"이다.
@@ -3261,7 +3281,7 @@ export class Orchestrator {
       }
 
       // ---- PLAN_REVIEWING (B) ----
-      const reviewed = await this.runPlanReview(plan, fingerprint);
+      const reviewed = await this.runPlanReview(plan, fingerprint, grades);
       if (reviewed.kind === "final") return reviewed;
 
       // 쟁점이 있고 **아직 보여준 적이 없으면** 승인으로 되돌아간다. 승인의 근거가 바뀌었으니
@@ -3290,7 +3310,8 @@ export class Orchestrator {
    */
   private async runPlanReview(
     plan: PlanOutline,
-    fingerprint: string
+    fingerprint: string,
+    grades: readonly GradeDecision[]
   ): Promise<{ kind: "done" } | { kind: "final"; result: FinalResult }> {
     if (this.reviewedPlanFingerprint === fingerprint) {
       await this.emit("PLAN_REVIEW_COMPLETED", {
@@ -3309,7 +3330,15 @@ export class Orchestrator {
 
     const before = [...this.planReviewIssues];
     const snapshot = await this.snapshotForPrompt();
-    const review = await this.callProvider(reviewer, "planReviewer", `plan-review:${fingerprint.slice(5, 13)}`, (ctx) =>
+    // **B도 선택 호출이다.** 검토자를 부르지 못한 것은 **드롭과 같은 사실**이고(21.6절
+    // 사다리가 드롭을 정상 경로로 둔 이유 그대로), 그 사실은 카드와 체크리스트가 말한다.
+    // 필수로 두면 부가 검토자의 가용성이 **계획 단계에서 태스크를 죽인다** — 코드를 한 줄도
+    // 쓰기 전에.
+    const review = await this.callProviderMaybeOptional(
+      reviewer,
+      "planReviewer",
+      `plan-review:${fingerprint.slice(5, 13)}`,
+      (ctx) =>
       reviewer.reviewProposal(
         {
           snapshot,
@@ -3317,14 +3346,29 @@ export class Orchestrator {
           // **검토 대상은 계획이다.** `DraftProposal` 모양으로 감싸 보내는 이유는 어댑터가
           // 그 타입 하나만 받기 때문이고, 그 안에서 patch 자리는 비어 있다 — 계획에는
           // patch가 없다(53.5절).
-          draft: planAsReviewSubject(plan),
+          // **분해와 등급을 함께 보낸다**(72.6절).
+          draft: planAsReviewSubject(plan, grades),
           blind: false,
           acceptanceCriteria: this.criteriaForPrompt(),
         },
         ctx
-      )
+      ),
+      { optionalSample: true }
     );
     if (review.kind === "final") return review;
+    if (review.kind === "skipped") {
+      // 부르지 못했다 — **드롭과 같이 기록한다.** 조용히 넘어가면 "검토했는데 쟁점이
+      // 없었다"와 구별되지 않는다.
+      this.reviewedPlanFingerprint = fingerprint;
+      await this.emit("PLAN_REVIEW_COMPLETED", {
+        ran: false,
+        reason: "plan_review_skipped:call_failed — 계획 검토자를 부르지 못했습니다(예산·공급자 오류). 코드를 쓰기 전이므로 태스크를 실패시키지 않습니다.",
+        independence: this.routing?.planReviewIndependence ?? "not_applicable",
+        assignedPlanReviewerModel: this.routing?.assignedPlanReviewer?.modelId ?? null,
+        actualPlanReviewerModel: null,
+      });
+      return { kind: "done" };
+    }
 
     // **verdict를 판정으로 쓰지 않는다**(72.6절). 쟁점만 꺼낸다 — 모델이 판정하지 않고
     // 쟁점을 발굴한다는 product-strategy 16절 그대로다.
@@ -3402,10 +3446,15 @@ export class Orchestrator {
     }
     let adapter = picked.adapter;
 
+    // **`snapshotForPrompt()`를 지난다.** 서브태스크는 순차로 돌고 앞 조각이 이미 파일을
+    // 바꿔 놓았다 — `this.snapshot`을 그대로 주면 후속 모델이 **패치 전 내용**을 보고 patch를
+    // 만들고, 그 patch는 적용에 실패하거나 앞 조각을 덮어쓴다. 순차로 돌리는 이유의 절반이
+    // 여기서 사라진다.
+    const implSnapshot = await this.snapshotForPrompt();
     const drafted = await this.callProvider(adapter, "executor", `impl:${subtask.subtaskId}`, (ctx) =>
       adapter.generateDraft(
         {
-          snapshot: this.snapshot!,
+          snapshot: implSnapshot,
           userMessage: this.input.taskRequest.userMessage,
           ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
           acceptanceCriteria: this.criteriaForPrompt(),
@@ -3527,10 +3576,12 @@ export class Orchestrator {
 
     this.state.counters.escalationCalls += 1;
     const adapter = picked.adapter;
+    // 같은 이유로 최신 스냅샷을 쓴다 — 앞 조각의 변경이 이미 디스크에 있다.
+    const escSnapshot = await this.snapshotForPrompt();
     const redrafted = await this.callProvider(adapter, "executor", `impl-esc:${subtask.subtaskId}`, (ctx) =>
       adapter.generateDraft(
         {
-          snapshot: this.snapshot!,
+          snapshot: escSnapshot,
           userMessage: this.input.taskRequest.userMessage,
           ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
           acceptanceCriteria: this.criteriaForPrompt(),
@@ -3828,7 +3879,15 @@ export class Orchestrator {
     }
 
     const snapshot = await this.snapshotForPrompt();
-    const review = await this.callProvider(assigned, "resultReviewer", "result-review:1", (ctx) =>
+    // **C는 태스크를 실패시키지 못한다**(72.7절). 그러므로 그 호출은 **선택 호출**이어야
+    // 한다 — 필수로 두면 예산 거부·인증 오류·재시도 소진이 그대로 `TASK_FAILED`가 되고,
+    // **결정론적 검증을 통과한 결과가 부가 검토자의 가용성 때문에 실패한다.** 그건 원칙 1이
+    // 정한 판정 권위를 C에게 넘기는 것과 같다.
+    const review = await this.callProviderMaybeOptional(
+      assigned,
+      "resultReviewer",
+      "result-review:1",
+      (ctx) =>
       assigned.reviewProposal(
         {
           snapshot,
@@ -3845,9 +3904,24 @@ export class Orchestrator {
           acceptanceCriteria: this.criteriaForPrompt(),
         },
         ctx
-      )
+      ),
+      { optionalSample: true }
     );
     if (review.kind === "final") return review;
+    if (review.kind === "skipped") {
+      // 부르지 못했다. **조용히 넘어가지 않는다** — 체크리스트가 "3자 검토 없이 만들어졌다"를
+      // 적어야 하고, 그 근거가 이 이벤트다.
+      this.resultReviewRan = false;
+      await this.emit("RESULT_REVIEW_COMPLETED", {
+        ran: false,
+        reason: "result_review_skipped:call_failed — 결과 검토자를 부르지 못했습니다(예산·공급자 오류). 검증은 이미 통과했으므로 태스크를 실패시키지 않습니다(72.7절).",
+        assignedResultReviewerModel: this.routing?.assignedResultReviewer?.modelId ?? null,
+        actualResultReviewerModel: null,
+        implementerProviders: [...this.implementerProviders],
+        deterministicHalfStillRuns: true,
+      });
+      return { kind: "done" };
+    }
 
     this.resultReviewRan = true;
     // **C는 태스크를 실패시키지 못하고, `unverified`를 `verified`로 바꾸지도 못한다**(72.7절).
@@ -3887,6 +3961,23 @@ export class Orchestrator {
     report: VerificationReport
   ): Promise<{ kind: "final"; result: FinalResult } | { kind: "replan" } | { kind: "refix" }> {
     const unplanned = unplannedPaths(plan.filesToChange, this.mutatedPaths);
+    // **소진된 선택지를 카드가 말한다**(72.11절). 화면이 그대로 보여주고 누르면 실패하는
+    // 것은 *"상한은 반복을 끊으려는 것이지 태스크를 가두려는 것이 아니다"*와 정면으로
+    // 어긋난다 — 그리고 그 실패는 사용자가 방금 고른 동작의 결과로 나타난다.
+    const refixLeft = this.policy.limits.fixLoopRounds - this.state.counters.fixLoopRounds;
+    const replanLeft = this.policy.limits.planRounds - this.state.counters.planRounds;
+    const exhausted: string[] = [];
+    if (refixLeft <= 0) {
+      exhausted.push(
+        `다시 고치기 상한(${this.policy.limits.fixLoopRounds}회)을 다 썼습니다 — 이제 승인하거나 되돌리고 종료할 수 있습니다.`
+      );
+    }
+    if (replanLeft <= 0) {
+      exhausted.push(
+        `계획을 다시 세우는 상한(${this.policy.limits.planRounds}회)을 다 썼습니다 — 이제 승인하거나 되돌리고 종료할 수 있습니다.`
+      );
+    }
+
     const card = buildVerificationChecklist({
       criteria: this.acceptanceCriteria,
       evaluations: this.criterionEvaluations,
@@ -3894,7 +3985,7 @@ export class Orchestrator {
       unplannedPaths: unplanned,
       resultReviewRan: this.resultReviewRan,
       planReviewSkipped: this.planReviewSkipped,
-      extraNotes: this.unresolvedDisagreements.length > 0 ? [...this.unresolvedDisagreements] : [],
+      extraNotes: [...this.unresolvedDisagreements, ...exhausted],
     });
 
     await this.transition("AWAITING_USER_VERIFICATION");
@@ -3909,17 +4000,26 @@ export class Orchestrator {
         return { kind: "final", result: await this.finish("completed", this.describeSuccess(report, commit)) };
       }
       case "refix":
+        if (refixLeft <= 0) {
+          // **실패시키지 않는다.** 다시 물으면 카드가 남은 선택지를 적는다 — 위 `exhausted`가
+          // 그 문장이고, 상한에 걸린 자리에서 사용자가 할 수 있는 일이 남아 있어야 한다.
+          await this.emit("PHASE_CHANGED_NOTE", {
+            note: "다시 고치기 상한을 소진해 더 고칠 수 없습니다 — 승인 또는 되돌리기만 남았습니다",
+            fixLoopRounds: this.state.counters.fixLoopRounds,
+            max: this.policy.limits.fixLoopRounds,
+          });
+          return this.confirmWithUser(plan, report);
+        }
         return { kind: "refix" };
       case "replan":
-        if (this.state.counters.planRounds >= this.policy.limits.planRounds) {
-          return {
-            kind: "final",
-            result: await this.finish(
-              "failed",
-              `계획을 다시 세우는 상한(${this.policy.limits.planRounds}회)을 넘었습니다. 변경사항은 그대로 남아 있으며 되돌릴 수 있습니다.`,
-              "revise_exhausted"
-            ),
-          };
+        if (replanLeft <= 0) {
+          // 같은 이유로 실패시키지 않는다(72.11절).
+          await this.emit("PHASE_CHANGED_NOTE", {
+            note: "계획을 다시 세우는 상한을 소진했습니다 — 승인 또는 되돌리기만 남았습니다",
+            planRounds: this.state.counters.planRounds,
+            max: this.policy.limits.planRounds,
+          });
+          return this.confirmWithUser(plan, report);
         }
         this.state.counters.planRounds += 1;
         // **승인이 무효화된다.** 쟁점과 검토 지문도 함께 버린다 — 새 계획에 옛 지적이 붙으면
@@ -3928,16 +4028,24 @@ export class Orchestrator {
         this.planReviewIssues = [];
         this.reviewedPlanFingerprint = null;
         this.issuesShownFor = null;
+        // **폐기된 계획의 기준을 들고 가지 않는다.** 이벤트 쪽은 다음 승격이
+        // `acceptanceCriteriaReplaces: "plan_outline"`으로 대체하지만, 이 배열은 프롬프트와
+        // 체크리스트가 직접 읽으므로 여기서도 버려야 한다 — 남기면 사용자가 승인하지 않은
+        // 요구가 새 구현에 그대로 실린다. **사용자 판정은 남는다**(출처가 다르다).
+        this.acceptanceCriteria = this.acceptanceCriteria.filter((c) => c.source !== "plan_outline");
         return { kind: "replan" };
-      case "revert_and_stop":
+      case "revert_and_stop": {
         // **터미널은 `REJECTED`다**(72.8절). 사용자가 중단한 것이 아니라 **결과를 거부한
         // 것**이라 `CANCELLED`가 아니고, 실패한 것이 없어 `FAILED`도 아니다.
+        //
         // 되돌리기는 Rust가 게이트 왕복 안에서 수행한다 — 파일을 되돌리는 것은 신뢰 경계의
         // 일이고, Node가 "되돌렸다"를 만들어낼 수 없어야 한다(원칙 2).
-        return {
-          kind: "final",
-          result: await this.finishRejected("사용자가 결과를 거부하고 변경을 되돌렸습니다"),
-        };
+        //
+        // **그래서 여기서 지어내지 않는다.** 응답이 실어 온 결과를 그대로 말한다 —
+        // 되돌리지 못한 파일이 있는데 "되돌렸습니다"라고 보고하면, 사용자는 파일이
+        // 복원됐다고 믿은 채 바뀐 워크스페이스를 갖게 된다.
+        return { kind: "final", result: await this.finishRejected(describeRollback(response)) };
+      }
     }
   }
 
@@ -4029,6 +4137,12 @@ export class Orchestrator {
         ),
       };
     }
+    // **취소를 실패로 보고하지 않는다.** 게이트에 타임아웃이 없으므로 대기 중인 태스크를
+    // 깨우는 유일한 길이 취소이고(72.11절), Rust는 그것을 `Unavailable`로 돌려준다 —
+    // 거부로 뭉개지 않기 위해서다. 여기서 실패로 읽으면 사용자가 누른 취소가 "오류"가 된다.
+    if (this.cancelRequested || this.abort.signal.aborted) {
+      return { kind: "final", result: await this.finish("cancelled", `${label} 대기 중 취소됨`) };
+    }
     return {
       kind: "final",
       result: await this.finish(
@@ -4065,12 +4179,17 @@ export class Orchestrator {
     // Rust가 이벤트를 기록하는 **같은 트랜잭션 안에서** 캐시를 반영한다 — 이벤트 없이
     // 테이블만 갱신하는 경로를 만들지 않기 위한 장치다.
     //
-    // **`acceptanceCriteriaReplaces`를 달지 않는다.** 계획을 다시 세우면 새 기준이 쌓이지만
-    // 사용자 판정(`user_decision`)은 그 위에서 살아남아야 하고, 이 승격은 `plan_outline`
-    // 출처 안에서만 중복을 거른다(위 루프).
     await this.emit("PHASE_CHANGED_NOTE", {
       note: "승인된 계획의 완료 기준을 기준으로 승격했습니다 (plan_outline)",
-      acceptanceCriteria: added,
+      acceptanceCriteria: this.acceptanceCriteria.filter((c) => c.source === "plan_outline"),
+      // **이 출처만 대체한다.** 계획을 다시 세우면 옛 계획의 요구는 **철회된 것**인데,
+      // 대체하지 않으면 폐기된 계획의 기준이 새 구현 프롬프트와 최종 체크리스트에 계속
+      // 남아 사용자가 승인하지 않은 요구를 구현하게 된다.
+      //
+      // **사용자 판정은 영향을 받지 않는다** — 대체는 `source`별이고(`store.rs`의
+      // `sync_acceptance_criteria_tx`), `user_decision`은 다른 칸이다. 72.2.2절이 금지한
+      // 것은 **구현 모델의 `DraftProposal`이 기준을 덮는 것**이지 이 자리가 아니다.
+      acceptanceCriteriaReplaces: "plan_outline",
     });
   }
 
@@ -4137,6 +4256,20 @@ export class Orchestrator {
     this.implementationReservation = null;
   }
 
+  /**
+   * 등급 하나의 **서브태스크 한 개분** 추정 비용 — 72.4·72.10절.
+   *
+   * 라우터의 대표 토큰 수(8k/2k)를 그대로 쓴다: 카드가 보여주는 다른 금액과 **같은 자로**
+   * 재야 합이 뜻을 갖는다. `null`은 "0달러"가 아니라 **"금액으로 말할 수 없다"**이고,
+   * 카드가 그 둘을 다른 칸에 적는다.
+   */
+  private implementationCostFor(grade: ModelGrade): number | null {
+    const picked = this.adapterForGrade(grade);
+    if (picked.kind === "none") return null;
+    const cost = this.registry.costOf(picked.adapter.modelId, { inputTokens: 8_000, outputTokens: 2_000 });
+    return cost.kind === "usd" ? cost.usd : null;
+  }
+
   private requireRouting(): RoutingDecision {
     if (!this.routing) throw new Error("라우팅이 아직 결정되지 않았습니다");
     return this.routing;
@@ -4170,6 +4303,16 @@ export class Orchestrator {
     // 통과해 terminal 이벤트가 두 번 남는다 — 실측으로 `TASK_CANCELLED`가 둘 기록됐다.
     // JS는 단일 스레드지만 await가 곧 양보 지점이므로, 이 구간은 동기여야 한다.
     this.terminalReached = true;
+
+    // **열린 단계 예약을 닫는다** — multi-engine 10.7절.
+    //
+    // 승인 시점에 연 구현 예약은 첫 구현 호출 직전에 닫히지만, **거기 닿지 못하고 끝나는
+    // 경로가 있다**: B 호출이 실패하거나 그 사이에 취소되면 예약이 열린 채로 남고,
+    // 그러면 터미널 예산 보고와 원장에 **`opened`만 있고 짝이 없는 예약**이 남는다.
+    // 10.7절이 `BLOCKED_UNRESOLVED_RESERVATION`으로 막는 상태가 정확히 그것이다.
+    //
+    // **`released`가 맞다**: 이 예약으로는 아무 요청도 나가지 않았다.
+    this.releaseImplementationStage("태스크가 끝나 열린 단계 예약을 닫습니다");
 
     // 재요청을 유발한 충돌이 결말 없이 사라지지 않게 한다. 결말을 세는 지표는 결말이
     // **빠짐없이** 남을 때만 의미가 있다 — 감지 N건에 결말 M건(M<N)이면 차이가 어디서
@@ -4714,17 +4857,40 @@ function planFingerprint(plan: PlanOutline): string {
  * 코드를 판정한다. 그래서 `plan`에 단계를 싣고 `doneCriteria`·`requiredTests`를 그대로 옮긴다 —
  * 검토 대상이 **계획**이라는 사실이 payload에서 드러나야 한다.
  */
-function planAsReviewSubject(plan: PlanOutline): DraftProposal {
+function planAsReviewSubject(plan: PlanOutline, grades: readonly GradeDecision[] = []): DraftProposal {
+  const finalGrade = new Map(grades.map((g) => [g.subtaskId, g]));
   return {
     taskId: plan.taskId,
     proposalId: `${plan.taskId}-plan`,
     interpretation: plan.summary,
     relevantFiles: plan.filesToChange.map((path) => ({ path, reason: "계획이 건드릴 것으로 본 파일" })),
-    plan: plan.steps.map((step, i) => ({
-      stepId: `plan-step-${i + 1}`,
-      description: step.intent,
-      targetPaths: step.files,
-    })),
+    /**
+     * **서술 뒤에 실행 단위를 붙인다** — 72.6절이 *"검토 항목에 분해와 등급 배정을 명시적으로
+     * 포함한다"*고 정했기 때문이다. 거기서 돈과 품질이 동시에 결정되는데, 보여주지 않으면
+     * **그 결정만 검토 밖에 남는다.**
+     *
+     * 등급은 **계산이 끝난 최종 값**이다(72.2.2절) — 모델의 제안이 아니라 clamp와 위험
+     * 하한선을 지난 값이어야 B가 검토하는 것이 실제로 돌 배정이 된다.
+     */
+    plan: [
+      ...plan.steps.map((step, i) => ({
+        stepId: `plan-step-${i + 1}`,
+        description: step.intent,
+        targetPaths: step.files,
+      })),
+      ...(plan.subtasks ?? []).map((subtask) => {
+        const decision = finalGrade.get(subtask.subtaskId);
+        const risk = decision && decision.riskSegments.length > 0 ? ` · 위험 경로 ${decision.riskSegments.join("·")}` : "";
+        return {
+          stepId: `subtask:${subtask.subtaskId}`,
+          description:
+            `[실행 단위] ${subtask.intent} — 배정 등급 ${decision?.final ?? subtask.proposedGrade}` +
+            (decision && decision.final !== decision.proposed ? ` (계획 제안 ${decision.proposed})` : "") +
+            risk,
+          targetPaths: subtask.files,
+        };
+      }),
+    ],
     risks: plan.risks,
     requiredTests: plan.requiredTests ?? [],
     uncertainties: plan.openQuestions,
@@ -4776,6 +4942,30 @@ function matchCriterionIds(issues: readonly string[], criteria: readonly Accepta
     if (haystack.some((i) => i.includes(needle))) matched.add(c.criterionId);
   }
   return [...matched];
+}
+
+/**
+ * 되돌리기 결과를 **관측된 것만으로** 문장으로 만든다 — 72.8절 귀환 경로 3.
+ *
+ * Rust가 실제로 무엇을 복원했는지가 응답에 실려 온다. **지어내지 않는다**: 결과가 없으면
+ * "되돌렸다"고 말하지 않고, 실패한 파일이 있으면 그 수를 말한다.
+ */
+function describeRollback(response: UserGateResponse): string {
+  const base = "사용자가 결과를 거부했습니다";
+  if (response.outcome !== "verification") return base;
+  const rollback = response.rollback;
+  if (!rollback) {
+    // 되돌리기 결과가 오지 않았다. **"되돌렸다"고 말하지 않는다** — 옛 호스트이거나
+    // 배선이 끊긴 경우이고, 둘 다 "복원됐다"의 근거가 아니다.
+    return `${base}. 변경은 그대로 남아 있을 수 있습니다 — 되돌리기 결과를 받지 못했습니다.`;
+  }
+  const restored = Array.isArray(rollback.restored) ? rollback.restored.length : 0;
+  const failed = Array.isArray(rollback.failed) ? rollback.failed.length : 0;
+  if (rollback.ok === false || failed > 0) {
+    const reason = rollback.reason ? ` (${rollback.reason})` : "";
+    return `${base}. 파일 ${restored}개를 되돌렸고 ${failed}개는 되돌리지 못했습니다${reason}.`;
+  }
+  return `${base}. 변경한 파일 ${restored}개를 되돌렸습니다.`;
 }
 
 function sameStrings(a: readonly string[], b: readonly string[]): boolean {

@@ -437,7 +437,66 @@ impl TaskHost {
             return Ok(json!({ "outcome": "unattended" }));
         };
 
+        // **묻기 직전의 지문을 잡아 둔다** — state-machine 72.5절.
+        //
+        // 사용자가 계획을 승인하고 **자리를 비운 사이에** 파일을 고쳤거나 `git pull`을 했다면,
+        // 그 승인은 **다른 워크스페이스에 대한 승인**이다. 비교할 대상이 없으면 그 사실을
+        // 알 방법이 없으므로, 묻기 전과 답을 받은 뒤를 둘 다 찍는다.
+        //
+        // 착지 attestation이 이미 같은 규칙을 쓴다: *"커밋이 바뀌면 만료된다 — 옛 확인이
+        // 새 코드를 통과시키면 안 되기 때문이다."* 같은 문장이 여기서도 참이다.
+        let before = self
+            .workspace_fingerprint(&task_id)
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
         let outcome = gates.request_gate(request);
+
+        // **승인만 만료시킨다.** 거부·수정 요청·무인 정지는 워크스페이스가 바뀌었어도 그대로
+        // 유효하다 — 사용자가 "이건 아니다"라고 말한 것은 코드가 바뀌어도 여전히 참이다.
+        let approving = matches!(
+            (&outcome, request),
+            (UserGateOutcome::Plan(PlanApprovalChoice::ApproveWithReview), _)
+                | (UserGateOutcome::Plan(PlanApprovalChoice::ApproveSkipReview), _)
+                | (UserGateOutcome::Verification(VerificationChoice::Approve), _)
+        );
+        if approving {
+            let after = self
+                .workspace_fingerprint(&task_id)
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            // **지문을 낼 수 없는 워크스페이스에서는 만료시키지 않는다**(git 저장소가
+            // 아닌 경우). "모른다"를 "바뀌었다"로 읽으면 그 워크스페이스에서는 승인이
+            // 언제나 만료되어 태스크가 영영 진행되지 않는다.
+            if let (Some(before), Some(after)) = (&before, &after) {
+                if before != after {
+                    let _ = self.append_event(
+                        &task_id,
+                        "APPROVAL_EXPIRED",
+                        json!({
+                            "gate": gate_name(request),
+                            "before": before,
+                            "after": after,
+                            "note": "승인을 기다리는 동안 워크스페이스가 바뀌었습니다 — 이 승인은 다른 상태에 대한 것입니다",
+                        }),
+                    );
+                    // **승인으로 기록하지 않는다.** 기록하면 예산 예약이 그 승인에 묶이고
+                    // (72.12절), 낡은 계획이 새 코드 위에서 실행된다.
+                    return Ok(json!({
+                        "outcome": "unavailable",
+                        "reason": format!(
+                            "승인을 기다리는 동안 워크스페이스가 바뀌었습니다 ({} → {}). 다시 물어야 합니다.",
+                            &before[..before.len().min(12)],
+                            &after[..after.len().min(12)]
+                        ),
+                        "expired": true,
+                    }));
+                }
+            }
+        }
+
         match (&outcome, request) {
             (UserGateOutcome::Plan(choice), UserGateRequest::Plan { card, .. }) => {
                 let approved = matches!(
@@ -471,6 +530,29 @@ impl TaskHost {
                 Ok(json!({ "outcome": "plan", "choice": choice }))
             }
             (UserGateOutcome::Verification(choice), UserGateRequest::Verification { card, .. }) => {
+                // **"되돌리고 종료"는 실제로 되돌린다.** 이 선택지의 이름이 약속하는 것이
+                // 그것이고, 되돌리지 않은 채 `REJECTED`로 끝내면 사용자는 파일이 복원됐다고
+                // 믿은 채 바뀐 워크스페이스를 갖게 된다 — **화면이 더 좋은 소식을 말하는**
+                // 종류의 실패라 아무도 신고하지 않는다.
+                //
+                // # 왜 Node가 아니라 여기인가
+                //
+                // 파일을 되돌리는 것은 신뢰 경계의 일이다(원칙 2). Node가 "되돌렸다"를
+                // 만들어낼 수 없어야 하고, 롤백은 Policy Gate를 그대로 지나야 한다
+                // (`TaskHost::rollback`이 그 규칙을 이미 갖고 있다).
+                //
+                // # 실패해도 태스크는 끝난다 — 다만 **거짓말하지 않는다**
+                //
+                // 되돌리지 못한 파일이 있으면 그 사실을 응답에 실어 보낸다. 삼키면 Node의
+                // 최종 보고가 "되돌렸습니다"라고 말하게 되고, 그게 이 수정이 막는 바로 그것이다.
+                let rollback = if matches!(choice, VerificationChoice::RevertAndStop) {
+                    match self.rollback(&task_id) {
+                        Ok(value) => value,
+                        Err(reason) => json!({ "ok": false, "reason": reason }),
+                    }
+                } else {
+                    Value::Null
+                };
                 if matches!(choice, VerificationChoice::Approve) {
                     self.append_event(
                         &task_id,
@@ -489,7 +571,7 @@ impl TaskHost {
                         json!({ "gate": "verification", "choice": choice }),
                     )?;
                 }
-                Ok(json!({ "outcome": "verification", "choice": choice }))
+                Ok(json!({ "outcome": "verification", "choice": choice, "rollback": rollback }))
             }
             (UserGateOutcome::Unattended, _) => {
                 let _ = self.append_event(

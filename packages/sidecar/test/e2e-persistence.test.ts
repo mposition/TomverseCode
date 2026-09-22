@@ -983,7 +983,16 @@ test("[시나리오 D] 저장된 이벤트에서 기준 계측을 집계할 수 
     // tier를 정하지 않으므로 TRIAGE가 이 fixture를 `simple`로 보내면 기준이 아예 없다.
     const result = spawnSync(
       HOST_BIN,
-      runArgs(ctx, ["--mode", "verified", "--pipeline", "legacy-cross-verification", "--timeout-secs", "180"]),
+      runArgs(ctx, [
+        "--mode",
+        "verified",
+        // 물러난 경로는 측정 도구 전용이므로 선언을 함께 준다(72.3절).
+        "--experiment-harness",
+        "--pipeline",
+        "legacy-cross-verification",
+        "--timeout-secs",
+        "180",
+      ]),
       {
         encoding: "utf8",
         timeout: 210_000,

@@ -2346,6 +2346,16 @@ impl SessionState {
 
         // 순서: Rust 먼저. 토큰이 켜져야 진행 중인 프로세스가 죽고 새 도구가 시작되지 않는다.
         let rust_outcome = host.cancel_task(task_id)?;
+
+        // **대기 중인 사용자 게이트를 깨운다** — state-machine 72.11절.
+        //
+        // 게이트 둘에는 타임아웃이 없다(72.12절). 그래서 자리를 뜬 사용자에게 남는 탈출구는
+        // **취소뿐**인데, 그 취소가 여기 닿지 않으면 `UiUserGateway::request_gate`의
+        // `recv()`가 영원히 기다리고 **태스크는 터미널 이벤트 없이 매달린다.**
+        // 타임아웃을 없앤 결정이 탈출구를 함께 없애면 안 된다.
+        let gate_woken = self
+            .pending_gates
+            .cancel_waiting(task_id, "사용자가 태스크를 취소했습니다");
         let node_outcome = sidecar
             .request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5))
             .unwrap_or(Value::Null);
@@ -2355,6 +2365,9 @@ impl SessionState {
             "outcome": rust_outcome.get("outcome"),
             "host": rust_outcome,
             "sidecar": node_outcome,
+            // 게이트에서 기다리던 태스크였는가. **화면이 이 사실을 구별해야** "취소를 눌렀는데
+            // 아무 일도 없었다"와 "카드를 닫고 취소했다"가 같아 보이지 않는다.
+            "gateWoken": gate_woken,
         }))
     }
 

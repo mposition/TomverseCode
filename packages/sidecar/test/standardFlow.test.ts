@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { PlanApprovalCard, TaskRequest, VerificationChecklistCard } from "@tomverse/protocol";
+import type {
+  PlanApprovalCard,
+  TaskRequest,
+  VerificationChecklistCard,
+  VerificationChecklistCard as VerificationChecklistCardData,
+} from "@tomverse/protocol";
 import { Orchestrator } from "../src/orchestrator/orchestrator.js";
 import { FakeHost, VALID_PATCH, type FakeHostOptions } from "./helpers/fakeHost.js";
 import { makePolicy } from "./helpers/fixtures.js";
@@ -513,6 +518,172 @@ test("결과를 거부하면 CANCELLED가 아니라 REJECTED다", async () => {
   const result = await orchestrator.run();
   // 사용자가 중단한 것이 아니라 **결과를 거부한 것**이고, 실패한 것이 없어 FAILED도 아니다.
   assert.equal(result.status, "rejected");
+});
+
+/**
+ * **"되돌리고 종료"는 실제로 되돌린다** — 72.8절 귀환 경로 3.
+ *
+ * 이 검사가 없던 동안 코드는 "되돌리기는 Rust가 한다"고 **주석으로만** 말하고 아무것도
+ * 되돌리지 않았으며, 최종 보고는 "변경을 되돌렸습니다"라고 했다. 상태만 보는 검사는 그것을
+ * 초록색으로 통과시킨다 — 사용자는 파일이 복원됐다고 믿은 채 바뀐 워크스페이스를 갖는다.
+ */
+test("되돌리고 종료는 Rust에 되돌리기를 시키고, 그 결과만 보고한다", async () => {
+  const { orchestrator, host } = build({
+    verificationGateChoices: ["revert_and_stop"],
+    rollbackResult: { restored: ["src/app.ts"], failed: [] },
+  });
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "rejected");
+  // **실제로 시켰는가.** 이것이 없으면 주석만 남는다.
+  assert.equal(host.rollbackCalls, 1);
+  assert.match(result.summary, /1개를 되돌렸습니다/, result.summary);
+});
+
+test("되돌리지 못한 파일이 있으면 '되돌렸습니다'라고 말하지 않는다", async () => {
+  const { orchestrator } = build({
+    verificationGateChoices: ["revert_and_stop"],
+    rollbackResult: { restored: ["src/app.ts"], failed: [{ path: "src/other.ts" }] },
+  });
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "rejected");
+  assert.match(result.summary, /1개는 되돌리지 못했습니다/, result.summary);
+});
+
+test("되돌리기 결과가 오지 않으면 되돌렸다고 주장하지 않는다", async () => {
+  // 옛 호스트이거나 배선이 끊긴 경우다. 둘 다 "복원됐다"의 근거가 아니다.
+  const { orchestrator } = build({ verificationGateChoices: ["revert_and_stop"], rollbackResult: null });
+  const result = await orchestrator.run();
+
+  assert.match(result.summary, /그대로 남아 있을 수 있습니다/, result.summary);
+});
+
+/**
+ * **게이트에는 타임아웃이 없다**(72.12절). 그래서 자리를 뜬 사용자에게 남는 탈출구는
+ * **취소뿐**이고, 그 취소가 게이트에 닿지 않으면 태스크는 **터미널 이벤트 없이 매달린다.**
+ * 타임아웃을 없앤 결정이 탈출구를 함께 없애면 안 된다(72.11절).
+ */
+test("게이트 대기 중 취소는 실패가 아니라 취소로 끝난다", async () => {
+  const { orchestrator } = build({
+    // 실제 Rust는 `PendingGates::cancel_waiting`이 `Unavailable`로 깨운다 — 거부로 뭉개지
+    // 않기 위해서다. 그 응답을 받은 Node가 그것을 **실패로 읽으면** 사용자가 누른 취소가
+    // "오류"가 된다.
+    gateOutcome: { unavailable: "사용자가 태스크를 취소했습니다" },
+  });
+  orchestrator.cancel();
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "cancelled", result.summary);
+  assert.notEqual(result.status, "failed");
+});
+
+/**
+ * **C는 태스크를 실패시키지 못한다**(72.7절).
+ *
+ * 필수 호출로 두면 예산 거부·인증 오류·재시도 소진이 그대로 `TASK_FAILED`가 되고,
+ * **결정론적 검증을 통과한 결과가 부가 검토자의 가용성 때문에 실패한다** — 그건 원칙 1이
+ * 정한 판정 권위를 C에게 넘기는 것과 같다.
+ */
+test("결과 검토자가 죽어도 검증을 통과한 태스크는 완료된다", async () => {
+  const { orchestrator, host } = build(undefined, {
+    defaultPatch: VALID_PATCH,
+    scriptByModel: {
+      // B와 C가 같은 fake를 쓰므로 `review` 스텝 둘을 준다: 첫째는 B가 소비하고,
+      // 둘째에서 C가 죽는다. (어댑터 인스턴스별로 커서가 따로 도는 것은 fake의 계약이다.)
+      "fake-reviewer": [
+        { kind: "review", throws: { message: "공급자가 죽었습니다" } },
+        { kind: "review", throws: { message: "공급자가 죽었습니다" } },
+        { kind: "review", throws: { message: "공급자가 죽었습니다" } },
+        { kind: "review", throws: { message: "공급자가 죽었습니다" } },
+        { kind: "review", throws: { message: "공급자가 죽었습니다" } },
+        { kind: "review", throws: { message: "공급자가 죽었습니다" } },
+        { kind: "review", throws: { message: "공급자가 죽었습니다" } },
+        { kind: "review", throws: { message: "공급자가 죽었습니다" } },
+      ],
+    },
+  });
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "completed", result.summary);
+  // 그리고 **조용히 넘어가지 않는다** — 체크리스트가 "3자 검토 없이 만들어졌다"를 적으려면
+  // 그 근거가 이벤트로 남아야 한다.
+  const done = host.events.filter((e) => e.type === "RESULT_REVIEW_COMPLETED");
+  assert.ok(done.some((e) => (e.payload as { ran: boolean }).ran === false), JSON.stringify(done));
+});
+
+/**
+ * **폐기된 계획의 요구를 들고 가지 않는다.**
+ *
+ * 재계획하면 옛 계획은 사용자가 승인하지 않은 것이 된다. 그 기준이 남으면 새 구현 프롬프트와
+ * 최종 체크리스트에 계속 실리고, **사용자가 승인하지 않은 요구를 구현하게 된다.**
+ */
+test("계획을 다시 세우면 옛 계획의 기준은 남지 않는다", async () => {
+  const { orchestrator, host } = build({ planGateChoices: ["revise", "approve_with_review"] }, {
+    defaultPatch: VALID_PATCH,
+    script: [
+      {
+        kind: "plan",
+        payload: {
+          summary: "첫 계획",
+          steps: [{ intent: "첫", files: ["src/app.ts"] }],
+          filesToChange: ["src/app.ts"],
+          risks: [],
+          openQuestions: [],
+          doneCriteria: ["폐기될 옛 요구"],
+          requiredTests: ["npm test"],
+          subtasks: [{ subtaskId: "s1", intent: "첫", files: ["src/app.ts"], proposedGrade: "economy" }],
+        },
+      },
+      {
+        kind: "plan",
+        payload: {
+          summary: "두 번째 계획",
+          steps: [{ intent: "둘", files: ["src/app.ts"] }],
+          filesToChange: ["src/app.ts"],
+          risks: [],
+          openQuestions: [],
+          doneCriteria: ["살아남을 새 요구"],
+          requiredTests: ["npm test"],
+          subtasks: [{ subtaskId: "s1", intent: "둘", files: ["src/app.ts"], proposedGrade: "economy" }],
+        },
+      },
+    ],
+  });
+  const result = await orchestrator.run();
+  assert.equal(result.status, "completed", result.summary);
+
+  const texts = (result.acceptanceCriteria ?? []).map((c) => c.text);
+  assert.ok(texts.includes("살아남을 새 요구"), JSON.stringify(texts));
+  assert.ok(!texts.includes("폐기될 옛 요구"), JSON.stringify(texts));
+  // 체크리스트도 같은 목록을 본다.
+  assert.ok(!checklist(host).items.some((i) => i.text === "폐기될 옛 요구"));
+});
+
+/**
+ * **상한은 막다른 길을 만들지 않는다**(72.11절).
+ *
+ * 화면은 선택지를 그대로 보여준다. 소진된 것을 누르면 태스크가 실패하는 것은 그 규칙과
+ * 정면으로 어긋나고, **그 실패는 사용자가 방금 고른 동작의 결과로 나타난다.**
+ */
+test("체크리스트에서 상한을 넘겨 고르면 실패시키지 않고 다시 묻는다", async () => {
+  const { orchestrator, host } = build({
+    // 상한이 2인데 세 번 계획으로 되돌아가라고 한다.
+    verificationGateChoices: ["replan", "replan", "replan", "approve"],
+    verifyResults: [{ overall: "pass" }, { overall: "pass" }, { overall: "pass" }, { overall: "pass" }],
+  });
+  const result = await orchestrator.run();
+
+  assert.equal(result.status, "completed", result.summary);
+  assert.equal(countersOf(host).planRounds, 2);
+  // 그리고 소진 사실을 카드가 적는다 — 적지 않으면 사용자는 같은 버튼을 계속 누른다.
+  const cards = host.gateRequests
+    .filter((r) => r.gate === "verification")
+    .map((r) => r.card as VerificationChecklistCardData);
+  assert.ok(
+    cards.some((c) => c.notes.some((n) => n.includes("다 썼습니다"))),
+    JSON.stringify(cards.map((c) => c.notes))
+  );
 });
 
 // ---------------------------------------------------------------------------

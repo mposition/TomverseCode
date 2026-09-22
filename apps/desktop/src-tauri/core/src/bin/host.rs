@@ -189,6 +189,15 @@ struct Args {
     /// 그것**이고, 그 판정 기준은 `criteria.ts`에 해시로 봉인된 사전등록이라 재는 대상이
     /// 조용히 바뀌면 봉인이 지키는 것이 없어진다.
     pipeline: Option<String>,
+    /// **이 실행이 측정 도구의 것임을 선언한다** — `--experiment-harness`.
+    ///
+    /// `--pipeline`은 72.3절에서 물러난 경로를 되살리는 스위치이고, 그것은 **제품 동작이
+    /// 아니다.** 선언 없이 켤 수 있으면 "production에 누출될 수 없다"는 말이 성립하지 않는다 —
+    /// 일반 사용자가 `run --pipeline ...`으로 은퇴한 경로를 탈 수 있기 때문이다.
+    ///
+    /// 권한이 아니라 **선언**이다(헤드리스에 권한 개념이 없다). 그러나 선언을 요구하면
+    /// 우연히 켜지는 일이 없어지고, 켠 실행은 그 사실을 기록에 남긴다.
+    experiment_harness: bool,
     /// 대조(계획자 ×2)를 **명시적으로** 켠다 — `--contrast`.
     ///
     /// # 왜 플래그가 필요한가
@@ -520,6 +529,7 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         review_mode: None,
         replay_draft: None,
         pipeline: None,
+        experiment_harness: false,
         contrast: false,
         file: None,
         accept_fingerprint: None,
@@ -661,6 +671,7 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
                 args.pipeline = Some(name);
             }
+            "--experiment-harness" => args.experiment_harness = true,
             "--file" => args.file = Some(PathBuf::from(value()?)),
             "--accept-fingerprint" => args.accept_fingerprint = Some(value()?),
             "--apply" => args.apply = true,
@@ -733,6 +744,7 @@ fn usage() -> String {
      가설 게이트 전용: [--providers <csv>] [--review-mode blind|informed] [--replay-draft <file>]\n\
                        [--pipeline legacy-cross-verification]\n\
                        [--contrast]\n\
+                       [--experiment-harness]  (--pipeline에 필수)\n\
      \n\
      run --worktree <branch> — 격리 실행. 그 브랜치의 worktree를 만들고 **그 경로를 워크스페이스\n\
                  루트로 쓴다**. 브랜치가 없으면 만들고, 출발점은 [--worktree-base <ref>].\n\
@@ -1877,6 +1889,12 @@ fn run_task(
     }
     if args.contrast {
         experiment.insert("contrast".to_string(), json!(true));
+    }
+    if args.pipeline.is_some() && !args.experiment_harness {
+        return Err(
+            "--pipeline은 측정 도구 전용입니다. 물러난 경로(72.3절)를 제품 실행에서 켤 수 없으므로              --experiment-harness를 함께 지정하세요."
+                .to_string(),
+        );
     }
     if args.pipeline.is_some() {
         // 프로토콜의 값은 snake_case다(`ExperimentControls.pipeline`). CLI 쪽은 대시를 쓰므로

@@ -227,6 +227,14 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
    * "`REJECTED`는 되돌릴 파일이 없다"고 적은 것이 그래서 낡았다.
    */
   AWAITING_USER_VERIFICATION: [
+    /**
+     * **자기 자신으로의 전이** — 체크리스트를 다시 묻는다.
+     *
+     * 귀환 경로의 상한을 다 쓴 뒤 그 선택지를 또 고르면, 실패시키지 않고 같은 카드를 남은
+     * 선택지와 함께 다시 보여준다(72.11절: **상한은 반복을 끊으려는 것이지 태스크를
+     * 가두려는 것이 아니다**). `AWAITING_PLAN_APPROVAL`의 자기 전이와 같은 자리다.
+     */
+    "AWAITING_USER_VERIFICATION",
     "COMPLETED",
     "FIX_LOOP",
     "OUTLINING",

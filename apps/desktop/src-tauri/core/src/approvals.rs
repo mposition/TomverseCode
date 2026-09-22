@@ -531,6 +531,29 @@ impl PendingGates {
         ids
     }
 
+    /**
+     * **취소가 이 게이트를 빠져나오게 한다** — state-machine 72.11절.
+     *
+     * 게이트 둘에는 타임아웃이 없다(72.12절: 무응답은 거부가 아니라 대기다). 그러면 남는
+     * 탈출구는 **명시적 거부와 취소** 둘인데, 거부는 사용자가 카드를 **보고** 고르는 것이라
+     * 화면 앞에 없으면 쓸 수 없다 — **자리를 뜬 사용자에게 남는 것은 취소뿐이다.**
+     *
+     * 그 취소가 여기 닿지 않으면 `request_gate`의 `recv()`가 영원히 기다리고, 태스크는
+     * 터미널 이벤트 없이 매달린다. **타임아웃을 없앤 결정이 탈출구를 함께 없애면 안 된다.**
+     *
+     * `drain`과 나누는 이유는 범위다: 저쪽은 워크스페이스 전환·종료라 **전부**를 닫고,
+     * 이쪽은 취소된 태스크 **하나**만 닫는다. 같은 함수로 뭉치면 한 태스크를 취소했을 때
+     * 다른 Fleet 구성원의 게이트까지 닫힌다.
+     */
+    pub fn cancel_waiting(&self, task_id: &str, reason: &str) -> bool {
+        let Some(tx) = self.inner.lock().expect("gates mutex").remove(task_id) else {
+            return false;
+        };
+        // **거부가 아니라 `Unavailable`이다.** 거부는 태스크를 `REJECTED`로 끝내는 결말이고,
+        // 취소는 사용자가 그 결말을 고른 것이 아니다 — 부르는 쪽이 취소로 확정한다.
+        tx.send(crate::types::UserGateOutcome::Unavailable(reason.to_string())).is_ok()
+    }
+
     /// 워크스페이스를 전환하거나 앱을 닫을 때 대기 중인 게이트를 정리한다.
     ///
     /// **거부가 아니라 `Unavailable`로 닫는다.** 도구 승인의 정리가 거부인 것과 다른 이유는
