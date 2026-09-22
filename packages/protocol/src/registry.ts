@@ -3,6 +3,7 @@ import type {
   EffortLevel,
   EngineRole,
   ISODateTime,
+  ReviewerIndependence,
   ModelId,
   ProviderId,
 } from "./common.js";
@@ -329,15 +330,51 @@ export interface RoleAssignment {
 export interface RoutingDecision {
   taskId: string;
   complexityTier: ComplexityTier;
-  activeRoles: EngineRole[]; // simple이면 ["executor"] 하나뿐
+  /**
+   * 켜진 자리들. `simple`이면 `["executor"]` 하나뿐이다.
+   *
+   * **드롭은 이 배열에서 빠지는 것으로 표현된다.** 어느 자리가 왜 빠졌는지는
+   * `planReviewIndependence`/`resultReviewIndependence`와 `appliedPolicies`가 말한다.
+   */
+  activeRoles: EngineRole[];
   assignments: RoleAssignment[];
   appliedPolicies: string[]; // forceComplexityTier, reviewer 드롭 사유 등 override 흔적
   /**
    * 5절 불변식: executor와 reviewer가 모두 활성이면 두 역할의 providerId가 달라야 한다.
    * 서로 다른 공급자를 찾지 못해 reviewer를 드롭했으면 false이며, UI가 이 값을 보고
    * "교차검증 없이 진행됨"을 표시한다. 조용히 같은 공급자로 검증한 척하지 않는다.
+   *
+   * **지우지 않는다**(21.6절). 과거 기록이 이 값을 쓰고 있고, `simple` 경로와 72절 이전
+   * 태스크에 대해서는 지금도 정확하다. 72절 흐름의 검토자 둘은 아래 두 필드가 말한다 —
+   * 검토자가 둘이 되면 `boolean` 하나로는 **어느 쪽이 빠졌는지 표현할 수 없기** 때문이다.
    */
   reviewerIndependent: boolean;
+  /**
+   * B(계획 검토) 자리가 어떻게 채워졌는가 — 21.6절.
+   *
+   * `shares_provider`는 **B = A′**인 경우다: 대조가 켜지면 계획이 둘이고 살아남지 않은
+   * 쪽의 계획자를 B로 쓰면 자기 계획을 자기가 검토하는 일은 생기지 않는다. 그래도
+   * 완전 독립은 아니다 — 같은 스냅샷을 같은 시점에 본 당사자이기 때문이다.
+   */
+  planReviewIndependence: ReviewerIndependence;
+  /**
+   * C(결과 검토) 자리가 어떻게 채워졌는가 — 21.6절.
+   *
+   * `shares_provider`는 **C = B**인 경우다. 그것이 유일한 허용 예외이며, 이유는 **B가
+   * 코드를 쓰지 않았기 때문**이다 — 자기 산출물을 자기가 승인하는 경우가 아니다.
+   */
+  resultReviewIndependence: ReviewerIndependence;
+  /**
+   * 라우터가 **잠정 배정한** 계획 검토자와 오케스트레이터가 **확정한** 계획 검토자.
+   *
+   * 둘 다 남기는 이유는 13.5절이 검수자에 대해 정한 것과 같다: 실제 B는 "살아남은 계획의
+   * 저자가 아닌 쪽"이라 계획 단계가 끝나야 정해지는데, **잠정 배정만 남기면 기록이
+   * 실제로 누가 검토했는지를 말하지 못하고**, 확정만 남기면 라우터의 판단을 검증할 수 없다.
+   */
+  assignedPlanReviewer?: RoleAssignment | null;
+  actualPlanReviewer?: RoleAssignment | null;
+  assignedResultReviewer?: RoleAssignment | null;
+  actualResultReviewer?: RoleAssignment | null;
   /**
    * **계량 과금분만의** 예상 금액 — state-machine 72.4절.
    *

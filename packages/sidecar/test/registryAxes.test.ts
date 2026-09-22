@@ -181,3 +181,84 @@ test("effort 매핑에는 확인 날짜가 붙는다", () => {
     }
   }
 });
+
+/**
+ * **비교 축과 동일성 키는 다르고, 둘 다 걸려 있어야 한다** — 21.4·21.7절.
+ *
+ * 비교(원칙 4)는 `providerId` 하나로 하고, 동일성은 `(providerId, modelId)`로 접는다.
+ * **하나만 두면 한쪽이 샌다:**
+ *
+ * - 비교를 동일성 키로 하면 `openai/gpt-5`와 `openai/gpt-4.1`이 "서로 다른 키라서 독립"으로
+ *   읽힌다 — 21.7절 첫머리가 `providerId`를 나누지 말라고 한 것과 똑같은 실패가 **키를
+ *   넓히는 쪽으로** 돌아온다.
+ * - 접지 않으면 같은 참가자의 두 경로(HTTP·CLI)가 **후보 둘로 보인다.** 물어볼 모델은
+ *   하나인데 후보 수를 세는 자리가 둘로 읽는다.
+ *
+ * 소스 문자열이 아니라 **동작**으로 잰다. 소스를 훑는 검사는 자기 자신을 세고, 무엇보다
+ * "규칙이 적혀 있다"와 "규칙이 작동한다"를 구별하지 못한다.
+ */
+test("비교는 공급자로 한다 — modelId가 달라도 같은 공급자면 검수가 드롭된다", async () => {
+  const { ModelRegistry } = await import("../src/routing/registry.js");
+  const { Router } = await import("../src/routing/router.js");
+  const base = BUILTIN_MODELS.find((e) => e.providerId === "anthropic")!;
+  const decision = new Router(
+    new ModelRegistry([base, { ...base, modelId: `${base.modelId}-alt` }])
+  ).decide({ taskId: "t1", complexityTier: "standard", availableProviders: ["anthropic"] });
+
+  assert.ok(
+    !decision.activeRoles.includes("reviewer"),
+    "modelId만 다른 같은 공급자를 검수자로 앉혔습니다 — 비교 축은 providerId입니다"
+  );
+});
+
+test("같은 참가자의 두 경로는 후보 하나로 접힌다", async () => {
+  const { ModelRegistry } = await import("../src/routing/registry.js");
+  const { Router } = await import("../src/routing/router.js");
+  const base = BUILTIN_MODELS.find((e) => e.providerId === "anthropic")!;
+  /** 같은 `(providerId, modelId)`의 CLI 경로 — 참가자는 하나다. */
+  const cliPath: ModelEntry = {
+    ...base,
+    transport: "cli",
+    cliVendor: "claude-code",
+    apiBaseUrl: undefined,
+    endpointRegion: undefined,
+    providerJurisdiction: ["미국 (Anthropic PBC)", "미국 (Anthropic PBC)"],
+    accounting: "subscription",
+  };
+  const registry = new ModelRegistry([base, cliPath]);
+  const router = new Router(registry, { enabledCliVendors: ["claude-code"] });
+
+  // 두 경로가 **둘 다 후보에 있는데도** 실행자와 검수자에 나눠 앉지 않는다.
+  const decision = router.decide({
+    taskId: "t2",
+    complexityTier: "standard",
+    availableProviders: ["anthropic"],
+  });
+  assert.equal(registry.available(["anthropic"], { enabledCliVendors: ["claude-code"] }).length, 2, "전제: 경로가 둘이어야 한다");
+  assert.ok(
+    !decision.activeRoles.includes("reviewer"),
+    "같은 참가자의 다른 경로를 검수자로 앉혔습니다 — 같은 모델에게 두 번 묻는 것입니다"
+  );
+
+  // 그리고 72.10.1절 동점 규칙대로 **포함된 용량 쪽 경로**가 뽑힌다. 등급은 바꾸지 않는다.
+  const executor = decision.assignments.find((a) => a.role === "executor")!;
+  assert.equal(executor.modelId, base.modelId);
+  assert.equal(registry.getPath({ ...cliPath })!.accounting, "subscription");
+});
+
+/**
+ * 72절 흐름이 라우터를 지나기 전에는 B·C 자리가 **없다.** "독립적이지 않다"가 아니다 —
+ * 둘을 뭉개면 화면이 없는 검토를 드롭된 검토로 표시하고, 사용자는 있지도 않았던 것을
+ * 잃었다고 읽는다.
+ */
+test("B·C 자리는 없을 때 dropped가 아니라 not_applicable이다", async () => {
+  const { ModelRegistry } = await import("../src/routing/registry.js");
+  const { Router } = await import("../src/routing/router.js");
+  const decision = new Router(new ModelRegistry()).decide({
+    taskId: "t3",
+    complexityTier: "standard",
+    availableProviders: ["fake-a", "fake-b", "fake-c"],
+  });
+  assert.equal(decision.planReviewIndependence, "not_applicable");
+  assert.equal(decision.resultReviewIndependence, "not_applicable");
+});

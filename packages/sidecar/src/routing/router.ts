@@ -1,4 +1,12 @@
-import type { ComplexityTier, EngineRole, ModelEntry, RoleAssignment, RoutingDecision } from "@tomverse/protocol";
+import type {
+  CliVendor,
+  ComplexityTier,
+  EngineRole,
+  ModelEntry,
+  RoleAssignment,
+  RoutingDecision,
+} from "@tomverse/protocol";
+import { participantKey } from "@tomverse/protocol";
 import type { ModelRegistry } from "./registry.js";
 
 /**
@@ -22,9 +30,24 @@ export interface RouterOptions {
    * `preferred`와 달리 **대체하지 않는다.** 쓸 수 없으면 `RoutingError`로 멈춘다 —
    * 대체하면 사용자는 자기가 고르지 않은 모델에 자기 돈이 나간 것을 나중에 안다.
    */
-  pinned?: { executor?: string; reviewer?: string };
+  pinned?: {
+    planner?: string;
+    executor?: string;
+    reviewer?: string;
+    planReviewer?: string;
+    resultReviewer?: string;
+  };
   /** 조직 인증이 필요한 모델도 후보에 넣을지 (사용자가 인증됐다고 알린 경우) */
   allowOrgVerified?: boolean;
+  /**
+   * 사용자가 **켠** CLI들 — state-machine 72.10.1절의 옵트인 단서.
+   *
+   * 기본값이 비어 있는 것이 핵심이다. 열어 두면 동점이 생기는 순간 라우터가 21.7절이
+   * "기본 경로가 아니다"라고 못박은 경로를 사용자에게 묻지 않고 고른다. 그리고 그 경로가
+   * 뽑힐수록 승인 카드의 금액이 "환산 불가" 쪽으로 넘어가는데, *"사용자가 비용을 보고
+   * 승인한다"*가 13.0.2 뒤집기의 근거이므로 옵트인이 아니면 그 근거가 옅어진다.
+   */
+  enabledCliVendors?: readonly CliVendor[];
 }
 
 /**
@@ -97,6 +120,7 @@ export class Router {
     const appliedPolicies = [...(input.appliedPolicies ?? [])];
     const candidates = this.registry.available(input.availableProviders, {
       allowOrgVerified: this.options.allowOrgVerified,
+      ...(this.options.enabledCliVendors ? { enabledCliVendors: this.options.enabledCliVendors } : {}),
     });
 
     if (candidates.length === 0) {
@@ -109,8 +133,11 @@ export class Router {
 
     // **지정은 대체하지 않는다.** 쓸 수 없으면 여기서 멈추고 이유를 말한다 — 첫 유료 호출
     // 전이며, 사용자가 고르지 않은 모델에 돈이 나가지 않는다.
-    this.assertPinAvailable("executor", candidates, input.availableProviders);
-    this.assertPinAvailable("reviewer", candidates, input.availableProviders);
+    // 지정한 자리를 **전부** 먼저 확인한다. 하나라도 빠뜨리면 그 자리만 배정 도중에
+    // 실패하게 되고, 그때는 "무엇이 잘못됐나"에 답하기 위해 두 사실을 합쳐야 한다.
+    for (const role of PINNABLE_ROLES) {
+      this.assertPinAvailable(role, candidates, input.availableProviders);
+    }
 
     const executor = this.pick("executor", candidates);
     const assignments: RoleAssignment[] = [executor];
@@ -153,6 +180,22 @@ export class Router {
       const executorProviders = new Set(
         assignments.filter((a) => a.role === "executor").map((a) => a.providerId)
       );
+      /**
+       * **비교 축은 `providerId` 하나다**(21.4절) — 그게 원칙 4가 재는 축이다.
+       *
+       * 21.4절이 "검수 자리에는 동일성 접기가 아직 없다"고 적어둔 자리가 여기인데, **이
+       * 자리에서는 공급자 비교가 동일성 접기를 이미 포함한다**: 같은 참가자
+       * (`(providerId, modelId)`)는 정의상 같은 `providerId`이므로 이 필터가 먼저 뺀다.
+       *
+       * 그래서 참가자 필터를 한 줄 더 얹지 않는다 — 얹으면 **어떤 테스트로도 실패시킬 수
+       * 없는 코드**가 되고, 이 저장소는 "빠진 테스트는 실패하지 않으므로 빠진 사실이 드러나지
+       * 않는다"를 이미 겪었다. 대신 **두 규칙이 함께 성립하는지를 검사가 확인한다**:
+       * 비교가 `providerId`로 이루어지는가(이 필터)와 CLI 엔트리가 독립된 `providerId`를
+       * 갖지 않는가(`registryAxes.test.ts`). 뒤가 깨지면 앞의 포함 관계가 무너진다.
+       *
+       * 동일성 접기가 **실제로 필요한 자리**는 후보 정렬이다 — 같은 참가자의 두 경로가
+       * 후보에 함께 들면 "후보가 둘"로 보이는데 물어볼 모델은 하나다(`pick` 참조).
+       */
       const independent = candidates.filter((c) => !executorProviders.has(c.providerId));
 
       // 사용자가 지정한 검수자가 **독립적이지 않은** 경우가 있다(실행자와 같은 공급자).
@@ -226,6 +269,15 @@ export class Router {
       assignments,
       appliedPolicies,
       reviewerIndependent,
+      /**
+       * **72절 흐름은 아직 이 라우터를 지나지 않는다.**
+       *
+       * B·C 자리는 `standard` 경로가 72절 흐름으로 바뀔 때(오케스트레이터 단계) 배정된다.
+       * 그 전까지 `not_applicable`인 것은 "독립적이지 않다"가 아니라 **"그 자리가 아직
+       * 없다"**이고, 둘을 뭉개면 화면이 없는 검토를 드롭된 검토로 표시한다.
+       */
+      planReviewIndependence: "not_applicable",
+      resultReviewIndependence: "not_applicable",
       estimatedCostUsd,
       unpricedAssignments,
       decidedAt: new Date().toISOString(),
@@ -239,7 +291,7 @@ export class Router {
    * 이미 "무엇이 잘못됐나"에 답하기 위해 두 개의 사실을 합쳐야 한다.
    */
   private assertPinAvailable(
-    role: "executor" | "reviewer",
+    role: PinnableRole,
     candidates: ModelEntry[],
     availableProviders: readonly string[]
   ): void {
@@ -254,7 +306,7 @@ export class Router {
 
   private pick(role: EngineRole, candidates: ModelEntry[]): RoleAssignment {
     const pool = candidates;
-    const pinnedId = role === "executor" || role === "reviewer" ? this.options.pinned?.[role] : undefined;
+    const pinnedId = isPinnableRole(role) ? this.options.pinned?.[role] : undefined;
     if (pinnedId) {
       const match = pool.find((c) => c.modelId === pinnedId);
       if (match) {
@@ -290,10 +342,34 @@ export class Router {
       if (structured !== 0) return structured;
       const context = b.capabilities.maxContextTokens - a.capabilities.maxContextTokens;
       if (context !== 0) return context;
-      return a.economics.outputPerMTok - b.economics.outputPerMTok;
+      const price = a.economics.outputPerMTok - b.economics.outputPerMTok;
+      if (price !== 0) return price;
+      // **여기서부터가 경로를 고르는 자리다.** 위까지는 전부 참가자의 성질이라 같은 참가자의
+      // 두 경로는 전부 동점이 된다 — 그 동점을 72.10.1절 규칙이 가른다: 같은 등급 안에서
+      // 포함된 용량이 계량 과금보다 앞선다. 옵트인 단서는 `available()`이 이미 걸었으므로
+      // 여기 후보에 남은 CLI는 사용자가 켠 것뿐이다.
+      //
+      // **순서를 뒤집지 않는 것이 핵심이다.** 뒤집으면 "포함되어 있다"가 "쓸 만하다"로
+      // 번지고, 그건 가격에 대한 사실을 품질에 대한 사실로 읽는 것이다.
+      return accountingRank(b) - accountingRank(a);
     });
 
-    const chosen = sorted[0];
+    /**
+     * **같은 참가자의 두 경로는 한 후보다**(21.4절 동일성 키).
+     *
+     * 접지 않으면 `(anthropic, claude-sonnet-5)`의 HTTP 경로와 CLI 경로가 후보 둘로 보인다 —
+     * 물어볼 모델은 하나인데 후보 수를 세는 자리가 둘로 읽는다. 위 정렬이 이미 경로를
+     * 갈라 놓았으므로, 참가자별로 **첫 경로만** 남기면 그게 그 참가자의 대표 경로다.
+     */
+    const seen = new Set<string>();
+    const folded = sorted.filter((c) => {
+      const key = participantKey(c);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    const chosen = folded[0];
     if (!chosen) throw new RoutingError(`${role} 역할에 배정할 모델이 없습니다.`);
 
     const reason = preferredId
@@ -302,6 +378,17 @@ export class Router {
 
     return { role, modelId: chosen.modelId, providerId: chosen.providerId, reason };
   }
+}
+
+/**
+ * 비용 출처의 동점 규칙 — state-machine 72.10.1절. 높을수록 먼저 고른다.
+ *
+ * **등급을 바꾸지 않는다.** 1순위는 `PerformanceProfile`이 clamp한 등급이고 이 축은 그
+ * 안에서만 작동한다. 단서(`transport: "cli"`는 켠 경우에만 후보)는 `available()`이 건다 —
+ * 막으려는 것은 "구독"이 아니라 **약관 리스크를 사용자에게 지우는 경로**이기 때문이다.
+ */
+function accountingRank(entry: ModelEntry): number {
+  return entry.accounting === "subscription" ? 1 : 0;
 }
 
 function structuredOutputRank(entry: ModelEntry): number {
@@ -323,6 +410,17 @@ export class RoutingError extends Error {
     super(message);
     this.name = "RoutingError";
   }
+}
+
+/**
+ * 사용자가 **지정할 수 있는** 자리. co-planner(대조용 두 번째 계획자)는 여기 없다 —
+ * 고르게 하면 primary와 같게 만들 수 있고, 그 순간 "불일치 없음"이 착시가 된다(15.3절).
+ */
+const PINNABLE_ROLES = ["planner", "executor", "reviewer", "planReviewer", "resultReviewer"] as const;
+type PinnableRole = (typeof PINNABLE_ROLES)[number];
+
+function isPinnableRole(role: EngineRole): role is PinnableRole {
+  return (PINNABLE_ROLES as readonly string[]).includes(role);
 }
 
 /** 환경변수에서 역할별 모델 override를 읽는다. 모델 ID를 코드에 고정하지 않기 위한 통로. */

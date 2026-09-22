@@ -29,8 +29,56 @@ export interface TokenUsage {
 export type ProviderId = string;
 export type ModelId = string;
 
-// docs/design/multi-engine-routing.md 4절 — phase가 어느 모델을 부르는지는 역할로 표현한다.
-export type EngineRole = "planner" | "executor" | "reviewer";
+/**
+ * phase가 어느 모델을 부르는지는 역할로 표현한다 — multi-engine-routing.md 4절·21.6절.
+ *
+ * # 왜 `reviewer` 하나로는 부족한가
+ *
+ * 72절 흐름은 검수를 **앞뒤로 나눈다**: B(계획 검토, 코드 전)와 C(결과 검토, 검증 통과 후).
+ * 둘 다 `reviewer`로 두면 **어느 검토자가 어느 공급자인가**를 물을 수 없고, 21.6절의 불변식
+ * 둘(B는 살아남은 계획의 저자와 달라야 하고, C는 코드를 쓴 어떤 공급자와도 달라야 한다)을
+ * **따로 검사할 수 없다.**
+ *
+ * **`RoleAssignment`에 축을 하나 더하는 대신 값을 더한 이유**: 이 타입은 `activeRoles`와
+ * `RoleAssignment.role`만 쓰는 것이 아니라 `ProviderCall.role`·`ToolRequester.role`·
+ * `ToolBridge.as(role)`이 함께 쓴다. 축을 더하면 그 셋은 여전히 "reviewer"만 말할 수 있어
+ * **72.14절 계측이 B와 C의 호출을 가르지 못한다.** 값을 더하면 그 자리들이 전부 공짜로
+ * 구별을 얻는다.
+ *
+ * **`reviewer`를 지우지 않는다.** `task_events`는 append-only이고 과거 태스크가 그 역할로
+ * 호출된 기록이 남아 있다 — 지우면 옛 기록을 읽을 수 없게 된다(72.3절이 `REVIEWING` phase에
+ * 대해 적은 것과 같은 구별: 쓰이지 않는 것 / 없는 것).
+ *
+ * **대조 계획자(A′)에는 이름이 없다.** 하는 일이 A와 완전히 같고 표본이 둘일 뿐이라
+ * (13.1절), 이름을 나누면 프롬프트가 갈릴 여지가 생겨 "모델 차이"와 "프롬프트 차이"가 섞인다.
+ * `planner` 배정이 둘이고 **순서가 primary를 정한다.**
+ */
+export type EngineRole =
+  | "planner"
+  | "executor"
+  /** 종전 `REVIEWING`의 초안 검수자. 72.3절에서 standard 경로가 물러났고 기록을 위해 남는다. */
+  | "reviewer"
+  /** B — 계획 독립 검토자. 살아남은 계획의 저자와 다른 공급자여야 한다(21.6절). */
+  | "planReviewer"
+  /** C — 결과 검토자. 구현자 공급자 **전부**와 달라야 한다(21.6절). */
+  | "resultReviewer";
+
+/**
+ * 한 검토 자리가 **어떻게 채워졌는가** — 21.6절 드롭 사다리의 결과.
+ *
+ * `boolean` 하나로는 "배정됐지만 완전 독립은 아니다"를 말할 수 없다. 21.6절이 그 경우를
+ * 명시적으로 남기라고 한 이유는 13.3절보다 정직성이 후퇴하지 않기 위해서다 — B = A′는
+ * 자기 계획을 검토하지는 않지만 **같은 스냅샷을 같은 시점에 본 당사자**다.
+ */
+export type ReviewerIndependence =
+  /** 실행자/저자와 다른 공급자로 배정됐다. */
+  | "independent"
+  /** 배정은 됐으나 완전 독립이 아니다 — 그 사실이 `appliedPolicies`에 남는다. */
+  | "shares_provider"
+  /** 독립 후보가 없어 드롭했다. **같은 공급자로 "검증한 척"하지 않는다**(원칙 4). */
+  | "dropped"
+  /** 이 경로에 그 자리가 애초에 없다 (예: `simple`, 또는 72절 흐름 이전의 태스크). */
+  | "not_applicable";
 
 /**
  * 사용자가 고르는 네 번째 축 — **고른 모델을 얼마나 깊게 굴리는가**
