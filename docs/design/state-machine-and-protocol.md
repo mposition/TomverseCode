@@ -723,18 +723,37 @@ CREATE TABLE snapshots (
 
 -- 10절 FileMutationRecord — 롤백 UX가 조회하는 테이블. request_id 1개당 파일 1개.
 CREATE TABLE file_mutations (
+  mutation_id      TEXT,               -- 기록 하나의 식별자
   request_id       TEXT NOT NULL REFERENCES tool_requests(request_id),
+  task_id          TEXT NOT NULL REFERENCES tasks(task_id),   -- 롤백이 직접 본다(조인 없음)
   path             TEXT NOT NULL,
   pre_existed      INTEGER NOT NULL,   -- boolean (0/1)
   pre_content_ref  TEXT,               -- artifact 경로, pre_existed=0이면 NULL
+  pre_sha256       TEXT,
   post_existed     INTEGER NOT NULL,
   post_content_ref TEXT,
+  post_sha256      TEXT,
+  rollback_status  TEXT NOT NULL DEFAULT 'applied',  -- 'applied' | 'rolled_back'
+  rolled_back_at   TEXT,
+  recorded_at      TEXT NOT NULL,
   PRIMARY KEY (request_id, path)
 );
 CREATE INDEX idx_file_mutations_request ON file_mutations(request_id);
 ```
 
-롤백(10절)은 `tool_requests.task_id`로 해당 태스크의 모든 `request_id`를 찾고, `file_mutations`를 조인해 `path`별 최신 `pre_image`를 역방향 patch로 변환한다.
+**이 DDL은 한동안 코드보다 뒤처져 있었다** — `task_id`·`rollback_status`·`rolled_back_at`·
+`mutation_id`·`*_sha256`·`recorded_at`이 코드에만 있었다. 10절이 이 테이블을 **롤백 판정의
+근거**로 승격시켰으므로(같은 이름 아래 롤백 대상이 갈린다) 문서 정본이 실제 모양을 말해야
+한다.
+
+롤백(10절)은 `file_mutations.task_id`를 **직접** 보고(조인하지 않는다), `path`별 **최초**
+`pre_image`를 역방향 patch로 변환한다. ~~`tool_requests`를 조인해 `path`별 **최신**을 쓴다~~ —
+**둘 다 틀렸고 구현이 맞다.** 최신으로 되돌리면 **태스크 중간 상태**로 돌아가는데 그건 "이
+태스크를 없앤 것"이 아니다(`store.rs`의 `rollback_targets`가 `MIN(rowid)`를 쓰는 이유이고
+주석에 적혀 있다).
+
+**이 구별이 72절에서 처음으로 중요해진다.** 서브태스크 N개가 **같은 파일을 여러 번 고치는
+것이 기본 모양**이라, "최신"으로 읽은 구현자는 되돌리기가 중간 상태를 남기게 만든다.
 
 `task_events.event_type` 값: `TASK_CREATED`, `SNAPSHOT_CREATED`, `DRAFT_RECEIVED`, `REVIEW_RECEIVED`, `PLAN_CREATED`, `APPROVAL_REQUESTED`, `APPROVAL_GRANTED`, `APPROVAL_DENIED`, `TOOL_REQUESTED`, `TOOL_COMPLETED`, `VERIFICATION_COMPLETED`, `FIX_LOOP_STARTED`, `PHASE_CHANGED`, `USER_MESSAGE_RECEIVED`, `TASK_COMPLETED`, `TASK_FAILED`, `TASK_CANCELLED`, `TASK_REJECTED`, `DISAGREEMENT_DETECTED`, `USER_DECISION_RECORDED`(17.3절).
 
@@ -833,11 +852,17 @@ interface TaskState {
 검증은 통과했고 사용자가 받지 않기로 정했다. 이름이 뜻을 말해야 결말 집계가 쓸모 있다
 (2절이 `CANCELLED`/`REJECTED`를 가르는 집계를 요구한 것과 같은 자리다).
 
-**그러므로 롤백이 필요한 결말은 셋이다**: `FAILED`, `CANCELLED`, 그리고 **`REJECTED` 중
-"되돌리고 종료"로 온 것.** 계획 승인 카드에서 거부해 온 `REJECTED`는 여전히 되돌릴 파일이
-없다 — **같은 터미널인데 롤백 대상이 갈린다.** 그래서 아래 UX는 "터미널 이름"이 아니라
-**`file_mutations`에 이 태스크의 기록이 있는가**로 판단해야 한다. 이름으로 판단하면 방금
-쓴 코드를 되돌릴 기회를 잃는다.
+**"되돌리고 종료"는 되돌린 **뒤에** `REJECTED`로 간다.** 이름이 그렇게 읽히고, 그래야 사용자가
+고른 것("되돌려 달라")이 터미널에 닿기 전에 실행된다. 그러므로 그 화면에 **보통은 되돌릴 것이
+남아 있지 않다.**
+
+**그런데 "보통"이지 "항상"이 아니다.** 롤백이 부분 실패하면 되돌리지 못한 기록이 남고, 그때
+`REJECTED` 화면은 되돌릴 것이 있는 화면이 된다. 그리고 계획 승인 카드에서 거부해 온
+`REJECTED`는 **처음부터** 되돌릴 것이 없다.
+
+**같은 터미널 이름 아래 세 상태가 있다는 것이 요점이다.** 그래서 아래 UX는 "터미널 이름"이
+아니라 **되돌리지 않은 `file_mutations` 기록이 있는가**로 판단한다 — 이름으로 판단하면
+한쪽에서는 방금 쓴 코드를 되돌릴 기회를 잃고, 다른 쪽에서는 되돌릴 것이 없는데 버튼이 뜬다.
 
 **git stash 대신 태스크 단위 파일 되돌리기를 쓴다.** git stash는 사용자가 Tomverse Code와 무관하게 작업 중이던 uncommitted 변경사항까지 전부 쓸어담아 혼란을 준다. 대신 Tool Runtime이 파일을 변경하는 모든 `ToolRequest`(`apply_patch`/`create_file`/`delete_file`) 결과에 이미 diff 표시를 위해 필요한 pre-image/post-image를 남기므로, 이걸 재사용해 **이 태스크가 건드린 파일만** 정확히 원상복구한다.
 
@@ -851,7 +876,21 @@ interface FileMutationRecord {
 ```
 
 - `ToolResult.output`이 아니라 별도 `file_mutations` 테이블에 저장(7절 스키마에 DDL 포함, `request_id`로 `tool_requests`와 조인).
-- UI: `FAILED`/`CANCELLED` 화면에 "이 작업이 변경한 N개 파일" 목록과 "되돌리기" 버튼. `FAILED`는 되돌리기가 기본 추천(깨진 상태 방치 방지), `CANCELLED`는 사용자 선택에 맡긴다(부분 진행 결과를 원할 수도 있음).
+- UI: ~~`FAILED`/`CANCELLED` 화면에~~ → **되돌리지 않은 `file_mutations` 기록이 있는 모든
+  터미널 화면에** "이 작업이 변경한 N개 파일" 목록과 "되돌리기" 버튼. **기록이 없으면 버튼도
+  없다** — 화면을 터미널 이름으로 고르면 위 규칙과 이 절이 두 말을 하게 된다.
+  기본 추천만 터미널마다 다르다:
+
+  | 터미널 | 기본 추천 | 왜 |
+  |---|---|---|
+  | `FAILED` | **사전 체크** | 깨진 상태 방치 방지 |
+  | `CANCELLED` | 해제 | 부분 진행 결과를 원할 수도 있다 |
+  | `REJECTED` | **사전 체크** | 결과를 거부한 것이므로 남길 이유가 없다. 다만 아래대로 **보통은 이 화면에 되돌릴 것이 없다** |
+
+  **술어는 "기록이 있는가"가 아니라 "되돌리지 않은 기록이 있는가"다.** 되돌리기 자체가 같은
+  테이블에 기록을 남기므로(아래 불릿), 앞으로 적으면 **이미 되돌린 태스크도 참이 되어 버튼이
+  헛되이 뜬다.** 그 컬럼은 이미 있다(`rollback_status`). 두 번 눌러도 `MIN(rowid)` 덕분에
+  원본으로 복원될 뿐이라 데이터가 상하지는 않지만, 버튼이 뜨는 것 자체가 거짓말이다.
 - **되돌리기도 일반 `ToolRequest` 경로를 그대로 탄다** — pre-image를 역방향 patch로 만들어 `apply_patch`/`create_file`/`delete_file`을 다시 큐잉하고 정상적으로 이벤트 로그에 남긴다. 감사 추적에 예외가 없어야 한다.
 
 ## 11. Artifact 디렉터리 GC 정책
@@ -9445,6 +9484,9 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | 72.14절 계측 표 | 에스컬레이션 행(요청/호출/거절 셋을 센다) | 갱신 |
 | `apps/desktop/src-tauri/core/src/metrics.rs` | **태스크 결말 집계가 없다** — `CANCELLED`/`REJECTED`를 가르지 못한다(2절). 게이트가 둘이 되면서 "사용자가 그만둔 방식"이 처음 의미를 갖는다 | **아직 안 함** — 72.14 계측과 함께 |
 | **카운터 집합의 사본이 셋** | `TaskCounters`/`TaskLoopLimits`가 TS↔Rust로 갈려 있고(`mcpRounds`·`contextRounds`가 TS에만), **문서 9절의 `TaskState.counters` 블록이 세 번째 사본**이다. 새 카운터는 셋 모두에 더해야 하고 지금 갈린 것도 그때 맞춘다 — 쓰기 경로가 payload를 그대로 넣어서 이 불일치가 오류 없이 지나간다(2.2절) | 9절 블록에 **주석 달았다** / 타입 둘은 **아직 안 함** |
+| [ui-wireframes 3절 결말 화면](./ui-wireframes.md) | `FAILED`/`CANCELLED`만 되돌리기를 노출하던 규칙이 10절과 함께 바뀐다 — 그 줄이 *"10절 원칙 그대로"*라고 인용하고 있었다 | 갱신 |
+| 7절 `file_mutations` DDL | `task_id`·`rollback_status`·`rolled_back_at`·`mutation_id`·`*_sha256`·`recorded_at`이 코드에만 있었다 | **고쳤다** |
+| 7절 롤백 알고리즘 한 줄 | `path`별 ~~최신~~ → **최초** `pre_image`, 조인하지 않는다 | 취소선 + 근거(구현 주석) |
 | **10절 "REJECTED는 되돌릴 파일이 없다"** | 근거(*"REJECT는 `REVIEWING`에서만 나온다"*)가 72.3절로 낡았고, 72.8 귀환 경로 3의 **"되돌리고 종료"**가 그 결론을 뒤집는다 | 취소선 + 근거 교체 |
 | 2.2절 표의 완결성 | 표에 없는 상한 셋(`providerRetries`·`mcpRounds`·`contextRounds`)이 "상한이 없다"로 읽혔다 | **범위를 좁혔다** — 싣는 규칙("여기서 값을 정하는 것만")과 나머지가 어디 있는지를 표 아래 적었다. 값을 옮겨 적지는 **않았다** |
 | [product-strategy 8.6절](./product-strategy.md) 호출 수 | "실행자 2 + 검수자 1 = 3"과 "verified는 실행자를 하나 더 부른다" | 취소선 + 근거 |
