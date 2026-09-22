@@ -40,7 +40,18 @@ export type TaskPhase =
   /** 계획을 세우는 중 (53절). `PLANNING`과 다르다 — 저쪽은 patch를 쪼갠다. */
   | "OUTLINING"
   /** 계획을 냈다 — **완료도 답변도 아니다** (53절). */
-  | "OUTLINED";
+  | "OUTLINED"
+  // ---- 72절 `standard` 흐름의 새 phase 다섯 ----
+  /** 계획이 준비되어 사용자의 승인을 기다린다 (72.4절). **타임아웃이 없다.** */
+  | "AWAITING_PLAN_APPROVAL"
+  /** B — 승인된 계획의 독립 검토 (72.6절). 산출물은 verdict가 아니라 쟁점 목록이다. */
+  | "PLAN_REVIEWING"
+  /** 서브태스크 하나의 구현 모델 호출 (72.2.2절). `DRAFTING`이 아니다 — 초안이 하나다. */
+  | "IMPLEMENTING"
+  /** C — 결과 검토 (72.7절). `VERIFYING`이 통과한 뒤에만 돈다. */
+  | "RESULT_REVIEWING"
+  /** 검증 체크리스트를 사용자가 확인하기를 기다린다 (72.8절). `확인 필요`와 다르다. */
+  | "AWAITING_USER_VERIFICATION";
 
 /**
  * **이 목록은 세 번째 사본이다** (3.26.4절).
