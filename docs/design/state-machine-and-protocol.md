@@ -169,7 +169,7 @@ stateDiagram-v2
 #### 이 표는 **여기서 값을 정하는 상한**만 싣는다 — 전수 목록이 아니다
 
 상한이 이 표에만 있다고 읽히면 **없는 것이 곧 상한이 없다는 뜻**이 되는데, 사실이 아니다.
-다른 절이 값을 정하는 상한이 셋 더 있고, 그것들도 `TaskCounters`·`TaskLoopLimits`에 산다.
+다른 절이 값을 정하는 상한이 셋 더 있다.
 
 | 카운터 | 값의 정본 | 왜 여기 옮겨 적지 않는가 |
 |---|---|---|
@@ -184,6 +184,19 @@ stateDiagram-v2
 **규칙을 하나로 두는 것이 요점이다.** "원칙 5가 이름을 적었으니 싣는다"로 하면 `mcpRounds`와
 `contextRounds`를 뺀 근거가 무너지고, 셋 다 실으면 값이 네 절에 흩어진다. **"여기서 값을
 정하는 것만 싣고, 나머지는 어디서 정하는지 가리킨다"**가 셋 모두를 같은 말로 설명한다.
+
+##### 이 규칙이 경계하는 것이 **타입 둘 사이에서 이미 일어나 있다**
+
+`TaskCounters`와 `TaskLoopLimits`는 protocol(TS)과 core(Rust) 양쪽에 있는데 **지금 서로
+다르다**: TS에는 `mcpRounds`·`contextRounds`가 있고 **Rust에는 없다.** 그래서 "어떤 카운터가
+있는지"를 타입 하나로 가리킬 수 없다 — 둘을 함께 정본이라 부르면 이 소절이 방금 세운 규칙을
+같은 문단이 어긴다.
+
+**증상이 조용한 이유는 쓰기 경로에 있다.** `store.rs`는 이벤트 payload의 `counters` 값을
+**그대로** 직렬화해 넣고 Rust 구조체로 왕복하지 않으므로, Rust가 모르는 필드가 와도
+`counters_json`에는 그냥 저장된다. **읽을 때 사라진다** — 그때 그 카운터는 "0이었다"와
+구별되지 않는다. 원칙 7이 `task_events`를 진실의 원천으로 두었으므로 복구는 되지만,
+파생 캐시를 읽는 화면과 집계는 그 사이에 틀린 값을 본다. 72.15절 목록에 있다.
 
 > **`reviseRounds`는 증가시키는 경로가 남지 않았다.** 그 카운터는 `REVISE` verdict에서 오르는데,
 > `SINGLE_MODEL_FIX`에는 `REVISE`가 없고(14.1절) `standard`에서는 `REVIEWING`이 물러났다(72.3절).
@@ -635,11 +648,11 @@ CREATE TABLE tasks (
   workspace_id   TEXT NOT NULL REFERENCES workspaces(workspace_id),
   user_message   TEXT NOT NULL,
   phase          TEXT NOT NULL,       -- TaskPhase
-  counters_json  TEXT NOT NULL,       -- TaskCounters를 그대로 직렬화한다. **세는 것만** 들어간다:
-                                      -- maxSubtasks처럼 한 번 검사하는 상한은 여기가 아니라
-                                      -- TaskPolicy에 산다. 어떤 카운터가 있는지의 정본은 타입이고
-                                      -- (protocol / core의 TaskCounters), 상한값의 정본은 그
-                                      -- 카운터를 정의한 절이다 — 2.2절은 전수 목록이 아니다
+  counters_json  TEXT NOT NULL,       -- **이벤트 payload의 `counters`를 그대로** 직렬화해 넣는다
+                                      -- (Rust 구조체로 왕복하지 않는다 — 아래 주의). **세는 것만**
+                                      -- 들어간다: maxSubtasks처럼 한 번 검사하는 상한은 여기가
+                                      -- 아니라 TaskPolicy에 산다. 상한값의 정본은 그 카운터를
+                                      -- 정의한 절이다 — 2.2절은 전수 목록이 아니다
   final_status   TEXT,                -- null 이면 아직 진행 중
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL
@@ -9394,6 +9407,7 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | multi-engine 15.3절 co-executor 지정 금지 | 대조가 계획으로 옮겨가 **co-planner**에 걸린다. `simple`·`fast`에 남는 co-executor는 **없다** | 취소선 + 대상 교체 + 자기정정 |
 | 72.14절 계측 표 | 에스컬레이션 행(요청/호출/거절 셋을 센다) | 갱신 |
 | `apps/desktop/src-tauri/core/src/metrics.rs` | **태스크 결말 집계가 없다** — `CANCELLED`/`REJECTED`를 가르지 못한다(2절). 게이트가 둘이 되면서 "사용자가 그만둔 방식"이 처음 의미를 갖는다 | **아직 안 함** — 72.14 계측과 함께 |
+| **`TaskCounters`/`TaskLoopLimits`의 TS↔Rust 불일치** | `mcpRounds`·`contextRounds`가 TS에만 있다. 새 카운터 셋을 더할 때 **양쪽에 더해야 하고**, 지금 갈린 둘도 그때 맞춘다 — 쓰기 경로가 payload를 그대로 넣어서 이 불일치가 오류 없이 지나간다(2.2절) | **아직 안 함** |
 | 2.2절 표의 완결성 | 표에 없는 상한 셋(`providerRetries`·`mcpRounds`·`contextRounds`)이 "상한이 없다"로 읽혔다 | **범위를 좁혔다** — 싣는 규칙("여기서 값을 정하는 것만")과 나머지가 어디 있는지를 표 아래 적었다. 값을 옮겨 적지는 **않았다** |
 | [product-strategy 8.6절](./product-strategy.md) 호출 수 | "실행자 2 + 검수자 1 = 3"과 "verified는 실행자를 하나 더 부른다" | 취소선 + 근거 |
 | [ui-wireframes 3.11절](./ui-wireframes.md) | 같은 문장이 화면 쪽에도 있었다 | 취소선 + 근거 |
