@@ -39,9 +39,13 @@ function entryFor(providerId: string, modelId: string): ModelEntry {
     modelId,
     providerId,
     protocol: "native",
+    transport: "http",
     // 주입한 fetch가 받는 주소일 뿐 실제로 연결되지 않는다.
     apiBaseUrl: "https://conformance.invalid",
     apiKeyEnvName: "TOMVERSE_CONFORMANCE_KEY",
+    grade: "unmeasured",
+    accounting: "metered",
+    effort: { kind: "none" },
     capabilities: {
       toolCalling: "basic",
       structuredOutput: "strict_schema",

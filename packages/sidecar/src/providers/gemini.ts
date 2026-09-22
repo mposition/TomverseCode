@@ -1,3 +1,4 @@
+import { httpBaseUrlOf } from "../routing/registry.js";
 import type {
   DraftProposal,
   ModelEntry,
@@ -255,7 +256,8 @@ export class GeminiAdapter implements ProviderAdapter {
   }
 
   private modelUrl(suffix = ""): string {
-    const base = this.entry.apiBaseUrl.replace(/\/+$/, "");
+    // `apiBaseUrl`은 `transport: "http"`에만 있다(21.4절). 판정을 여기 복사하지 않는다.
+    const base = httpBaseUrlOf(this.entry).replace(/\/+$/, "");
     return `${base}/models/${this.modelId}${suffix}`;
   }
 

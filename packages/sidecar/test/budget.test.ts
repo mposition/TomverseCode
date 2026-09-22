@@ -29,8 +29,12 @@ function pricedEntry(modelId: string, providerId: string, priced: boolean): Mode
     modelId,
     providerId,
     protocol: "native",
+    transport: "http",
     apiBaseUrl: "local://fake",
     apiKeyEnvName: "TOMVERSE_FAKE_KEY",
+    grade: "unmeasured",
+    accounting: "metered",
+    effort: { kind: "none" },
     capabilities: {
       toolCalling: "basic",
       structuredOutput: "strict_schema",
@@ -214,18 +218,68 @@ test("예약과 정산이 task_events에 남는다", async () => {
 });
 
 /**
- * fake와 real의 구별은 **주소 스킴**에서 온다. providerId 이름 규칙에 기대면 이름이 바뀔 때
- * 조용히 어긋나고, 그 순간 실제 호출의 0 토큰이 정상으로 통과한다.
+ * fake와 real의 구별은 **주소 스킴**에서 오고, CLI는 그 둘 중 어느 쪽도 아니다.
+ *
+ * providerId 이름 규칙에 기대면 이름이 바뀔 때 조용히 어긋나고, 그 순간 실제 호출의 0 토큰이
+ * 정상으로 통과한다. CLI를 셋째 값으로 둔 근거는 `providerKindOf`의 주석에 있다(21.7절) —
+ * **어느 쪽으로 접어도 대가가 있다.**
  */
-test("공급자 종류를 주소로 판정한다", () => {
+test("공급자 종류를 전송 축과 주소로 판정한다", () => {
   const builtin = new ModelRegistry();
   for (const entry of builtin.all()) {
-    const expected = entry.apiBaseUrl.startsWith("local://") ? "fake" : "real";
+    const expected =
+      entry.transport === "cli" ? "cli" : entry.apiBaseUrl?.startsWith("local://") ? "fake" : "real";
     assert.equal(providerKindOf(entry), expected, entry.modelId);
   }
   // 등록된 fake가 실제로 존재해야 이 테스트가 무언가를 검증한다.
   assert.ok(builtin.all().some((e) => providerKindOf(e) === "fake"));
   assert.ok(builtin.all().some((e) => providerKindOf(e) === "real"));
+});
+
+/**
+ * 21.7절: CLI 엔트리가 들어오면 `providerKindOf`가 `cli`를 내야 하고, **`real`도 `fake`도
+ * 되어서는 안 된다.** `BUILTIN_MODELS`에는 아직 CLI 줄이 없으므로(외부 사실 미확인) 합성
+ * 엔트리로 잰다 — 카탈로그가 비어 있다고 이 규칙을 검사하지 않으면, CLI 줄을 추가하는 사람이
+ * 규칙이 있다는 사실조차 모른다.
+ */
+test("CLI 경로는 real로도 fake로도 접히지 않는다", () => {
+  const cliEntry: ModelEntry = {
+    ...pricedEntry("claude-sonnet-5", "anthropic", true),
+    transport: "cli",
+    cliVendor: "claude-code",
+    apiBaseUrl: undefined,
+    accounting: "subscription",
+    gradeInheritedFrom: "anthropic\u0000claude-sonnet-5\u0000http\u0000",
+  };
+  assert.equal(providerKindOf(cliEntry), "cli");
+
+  // 그리고 구독 경로의 비용은 0이 아니라 **환산 불가**다(21.7절). 0으로 적으면 예산 화면이
+  // "안 썼다"고 거짓말한다.
+  const registry = new ModelRegistry([cliEntry]);
+  const cost = registry.costOf("claude-sonnet-5", { inputTokens: 1_000, outputTokens: 500 });
+  assert.equal(cost.kind, "unknown");
+  assert.equal(registry.costUsd("claude-sonnet-5", { inputTokens: 1_000, outputTokens: 500 }), undefined);
+});
+
+/**
+ * 72.10.1절 옵트인 단서 — **켜지 않은 CLI는 후보에 들지 않는다.**
+ *
+ * 단서가 없으면 이 규칙이 21.7절을 무효로 만든다: 포함된 용량은 지금 아는 한 CLI 경로에서만
+ * 오므로, 동점이 생기는 순간 라우터가 "기본 경로가 아니다"라고 못박힌 경로를 사용자에게 묻지
+ * 않고 고른다.
+ */
+test("켜지 않은 CLI 경로는 후보에 들지 않는다", () => {
+  const cliEntry: ModelEntry = {
+    ...pricedEntry("claude-sonnet-5", "anthropic", true),
+    transport: "cli",
+    cliVendor: "claude-code",
+    apiBaseUrl: undefined,
+    accounting: "subscription",
+  };
+  const registry = new ModelRegistry([cliEntry]);
+  assert.equal(registry.available(["anthropic"]).length, 0, "켜지 않았는데 후보에 들었습니다");
+  assert.equal(registry.available(["anthropic"], { enabledCliVendors: ["cursor"] }).length, 0, "다른 CLI를 켰는데 들었습니다");
+  assert.equal(registry.available(["anthropic"], { enabledCliVendors: ["claude-code"] }).length, 1);
 });
 
 /**

@@ -1,3 +1,4 @@
+import type { ProviderKind } from "../routing/registry.js";
 import type { ModelEntry } from "@tomverse/protocol";
 
 /**
@@ -197,10 +198,15 @@ export interface Settlement {
   cost: CostMeasurement;
   usage: UsageMeasurement;
   /**
-   * 실제 공급자였는가. `real`이면 입력·출력 토큰이 **둘 다 0인 것은 측정 실패로 본다** —
+   * 공급자 호출의 성질. `real`이면 입력·출력 토큰이 **둘 다 0인 것은 측정 실패로 본다** —
    * 실제 호출이 0 토큰을 쓰는 일은 없다. fake는 0이 정상이다.
+   *
+   * **`cli`는 그 검사에 걸리지 않는다**(multi-engine-routing 21.7절). 나가기는 하지만 응답
+   * envelope이 없어 토큰 사용량이 보고되지 않을 수 있고, 그 0은 "usage를 못 읽었다"가 아니라
+   * **"이 경로에는 읽을 envelope이 없다"**이다. 그 사실은 `cost`가 `unknown`인 것으로 이미
+   * 표현되며, 여기서 실패로 다루면 CLI 호출이 언제나 원장을 멈춘다.
    */
-  providerKind: "real" | "fake";
+  providerKind: ProviderKind;
   requestedModelId?: string;
   providerReportedModelId?: string;
   providerRequestId?: string;
@@ -392,6 +398,7 @@ export function validateSettlement(
     if (value < 0) return { ok: false, reason: `${name}이 음수입니다 (${value})` };
   }
   if (
+    // `cli`를 제외하는 근거는 이 필드의 주석에 있다 — 그 경로에는 읽을 envelope이 없다.
     settlement.providerKind === "real" &&
     settlement.usage.inputTokens === 0 &&
     settlement.usage.outputTokens === 0

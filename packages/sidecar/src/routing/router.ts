@@ -205,12 +205,19 @@ export class Router {
       }
     }
 
-    const estimatedCostUsd = assignments.reduce((sum, a) => {
-      // 실제 토큰 수를 모르므로 대표값으로 추정한다. UI에 "예상"으로 표시되며 실측 usage가
-      // 도착하면 대체된다 — 추정값을 실측처럼 보여주지 않는 것이 중요하다.
-      const estimate = this.registry.costUsd(a.modelId, { inputTokens: 8_000, outputTokens: 2_000 });
-      return sum + (estimate ?? 0);
-    }, 0);
+    // 실제 토큰 수를 모르므로 대표값으로 추정한다. UI에 "예상"으로 표시되며 실측 usage가
+    // 도착하면 대체된다 — 추정값을 실측처럼 보여주지 않는 것이 중요하다.
+    //
+    // **합계가 하나가 아니다**(state-machine 72.4절). 환산되지 않는 배정을 0으로 더하면
+    // 카드가 "이만큼만 듭니다"라고 거짓을 말한다 — 구독 용량에는 쿼터가 있고 소진되면
+    // 어떻게 되는지 그 CLI가 정하지 우리가 모른다.
+    let estimatedCostUsd = 0;
+    const unpricedAssignments: string[] = [];
+    for (const a of assignments) {
+      const cost = this.registry.costOf(a.modelId, { inputTokens: 8_000, outputTokens: 2_000 });
+      if (cost.kind === "usd") estimatedCostUsd += cost.usd;
+      else unpricedAssignments.push(`${a.role}: ${cost.reason}`);
+    }
 
     return {
       taskId: input.taskId,
@@ -220,6 +227,7 @@ export class Router {
       appliedPolicies,
       reviewerIndependent,
       estimatedCostUsd,
+      unpricedAssignments,
       decidedAt: new Date().toISOString(),
     };
   }

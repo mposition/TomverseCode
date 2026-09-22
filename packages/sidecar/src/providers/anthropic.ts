@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { httpBaseUrlOf } from "../routing/registry.js";
 import type {
   DraftProposal,
   ModelEntry,
@@ -70,7 +71,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     this.modelId = deps.entry.modelId;
     this.client = new Anthropic({
       apiKey: deps.apiKey,
-      baseURL: deps.entry.apiBaseUrl,
+      baseURL: httpBaseUrlOf(deps.entry),
       // 재시도는 우리 정책이 관리한다 (openai.ts와 같은 이유).
       maxRetries: 0,
       ...(deps.fetch ? { fetch: deps.fetch } : {}),

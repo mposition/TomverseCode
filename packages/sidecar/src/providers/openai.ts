@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { httpBaseUrlOf } from "../routing/registry.js";
 import type {
   DraftProposal,
   ModelEntry,
@@ -166,7 +167,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     this.modelId = deps.entry.modelId;
     this.client = new OpenAI({
       apiKey: deps.apiKey,
-      baseURL: deps.entry.apiBaseUrl,
+      baseURL: httpBaseUrlOf(deps.entry),
       // 재시도는 우리 정책(state-machine-and-protocol.md 9절)으로 관리하므로 SDK 재시도를 끈다.
       // 두 층이 각각 재시도하면 실제 시도 횟수가 곱해지고 카운터가 사실과 달라진다.
       maxRetries: 0,

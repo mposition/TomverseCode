@@ -544,7 +544,10 @@ export interface RoutingInfo {
   assignments: { role: string; modelId: string; providerId: string; reason: string }[];
   appliedPolicies: string[];
   reviewerIndependent: boolean;
+  /** 계량 과금분만의 예상 금액. 환산되지 않은 배정은 `unpricedAssignments`에 있다(72.4절). */
   estimatedCostUsd: number;
+  /** 금액으로 환산되지 않은 배정. 비어 있지 않으면 화면이 금액과 나눠 적어야 한다. */
+  unpricedAssignments?: string[];
 }
 
 export interface UsageTotals {

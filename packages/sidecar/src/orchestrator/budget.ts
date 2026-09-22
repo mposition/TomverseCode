@@ -1,3 +1,4 @@
+import type { ProviderKind } from "../routing/registry.js";
 import type { ModelEntry, TaskBudgetOutcome, TaskBudgetState } from "@tomverse/protocol";
 import {
   createBudgetLedger,
@@ -48,7 +49,7 @@ export type CallBudget =
 export interface SettleInput {
   costUsd: number | undefined;
   usage: { inputTokens: number; outputTokens: number } | undefined;
-  providerKind: "real" | "fake";
+  providerKind: ProviderKind;
   requestedModelId?: string;
   providerReportedModelId?: string;
   providerRequestId?: string;

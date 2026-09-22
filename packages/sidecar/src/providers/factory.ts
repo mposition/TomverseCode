@@ -1,3 +1,4 @@
+import { providerKindOf } from "../routing/registry.js";
 import type { ModelEntry, RoleAssignment } from "@tomverse/protocol";
 import { AnthropicAdapter } from "./anthropic.js";
 import { resolveCredential } from "./credentials.js";
@@ -55,10 +56,25 @@ export function createAdapter(
 ): ProviderAdapter {
   const env = options.env ?? process.env;
 
-  // fake 공급자는 키를 요구하지 않는다. 레지스트리에서 apiBaseUrl로 구분한다 —
-  // providerId 문자열 비교보다 "이 엔트리가 로컬 가짜인가"라는 사실에 가깝다.
-  if (entry.apiBaseUrl.startsWith("local://")) {
+  // fake 공급자는 키를 요구하지 않는다. `providerKindOf`가 그 판정의 정본이다 —
+  // `local://` 규칙을 여기 복사하면 두 자리가 갈린다(21.5절이 그 함수를 판정 축으로 쓰지
+  // 말라고 한 것은 **`endpointRegion` 면제**에 대한 이야기이고, "로컬 가짜인가"는 정확히
+  // 이 함수가 답하는 질문이다).
+  const kind = providerKindOf(entry);
+  if (kind === "fake") {
     return new FakeProviderAdapter({ entry, apiKey: "" }, options.fake);
+  }
+
+  // **CLI 경로는 Node가 띄우지 않는다**(multi-engine-routing 21.7절 "누가 띄우는가").
+  // sidecar에는 애초에 자식 프로세스 생성 경로가 없고(원칙 2), 이 호출은 도구가 아니라
+  // 공급자 호출이라 Rust가 spawn한다. 그러므로 **여기서 조용히 HTTP로 대체하지 않는다** —
+  // 대체하면 사용자가 고른 것과 다른 경로로 돈이 나가고, 전송 화면이 거짓이 된다.
+  if (kind === "cli") {
+    throw new Error(
+      `${entry.modelId}(${entry.cliVendor ?? "cli"})는 CLI 전송 경로이고 Node가 띄우지 않습니다 — ` +
+        "Rust가 spawn하는 공급자 호출 경로가 아직 없습니다(multi-engine-routing 21.7절). " +
+        "HTTP 경로로 조용히 대체하지 않습니다."
+    );
   }
 
   // **공용 resolver를 지난다** (§2.10). preflight·준비성·evidence binding·이 factory가 같은

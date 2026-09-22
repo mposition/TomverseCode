@@ -31,3 +31,24 @@ export type ModelId = string;
 
 // docs/design/multi-engine-routing.md 4절 — phase가 어느 모델을 부르는지는 역할로 표현한다.
 export type EngineRole = "planner" | "executor" | "reviewer";
+
+/**
+ * 사용자가 고르는 네 번째 축 — **고른 모델을 얼마나 깊게 굴리는가**
+ * (state-machine-and-protocol.md 72.9절).
+ *
+ * `PerformanceProfile`과 직교한다: 저쪽은 **어느 모델이 하는가**(모델 교체), 이쪽은
+ * **그 모델이 얼마나 하는가**(같은 모델, 추론 예산)다. 한 슬라이더로 합치면
+ * `economy` + `high`("싼 모델에게 시간을 더 준다")나 `max` + `low`("가장 센 모델에게 빠르게
+ * 묻는다") 중 하나를 표현할 수 없게 되는데, **어느 쪽이 나은지 우리는 모른다.**
+ *
+ * **닫힌 enum인 것이 중요하다**(multi-engine-routing 21.4절). CLI 경로에서 effort는 명령줄
+ * 플래그가 되고, 값의 집합이 유한해야 "실행될 수 있는 argv의 집합이 열거 가능하다"가 유지된다
+ * — 여기를 문자열로 열면 원칙 6의 보장이 이 경로에서만 사라진다.
+ *
+ * **이 축은 `ModelEntry.effort` 매핑표가 각 공급자의 실제 파라미터로 옮긴다.** 매핑이 없는
+ * 모델에 `high`를 고르면 아무 일도 일어나지 않으며, **그 사실이 화면에 있어야 한다.**
+ *
+ * 타입을 `task.ts`가 아니라 여기 두는 이유는 `ComplexityTier`·`ReviewMode`와 같다 —
+ * 태스크와 레지스트리가 **둘 다** 쓰는 어휘라 한쪽에 두면 다른 쪽이 거꾸로 import하게 된다.
+ */
+export type EffortLevel = "low" | "medium" | "high";
