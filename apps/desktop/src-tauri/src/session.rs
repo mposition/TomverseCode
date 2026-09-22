@@ -374,7 +374,10 @@ struct MemberDone {
 /// 채널을 둘로 나누지 않는다. 나누면 스케줄러가 둘 중 하나를 골라 기다려야 하고, 그 순간
 /// 한쪽이 오지 않으면 나머지도 들리지 않는다. 한 줄로 받으면 순서가 일어난 순서 그대로다.
 enum MemberSignal {
-    /// 이 구성원이 `PLAN_APPROVED`를 받았다 — 구현 몫을 **카드 금액으로 확정한다.**
+    /// 이 구성원이 `PLAN_APPROVED`를 받았다 — **기록만 한다.**
+    ///
+    /// 예약은 움직이지 않는다(72.12.1절). 줄이면 합계 상한이 깨지고, 올리면 태스크당
+    /// 상한을 넘는다. 카드가 말한 금액은 관측으로만 실린다.
     PlanApproved(tomverse_core::fleet::PlanApproved),
     Done(Box<MemberDone>),
 }
@@ -1666,6 +1669,11 @@ impl SessionState {
     ///
     /// **아직 시작하지 않은 구성원에도 닿아야 한다.** 도는 것만 멈추고 대기열을 그대로 두면
     /// 취소를 누른 뒤에 새 태스크가 시작된다 — 사용자가 요청한 것의 정반대다.
+    ///
+    /// **그리고 게이트에서 기다리는 구성원에도 닿아야 한다.** 사용자 게이트 둘에는 타임아웃이
+    /// 없으므로(72.12절), 취소가 `PendingGates`에 닿지 않으면 그 구성원은 `recv()`에서 영원히
+    /// 기다린다 — `Done`을 보내지 않으니 **스케줄러도 멈추고 예약도 풀리지 않는다.** 독립
+    /// 검토가 이것을 P0로 잡았다: `cancel_task`에는 이 처리가 있었는데 Fleet 쪽 둘에는 없었다.
     pub fn cancel_fleet(&self) -> Result<Value, String> {
         let (members, fleet_id) = {
             let guard = self.fleet.lock().unwrap();
@@ -1680,10 +1688,21 @@ impl SessionState {
         // **어느 구성원에 닿았는지 말한다.** 개수만 주면 화면은 "3개 취소함"이라고 쓰고,
         // 사용자는 자기가 보고 있던 브랜치가 그 셋에 들었는지 알 수 없다.
         let mut reached: Vec<String> = Vec::new();
+        // 게이트에서 기다리다 깨어난 구성원. **개수가 아니라 브랜치로 남긴다** — 화면이
+        // "취소했는데 카드가 그대로다"와 "카드에서 기다리다 취소됐다"를 구별해야 한다.
+        let mut woken: Vec<String> = Vec::new();
         for member in &members {
             // 순서: Rust 먼저. 토큰이 켜져야 진행 중인 프로세스가 죽고 새 도구가 시작되지 않는다.
             if member.host.cancel_task(&member.task_id).is_ok() {
                 reached.push(member.branch.clone());
+            }
+            // **게이트에서 기다리는 구성원을 깨운다.** 깨우지 않으면 타임아웃이 없는 `recv()`가
+            // 영원히 기다리고, 그 구성원은 `Done`을 보내지 않아 Fleet 전체가 끝나지 않는다.
+            if self
+                .pending_gates
+                .cancel_waiting(&member.task_id, "Fleet이 취소되었습니다")
+            {
+                woken.push(member.branch.clone());
             }
             let _ = member
                 .sidecar
@@ -1692,6 +1711,8 @@ impl SessionState {
         Ok(json!({
             "fleetId": fleet_id,
             "cancelledBranches": reached,
+            // 게이트에서 기다리다 깨어난 구성원들.
+            "gateWokenBranches": woken,
             // **대기열도 닫았다.** 닫지 않으면 취소를 누른 뒤에 새 태스크가 시작된다.
             "queueClosed": true,
         }))
@@ -1707,6 +1728,11 @@ impl SessionState {
                 .ok_or_else(|| "그 구성원은 지금 도는 Fleet에 없습니다.".to_string())?
         };
         let rust_outcome = member.host.cancel_task(task_id)?;
+        // **게이트에서 기다리는 구성원을 깨운다** — `cancel_task`와 같은 이유(72.12절).
+        // 없으면 카드 앞에 선 구성원이 취소에 반응하지 않고, Fleet 전체가 끝나지 않는다.
+        let gate_woken = self
+            .pending_gates
+            .cancel_waiting(task_id, "사용자가 구성원을 취소했습니다");
         let node_outcome = member
             .sidecar
             .request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5))
@@ -1715,6 +1741,8 @@ impl SessionState {
             "accepted": rust_outcome.get("accepted").and_then(Value::as_bool).unwrap_or(false),
             "host": rust_outcome,
             "sidecar": node_outcome,
+            // 게이트에서 기다리던 구성원이었는가 — `cancel_task`와 같은 구별이 필요하다.
+            "gateWoken": gate_woken,
         }))
     }
 
@@ -1895,8 +1923,9 @@ impl SessionState {
                 }
                 let signal = rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))?;
                 let mut done = match signal {
-                    // **승인 순간이 곧 구현 예약 시점이다**(72.12절). 여기서 잡으면 사람을
-                    // 기다리는 동안 잠겨 있는 것은 계획 한 번 값뿐이다.
+                    // **승인은 원장을 움직이지 않는다**(72.12.1절). 이 팔은 읽고 기록할
+                    // 뿐이다 — 여기서 줄이면 구성원의 `TaskBudget` 상한과 어긋나고,
+                    // 그 순간 합계 상한이 깨진다. 소스 검사가 그것을 지킨다.
                     MemberSignal::PlanApproved(approved) => {
                         let index = approved.index;
                         if let tomverse_core::fleet::ImplementationStage::Staged {
@@ -1947,7 +1976,16 @@ impl SessionState {
                 // 단계 분할 뒤로 화면과 헤드리스가 서로 다른 숫자를 쓰게 된다.
                 done.report.reserved_usd = budget.held_for(done.report.index).or(done.report.reserved_usd);
                 // **비용은 저장소가 말한다** — Node의 주장이 아니라 `provider_usage` 행이다.
-                budget.settle(done.report.index, done.report.cost_usd);
+                // 읽지 못했으면 **예약만큼 썼다고 친다** — 0으로 접으면 자리가 열린다.
+                if done.report.cost_read_failed {
+                    let assumed = budget.settle_with_unknown_cost(done.report.index);
+                    eprintln!(
+                        "[fleet] 구성원 지출을 읽지 못했습니다({}) — 예약 ${assumed:.4}을 지출로 칩니다",
+                        done.report.branch
+                    );
+                } else {
+                    budget.settle(done.report.index, done.report.cost_usd);
+                }
                 if let Some(host) = &done.host {
                     let _ = host.append_event(
                         &done.report.task_id,
@@ -1958,6 +1996,8 @@ impl SessionState {
                             "memberIndex": done.report.index + 1,
                             "status": done.report.status,
                             "costUsd": done.report.cost_usd,
+                            // **모르는 것을 아는 것처럼 적지 않는다.**
+                            "costReadFailed": done.report.cost_read_failed,
                             "reservedUsd": done.report.reserved_usd,
                             "fleetCommittedUsd": budget.committed_usd(),
                         }),
@@ -2085,6 +2125,8 @@ impl SessionState {
                 status: "failed".to_string(),
                 summary,
                 cost_usd: 0.0,
+                // 시작조차 못 했으므로 **읽을 지출이 없다** — 못 읽은 것과 다르다.
+                cost_read_failed: false,
                 // **예약을 돌려준다.** 돌려주지 않으면 남은 구성원들이 있지도 않은 지출에 막힌다.
                 reserved_usd,
                 started_at: Some(started_at.clone()),
@@ -2247,6 +2289,7 @@ impl SessionState {
             status: "failed".to_string(),
             summary: String::new(),
             cost_usd: 0.0,
+            cost_read_failed: false,
             reserved_usd,
             started_at: Some(started_at.clone()),
             finished_at: None,
@@ -2323,12 +2366,20 @@ impl SessionState {
             }
         }
         // **비용은 저장소가 말한다** — Node의 주장이 아니라 `provider_usage` 행이다.
-        report.cost_usd = self
+        //
+        // **못 읽은 것을 $0으로 접지 않는다.** 접으면 원장에 자리가 열리고 합계 상한이
+        // 깨진다(`settle_with_unknown_cost`의 머리말 — 독립 검토가 P1으로 잡았다).
+        match self
             .with_store_prose("비용 집계", |s| s.task_cost_usd(&task_id))
             .ok()
             .and_then(|r| r.ok())
-            .map(|(cost, _, _)| cost)
-            .unwrap_or(0.0);
+        {
+            Some((cost, _, _)) => report.cost_usd = cost,
+            None => {
+                report.cost_usd = 0.0;
+                report.cost_read_failed = true;
+            }
+        }
         report.finished_at = Some(tomverse_core::time::now_iso());
         MemberDone { report, host: Some(host) }
     }
@@ -2490,6 +2541,12 @@ impl SessionState {
 
         // 취소 토큰을 확실히 켠다. 이미 켜져 있으면 idempotent다.
         let _ = host.cancel_task(task_id);
+        // **게이트 대기도 깨운다.** 강제 포기는 마지막 탈출구인데, 카드 앞에서 기다리는
+        // 스레드를 깨우지 않으면 그 스레드는 **포기한 뒤에도 영원히 서 있는다**
+        // (게이트 둘에는 타임아웃이 없다 — 72.12절). `cancel_task`와 같은 이유다.
+        let _ = self
+            .pending_gates
+            .cancel_waiting(task_id, "사용자가 태스크를 강제 포기했습니다");
         // sidecar 응답을 **기다리지 않는다** — 응답하지 않는 것이 이 경로의 전제다.
         // 짧은 타임아웃으로 한 번만 밀어 넣고, 실패해도 진행한다.
         let _ = sidecar.request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(1));

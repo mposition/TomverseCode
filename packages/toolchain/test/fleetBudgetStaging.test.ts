@@ -26,8 +26,8 @@ import { fileURLToPath } from "node:url";
  *    "모르는 것"으로 다루는 것)이 두 벌이 되고, 둘 중 하나는 언젠가 덜 조심스러워진다.
  * 2. 두 루프 모두 `reserve_implementation`을 부른다 — 예약 산수를 자기 자리에서 하지 않는다.
  *    (그 함수 자체는 **금액을 움직이지 않는다** — 아래 마지막 검사와 72.12.1절.)
- * 3. 어느 루프도 `PLANNING_SHARE`를 직접 쓰지 않는다. 쓰기 시작하면 비율이 상한의 뜻을
- *    정하게 되고, 그것이 이 분할의 첫 판이 실패한 이유다(`fleet.rs`의 머리말).
+ * 3. 어느 루프도 예약 금액을 직접 계산하지 않는다. 계산하기 시작하면 **측정하지 않은 값이
+ *    상한의 뜻을 정하게** 되고, 그것이 이 분할의 첫 판이 실패한 이유다(`fleet.rs`의 머리말).
  *
  * # 무엇을 검사하지 못하는가
  *
@@ -57,6 +57,9 @@ const FLEET_RS = path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "s
 
 /** 검사 대상 토큰을 assertion 안에 그대로 적으면 자기 자신을 센다 — 런타임에 조립한다. */
 const APPROVAL_EVENT = "PLAN" + "_APPROVED";
+
+/** Rust 함수 본문의 끝. 문자열로 두면 이 파일 안에서 escape가 한 겹 벗겨지기 쉽다. */
+const END_OF_FN = "\n    }\n";
 
 function read(file: string): string {
   return readFileSync(file, "utf8");
@@ -95,10 +98,13 @@ test("두 스케줄링 루프가 예약 산수를 하지 않는다 — 원장이
       source.includes("reserve_implementation("),
       `${label}가 구현 예약을 원장에 맡기지 않습니다`
     );
-    assert.ok(
-      !codeOnly(source).includes("PLANNING_SHARE"),
-      `${label}가 계획 몫 비율을 직접 씁니다 — 측정하지 않은 상수가 상한의 뜻을 정하게 됩니다`
-    );
+    // 스케줄러가 금액을 만들기 시작하면 원장이 진실의 원천이 아니게 된다.
+    for (const forbidden of ["per_task_usd *", "* PLANNING_SHARE", "cap_usd -"]) {
+      assert.ok(
+        !codeOnly(source).includes(forbidden),
+        `${label}가 예약 금액을 직접 계산합니다(${forbidden}) — 원장이 진실의 원천이 아니게 됩니다`
+      );
+    }
   }
 });
 
@@ -114,7 +120,7 @@ test("상한 판정은 계획 몫이 아니라 태스크당 상한 전부를 본
   );
   assert.ok(
     !body.includes("planning > cap") && !body.includes("+ planning >"),
-    "try_admit이 계획 몫으로 판정합니다 — 상한이 PLANNING_SHARE만큼 느슨해집니다"
+    "try_admit이 계획 몫으로 판정합니다 — 상한이 그 비율만큼 느슨해집니다(72.12.1절)"
   );
 });
 
@@ -127,16 +133,49 @@ test("승인은 예약을 움직이지 않는다 — 움직이면 합계 상한�
   // 금액을 쓰는 함수가 되지 않는 것**이다 — 줄이는 코드는 한 줄이면 돌아온다.
   const source = read(FLEET_RS);
   const fn = source.slice(source.indexOf("pub fn reserve_implementation("));
-  const body = codeOnly(fn.slice(0, fn.indexOf("\n    }\n")));
-  for (const forbidden of ["remainder_usd =", "planning_usd =", "committed_usd +="]) {
-    assert.ok(
-      !body.includes(forbidden),
-      `승인이 예약을 다시 움직입니다(${forbidden}) — 합계 상한이 깨집니다(72.12.1절)`
-    );
-  }
+  const body = codeOnly(fn.slice(0, fn.indexOf(END_OF_FN)));
+  // **형태 하나만 막으면 옆으로 돌아온다**(2차 검토 P2). `-=`도, 구조체 재구성도 축소다.
+  // 그래서 형태가 아니라 **대상**을 본다: 보관 중인 값에 쓰는 줄이 있는가.
+  // 읽기(`held.total()`)와 `staged`(bool) 대입은 금액이 아니므로 지나간다.
+  const writes = body
+    .split("\n")
+    .filter((line) => line.includes("held.") && line.includes("=") && !line.includes("staged"))
+    .filter((line) => !line.includes("=="))
+    // `let ...`는 읽어서 새 이름에 묶는 것이지 보관 중인 값에 쓰는 것이 아니다.
+    .filter((line) => !line.trimStart().startsWith("let "));
+  assert.deepEqual(
+    writes,
+    [],
+    `승인이 보관 중인 금액에 씁니다 — 어떤 형태의 축소든 합계 상한을 깹니다(72.12.1절)`
+  );
+  assert.ok(
+    !/\bHeld\s*\{/.test(body),
+    "승인이 Held를 다시 만듭니다 — 재구성도 축소입니다(72.12.1절)"
+  );
   // 거절 경로가 생기면 그 자리에 교착도 함께 생긴다(모두가 서로의 정산을 기다린다).
   assert.ok(
     !body.includes("Refused"),
     "구현 예약이 거절할 수 있게 됐습니다 — 승인된 작업이 서고, 교착이 생깁니다"
   );
+});
+
+test("스케줄러 루프가 승인 처리에서 원장을 움직이지 않는다 (2차 검토 P2)", () => {
+  // **축소를 `reserve_implementation` 밖으로 옮기면 위 검사를 피한다.** 실제로 루프 주석이
+  // 한때 "계획 한 번 값만 잠긴다"라고 말하고 있었으므로, 다음 사람이 그 말을 따라 여기서
+  // 줄일 길이 열려 있었다. 승인 팔에서 원장을 **읽기만** 한다는 것을 고정한다.
+  for (const [label, file] of Object.entries(LOOPS)) {
+    const source = codeOnly(read(file));
+    const arm = source.indexOf("MemberSignal::PlanApproved(");
+    assert.ok(arm > 0, `${label}에 승인 처리가 없습니다`);
+    // 승인 팔은 `continue`로 끝난다 — 거기까지가 범위다.
+    const stop = source.indexOf("continue;", arm);
+    assert.ok(stop > arm, `${label}의 승인 처리가 continue로 끝나지 않습니다`);
+    const body = source.slice(arm, stop);
+    for (const forbidden of ["settle(", "try_admit(", "settle_with_unknown_cost("]) {
+      assert.ok(
+        !body.includes(forbidden),
+        `${label}의 승인 처리가 원장을 움직입니다(${forbidden}) — 승인은 결말이 아닙니다`
+      );
+    }
+  }
 });

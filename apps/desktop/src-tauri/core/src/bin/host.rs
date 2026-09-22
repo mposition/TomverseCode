@@ -2105,7 +2105,10 @@ struct MemberDone {
 /// `session.rs`의 같은 이름과 **같은 모양이어야 한다.** 둘이 갈리면 화면과 헤드리스의 예산이
 /// 갈리고, 갈린 예산은 화면에서 드러나지 않는다(72.16절이 한 번에 하라고 적은 이유).
 enum MemberSignal {
-    /// 이 구성원이 `PLAN_APPROVED`를 받았다 — 구현 몫을 **카드 금액으로 확정한다.**
+    /// 이 구성원이 `PLAN_APPROVED`를 받았다 — **기록만 한다.**
+    ///
+    /// 예약은 움직이지 않는다(72.12.1절). 줄이면 합계 상한이 깨지고, 올리면 태스크당
+    /// 상한을 넘는다. 카드가 말한 금액은 관측으로만 실린다.
     PlanApproved(tomverse_core::fleet::PlanApproved),
     Done(MemberDone),
 }
@@ -2334,6 +2337,8 @@ fn run_fleet(
                                 status: "failed".to_string(),
                                 summary: message,
                                 cost_usd: 0.0,
+                                // 시작조차 못 했으므로 **읽을 지출이 없다.**
+                                cost_read_failed: false,
                                 reserved_usd: None,
                                 started_at: None,
                                 finished_at: Some(tomverse_core::time::now_iso()),
@@ -2378,8 +2383,8 @@ fn run_fleet(
 
         // ---- 하나가 끝나기를 기다린다 ----
         let done = match rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))? {
-            // **승인 순간이 곧 구현 예약 시점이다**(72.12절). 사람을 기다리는 동안 잠겨
-            // 있는 것은 계획 한 번 값뿐이 된다.
+            // **승인은 원장을 움직이지 않는다**(72.12.1절). 이 팔은 읽고 기록할 뿐이다 —
+            // 여기서 줄이면 구성원의 `TaskBudget` 상한과 어긋나고 합계 상한이 깨진다.
             MemberSignal::PlanApproved(approved) => {
                 let index = approved.index;
                 if let ImplementationStage::Staged { held_usd, card_usd, priced } = budget
@@ -2415,15 +2420,23 @@ fn run_fleet(
         let _ = member.handle.join();
         // **비용은 저장소가 말한다.** Node의 주장이 아니라 `provider_usage` 행이다 —
         // 합계 상한의 근거가 sidecar에 있으면 장악당한 sidecar가 상한을 지웠다고 말할 수 있다.
-        let (cost_usd, _, _) = store
-            .lock()
-            .unwrap()
-            .task_cost_usd(&member.task_id)
-            .unwrap_or((0.0, 0, 0));
+        // **못 읽은 것을 $0으로 접지 않는다** — 접으면 원장에 자리가 열리고 합계 상한이
+        // 깨진다(`settle_with_unknown_cost`의 머리말 — 독립 검토가 P1으로 잡았다).
+        let read = store.lock().unwrap().task_cost_usd(&member.task_id);
+        let cost_read_failed = read.is_err();
+        let (cost_usd, _, _) = read.unwrap_or((0.0, 0, 0));
         // **지금 잡고 있는 금액은 원장이 말한다** — 단계 분할 뒤로 입장 시점의 값은
         // 계획 몫뿐이라, 그것을 정산 기록에 쓰면 구현 예약이 없었던 것처럼 읽힌다.
         let held_usd = budget.held_for(done.index).or(member.reserved_usd);
-        budget.settle(done.index, cost_usd);
+        if cost_read_failed {
+            let assumed = budget.settle_with_unknown_cost(done.index);
+            eprintln!(
+                "구성원 지출을 읽지 못했습니다({}) — 예약 ${assumed:.4}을 지출로 칩니다",
+                member.branch
+            );
+        } else {
+            budget.settle(done.index, cost_usd);
+        }
         let _ = member.host.append_event(
             &member.task_id,
             "FLEET_MEMBER_SETTLED",
@@ -2433,6 +2446,8 @@ fn run_fleet(
                 "memberIndex": done.index + 1,
                 "status": done.status,
                 "costUsd": cost_usd,
+                // **모르는 것을 아는 것처럼 적지 않는다.**
+                "costReadFailed": cost_read_failed,
                 "reservedUsd": held_usd,
                 "fleetCommittedUsd": budget.committed_usd(),
             }),
@@ -2452,6 +2467,7 @@ fn run_fleet(
             status: done.status,
             summary: done.summary,
             cost_usd,
+            cost_read_failed,
             reserved_usd: held_usd,
             started_at: Some(member.started_at),
             finished_at: Some(done.finished_at),
