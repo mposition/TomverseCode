@@ -2536,6 +2536,14 @@ pub const NODE_MAY_NOT_EMIT: &[&str] = &[
     // 근거를 오염시킬 수 있다.
     "FLEET_ENROLLED",
     "FLEET_MEMBER_SETTLED",
+    // 72절 흐름의 **두 사용자 게이트**(72.4절). Node가 낼 수 있으면 장악당한 sidecar가
+    // 자기 계획을 스스로 승인하고, 흐름 전체가 모델이 혼자 도는 경로가 된다(원칙 2·3).
+    //
+    // 특히 72.12절이 구현 예산 예약을 계획 승인에 묶은 뒤로는 **구멍 하나가 둘을 뚫는다** —
+    // 승인을 지어낼 수 있으면 예산 상한도 함께 사라진다. 위 Fleet 항목과 같은 처방이고,
+    // 그 선례가 있으므로 새 장치가 필요하지도 않았다.
+    "PLAN_APPROVED",
+    "USER_VERIFICATION_APPROVED",
 ];
 
 fn redact_user_decision(event_type: &str, payload: Value) -> Value {

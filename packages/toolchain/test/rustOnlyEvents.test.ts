@@ -119,3 +119,50 @@ test("사용자 답변의 회신 경로는 거절 목록에 들어가지 않는�
     assert.ok(!denied.has(event), `${event}을 거절하면 오케스트레이터 왕복이 성립하지 않습니다`);
   }
 });
+
+/**
+ * **72절 흐름의 두 사용자 게이트는 반드시 거절 목록에 있어야 한다** — state-machine 72.4절.
+ *
+ * 위 검사들은 "목록과 sidecar가 갈라지지 않았는가"를 본다. 그것만으로는 **목록에서 지우는
+ * 변경**을 막지 못한다 — 지우면 sidecar가 아직 내지 않으므로 모든 검사가 통과하고, 그 다음에
+ * 누군가 그 이벤트를 sidecar에서 내면 아무것도 막지 않는다.
+ *
+ * 이 둘만 이름으로 적는 이유는 **구멍 하나가 둘을 뚫기 때문이다**: 72.12절이 구현 예산 예약을
+ * 계획 승인에 묶었으므로, 승인을 지어낼 수 있으면 예산 상한도 함께 사라진다(원칙 2·3·5).
+ * 목록 전체를 여기 적는 것과는 다르다 — 그건 갈라질 곳을 하나 늘리는 일이고, 이건 **지워지면
+ * 안 되는 항목**을 못박는 일이다.
+ */
+test("계획 승인과 최종 확인은 Rust만 기록할 수 있다", () => {
+  const denied = new Set(rustOnlyEvents());
+  for (const event of ["PLAN_APPROVED", "USER_VERIFICATION_APPROVED"]) {
+    assert.ok(
+      denied.has(event),
+      `${event}이 거절 목록에 없습니다 — 장악당한 sidecar가 자기 계획을 스스로 승인하고, ` +
+        "예산 예약이 그 승인에 묶여 있으므로 예산 상한도 함께 사라집니다(72.4·72.12절)"
+    );
+  }
+});
+
+/**
+ * 새 이벤트 여섯이 **프로토콜 타입에도** 있어야 한다.
+ *
+ * Rust의 거절 목록은 문자열이고 TS의 `TaskEventType`은 유니온이라, 한쪽에만 넣어도 아무것도
+ * 실패하지 않는다. 타입에 없으면 오케스트레이터가 그 이벤트를 낼 수 없고 — 거절 목록에 있는
+ * 둘은 그것이 맞지만 — **나머지 넷은 Node가 내야 하는 것**이다(72.14절 계측이 거기 걸려 있다).
+ */
+test("72절 흐름의 이벤트 여섯이 프로토콜 타입에 있다", () => {
+  const source = readFileSync(
+    path.join(REPO_ROOT, "packages", "protocol", "src", "events.ts"),
+    "utf8"
+  );
+  for (const event of [
+    "PLAN_APPROVED",
+    "USER_VERIFICATION_APPROVED",
+    "PLAN_REVIEW_COMPLETED",
+    "RESULT_REVIEW_COMPLETED",
+    "ESCALATION_CALLED",
+    "ESCALATION_REJECTED",
+  ]) {
+    assert.ok(source.includes(`| "${event}"`), `TaskEventType에 ${event}이 없습니다`);
+  }
+});
