@@ -82,7 +82,9 @@ stateDiagram-v2
 >
 > 위 그림에서 **`TRIAGE → DRAFTING → REVIEWING → PLANNING`** 구간은 `complexityTier = standard`
 > 일 때의 경로이고, **72절**이 그 구간을 통째로 바꾼다. **`simple` 경로(`TRIAGE → SINGLE_MODEL_FIX → PLANNING → …`)와 취소·중단·터미널
-> 구조는 그대로다.**
+> 구조는 그대로다** — 위 그림이 취소 간선을 phase마다 열거하는 모양이므로 한 마디 덧붙인다:
+> **취소 간선은 새 phase 다섯에도 그대로 있다**(72.11절). 72절의 두 사용자 게이트는 타임아웃
+> 없이 기다리므로 그 자리에서 취소가 유일한 탈출구다.
 >
 > ```
 > TRIAGE ──standard──→ OUTLINING → AWAITING_PLAN_APPROVAL → PLAN_REVIEWING
@@ -139,7 +141,7 @@ stateDiagram-v2
 | `toolRetries[requestId]` | ToolResult.status = timeout/transient error | 2 (지수 백오프) | 해당 ToolRequest를 `error`로 확정, EXECUTING 전체를 FAILED로 전이 |
 | `planRounds` | `OUTLINING` 재진입 시 (**경로 셋** — 72.11절) | 2 | 계획을 다시 세우지 않는다. **남는 선택지는 서 있는 자리에 따라 다르다** — 72.11절 |
 | `maxSubtasks` | 계획이 서브태스크를 선언할 때 | 8 | 계획을 거부하고 사용자에게 쪼개 달라고 올린다 |
-| `escalationCalls` | 런타임 에스컬레이션을 **실제로 부를 때**(72.10.2절) | 승인 카드의 `escalationAllowance.maxCalls` | **초과 요청을 거절한다.** 서브태스크는 원래 등급으로 계속 간다 — 중간에 봉투를 늘리지 않는다 |
+| `escalationCalls` | 런타임 에스컬레이션을 **실제로 부를 때**(72.10.2절) | 승인 카드의 `escalationAllowance.maxCalls`, **단 `TaskPolicy`의 천장 안에서** — 사용자가 정한 값이 유일한 상한이면 상한이 아니다 | **초과 요청을 거절한다.** 서브태스크는 원래 등급으로 계속 간다 — 중간에 봉투를 늘리지 않는다 |
 
 
 > **`fixLoopRounds`의 증가 지점이 바뀐 이유**: 종전 정의 *"`VERIFYING` → fail 판정 시"*는
@@ -148,7 +150,7 @@ stateDiagram-v2
 > 않는다**(원칙 5). **진입**을 세면 두 경로가 모두 잡히고, 기존 경로에 대해서는 두 정의가
 > 같은 값을 내므로 회귀가 없다. 값(3)은 그대로다.
 
-`planRounds`와 `maxSubtasks`는 72절의 `standard` 흐름에서만 쓰인다.
+`planRounds`·`maxSubtasks`·`escalationCalls`는 72절의 `standard` 흐름에서만 쓰인다.
 
 > **`reviseRounds`는 증가시키는 경로가 남지 않았다.** 그 카운터는 `REVISE` verdict에서 오르는데,
 > `SINGLE_MODEL_FIX`에는 `REVISE`가 없고(14.1절) `standard`에서는 `REVIEWING`이 물러났다(72.3절).
@@ -600,9 +602,10 @@ CREATE TABLE tasks (
   workspace_id   TEXT NOT NULL REFERENCES workspaces(workspace_id),
   user_message   TEXT NOT NULL,
   phase          TEXT NOT NULL,       -- TaskPhase
-  counters_json  TEXT NOT NULL,       -- 2.2절 표의 카운터 전부. 표가 정본이고 여기는 그 사본이다
+  counters_json  TEXT NOT NULL,       -- 2.2절 표에서 **세는 것**만. 표가 정본이고 여기는 그 사본이다
                                       -- (지금: clarificationRounds, reviseRounds, fixLoopRounds,
-                                      --  toolRetries, planRounds, maxSubtasks, escalationCalls)
+                                      --  toolRetries, planRounds, escalationCalls)
+                                      -- maxSubtasks는 상한이지 카운터가 아니다 — TaskPolicy에 산다
   final_status   TEXT,                -- null 이면 아직 진행 중
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL
@@ -8798,7 +8801,9 @@ EffortLevel        : 그 모델이 얼마나 하는가 (같은 모델, 추론 �
 **비용에 대해 말할 수 있는 것은 방향뿐이다.** effort를 올리면 추론 토큰이 늘어 비용이 는다 —
 그러나 **얼마나 느는지는 호출 전에 모른다.** 72.4절 비용 카드가 이 축을 입력으로 받되
 숫자를 좁히지 않고, 상한은 카드의 에스컬레이션 봉투가 아니라 **10.5절 출력 상한**이 건다
-(그 상한 계산에 effort가 들어가야 한다는 것도 21.4절에 적었다 — 넣지 않으면 답이 조용히 잘린다).
+(그 계산에 effort가 들어갈 **자리**를 비워 둬야 한다는 것도 21.4절에 적었다 — 추론 토큰이
+출력 예산에서 나가는 공급자가 **있다면** 답이 조용히 잘리고, 그런 공급자가 있는지는 아직
+확인하지 않았다. 적합성 스위트가 확인한다).
 
 #### 대조(executor ×2)가 계획 단계로 옮겨온다
 
@@ -9015,9 +9020,22 @@ frontier를 부를 수 있으면 승인 카드의 금액이 **승인 직후부�
 읽는다"고 금지한 현상이 `실행 → 계획 승인`으로 일어난다.
 
 그래서 **`maxCalls`가 진짜 상한이다.** 카운터 이름은 `escalationCalls`이고 2.2절과 72.11절
-상한 표에 들어간다. 초과 요청은 그 자리에서 거절되고, 서브태스크는 원래 배정된 등급으로 계속
-간다. **거절도 이벤트로 남는다** — 남기지 않으면 "요청이 없었다"와 구별되지 않고, 아래
-남발 계측이 셀 것을 잃는다.
+상한 표에 들어간다. **거절도 이벤트로 남는다** — 남기지 않으면 "요청이 없었다"와 구별되지
+않고, 아래 남발 계측이 셀 것을 잃는다.
+
+**거절된 요청의 산출물은 그대로 쓴다.** 요청은 산출물에 실려 오므로(위 표) 판정 시점에
+`DraftProposal`은 **이미 있고 이미 값을 치렀다.** 원래 모델을 다시 부르면 호출이 하나 더
+생기는데 그건 어느 카운터도 세지 않는다 — 거절이 비용을 만드는 셈이다. "더 센 모델이 봐야
+한다"고 스스로 말한 초안을 그대로 보내는 것이 불안해 보이지만, **그 불안을 받는 자리가 뒤에
+있다**: 결정론적 검증(원칙 1)과 체크리스트다. 이 절이 거절을 택한 논리가 거기까지 같다.
+
+#### 봉투를 **제안하는 것은 제품, 정하는 것은 사용자**
+
+두 절이 다르게 읽힐 수 있어 못박는다. 카드는 계획에서 유도한 값을 **제안**하고 사용자가
+확인하거나 고친다 — `autoApproveVerification` 옆의 예산 상한 입력란과 같은 모양이다
+(ui-wireframes 3.11절: *"제안값은 승인이 아니다"*, *"제안이 어디서 왔는지를 함께 적는다"*).
+그러므로 **기본 제안값은 `TaskPolicy`에 있고**(2.2절 규칙), **천장도 거기 있다.** 사용자가
+정한 값이 유일한 상한이면 원칙 5가 사용자 입력에 의존하게 된다.
 
 **막다른 길이 아닌 이유는 되묻는 자리가 뒤에 있기 때문이다.** 등급이 모자랐다면 결정론적
 검증이 잡고(원칙 1), 잡지 못한 것은 **검증 체크리스트**가 사용자 앞에 놓는다 — 거기에
@@ -9322,7 +9340,7 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | `packages/sidecar/src/triage.ts` 주석 | 같은 문장이 코드에 남아 있었다 | **고쳤다**(문서만 고치면 다음 사람은 주석을 읽는다) |
 | [product-strategy 13.0.1·13.0.2](./product-strategy.md) | 게이트 결론 인용문, 보류 두 항목 | 취소선 + 근거 |
 | multi-engine 21.4절 레지스트리 키 | `modelId` 단일 키 → **경로 키**(같은 모델에 HTTP·CLI 둘) | 21.7절에 근거, 21.4절에 규칙 |
-| multi-engine 10.5절 출력 토큰 상한 | 상한 계산의 입력에 `EffortLevel`이 들어간다 | **아직 안 함** — 21.4절이 요구만 적었다 |
+| multi-engine 10.5절 출력 토큰 상한 | 상한 계산에 `EffortLevel`이 들어갈 **자리**가 필요하다(해당 공급자가 있는지는 **미확인** — 21.4절) | **아직 안 함** |
 | multi-engine 14절 적합성 스위트 | effort 파라미터 수용 + **추론 토큰 보고** 두 항목 | **아직 안 함** — 21.4절이 요구만 적었다 |
 | multi-engine 15.3절 co-executor 지정 금지 | 대조가 계획으로 옮겨가 **co-planner**에 걸린다 | 취소선 + 대상 교체 |
 | [product-strategy 8.6절](./product-strategy.md) 호출 수 | "실행자 2 + 검수자 1 = 3"과 "verified는 실행자를 하나 더 부른다" | 취소선 + 근거 |
@@ -9354,6 +9372,12 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   **(c)** `grade`·`accounting`·`transport`·`cliVendor`·effort 매핑·경로상 관할 목록·
   `gradeInheritedFrom`(CLI 경로가 어느 HTTP 경로의 등급을 물려받았는지 — 21.7절이 "가정 위에
   선다는 사실이 화면에 있어야 한다"고 정했는데 그 사실을 실을 필드가 없다)이 전부 없는 축이다.
+  **(d)** `apiBaseUrl`이 선택 필드가 되면 **`providerKindOf`가 깨진다** —
+  `packages/sidecar/src/routing/registry.ts`의 `entry.apiBaseUrl.startsWith("local://")`가
+  CLI 엔트리에서 터진다. 그리고 21.7절이 그 함수의 `real | fake` 2값에 CLI를 접지 않기로
+  했으므로 **셋째 값이 여기서 나와야 한다.** 접는 쪽을 고르면 대가가 양쪽 다 있다: `real`이면
+  모든 CLI 호출이 "0 토큰 = 측정 실패"로 보이고(그 함수의 주석이 예산 정산을 거기 걸어 두었다),
+  `fake`면 게이트 집계가 오염된다.
   **(b)는 (a)보다 파급이 넓다** — 키가 바뀌면 레지스트리를 조회하는 모든 자리가 바뀌므로,
   둘을 한 커밋에 섞으면 독립성 타입 변경이 키 변경의 노이즈에 묻힌다.
 - `packages/protocol/src/task.ts` — `PerformanceProfile`과 `EffortLevel`이 **아직 타입에
@@ -9390,7 +9414,10 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   예산 예약을 그 승인에 묶은 뒤로는 **구멍 하나가 둘을 뚫는다.**
   `packages/toolchain/test/rustOnlyEvents.test.ts`가 함께 움직인다.
 - **`packages/protocol/src/task.ts`의 `TaskLoopLimits`·`DEFAULT_LOOP_LIMITS`·`TaskCounters`** —
-  `planRounds`·`maxSubtasks`·`escalationCalls`가 없다. 그 타입 주석이 *"state-machine 2.2절 —
+  **세는 것과 상한을 갈라서** 넣어야 한다: `TaskCounters`에는 `planRounds`·`escalationCalls`,
+  `TaskLoopLimits`에는 `planRounds`·`maxSubtasks`·`escalationCalls`의 천장. `maxSubtasks`는
+  **상한이지 카운터가 아니고**, `escalationCalls`는 둘 다 필요하다(세는 값과 천장).
+  셋을 한 자리에 뭉뚱그리면 `counters_json`이 원칙 7의 파생 캐시라는 성질과 어긋난다. 그 타입 주석이 *"state-machine 2.2절 —
   모든 루프 상한은 여기서 읽는다. CLAUDE.md 원칙 5"*라고 적으므로, 빠지면 **원칙 5가 요구하는
   "하드코딩하지 않는다"가 새 상한 셋에 대해서만 깨진다.**
 - **`packages/protocol/src/proposal.ts`·`validate.ts`·`decision.ts`** — `PlanOutline`에
@@ -9401,8 +9428,11 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   두 곳에 있고 72.2.1절이 그 SQL을 직접 인용하며 교체를 요구한다. source enum 주석도 같다.
 - **`packages/protocol/src/task.ts`의 `modelPins` 주석** — *"지정 가능한 것은 primary executor와
   reviewer뿐"*이 **co-executor 기준으로만** 적혀 있다. 대조가 계획으로 옮겨갔으므로 금지 대상이
-  co-planner가 된다(multi-engine 15.3절). 필드 모양이 바뀌는지(계획자 자리 지정)는
-  `RoleAssignment` 변경과 함께 정한다.
+  co-planner가 된다(multi-engine 15.3절).
+  **그리고 이 필드로는 B·C를 갈라 지정할 수 없다** — `reviewer` 한 자리뿐이라 15.2절의 드롭
+  규칙이 **어느 검토자에 걸리는지** 정해지지 않는다. 계획자(A) 자리도 없다. 필드 모양은
+  `RoleAssignment`가 B와 C를 구별하게 되는 변경(위 `registry.ts` (a))과 **같은 커밋에서**
+  정한다 — 따로 정하면 두 타입이 다른 역할 분류를 갖게 된다.
 - product-strategy 3절 자기 진단 표와 8.2절 출시 기준 표 — 마커(`<!-- present: -->`)가 붙는
   행들이라 **파일이 생긴 뒤에** 고친다. 지금 고치면 `docStatus.test.ts`가 없는 파일을 가리켜
   실패한다.
