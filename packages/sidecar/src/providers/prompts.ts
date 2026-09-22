@@ -652,6 +652,16 @@ export function buildPlanPrompt(input: {
   userAnswers?: { question: string; answer: string }[];
   /** 직전 라운드에서 들어주지 못한 컨텍스트 요청 (57절). */
   contextNote?: string;
+  /**
+   * 이 계획이 **실행으로 이어지는가** — state-machine 72절의 `standard` 경로인가.
+   *
+   * `false`(계획 모드, 53절)면 `doneCriteria`·`requiredTests`·`subtasks`를 요구하지 않는다.
+   * 그 경로는 실행으로 이어지지 않으므로 실행 단위가 필요 없고, **없는 것을 내게 하면 그
+   * 모드가 아끼려는 토큰을 도로 쓴다.**
+   */
+  forExecution?: boolean;
+  /** 서브태스크 개수 상한 (`TaskLoopLimits.maxSubtasks`). 프롬프트에 그대로 싣는다. */
+  maxSubtasks?: number;
 }): string {
   const parts = [
     "You are producing a PLAN for a change to this repository. You are NOT writing the change — " +
@@ -692,6 +702,32 @@ export function buildPlanPrompt(input: {
       "Do NOT write a diff, a patch, or file contents. The plan is the deliverable.",
     ].join("\n")
   );
+
+  // **실행으로 이어지는 계획에만 붙인다**(72.2.2절). 계획 모드는 이 셋을 소비할 다음
+  // 단계가 없으므로 요구하지 않는다.
+  if (input.forExecution) {
+    parts.push(
+      [
+        "## This plan will be EXECUTED",
+        "A user will approve this plan and then it will be implemented. Three more fields are required.",
+        "",
+        "`doneCriteria` — the conditions under which this is done. Each one must be something a person " +
+          "or a test can check. These become the user's final checklist, so vague entries are worse than none.",
+        "`requiredTests` — what must be run to judge the result. Command lines or test names.",
+        "`subtasks` — the execution units. Each becomes ONE implementation call." +
+          (input.maxSubtasks !== undefined ? ` At most ${input.maxSubtasks}.` : ""),
+        "",
+        "`subtasks` is NOT `steps` renamed. `steps` is prose the user reads; `subtasks` is what runs. " +
+          "They may have different lengths and different boundaries.",
+        // **등급을 제안이라고 부르는 것이 중요하다.** 최종 등급은 규칙이 계산하고(72.10절),
+        // 모델이 그것을 "내가 정한다"로 읽으면 자기에게 유리한 배정을 시도할 이유가 생긴다.
+        "For each subtask give `proposedGrade`: `economy` for units a cheaper model can finish, " +
+          "`frontier` for units that need the strongest model. This is a PROPOSAL — the final grade is " +
+          "computed from it by rules you do not control, and units touching sensitive paths are raised " +
+          "regardless of what you say.",
+      ].join("\n")
+    );
+  }
   return parts.join("\n\n");
 }
 
@@ -736,6 +772,47 @@ export const PLAN_SCHEMA = {
         "Workspace-relative paths you need to see before this plan is reliable. " +
         "Paths only — a description is not a path and cannot be fetched.",
       items: { type: "string" },
+    },
+    // ---- 아래 셋은 `standard` 실행 경로가 소비한다 (state-machine 72.2.1·72.2.2절) ----
+    //
+    // 계획 모드(53절)에서도 스키마에 있지만 **프롬프트가 요구하지 않는다.** 스키마를
+    // 경로마다 갈라 두면 "어느 스키마로 물었는가"가 기록에서 사라지고, 같은 타입을 두
+    // 모양으로 검증하게 된다. 요구하는 것은 프롬프트가 정하고, 없으면 빈 배열이다.
+    doneCriteria: {
+      type: "array",
+      description: "Conditions under which this plan can be called done. Checkable statements, not prose.",
+      items: { type: "string" },
+    },
+    requiredTests: {
+      type: "array",
+      description: "What must be run to judge this plan's result. Command lines or test names.",
+      items: { type: "string" },
+    },
+    subtasks: {
+      type: "array",
+      description:
+        "Execution units. Each is one implementation call. This is NOT the same list as `steps`: " +
+        "`steps` is prose for the user to read, `subtasks` is what gets executed.",
+      items: {
+        type: "object",
+        properties: {
+          subtaskId: { type: "string", description: "Stable id, e.g. \"subtask-1\"." },
+          intent: { type: "string", description: "What this unit implements." },
+          files: {
+            type: "array",
+            description: "Workspace-relative paths this unit is expected to touch.",
+            items: { type: "string" },
+          },
+          proposedGrade: {
+            type: "string",
+            enum: ["economy", "frontier"],
+            description:
+              "How hard this unit is. This is a PROPOSAL: the final grade is computed from it by " +
+              "rules you do not control (a user-chosen clamp and a risk floor on sensitive paths).",
+          },
+        },
+        required: ["intent", "proposedGrade"],
+      },
     },
   },
   required: ["summary", "steps"],

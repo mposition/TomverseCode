@@ -328,12 +328,32 @@ export class FakeProviderAdapter implements ProviderAdapter {
       filesToChange: targets.map((f) => f.path),
       risks: [],
       openQuestions: [],
+      // **실행 경로의 기본 payload도 게으르면 안 된다.** `standard`는 빈 `subtasks`를
+      // 실패로 다루므로(72.2.2절), fake가 그것을 내지 않으면 fake로 도는 검사 전부가
+      // "계획 실패"로 죽는다. `steps`와 **개수를 맞추지 않는다** — 둘이 같은 목록이라는
+      // 인상을 fake가 만들면, 실제로 갈리는 경우를 아무도 태워보지 않게 된다.
+      ...(input.forExecution
+        ? {
+            doneCriteria: [`(fake) ${input.userMessage}가 반영되었다`],
+            requiredTests: ["(fake) npm test"],
+            subtasks: [
+              {
+                subtaskId: "subtask-1",
+                intent: "(fake) 서브태스크 1",
+                files: targets.map((f) => f.path),
+                proposedGrade: "economy",
+              },
+            ],
+          }
+        : {}),
     };
     return {
       value: validatePlanOutline(payload, {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
+        ...(input.forExecution ? { requireSubtasks: true } : {}),
+        ...(input.maxSubtasks !== undefined ? { maxSubtasks: input.maxSubtasks } : {}),
       }),
       usage: step?.usage ?? DEFAULT_USAGE,
       latencyMs: step?.delayMs ?? 1,

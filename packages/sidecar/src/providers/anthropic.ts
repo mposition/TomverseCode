@@ -230,6 +230,10 @@ export class AnthropicAdapter implements ProviderAdapter {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
+        // **경로를 입력이 말한다.** 여기서 기본값을 정하면 어댑터 넷이 각자 정하게 되고,
+        // 그중 하나가 `standard`에서 느슨하면 빈 계획이 조용히 통과한다(72.2.2절).
+        ...(input.forExecution ? { requireSubtasks: true } : {}),
+        ...(input.maxSubtasks !== undefined ? { maxSubtasks: input.maxSubtasks } : {}),
       }), { usage, latencyMs, meta }),
       usage,
       latencyMs,

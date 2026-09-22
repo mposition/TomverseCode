@@ -14,14 +14,28 @@ export interface AcceptanceCriterion {
   criterionId: string;
   text: string;
   /**
-   * 이 기준이 어디서 왔는가. **`user_decision`만이 권위를 갖는다** —
-   * 나머지는 모델이 제안한 것이고 사용자가 뒤집을 수 있다.
+   * 이 기준이 어디서 왔는가. **출처마다 권위가 다르다.**
+   *
+   * ```
+   * user_decision  > plan_outline > draft_proposal > user_message
+   * 사용자가 답했다  사용자가 승인한  모델이 초안에서  (생산자 없음)
+   *                 계획에서 왔다    스스로 적었다
+   * ```
+   *
+   * `plan_outline`을 `draft_proposal`에 접어 넣지 않는 이유는 이 필드의 존재 이유 그대로다
+   * (72.2.1절): **사용자 승인을 지난 계획에서 온 기준은 초안이 스스로 적은 기준과 같은
+   * 무게가 아니다.** 뭉개면 체크리스트가 그 차이를 말하지 못한다.
+   *
+   * **값을 나눴으면 정렬 규칙도 함께 바꿔야 한다.** `store.rs`의 기준 조회가
+   * `ORDER BY (source = 'user_decision') DESC`였는데, 그러면 `user_decision`이 아닌 것은
+   * 전부 같은 등급이라 계획 기준과 초안 기준이 한 덩어리로 섞인다 — 방금 나눈 이유를
+   * 무효로 만든다.
    *
    * `user_message`는 타입 정의에는 있으나 현재 아무도 생성하지 않는다. 최초 요청 문장을
    * 통째로 기준으로 승격하면 체크리스트가 "요청 다시 읽기"가 되어 정보가 없기 때문이다.
    * 요청에서 기준을 뽑아내는 것은 모델의 해석이므로 `draft_proposal`로 들어온다.
    */
-  source: "user_decision" | "draft_proposal" | "user_message";
+  source: "user_decision" | "plan_outline" | "draft_proposal" | "user_message";
   /** source = user_decision일 때, 어떤 불일치에 대한 답이었는지 */
   disagreementId?: string;
   decidedAt: ISODateTime;

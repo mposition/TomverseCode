@@ -711,9 +711,23 @@ impl Store {
 
     /// 이 태스크에 고정된 기준. **파생 캐시를 읽을 뿐이고, 여기서 만들어지지 않는다.**
     ///
-    /// 정렬을 `source` 우선으로 하는 이유: 권위를 가진 것(`user_decision`)이 먼저 보여야
-    /// 최종 보고 화면에서 사용자가 자기 판정을 먼저 읽는다. 알파벳 순으로 `draft_proposal`이
-    /// 앞서므로 명시적으로 뒤집는다.
+    /// # 정렬은 권위 순서다 — 이진 판정이 아니다
+    ///
+    /// 종전 정렬은 `(source = 'user_decision') DESC` 하나였고, 그러면 **`user_decision`이
+    /// 아닌 것은 전부 같은 등급**이 된다. 72.2.1절이 `plan_outline`을 따로 만든 이유가
+    /// 정확히 그 뭉개기를 없애는 것이었으므로, 값을 나눠 놓고 정렬을 그대로 두면 계획 기준과
+    /// 초안 기준이 한 덩어리로 섞여 **방금 나눈 이유가 무효가 된다.**
+    ///
+    /// ```text
+    /// user_decision  사용자가 답했다        — 유일하게 권위를 갖는다
+    /// plan_outline   사용자가 승인한 계획   — 승인을 지났다
+    /// draft_proposal 모델이 스스로 적었다
+    /// user_message   (생산자 없음)
+    /// ```
+    ///
+    /// 알파벳 순은 이 순서와 무관하므로(`draft_proposal`이 앞선다) 명시적으로 적는다.
+    /// **모르는 값은 맨 뒤로 보낸다** — 새 출처가 생겼는데 여기 없으면 중간에 끼어들어
+    /// 조용히 권위를 얻는 것보다, 뒤에 붙어 눈에 띄는 편이 낫다.
     /// 이 세션의 **다른** 태스크에서 사용자가 정한 것들 — 최신순 (session_memory.rs, 27절).
     ///
     /// **`source = 'user_decision'`으로 좁히는 것이 이 질의의 전부다.** 모델 제안까지 주면
@@ -778,7 +792,13 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT criterion_id, text, source, disagreement_id, decided_at, withdrawn_at
              FROM acceptance_criteria WHERE task_id = ?1
-             ORDER BY (source = 'user_decision') DESC, decided_at ASC, criterion_id ASC",
+             ORDER BY CASE source
+                        WHEN 'user_decision'  THEN 0
+                        WHEN 'plan_outline'   THEN 1
+                        WHEN 'draft_proposal' THEN 2
+                        WHEN 'user_message'   THEN 3
+                        ELSE 4
+                      END ASC, decided_at ASC, criterion_id ASC",
         )?;
         let rows = stmt.query_map(params![task_id], |r| {
             Ok(AcceptanceCriterionRow {
@@ -2055,7 +2075,8 @@ CREATE TABLE IF NOT EXISTS acceptance_criteria (
   task_id        TEXT NOT NULL REFERENCES tasks(task_id),
   criterion_id   TEXT NOT NULL,
   text           TEXT NOT NULL,
-  source         TEXT NOT NULL,       -- user_decision | draft_proposal | user_message
+  source         TEXT NOT NULL,       -- user_decision | plan_outline | draft_proposal | user_message
+                                      -- 권위 순서이고 조회 정렬이 이 순서를 그대로 쓴다(72.2.1절)
   disagreement_id TEXT,               -- source = user_decision 일 때
   decided_at     TEXT NOT NULL,
   PRIMARY KEY (task_id, criterion_id)
@@ -2356,6 +2377,80 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source, "user_decision");
         assert_eq!(rows[0].text, "빈 문자열 이메일은 거부한다");
+    }
+
+    /// **정렬은 권위 순서다 — 이진 판정이 아니다**(72.2.1절).
+    ///
+    /// 종전 정렬(`(source = 'user_decision') DESC`)은 `user_decision`이 아닌 것을 전부 같은
+    /// 등급으로 묶었다. `plan_outline`을 따로 만든 이유가 그 뭉개기를 없애는 것이었으므로,
+    /// 값만 나누고 정렬을 그대로 두면 **방금 나눈 이유가 무효가 된다.**
+    ///
+    /// 알파벳 순과 결과가 다르다는 것이 이 검사의 요점이다 — 같으면 정렬이 우연히 맞는
+    /// 것이고, 출처 이름이 바뀌는 날 조용히 틀린다.
+    #[test]
+    fn criteria_are_ordered_by_authority_not_alphabetically() {
+        let (_d, mut store) = seeded();
+        // **입력 순서를 결과의 역순으로 넣는다.** 삽입 순서대로 나오면 통과해 버리는 검사가
+        // 되지 않게 하기 위해서다.
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &serde_json::json!({
+                    "acceptanceCriteria": [
+                        { "criterionId": "c-msg",   "text": "요청 문장",   "source": "user_message",   "decidedAt": "2024-01-01T00:00:00Z" },
+                        { "criterionId": "c-draft", "text": "초안이 적음", "source": "draft_proposal", "decidedAt": "2024-01-01T00:00:00Z" },
+                        { "criterionId": "c-plan",  "text": "승인된 계획", "source": "plan_outline",   "decidedAt": "2024-01-01T00:00:00Z" },
+                        { "criterionId": "c-user",  "text": "사용자 판정", "source": "user_decision",  "decidedAt": "2024-01-01T00:00:00Z" },
+                    ],
+                }),
+            )
+            .unwrap();
+
+        let sources: Vec<String> = store
+            .acceptance_criteria("task-1")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.source)
+            .collect();
+        assert_eq!(
+            sources,
+            vec!["user_decision", "plan_outline", "draft_proposal", "user_message"],
+            "권위 순서가 아닙니다 — plan_outline과 draft_proposal이 한 덩어리로 섞이면 \
+             체크리스트가 사용자 승인을 지난 기준과 모델이 스스로 적은 기준을 구별하지 못합니다"
+        );
+
+        // 알파벳 순이었다면 draft_proposal이 맨 앞이다. 두 순서가 다르다는 것이
+        // 이 검사가 무언가를 재고 있다는 근거다.
+        let mut alphabetical = sources.clone();
+        alphabetical.sort();
+        assert_ne!(sources, alphabetical, "정렬이 알파벳 순과 같아 이 검사가 공허합니다");
+    }
+
+    /// 모르는 출처는 **맨 뒤로 간다.** 새 출처가 생겼는데 정렬 표에 없으면 중간에 끼어들어
+    /// 조용히 권위를 얻는 것보다, 뒤에 붙어 눈에 띄는 편이 낫다.
+    #[test]
+    fn an_unknown_source_sorts_last() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "USER_DECISION_RECORDED",
+                &serde_json::json!({
+                    "acceptanceCriteria": [
+                        { "criterionId": "c-new",  "text": "새 출처",     "source": "some_future_source", "decidedAt": "2024-01-01T00:00:00Z" },
+                        { "criterionId": "c-msg",  "text": "요청 문장",   "source": "user_message",       "decidedAt": "2024-01-01T00:00:00Z" },
+                    ],
+                }),
+            )
+            .unwrap();
+        let sources: Vec<String> = store
+            .acceptance_criteria("task-1")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.source)
+            .collect();
+        assert_eq!(sources, vec!["user_message", "some_future_source"]);
     }
 
     #[test]

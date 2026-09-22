@@ -66,6 +66,19 @@ export interface DraftInput {
    * 받지 않는 모양이다" — 모델이 고쳐야 할 것이 다르므로 프롬프트에서도 다른 문단이다.
    */
   gateFeedback?: string[];
+  /**
+   * `outlinePlan` 전용 — 이 계획이 **실행으로 이어지는가** (state-machine 72절).
+   *
+   * `outlinePlan`이 `DraftInput`을 받는 것은 두 경로가 같은 입력을 필요로 하기 때문이고,
+   * **다른 것은 산출물에 무엇을 요구하는가 하나뿐**이다. 그래서 타입을 가르지 않고 축을
+   * 하나 더한다 — 가르면 스냅샷·답변·컨텍스트 노트가 두 벌이 되고, 그 둘이 갈리는 날
+   * "어느 쪽 계획이 무엇을 봤는가"가 기록에서 답해지지 않는다.
+   *
+   * 없으면 계획 모드(53절)다: `doneCriteria`·`requiredTests`·`subtasks`를 요구하지 않는다.
+   */
+  forExecution?: boolean;
+  /** `forExecution`일 때 계획이 만들 수 있는 서브태스크 수 (`TaskLoopLimits.maxSubtasks`). */
+  maxSubtasks?: number;
 }
 
 export interface ReviewInput {
