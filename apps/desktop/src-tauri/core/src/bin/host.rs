@@ -37,7 +37,10 @@ use tomverse_core::artifacts::ArtifactStore;
 use tomverse_core::host::{AlwaysDeny, ApprovalGateway, AutoApprove, EventSink, TaskHost};
 use tomverse_core::sidecar::SidecarClient;
 use tomverse_core::store::{Store, TerminalOutcome};
-use tomverse_core::types::{EffortLevel, ExecutionMode, PerformanceProfile, TaskPolicy};
+use tomverse_core::types::{
+    EffortLevel, ExecutionMode, PerformanceProfile, PlanApprovalChoice, TaskPolicy, UserGateOutcome,
+    VerificationChoice,
+};
 use tomverse_core::CancellationRegistry;
 use tomverse_core::{
     available_providers_for, credential_injection_for, credentials, WorkspaceRoot, PROTOCOL_VERSION,
@@ -86,6 +89,12 @@ struct Args {
     /// 고른 모델을 얼마나 깊게 굴리는가 (72.9절). `--effort low|medium|high`.
     effort: EffortLevel,
     approve: String,
+    /// 72절 **사용자 게이트 둘**에 대한 헤드리스 응답 — `--gate`.
+    ///
+    /// **`--approve`와 나누는 이유가 72.12절이다.** 도구 승인과 사용자 게이트는 무응답의
+    /// 뜻이 다르고(거부 / 대기), 헤드리스에서도 그 구별이 필요하다 — `--approve auto`로
+    /// 게이트까지 자동 승인하면 "두 게이트에서 멈춘다"를 헤드리스에서 태워볼 수 없다.
+    gate: String,
     db: Option<PathBuf>,
     artifacts: Option<PathBuf>,
     sidecar: Option<PathBuf>,
@@ -173,6 +182,25 @@ struct Args {
     /// 초안을 새로 생성하지 않고 이 파일의 `DraftProposal`을 쓴다.
     /// **파일을 읽는 것은 Rust다** — sidecar는 경로를 받지도 않는다.
     replay_draft: Option<PathBuf>,
+    /// 어느 **파이프라인**을 태울 것인가 — state-machine 72.3절.
+    ///
+    /// 기본(지정 없음)은 72절의 `standard` 흐름이다. `legacy-cross-verification`을 주면
+    /// 물러난 `DRAFTING` 경로를 탄다 — **가설 게이트 Protocol v1의 arm C·D가 재는 대상이
+    /// 그것**이고, 그 판정 기준은 `criteria.ts`에 해시로 봉인된 사전등록이라 재는 대상이
+    /// 조용히 바뀌면 봉인이 지키는 것이 없어진다.
+    pipeline: Option<String>,
+    /// 대조(계획자 ×2)를 **명시적으로** 켠다 — `--contrast`.
+    ///
+    /// # 왜 플래그가 필요한가
+    ///
+    /// `ExperimentControls`가 하나라도 지정되면 대조는 **기본이 꺼짐**이다(하네스가 arm을
+    /// 고정하기 위한 규칙 — 호출이 하나 더 생기면 그게 arm 차이인지 대조 때문인지 구별되지
+    /// 않는다). 그런데 이 축에는 CLI 입구가 없어서, `--pipeline`을 주는 순간 대조가 조용히
+    /// 꺼지고 **그 경로를 e2e로 태워볼 수 없게 된다.**
+    ///
+    /// 켜는 입구를 만들되 **끄는 입구는 만들지 않는다**: 끄는 것은 이미 기본값이고, 플래그를
+    /// 둘 두면 "지정하지 않음"과 "꺼짐"이 명령줄에서 구별되지 않는다.
+    contrast: bool,
 
     // ---- reproduce 전용 ----
     /// 검사할 export 파일. **태스크 id가 아니라 파일이다** — 재현을 돌리는 사람에게는
@@ -458,6 +486,7 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         profile: PerformanceProfile::Balanced,
         effort: EffortLevel::Medium,
         approve: "auto".to_string(),
+        gate: "approve".to_string(),
         db: None,
         artifacts: None,
         sidecar: None,
@@ -490,6 +519,8 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         providers: None,
         review_mode: None,
         replay_draft: None,
+        pipeline: None,
+        contrast: false,
         file: None,
         accept_fingerprint: None,
         apply: false,
@@ -533,6 +564,7 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
             }
             "--approve" => args.approve = value()?,
+            "--gate" => args.gate = value()?,
             "--worktree" => args.worktree = Some(value()?),
             "--member" => args.fleet_members.push(parse_member(&value()?)?),
             "--fleet" => args.fleet_id = Some(value()?),
@@ -619,6 +651,16 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                 args.review_mode = Some(mode);
             }
             "--replay-draft" => args.replay_draft = Some(PathBuf::from(value()?)),
+            "--contrast" => args.contrast = true,
+            "--pipeline" => {
+                let name = value()?;
+                if name != "legacy-cross-verification" {
+                    return Err(format!(
+                        "알 수 없는 --pipeline: {name} (legacy-cross-verification만 지정할 수 있습니다)"
+                    ));
+                }
+                args.pipeline = Some(name);
+            }
             "--file" => args.file = Some(PathBuf::from(value()?)),
             "--accept-fingerprint" => args.accept_fingerprint = Some(value()?),
             "--apply" => args.apply = true,
@@ -689,6 +731,8 @@ fn usage() -> String {
      [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
      \n\
      가설 게이트 전용: [--providers <csv>] [--review-mode blind|informed] [--replay-draft <file>]\n\
+                       [--pipeline legacy-cross-verification]\n\
+                       [--contrast]\n\
      \n\
      run --worktree <branch> — 격리 실행. 그 브랜치의 worktree를 만들고 **그 경로를 워크스페이스\n\
                  루트로 쓴다**. 브랜치가 없으면 만들고, 출발점은 [--worktree-base <ref>].\n\
@@ -1176,6 +1220,45 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
         "autopilot" => Arc::new(tomverse_core::host::UnattendedStop),
         other => return Err(format!("알 수 없는 --approve: {other} (auto|deny|autopilot)")),
     };
+    /// 헤드리스 실행의 사용자 게이트 응답 — state-machine 72.4·72.12절.
+    ///
+    /// **고정된 답을 낸다.** 사람이 없는 자리에서 "물어본다"는 것은 성립하지 않으므로,
+    /// 무엇을 답할지는 실행을 시작할 때 인자로 정해진다. `--approve autopilot`이면 그 인자와
+    /// 무관하게 `Unattended`다 — **Autopilot은 두 게이트에서 멈춘다**(72.12절). 자동
+    /// 승인하면 이 설계의 전부인 사용자 권위가 사라지고, 그 결과 Autopilot의 실질 범위가
+    /// `simple` 태스크로 좁아지는 것은 부작용이 아니라 정의에서 따라 나오는 것이다.
+    struct HeadlessGateway {
+        choice: String,
+        unattended: bool,
+    }
+    impl tomverse_core::types::UserGateway for HeadlessGateway {
+        fn request_gate(&self, request: &tomverse_core::types::UserGateRequest) -> UserGateOutcome {
+            if self.unattended {
+                return UserGateOutcome::Unattended;
+            }
+            match request {
+                tomverse_core::types::UserGateRequest::Plan { .. } => match self.choice.as_str() {
+                    "approve" => UserGateOutcome::Plan(PlanApprovalChoice::ApproveWithReview),
+                    "approve-skip-review" => UserGateOutcome::Plan(PlanApprovalChoice::ApproveSkipReview),
+                    "revise" => UserGateOutcome::Plan(PlanApprovalChoice::Revise),
+                    "reject" => UserGateOutcome::Plan(PlanApprovalChoice::Reject),
+                    other => UserGateOutcome::Unavailable(format!("알 수 없는 --gate: {other}")),
+                },
+                tomverse_core::types::UserGateRequest::Verification { .. } => match self.choice.as_str() {
+                    // 계획을 승인한 실행은 결과도 승인해야 끝까지 돈다 — e2e가 그 경로를
+                    // 태우는 것이 목적이고, 거부 경로는 `--gate reject`가 따로 있다.
+                    "approve" | "approve-skip-review" => UserGateOutcome::Verification(VerificationChoice::Approve),
+                    "revise" => UserGateOutcome::Verification(VerificationChoice::Replan),
+                    "reject" => UserGateOutcome::Verification(VerificationChoice::RevertAndStop),
+                    other => UserGateOutcome::Unavailable(format!("알 수 없는 --gate: {other}")),
+                },
+            }
+        }
+    }
+    let gates: Arc<dyn tomverse_core::types::UserGateway> = Arc::new(HeadlessGateway {
+        choice: args.gate.clone(),
+        unattended: args.approve == "autopilot",
+    });
     let sink = Arc::new(StderrSink { verbose: args.verbose });
 
     match args.command.as_str() {
@@ -1232,7 +1315,11 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
                 approvals,
                 sink,
                 Arc::new(CancellationRegistry::new()),
-            );
+            )
+            // **`run`/`ask`/`plan`에만 붙인다.** 되돌리기·재현 같은 명령은 태스크를 돌리지
+            // 않으므로 사용자 게이트에 닿을 일이 없고, 붙이면 "물을 사람이 있다"가 참이
+            // 아닌 자리에서 참이 된다.
+            .with_gates(gates.clone());
             if let Some(pool) = mcp.clone() {
                 eprintln!("MCP 서버 등록: {}", pool.names().join(", "));
                 task_host = task_host.with_mcp(pool);
@@ -1787,6 +1874,14 @@ fn run_task(
     }
     if let Some(draft) = replay_draft {
         experiment.insert("replayDraft".to_string(), draft);
+    }
+    if args.contrast {
+        experiment.insert("contrast".to_string(), json!(true));
+    }
+    if args.pipeline.is_some() {
+        // 프로토콜의 값은 snake_case다(`ExperimentControls.pipeline`). CLI 쪽은 대시를 쓰므로
+        // **여기서 한 번만** 옮긴다 — 두 곳에서 옮기면 언젠가 한쪽만 바뀐다.
+        experiment.insert("pipeline".to_string(), json!("legacy_cross_verification"));
     }
 
     // 지정이 없으면 키 자체를 넣지 않는다 — 빈 객체를 넣으면 "지정했는데 비었다"와

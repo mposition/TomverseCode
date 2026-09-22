@@ -7,6 +7,7 @@ import {
   stagesFor,
   type AcceptanceCriterion,
   type ApprovalRequest,
+  type UserGateRequest,
   type CriterionEvaluation,
   type Disagreement,
   type DraftNarrative,
@@ -46,6 +47,8 @@ import {
 import { summarizeContrast, type ContrastInput } from "./lib/contrastSummary";
 import { describeCallPlan } from "./lib/callPlan";
 import { ApprovalModal } from "./components/ApprovalModal";
+import { PlanApprovalCard } from "./components/PlanApprovalCard";
+import { VerificationChecklist } from "./components/VerificationChecklist";
 import { buildApprovalQueue } from "./lib/approvalQueue";
 // 화면의 예산 입력을 Rust가 받는 두 값으로 바꾸는 곳은 **여기 하나뿐이다** — Fleet은
 // 상한을 둘(작업당·합계) 받으므로 그 한 곳이 실제로 두 화면에서 쓰인다.
@@ -180,6 +183,24 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [mode, setMode] = useState<"fast" | "verified">("verified");
   /**
+   * 72.9절의 축 둘 — **직교한다.**
+   *
+   * ```
+   * PerformanceProfile : 어느 모델이 하는가   (모델 교체)
+   * EffortLevel        : 그 모델이 얼마나 하는가 (같은 모델, 추론 예산)
+   * ```
+   *
+   * 한 슬라이더로 합치면 `economy + high`("싼 모델에게 시간을 더 준다")와 `max + low`
+   * ("가장 센 모델에게 빠르게 묻는다") 중 하나는 표현할 수 없게 되는데, **어느 쪽이 나은지
+   * 우리는 모른다.** 모르는 것을 제품이 미리 골라버리는 것이 합치기의 실제 대가다.
+   *
+   * 기본값은 `balanced`/`medium`이다 — 둘 다 항등에 가장 가까운 값이고, **기본값 공백과
+   * 동작이 같더라도 적어 두어야** 나중에 누가 바꿀 때 그것이 변경인지 공백 채우기인지
+   * 구별된다.
+   */
+  const [profile, setProfile] = useState<"economy" | "balanced" | "max">("balanced");
+  const [effort, setEffort] = useState<"low" | "medium" | "high">("medium");
+  /**
    * 검증 통과 후 커밋을 **제안할지**. 기본은 꺼짐이다.
    *
    * 이 토글은 승인 등급을 낮추지 않는다 — 켜져 있어도 Policy Gate는 `git commit`을 승인
@@ -259,6 +280,18 @@ export default function App() {
    * 순서와 표시 규칙은 화면 밖 순수 함수에 있다(`lib/approvalQueue.ts`).
    */
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  /**
+   * 사용자 게이트 둘의 카드 — state-machine 72.4·72.8절.
+   *
+   * **도구 승인 큐와 합치지 않는다.** 그쪽은 600초 뒤 거부이고 이쪽은 **타임아웃이 없다**
+   * (72.12절). 그리고 답의 모양이 다르다 — 도구 승인은 허용/거부 둘이고 이쪽은 카드마다
+   * 다른 넷이다. 합치면 `granted: boolean`에 넷을 욱여넣게 된다.
+   *
+   * 값이 하나뿐인 이유: 한 태스크에 게이트는 한 번에 하나만 뜬다(서브태스크는 순차다).
+   * Fleet 구성원이 각자 게이트를 갖지만 그건 도구 승인 큐와 같은 문제이고, 카드 큐를
+   * 여기서 미리 만들지 않는다 — 만들면 **쓰이지 않는 규칙을 검증 없이 갖게 된다.**
+   */
+  const [gate, setGate] = useState<UserGateRequest | null>(null);
   const [finalResult, setFinalResult] = useState<FinalResult | null>(null);
   const [questions, setQuestions] = useState<string[] | null>(null);
   /**
@@ -498,9 +531,19 @@ export default function App() {
         prev.some((a) => a.approvalId === event.payload.approvalId) ? prev : [...prev, event.payload]
       );
     });
+    // 72절 사용자 게이트 — **채널이 둘이고 카드가 둘이다.** 한 채널로 합치면 화면이
+    // payload를 보고 어느 카드인지 판정해야 하고, 그 판정은 틀릴 수 있다.
+    const unlistenPlanGate = listen<UserGateRequest>("plan-approval-required", (event) => {
+      setGate(event.payload);
+    });
+    const unlistenVerifyGate = listen<UserGateRequest>("verification-required", (event) => {
+      setGate(event.payload);
+    });
     return () => {
       void unlistenEvent.then((fn) => fn());
       void unlistenApproval.then((fn) => fn());
+      void unlistenPlanGate.then((fn) => fn());
+      void unlistenVerifyGate.then((fn) => fn());
     };
   }, []);
 
@@ -684,6 +727,8 @@ export default function App() {
       const result = await invoke<FinalResult>("start_task", {
         message,
         mode,
+        profile,
+        effort,
         allowGitCommit,
         ...budgetArgs(budgetText),
         modelPins: modelPins(pinExecutor, pinReviewer),
@@ -722,7 +767,9 @@ export default function App() {
       // `alive`가 나와 배너가 뜨지 않는다.
       void refreshBackend();
     }
-  }, [workspace, message, mode, taskId, refreshTasks, refreshBackend]);
+    // 축 둘을 의존성에 넣는다 — 빠뜨리면 사용자가 고른 값이 아니라 **첫 렌더의 값**으로
+    // 태스크가 돌고, 그 어긋남은 화면 어디에도 나타나지 않는다.
+  }, [workspace, message, mode, profile, effort, taskId, refreshTasks, refreshBackend]);
 
   /**
    * 승인 큐 — **도착 순서대로 하나씩**(process-architecture 11.6①).
@@ -746,6 +793,35 @@ export default function App() {
   const activeApproval = useMemo(
     () => approvals.find((request) => request.approvalId === approvalQueue.active?.approvalId) ?? null,
     [approvals, approvalQueue]
+  );
+
+  /**
+   * 게이트 카드의 답 — `respond_gate`로 Rust에 보낸다.
+   *
+   * **`respond_approval`과 나눈다.** 승인 이벤트가 `NODE_MAY_NOT_EMIT`이라 왕복 전체가
+   * Rust 소유이고, 답의 모양도 다르다(선택지 넷).
+   *
+   * **보내기 전에 카드를 내린다.** 같은 카드에 두 번 답하면 뒤의 답은 갈 곳이 없고,
+   * 그 사이에 사용자가 다른 버튼을 누르면 자기가 무엇을 보냈는지 알 수 없게 된다.
+   */
+  const respondGate = useCallback(
+    async (choice: string) => {
+      const current = gate;
+      if (!current) return;
+      setGate(null);
+      try {
+        await invoke<Record<string, unknown>>("respond_gate", {
+          taskId: current.taskId,
+          gate: current.gate,
+          choice,
+        });
+      } catch (error) {
+        // **답이 전달되지 않은 것을 조용히 넘기지 않는다.** 태스크는 그 자리에서 계속
+        // 기다리고 있으므로, 말하지 않으면 사용자는 멈춘 이유를 알 수 없다.
+        setNotice(`게이트 응답을 보내지 못했습니다: ${String(error)}`);
+      }
+    },
+    [gate]
   );
 
   const respondApproval = useCallback(
@@ -1028,8 +1104,12 @@ export default function App() {
   // **끝난 태스크의 단계도 phase에서 읽는다.** 종전에는 결과가 있으면 무조건 "완료"였는데,
   // 답변은 완료가 아니다(51절) — 그 구별이 여기서 사라지면 종착지를 나눈 이유도 사라진다.
   // 그래서 결과 유무로 갈라지 않는다: phase 하나가 답한다.
-  const stage: UserStage = phaseToStage(phase);
-  const stages = stagesFor(taskKind);
+  // **선택자는 `(kind, complexityTier)`다**(72.2.3절). tier는 TRIAGE가 끝나야 알 수 있으므로
+  // 그 전에는 `null`이고, 그동안 화면은 **공통 접두사만** 그린다 — 모든 순서가 `준비 중`으로
+  // 시작하므로 미뤄도 틀린 것을 그리는 구간이 없다.
+  const tier = routing?.complexityTier ?? null;
+  const stage: UserStage = phaseToStage(phase, taskKind, tier);
+  const stages = stagesFor(taskKind, tier);
 
   const noProviders = providerStatus?.providers.every((p) => !p.configured) ?? false;
 
@@ -1317,8 +1397,37 @@ export default function App() {
                 </label>
                 <label>
                   <input type="radio" checked={mode === "verified"} onChange={() => setMode("verified")} />
-                  Verified — 항상 독립 검수 <span className="muted">(실행자를 둘 부릅니다)</span>
+                  Verified — 계획을 둘로 세워 대조 <span className="muted">(계획자를 둘 부릅니다)</span>
                 </label>
+                {/* **72.9절의 축 둘.** 모드와 나란히 두되 합치지 않는다 — 직교하는 축이고,
+                    한 슬라이더로 합치면 `economy + high`와 `max + low` 중 하나를 표현할 수
+                    없게 된다. 어느 쪽이 나은지 우리는 모른다. */}
+                <label className="policy-axis">
+                  구현 등급
+                  <select
+                    value={profile}
+                    onChange={(e) => setProfile(e.target.value as typeof profile)}
+                  >
+                    <option value="economy">Economy — 싼 모델로 (위험 경로는 그대로 올라갑니다)</option>
+                    <option value="balanced">Balanced — 계획 모델의 판정을 그대로</option>
+                    <option value="max">Max — 전부 최상급</option>
+                  </select>
+                </label>
+                <label className="policy-axis">
+                  실행 강도
+                  <select value={effort} onChange={(e) => setEffort(e.target.value as typeof effort)}>
+                    <option value="low">Low — 빠르게</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High — 더 깊게</option>
+                  </select>
+                </label>
+                {/* **효과를 주장하지 않는다**(72.10.3절). 노출하는 것과 효과를 주장하는 것은
+                    다른 일이고, 후자만 측정을 요구한다 — 우리는 재지 않았다. */}
+                <p className="muted small">
+                  실행 강도는 **비용을 늘리는 방향**입니다. 얼마나 늘어나는지, 통과율을 바꾸는지는
+                  아직 재지 않았습니다. 손잡이가 없는 모델에서는 아무 일도 하지 않으며, 그 사실은
+                  계획 승인 카드가 적습니다.
+                </p>
                 {/* **모드가 바꾸는 것은 대부분 비용인데 이름이 그걸 말하지 않고 있었다.**
                     경고가 아니라 사실 나열이다 — 계산은 화면 밖(lib/callPlan.ts)에 있고,
                     "모자랄 수 있습니다" 같은 예측은 하지 않는다(budgetCheck.ts의 규율). */}
@@ -1927,6 +2036,13 @@ export default function App() {
 
       {activeApproval && (
         <ApprovalModal request={activeApproval} queue={approvalQueue} onRespond={respondApproval} />
+      )}
+      {/* **도구 승인 모달과 같은 자리에 둔다.** 둘이 동시에 뜨는 일은 없다 — 게이트를
+          기다리는 동안에는 도구를 실행하지 않는다. 자리를 나누면 그 사실이 화면에서
+          "우연히 안 겹친다"로 읽힌다. */}
+      {gate?.gate === "plan" && <PlanApprovalCard card={gate.card} onRespond={respondGate} />}
+      {gate?.gate === "verification" && (
+        <VerificationChecklist card={gate.card} onRespond={respondGate} />
       )}
     </main>
   );

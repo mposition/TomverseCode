@@ -45,7 +45,20 @@ function build(
 ): { orchestrator: Orchestrator; host: FakeHost } {
   const host = new FakeHost({ ...WORKSPACE_FILES, ...hostOptions });
   const orchestrator = new Orchestrator(
-    { taskRequest: taskRequest(), policy: makePolicy(policy), availableProviders: ["fake-a", "fake-b"] },
+    {
+      taskRequest: taskRequest(),
+      // **물러난 교차검증 파이프라인**(`DRAFTING → REVIEWING`)을 고정한다 — 72.3절.
+      // 이 파일의 검사 대상이 그 파이프라인의 동작이고, 72절이 `standard`를 새 흐름으로
+      // 바꾸었어도 그 phase는 지워지지 않았다(가설 게이트 arm C·D가 지금도 그 경로를 잰다).
+      // 새 흐름의 검사는 `standardFlow.test.ts`에 있다.
+      // `contrast: true`는 **하네스 arm이 아니라 production 기본값을 지키는 것**이다.
+      // `experiment`가 정의되면 대조는 기본이 꺼짐이므로(하네스가 arm을 고정하기 위한 규칙),
+      // 적지 않으면 이 파일의 대조 검사가 조용히 대조 없이 돈다.
+      experiment: { pipeline: "legacy_cross_verification", contrast: true },
+      // `executionMode`는 이제 tier를 정하지 않는다(72.9절) — 경로를 고정하려면 tier 축에서 건다.
+      policy: makePolicy({ forceComplexityTier: "standard", ...policy }),
+      availableProviders: ["fake-a", "fake-b"],
+    },
     { transport: host.asTransport(), adapterOptions: { fake } }
   );
   return { orchestrator, host };

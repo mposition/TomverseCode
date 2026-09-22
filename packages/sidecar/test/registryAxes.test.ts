@@ -247,18 +247,85 @@ test("같은 참가자의 두 경로는 후보 하나로 접힌다", async () =>
 });
 
 /**
- * 72절 흐름이 라우터를 지나기 전에는 B·C 자리가 **없다.** "독립적이지 않다"가 아니다 —
- * 둘을 뭉개면 화면이 없는 검토를 드롭된 검토로 표시하고, 사용자는 있지도 않았던 것을
- * 잃었다고 읽는다.
+ * `not_applicable` / `independent` / `dropped`는 **서로 다른 사실**이다 — 21.6절.
+ *
+ * 뭉개면 화면이 없는 검토를 드롭된 검토로 표시하고, 사용자는 있지도 않았던 것을 잃었다고
+ * 읽는다. 그래서 세 경우를 한 검사에서 함께 본다 — 하나만 보면 나머지 둘이 같은 값을
+ * 내도 통과한다.
  */
-test("B·C 자리는 없을 때 dropped가 아니라 not_applicable이다", async () => {
+test("B·C의 세 상태를 구별한다 — 자리가 없다 / 독립이다 / 드롭됐다", async () => {
   const { ModelRegistry } = await import("../src/routing/registry.js");
   const { Router } = await import("../src/routing/router.js");
-  const decision = new Router(new ModelRegistry()).decide({
-    taskId: "t3",
+  const router = new Router(new ModelRegistry());
+
+  // ① `simple`에는 B·C **자리가 없다**(72절은 `simple`을 바꾸지 않는다).
+  const simple = router.decide({
+    taskId: "t3-simple",
+    complexityTier: "simple",
+    availableProviders: ["fake-a", "fake-b", "fake-c"],
+  });
+  assert.equal(simple.planReviewIndependence, "not_applicable");
+  assert.equal(simple.resultReviewIndependence, "not_applicable");
+  assert.deepEqual(simple.activeRoles, ["executor"]);
+
+  // ② 공급자가 넉넉하면 사다리가 자리를 **채운다**.
+  const filled = router.decide({
+    taskId: "t3-filled",
     complexityTier: "standard",
     availableProviders: ["fake-a", "fake-b", "fake-c"],
   });
-  assert.equal(decision.planReviewIndependence, "not_applicable");
-  assert.equal(decision.resultReviewIndependence, "not_applicable");
+  assert.equal(filled.planReviewIndependence, "independent");
+  assert.ok(filled.activeRoles.includes("planReviewer"));
+  assert.ok(filled.activeRoles.includes("resultReviewer"));
+  // **C = B는 허용되는 유일한 예외다**(21.6절) — B가 코드를 쓰지 않았으므로 자기 산출물
+  // 자기 승인이 아니다. 다만 계획에 관여했으므로 `independent`가 아니라 `shares_provider`로
+  // 남는다. 이 구별을 지우면 13.3절보다 정직성이 후퇴한다.
+  assert.equal(filled.resultReviewIndependence, "shares_provider");
+  assert.ok(
+    filled.appliedPolicies.some((p) => p.startsWith("result_reviewer_shares_provider_with_plan_reviewer")),
+    JSON.stringify(filled.appliedPolicies)
+  );
+
+  // ③ 공급자가 하나면 **드롭된다** — 같은 공급자로 "검토한 척"하지 않는다(원칙 4).
+  const dropped = router.decide({
+    taskId: "t3-dropped",
+    complexityTier: "standard",
+    availableProviders: ["fake-a"],
+  });
+  assert.equal(dropped.planReviewIndependence, "dropped");
+  assert.equal(dropped.resultReviewIndependence, "dropped");
+  assert.ok(!dropped.activeRoles.includes("planReviewer"));
+  assert.ok(!dropped.activeRoles.includes("resultReviewer"));
+  // 드롭 사유가 `appliedPolicies`에 남는다 — 남기지 않으면 "없었다"와 구별되지 않는다.
+  assert.ok(dropped.appliedPolicies.some((p) => p.startsWith("plan_review_dropped")));
+  assert.ok(dropped.appliedPolicies.some((p) => p.startsWith("result_review_dropped")));
+});
+
+/**
+ * **실제 공급자는 측정 전까지 `unmeasured`다** — multi-engine-routing.md 21.4·21.8절.
+ *
+ * 등급은 "이 모델이 fixture를 몇 % 통과하는가"이고 **우리가 실제로 잰 값**이 근거다.
+ * 측정 없이 등급을 붙이면 21.6절의 A·B·C 기본 배정 금지가 그 추측 위에서 풀린다 —
+ * 독립성 주장이 검증되지 않은 것 위에 서게 되는 바로 그 경우다.
+ *
+ * `fake-*`는 예외다. 모델이 아니라 하네스이므로 잴 능력이 없고, 붙어 있는 값은 능력에 대한
+ * 주장이 아니라 고정된 fixture다(`registry.ts`의 fake 머리말). 예외를 여기 적어 두지
+ * 않으면 다음 사람이 그 값을 "이미 측정했다"로 읽는다.
+ */
+test("측정하지 않은 실제 공급자에 등급을 붙이지 않는다", () => {
+  const real = BUILTIN_MODELS.filter((e) => providerKindOf(e) === "real");
+  assert.ok(real.length > 0);
+  for (const entry of real) {
+    assert.equal(
+      entry.grade,
+      "unmeasured",
+      `${entry.modelId}에 등급이 붙어 있습니다 — 게이트 fixture 세트로 잰 뒤에만 붙습니다(21.8절 5단계)`
+    );
+  }
+  // fake에는 붙어 있어야 한다 — 없으면 B·C 경로를 아무도 태워볼 수 없다.
+  const fake = BUILTIN_MODELS.filter((e) => providerKindOf(e) === "fake");
+  assert.ok(
+    fake.some((e) => e.grade === "frontier"),
+    "하네스에 frontier fixture가 없어 결과 검토(C) 경로를 태워볼 수 없습니다"
+  );
 });

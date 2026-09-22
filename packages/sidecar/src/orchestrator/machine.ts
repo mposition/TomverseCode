@@ -170,6 +170,15 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
    * 간선을 만들면 2.1절 표에 없는 전이(`OUTLINING → AWAITING_USER_INPUT`)를 만들게 된다.
    */
   AWAITING_PLAN_APPROVAL: [
+    /**
+     * **자기 자신으로의 전이** — 카드를 다시 묻는다.
+     *
+     * 계획 수정 상한을 다 쓴 뒤 "수정 요청"이 또 오면 계획을 다시 세우지 않고 같은 카드를
+     * 남은 선택지와 함께 다시 보여준다(72.11절: 막다른 길을 만들지 않는다). `EXECUTING →
+     * EXECUTING`이 "다음 ToolRequest"인 것과 같은 자리이고, **진행바가 뒤로 가지 않는다**
+     * — 72.2.3절이 금지한 것은 같은 칸을 두 번 *지나는* 것이지 머무는 것이 아니다.
+     */
+    "AWAITING_PLAN_APPROVAL",
     "PLAN_REVIEWING",
     "IMPLEMENTING",
     "OUTLINING",

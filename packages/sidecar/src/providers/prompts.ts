@@ -211,12 +211,24 @@ export function buildDraftPrompt(input: {
    * 받지 않는 모양이다" — 모델이 고쳐야 할 것이 다르다.
    */
   gateFeedback?: string[];
+  /** 이 호출이 맡은 서브태스크 (state-machine 72.2.2절). `standard` 경로에서만 온다. */
+  subtask?: {
+    intent: string;
+    files: string[];
+    index: number;
+    total: number;
+    planSummary: string;
+    completedIntents: string[];
+  };
 }): string {
   const parts = [
     "You are the executor in a verification-first coding agent. Your patch will be applied to a real repository and then judged by the project's build/test/lint commands — not by your own confidence.",
     "",
     `## Task\n${input.userMessage}`,
   ];
+
+  const subtask = renderSubtask(input.subtask);
+  if (subtask) parts.push(subtask);
 
   if (input.userAnswers && input.userAnswers.length > 0) {
     parts.push(
@@ -243,6 +255,54 @@ export function buildDraftPrompt(input: {
   parts.push(renderSnapshot(input.snapshot));
   parts.push(`## Output rules\n${PATCH_RULES}`);
   return parts.filter((p) => p.length > 0).join("\n\n");
+}
+
+/**
+ * 이 호출이 맡은 조각 — state-machine 72.2.2절.
+ *
+ * # 왜 범위를 좁힌다고 말해야 하는가
+ *
+ * 분해의 값어치는 조각이 작다는 데 있는데, 모델에게 "전체를 고쳐라"로 읽히면 조각 N개가
+ * 각자 전체를 다시 쓰려 한다. 그러면 분해는 비용만 N배로 늘리고 아무것도 좁히지 않으며,
+ * 같은 워크스페이스를 순차로 고치므로 뒤 조각이 앞 조각을 덮어쓴다.
+ *
+ * # 앞 조각들이 한 일을 함께 말한다
+ *
+ * 순차 실행이므로 이 시점에 워크스페이스는 **이미 바뀌어 있다**(72.16절 ③: 서브태스크는
+ * 순차다). 말하지 않으면 모델은 아직 하지 않은 일로 보고 다시 하려 한다.
+ *
+ * 제목에 괄호를 쓰지 않는다 — 전송 분류 대조가 섹션 이름을 ` (`에서 자른다.
+ */
+function renderSubtask(
+  subtask:
+    | { intent: string; files: string[]; index: number; total: number; planSummary: string; completedIntents: string[] }
+    | undefined
+): string {
+  if (!subtask) return "";
+  const lines = [
+    "## Your subtask from the approved plan",
+    `The user approved this plan: ${subtask.planSummary}`,
+    `It was split into ${subtask.total} subtasks and you are implementing subtask ${subtask.index} of ${subtask.total}.`,
+    "",
+    `**Do only this**: ${subtask.intent}`,
+  ];
+  if (subtask.files.length > 0) {
+    lines.push(`Expected to touch: ${subtask.files.join(", ")} (not binding — the plan may have missed a file).`);
+  }
+  if (subtask.completedIntents.length > 0) {
+    lines.push(
+      "",
+      "Earlier subtasks are ALREADY APPLIED to the repository — the Files section below reflects them:",
+      ...subtask.completedIntents.map((i) => `- ${i}`),
+      "Do not redo them. Do not revert them."
+    );
+  }
+  lines.push(
+    "",
+    "Later subtasks will be implemented after yours, so leave their work alone.",
+    "The build/test/lint verification runs once after ALL subtasks are done, not after yours."
+  );
+  return lines.join("\n");
 }
 
 /**

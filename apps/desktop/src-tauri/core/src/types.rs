@@ -824,3 +824,188 @@ pub struct TaskCounters {
     #[serde(rename = "providerRetries", default)]
     pub provider_retries: BTreeMap<String, u32>,
 }
+
+// ---- 72절 사용자 게이트 ----
+//
+// `standard` 흐름에는 **사용자 게이트가 둘** 있다(state-machine 72.2절): 계획 승인과
+// 검증 체크리스트. 둘 다 승인 이벤트가 `NODE_MAY_NOT_EMIT`이므로(72.4절) **왕복 전체를
+// Rust가 소유한다** — 도구 승인이 그런 것과 같은 자리다(process-architecture 4절).
+//
+// Node가 왕복을 소유하면 장악당한 sidecar가 자기 계획을 스스로 승인하고, 72.12절이 구현
+// 예산 예약을 그 승인에 묶은 뒤로는 **구멍 하나가 둘을 뚫는다.**
+
+/// 계획 승인 카드가 **보여주는 것** — state-machine 72.4절.
+///
+/// *"사용자가 비용을 보고 승인한다"*가 이 절 전체와 product-strategy 13.0.2의 뒤집기를
+/// 떠받치는 문장이므로, **카드가 무엇을 보여주는지가 곧 그 근거의 실체다.**
+///
+/// # 금액이 하나가 아니라 셋이다
+///
+/// 합치면 셋 중 어느 것도 정확히 말하지 못한다(72.4절):
+/// 계량 과금분(추정), 포함된 용량분(환산 불가), 그리고 에스컬레이션 봉투(상한).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanApprovalCard {
+    /// 계획 요약과 단계 — 승인 대상 그 자체.
+    pub summary: String,
+    #[serde(default)]
+    pub steps: Vec<String>,
+    /// **서브태스크 개수와 각 등급.** 개수만 보여주면 왜 그 금액인지 알 수 없다(72.10절).
+    #[serde(default)]
+    pub subtasks: Vec<PlanApprovalSubtask>,
+    /// 계량 과금분의 **추정** 금액. 실측이 아니라는 것을 화면이 말해야 한다.
+    #[serde(rename = "estimatedCostUsd", default)]
+    pub estimated_cost_usd: f64,
+    /// **금액으로 환산되지 않는** 배정들 — 구독에 포함된 경로 등. 0으로 합산하지 않는다.
+    #[serde(rename = "unpricedAssignments", default)]
+    pub unpriced_assignments: Vec<String>,
+    /// 추정을 틀리게 만드는 것들. `EffortLevel`도 여기 들어간다 — **금액에 곱하지 않는다.**
+    #[serde(rename = "estimateCaveats", default)]
+    pub estimate_caveats: Vec<String>,
+    /// 에스컬레이션 봉투 — **같이 승인하는 대상이다**(72.10.2절).
+    pub escalation: EscalationAllowance,
+    /// 배정된 모델과 그 성질 — `unmeasured` 계획자, effort를 무시하는 모델 등(72.4절).
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// 승인 시점의 워크스페이스 지문 (72.5절). 다음 단계에서 다시 찍어 대조한다.
+    #[serde(rename = "workspaceFingerprint", default)]
+    pub workspace_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanApprovalSubtask {
+    #[serde(rename = "subtaskId")]
+    pub subtask_id: String,
+    pub intent: String,
+    /// **계산이 끝난 최종 등급**이다(72.2.2절) — 모델의 제안이 아니라 clamp와 하한선을 지난 값.
+    pub grade: String,
+    /// 하한선이 올렸다면 무엇 때문인가. 비어 있으면 걸리지 않았다.
+    #[serde(rename = "riskSegments", default)]
+    pub risk_segments: Vec<String>,
+}
+
+/// 런타임 에스컬레이션 **봉투** — 72.10.2절.
+///
+/// **제안하는 것은 제품, 정하는 것은 사용자다.** 카드는 계획에서 유도한 값을 제안하고
+/// 사용자가 확인하거나 고친다. 기본 제안값과 **천장**은 둘 다 `TaskPolicy`에 있다 —
+/// 사용자가 정한 값이 유일한 상한이면 원칙 5가 사용자 입력에 의존하게 된다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EscalationAllowance {
+    #[serde(rename = "maxCalls")]
+    pub max_calls: u32,
+    /// 어느 등급까지 올릴 수 있는가.
+    pub grade: String,
+    /// 이 봉투가 쓸 수 있는 금액의 상한. 환산 불가 경로에서는 `None`이다.
+    #[serde(rename = "budgetUsd", default)]
+    pub budget_usd: Option<f64>,
+}
+
+/// 계획 승인 카드의 **선택지 넷** — 72.4절. **기본값이 없다**(사용자가 매번 고른다).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanApprovalChoice {
+    /// 승인 + 독립 검토 → `PLAN_REVIEWING`
+    ApproveWithReview,
+    /// 승인 + 검토 생략 → `IMPLEMENTING`. **생략 사실이 기록되고 체크리스트에 적힌다.**
+    ApproveSkipReview,
+    /// 수정 요청 → `OUTLINING` 재진입 (`planRounds` 안에서)
+    Revise,
+    /// 거부 → `REJECTED`
+    Reject,
+}
+
+/// 검증 체크리스트의 선택지 — 72.8절.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationChoice {
+    /// 승인 → (커밋) → `COMPLETED`
+    Approve,
+    /// 지적한 항목으로 `FIX_LOOP` 재진입 (**`fixLoopRounds` 안에서**)
+    Refix,
+    /// 계획으로 되돌아간다 (**`planRounds` 안에서**). 승인이 무효화된다.
+    Replan,
+    /// 변경을 되돌리고 종료 → **`REJECTED`**. 되돌릴 파일이 **있다**(10절이 낡은 이유).
+    RevertAndStop,
+}
+
+/// 검증 체크리스트 — 72.8절. **17.9절이 이미 계산하던 여집합의 화면**이다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationChecklistCard {
+    #[serde(default)]
+    pub items: Vec<ChecklistItem>,
+    /// C가 없었으면 **그 사실도 적는다** — 짧아진 목록을 그냥 보여주면 사용자는 확인할 것이
+    /// 적다고 읽는다(72.8절).
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// 계획에 없던 파일들 — **판정하지 않고 보여준다**(72.7절). 이 절반은 **모델 없이** 낸다.
+    #[serde(rename = "unplannedPaths", default)]
+    pub unplanned_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChecklistItem {
+    pub text: String,
+    /// `verified` | `flagged_by_review` | `unverified` (72.8절).
+    ///
+    /// **`flagged_by_review`는 확인이 아니라 경고다.** 그리고 C가 "괜찮아 보입니다"라고 한
+    /// 것은 `verified`가 아니라 `unverified`로 남는다 — 17.9절이 정한 확인의 정의는
+    /// **검증 출력에 나타났는가**이고 모델 의견은 거기 해당하지 않는다.
+    pub grade: String,
+    /// `AcceptanceCriterion.source`. 사용자가 자기가 정한 것과 모델이 추측한 것을 구별해야 한다.
+    pub source: String,
+}
+
+/// Node가 Rust에게 **사용자에게 물어 달라고** 요청하는 것.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "gate", rename_all = "snake_case")]
+pub enum UserGateRequest {
+    Plan {
+        #[serde(rename = "taskId")]
+        task_id: String,
+        card: PlanApprovalCard,
+    },
+    Verification {
+        #[serde(rename = "taskId")]
+        task_id: String,
+        card: VerificationChecklistCard,
+    },
+}
+
+impl UserGateRequest {
+    pub fn task_id(&self) -> &str {
+        match self {
+            UserGateRequest::Plan { task_id, .. } | UserGateRequest::Verification { task_id, .. } => task_id,
+        }
+    }
+}
+
+/// 사용자의 답. **무응답은 거부가 아니라 대기다**(72.12절) — 이 열거형에 "시간 초과"가 없는
+/// 것이 그 결정의 구조적 표현이다.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserGateOutcome {
+    Plan(PlanApprovalChoice),
+    Verification(VerificationChoice),
+    /// **물을 사람이 없다** — 무인 실행(Autopilot)이 이 게이트에 닿았다(72.12절).
+    ///
+    /// `Reject`로 뭉개지 않는다. 뭉개면 최종 보고가 "사용자가 거부했다"고 거짓말하는데,
+    /// 사용자는 아무것도 거부한 적이 없다 — 24절이 도구 승인에 대해 정한 것과 같은 규칙이다.
+    /// 그 결과 **Autopilot의 실질 범위가 `simple` 태스크로 좁아진다**: 부작용이 아니라
+    /// 이 흐름의 정의에서 따라 나오는 것이다.
+    Unattended,
+    /// UI에 전달할 수 없었다. 오류이지 사용자의 판정이 아니다.
+    Unavailable(String),
+}
+
+/// 사용자 게이트의 왕복 — **타임아웃이 없다**(72.12절).
+///
+/// `ApprovalGateway`와 나누는 이유가 그 한 줄이다. 도구 승인은 600초 뒤 **거부**로 처리하고
+/// 그게 맞다(낡은 모달이 나중에 통과하면 위험하다). 사용자 게이트에는 맞지 않는다:
+///
+/// - 72.5절은 *"사용자가 계획을 승인하고 **자리를 비운 사이**"*를 명시적으로 전제하고,
+///   그 경우를 위해 지문 만료를 설계했다. 10분 뒤 자동 거부되면 그 설계가 걸릴 일이 없다.
+/// - 72.12절은 그 대기 동안 **구현 예산 예약을 잡아 둔다.** 10분마다 태스크가 거부로 끝나면
+///   예약과 해제가 반복될 뿐이다.
+/// - **거부는 결말이다.** 도구 하나의 거부와 달리 계획 승인의 거부는 태스크를 `REJECTED`로
+///   끝낸다 — 점심 먹으러 간 사이에 작업이 사라지는 것은 사용자가 고른 적 없는 결말이다.
+pub trait UserGateway: Send + Sync {
+    fn request_gate(&self, request: &UserGateRequest) -> UserGateOutcome;
+}

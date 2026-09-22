@@ -8639,6 +8639,27 @@ PlanSubtask = { intent, files, proposedGrade }
 진입하지 않을 뿐이다. 이 구별(쓰이지 않는 것 / 없는 것)을 문서가 말해두지 않으면, 나중에
 누군가 "코드에 있는데 왜 안 도나"를 결함으로 읽는다.
 
+#### 그런데 **가설 게이트가 그 경로를 지금도 잰다**
+
+구현하면서 드러난 것이라 여기 적는다. Protocol v1의 arm C·D가 재는 대상이 바로 이
+`DRAFTING → REVIEWING` 파이프라인이고, 그 판정 기준은 `evals/hypothesis-gate/src/criteria.ts`에
+**해시로 봉인된 사전등록**이다. `standard`를 새 흐름으로 바꾸면 하네스는 아무 표시 없이
+**다른 것을 재게 되는데**, 그건 봉인이 지키는 것을 없애는 일이다.
+
+그래서 축을 하나 만들었다: `ExperimentControls.pipeline = "legacy_cross_verification"`
+(헤드리스 `--pipeline legacy-cross-verification`). 이 값이 켜지면 라우터는 종전 배정을 하고
+(`executor` ×1~2 + `reviewer`) 오케스트레이터는 종전 경로를 탄다.
+
+**이것은 "측정 도구가 production 경로를 그대로 탄다"를 깬다.** 그래서 축을 만들되 그 사실을
+기록에 남긴다 — 이 값으로 돈 태스크는 `appliedPolicies`에 그 사실을 달고 나오고, 그래서
+TRIAGE 캘리브레이션의 관측에서도 빠진다(규칙이 돌지 않았으므로 분모에 넣으면 오분류율이
+실제보다 낮아 보인다). 대안은 둘 다 더 나빴다:
+
+- 하네스를 그대로 두면 **사전등록이 무의미해진다.**
+- 72절을 하네스에 맞춰 미루면 **제품이 측정 도구에 인질이 된다.**
+
+**새 흐름을 재려면 새 프로토콜이 필요하다** — 같은 봉인 아래에서 대상을 바꾸지 않는다.
+
 ### 72.4 승인이 검토보다 먼저다 — 두 승인이 **다른 질문**에 답하기 때문이다
 
 순서가 뒤집혀 보이지만 그렇지 않다. product-strategy 16절의 권한 관할이 그대로 적용된다.
@@ -9483,18 +9504,18 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | multi-engine 10절 | "planner/executor 분리 실행" 미채택 | 취소선 |
 | multi-engine 13.4절 | 호출 수 표, 대조의 대상 | 취소선 + 전후 대조 |
 | [ui-wireframes 2절](./ui-wireframes.md) | 5단계 매핑이 `standard`를 못 덮음 | 주석 + 정본 이관 |
-| ui-wireframes 3절 화면 인벤토리 | 계획 승인·검증 체크리스트 화면, 그리고 **`PerformanceProfile`·`EffortLevel`을 고르는 자리**(시작 화면의 실행 정책 옆)가 목록에 없다 | **아직 안 함** — 화면을 그릴 때 함께 |
-| [product-strategy 8.2절](./product-strategy.md) Autopilot 행 | 72.12절이 "제품 설명이 그렇게 바뀌어야 한다"고 적었다 | **아직 안 함** — 마커가 붙는 행이라 구현 뒤에 |
+| [ui-wireframes 3절](./ui-wireframes.md) 화면 인벤토리 | 계획 승인·검증 체크리스트 화면, 그리고 **`PerformanceProfile`·`EffortLevel`을 고르는 자리**(시작 화면의 실행 정책 옆) | **갱신했다** — 3.27·3.28절과 3.11절 |
+| [product-strategy 8.2절](./product-strategy.md) Autopilot 행 | 72.12절이 "제품 설명이 그렇게 바뀌어야 한다"고 적었다 | **갱신했다** — 실질 범위가 `simple`로 좁아진다 |
 | product-strategy 5절 `public API 변경` 항목 | "Tree-sitter가 아직 없고" | 취소선 + 후속 링크 |
 | `packages/sidecar/src/triage.ts` 주석 | 같은 문장이 코드에 남아 있었다 | **고쳤다**(문서만 고치면 다음 사람은 주석을 읽는다) |
 | [product-strategy 13.0.1·13.0.2](./product-strategy.md) | 게이트 결론 인용문, 보류 두 항목 | 취소선 + 근거 |
 | multi-engine 21.4절 레지스트리 키 | `modelId` 단일 키 → **경로 키**(같은 모델에 HTTP·CLI 둘) | 21.7절에 근거, 21.4절에 규칙 |
-| multi-engine 10.5절 출력 토큰 상한 | 상한 계산에 `EffortLevel`이 들어갈 **자리**가 필요하다(해당 공급자가 있는지는 **미확인** — 21.4절) | **아직 안 함** |
-| multi-engine 14절 적합성 스위트 | effort 파라미터 수용 + **추론 토큰 보고** 두 항목 | **아직 안 함** — 21.4절이 요구만 적었다 |
+| [multi-engine 10.5절](./multi-engine-routing.md) 출력 토큰 상한 | 상한 계산에 `EffortLevel`이 들어갈 **자리**가 필요하다(해당 공급자가 있는지는 **미확인** — 21.4절) | **자리를 적었다** — 값은 적지 않았다 |
+| [multi-engine 14절](./multi-engine-routing.md) 적합성 스위트 | effort 파라미터 수용 + **추론 토큰 보고** 두 항목 | **갱신했다** |
 | multi-engine 15.3절 co-executor 지정 금지 | 대조가 계획으로 옮겨가 **co-planner**에 걸린다. `simple`·`fast`에 남는 co-executor는 **없다** | 취소선 + 대상 교체 + 자기정정 |
 | 72.14절 계측 표 | 에스컬레이션 행(요청/호출/거절 셋을 센다) | 갱신 |
-| `apps/desktop/src-tauri/core/src/metrics.rs` | **태스크 결말 집계가 없다** — `CANCELLED`/`REJECTED`를 가르지 못한다(2절). 게이트가 둘이 되면서 "사용자가 그만둔 방식"이 처음 의미를 갖는다 | **아직 안 함** — 72.14 계측과 함께 |
-| **카운터 집합의 사본이 셋** | `TaskCounters`/`TaskLoopLimits`가 TS↔Rust로 갈려 있고(`mcpRounds`·`contextRounds`가 TS에만), **문서 9절의 `TaskState.counters` 블록이 세 번째 사본**이다. 새 카운터는 셋 모두에 더해야 하고 지금 갈린 것도 그때 맞춘다 — 쓰기 경로가 payload를 그대로 넣어서 이 불일치가 오류 없이 지나간다(2.2절) | 9절 블록에 **주석 달았다** / 타입 둘은 **아직 안 함** |
+| `apps/desktop/src-tauri/core/src/metrics.rs` | **태스크 결말 집계가 없다** — `CANCELLED`/`REJECTED`를 가르지 못한다(2절) | **고쳤다** — `taskOutcomes`·`escalations`·`stagedReviews` 셋을 더하고 각각에 열린 질문을 붙였다 |
+| **카운터 집합의 사본이 셋** | `TaskCounters`/`TaskLoopLimits`가 TS↔Rust로 갈려 있고, **문서 9절의 `TaskState.counters` 블록이 세 번째 사본**이다 | **셋 모두 맞췄다**(단계 C) |
 | [ui-wireframes 3절 결말 화면](./ui-wireframes.md) | `FAILED`/`CANCELLED`만 되돌리기를 노출하던 규칙이 10절과 함께 바뀐다 — 그 줄이 *"10절 원칙 그대로"*라고 인용하고 있었다 | 갱신 |
 | 7절 `file_mutations` DDL | `task_id`·`rollback_status`·`rolled_back_at`·`mutation_id`·`*_sha256`·`recorded_at`이 코드에만 있었다 | **고쳤다** |
 | 7절 롤백 알고리즘 한 줄 | `path`별 ~~최신~~ → **최초** `pre_image`, 조인하지 않는다 | 취소선 + 근거(구현 주석) |
@@ -9502,6 +9523,18 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
 | 2.2절 표의 완결성 | 표에 없는 상한 셋(`providerRetries`·`mcpRounds`·`contextRounds`)이 "상한이 없다"로 읽혔다 | **범위를 좁혔다** — 싣는 규칙("여기서 값을 정하는 것만")과 나머지가 어디 있는지를 표 아래 적었다. 값을 옮겨 적지는 **않았다** |
 | [product-strategy 8.6절](./product-strategy.md) 호출 수 | "실행자 2 + 검수자 1 = 3"과 "verified는 실행자를 하나 더 부른다" | 취소선 + 근거 |
 | [ui-wireframes 3.11절](./ui-wireframes.md) | 같은 문장이 화면 쪽에도 있었다 | 취소선 + 근거 |
+
+**구현하면서 이 표에 더해진 줄** — "새 자리를 발견하면 고치는 것으로 끝내지 말고 줄을 더할 것":
+
+| 정본 | 무엇이 바뀌었나 | 상태 |
+|---|---|---|
+| `packages/protocol/src/gate.ts` (신규) | 게이트 카드 둘의 타입. **Rust `types.rs`가 정본이고 이것이 사본**이다 — 왕복 전체를 Rust가 소유하므로(72.4절) Node에는 기록 경로가 없다 | **만들었다** |
+| `packages/protocol/src/ipc.ts` `ExperimentControls` | `pipeline` 축 — 가설 게이트가 **물러난 파이프라인**을 명시하게 한다(72.3절) | **더했다** |
+| `packages/sidecar/src/orchestrator/machine.ts` | `AWAITING_PLAN_APPROVAL → AWAITING_PLAN_APPROVAL` 자기 전이. 상한을 다 쓴 뒤 같은 카드를 다시 묻는 자리이고, **진행바가 뒤로 가지 않는다**(머무는 것은 지나는 것이 아니다) | **더했다** |
+| `packages/sidecar/src/providers/prompts.ts` + `core/src/transmission.rs` | 구현 모델에게 **맡은 조각**을 말하는 섹션. 프롬프트에 실리는 것은 전부 공급자로 나가므로 분류가 함께 움직인다 | **더했다**(UNREPORTED) |
+| `apps/desktop/src/types.ts` `FleetMemberStatus` | `kind`·`complexityTier`를 싣는다 — 구성원은 **평범한 태스크**이므로 화면마다 다른 매핑을 쓰면 그 구조적 사실이 화면에서 거짓이 된다 | **더했다** |
+| `core/src/fleet.rs` `FLEET_ENROLLED` payload | 같은 이유로 `kind`를 값으로 적는다. 추측하지 않는다 | **더했다** |
+| **72.12절의 Fleet 쪽 절반** | 태스크 원장의 단계 예약은 구현했고, **합계 예약의 분할은 아직이다** | **아직 안 함** — 72.16절에 근거와 함께 |
 
 **아직 바꾸지 않았고, 구현 시점에 반드시 함께 바꿔야 하는 것:**
 
@@ -9630,3 +9663,16 @@ append-only이고 phase는 저장되므로, **나중에 뜻이 바뀐 phase는 �
   등급(`grade`) 다음이다 — 등급이 없으면 effort 차이와 모델 차이가 섞인다.
 - **product-strategy 13절 로드맵이 이 흐름을 반영해야 한다.** 그 문서가 로드맵의 정본이고,
   이 절은 거기 없던 항목이다.
+- **Fleet 합계 예산의 단계 분할이 아직 없다.** 72.12절이 정한 "예약을 단계로 나눈다"는
+  태스크 원장에서 구현됐다(`TaskBudget.reserveStage` — 승인 시점에 금액을 확인하고, 승인으로
+  되돌아가면 닫고 다시 연다). **그런데 72.12절이 이 답을 꺼낸 자리는 Fleet의 합계 예약이었다**:
+  `FleetBudget::try_admit`이 지금도 구성원 입장 시점에 태스크당 몫 **전부**를 잡으므로, 구성원이
+  사람을 기다리는 동안 그 금액이 잠긴 채로 있다.
+  나누려면 구성원 스레드가 `PLAN_APPROVED`를 스케줄러에 알려야 하고, 그 신호를 넣는 자리가
+  session.rs와 `bin/host.rs` 두 곳의 스케줄링 루프다. **두 곳을 다르게 고치면 화면과 헤드리스의
+  예산이 갈린다** — 한 번에, 그리고 그 루프를 실제로 돌려볼 수 있을 때 한다.
+- **`unmeasured` 등급의 모델만 있을 때 등급별 배정이 무엇을 하는가.** 지금은 해당 등급의
+  모델이 없으면 기본 구현 모델로 내려가고 그 사실을 이벤트로 남긴다. 실제 공급자는 측정
+  전까지 전부 `unmeasured`이므로(21.8절) **이 경로가 당분간 기본 경로다** — 즉 승인 카드가
+  보여준 등급과 실제로 부른 모델이 거의 언제나 다르다. 측정이 붙기 전까지는 카드가 그
+  사실을 더 크게 말해야 하는지가 열린 질문이다.

@@ -233,6 +233,11 @@ pub struct FleetMemberRow {
     pub worktree_path: Option<String>,
     pub workspace_path: Option<String>,
     pub phase: String,
+    /// 구성원이 도는 경로의 종류 — `FLEET_ENROLLED` 페이로드에서 온다(72.2.3절).
+    /// 그 키가 생기기 전의 기록에는 없으므로 `change`로 읽는다.
+    pub kind: String,
+    /// TRIAGE의 판정 — `TRIAGE_COMPLETED`에서 온다. **`None`은 "아직 판정 전"이다.**
+    pub complexity_tier: Option<String>,
     pub final_status: Option<String>,
     pub created_at: String,
 }
@@ -1279,8 +1284,15 @@ impl Store {
     ///
     /// `FLEET_ENROLLED`는 `NODE_MAY_NOT_EMIT`에 있으므로 sidecar가 이 집합에 자기를 넣을 수 없다.
     pub fn fleet_members(&self, fleet_id: Option<&str>) -> Result<Vec<FleetMemberRow>> {
+        // **tier는 이벤트에서 온다.** `tasks`에 컬럼이 없고, 만들 이유도 없다 —
+        // `TRIAGE_COMPLETED`가 진실의 원천이고 이건 조회일 뿐이다(원칙 7).
+        // 상관 서브쿼리로 붙이면 구성원마다 한 번씩 도는 N+1이 되지 않는다.
         let mut stmt = self.conn.prepare(
-            "SELECT e.task_id, e.payload_json, t.phase, t.final_status, t.workspace_path, t.created_at
+            "SELECT e.task_id, e.payload_json, t.phase, t.final_status, t.workspace_path, t.created_at,
+                    (SELECT json_extract(te.payload_json, '$.complexityTier')
+                       FROM task_events te
+                      WHERE te.task_id = e.task_id AND te.event_type = 'TRIAGE_COMPLETED'
+                      ORDER BY te.event_id DESC LIMIT 1)
              FROM task_events e JOIN tasks t ON t.task_id = e.task_id
              WHERE e.event_type = 'FLEET_ENROLLED'
              ORDER BY e.event_id",
@@ -1294,11 +1306,12 @@ impl Store {
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (task_id, payload, phase, final_status, workspace_path, created_at) = row?;
+            let (task_id, payload, phase, final_status, workspace_path, created_at, complexity_tier) = row?;
             let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
             let id = payload.get("fleetId").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if let Some(wanted) = fleet_id {
@@ -1308,6 +1321,14 @@ impl Store {
             }
             out.push(FleetMemberRow {
                 fleet_id: id,
+                // **키가 없으면 `change`다.** 이 키가 생기기 전의 기록이 그렇고, Fleet에는
+                // 변경 말고 다른 종류를 넣는 입구가 없다(`fleet::Enrollment::payload`).
+                kind: payload
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("change")
+                    .to_string(),
+                complexity_tier,
                 task_id,
                 branch: payload.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 member_index: payload.get("memberIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize,

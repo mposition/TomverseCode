@@ -284,7 +284,11 @@ function FleetOutcome({
                 배지의 "미시작 1"과 줄의 `not_started`가 같은 것으로 읽히지 않는다.
                 단계는 도는 동안에만 뜻이 있다 — 끝난 구성원의 phase는 결말과 같은 말이다. */}
             — {outcomeLabel(member.status)}
-            {member.status === "running" ? ` · ${phaseToStage(member.phase as TaskPhase)}` : ""} · $
+            {member.status === "running"
+              ? // **메인 화면과 같은 매핑을 쓴다**(72.2.3절). 구성원은 평범한 태스크이므로
+                // 같은 phase가 두 화면에서 다르게 읽히면 안 된다.
+                ` · ${phaseToStage(member.phase as TaskPhase, member.kind, member.complexityTier)}`
+              : ""} · $
             {member.costUsd.toFixed(4)}
             {member.status === "running" && (
               <button

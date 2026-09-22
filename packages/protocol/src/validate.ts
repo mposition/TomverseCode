@@ -140,8 +140,30 @@ export function validateDraftProposal(
     mcpCalls: validateMcpCalls(o.mcpCalls),
     moves: validateMoves(o.moves, "draftProposal.moves"),
     deletions: validateDeletions(o.deletions, "draftProposal.deletions"),
+    escalationRequest: validateEscalationRequest(o.escalationRequest),
     model: ctx.model,
     createdAt: ctx.createdAt,
+  };
+}
+
+/**
+ * 구현 모델의 에스컬레이션 요청 — state-machine 72.10.2절.
+ *
+ * **형태가 틀리면 버리지 않고 오류로 만든다**(`mcpCalls`와 같은 이유). 조용히 버리면 모델이
+ * 요청했다는 사실이 사라지고, 72.14절의 계측이 "요청 수"를 셀 수 없게 된다 — 남발이
+ * 상한에 가려 보이지 않는 바로 그 상태다.
+ *
+ * `proposedGrade`는 `PlanSubtask`와 **같은 규칙**으로 읽는다: 모르는 값은 `unmeasured`다.
+ * `economy`로 접지 않는 이유는 21.4절에 있다 — 싸다는 것은 가격에 대한 사실이고 등급은
+ * 품질에 대한 사실이다.
+ */
+function validateEscalationRequest(raw: unknown): DraftProposal["escalationRequest"] {
+  if (raw === undefined || raw === null) return undefined;
+  const o = requireObject(raw, "draftProposal.escalationRequest");
+  const grade = o.proposedGrade;
+  return {
+    reason: requireNonEmptyString(o.reason, "draftProposal.escalationRequest.reason"),
+    proposedGrade: grade === "economy" || grade === "frontier" ? grade : "unmeasured",
   };
 }
 

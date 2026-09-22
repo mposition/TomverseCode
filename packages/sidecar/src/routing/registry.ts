@@ -202,6 +202,19 @@ export const BUILTIN_MODELS: ModelEntry[] = [
    * (multi-engine-routing.md 13.3절). 셋이면 "완전 독립 배정"과 "절충 배정"을 둘 다 실제로
    * 돌려볼 수 있다. 실제 배정은 `availableProviders`가 결정하므로, 세 번째가 있다고 해서
    * 자격증명이 둘뿐인 사용자의 경로가 바뀌지는 않는다.
+   *
+   * # 이 셋에는 `grade`가 붙어 있다 — **측정값이 아니다**
+   *
+   * 21.4절은 "등급은 측정으로만 붙는다"고 정했고 그 규칙은 **실제 공급자**에 대한 것이다.
+   * fake는 모델이 아니라 하네스이므로 잴 능력이 없고, 그래서 여기 적힌 값은 능력에 대한
+   * 주장이 아니라 **고정된 fixture 값**이다.
+   *
+   * 비워 두지 않는 이유는 위 문단이 적은 것 그대로다: fake를 둔 목적이 "불변식을 실제로
+   * 테스트할 수 있게" 하는 것인데, 21.6절이 `unmeasured`를 A·B·C 기본 배정에서 막으므로
+   * 전부 `unmeasured`로 두면 **계획 검토·결과 검토 경로를 아무도 태워볼 수 없다.**
+   * 라우터가 fake를 특별 취급하게 만드는 것(그쪽이 더 나쁘다)을 피하는 유일한 길이다.
+   *
+   * 실제 공급자가 측정 없이 등급을 얻는 것은 `registryAxes.test.ts`가 막는다.
    */
   {
     modelId: "fake-executor",
@@ -220,7 +233,8 @@ export const BUILTIN_MODELS: ModelEntry[] = [
     economics: { inputPerMTok: 0, outputPerMTok: 0, pricingAsOf: PRICING_AS_OF },
     availability: { requiresOrgVerification: false },
     // 21.4절: 등급 초기값은 전부 `unmeasured`다 — 측정으로만 붙는다.
-    grade: "unmeasured",
+    // 하네스 fixture의 등급 — 아래 머리말 참조. 측정값이 아니다.
+    grade: "economy",
     accounting: "metered",
     // 21.9절: 공급자별 파라미터 이름·단위·허용값을 아직 확인하지 않았다.
     effort: { kind: "none" },
@@ -242,7 +256,8 @@ export const BUILTIN_MODELS: ModelEntry[] = [
     economics: { inputPerMTok: 0, outputPerMTok: 0, pricingAsOf: PRICING_AS_OF },
     availability: { requiresOrgVerification: false },
     // 21.4절: 등급 초기값은 전부 `unmeasured`다 — 측정으로만 붙는다.
-    grade: "unmeasured",
+    // 하네스 fixture의 등급 — 아래 머리말 참조. 측정값이 아니다.
+    grade: "frontier",
     accounting: "metered",
     // 21.9절: 공급자별 파라미터 이름·단위·허용값을 아직 확인하지 않았다.
     effort: { kind: "none" },
@@ -268,7 +283,8 @@ export const BUILTIN_MODELS: ModelEntry[] = [
     economics: { inputPerMTok: 0, outputPerMTok: 0, pricingAsOf: PRICING_AS_OF },
     availability: { requiresOrgVerification: false },
     // 21.4절: 등급 초기값은 전부 `unmeasured`다 — 측정으로만 붙는다.
-    grade: "unmeasured",
+    // 하네스 fixture의 등급 — 아래 머리말 참조. 측정값이 아니다.
+    grade: "frontier",
     accounting: "metered",
     // 21.9절: 공급자별 파라미터 이름·단위·허용값을 아직 확인하지 않았다.
     effort: { kind: "none" },

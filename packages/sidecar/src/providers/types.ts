@@ -79,6 +79,26 @@ export interface DraftInput {
   forExecution?: boolean;
   /** `forExecution`일 때 계획이 만들 수 있는 서브태스크 수 (`TaskLoopLimits.maxSubtasks`). */
   maxSubtasks?: number;
+  /**
+   * `generateDraft` 전용 — **이 호출이 맡은 서브태스크** (state-machine 72.2.2절).
+   *
+   * `IMPLEMENTING`은 계획 전체가 아니라 조각 하나를 구현한다. 이걸 주지 않으면 모델은
+   * 매번 태스크 전체를 다시 구현하려 하고, 그러면 분해가 비용만 늘리고 아무것도 좁히지
+   * 않는다.
+   *
+   * **승인된 계획을 함께 싣는다.** 조각만 주면 모델이 전체 맥락 없이 일하게 되는데, 이
+   * 경로에서 기준을 정한 것은 사용자가 승인한 그 계획이다(`plan_outline`).
+   */
+  subtask?: {
+    intent: string;
+    files: string[];
+    /** 1부터. `index/total`을 함께 주는 이유는 모델이 "앞 조각이 이미 됐다"를 알아야 하기 때문이다. */
+    index: number;
+    total: number;
+    planSummary: string;
+    /** 앞선 조각들이 무엇을 했는가 — 같은 워크스페이스를 순차로 고치므로 겹치면 충돌한다. */
+    completedIntents: string[];
+  };
 }
 
 export interface ReviewInput {

@@ -80,6 +80,21 @@ interface RunOptions {
   mcpServers?: string[];
   /** 서버별 도구 허용목록 — `이름=도구1[,도구2...]` (state-machine 32절). */
   mcpTools?: string[];
+  /**
+   * **물러난 교차검증 파이프라인**(`DRAFTING → REVIEWING`)을 고정한다 — 72.3절.
+   *
+   * `mode: "verified"`만으로는 더 이상 그 경로를 태울 수 없다(72.9절: 모드가 tier를 정하지
+   * 않는다). 그 경로의 동작을 실제 호스트에서 지키려면 여기서 명시해야 한다.
+   */
+  legacyPipeline?: boolean;
+  /**
+   * 대조(계획자 ×2 / 물러난 경로에서는 실행자 ×2)를 **명시적으로** 켠다.
+   *
+   * `experiment`가 하나라도 지정되면 대조는 기본이 꺼짐이다(하네스가 arm을 고정하기 위한
+   * 규칙). 그래서 `legacyPipeline`을 주는 순간 대조도 함께 꺼지므로, 그 경로를 태우려면
+   * 여기서 다시 켜야 한다 — **끄는 입구는 없다**(끄는 것이 이미 기본값이다).
+   */
+  contrast?: boolean;
 }
 
 function hostAvailable(): boolean {
@@ -117,6 +132,8 @@ function runHost(repo: FixtureRepo, stateDir: string, options: RunOptions = {}):
     "--timeout-secs",
     String(options.timeoutSecs ?? 180),
   ];
+  if (options.legacyPipeline) args.push("--pipeline", "legacy-cross-verification");
+  if (options.contrast) args.push("--contrast");
   if (options.worktree) args.push("--worktree", options.worktree);
   for (const hook of options.hooks ?? []) args.push("--hook", hook);
   if (options.skill) args.push("--skill", options.skill);
@@ -521,9 +538,18 @@ test("롤백이 태스크가 바꾼 파일만 원래 내용으로 되돌린다",
   });
 });
 
-test("verified 모드는 교차검증 경로(REVIEWING)를 지난다", () => {
+/**
+ * **물러난 파이프라인을 실제 호스트에서 지킨다** — 72.3절.
+ *
+ * 72절이 `standard`를 새 흐름으로 바꿨지만 그 phase와 타입은 지우지 않았고, **가설 게이트
+ * Protocol v1의 arm C·D가 지금도 이 경로를 잰다.** 검사가 사라지면 그 경로는 아무도 지키지
+ * 않게 되고, 하네스는 깨진 것을 유료 실행에서야 알게 된다.
+ *
+ * `mode: "verified"`만으로는 이 경로에 닿지 않는다 — 모드는 더 이상 tier를 정하지 않는다.
+ */
+test("물러난 교차검증 경로(REVIEWING)를 명시하면 실제 호스트가 그 경로를 지난다", () => {
   withRepo((repo, stateDir) => {
-    const run = runHost(repo, stateDir, { mode: "verified" });
+    const run = runHost(repo, stateDir, { mode: "verified", legacyPipeline: true, contrast: true });
     assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
     // fake-a(executor)와 fake-b(reviewer)가 다른 공급자이므로 독립성 불변식이 만족된다.
     assert.ok(run.eventTypes.includes("REVIEW_RECEIVED"), `검수 단계가 실행되지 않았습니다: ${run.eventTypes.join(", ")}`);
@@ -611,7 +637,9 @@ test("확정된 기준이 있으면 검증 뒤에 기준별 판정이 계산된�
         doneCriteria: ["1페이지가 첫 항목부터 나온다 (paginate.test.js)", "오류 메시지를 한국어로 표시한다"],
       },
     };
-    const run = runHost(repo, stateDir, { mode: "verified", script: [draft, draft] });
+    // 이 검사의 대상은 **기준 판정**이고, 기준을 초안에서 흡수하는 것은 물러난 경로다
+    // (새 흐름에서는 승인한 계획이 기준을 낸다 — 72.2.1절). 경로를 명시한다.
+    const run = runHost(repo, stateDir, { mode: "verified", legacyPipeline: true, script: [draft, draft] });
     assert.equal(run.final.status, "completed", `${run.final.summary}\n${run.stderr}`);
     assert.ok(run.eventTypes.includes("CRITERIA_EVALUATED"), run.eventTypes.join(", "));
 
@@ -1209,7 +1237,9 @@ test("스킬 파일의 알 수 없는 도구 이름은 실행 전에 거절된�
 test("세션을 이어도 모델 제안은 다음 태스크로 넘어가지 않는다", () => {
   withRepo((repo, stateDir) => {
     const session = "sess-e2e-memory";
-    const first = runHost(repo, stateDir, { mode: "verified", session });
+    // 이 검사의 대상은 **모델 제안 기준**(`draft_proposal`)이고, 그 생산자는 물러난
+    // 경로다 — 새 흐름에서는 승인한 계획이 기준을 낸다(72.2.1절).
+    const first = runHost(repo, stateDir, { mode: "verified", legacyPipeline: true, session });
     // 첫 태스크가 **모델 제안 기준을 실제로 만들었는지** 먼저 확인한다. 안 만들었으면
     // 아래 단언은 "나를 것이 없어서" 통과하고, 아무것도 검증하지 않는다.
     const proposals = (first.final.acceptanceCriteria ?? []).filter((c) => c.source !== "user_decision");
@@ -1334,9 +1364,11 @@ test("등록한 MCP 서버의 도구를 모델이 알고, 요청하면 실행되
       mcpCalls: [{ server: "echo", tool: "echo", arguments: { probe: "MCP_E2E_MARKER" }, reason: "확인이 필요하다" }],
     };
     const run = runHost(repo, stateDir, {
-      // **교차검증 경로로 고정한다.** `fast`는 TRIAGE가 단일 모델로 보낼 수 있고, 그러면
-      // 이 시나리오가 무엇을 태웠는지가 실행마다 달라진다.
+      // **경로를 고정한다.** TRIAGE가 단일 모델로 보내면 이 시나리오가 무엇을 태웠는지가
+      // 실행마다 달라진다. **모드로는 더 이상 고정되지 않는다**(72.9절) — 이 검사의 대상은
+      // 초안이 도구를 요청하는 왕복이므로 그 경로를 명시한다.
       mode: "verified",
+      legacyPipeline: true,
       mcpServers: [`echo=node,${ECHO_SERVER},${path.join(stateDir, "mcp-spawned")}`],
       // 첫 초안만 도구를 요청한다. 두 번째 초안이 실제 patch를 낸다.
       script: [
@@ -1426,6 +1458,8 @@ test("허용목록 밖의 MCP 도구는 게이트가 막는다 — 승인을 물
     };
     const run = runHost(repo, stateDir, {
       mode: "verified",
+      // 위 검사와 같은 이유로 경로를 명시한다(72.9절: 모드는 tier를 정하지 않는다).
+      legacyPipeline: true,
       mcpServers: [`echo=node,${path.join(REPO_ROOT, "apps", "desktop", "src-tauri", "core", "examples", "fixtures", "echo-server.js")}`],
       // 서버가 내놓는 것은 `echo` 하나인데, 허용한 것은 다른 이름이다.
       mcpTools: ["echo=onlythis"],
@@ -1501,7 +1535,8 @@ test("허용목록 밖의 MCP 도구는 게이트가 막는다 — 승인을 물
 test("모델이 낸 기준은 목록에 없고, 가리켜도 거두지 못한다", () => {
   withRepo((repo, stateDir) => {
     const session = "sess-e2e-withdraw";
-    const run = runHost(repo, stateDir, { mode: "verified", session });
+    // 같은 이유로 경로를 명시한다 — "모델이 낸 기준"의 생산자가 물러난 경로다(72.2.1절).
+    const run = runHost(repo, stateDir, { mode: "verified", legacyPipeline: true, session });
     const proposals = (run.final.acceptanceCriteria ?? []).filter((c) => c.source !== "user_decision");
     assert.ok(
       proposals.length > 0,

@@ -205,6 +205,10 @@ pub const UNREPORTED_SECTIONS: &[&str] = &[
     // 붙고, 그 사유에는 **경로가 들어갈 수 있다**(경계 위반이면 그 경로가 문장에 있다).
     // 그래서 우리 지시문으로 접지 않고 여기 둔다.
     "Your previous plan was refused by the policy gate before anything ran",
+    // 구현 모델이 맡은 조각(state-machine 72.2.2절). **우리 지시문으로 접지 않는다** —
+    // 실리는 것은 계획 모델이 워크스페이스를 읽고 쓴 문장과 **경로 목록**이고, 그 경로는
+    // 사용자 저장소의 것이다. 위 칸의 게이트 거부 사유와 같은 가족이다.
+    "Your subtask from the approved plan",
 ];
 
 #[derive(Debug, Clone, Default, serde::Serialize)]

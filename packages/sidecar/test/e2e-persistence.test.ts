@@ -977,11 +977,19 @@ test("[시나리오 D] 저장된 이벤트에서 기준 계측을 집계할 수 
   // Rust 단위 테스트는 직접 넣은 이벤트를 세지만, 여기서는 실제 실행이 남긴 이벤트를 센다.
   requireArtifacts();
   await withCtx({}, (ctx) => {
-    const result = spawnSync(HOST_BIN, runArgs(ctx, ["--mode", "verified", "--timeout-secs", "180"]), {
-      encoding: "utf8",
-      timeout: 210_000,
-      env: hostEnv(),
-    });
+    // **경로를 명시한다**(state-machine 72.3절). 이 검사가 기대는 것은 *"교차검증 경로의
+    // 초안이 `doneCriteria`를 낸다"*이고 그 생산자는 물러난 경로다 — 72절 흐름에서는 승인한
+    // 계획이 기준을 낸다(72.2.1절). **모드로는 더 이상 고정되지 않는다**(72.9절): 모드가
+    // tier를 정하지 않으므로 TRIAGE가 이 fixture를 `simple`로 보내면 기준이 아예 없다.
+    const result = spawnSync(
+      HOST_BIN,
+      runArgs(ctx, ["--mode", "verified", "--pipeline", "legacy-cross-verification", "--timeout-secs", "180"]),
+      {
+        encoding: "utf8",
+        timeout: 210_000,
+        env: hostEnv(),
+      }
+    );
     const line = (result.stdout ?? "").trim().split("\n").filter(Boolean).pop();
     assert.ok(line, `결과 JSON이 없습니다:\n${result.stdout}\n${result.stderr}`);
     const run = JSON.parse(line) as { final: { status: string } };

@@ -1177,6 +1177,91 @@ pub fn contrast_outcome(events: &[crate::store::StoredEvent]) -> ContrastOutcome
     ContrastOutcome::Won { models: pair, winner }
 }
 
+/**
+ * **태스크가 어떻게 끝났는가** — state-machine 72.14절.
+ *
+ * 게이트가 둘이 되면서 *"사용자가 그만둔 방식"*이 처음 의미를 갖는다. 종전 집계는
+ * `CANCELLED`와 `REJECTED`를 가르지 못했는데, 이 흐름에서 둘은 **완전히 다른 사실**이다:
+ * 취소는 사용자가 기다리기를 그만둔 것이고, 거부는 **결과를 보고 아니라고 한 것**이다.
+ * 뭉개면 "계획 승인에서 거부된 태스크가 몇인가"에 답할 수 없고, 그건 이 흐름이 값을
+ * 하는지 묻는 질문의 절반이다.
+ */
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TaskOutcomes {
+    /// 터미널 상태별 태스크 수. 아직 끝나지 않은 태스크는 `running`으로 들어간다.
+    #[serde(rename = "byStatus")]
+    pub by_status: BTreeMap<String, u64>,
+    /// **어느 게이트에서 거부됐는가.** `plan` | `verification`.
+    ///
+    /// 거부가 계획 단계에서 일어나면 코드를 쓰기 전이고(싸다), 검증 단계에서 일어나면
+    /// 이미 돈을 다 쓴 뒤다 — 같은 `REJECTED`인데 대가가 다르다.
+    #[serde(rename = "rejectedAtGate")]
+    pub rejected_at_gate: BTreeMap<String, u64>,
+    /// 무인 실행이 게이트에 닿아 멈춘 횟수. **거부가 아니다**(24절).
+    #[serde(rename = "unattendedStops")]
+    pub unattended_stops: u64,
+}
+
+/**
+ * 런타임 에스컬레이션 — 72.10.2·72.14절. **분모가 셋이라는 점이 중요하다.**
+ *
+ * 거절된 요청을 세지 않으면 "요청 수"가 곧 "부른 수"가 되어 **남발이 상한에 가려 보이지
+ * 않는다.** 모델 입장에서 "더 센 모델에게 물어보자"는 언제나 안전한 선택이고(틀릴 위험이
+ * 줄고 비용은 자기가 내지 않는다), 봉투가 그 남발을 상한으로 막지만 **얼마나 요청했는지와
+ * 그게 결과를 바꿨는지**는 따로 세야 한다.
+ */
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Escalations {
+    /// 구현 모델이 **요청한** 수 = 아래 둘의 합.
+    pub requested: u64,
+    /// 그중 봉투 안이어서 **부른** 수.
+    pub called: u64,
+    /// 봉투를 넘어 **거절한** 수.
+    pub rejected: u64,
+    /// 부른 것이 **결과를 바꿨는가.** 요청이 늘 봉투를 채우는데 결과가 달라진 적이 없으면
+    /// 그건 신호가 아니라 습관이다.
+    #[serde(rename = "calledThatChangedThePatch")]
+    pub called_that_changed_the_patch: u64,
+}
+
+/**
+ * B·C가 무엇을 했는가 — 72.14절.
+ *
+ * 게이트가 남긴 가장 아픈 숫자("실패한 초안 67건 중 61건에서 아무것도 바꾸지 못했다")를
+ * **되물을 수 있는 모양**이어야 한다. 그래서 "돌았는가"와 "바꿨는가"를 따로 센다 —
+ * 돈 횟수만 세면 무력한 단계도 활발해 보인다.
+ */
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct StagedReviews {
+    /// B가 **실제로 돈** 태스크 수. 드롭·생략은 아래에서 따로 센다.
+    #[serde(rename = "planReviewsRan")]
+    pub plan_reviews_ran: u64,
+    /// B가 쟁점을 올린 태스크 수.
+    #[serde(rename = "planReviewsWithIssues")]
+    pub plan_reviews_with_issues: u64,
+    /// B가 돌지 못한 사유별 수 (`plan_review_dropped:…` / `plan_unchanged` 등).
+    ///
+    /// **"돌지 않았다"와 "쟁점이 없었다"를 구별한다.** 뭉개면 드롭이 많은 설정에서
+    /// "계획이 건전하다"로 읽힌다.
+    #[serde(rename = "planReviewsNotRun")]
+    pub plan_reviews_not_run: BTreeMap<String, u64>,
+    /// C가 **실제로 돈** 태스크 수.
+    #[serde(rename = "resultReviewsRan")]
+    pub result_reviews_ran: u64,
+    /// C가 올린 항목 수의 합.
+    #[serde(rename = "resultReviewItemsRaised")]
+    pub result_review_items_raised: u64,
+    /// C가 돌지 못한 사유별 수.
+    #[serde(rename = "resultReviewsNotRun")]
+    pub result_reviews_not_run: BTreeMap<String, u64>,
+    /// 계획 **대조**가 돈 태스크 수 (72.9절). 초안 대조와 따로 센다.
+    #[serde(rename = "planContrastTasks")]
+    pub plan_contrast_tasks: u64,
+    /// 그중 두 계획이 **갈린** 태스크 수.
+    #[serde(rename = "planContrastDiverged")]
+    pub plan_contrast_diverged: u64,
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Metrics {
     pub coverage: CriteriaCoverage,
@@ -1239,6 +1324,14 @@ pub struct Metrics {
     /// 실패한 테스트 이름을 갈랐는가, 갈라 보니 섞여 있었는가 (state-machine 54·55절).
     #[serde(rename = "testAttribution")]
     pub test_attribution: TestAttributionCoverage,
+    /// 태스크가 어떻게 끝났는가 (state-machine 72.14절).
+    #[serde(rename = "taskOutcomes")]
+    pub task_outcomes: TaskOutcomes,
+    /// 런타임 에스컬레이션 — **요청 / 호출 / 거절 셋을 따로 센다**(72.10.2절).
+    pub escalations: Escalations,
+    /// B·C와 계획 대조가 무엇을 했는가 (72.14절).
+    #[serde(rename = "stagedReviews")]
+    pub staged_reviews: StagedReviews,
     /// 집계에 들어간 태스크 수 (기준이 없는 태스크 포함).
     #[serde(rename = "tasksScanned")]
     pub tasks_scanned: u64,
@@ -1409,6 +1502,38 @@ fn open_question_with_min(
 /// 어긋날 수 있고, 그때 어느 쪽이 정본인지 알 방법이 없다.
 fn open_questions(m: &Metrics) -> Vec<OpenQuestion> {
     vec![
+        // ---- 72절 흐름 (state-machine 72.14절) ----
+        //
+        // **이 흐름은 아직 측정되지 않은 가설이다.** 교차검증에 대해 세운 규칙을 그대로
+        // 적용한다: 만드는 것은 진행하되, 게이트가 답하기 전까지 이 흐름을 **품질 주장으로
+        // 쓰지 않는다.** 그래서 질문이 먼저 있고 답이 나중에 온다.
+        open_question(
+            "stagedReviews",
+            "stagedReviews",
+            "앞뒤로 나눈 검토가 **사용자 판단을 바꾼 적이 있는가** (state-machine 72.14절)",
+            "B가 실제로 돈 태스크 수",
+            m.staged_reviews.plan_reviews_ran,
+            "게이트가 남긴 가장 아픈 숫자는 '실패한 초안 67건 중 61건에서 아무것도 바꾸지 못했다'였다. 그것을 되묻는 축이 **planReviewsWithIssues / planReviewsRan**이다 — 쟁점을 거의 올리지 않으면 B는 무력하고, 늘 올리는데 사용자가 매번 그대로 승인하면 그것도 무력하다(후자는 승인 카드의 선택 분포가 말한다). **planReviewsNotRun을 먼저 볼 것** — 드롭이 대부분이면 위 비율은 표본이 아니라 잡음이다. 답이 '바꾼 적 없다'면 그 단계를 드롭할 근거가 된다",
+        ),
+        open_question(
+            "escalations",
+            "escalations",
+            "런타임 에스컬레이션이 **신호인가 습관인가** (state-machine 72.10.2절)",
+            "에스컬레이션 요청 수",
+            m.escalations.requested,
+            "**분모가 셋이라는 점이 요점이다.** requested가 늘 봉투를 채우는데(called ≈ maxCalls) calledThatChangedThePatch가 0에 가까우면 그건 신호가 아니라 습관이고, 봉투를 줄이거나 요청 자체를 막을 근거다. 반대로 rejected가 크고 결과가 나쁘면 봉투가 좁은 것이다 — **rejected를 세지 않으면 이 둘이 구별되지 않는다**",
+        ),
+        open_question(
+            "taskOutcomes",
+            "taskOutcomes",
+            "사용자가 **어느 게이트에서 그만두는가** (state-machine 72.14절)",
+            // **분모는 "게이트에서 그만둔 횟수"이지 태스크 수가 아니다.** 태스크 수로 잡으면
+            // 게이트를 한 번도 지나지 않은 `simple` 태스크가 분모를 부풀려, 표본이 없는데도
+            // 표본이 쌓인 것처럼 보인다.
+            "게이트에서 거부되거나 무인으로 멈춘 횟수",
+            m.task_outcomes.rejected_at_gate.values().sum::<u64>() + m.task_outcomes.unattended_stops,
+            "rejectedAtGate의 `plan`이 크면 계획이 사용자가 원한 것과 자주 어긋난다는 뜻이고, 그건 계획 단계의 프롬프트나 대조 쪽 문제다 — **코드를 쓰기 전이라 싸다.** `verification`이 크면 이미 돈을 다 쓴 뒤에 거부되는 것이므로 훨씬 비싸고, C나 체크리스트가 잡았어야 할 것을 놓쳤다는 신호다. unattendedStops가 크면 Autopilot을 `simple`에 쓰고 있지 않다는 뜻이다(72.12절)",
+        ),
         open_question(
             "criteriaCoverage",
             "coverage",
@@ -1647,6 +1772,22 @@ fn mentions_at_boundary(haystack: &str, needle: &str) -> bool {
 }
 
 /// 저장된 이벤트에서 두 지표를 집계한다. **아무것도 쓰지 않는다.**
+/**
+ * 드롭 사유의 **집계 키** — 꼬리를 자른다.
+ *
+ * 사유 문자열에는 공급자 이름이 붙는다(`result_review_dropped:implementer_provider(fake-a)`).
+ * 그대로 키로 쓰면 같은 사유가 설정마다 다른 칸으로 흩어져 **"얼마나 자주 드롭되는가"에
+ * 답할 수 없다.** 첫 구분자까지만 쓴다.
+ */
+fn reason_key(reason: &str) -> String {
+    let head = reason.split([' ', '(', '—']).next().unwrap_or(reason).trim();
+    if head.is_empty() {
+        "unknown".to_string()
+    } else {
+        head.to_string()
+    }
+}
+
 pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, String> {
     let tasks = store
         .all_tasks_for_metrics(workspace_path)
@@ -1888,6 +2029,109 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
                     // "바꿀 기회가 없었다"가 같은 값이 된다.
                     None => metrics.reviewer_findings.revisions_without_patch += 1,
                 }
+            }
+        }
+
+        // ---- 72절 흐름의 계측 (state-machine 72.14절) ----
+        //
+        // **넷 다 실사용에서 공짜로 쌓인다.** 유료 실험 없이 "이 단계가 사용자 판단을 바꾼
+        // 적이 있는가"에 답할 수 있고, 답이 "없다"면 그 단계를 드롭할 근거가 된다.
+        *metrics
+            .task_outcomes
+            .by_status
+            .entry(terminal_status.clone().unwrap_or_else(|| "running".to_string()))
+            .or_insert(0) += 1;
+
+        for event in &events {
+            match event.event_type.as_str() {
+                // **거부가 어느 게이트에서 일어났는가.** 계획 단계면 코드를 쓰기 전이고,
+                // 검증 단계면 이미 돈을 다 쓴 뒤다 — 같은 `REJECTED`인데 대가가 다르다.
+                "APPROVAL_DENIED" => {
+                    if let Some(gate) = event.payload.get("gate").and_then(Value::as_str) {
+                        *metrics
+                            .task_outcomes
+                            .rejected_at_gate
+                            .entry(gate.to_string())
+                            .or_insert(0) += 1;
+                    }
+                }
+                // **거부가 아니다**(24절). 사용자는 아무것도 거부한 적이 없다.
+                "APPROVAL_UNATTENDED" => metrics.task_outcomes.unattended_stops += 1,
+
+                "ESCALATION_CALLED" => {
+                    metrics.escalations.requested += 1;
+                    metrics.escalations.called += 1;
+                    if event
+                        .payload
+                        .get("changedThePatch")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        metrics.escalations.called_that_changed_the_patch += 1;
+                    }
+                }
+                // **거절을 세지 않으면 요청 수가 곧 호출 수가 되어 남발이 상한에 가려
+                // 보이지 않는다**(72.10.2절). 그래서 요청은 둘의 합으로 유도한다 —
+                // 별도 이벤트를 만들면 한쪽만 기록되는 날 합이 맞지 않는다.
+                "ESCALATION_REJECTED" => {
+                    metrics.escalations.requested += 1;
+                    metrics.escalations.rejected += 1;
+                }
+
+                "PLAN_REVIEW_COMPLETED" => {
+                    if event.payload.get("ran").and_then(Value::as_bool).unwrap_or(false) {
+                        metrics.staged_reviews.plan_reviews_ran += 1;
+                        if event.payload.get("issueCount").and_then(Value::as_u64).unwrap_or(0) > 0 {
+                            metrics.staged_reviews.plan_reviews_with_issues += 1;
+                        }
+                    } else {
+                        // 사유를 **머리 토큰까지만** 센다 — 모델 이름이나 공급자가 붙은
+                        // 꼬리를 그대로 키로 쓰면 집계가 설정마다 갈린다.
+                        let reason = event
+                            .payload
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map(reason_key)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        *metrics.staged_reviews.plan_reviews_not_run.entry(reason).or_insert(0) += 1;
+                    }
+                }
+
+                "RESULT_REVIEW_COMPLETED" => {
+                    if event.payload.get("ran").and_then(Value::as_bool).unwrap_or(false) {
+                        metrics.staged_reviews.result_reviews_ran += 1;
+                        metrics.staged_reviews.result_review_items_raised +=
+                            event.payload.get("raisedCount").and_then(Value::as_u64).unwrap_or(0);
+                    } else {
+                        let reason = event
+                            .payload
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map(reason_key)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        *metrics.staged_reviews.result_reviews_not_run.entry(reason).or_insert(0) += 1;
+                    }
+                }
+
+                // **계획 대조를 초안 대조와 따로 센다.** 같은 이벤트 이름을 쓰므로
+                // payload가 대상을 말하지 않으면 집계가 둘을 구별하지 못한다(72.9절).
+                "DISAGREEMENT_DETECTED" => {
+                    if event.payload.get("contrastOf").and_then(Value::as_str) == Some("plan_outline")
+                        && event.payload.get("contrasted").and_then(Value::as_bool).unwrap_or(false)
+                    {
+                        metrics.staged_reviews.plan_contrast_tasks += 1;
+                        let diverged = event
+                            .payload
+                            .get("disagreements")
+                            .and_then(Value::as_array)
+                            .map(|a| !a.is_empty())
+                            .unwrap_or(false);
+                        if diverged {
+                            metrics.staged_reviews.plan_contrast_diverged += 1;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -3267,6 +3511,134 @@ mod tests {
         }
     }
 
+    // ---- 72절 흐름의 계측 (state-machine 72.14절) ----
+
+    /// **거절을 세지 않으면 요청 수가 곧 호출 수가 된다** — 그러면 남발이 상한에 가려
+    /// 보이지 않는다(72.10.2절). 분모가 셋이라는 사실을 이 검사가 고정한다.
+    #[test]
+    fn escalation_counts_requests_calls_and_rejections_separately() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "ESCALATION_CALLED",
+                &json!({ "subtaskId": "s1", "changedThePatch": true }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "task-1",
+                "ESCALATION_CALLED",
+                &json!({ "subtaskId": "s2", "changedThePatch": false }),
+            )
+            .unwrap();
+        store
+            .append_event("task-1", "ESCALATION_REJECTED", &json!({ "subtaskId": "s3" }))
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.escalations.called, 2);
+        assert_eq!(m.escalations.rejected, 1);
+        // **요청은 둘의 합으로 유도한다** — 별도 이벤트를 만들면 한쪽만 기록되는 날 합이
+        // 맞지 않고, 그 불일치는 아무것도 실패시키지 않는다.
+        assert_eq!(m.escalations.requested, 3);
+        // 부른 것이 결과를 바꿨는가. 늘 봉투를 채우는데 결과가 달라진 적이 없으면 그건
+        // 신호가 아니라 습관이다.
+        assert_eq!(m.escalations.called_that_changed_the_patch, 1);
+    }
+
+    /// **`CANCELLED`와 `REJECTED`는 다른 사실이다.** 게이트가 둘이 되면서 "사용자가 그만둔
+    /// 방식"이 처음 의미를 갖는다 — 그리고 **어느 게이트에서** 그만뒀는지가 대가를 가른다.
+    #[test]
+    fn rejections_are_counted_by_the_gate_they_happened_at() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "APPROVAL_DENIED",
+                &json!({ "gate": "plan", "choice": "reject" }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "task-1",
+                "APPROVAL_UNATTENDED",
+                &json!({ "gate": "verification" }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.task_outcomes.rejected_at_gate.get("plan"), Some(&1));
+        // **무인 정지는 거부가 아니다**(24절) — 사용자는 아무것도 거부한 적이 없다.
+        assert_eq!(m.task_outcomes.unattended_stops, 1);
+        assert_eq!(m.task_outcomes.rejected_at_gate.get("verification"), None);
+    }
+
+    /// **"돌지 않았다"와 "쟁점이 없었다"를 구별한다.** 뭉개면 드롭이 많은 설정에서
+    /// "계획이 건전하다"로 읽힌다.
+    #[test]
+    fn staged_reviews_separate_not_run_from_no_issues() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "PLAN_REVIEW_COMPLETED",
+                &json!({ "ran": true, "issueCount": 0 }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                "task-1",
+                "RESULT_REVIEW_COMPLETED",
+                &json!({
+                    "ran": false,
+                    "reason": "result_review_dropped:implementer_provider(fake-a) — 배정된 …"
+                }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.staged_reviews.plan_reviews_ran, 1);
+        assert_eq!(m.staged_reviews.plan_reviews_with_issues, 0);
+        assert_eq!(m.staged_reviews.result_reviews_ran, 0);
+        // 사유의 **꼬리를 자른다** — 공급자 이름이 붙은 채로 키가 되면 같은 사유가 설정마다
+        // 다른 칸으로 흩어져 "얼마나 자주 드롭되는가"에 답할 수 없다.
+        assert_eq!(
+            m.staged_reviews
+                .result_reviews_not_run
+                .get("result_review_dropped:implementer_provider"),
+            Some(&1),
+            "{:?}",
+            m.staged_reviews.result_reviews_not_run
+        );
+    }
+
+    /// **계획 대조를 초안 대조와 따로 센다** — 같은 이벤트 이름을 쓰므로 payload가 대상을
+    /// 말하지 않으면 집계가 둘을 구별하지 못한다(72.9절).
+    #[test]
+    fn plan_contrast_is_counted_apart_from_draft_contrast() {
+        let (_d, mut store) = seeded();
+        store
+            .append_event(
+                "task-1",
+                "DISAGREEMENT_DETECTED",
+                &json!({ "contrastOf": "plan_outline", "contrasted": true, "disagreements": [{ "field": "doneCriteria" }] }),
+            )
+            .unwrap();
+        // 초안 대조는 `contrastOf`가 없다 — 세지 않는다.
+        store
+            .append_event(
+                "task-1",
+                "DISAGREEMENT_DETECTED",
+                &json!({ "contrasted": true, "disagreements": [{ "field": "targetPaths" }] }),
+            )
+            .unwrap();
+
+        let m = collect(&store, None).unwrap();
+        assert_eq!(m.staged_reviews.plan_contrast_tasks, 1);
+        assert_eq!(m.staged_reviews.plan_contrast_diverged, 1);
+    }
+
     /// 규칙이 판정을 바꾸고, 제외했던 테스트 파일이 실제로 고쳐졌다 = **오분류**다.
     #[test]
     fn a_mutated_excluded_test_counts_as_a_misclassification() {
@@ -3423,7 +3795,10 @@ mod tests {
         seed_triage(
             &mut store,
             "task-1",
-            json!({ "complexityTier": "standard", "appliedPolicies": ["executionMode=verified"] }),
+            // **모드는 더 이상 tier를 정하지 않는다**(state-machine 72.9절) — 강제가 남아
+            // 있는 축은 `forceComplexityTier` 하나다. 옛 문자열을 fixture로 두면 이 검사가
+            // production이 다시는 내지 않는 입력에 대해 통과한다.
+            json!({ "complexityTier": "standard", "appliedPolicies": ["forceComplexityTier=standard"] }),
             &["src/a.test.ts"],
         );
 

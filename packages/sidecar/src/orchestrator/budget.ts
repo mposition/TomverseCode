@@ -148,6 +148,60 @@ export class TaskBudget {
   }
 
   /**
+   * **단계 예약** — state-machine 72.12절. 호출 하나가 아니라 **구간 하나**를 잡는다.
+   *
+   * # 왜 필요한가
+   *
+   * 72절 흐름은 *"사용자가 비용을 보고 승인한다"* 위에 서 있는데, 승인 시점에 그 금액이
+   * **실제로 남아 있는지 아무도 확인하지 않으면** 승인의 뜻이 절반만 참이 된다. 사용자는
+   * "$X를 쓴다"에 동의했는데 $X가 없을 수 있고, 그때 태스크는 **구현 중간에** 죽는다 —
+   * 시작 전에 거부되는 것보다 나쁜 결말이다(`callPlan.ts`가 적은 그 실패).
+   *
+   * # 호출 예약과 겹쳐 두지 않는다
+   *
+   * 이 예약은 **첫 구현 호출 직전에 닫는다.** 열어 둔 채로 호출 예약이 겹치면 같은 돈이
+   * 두 번 잡혀 상한이 사실상 절반이 된다. 그러므로 이것이 하는 일은 **승인 시점의 확인과
+   * 그 사실의 기록**이고, 실제 강제는 그대로 호출 예약이 한다.
+   *
+   * # 승인으로 되돌아가면 닫고 다시 연다
+   *
+   * B가 쟁점을 올려 승인 카드로 돌아가면(72.11절 경로 3) 열린 예약을 `released`로 닫고,
+   * 다시 승인될 때 새로 연다 — **다시 여는 금액이 달라질 수 있기 때문이다**(B의 지적으로
+   * 분해나 등급이 바뀌면 그렇다). 닫아도 되는 근거는 **그 사이에 구현이 돌지 않았다**는
+   * 것이고, **이미 쓴 것은 여기 없다**(그쪽은 호출 예약이 `settled`로 확정했다).
+   */
+  reserveStage(maxUsd: number, label: string): CallBudget {
+    if (this.ledger === null) return { ok: true, reservation: null };
+    if (!Number.isFinite(maxUsd) || maxUsd < 0) {
+      // **모르는 금액을 0으로 두지 않는다.** 0으로 예약하면 언제나 통과하고, 그 통과는
+      // "확인했다"로 읽힌다 — 확인한 것이 없는데도.
+      const reason = `${label}: 예약할 금액을 계산할 수 없습니다 (${maxUsd})`;
+      this.ledger.recordBlocked(reason);
+      this.lastReason = reason;
+      return { ok: false, reason, state: "blocked" };
+    }
+    const outcome = this.ledger.reserve({ maxUsd, basis: label }, label);
+    if (outcome.ok) return { ok: true, reservation: outcome.reservation };
+    const reason =
+      `${outcome.reason} (이 단계의 예상 비용 $${maxUsd.toFixed(4)}, ` +
+      `남은 예산 $${outcome.availableUsd.toFixed(4)}, 상한 $${(this.limitUsd ?? 0).toFixed(2)})`;
+    this.lastReason = reason;
+    return { ok: false, reason, state: outcome.state ? "blocked" : "limit_reached" };
+  }
+
+  /**
+   * 단계 예약을 닫는다 — **`released`이지 `settled`가 아니다.**
+   *
+   * 이 예약으로는 아무 요청도 나가지 않았으므로 "나가지 않았다"가 참이다(10.7절의
+   * `opened → released`). 나간 뒤의 실패를 이렇게 닫으면 쓴 돈을 안 쓴 것으로 만드는데,
+   * 그 경우는 여기 오지 않는다 — 호출 예약과 자리가 다르다.
+   */
+  releaseStage(reservation: Reservation | null, reason: string): void {
+    if (reservation === null || reservation.settled) return;
+    reservation.release({ dispatchState: "not_dispatched", reason });
+  }
+
+  /**
    * 실제 사용량으로 정산한다.
    *
    * **비용을 모르는 것과 0달러를 구별한다.** `costUsd`가 `undefined`면 측정 실패로 정산하고,

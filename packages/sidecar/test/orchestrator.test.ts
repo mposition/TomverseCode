@@ -34,6 +34,14 @@ function build(
   hostOptions: FakeHostOptions,
   fake: FakeProviderOptions,
   overrides: {
+    /**
+     * tier를 어떻게 정할 것인가.
+     *
+     * 기본은 `"standard"`(강제)다 — **`executionMode: "fast"`/`"verified"`는 이제 tier를
+     * 정하지 않으므로**(state-machine 72.9절) 모드만으로는 경로가 고정되지 않는다.
+     * `"triage"`를 주면 규칙이 정하게 둔다.
+     */
+    tier?: "standard" | "triage";
     providers?: string[];
     policy?: Parameters<typeof makePolicy>[0];
     message?: string;
@@ -48,7 +56,27 @@ function build(
   const orchestrator = new Orchestrator(
     {
       taskRequest: taskRequest(overrides.message, overrides.kind),
-      policy: makePolicy(overrides.policy),
+      /**
+       * **물러난 교차검증 파이프라인**(`DRAFTING → REVIEWING`)을 고정한다 — 72.3절.
+       *
+       * 이 파일의 검사 대상이 그 파이프라인의 동작이다. 72절이 `standard`를 새 흐름으로
+       * 바꾸었지만 그 phase와 타입은 지우지 않았고(과거 기록이 그것을 읽는다), **가설 게이트
+       * Protocol v1의 arm C·D가 지금도 그 경로를 잰다.** 검사가 사라지면 그 경로는 아무도
+       * 지키지 않게 된다.
+       *
+       * 새 흐름(72절)의 검사는 `standardFlow.test.ts`에 있다.
+       *
+       * **`tier: "triage"`이면 고정하지 않는다.** 이 축은 `standard` 경로의 것이므로
+       * (`decideTier`가 그렇게 읽는다) 규칙에게 맡기려는 검사에서 고정하면 규칙이 돌지
+       * 않는다 — 그 검사가 재려던 것이 바로 규칙의 판정이다.
+       */
+      ...((overrides.tier ?? "standard") === "standard"
+        ? { experiment: { pipeline: "legacy_cross_verification" as const, contrast: true } }
+        : {}),
+      policy: makePolicy({
+        ...((overrides.tier ?? "standard") === "standard" ? { forceComplexityTier: "standard" as const } : {}),
+        ...overrides.policy,
+      }),
       availableProviders: overrides.providers ?? ["fake-a", "fake-b"],
       sessionMemory: overrides.sessionMemory,
       mcpTools: overrides.mcpTools,
@@ -98,11 +126,14 @@ test("baseline 검증이 작업 전에 먼저 실행된다", async () => {
 });
 
 test("VERIFYING은 simple tier에서도 생략되지 않는다", async () => {
-  // CLAUDE.md 원칙 1. fast 모드 + 단일 파일 → simple로 분류되지만 검증은 그대로 돈다.
+  // CLAUDE.md 원칙 1. 단일 파일 → TRIAGE가 simple로 분류하지만 검증은 그대로 돈다.
+  //
+  // **`executionMode: "fast"`가 simple을 만드는 것이 아니다**(72.9절) — 모드는 더 이상 tier를
+  // 정하지 않는다. 규칙이 판정하게 두려면 tier 축에서 강제를 풀어야 한다.
   const { orchestrator, host } = build(
     { verifyResults: [{ overall: "pass" }, { overall: "pass" }] },
     { defaultPatch: VALID_PATCH },
-    { policy: { executionMode: "fast" }, providers: ["fake-a"] }
+    { tier: "triage", policy: { executionMode: "fast" }, providers: ["fake-a"] }
   );
   const result = await orchestrator.run();
 
@@ -607,7 +638,8 @@ test("fast 모드에서도 초안의 삭제와 이동이 실행된다", async ()
         },
       ],
     },
-    { policy: { executionMode: "fast" }, providers: ["fake-a"], message: "정리해줘" }
+    // tier를 규칙이 정하게 둔다 — 모드만으로는 simple이 되지 않는다(72.9절).
+    { tier: "triage", policy: { executionMode: "fast" }, providers: ["fake-a"], message: "정리해줘" }
   );
   const result = await orchestrator.run();
 

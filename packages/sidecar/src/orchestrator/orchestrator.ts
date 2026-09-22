@@ -5,6 +5,15 @@ import type {
   CriterionEvaluation,
   Disagreement,
   DraftNarrative,
+  EngineRole,
+  EscalationAllowance,
+  ModelGrade,
+  PlanApprovalCard,
+  PlanApprovalChoice,
+  PlanSubtask,
+  UserGateResponse,
+  VerificationChecklistCard,
+  VerificationChoice,
   DraftProposal,
   ExperimentControls,
   ExecutionPlan,
@@ -51,7 +60,15 @@ import { ToolBridge } from "../tools/bridge.js";
 import { buildDigest } from "../verify/digest.js";
 import { snapshotPayload } from "./snapshotPayload.js";
 import { digestSectionSizes } from "../providers/prompts.js";
-import { canonicalText, contrastDrafts, fieldLabel, planQuestionRound } from "./contrast.js";
+import { canonicalText, contrastDrafts, contrastPlans, fieldLabel, planQuestionRound } from "./contrast.js";
+import { decideGrades, type GradeDecision } from "./grade.js";
+import {
+  buildPlanApprovalCard,
+  buildVerificationChecklist,
+  judgeEscalation,
+  proposeEscalationAllowance,
+  unplannedPaths,
+} from "./standard.js";
 import {
   describeEvaluations,
   evaluateCriteria,
@@ -62,8 +79,9 @@ import {
 import { InvalidTransitionError, isValidTransition } from "./machine.js";
 import { buildCommitMessage, buildCommitPlan, buildExecutionPlan, planPaths, PlanningError } from "./planner.js";
 import { refusalNote, resolveRequests } from "../context/followUp.js";
-import { triage, type TriagePolicy, type TriageResult } from "../triage.js";
+import { DEFAULT_TRIAGE_POLICY, triage, type TriagePolicy, type TriageResult } from "../triage.js";
 import { BudgetRefused, TaskBudget } from "./budget.js";
+import type { Reservation } from "../budget/ledger.js";
 import type { BudgetEventType } from "../budget/ledger.js";
 
 /**
@@ -376,6 +394,55 @@ export class Orchestrator {
    */
   private budget: TaskBudget | null = null;
 
+  // ---- `standard` 흐름의 상태 (state-machine 72절) ----
+
+  /**
+   * 사용자가 승인한 계획. **기준의 출처가 되는 권위**다(`plan_outline`).
+   *
+   * `pendingPlan`(계획 모드의 산출물)과 나눈다 — 저쪽은 읽고 끝나는 경로의 결과라 실행에
+   * 쓰이지 않는다. 한 필드로 합치면 "승인을 지났는가"가 값에서 사라진다.
+   */
+  private approvedPlan: PlanOutline | null = null;
+  /** 서브태스크별 **최종** 등급. 규칙이 계산한 값이고 라우팅과 비용이 이것을 쓴다(72.10절). */
+  private approvedGrades: GradeDecision[] = [];
+  /** 사용자가 함께 승인한 에스컬레이션 봉투 (72.10.2절). 승인 전에는 `null`이다. */
+  private escalationAllowance: EscalationAllowance | null = null;
+  /** 사용자가 계획 검토(B)를 생략했는가 — **체크리스트에 적힌다**(72.4절). */
+  private planReviewSkipped = false;
+  /** B가 올린 쟁점. 계획이 바뀌지 않았으면 B를 다시 부르지 않고 이것을 그대로 보여준다(72.11절). */
+  private planReviewIssues: string[] = [];
+  /**
+   * B가 마지막으로 검토한 계획의 지문.
+   *
+   * **계획이 바뀌지 않았으면 B를 다시 부르지 않는다**(72.11절). 같은 입력에 같은 검토를 다시
+   * 시키는 것이므로 새로 얻는 정보가 없고, 부르면 `B 호출만 상한 없이 늘어난다` — 매 회
+   * 사용자 클릭이 필요하므로 무인 루프는 아니지만 상한이 없는 것은 같다.
+   */
+  private reviewedPlanFingerprint: string | null = null;
+  /** 이 지문의 쟁점을 사용자에게 이미 보여줬는가. 보여준 뒤 다시 승인하면 그대로 진행한다. */
+  private issuesShownFor: string | null = null;
+  /** C가 지목한 기준 id들. **경고이지 확인이 아니다**(72.8절). */
+  private flaggedCriterionIds: string[] = [];
+  /** C가 실제로 돌았는가. 돌지 않았으면 체크리스트가 그 사실을 적는다. */
+  private resultReviewRan = false;
+  /**
+   * **코드를 쓴 공급자들** — 21.6절 불변식 C가 보는 집합.
+   *
+   * 라우터의 C 배정은 executor 하나만 보고 한 **잠정** 판정이다. 등급별 배정과 에스컬레이션이
+   * 실제 구현자를 늘릴 수 있으므로, C를 부르기 전에 이 집합으로 다시 판정한다 — 그래서
+   * 기록에 `assigned*`와 `actual*`이 둘 다 남는다(13.5절과 같은 모양).
+   */
+  private readonly implementerProviders = new Set<string>();
+  /** 등급별 구현 어댑터 캐시. 같은 등급의 서브태스크가 매번 새 어댑터를 만들지 않게 한다. */
+  private readonly gradeAdapters = new Map<ModelGrade, ProviderAdapter>();
+  /**
+   * 계획 승인 시점에 연 **구현·검토 단계 예약** — 72.12절.
+   *
+   * 승인으로 되돌아가면 닫고 다시 연다. 첫 구현 호출 직전에도 닫는다 — 열어 둔 채로 호출
+   * 예약이 겹치면 같은 돈이 두 번 잡힌다(`TaskBudget.reserveStage`의 머리말).
+   */
+  private implementationReservation: Reservation | null = null;
+
   constructor(private readonly input: RunInput, deps: OrchestratorDeps) {
     this.deps = deps;
     this.registry = deps.registry ?? new ModelRegistry();
@@ -603,6 +670,9 @@ export class Orchestrator {
         availableProviders: this.input.availableProviders,
         appliedPolicies: tier.appliedPolicies,
         contrast: this.contrastRequested(tier.tier),
+        // **물러난 파이프라인은 배정도 종전대로 한다**(72.3절). 실험 하네스 전용이며
+        // production에서 `experiment`는 언제나 `undefined`다.
+        legacyCrossVerification: this.input.experiment?.pipeline === "legacy_cross_verification",
       });
     } catch (error) {
       if (error instanceof RoutingError) {
@@ -644,6 +714,29 @@ export class Orchestrator {
      *
      * 이제 경로는 **tier가 정하고**, 검수자가 없으면 REVIEWING만 건너뛴다.
      */
+    /**
+     * ---- `standard`는 72절 흐름으로 간다 ----
+     *
+     * `simple`은 바뀌지 않는다(`SINGLE_MODEL_FIX` 그대로) — 작은 수정에 승인 두 번을
+     * 요구하면 그 수정을 하지 않게 된다.
+     *
+     * **예외는 실험 하네스 하나뿐이다.** 가설 게이트 Protocol v1의 arm C·D가 재는 대상이
+     * 72.3절에서 물러난 그 파이프라인이라, 축 없이 두면 하네스가 조용히 다른 것을 잰다 —
+     * 그 판정 기준이 해시로 봉인된 사전등록이므로 그건 봉인이 지키는 것을 없애는 일이다.
+     * production 경로에서 `experiment`는 언제나 `undefined`다.
+     */
+    if (tier.tier === "standard") {
+      if (this.input.experiment?.pipeline === "legacy_cross_verification") {
+        await this.emit("PHASE_CHANGED_NOTE", {
+          note:
+            "실험 하네스가 **물러난 교차검증 파이프라인**(DRAFTING→REVIEWING)을 지정했습니다 — " +
+            "production 경로가 아닙니다(72.3절).",
+          pipeline: "legacy_cross_verification",
+        });
+      } else {
+        return this.runStandardPath();
+      }
+    }
     const crossVerified = tier.tier !== "simple";
 
     // ---- 실행 전 루프: DRAFTING→REVIEWING 또는 SINGLE_MODEL_FIX ----
@@ -1940,7 +2033,20 @@ export class Orchestrator {
    * `fast`는 사용자가 **싸게 가겠다고 고른 것**이고, 규칙이 "이 태스크는 어렵다"고 본 것은
    * 교차검증(executor 1 + reviewer 1)을 켜는 근거이지 executor를 하나 더 부르는 근거가 아니다.
    *
-   * 그래서 두 축을 갈라 둘 다 요구한다. tier는 **교차검증**을, 실행 모드는 **대조**를 켠다.
+   * 그래서 두 축을 갈라 둘 다 요구한다.
+   *
+   * # 그리고 **둘이 되는 것이 executor가 아니다** — 72.9절
+   *
+   * 종전 문장은 *"tier는 교차검증을, 실행 모드는 대조를 켠다"*였고 대조의 대상이 executor
+   * ×2였다. 서브태스크 분해가 들어오면 그건 **서브태스크마다 ×2**가 되어 N배가 되고,
+   * 불일치 카드가 붙을 게이트도 없다 — 구현 중에 사용자를 N번 부를 수는 없다.
+   *
+   * 계획 단계로 옮기면 정반대가 된다. 계획자를 둘 부르고 갈린 지점을 **이미 사용자가 서 있는
+   * 승인 게이트**에 올린다. 추가 호출은 1회, **추가 정지는 0**이다("마찰 0"이 아니다 —
+   * 카드가 붙으면 읽을 것은 늘어난다. 없어지는 것은 따로 멈춰 서는 일이다).
+   *
+   * 그래서 이 함수가 켜는 것은 이제 **계획자 둘**이고, `simple` 경로에 남는 co-executor는
+   * **없다**(multi-engine 15.3절: 지정 금지 대상이 co-executor에서 co-planner로 옮겨갔다).
    *
    * **실험 하네스에서는 명시적으로 켜지 않는 한 끈다.** 하네스는 arm을 고정해 비교하는데,
    * 호출이 하나 더 생기면 그게 arm 차이인지 대조 때문인지 구별되지 않는다 — 측정 도구가
@@ -1966,9 +2072,40 @@ export class Orchestrator {
   private decideTier(): { tier: ComplexityTier; appliedPolicies: string[]; evidence?: TriageResult } {
     const appliedPolicies: string[] = [];
 
-    // 사용자가 UI에서 Verified를 고르면 TRIAGE 결과와 무관하게 standard다.
-    if (this.policy.executionMode === "verified") {
-      appliedPolicies.push("executionMode=verified — 항상 교차검증 경로");
+    /**
+     * **`executionMode`는 더 이상 tier를 정하지 않는다** — state-machine 72.9절.
+     *
+     * 여기 있던 *"사용자가 UI에서 Verified를 고르면 TRIAGE 결과와 무관하게 standard다"*가
+     * 72.9절이 뒤집는 바로 그 코드다. `verified`는 **"계획자를 둘 부르라"**는 지시이지
+     * "이 태스크를 어렵게 다루라"는 지시가 아니다.
+     *
+     * 종전 기본값은 세 가지를 한꺼번에 했다: TRIAGE 판정을 버리고, 게이트가 부정한 단계(patch
+     * 검수)를 켜고, 미측정 단계(대조)를 켰다. 재정의 뒤에는 TRIAGE가 살아나고, 부정된 단계는
+     * 72.3절에서 물러났으며, 켜지는 것은 미측정 단계 하나에 호출 1회다.
+     *
+     * **그러면 사용자는 어떻게 tier를 올리는가** — tier 축에서 올린다(`forceComplexityTier`).
+     * 그 수단을 모드 축에 얹지 않는 것이 72.9절의 요점이며, 얹으면 17.5절이 고친 혼동이
+     * 이름만 바꿔 돌아온다.
+     *
+     * 그리고 이 변경은 **관측의 분모를 넓힌다**: 종전에는 `verified`로 돈 태스크 전부가
+     * `appliedPolicies`를 달고 나와 TRIAGE 캘리브레이션의 관측에서 빠졌다(가설 게이트의
+     * `observationFromEvents`가 그 배열이 비어 있는지로 판정한다). 이제 규칙이 실제로 돈다.
+     */
+    /**
+     * **물러난 파이프라인은 `standard` 경로의 것이다** — 72.3절.
+     *
+     * 실험 하네스가 그것을 지정했다는 것은 "그 경로를 태워 달라"는 뜻이므로 tier도 함께
+     * 정해진다. 종전에는 `executionMode=verified`가 그 일을 했고(그래서 하네스가 그 값만
+     * 주면 됐다), 72.9절이 그 규칙을 없앴으므로 **의지할 자리가 여기로 옮겨온다.**
+     *
+     * 적지 않으면 하네스의 fixture가 TRIAGE에서 `simple`로 분류되어 `SINGLE_MODEL_FIX`로
+     * 끝나고, arm C·D는 **재생할 초안이 없어 아무것도 재지 못한 채 통과한다.**
+     *
+     * `appliedPolicies`에 남기므로 TRIAGE 캘리브레이션의 관측에서는 빠진다 — 규칙이 돌지
+     * 않았으므로 분모에 넣으면 오분류율이 실제보다 낮아 보인다.
+     */
+    if (this.input.experiment?.pipeline === "legacy_cross_verification") {
+      appliedPolicies.push("experiment.pipeline=legacy_cross_verification — 물러난 교차검증 경로(72.3절)");
       return { tier: "standard", appliedPolicies };
     }
     if (this.policy.forceComplexityTier) {
@@ -1986,7 +2123,7 @@ export class Orchestrator {
    */
   private async callProvider<T>(
     adapter: ProviderAdapter,
-    role: "executor" | "reviewer",
+    role: EngineRole,
     callId: string,
     call: (ctx: ProviderCallContext) => Promise<ProviderResponse<T>>
   ): Promise<{ kind: "value"; value: T } | { kind: "final"; result: FinalResult }> {
@@ -2002,7 +2139,7 @@ export class Orchestrator {
 
   private async callProviderMaybeOptional<T>(
     adapter: ProviderAdapter,
-    role: "executor" | "reviewer",
+    role: EngineRole,
     callId: string,
     call: (ctx: ProviderCallContext) => Promise<ProviderResponse<T>>,
     options: { optionalSample?: boolean }
@@ -2151,7 +2288,7 @@ export class Orchestrator {
    */
   private async recordCallFailure(
     adapter: ProviderAdapter,
-    role: "executor" | "reviewer",
+    role: EngineRole,
     callId: string,
     attempt: number,
     original: unknown,
@@ -2199,7 +2336,7 @@ export class Orchestrator {
 
   private async recordUsage<T>(
     adapter: ProviderAdapter,
-    role: "executor" | "reviewer",
+    role: EngineRole,
     callId: string,
     response: ProviderResponse<T>,
     attempt: number
@@ -2786,6 +2923,1225 @@ export class Orchestrator {
     return this.finish("planned", plan.summary);
   }
 
+  // ==========================================================================
+  // `standard` 개발 흐름 — state-machine 72절
+  // ==========================================================================
+
+  /**
+   * 72.2절의 흐름 전체.
+   *
+   * ```
+   * OUTLINING → AWAITING_PLAN_APPROVAL → PLAN_REVIEWING
+   *   → [서브태스크마다] IMPLEMENTING → PLANNING → AWAITING_APPROVAL → EXECUTING
+   *   → VERIFYING ⇄ FIX_LOOP → RESULT_REVIEWING → AWAITING_USER_VERIFICATION → (커밋)
+   * ```
+   *
+   * # 바깥 루프가 세는 것은 `planRounds`다
+   *
+   * 계획으로 돌아오는 경로는 **셋이고 하나도 빠뜨리면 안 된다**(72.11절):
+   * ① 승인 카드의 "수정 요청", ② 체크리스트의 "계획으로 되돌아간다",
+   * ③ **B의 쟁점을 보고 계획을 고침**. ③이 빠지기 쉽다 — 앞의 둘은 사용자가 먼저 움직이지만
+   * 이것은 모델이 올린 쟁점에서 시작하므로 "사용자가 요청한 수정" 목록에 안 들어간다.
+   * 그런데 돌아가는 자리는 같은 `OUTLINING`이고, 카운터가 다르면 그 고리만 상한 없이 돈다.
+   *
+   * 셋이 **같은 이 루프**를 돌므로 카운터가 갈릴 자리가 없다.
+   */
+  private async runStandardPath(): Promise<FinalResult> {
+    for (;;) {
+      if (await this.cancelledHere()) return this.finish("cancelled", "계획 중 취소됨");
+
+      const outlined = await this.outlineForExecution();
+      if (outlined.kind === "final") return outlined.result;
+
+      const approved = await this.planApprovalLoop(outlined.plan, outlined.disagreements);
+      if (approved.kind === "final") return approved.result;
+      if (approved.kind === "replan") continue;
+
+      const built = await this.implementAndVerify(approved.plan);
+      if (built.kind === "final") return built.result;
+      // built.kind === "replan" — 체크리스트에서 계획으로 되돌아왔다(72.8 귀환 경로 2).
+      // **이미 쓴 예산은 해제하지 않는다** — 구현이 이미 돌았고 그 지출은 확정되어 있다.
+    }
+  }
+
+  /**
+   * 실행으로 이어지는 계획을 만든다 — 대조가 켜져 있으면 **계획자를 둘** 부른다(72.9절).
+   *
+   * 초안 경로의 `runCrossVerifiedPath`와 모양이 같은 것은 우연이 아니다: 옮겨온 것은 대조가
+   * 일어나는 **자리**이지 대조 자체가 아니다. 그래서 불일치 카드도 같은 `askUser` 왕복을
+   * 쓰고, blocking 판정도 같은 규칙을 지난다.
+   */
+  private async outlineForExecution(): Promise<
+    { kind: "plan"; plan: PlanOutline; disagreements: string[] } | { kind: "final"; result: FinalResult }
+  > {
+    const adapters = this.requireAdapters();
+    // **계획자가 없으면 이 경로가 성립하지 않는다.** 라우터는 `standard`에서 A를 언제나
+    // 배정한다(21.6절 사다리에서 A는 필수다) — 없다는 것은 불변식 위반이고, 조용히
+    // executor로 대체하면 "계획은 프로파일과 무관하게 frontier"가 거짓이 된다(72.10절).
+    const planner = adapters.planner;
+    if (!planner) {
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          "라우터가 계획자를 배정하지 않았습니다 (내부 불변식 위반)",
+          "internal_invariant_violated"
+        ),
+      };
+    }
+
+    await this.transition("OUTLINING");
+    if (await this.cancelledHere()) {
+      return { kind: "final", result: await this.finish("cancelled", "OUTLINING 중 취소됨") };
+    }
+
+    const round = this.state.counters.planRounds + 1;
+    const plans = await this.callPlanners(planner, adapters.coPlanner, round);
+    if (plans.kind === "final") return plans;
+
+    const primary = plans.plans[0]!;
+    this.lastInterpretation = primary.summary;
+
+    for (const [index, p] of plans.plans.entries()) {
+      await this.emit("DRAFT_RECEIVED", {
+        model: p.model,
+        kind: "plan_outline",
+        primary: index === 0,
+        stepCount: p.steps.length,
+        subtaskCount: p.subtasks?.length ?? 0,
+        filesToChange: p.filesToChange,
+        riskCount: p.risks.length,
+        openQuestionCount: p.openQuestions.length,
+        // **`acceptanceCriteriaReplaces`를 달지 않는다**(72.2.2절). 기준을 정하는 것은
+        // 사용자가 승인한 계획이고, 그 승격은 승인 뒤에 한 번만 일어난다.
+      });
+    }
+
+    // 비교할 것이 하나뿐이면 돌리지 않는다. 빈 리포트를 남기면 "대조했는데 쟁점이 없었다"로
+    // 읽히는데 실제로는 시도조차 하지 않은 것이다(13.2절).
+    const disagreements = plans.plans.length >= 2 ? await this.contrastPlansForCard(plans.plans) : [];
+    return { kind: "plan", plan: primary, disagreements };
+  }
+
+  /**
+   * 계획자 1~2명 호출 + 컨텍스트 요청 왕복.
+   *
+   * **둘은 서로의 산출물을 보지 않는다**(17.1절). 같은 스냅샷·같은 프롬프트로 동시에 부르는
+   * 것이 그 독립성의 구현이다 — 순차로 부르면서 앞의 결과를 넘기고 싶은 유혹이 생기지 않도록
+   * 구조 자체를 병렬로 둔다.
+   *
+   * **A′ 실패는 대조만 잃는다.** 대조는 질문을 만드는 장치이지 진행 조건이 아니다.
+   *
+   * `forExecution`과 `maxSubtasks`를 넘기지 않으면 모델이 `subtasks`를 내지 않고 빈 계획이
+   * **조용히 통과한다**(72.2.2절) — 둘 다 어댑터가 받아 프롬프트와 검증에 각각 쓴다.
+   */
+  private async callPlanners(
+    planner: ProviderAdapter,
+    coPlanner: ProviderAdapter | undefined,
+    round: number
+  ): Promise<{ kind: "plans"; plans: PlanOutline[] } | { kind: "final"; result: FinalResult }> {
+    let refusal = "";
+    for (let contextRound = 0; ; contextRound += 1) {
+      const snapshot = await this.snapshotForPrompt();
+      const input = {
+        snapshot,
+        userMessage: this.input.taskRequest.userMessage,
+        ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
+        ...(refusal ? { contextNote: refusal } : {}),
+        forExecution: true,
+        maxSubtasks: this.policy.limits.maxSubtasks,
+      };
+      const [a, b] = await Promise.all([
+        this.callProvider(planner, "planner", `plan:${round}.${contextRound + 1}`, (ctx) =>
+          planner.outlinePlan(input, ctx)
+        ),
+        coPlanner
+          ? this.callProviderMaybeOptional(
+              coPlanner,
+              "planner",
+              `plan-co:${round}.${contextRound + 1}`,
+              (ctx) => coPlanner.outlinePlan(input, ctx),
+              { optionalSample: true }
+            )
+          : Promise.resolve({ kind: "skipped" as const }),
+      ]);
+      if (a.kind === "final") return a;
+      if (b.kind === "final") return b;
+      const plans: PlanOutline[] = [a.value];
+      if (b.kind === "value") plans.push(b.value);
+      else if (coPlanner) {
+        // **조용히 넘기지 않는다.** 대조를 하지 못했다는 사실이 로그에 남아야 "쟁점이
+        // 없었다"와 구별된다. 대조 없이 나온 "불일치 0"은 정보가 아니라 착시다.
+        await this.emit("ERROR", {
+          stage: "OUTLINING",
+          message: "대조 계획자의 계획을 얻지 못해 이번 라운드는 대조 없이 진행합니다",
+        });
+      }
+
+      // **계획도 같은 길을 쓴다**(57절). 두 경로가 갈라지면 한쪽만 상한을 잃는다.
+      const more = await this.fetchRequestedContext(plans[0]!.needsContext ?? [], contextRound);
+      if (more === null) return { kind: "plans", plans };
+      refusal = more;
+    }
+  }
+
+  /**
+   * 계획 대조 — 쟁점을 **승인 카드에 실을 문장으로** 돌려준다(72.9절).
+   *
+   * # 따로 멈추지 않는다
+   *
+   * `AWAITING_USER_INPUT`으로 가는 별도 정지를 두지 않는다. 불일치는 **계획 승인 카드의
+   * 일부**로 올라가고, 사용자는 72.4절의 같은 선택지 넷 안에서 답한다 — 추가 호출은 1회,
+   * **추가 정지는 0**이다.
+   *
+   * **17.8①의 *목적*은 옮겨오고 *기구*는 옮겨오지 않는다.** 그 절이 "사용자 답변 후 항상
+   * 재진입"을 택한 이유는 초안 경로에 **사용자 게이트가 없어서** 답을 작업에 반영할 길이
+   * 재실행뿐이었기 때문이다. 계획 경로에는 그 게이트가 바로 거기 있다.
+   *
+   * 그래서 **`standard` 경로는 `AWAITING_USER_INPUT`을 쓰지 않는다**(72.11절). 쓰면 2.1절
+   * 표에 없는 전이(`OUTLINING → AWAITING_USER_INPUT`)를 만들게 된다.
+   *
+   * 살아남는 계획은 **primary**다 — 사용자가 고르지 않는다(17.8① 그대로). 계획 자체를
+   * 고쳐야 하는지는 사용자가 카드에서 "수정 요청"으로 정하고, 그건 72.11절 경로 1이라
+   * `planRounds`를 이미 쓴다.
+   */
+  private async contrastPlansForCard(plans: readonly PlanOutline[]): Promise<string[]> {
+    const round = this.state.counters.planRounds + 1;
+    const report = contrastPlans({
+      taskId: this.taskId,
+      plans,
+      complexityTier: this.state.complexityTier ?? "standard",
+      round,
+    });
+    await this.emit("DISAGREEMENT_DETECTED", {
+      ...report,
+      contrasted: plans.length >= 2,
+      // **대조의 대상을 payload가 말한다.** 초안 대조와 계획 대조가 같은 이벤트 이름을 쓰므로,
+      // 적지 않으면 집계가 둘을 구별하지 못한다 — 72.14절은 계획 대조를 따로 센다.
+      contrastOf: "plan_outline",
+      blockingCount: report.disagreements.filter((d) => d.blocking).length,
+      // **여기서는 질문 예산을 쓰지 않는다.** 한 화면 상한은 "따로 멈춰 물을 때" 화면이
+      // 감당할 수 있는 양의 규칙인데, 이 쟁점들은 승인 카드에 함께 실린다. 예산으로 자르면
+      // "묻지 못했다"가 아니라 **보여주지 못했다**가 되고, 그건 기록에 남을 사실이 다르다.
+      askedCount: 0,
+      deferredCount: 0,
+      advisoryCount: report.disagreements.filter((d) => !d.blocking).length,
+    });
+
+    // 카드에 실을 문장. **어느 쪽이 옳은지 말하지 않는다** — 그건 모델에게 판정을 시키는
+    // 것이고, 여기가 하는 일은 사용자가 볼 수 있게 갈린 자리를 보여주는 것뿐이다.
+    return report.disagreements.map(
+      (d) =>
+        `${fieldLabel(d.field)}${d.blocking ? "(중요)" : ""}: ` +
+        d.positions.map((p) => (p.value.length > 0 ? p.value.join(" / ") : "(정하지 않음)")).join("  ↔  ")
+    );
+  }
+
+  /**
+   * 계획 승인 게이트 ⇄ B — 72.4·72.6·72.11절.
+   *
+   * # 승인이 검토보다 먼저다
+   *
+   * 순서가 뒤집혀 보이지만 그렇지 않다. **사용자 승인**은 *"이게 내가 원하는 것인가"* =
+   * 요구에 관한 질문이고 사용자만이 답할 수 있다. **독립 검토**는 *"이 계획이 건전한가"*이고
+   * 사용자가 답하지 못할 수도 있다. 뒤집으면 사용자가 자기 관할이 아닌 것까지 떠안는다.
+   * 그리고 실무적으로 **사용자가 방향을 거부할 계획에 검토비를 쓰지 않는다.**
+   *
+   * # B의 쟁점은 승인으로 되돌아간다
+   *
+   * 검토자는 승인된 계획을 **조용히 바꿀 수 없다**(72.4절). 사용자가 계획 X를 승인했는데
+   * 계획 Y가 실행되면 그 승인은 아무것도 뜻하지 않는다. 그래서 쟁점은 카드로 되돌아가고,
+   * 사용자가 같은 선택지 넷 안에서 답한다.
+   */
+  private async planApprovalLoop(
+    plan: PlanOutline,
+    contrastIssues: readonly string[]
+  ): Promise<{ kind: "approved"; plan: PlanOutline } | { kind: "replan" } | { kind: "final"; result: FinalResult }> {
+    const subtasks = plan.subtasks ?? [];
+    const grades = decideGrades(
+      subtasks,
+      this.policy.performanceProfile,
+      (this.deps.triagePolicy ?? DEFAULT_TRIAGE_POLICY).riskPathSegments
+    );
+    const escalation = proposeEscalationAllowance({
+      limits: this.policy.limits,
+      estimatedCostUsd: this.routing?.estimatedCostUsd ?? 0,
+      hasUnpricedAssignments: (this.routing?.unpricedAssignments.length ?? 0) > 0,
+    });
+    const fingerprint = planFingerprint(plan);
+
+    for (;;) {
+      if (await this.cancelledHere()) {
+        return { kind: "final", result: await this.finish("cancelled", "계획 승인 대기 중 취소됨") };
+      }
+
+      const card = buildPlanApprovalCard({
+        plan,
+        grades,
+        routing: this.requireRouting(),
+        escalation,
+        effortLevel: this.policy.effortLevel,
+        // **Node가 지문을 만들지 않는다.** Rust가 찍고 Rust가 기록하며(72.5절), 승인 이벤트에
+        // 남는 값은 Rust가 그 시점에 다시 찍은 것이지 이 값이 아니다.
+        workspaceFingerprint: null,
+        plannerUnmeasured: this.plannerGrade() === "unmeasured",
+        effortIgnoredBy: this.effortIgnoredBy(),
+      });
+      // 대조와 B의 쟁점을 **같은 카드에** 싣는다(72.9절: 별도 정지를 두지 않는다).
+      for (const issue of contrastIssues) card.notes.push(`계획 대조: ${issue}`);
+      for (const issue of this.planReviewIssues) card.notes.push(`계획 검토(B): ${issue}`);
+      if (this.state.counters.planRounds >= this.policy.limits.planRounds) {
+        // **막다른 길을 만들지 않는다**(72.11절). 상한에 걸린 자리가 계획 승인 카드이므로
+        // 남는 선택지는 "승인"과 "거부"다 — 코드가 아직 한 줄도 없어 되돌릴 것도 없다.
+        card.notes.push(
+          `계획 수정 상한(${this.policy.limits.planRounds}회)을 다 썼습니다 — 이제 승인하거나 거부할 수 있습니다.`
+        );
+      }
+
+      // **자기 자신으로의 전이가 허용된다**(machine.ts). 카드를 다시 묻는 것은 진행바가
+      // 뒤로 가는 일이 아니다 — `EXECUTING → EXECUTING`이 "다음 ToolRequest"인 것과 같다.
+      await this.transition("AWAITING_PLAN_APPROVAL");
+      const response = await this.requestUserGate({ gate: "plan", taskId: this.taskId, card });
+      const settled = await this.settleGateResponse(response, "계획 승인");
+      if (settled.kind === "final") return settled;
+
+      const choice = settled.choice as PlanApprovalChoice;
+      if (choice === "reject") {
+        return { kind: "final", result: await this.finishRejected("사용자가 계획을 거부했습니다") };
+      }
+      if (choice === "revise") {
+        if (this.state.counters.planRounds >= this.policy.limits.planRounds) {
+          // 상한을 넘겨도 **실패시키지 않는다.** 다시 물으면 카드가 남은 선택지를 적는다.
+          await this.emit("PHASE_CHANGED_NOTE", {
+            note: "계획 수정 상한을 소진해 더 고칠 수 없습니다 — 승인 또는 거부만 남았습니다",
+            planRounds: this.state.counters.planRounds,
+            max: this.policy.limits.planRounds,
+          });
+          continue;
+        }
+        this.state.counters.planRounds += 1;
+        // 쟁점은 계획과 함께 낡는다. 남겨두면 새 계획에 옛 지적이 붙는다.
+        this.planReviewIssues = [];
+        this.issuesShownFor = null;
+        // 이 경로에서는 아직 열린 예약이 없지만(승인 전이다) **규칙을 두 경로에 같이
+        // 둔다** — 10.7절이 경계한 자리가 정확히 "되돌아가는 경로가 둘인데 한쪽만 보고
+        // 규칙을 적는 것"이다.
+        this.releaseImplementationStage("사용자가 계획 수정을 요청했습니다");
+        return { kind: "replan" };
+      }
+
+      // ---- 승인됐다 ----
+      //
+      // **예약 시점이 곧 승인 시점이다**(72.12절). 승인 카드가 예상 비용을 보여주는 바로
+      // 그 시점에 그 금액이 실제로 남아 있는지 확인한다 — 확인하지 않으면 *"사용자가 비용을
+      // 보고 승인한다"*가 절반만 참이 되고, 태스크는 **구현 중간에** 죽는다.
+      const staged = await this.reserveImplementationStage(card);
+      if (staged.kind === "final") return staged;
+
+      this.approvedPlan = plan;
+      this.approvedGrades = grades;
+      this.escalationAllowance = escalation;
+      this.planReviewSkipped = choice === "approve_skip_review";
+      // **기준은 여기서 한 번만 승격된다**(72.2.1절). 구현 모델이 내는 `doneCriteria`는
+      // 기준이 되지 않는다 — 받는 쪽이 기준을 다시 쓰게 두면 `source`를 나눈 이유가 사라진다.
+      await this.absorbPlanCriteria(plan);
+
+      if (choice === "approve_skip_review" || !this.requireAdapters().planReviewer) {
+        if (choice === "approve_with_review") {
+          // 사용자는 검토를 골랐는데 배정이 없다. **조용히 넘어가지 않는다** — 라우터가
+          // 남긴 드롭 사유를 그대로 옮긴다(여기서 문장을 다시 만들면 둘이 갈라진다).
+          await this.emit("PLAN_REVIEW_COMPLETED", {
+            ran: false,
+            reason:
+              this.routing?.appliedPolicies.find((p) => p.startsWith("plan_review_dropped")) ?? "plan_review_dropped",
+            independence: this.routing?.planReviewIndependence ?? "not_applicable",
+          });
+        }
+        return { kind: "approved", plan };
+      }
+
+      // ---- PLAN_REVIEWING (B) ----
+      const reviewed = await this.runPlanReview(plan, fingerprint);
+      if (reviewed.kind === "final") return reviewed;
+
+      // 쟁점이 있고 **아직 보여준 적이 없으면** 승인으로 되돌아간다. 승인의 근거가 바뀌었으니
+      // 승인을 다시 묻는 것이고, 지문이 바뀌면 승인이 만료되는 것(72.5절)과 같은 모양이다.
+      if (this.planReviewIssues.length > 0 && this.issuesShownFor !== fingerprint) {
+        this.issuesShownFor = fingerprint;
+        // **연 예약을 닫고 다시 연다**(72.12절). 다시 여는 금액이 달라질 수 있기 때문이고
+        // (B의 지적으로 분해나 등급이 바뀌면 그렇다), 닫아도 되는 근거는 **그 사이에
+        // 구현이 돌지 않았다**는 것이다 — B는 구현 전에 선다.
+        this.releaseImplementationStage("계획 검토가 쟁점을 올려 승인으로 되돌아갑니다");
+        continue;
+      }
+      return { kind: "approved", plan };
+    }
+  }
+
+  /**
+   * B — 계획 독립 검토 (72.6절).
+   *
+   * 산출물은 **verdict가 아니라 쟁점 목록**이다. 카드로 올라가거나 주석으로 남을 뿐이고,
+   * 계획을 조용히 바꾸지 못한다.
+   *
+   * **계획이 바뀌지 않았으면 다시 부르지 않는다**(72.11절). 같은 입력에 같은 검토를 다시
+   * 시키면 새로 얻는 정보 없이 호출만 는다 — 사용자 클릭이 매번 필요하므로 무인 루프는
+   * 아니지만, 상한이 없는 것은 같다.
+   */
+  private async runPlanReview(
+    plan: PlanOutline,
+    fingerprint: string
+  ): Promise<{ kind: "done" } | { kind: "final"; result: FinalResult }> {
+    if (this.reviewedPlanFingerprint === fingerprint) {
+      await this.emit("PLAN_REVIEW_COMPLETED", {
+        ran: false,
+        reason: "plan_unchanged — 계획이 바뀌지 않아 이전 쟁점 목록을 그대로 씁니다",
+        issueCount: this.planReviewIssues.length,
+      });
+      return { kind: "done" };
+    }
+
+    const reviewer = this.requireAdapters().planReviewer!;
+    await this.transition("PLAN_REVIEWING");
+    if (await this.cancelledHere()) {
+      return { kind: "final", result: await this.finish("cancelled", "계획 검토 중 취소됨") };
+    }
+
+    const before = [...this.planReviewIssues];
+    const snapshot = await this.snapshotForPrompt();
+    const review = await this.callProvider(reviewer, "planReviewer", `plan-review:${fingerprint.slice(5, 13)}`, (ctx) =>
+      reviewer.reviewProposal(
+        {
+          snapshot,
+          userMessage: this.input.taskRequest.userMessage,
+          // **검토 대상은 계획이다.** `DraftProposal` 모양으로 감싸 보내는 이유는 어댑터가
+          // 그 타입 하나만 받기 때문이고, 그 안에서 patch 자리는 비어 있다 — 계획에는
+          // patch가 없다(53.5절).
+          draft: planAsReviewSubject(plan),
+          blind: false,
+          acceptanceCriteria: this.criteriaForPrompt(),
+        },
+        ctx
+      )
+    );
+    if (review.kind === "final") return review;
+
+    // **verdict를 판정으로 쓰지 않는다**(72.6절). 쟁점만 꺼낸다 — 모델이 판정하지 않고
+    // 쟁점을 발굴한다는 product-strategy 16절 그대로다.
+    const issues = collectPlanReviewIssues(review.value);
+    this.planReviewIssues = issues;
+    this.reviewedPlanFingerprint = fingerprint;
+
+    await this.emit("PLAN_REVIEW_COMPLETED", {
+      ran: true,
+      model: review.value.model,
+      independence: this.routing?.planReviewIndependence ?? "not_applicable",
+      assignedPlanReviewerModel: this.routing?.assignedPlanReviewer?.modelId ?? null,
+      actualPlanReviewerModel: reviewer.modelId,
+      issueCount: issues.length,
+      issues,
+      // **B가 계획을 실제로 바꿨는가**(72.14절 계측). 쟁점 목록이 달라졌는지로 잰다 —
+      // 계획 자체는 B가 바꿀 수 없으므로 "바꿨는가"의 관측 가능한 대리값이 이것이다.
+      issuesChanged: !sameStrings(before, issues),
+      verdict: review.value.verdict,
+    });
+    return { kind: "done" };
+  }
+
+  /**
+   * 서브태스크 순차 실행 → 검증 → C → 검증 체크리스트 — 72.2.2·72.7·72.8절.
+   *
+   * # 왜 순차인가 (72.16절 ③의 답)
+   *
+   * 셋이 같은 방향을 가리킨다: ① 승인 모달이 서브태스크마다 뜨는데 병렬이면 승인이 동시에
+   * 여러 개 뜬다 — Fleet의 승인 큐 문제를 태스크 **안으로** 들여오는 것이다. ② 서브태스크는
+   * 같은 워크스페이스를 고치므로 병렬은 쓰기 충돌을 만든다(Fleet이 구성원마다 worktree를
+   * 주는 이유이고, **서브태스크에는 그 격리가 없다**). ③ 병렬이 주는 것은 지연 단축인데
+   * 이 흐름의 지연은 이미 **사용자 게이트 둘이 지배한다.**
+   *
+   * 그래서 `tasks.phase`는 진행 중인 서브태스크의 phase다. **몇 번째인가는 phase가 아니라
+   * 이벤트와 counters가 말한다** — 파생 캐시에 인덱스를 얹지 않는다(원칙 7).
+   */
+  private async implementAndVerify(
+    plan: PlanOutline
+  ): Promise<{ kind: "final"; result: FinalResult } | { kind: "replan" }> {
+    // **단계 예약은 여기서 닫는다.** 열어 둔 채로 호출 예약이 겹치면 같은 돈이 두 번
+    // 잡혀 상한이 사실상 절반이 된다 — 이 예약이 하는 일은 승인 시점의 확인이고,
+    // 실제 강제는 그대로 호출 예약이 한다.
+    this.releaseImplementationStage("구현을 시작합니다 — 이제부터는 호출 예약이 강제합니다");
+    const subtasks = plan.subtasks ?? [];
+    const completed: string[] = [];
+
+    for (const [index, subtask] of subtasks.entries()) {
+      if (await this.cancelledHere()) {
+        return { kind: "final", result: await this.finish("cancelled", "구현 중 취소됨") };
+      }
+      const built = await this.implementSubtask(plan, subtask, index, subtasks.length, completed);
+      if (built.kind === "final") return built;
+      completed.push(subtask.intent);
+    }
+
+    return this.verifyReviewAndConfirm(plan);
+  }
+
+  /** 서브태스크 하나: `IMPLEMENTING → PLANNING → AWAITING_APPROVAL → EXECUTING`. */
+  private async implementSubtask(
+    plan: PlanOutline,
+    subtask: PlanSubtask,
+    index: number,
+    total: number,
+    completed: readonly string[]
+  ): Promise<{ kind: "ok" } | { kind: "final"; result: FinalResult }> {
+    const decision = this.approvedGrades.find((g) => g.subtaskId === subtask.subtaskId);
+    const grade: ModelGrade = decision?.final ?? "frontier";
+
+    await this.transition("IMPLEMENTING");
+    const picked = this.adapterForGrade(grade);
+    if (picked.kind === "none") {
+      return { kind: "final", result: await this.finish("failed", picked.reason, "provider_config_error") };
+    }
+    let adapter = picked.adapter;
+
+    const drafted = await this.callProvider(adapter, "executor", `impl:${subtask.subtaskId}`, (ctx) =>
+      adapter.generateDraft(
+        {
+          snapshot: this.snapshot!,
+          userMessage: this.input.taskRequest.userMessage,
+          ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
+          acceptanceCriteria: this.criteriaForPrompt(),
+          subtask: {
+            intent: subtask.intent,
+            files: subtask.files,
+            index: index + 1,
+            total,
+            planSummary: plan.summary,
+            completedIntents: [...completed],
+          },
+        },
+        ctx
+      )
+    );
+    if (drafted.kind === "final") return drafted;
+    let proposal = drafted.value;
+    this.implementerProviders.add(adapter.providerId);
+
+    // ---- 에스컬레이션 (72.10.2절) ----
+    const escalated = await this.maybeEscalate(proposal, subtask, grade, plan, index, total, completed);
+    if (escalated.kind === "final") return escalated;
+    if (escalated.kind === "replaced") {
+      proposal = escalated.proposal;
+      adapter = escalated.adapter;
+      this.implementerProviders.add(adapter.providerId);
+    }
+
+    await this.emitDraftReceived(proposal, {
+      replayed: false,
+      primary: true,
+      // **`criteria`를 넘기지 않는다**(72.2.2절). 넘기면 `acceptanceCriteriaReplaces`가 붙어
+      // 서브태스크 N개가 서로의 기준을 차례로 덮어쓰고 체크리스트에 마지막 하나만 남는다.
+    });
+
+    const mcp = await this.runMcpRound(proposal.mcpCalls);
+    if (mcp.kind === "final") return mcp;
+    // 도구를 부른 뒤 같은 서브태스크를 다시 구현한다. 상한은 `mcpRounds`가 이미 진다.
+    if (mcp.kind === "retry") return this.implementSubtask(plan, subtask, index, total, completed);
+
+    const patch = proposal.patch ?? "";
+    const ops = fileOps(proposal);
+    if (patch.trim().length === 0 && !hasFileOps(ops)) {
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          `서브태스크 "${subtask.intent}"에 적용할 변경이 없습니다.`,
+          "internal_invariant_violated"
+        ),
+      };
+    }
+
+    return this.executeSubtaskPatch(patch, ops, subtask);
+  }
+
+  /**
+   * 런타임 에스컬레이션 — 72.10.2절. **요청은 모델이, 허락은 카드가, 판정은 여기서.**
+   *
+   * 봉투를 넘으면 **거절하고 중간에 다시 묻지 않는다.** 그리고 **거절된 요청의 산출물은
+   * 그대로 쓴다** — 요청이 산출물에 실려 오므로 판정 시점에 초안은 이미 있고 이미 값을
+   * 치렀다. 원래 모델을 다시 부르면 어느 카운터도 세지 않는 호출이 하나 더 생기는데,
+   * **거절이 비용을 만드는 셈**이 된다.
+   *
+   * **거절도 이벤트로 남는다.** 남기지 않으면 "요청이 없었다"와 구별되지 않고, 72.14절의
+   * 계측이 분모 셋(요청/호출/거절) 중 하나를 잃는다 — 그러면 남발이 상한에 가려 보이지 않는다.
+   */
+  private async maybeEscalate(
+    proposal: DraftProposal,
+    subtask: PlanSubtask,
+    grade: ModelGrade,
+    plan: PlanOutline,
+    index: number,
+    total: number,
+    completed: readonly string[]
+  ): Promise<
+    | { kind: "none" }
+    | { kind: "replaced"; proposal: DraftProposal; adapter: ProviderAdapter }
+    | { kind: "final"; result: FinalResult }
+  > {
+    const request = proposal.escalationRequest;
+    const allowance = this.escalationAllowance;
+    if (!request || !allowance) return { kind: "none" };
+
+    const verdict = judgeEscalation({
+      request,
+      allowance,
+      calledSoFar: this.state.counters.escalationCalls,
+      currentGrade: grade,
+      spentUsd: this.budget?.outcome().spentUsd ?? null,
+    });
+
+    if (verdict.kind === "rejected") {
+      await this.emit("ESCALATION_REJECTED", {
+        subtaskId: subtask.subtaskId,
+        requestedGrade: request.proposedGrade,
+        reason: request.reason,
+        rejectedBecause: verdict.reason,
+        calledSoFar: this.state.counters.escalationCalls,
+        maxCalls: allowance.maxCalls,
+        // **그대로 쓴다**는 사실을 payload가 말한다 — 적지 않으면 나중에 "거절 뒤 무엇을
+        // 했는가"에 기록이 답하지 못한다.
+        proposalUsedAnyway: true,
+      });
+      return { kind: "none" };
+    }
+
+    const picked = this.adapterForGrade(verdict.grade);
+    if (picked.kind === "none") {
+      await this.emit("ESCALATION_REJECTED", {
+        subtaskId: subtask.subtaskId,
+        requestedGrade: request.proposedGrade,
+        reason: request.reason,
+        rejectedBecause: picked.reason,
+        proposalUsedAnyway: true,
+      });
+      return { kind: "none" };
+    }
+
+    this.state.counters.escalationCalls += 1;
+    const adapter = picked.adapter;
+    const redrafted = await this.callProvider(adapter, "executor", `impl-esc:${subtask.subtaskId}`, (ctx) =>
+      adapter.generateDraft(
+        {
+          snapshot: this.snapshot!,
+          userMessage: this.input.taskRequest.userMessage,
+          ...(this.answers.length > 0 ? { userAnswers: [...this.answers] } : {}),
+          acceptanceCriteria: this.criteriaForPrompt(),
+          subtask: {
+            intent: subtask.intent,
+            files: subtask.files,
+            index: index + 1,
+            total,
+            planSummary: plan.summary,
+            completedIntents: [...completed],
+          },
+        },
+        ctx
+      )
+    );
+    if (redrafted.kind === "final") return redrafted;
+
+    await this.emit("ESCALATION_CALLED", {
+      subtaskId: subtask.subtaskId,
+      fromGrade: grade,
+      toGrade: verdict.grade,
+      reason: request.reason,
+      model: adapter.modelId,
+      provider: adapter.providerId,
+      callNumber: this.state.counters.escalationCalls,
+      maxCalls: allowance.maxCalls,
+      // **결과를 바꿨는가**(72.14절). 요청이 늘 봉투를 채우는데 결과가 달라진 적이 없으면
+      // 그건 신호가 아니라 습관이다.
+      changedThePatch: (redrafted.value.patch ?? "").trim() !== (proposal.patch ?? "").trim(),
+    });
+    return { kind: "replaced", proposal: redrafted.value, adapter };
+  }
+
+  /**
+   * 서브태스크 하나의 patch를 실행한다 — `PLANNING → (프리플라이트) → AWAITING_APPROVAL → EXECUTING`.
+   *
+   * **`VERIFYING`이 여기 없다.** 검증은 서브태스크 전부가 끝난 뒤 한 번 돈다(72.11절) —
+   * 그래서 서브태스크별 `FIX_LOOP`가 존재하지 않고, 그 곱을 막는 상한도 필요 없다.
+   */
+  private async executeSubtaskPatch(
+    patch: string,
+    ops: FileOps | undefined,
+    subtask: PlanSubtask
+  ): Promise<{ kind: "ok" } | { kind: "final"; result: FinalResult }> {
+    await this.transition("PLANNING");
+    let plan: ExecutionPlan;
+    try {
+      plan = buildExecutionPlan({
+        taskId: this.taskId,
+        patch,
+        requestedBy: this.executorRequester(),
+        attempt: this.state.counters.fixLoopRounds,
+        moves: ops?.moves,
+        deletions: ops?.deletions,
+      });
+    } catch (error) {
+      if (error instanceof PlanningError || error instanceof ValidationError) {
+        // **서브태스크 경로에는 되돌아갈 초안 루프가 없다.** 여기서 `reviseRounds`를 태우면
+        // 실행 전 합의 예산이 조각 개수만큼 곱해진다(72.11절이 막는 바로 그 곱셈). 형태가
+        // 잘못된 patch는 이 조각의 실패이고, 되묻는 자리는 뒤의 체크리스트다.
+        return {
+          kind: "final",
+          result: await this.finish(
+            "failed",
+            `서브태스크 "${subtask.intent}"의 patch를 계획으로 변환하지 못했습니다: ${error.message}`,
+            "internal_invariant_violated"
+          ),
+        };
+      }
+      throw error;
+    }
+    await this.emit("PLAN_CREATED", {
+      planId: plan.planId,
+      subtaskId: subtask.subtaskId,
+      toolRequests: plan.toolRequests.map((r) => ({ requestId: r.requestId, tool: r.tool, args: describeArgs(r) })),
+      approvalRequired: plan.approvalRequired,
+      changedPaths: planPaths(plan),
+    });
+
+    const preflight = await this.preflightPlan(plan);
+    if (preflight.kind === "final") return preflight;
+    if (preflight.kind === "redraft") {
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          `서브태스크 "${subtask.intent}"의 계획을 게이트가 거부했습니다.`,
+          "policy_denied"
+        ),
+      };
+    }
+
+    // **진행바는 `실행`에 머물고 승인 모달이 그 위에 뜬다**(72.2.3절). `AWAITING_APPROVAL`은
+    // 이 경로에서 진행바의 칸이 아니다 — 서브태스크마다 반복되므로 칸으로 두면 진행바가
+    // 앞뒤로 움직인다. 그러나 phase 자체는 옮긴다: 화면이 승인 모달을 띄울 근거가 이것이다.
+    if (plan.approvalRequired) await this.transition("AWAITING_APPROVAL");
+    await this.transition("EXECUTING");
+
+    const execution = await this.executePlan(plan);
+    if (execution.kind === "final") return execution;
+    return { kind: "ok" };
+  }
+
+  /**
+   * 검증 → C → 검증 체크리스트 — 72.7·72.8절.
+   *
+   * **`VERIFYING`은 `complexityTier`와 무관하게 항상 실행된다**(원칙 1). C는 그것이
+   * **통과한 뒤에만** 돈다 — 깨진 코드에 C를 태우는 것은 돈만 쓴다.
+   */
+  private async verifyReviewAndConfirm(
+    plan: PlanOutline
+  ): Promise<{ kind: "final"; result: FinalResult } | { kind: "replan" }> {
+    for (;;) {
+      await this.transition("VERIFYING");
+      const report = await this.runVerification("post", this.state.counters.fixLoopRounds);
+      this.lastReport = report;
+      await this.evaluateCriteriaAgainst(report);
+
+      if (report.overall !== "pass") {
+        const handled = await this.handleFailedVerification(report);
+        if (handled.kind === "final") return handled;
+        continue; // FIX_LOOP를 돌았다 — 다시 검증한다
+      }
+
+      // ---- RESULT_REVIEWING (C) ----
+      const reviewed = await this.runResultReview(plan, report);
+      if (reviewed.kind === "final") return reviewed;
+
+      // ---- AWAITING_USER_VERIFICATION ----
+      const confirmed = await this.confirmWithUser(plan, report);
+      if (confirmed.kind !== "refix") return confirmed;
+      // refix — 체크리스트에서 `FIX_LOOP`로 되돌아간다(72.8 귀환 경로 1).
+      const refixed = await this.enterFixLoopFromChecklist(report);
+      if (refixed.kind === "final") return refixed;
+    }
+  }
+
+  /**
+   * 검증이 통과하지 못했다 — `FIX_LOOP`를 돌거나 끝낸다.
+   *
+   * **`fixLoopRounds`는 `FIX_LOOP`에 진입할 때마다 오른다**(72.11절). 종전 정의(*"`VERIFYING`
+   * → fail 판정 시"*)로는 72.8절 귀환 경로 1이 **영원히 카운터를 올리지 않는다** — 그 경로는
+   * 검증이 **통과한 뒤** 체크리스트에서 돌아오므로 fail 판정을 한 번도 만들지 않기 때문이다.
+   */
+  private async handleFailedVerification(
+    report: VerificationReport
+  ): Promise<{ kind: "final"; result: FinalResult } | { kind: "fixed" }> {
+    if (report.overall === "not_configured" || report.overall === "could_not_run") {
+      // 판정할 수 없었던 경우. 통과로 위장하지 않고 실패로도 몰지 않는다 — 고칠 근거가 없다.
+      const criteria = this.describeCriteria();
+      const explanation =
+        report.overall === "not_configured"
+          ? "이 프로젝트에서 실행할 수 있는 검증 명령이 없어 **검증되지 않았습니다**."
+          : "검증 명령을 **실행하지 못해** 검증되지 않았습니다.";
+      if (this.policy.unattended) {
+        return {
+          kind: "final",
+          result: await this.finish(
+            "failed",
+            `무인 실행이라 ${explanation} 검증되지 않은 결과를 완료로 보고하지 않습니다${criteria ? ` · ${criteria}` : ""}`,
+            "unverified_unattended"
+          ),
+        };
+      }
+      return {
+        kind: "final",
+        result: await this.finish("completed", `변경을 적용했으나 ${explanation}${criteria ? ` · ${criteria}` : ""}`),
+      };
+    }
+
+    for (const check of report.checks) {
+      if (check.status === "FAILED" || check.status === "TIMED_OUT") this.failedChecksAlongTheWay.push(check.kind);
+    }
+
+    this.state.counters.fixLoopRounds += 1;
+    await this.transition("FIX_LOOP");
+    if (this.state.counters.fixLoopRounds > this.policy.limits.fixLoopRounds) {
+      // **C를 부르지 않고 그대로 사용자에게 올린다**(72.7절) — 실패 원인은 검증 출력이
+      // 이미 말하고 있고, 깨진 코드에 C를 태우는 것은 돈만 쓴다.
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          `검증이 ${this.policy.limits.fixLoopRounds}회 재시도 후에도 실패했습니다. 변경사항은 그대로 남아 있으며 되돌릴 수 있습니다.`,
+          "fix_loop_exhausted"
+        ),
+      };
+    }
+    await this.emit("FIX_LOOP_STARTED", {
+      attempt: this.state.counters.fixLoopRounds,
+      max: this.policy.limits.fixLoopRounds,
+      enteredFrom: "verification_failed",
+      newlyFailing: report.newlyFailing ?? null,
+      preexistingFailures: report.preexistingFailures ?? null,
+    });
+
+    const fixed = await this.requestFix(report);
+    if (fixed.kind === "final") return fixed;
+    return this.applyFixPatch(fixed.patch);
+  }
+
+  /**
+   * 체크리스트에서 `FIX_LOOP`로 되돌아왔다 — 72.8절 귀환 경로 1.
+   *
+   * **검증은 통과한 상태다.** 그래서 이 진입은 "검증이 실패해서 온 것"과 구별되어야 하고,
+   * 그 구별이 payload에 없으면 집계가 "검증 실패 횟수"로 이것을 센다.
+   */
+  private async enterFixLoopFromChecklist(
+    report: VerificationReport
+  ): Promise<{ kind: "final"; result: FinalResult } | { kind: "fixed" }> {
+    this.state.counters.fixLoopRounds += 1;
+    await this.transition("FIX_LOOP");
+    if (this.state.counters.fixLoopRounds > this.policy.limits.fixLoopRounds) {
+      // **막다른 길을 만들지 않는다**(72.11절). 상한에 걸린 자리가 체크리스트이므로 남는
+      // 선택지는 "되돌리고 종료"다 — 그 사실을 말하고 끝낸다.
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          `다시 고치기 상한(${this.policy.limits.fixLoopRounds}회)을 다 썼습니다. 변경사항은 그대로 남아 있으며 되돌릴 수 있습니다.`,
+          "fix_loop_exhausted"
+        ),
+      };
+    }
+    await this.emit("FIX_LOOP_STARTED", {
+      attempt: this.state.counters.fixLoopRounds,
+      max: this.policy.limits.fixLoopRounds,
+      enteredFrom: "verification_checklist",
+      newlyFailing: null,
+      preexistingFailures: null,
+    });
+    const fixed = await this.requestFix(report);
+    if (fixed.kind === "final") return fixed;
+    return this.applyFixPatch(fixed.patch);
+  }
+
+  /** fix loop가 낸 patch를 적용한다. 서브태스크 경로와 같은 실행 단계를 지난다. */
+  private async applyFixPatch(patch: string): Promise<{ kind: "final"; result: FinalResult } | { kind: "fixed" }> {
+    const applied = await this.executeSubtaskPatch(patch, undefined, {
+      subtaskId: "fix-loop",
+      intent: "검증 실패를 고친다",
+      files: [],
+      // **가장 높은 등급으로 돈다**(이관 문서 ②). 검증은 태스크 전체에 대해 한 번 돌고,
+      // 실패가 어느 서브태스크의 것인지 결정론적으로 가를 수 없다 — 파일 단위 귀속을
+      // 시도하면 "계획에 없던 파일"(72.7절 `unplanned`)에 답이 없다. 위험 하한선이 이미
+      // "내려가지 않는다"를 정했고, 실패를 고치는 자리에서 그것을 뒤집을 이유가 없다.
+      proposedGrade: "frontier",
+    });
+    if (applied.kind === "final") return applied;
+    return { kind: "fixed" };
+  }
+
+  /**
+   * C — 결과 검토 (72.7절). **코드 리뷰를 하지 않는다.** 범위는 하나다:
+   * *"구현된 것이 사용자가 승인한 계획과 일치하는가?"*
+   *
+   * 범위를 좁히는 것이 이 단계의 설계 전부다. 열어 두면 게이트가 잰 그 자리(완성된 patch를
+   * 보는 검수자)로 되돌아가고, 같은 결과를 기대할 이유가 없다.
+   *
+   * # 구현자 집합으로 **다시** 판정한다
+   *
+   * 라우터의 배정은 executor 하나만 보고 한 잠정 판정이다(21.6절). 등급별 배정과
+   * 에스컬레이션이 실제 구현자를 늘리므로, 여기서 `implementerProviders`로 다시 본다 —
+   * 그래서 기록에 `assigned*`와 `actual*`이 둘 다 남는다.
+   */
+  private async runResultReview(
+    plan: PlanOutline,
+    report: VerificationReport
+  ): Promise<{ kind: "done" } | { kind: "final"; result: FinalResult }> {
+    const assigned = this.requireAdapters().resultReviewer;
+    const independentOfImplementers = assigned && !this.implementerProviders.has(assigned.providerId);
+
+    if (!assigned || !independentOfImplementers) {
+      this.resultReviewRan = false;
+      await this.emit("RESULT_REVIEW_COMPLETED", {
+        ran: false,
+        reason: assigned
+          ? `result_review_dropped:implementer_provider(${assigned.providerId}) — 배정된 결과 검토자가 ` +
+            "코드를 쓴 공급자에 포함되어 드롭했습니다. 등급별 배정이나 에스컬레이션이 구현자를 " +
+            "늘리면 라우터의 잠정 배정이 뒤집힙니다(21.6절 불변식 C)."
+          : (this.routing?.appliedPolicies.find((p) => p.startsWith("result_review_dropped")) ??
+            "result_review_dropped"),
+        assignedResultReviewerModel: this.routing?.assignedResultReviewer?.modelId ?? null,
+        actualResultReviewerModel: null,
+        implementerProviders: [...this.implementerProviders],
+        // **결정론적 절반은 그대로 동작한다**(72.7절) — 체크리스트가 범위 이탈 파일을 낸다.
+        deterministicHalfStillRuns: true,
+      });
+      return { kind: "done" };
+    }
+
+    await this.transition("RESULT_REVIEWING");
+    if (await this.cancelledHere()) {
+      return { kind: "final", result: await this.finish("cancelled", "결과 검토 중 취소됨") };
+    }
+
+    const snapshot = await this.snapshotForPrompt();
+    const review = await this.callProvider(assigned, "resultReviewer", "result-review:1", (ctx) =>
+      assigned.reviewProposal(
+        {
+          snapshot,
+          userMessage: this.input.taskRequest.userMessage,
+          // **C가 보는 것은 원칙적으로 정의된 blind다**(72.7절): 승인된 계획과 최종 diff와
+          // 검증 출력과 기준 목록. 주지 않는 것은 계획자의 `interpretation`·`rationale`,
+          // B의 검토 서술, 앞 단계 모델의 이름이다.
+          //
+          // 4.1절이 blind를 철회한 근거는 **"정보를 숨긴 대가"**였는데 — blind는 세 케이스를
+          // 전부 REJECT하고 아무것도 만들지 않았다 — **C는 수리하지 않으므로 그 대가가
+          // 발생하지 않는다.** 숨기는 것은 모델의 산문이고 보여주는 것은 사용자가 승인한 것이다.
+          draft: planAsReviewSubject(plan),
+          blind: true,
+          acceptanceCriteria: this.criteriaForPrompt(),
+        },
+        ctx
+      )
+    );
+    if (review.kind === "final") return review;
+
+    this.resultReviewRan = true;
+    // **C는 태스크를 실패시키지 못하고, `unverified`를 `verified`로 바꾸지도 못한다**(72.7절).
+    // 그래서 verdict를 판정으로 쓰지 않고 지목만 꺼낸다.
+    const issues = collectPlanReviewIssues(review.value);
+    this.flaggedCriterionIds = matchCriterionIds(issues, this.acceptanceCriteria);
+
+    await this.emit("RESULT_REVIEW_COMPLETED", {
+      ran: true,
+      model: review.value.model,
+      independence: this.routing?.resultReviewIndependence ?? "not_applicable",
+      assignedResultReviewerModel: this.routing?.assignedResultReviewer?.modelId ?? null,
+      actualResultReviewerModel: assigned.modelId,
+      implementerProviders: [...this.implementerProviders],
+      // 72.14절 계측: C가 올린 항목 수. 사용자가 그중 몇을 문제로 봤는지는 체크리스트의
+      // 답이 말한다.
+      raisedCount: issues.length,
+      raised: issues,
+      flaggedCriterionCount: this.flaggedCriterionIds.length,
+      verificationOverall: report.overall,
+      // **판정이 아니다**를 payload가 말한다. verdict를 남기되 그것이 태스크의 결말을 바꾸지
+      // 않았다는 사실을 같이 적는다 — 적지 않으면 나중에 이 값이 판정으로 읽힌다.
+      verdict: review.value.verdict,
+      verdictIsAdvisoryOnly: true,
+    });
+    return { kind: "done" };
+  }
+
+  /**
+   * 검증 체크리스트 게이트 — 72.8절. 사용자 게이트 ②.
+   *
+   * **타임아웃이 없다**(72.12절). 무응답은 거부가 아니라 대기이고, 태스크는 앱을 다시 켜도
+   * 그 자리에 있다 — 점심 먹으러 간 사이에 작업이 사라지는 것은 사용자가 고른 적 없는 결말이다.
+   */
+  private async confirmWithUser(
+    plan: PlanOutline,
+    report: VerificationReport
+  ): Promise<{ kind: "final"; result: FinalResult } | { kind: "replan" } | { kind: "refix" }> {
+    const unplanned = unplannedPaths(plan.filesToChange, this.mutatedPaths);
+    const card = buildVerificationChecklist({
+      criteria: this.acceptanceCriteria,
+      evaluations: this.criterionEvaluations,
+      flaggedCriterionIds: this.flaggedCriterionIds,
+      unplannedPaths: unplanned,
+      resultReviewRan: this.resultReviewRan,
+      planReviewSkipped: this.planReviewSkipped,
+      extraNotes: this.unresolvedDisagreements.length > 0 ? [...this.unresolvedDisagreements] : [],
+    });
+
+    await this.transition("AWAITING_USER_VERIFICATION");
+    const response = await this.requestUserGate({ gate: "verification", taskId: this.taskId, card });
+    const settled = await this.settleGateResponse(response, "검증 확인");
+    if (settled.kind === "final") return settled;
+
+    switch (settled.choice as VerificationChoice) {
+      case "approve": {
+        // 검증을 통과한 **뒤에만** 커밋한다(원칙 1). 그리고 사용자 확인 뒤다.
+        const commit = await this.maybeCommit(report);
+        return { kind: "final", result: await this.finish("completed", this.describeSuccess(report, commit)) };
+      }
+      case "refix":
+        return { kind: "refix" };
+      case "replan":
+        if (this.state.counters.planRounds >= this.policy.limits.planRounds) {
+          return {
+            kind: "final",
+            result: await this.finish(
+              "failed",
+              `계획을 다시 세우는 상한(${this.policy.limits.planRounds}회)을 넘었습니다. 변경사항은 그대로 남아 있으며 되돌릴 수 있습니다.`,
+              "revise_exhausted"
+            ),
+          };
+        }
+        this.state.counters.planRounds += 1;
+        // **승인이 무효화된다.** 쟁점과 검토 지문도 함께 버린다 — 새 계획에 옛 지적이 붙으면
+        // 사용자가 이미 지나온 자리를 다시 읽는다.
+        this.approvedPlan = null;
+        this.planReviewIssues = [];
+        this.reviewedPlanFingerprint = null;
+        this.issuesShownFor = null;
+        return { kind: "replan" };
+      case "revert_and_stop":
+        // **터미널은 `REJECTED`다**(72.8절). 사용자가 중단한 것이 아니라 **결과를 거부한
+        // 것**이라 `CANCELLED`가 아니고, 실패한 것이 없어 `FAILED`도 아니다.
+        // 되돌리기는 Rust가 게이트 왕복 안에서 수행한다 — 파일을 되돌리는 것은 신뢰 경계의
+        // 일이고, Node가 "되돌렸다"를 만들어낼 수 없어야 한다(원칙 2).
+        return {
+          kind: "final",
+          result: await this.finishRejected("사용자가 결과를 거부하고 변경을 되돌렸습니다"),
+        };
+    }
+  }
+
+  // ---- `standard` 흐름의 보조 ----
+
+  /**
+   * 등급에 맞는 구현 어댑터를 고른다 — 72.10절.
+   *
+   * 라우터가 잡은 것은 **기본 구현 모델**이다. 서브태스크는 계획의 산출물이라 라우팅 시점에
+   * 존재하지 않으므로(72.2.2절), 등급별 배정은 승인 뒤인 여기서 한다.
+   */
+  private adapterForGrade(
+    grade: ModelGrade
+  ): { kind: "adapter"; adapter: ProviderAdapter } | { kind: "none"; reason: string } {
+    const cached = this.gradeAdapters.get(grade);
+    if (cached) return { kind: "adapter", adapter: cached };
+
+    const candidates = this.registry
+      .available(this.input.availableProviders, {
+        allowOrgVerified: this.deps.routerOptions?.allowOrgVerified,
+        ...(this.deps.routerOptions?.enabledCliVendors
+          ? { enabledCliVendors: this.deps.routerOptions.enabledCliVendors }
+          : {}),
+      })
+      .filter((e) => e.grade === grade);
+
+    if (candidates.length === 0) {
+      // **등급을 못 채우면 기본 구현 모델로 간다.** 태스크를 죽이지 않는 이유는 그 등급이
+      // 승인 카드에 적혀 있었기 때문이다 — 사용자가 본 것과 달라졌다는 사실은 이벤트가
+      // 말하고, 여기서 멈추면 "쓸 수 있는 모델이 있는데 안 돈다"가 된다.
+      const fallback = this.adapters?.executor;
+      if (!fallback) return { kind: "none", reason: `등급 ${grade}의 모델도 기본 구현 모델도 없습니다` };
+      void this.emit("PHASE_CHANGED_NOTE", {
+        note: `등급 ${grade}에 해당하는 모델이 없어 기본 구현 모델(${fallback.modelId})로 진행합니다`,
+        grade,
+      });
+      this.gradeAdapters.set(grade, fallback);
+      return { kind: "adapter", adapter: fallback };
+    }
+
+    const entry = candidates[0]!;
+    try {
+      const adapter = createRoleAdapters(
+        [
+          {
+            role: "executor",
+            modelId: entry.modelId,
+            providerId: entry.providerId,
+            reason: `등급 ${grade} 배정(72.10절)`,
+          },
+        ],
+        (modelId) => this.registry.get(modelId),
+        this.deps.adapterOptions
+      ).executor;
+      this.gradeAdapters.set(grade, adapter);
+      return { kind: "adapter", adapter };
+    } catch (error) {
+      return { kind: "none", reason: `등급 ${grade}의 어댑터를 만들지 못했습니다: ${errorMessage(error)}` };
+    }
+  }
+
+  /** 사용자 게이트 왕복 — **Rust가 소유한다**(72.4절). Node는 "이 카드로 물어 달라"만 말한다. */
+  private async requestUserGate(request: UserGateRequestParams): Promise<UserGateResponse> {
+    return this.deps.transport.request<UserGateResponse>("gate.userDecision", request);
+  }
+
+  /**
+   * 게이트 응답에서 선택지를 꺼내거나 태스크를 끝낸다.
+   *
+   * **`unattended`를 거부로 뭉개지 않는다.** 뭉개면 최종 보고가 "사용자가 거부했다"고
+   * 거짓말하는데 사용자는 아무것도 거부한 적이 없다(24절). 그 결과 **Autopilot의 실질
+   * 범위가 `simple` 태스크로 좁아진다** — 부작용이 아니라 이 흐름의 정의에서 따라 나온다.
+   */
+  private async settleGateResponse(
+    response: UserGateResponse,
+    label: string
+  ): Promise<{ kind: "choice"; choice: string } | { kind: "final"; result: FinalResult }> {
+    if (response.outcome === "plan" || response.outcome === "verification") {
+      return { kind: "choice", choice: response.choice };
+    }
+    if (response.outcome === "unattended") {
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          `${label} 게이트에서 멈췄습니다 — 무인 실행에는 승인할 사람이 없습니다. ` +
+            "자동 승인하지 않습니다(72.12절): 이 흐름의 사용자 권위가 사라지기 때문입니다.",
+          "unattended_stop"
+        ),
+      };
+    }
+    return {
+      kind: "final",
+      result: await this.finish(
+        "failed",
+        `${label} 게이트를 사용자에게 전달하지 못했습니다: ${response.reason}`,
+        "internal_invariant_violated"
+      ),
+    };
+  }
+
+  /**
+   * 승인된 계획의 완료 기준을 `plan_outline` 출처로 승격한다 — 72.2.1절.
+   *
+   * **구현 모델의 `doneCriteria`는 승격되지 않는다**(72.2.2절). 이 경로에서 기준을 정한 것은
+   * 사용자가 승인한 계획이고, 구현 모델은 그 기준을 **받아서 일하는 쪽**이다.
+   */
+  private async absorbPlanCriteria(plan: PlanOutline): Promise<void> {
+    const texts = [...(plan.doneCriteria ?? []), ...(plan.requiredTests ?? [])];
+    const added: AcceptanceCriterion[] = [];
+    for (const text of texts) {
+      const trimmed = text.trim();
+      if (trimmed.length === 0) continue;
+      if (this.acceptanceCriteria.some((c) => c.source === "plan_outline" && c.text === trimmed)) continue;
+      added.push({
+        criterionId: `${this.taskId}-plan-${this.acceptanceCriteria.length + added.length + 1}`,
+        text: trimmed,
+        source: "plan_outline",
+        decidedAt: new Date().toISOString(),
+      });
+    }
+    if (added.length === 0) return;
+    this.acceptanceCriteria.push(...added);
+    // **파생 캐시는 이벤트가 갱신한다**(원칙 7). `acceptanceCriteria`가 payload에 있으면
+    // Rust가 이벤트를 기록하는 **같은 트랜잭션 안에서** 캐시를 반영한다 — 이벤트 없이
+    // 테이블만 갱신하는 경로를 만들지 않기 위한 장치다.
+    //
+    // **`acceptanceCriteriaReplaces`를 달지 않는다.** 계획을 다시 세우면 새 기준이 쌓이지만
+    // 사용자 판정(`user_decision`)은 그 위에서 살아남아야 하고, 이 승격은 `plan_outline`
+    // 출처 안에서만 중복을 거른다(위 루프).
+    await this.emit("PHASE_CHANGED_NOTE", {
+      note: "승인된 계획의 완료 기준을 기준으로 승격했습니다 (plan_outline)",
+      acceptanceCriteria: added,
+    });
+  }
+
+  /** 계획자의 등급. 배정이 없으면 `unmeasured`로 본다 — 모르는 것을 좋게 읽지 않는다. */
+  private plannerGrade(): ModelGrade {
+    const planner = this.routing?.assignments.find((a) => a.role === "planner");
+    if (!planner) return "unmeasured";
+    return this.registry.get(planner.modelId)?.grade ?? "unmeasured";
+  }
+
+  /** effort 손잡이가 없는 배정들 — 21.4절이 요구한 공개. 카드가 이 사실을 적는다. */
+  private effortIgnoredBy(): string[] {
+    const seen = new Set<string>();
+    for (const a of this.routing?.assignments ?? []) {
+      const entry = this.registry.get(a.modelId);
+      // `effort.kind === "none"`이 **손잡이가 없다**는 뜻이다(21.4절). 엔트리를 못 찾은
+      // 경우는 여기 넣지 않는다 — 모르는 것을 "없다"로 적으면 화면이 확인되지 않은 사실을
+      // 단언한다.
+      if (entry && entry.effort.kind === "none") seen.add(a.modelId);
+    }
+    return [...seen].sort();
+  }
+
+  /**
+   * 구현·검토 예산을 **승인 시점에** 잡는다 — 72.12절.
+   *
+   * 카드가 보여준 금액 그대로를 예약한다. **환산되지 않는 배정은 더하지 않는다** — 0으로
+   * 합산하면 카드가 거짓을 말하는 것과 같은 이유로, 예약도 없는 금액을 잡는 셈이 된다.
+   *
+   * 예약하지 못하면 **여기서 멈춘다.** 승인한 작업이 구현 중간에 돈이 없어 죽는 것보다
+   * 시작 전에 이유를 말하는 편이 낫다(`callPlan.ts`가 적은 그 실패). 사용자는 상한을
+   * 올리고 다시 시작할 수 있다.
+   */
+  private async reserveImplementationStage(
+    card: PlanApprovalCard
+  ): Promise<{ kind: "ok" } | { kind: "final"; result: FinalResult }> {
+    // 이미 열려 있으면 닫고 다시 연다 — 금액이 달라졌을 수 있다.
+    this.releaseImplementationStage("승인을 다시 받았습니다 — 금액을 다시 잡습니다");
+    const envelope = card.escalation.budgetUsd ?? 0;
+    const amount = card.estimatedCostUsd + envelope;
+    if (amount <= 0) {
+      // 계량 과금되는 배정이 없다. **잡을 것이 없는 것과 못 잡은 것은 다르다** —
+      // 0을 예약해 "확인했다"로 만들지 않는다.
+      return { kind: "ok" };
+    }
+    const staged = this.budget?.reserveStage(amount, "plan-approval:implementation");
+    if (staged && !staged.ok) {
+      return {
+        kind: "final",
+        result: await this.finish(
+          "failed",
+          `승인하신 계획의 예상 비용을 예산에 잡을 수 없습니다: ${staged.reason}`,
+          "budget_exceeded"
+        ),
+      };
+    }
+    this.implementationReservation = staged?.reservation ?? null;
+    return { kind: "ok" };
+  }
+
+  private releaseImplementationStage(reason: string): void {
+    if (!this.implementationReservation) return;
+    this.budget?.releaseStage(this.implementationReservation, reason);
+    this.implementationReservation = null;
+  }
+
+  private requireRouting(): RoutingDecision {
+    if (!this.routing) throw new Error("라우팅이 아직 결정되지 않았습니다");
+    return this.routing;
+  }
+
   /** 답을 실어 종료한다. `finish`를 지나므로 "정확히 한 번" 규칙과 취소 경쟁 처리를 공유한다. */
   private async finishAnswered(answer: QuestionAnswer): Promise<FinalResult> {
     this.pendingAnswer = answer;
@@ -3318,6 +4674,112 @@ function reviewedFileOps(proposal: DraftProposal, decision: ReviewDecision): Fil
 /** 초안/수정 결과에서 patch 밖 조작만 꺼낸다. 두 경로가 같은 값을 만들도록 한 곳에 둔다. */
 function fileOps(source: { moves?: FileMove[]; deletions?: string[] }): FileOps {
   return { moves: source.moves, deletions: source.deletions };
+}
+
+/** `gate.userDecision`의 params. Rust의 `UserGateRequest`와 **같은 모양이어야 한다**(72.4절). */
+type UserGateRequestParams =
+  | { gate: "plan"; taskId: string; card: PlanApprovalCard }
+  | { gate: "verification"; taskId: string; card: VerificationChecklistCard };
+
+/**
+ * 계획의 **지문** — 72.5절과 같은 재료를 쓴다.
+ *
+ * B를 다시 부를지(72.11절)와 쟁점을 다시 보여줄지가 이 값으로 갈린다. **실행에 영향을 주는
+ * 필드만 넣는다**: 요약과 서술이 바뀌었다고 다시 검토할 이유가 없고, 넣으면 모델이 문장을
+ * 다듬을 때마다 B 호출이 하나씩 늘어난다.
+ */
+function planFingerprint(plan: PlanOutline): string {
+  const material = JSON.stringify({
+    steps: plan.steps.map((s) => ({ intent: s.intent, files: [...s.files].sort() })),
+    filesToChange: [...plan.filesToChange].sort(),
+    doneCriteria: [...(plan.doneCriteria ?? [])].sort(),
+    requiredTests: [...(plan.requiredTests ?? [])].sort(),
+    subtasks: (plan.subtasks ?? []).map((s) => ({
+      intent: s.intent,
+      files: [...s.files].sort(),
+      proposedGrade: s.proposedGrade,
+    })),
+  });
+  // 암호학적 요구가 없다 — 필요한 것은 "같은 계획인가"뿐이고, 이 값은 어디에도 권한을
+  // 주지 않는다(승인의 권한은 Rust가 찍는 워크스페이스 지문이 진다).
+  let hash = 0;
+  for (let i = 0; i < material.length; i += 1) hash = (Math.imul(31, hash) + material.charCodeAt(i)) | 0;
+  return `plan-${(hash >>> 0).toString(16).padStart(8, "0")}-${material.length}`;
+}
+
+/**
+ * 계획을 검토 어댑터가 받는 모양으로 감싼다 — B와 C가 같은 `reviewProposal` 입구를 쓴다.
+ *
+ * **patch 자리는 비어 있다.** 계획에는 patch가 없고(53.5절), 있는 척하면 검토자가 없는
+ * 코드를 판정한다. 그래서 `plan`에 단계를 싣고 `doneCriteria`·`requiredTests`를 그대로 옮긴다 —
+ * 검토 대상이 **계획**이라는 사실이 payload에서 드러나야 한다.
+ */
+function planAsReviewSubject(plan: PlanOutline): DraftProposal {
+  return {
+    taskId: plan.taskId,
+    proposalId: `${plan.taskId}-plan`,
+    interpretation: plan.summary,
+    relevantFiles: plan.filesToChange.map((path) => ({ path, reason: "계획이 건드릴 것으로 본 파일" })),
+    plan: plan.steps.map((step, i) => ({
+      stepId: `plan-step-${i + 1}`,
+      description: step.intent,
+      targetPaths: step.files,
+    })),
+    risks: plan.risks,
+    requiredTests: plan.requiredTests ?? [],
+    uncertainties: plan.openQuestions,
+    doneCriteria: plan.doneCriteria ?? [],
+    model: plan.model,
+    createdAt: plan.createdAt,
+  };
+}
+
+/**
+ * 검토 결과에서 **쟁점만** 꺼낸다 — 72.6·72.7절.
+ *
+ * **verdict를 판정으로 쓰지 않는다.** B의 산출물은 verdict가 아니라 쟁점 목록이고(72.6절),
+ * C는 태스크를 실패시키지 못한다(72.7절). 모델이 판정하지 않고 쟁점을 발굴한다는
+ * product-strategy 16절 그대로다.
+ *
+ * `ACCEPT`이면서 할 말이 있는 경우도 있으므로 verdict로 걸러내지 않는다 — 걸러내면 "괜찮은데
+ * 이건 봐 두세요"가 사라진다.
+ */
+function collectPlanReviewIssues(decision: ReviewDecision): string[] {
+  const issues: string[] = [];
+  for (const q of decision.questionsForUser ?? []) {
+    const t = q.trim();
+    if (t.length > 0) issues.push(t);
+  }
+  if (decision.rejectionReason && decision.rejectionReason.trim().length > 0) {
+    issues.push(decision.rejectionReason.trim());
+  }
+  // `ACCEPT`의 rationale은 "문제 없음"인 경우가 대부분이라 쟁점으로 올리지 않는다.
+  if (decision.verdict !== "ACCEPT" && decision.rationale.trim().length > 0) {
+    issues.push(decision.rationale.trim());
+  }
+  return [...new Set(issues)];
+}
+
+/**
+ * C가 올린 쟁점이 **어느 기준을 지목했는가** — 72.8절의 `flagged_by_review`.
+ *
+ * 텍스트 포함으로 잇는다. 모델에게 기준 id를 달라고 하면 없는 id를 지어내고, 그러면 화면이
+ * 존재하지 않는 항목을 경고한다. **이을 수 없으면 잇지 않는다** — 지목되지 않은 기준은
+ * `unverified`로 남고, 그건 거짓이 아니다.
+ */
+function matchCriterionIds(issues: readonly string[], criteria: readonly AcceptanceCriterion[]): string[] {
+  const matched = new Set<string>();
+  const haystack = issues.map((i) => i.toLowerCase());
+  for (const c of criteria) {
+    const needle = c.text.trim().toLowerCase();
+    if (needle.length === 0) continue;
+    if (haystack.some((i) => i.includes(needle))) matched.add(c.criterionId);
+  }
+  return [...matched];
+}
+
+function sameStrings(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
 type PathOutcome =

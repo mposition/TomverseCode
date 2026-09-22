@@ -172,6 +172,13 @@ impl Enrollment<'_> {
             // **객체가 있다는 것 자체가 "기록됐다"이다.** 값이 `null`인 것과 키가 없는 것을
             // 화면이 구별해야 하므로, 두 값을 최상위에 흩뿌리지 않고 한 객체로 묶는다.
             "caps": self.caps,
+            // 구성원이 도는 **경로의 종류** — state-machine 72.2.3절.
+            //
+            // Fleet은 변경 태스크를 병렬로 돌리는 장치다: `MemberSpec`에 종류 축이 없고,
+            // 질문이나 계획 모드를 N개 띄우는 입구도 없다. 그래도 **값으로 적는다** —
+            // 화면의 단계 매핑이 `(kind, complexityTier)`를 받으므로, 적지 않으면 화면이
+            // 기본값을 추측하게 되고 그 추측은 종류 축이 늘어나는 날 조용히 틀린다.
+            "kind": "change",
         });
         let object = payload.as_object_mut().expect("방금 만든 객체");
         if let Some(reserved) = self.reserved_usd {
@@ -550,6 +557,12 @@ pub struct MemberStatus {
     /// `completed`|`failed`|`cancelled`|`rejected`|`interrupted`|`not_started`|`running`|`unknown`
     pub status: String,
     pub phase: String,
+    /// 이 구성원이 도는 경로 — `phaseToStage`의 선택자(72.2.3절). 기록에 없으면 `change`다.
+    pub kind: String,
+    /// TRIAGE의 판정. **`None`은 "아직 판정 전"이지 `simple`이 아니다** — 뭉개면 시작 직후의
+    /// 구성원이 전부 짧은 진행바로 그려진다.
+    #[serde(rename = "complexityTier")]
+    pub complexity_tier: Option<String>,
     /// **이 구성원 하나의 지출.** 합계가 아니다 — 이름이 그것을 말한다.
     pub cost_usd: f64,
     /// 가격을 모르는 모델로 나간 호출 수. 있으면 위 금액은 **하한이다.**
@@ -640,6 +653,8 @@ pub fn collect_status(
             fleet_size: row.fleet_size,
             admitted: row.admitted,
             phase: row.phase,
+            kind: row.kind,
+            complexity_tier: row.complexity_tier,
             cost_usd,
             unpriced_calls: unpriced,
             reserved_usd: row.reserved_usd,

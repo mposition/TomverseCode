@@ -14,6 +14,14 @@
 import type { CredentialStoreInfo, ProviderCredential } from "./lib/credentialDraft";
 export type { CredentialStoreInfo, CredentialSource, ProviderCredential } from "./lib/credentialDraft";
 
+/**
+ * TRIAGE의 판정 — `standard`가 72절 흐름 전체를 켠다.
+ *
+ * **`RoutingInfo`에서 끌어내 이름을 준다.** 화면의 단계 순서가 이 축으로 갈리므로
+ * (72.2.3절) 인라인 리터럴로 두면 그 사실이 타입에 남지 않는다.
+ */
+export type ComplexityTier = "simple" | "standard";
+
 export type TaskPhase =
   | "CREATED"
   | "SNAPSHOTTING"
@@ -92,8 +100,28 @@ export type UserStage =
    * 통일한다.
    */
   | "답변함"
-  /** 계획 경로 (53절). */
+  /** 계획 경로 (53절), 그리고 `standard` 개발 흐름의 첫 칸 (72.2.3절). */
   | "계획"
+  /**
+   * `standard` 흐름의 사용자 게이트 ① — 72.4절.
+   *
+   * **"승인 대기"와 다른 칸이다.** 그쪽은 **도구 실행** 승인이고 이쪽은 **계획** 승인이다 —
+   * 사용자가 답하는 질문이 "이 명령을 실행해도 되는가"와 "이게 내가 원하는 것인가"로
+   * 완전히 다르다. 같은 단어로 그리면 사용자가 무엇을 승인하는지 화면에서 사라진다.
+   */
+  | "계획 승인"
+  /** B — 계획 독립 검토 (72.6절). 코드를 쓰기 **전**이라 "검수"와 시점이 다르다. */
+  | "계획 검토"
+  /** C — 결과 검토 (72.7절). 범위가 "승인된 계획과 일치하는가" 하나로 좁다. */
+  | "결과 검토"
+  /**
+   * `standard` 흐름의 사용자 게이트 ② — 72.8절.
+   *
+   * **"확인 필요"에 접지 않는다.** 그쪽은 **모델이 막혀서 묻는 것**이고 이쪽은 **끝났으니
+   * 확인해 달라는 것**이다 — 51절이 답변과 완료를 가른 것과 같은 구별이며, 접으면 사용자가
+   * 둘 중 어느 쪽인지 모른 채 화면을 연다.
+   */
+  | "최종 확인"
   /**
    * 계획 경로의 종착 — **"완료"도 "답변함"도 아니다** (53절).
    *
@@ -116,54 +144,159 @@ export const QUESTION_STAGE_ORDER: UserStage[] = ["준비 중", "답변", "답�
 /** 계획 경로의 단계 (53절). 질문과 같은 모양이고, 같은 이유로 변경 경로를 빌리지 않는다. */
 export const PLAN_STAGE_ORDER: UserStage[] = ["준비 중", "계획", "계획 나옴"];
 
-/** 이 태스크가 밟는 단계들. `kind`가 정한다 — phase로 추측하면 시작 시점에 알 수 없다. */
-export function stagesFor(kind: TaskKind): UserStage[] {
+/**
+ * `standard` 개발 흐름의 단계 (state-machine 72.2.3절).
+ *
+ * **기존 순서에 끼워 넣을 수 없다** — 같은 칸이 두 번 나타나기 때문이다(승인이 둘, 검토가
+ * 둘). 단계 목록은 진행 막대이므로 같은 칸을 두 번 지나면 사용자는 **되돌아간 것으로 읽는다.**
+ * 질문·계획 경로가 각자 순서를 갖는 것과 같은 이유다.
+ */
+export const STANDARD_STAGE_ORDER: UserStage[] = [
+  "준비 중",
+  "계획",
+  "계획 승인",
+  "계획 검토",
+  "실행",
+  "검증",
+  "결과 검토",
+  "최종 확인",
+  "완료",
+];
+
+/**
+ * 순서가 확정되기 **전에** 그릴 수 있는 칸 — 72.2.3절.
+ *
+ * `change` 경로의 순서를 가르는 축은 `kind`가 아니라 **`complexityTier`이고, 그건 TRIAGE가
+ * 끝나야 안다.** `stagesFor`가 빌려온 장치("`kind`가 정한다")의 전제가 여기서 깨진다.
+ *
+ * 깨지지 않게 하는 사실이 하나 있다: **모든 순서가 `준비 중`으로 시작한다.** `CREATED` ·
+ * `SNAPSHOTTING` · `TRIAGE`가 전부 그 단계이므로, 순서가 확정되기 전에 화면이 그려야 하는
+ * 칸은 어느 순서를 골라도 같다 — 그래서 선택을 미뤄도 **틀린 것을 그리는 구간이 없다.**
+ */
+export const PENDING_TIER_STAGE_ORDER: UserStage[] = ["준비 중"];
+
+/**
+ * 이 태스크가 밟는 단계들.
+ *
+ * 선택자는 **`(kind, complexityTier)`**다. `kind`가 `question`/`plan`이면 tier와 무관하게
+ * 기존 순서이므로 시작 시점에 확정되고, 미뤄지는 것은 `change` 경로 하나뿐이다(72.2.3절).
+ */
+export function stagesFor(kind: TaskKind, complexityTier: ComplexityTier | null = null): UserStage[] {
   if (kind === "question") return QUESTION_STAGE_ORDER;
   if (kind === "plan") return PLAN_STAGE_ORDER;
-  return STAGE_ORDER;
+  if (complexityTier === "standard") return STANDARD_STAGE_ORDER;
+  if (complexityTier === "simple") return STAGE_ORDER;
+  return PENDING_TIER_STAGE_ORDER;
 }
 
 /** 바꿔 달라는 것인가 물어보는 것인가 (state-machine 51절). */
 export type TaskKind = "change" | "question" | "plan";
 
-export function phaseToStage(phase: TaskPhase): UserStage {
-  switch (phase) {
-    case "CREATED":
-    case "SNAPSHOTTING":
-    case "TRIAGE":
-      return "준비 중";
-    case "DRAFTING":
-    case "SINGLE_MODEL_FIX":
-      return "분석";
-    case "REVIEWING":
-      return "검수";
-    case "AWAITING_USER_INPUT":
-      return "확인 필요";
-    case "PLANNING":
-    case "AWAITING_APPROVAL":
-      return "승인 대기";
-    case "EXECUTING":
-      return "실행";
-    case "VERIFYING":
-    case "FIX_LOOP":
-      return "검증";
-    // 취소는 즉시 끝나지 않는다 — 자식 프로세스 종료를 기다리는 구간이 실제로 존재한다.
-    // "완료"로 접어버리면 아직 프로세스가 살아 있는 동안 끝난 것처럼 보인다.
-    case "CANCELLING":
-      return "취소 중";
-    case "ANSWERING":
-      return "답변";
-    // **"완료"로 접지 않는다.** 51절이 종착지를 나눈 이유가 여기서 사라진다.
-    case "ANSWERED":
-      return "답변함";
-    case "OUTLINING":
-      return "계획";
-    // **"완료"로도 "답변함"으로도 접지 않는다** (53절).
-    case "OUTLINED":
-      return "계획 나옴";
-    default:
-      return "완료";
+/**
+ * phase → 단계. **`default`가 없다** — state-machine 72.2.3절.
+ *
+ * # 없앤 이유
+ *
+ * 종전 이 함수에는 `default: return "완료"`가 있었다. 그래서 새 phase를 더하고 매핑을
+ * 잊으면 **컴파일이 통과하고 승인을 기다리는 태스크가 "완료"로 표시된다.** 사용자가
+ * 승인해야 진행되는 흐름에서 이보다 나쁜 오표시가 없고, **아무도 신고하지 않는 종류**다
+ * (화면이 더 좋은 소식을 말하기 때문이다).
+ *
+ * `Record<TaskPhase, UserStage>`로 두면 새 phase마다 컴파일이 멈추고, 그때 이 표를 보게
+ * 된다. 53.4절이 결말 표를 `Record`로 합치며 얻은 것과 같은 장치다.
+ *
+ * # 없애니 먼저 드러난 것은 새 phase가 아니라 **터미널 phase**였다
+ *
+ * `FAILED` · `CANCELLED` · `REJECTED` · `INTERRUPTED`에 case가 없어 전부 `default`로 `완료`에
+ * 접히고 있었다 — `UserStage`에 `실패`라는 값이 아예 없기 때문이다. **`default`가 그 사실을
+ * 가리고 있었다.**
+ *
+ * 여기서는 `완료` 하나로 두되 **결정이 필요하다는 것만 적는다.** 51절이 `ANSWERED`를,
+ * 53절이 `OUTLINED`를 각각 `완료`에 접지 않으려고 값을 따로 만든 선례가 있으므로 같은
+ * 논리가 실패 계열에도 적용될 수 있지만, 그건 **이 흐름이 아니라 화면이 답할 질문**이다.
+ * `default`를 지우는 작업이 그 질문을 강제로 꺼낸다 — 그게 지우는 이유의 절반이다.
+ */
+const BASE_STAGE: Record<TaskPhase, UserStage> = {
+  CREATED: "준비 중",
+  SNAPSHOTTING: "준비 중",
+  TRIAGE: "준비 중",
+  DRAFTING: "분석",
+  SINGLE_MODEL_FIX: "분석",
+  REVIEWING: "검수",
+  AWAITING_USER_INPUT: "확인 필요",
+  // **`standard`에서는 이 둘이 `실행`이다** — 아래 `STANDARD_STAGE`가 덮는다.
+  PLANNING: "승인 대기",
+  AWAITING_APPROVAL: "승인 대기",
+  EXECUTING: "실행",
+  VERIFYING: "검증",
+  FIX_LOOP: "검증",
+  // 취소는 즉시 끝나지 않는다 — 자식 프로세스 종료를 기다리는 구간이 실제로 존재한다.
+  // "완료"로 접어버리면 아직 프로세스가 살아 있는 동안 끝난 것처럼 보인다.
+  CANCELLING: "취소 중",
+  ANSWERING: "답변",
+  // **"완료"로 접지 않는다.** 51절이 종착지를 나눈 이유가 여기서 사라진다.
+  ANSWERED: "답변함",
+  OUTLINING: "계획",
+  // **"완료"로도 "답변함"으로도 접지 않는다** (53절).
+  OUTLINED: "계획 나옴",
+  // ---- 72절 흐름의 새 phase 다섯 ----
+  AWAITING_PLAN_APPROVAL: "계획 승인",
+  PLAN_REVIEWING: "계획 검토",
+  IMPLEMENTING: "실행",
+  RESULT_REVIEWING: "결과 검토",
+  AWAITING_USER_VERIFICATION: "최종 확인",
+  // ---- 터미널 ----
+  //
+  // **넷이 한 칸에 접혀 있다.** `UserStage`에 `실패`가 없어서이고, 그 결정은 이 절의
+  // 범위 밖이다(위 머리말). 여기 적어 두는 이유는 적지 않으면 다음 사람이 이것을
+  // **의도된 매핑**으로 읽기 때문이다.
+  COMPLETED: "완료",
+  FAILED: "완료",
+  CANCELLED: "완료",
+  REJECTED: "완료",
+  INTERRUPTED: "완료",
+};
+
+/**
+ * `standard` 경로에서만 다른 칸 — 72.2.3절.
+ *
+ * **`AWAITING_APPROVAL`이 이 경로에서 진행바의 칸이 아니다.** 실행 구간 안에서 서브태스크
+ * 개수만큼 반복되므로 칸으로 두면 진행바가 앞뒤로 움직인다. 진행바는 `실행`에 머물고
+ * **승인 모달이 그 위에 뜬다.**
+ *
+ * **`확인 필요`와 같은 처리가 아니다.** 그쪽은 진행바가 카드로 **바뀐다.** 둘을 가르는 것은
+ * **반복 횟수**다: `확인 필요`는 한 태스크에 드물게 한 번이라 진행바를 비켜도 되지만,
+ * 도구 승인은 서브태스크마다 여러 번 오므로 그때마다 사라졌다 나타나면 화면이 깜빡인다.
+ * 그리고 그 사이에도 **실행은 실제로 진행 중**이라 `실행`을 가리키는 것이 거짓이 아니다.
+ *
+ * **조건이 하나 붙는다**: 진행바가 `실행`에 머무는 동안 **승인 모달이 떠 있어야** 사용자가
+ * 무엇을 기다리는지 안다. 모달 없이 진행바만 `실행`이면 그건 거짓말이므로, 이 매핑은
+ * 승인 모달과 **함께** 구현되어야 한다.
+ */
+const STANDARD_STAGE: Partial<Record<TaskPhase, UserStage>> = {
+  PLANNING: "실행",
+  AWAITING_APPROVAL: "실행",
+};
+
+/**
+ * **시그니처가 `phase` 하나가 아니다** — 72.2.3절.
+ *
+ * `AWAITING_APPROVAL`이 그 증거다. 변경 경로에서는 **승인 대기**라는 단계이고 `standard`
+ * 에서는 실행 구간 안에서 서브태스크마다 들락거리는 상태다 — **같은 phase가 경로마다 다른
+ * 단계**가 되므로 `phase` 하나를 받는 함수로는 표현할 수 없다.
+ *
+ * `stagesFor`와 **같은 자리**에 둔다: 순서와 매핑은 같은 사실의 두 면이고, 떼어 놓으면
+ * 한쪽만 갱신되는 자리가 하나 더 생긴다.
+ */
+export function phaseToStage(
+  phase: TaskPhase,
+  kind: TaskKind = "change",
+  complexityTier: ComplexityTier | null = null
+): UserStage {
+  if (kind === "change" && complexityTier === "standard") {
+    return STANDARD_STAGE[phase] ?? BASE_STAGE[phase];
   }
+  return BASE_STAGE[phase];
 }
 
 export interface TaskEvent {
@@ -232,6 +365,24 @@ export interface FleetMemberStatus {
   admitted: boolean;
   status: string;
   phase: string;
+  /**
+   * 이 구성원이 **어느 경로를 도는가** — `phaseToStage`의 선택자(72.2.3절).
+   *
+   * # 왜 화면이 다른 표시를 쓰지 않고 이 둘을 싣는가
+   *
+   * `phaseToStage`의 시그니처가 바뀐 근거는 *"같은 phase가 경로마다 다른 단계"*라는 사실이고,
+   * 그 사실은 Fleet 구성원에게도 **똑같이 참이다.** 화면마다 다른 매핑을 쓰면 같은 phase가
+   * 메인 화면과 Fleet 화면에서 다르게 읽히고, 그건 72.2.3절이 막으려던 오표시와 같은 종류다.
+   *
+   * 그리고 Fleet 구성원은 **"평범한 태스크"**다(CLAUDE.md의 fleet 설명) — 화면만 다른 규칙을
+   * 쓰면 그 구조적 사실이 화면에서 거짓이 된다. 싣는 비용은 필드 둘이고, 다른 표시를 만드는
+   * 비용은 **매핑을 하나 더 만들어 두 곳이 갈리게 하는 것**이다.
+   *
+   * `complexityTier`가 `null`인 것은 **TRIAGE가 아직 끝나지 않았다**는 뜻이지 `simple`이라는
+   * 뜻이 아니다 — 뭉개면 시작 직후의 구성원이 전부 짧은 순서로 그려진다.
+   */
+  kind: TaskKind;
+  complexityTier: ComplexityTier | null;
   /** 이 구성원 **하나**의 지출. 합계가 아니다. */
   costUsd: number;
   unpricedCalls: number;
@@ -239,6 +390,68 @@ export interface FleetMemberStatus {
   worktreePath?: string;
   createdAt: string;
 }
+
+// ---------------------------------------------------------------------------
+// 사용자 게이트 둘의 카드 — state-machine 72.4·72.8절
+//
+// **정본은 `packages/protocol/src/gate.ts`이고 Rust의 `types.rs`가 그 사본이다.** 여기는
+// 화면이 쓰는 세 번째 사본이며(머리말의 "부분 미러" 규칙), 필드를 더할 때는 프로토콜을
+// 먼저 바꾼다.
+//
+// **도구 승인(`ApprovalRequest`)과 한 타입으로 합치지 않는다.** 그쪽은 600초 뒤 거부이고
+// 이쪽은 **타임아웃이 없다**(72.12절) — 이 타입들에 "시간 초과"가 없는 것이 그 결정의
+// 구조적 표현이다.
+// ---------------------------------------------------------------------------
+
+export interface EscalationAllowance {
+  maxCalls: number;
+  grade: string;
+  /** 환산 불가 경로에서는 `null`이다 — 0으로 적으면 "공짜"로 읽힌다(72.4절). */
+  budgetUsd: number | null;
+}
+
+export interface PlanApprovalSubtask {
+  subtaskId: string;
+  intent: string;
+  /** **계산이 끝난 최종 등급**이다 — 모델의 제안이 아니다(72.2.2절). */
+  grade: string;
+  riskSegments: string[];
+}
+
+export interface PlanApprovalCardData {
+  summary: string;
+  steps: string[];
+  subtasks: PlanApprovalSubtask[];
+  estimatedCostUsd: number;
+  unpricedAssignments: string[];
+  estimateCaveats: string[];
+  escalation: EscalationAllowance;
+  notes: string[];
+  workspaceFingerprint: string | null;
+}
+
+export interface ChecklistItem {
+  text: string;
+  /** `verified` | `flagged_by_review` | `unverified`. 가운데는 **확인이 아니라 경고**다. */
+  grade: string;
+  source: string;
+}
+
+export interface VerificationChecklistCardData {
+  items: ChecklistItem[];
+  notes: string[];
+  unplannedPaths: string[];
+}
+
+/** Rust가 `plan-approval-required` / `verification-required` 채널로 실어 보내는 것. */
+export type UserGateRequest =
+  | { gate: "plan"; taskId: string; card: PlanApprovalCardData }
+  | { gate: "verification"; taskId: string; card: VerificationChecklistCardData };
+
+/** 계획 승인 카드의 선택지 넷 — **`granted: boolean`으로 뭉치지 않는다**(72.4절). */
+export type PlanApprovalChoice = "approve_with_review" | "approve_skip_review" | "revise" | "reject";
+/** 검증 체크리스트의 선택지 넷 — 72.8절 귀환 경로 셋 + 승인. */
+export type VerificationChoice = "approve" | "refix" | "replan" | "revert_and_stop";
 
 export interface FleetStatus {
   fleetId: string;
@@ -550,7 +763,7 @@ export interface ProviderStatus {
 }
 
 export interface RoutingInfo {
-  complexityTier: "simple" | "standard";
+  complexityTier: ComplexityTier;
   activeRoles: string[];
   assignments: { role: string; modelId: string; providerId: string; reason: string }[];
   appliedPolicies: string[];

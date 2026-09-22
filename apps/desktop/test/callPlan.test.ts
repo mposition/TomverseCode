@@ -10,24 +10,52 @@ import { affordableCalls, describeCallPlan, planFor } from "../src/lib/callPlan.
  * 처음 알게 되는 종류의 실패다.
  */
 
-test("verified는 실행자를 둘 부른다 — 그 사실이 계획에 있다", () => {
+/**
+ * **이 파일의 수가 바뀐 것은 회귀가 아니라 정정이다** — state-machine 72.9절.
+ *
+ * 종전 테스트 이름은 *"verified는 실행자를 둘 부른다"*였고, 그 계약을 초록색으로 지키고
+ * 있었다. 72절이 대조를 **계획 단계로** 옮기면서 둘이 되는 것이 실행자가 아니라 계획자가
+ * 됐고, `fast`의 2도 함께 틀렸다(`fast`인데 TRIAGE가 `standard`로 분류하면 `REVIEWING`이
+ * 아니라 72절 흐름 전체가 돈다).
+ */
+test("verified는 계획자를 둘 부른다 — 둘이 되는 것은 실행자가 아니다", () => {
   const plan = planFor("verified");
-  assert.equal(plan.perRoundMax, 3);
-  assert.ok(plan.parts.some((p) => p.includes("실행자 2")), plan.parts.join(" | "));
+  assert.equal(plan.beforeApprovalMax, 3);
+  assert.ok(plan.beforeApprovalParts.some((p) => p.includes("계획 2")), plan.beforeApprovalParts.join(" | "));
+  assert.ok(!plan.beforeApprovalParts.some((p) => p.includes("실행자")), plan.beforeApprovalParts.join(" | "));
 });
 
-test("fast는 대조를 켜지 않는다", () => {
-  // 비용 2배는 사용자가 고르는 것이지 규칙이 고르는 것이 아니다(state-machine 17.5절).
+test("fast는 대조를 켜지 않지만 계획 검토는 받는다", () => {
+  // 비용 2배는 사용자가 고르는 것이지 규칙이 고르는 것이 아니다(17.5절). 그러나 B·C는
+  // 모드와 무관하게 사다리가 배정한다(21.6절) — 모드가 끄는 것은 대조 하나뿐이다.
   const plan = planFor("fast");
-  assert.equal(plan.perRoundMax, 2);
-  assert.ok(!plan.parts.some((p) => p.includes("실행자 2")), plan.parts.join(" | "));
+  assert.equal(plan.beforeApprovalMax, 2);
+  assert.ok(!plan.beforeApprovalParts.some((p) => p.includes("계획 2")), plan.beforeApprovalParts.join(" | "));
+  assert.ok(plan.beforeApprovalParts.some((p) => p.includes("계획 검토")), plan.beforeApprovalParts.join(" | "));
 });
 
 test("하한도 함께 말한다 — 라우터가 드롭하면 줄어든다", () => {
   // 상한만 적으면 언제나 그만큼 나가는 것처럼 읽히고, 하한만 적으면 비용이 작아 보인다.
   for (const mode of ["fast", "verified"] as const) {
     const plan = planFor(mode);
-    assert.ok(plan.perRoundMin >= 1 && plan.perRoundMin < plan.perRoundMax, `${mode}: ${JSON.stringify(plan)}`);
+    assert.ok(
+      plan.beforeApprovalMin >= 1 && plan.beforeApprovalMin < plan.beforeApprovalMax,
+      `${mode}: ${JSON.stringify(plan)}`
+    );
+  }
+});
+
+/**
+ * **승인 후 구간은 곱해 두지 않는다.**
+ *
+ * 서브태스크 개수는 계획이 정하므로 시작 시점에 알 수 없다. 여기서 개수를 지어내 곱하면
+ * 화면이 정확해 보이는 만큼 정확히 틀리고, 실제 수는 **계획 승인 카드**가 보여준다(72.4절).
+ */
+test("서브태스크 개수를 지어내지 않는다 — 단위당 수만 적는다", () => {
+  for (const mode of ["fast", "verified"] as const) {
+    const plan = planFor(mode);
+    assert.equal(plan.perSubtask, 1);
+    assert.equal(plan.afterApprovalFixedMax, 1);
   }
 });
 
@@ -65,9 +93,11 @@ test("상한이 한 호출에도 못 미치면 0회라고 말한다", () => {
  */
 test("사실만 나열하고 결과를 예측하지 않는다", () => {
   const lines = describeCallPlan("verified", 0.3, [{ modelId: "m", maxCallCostUsd: 0.2 }]);
-  assert.equal(lines.length, 2);
+  // 승인 전 구간 / 승인 후 구간 / 상한으로 부를 수 있는 수 — 셋이다.
+  assert.equal(lines.length, 3);
   assert.ok(lines[0]!.includes("최대 3회"), lines[0]);
-  assert.ok(lines[1]!.includes("최대 1회"), lines[1]);
+  assert.ok(lines[1]!.includes("승인 카드"), lines[1]);
+  assert.ok(lines[2]!.includes("최대 1회"), lines[2]);
   for (const line of lines) {
     for (const forbidden of ["모자랄", "멈출", "실패할", "부족할"]) {
       assert.ok(!line.includes(forbidden), `예측하는 문장이 들어왔습니다: ${line}`);
@@ -75,14 +105,14 @@ test("사실만 나열하고 결과를 예측하지 않는다", () => {
   }
 });
 
-test("상한을 모르면 두 번째 문장을 만들지 않는다", () => {
-  // 모르면서 아는 척하는 문장을 만들지 않는다.
-  assert.equal(describeCallPlan("fast", null, [{ modelId: "m", maxCallCostUsd: 0.2 }]).length, 1);
-  assert.equal(describeCallPlan("fast", 1, [{ modelId: "m" }]).length, 1);
+test("상한을 모르면 그 문장을 만들지 않는다", () => {
+  // 모르면서 아는 척하는 문장을 만들지 않는다. 앞의 두 문장은 상한과 무관하게 참이다.
+  assert.equal(describeCallPlan("fast", null, [{ modelId: "m", maxCallCostUsd: 0.2 }]).length, 2);
+  assert.equal(describeCallPlan("fast", 1, [{ modelId: "m" }]).length, 2);
 });
 
 test("재시도와 수정 루프가 빠져 있다는 사실을 함께 말한다", () => {
   // 이 수를 총비용으로 읽으면 실제 청구가 몇 배가 될 수 있다.
-  const [first] = describeCallPlan("fast", null, []);
-  assert.ok(first!.includes("포함되지 않습니다"), first);
+  const lines = describeCallPlan("fast", null, []);
+  assert.ok(lines.some((l) => l.includes("포함되지 않습니다")), lines.join(" | "));
 });

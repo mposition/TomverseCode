@@ -1,5 +1,6 @@
 import type { ISODateTime, ReviewMode, Verdict } from "./common.js";
 import type { ModelGrade } from "./registry.js";
+import type { EscalationRequest } from "./gate.js";
 
 /**
  * 모델이 서술하는 계획의 한 단계 — **사용자에게 보여주기 위한 것이다.**
@@ -87,6 +88,20 @@ export interface DraftProposal {
    * 부른 뒤 DRAFTING을 다시 돈다(재질문 왕복과 같은 모양). 상한은 `limits.mcpRounds`.
    */
   mcpCalls?: McpCallRequest[];
+  /**
+   * **더 센 모델이 봐야 한다는 요청** — state-machine 72.10.2절.
+   *
+   * `mcpCalls`와 같은 모양이다: 산출물에 실려 오는 **요청이고 실행되지 않는다.** 허락은
+   * 계획 승인 카드의 봉투(`EscalationAllowance`)가 미리 했고, 판정은 오케스트레이터가 한다.
+   *
+   * **봉투를 넘으면 거절하고 중간에 다시 묻지 않는다.** 되묻는 자리를 구현 한복판에 두면
+   * `구현 → 초과 요청 → 승인 → 구현`이 어떤 카운터도 세지 않는 고리가 된다(원칙 5).
+   *
+   * **거절돼도 이 초안은 그대로 쓴다.** 요청이 산출물에 실려 오므로 판정 시점에 이 초안은
+   * 이미 있고 이미 값을 치렀다 — 원래 모델을 다시 부르면 어느 카운터도 세지 않는 호출이
+   * 하나 더 생긴다. 그 불안을 받는 자리는 뒤에 있다(결정론적 검증과 체크리스트).
+   */
+  escalationRequest?: EscalationRequest;
   model: string;
   createdAt: ISODateTime;
 }

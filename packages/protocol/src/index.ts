@@ -8,5 +8,6 @@ export * from "./verification.js";
 export * from "./registry.js";
 export * from "./provider.js";
 export * from "./events.js";
+export * from "./gate.js";
 export * from "./ipc.js";
 export * from "./validate.js";

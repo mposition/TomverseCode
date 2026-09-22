@@ -85,7 +85,16 @@ function run(
   const orchestrator = new Orchestrator(
     {
       taskRequest,
-      policy: makePolicy({ budgetUsd }),
+      // **물러난 교차검증 파이프라인**(`DRAFTING → REVIEWING`)을 고정한다 — 72.3절.
+      // 이 파일의 검사 대상이 그 파이프라인의 동작이고, 72절이 `standard`를 새 흐름으로
+      // 바꾸었어도 그 phase는 지워지지 않았다(가설 게이트 arm C·D가 지금도 그 경로를 잰다).
+      // 새 흐름의 검사는 `standardFlow.test.ts`에 있다.
+      // `contrast: true`는 **하네스 arm이 아니라 production 기본값을 지키는 것**이다.
+      // `experiment`가 정의되면 대조는 기본이 꺼짐이므로(하네스가 arm을 고정하기 위한 규칙),
+      // 적지 않으면 이 파일의 대조 검사가 조용히 대조 없이 돈다.
+      experiment: { pipeline: "legacy_cross_verification", contrast: true },
+      // `executionMode`는 이제 tier를 정하지 않는다(72.9절) — 경로를 고정하려면 tier 축에서 건다.
+      policy: makePolicy({ forceComplexityTier: "standard", budgetUsd }),
       availableProviders: ["fake-a", "fake-b"],
     },
     {
@@ -355,7 +364,9 @@ test("타임아웃이 남긴 미해결 예약은 이후 호출을 막지 않는�
         userMessage: "src/app.ts 의 상수를 2로 고쳐줘",
         createdAt: new Date().toISOString(),
       },
-      policy: makePolicy({ budgetUsd: 100 }),
+      // 물러난 교차검증 파이프라인을 고정한다(72.3절) — 이 검사가 세는 것이 초안 호출의 예약이다.
+      experiment: { pipeline: "legacy_cross_verification" as const, contrast: true },
+      policy: makePolicy({ forceComplexityTier: "standard", budgetUsd: 100 }),
       availableProviders: ["fake-a", "fake-b"],
     },
     {
@@ -406,4 +417,69 @@ test("원장의 기본 동작은 미해결 예약 이후 유료 호출을 막는
   assert.equal(lenient.state(), "OK");
   assert.equal(lenient.unresolvedUsd(), 4);
   assert.equal(lenient.availableUsd(), 6);
+});
+
+// ---------------------------------------------------------------------------
+// 단계 예약 — state-machine 72.12절
+// ---------------------------------------------------------------------------
+
+/**
+ * **구간 하나를 잡는다.** 호출 예약과 달리 이 예약으로는 아무 요청도 나가지 않으며,
+ * 하는 일은 *"승인 시점에 그 금액이 실제로 남아 있는가"*의 확인과 그 사실의 기록이다.
+ *
+ * 태스크를 한 바퀴 돌려야만 확인되는 규칙은 실제로는 확인되지 않으므로 여기서 직접 본다.
+ */
+test("단계 예약은 남은 예산을 넘으면 거부한다 — 구현 중간에 죽는 것보다 낫다", async () => {
+  const { TaskBudget } = await import("../src/orchestrator/budget.js");
+  const created = TaskBudget.create(1, { taskId: "t", onEvent: () => {} });
+  assert.ok(created.ok);
+  const budget = created.budget;
+
+  const ok = budget.reserveStage(0.5, "plan-approval:implementation");
+  assert.equal(ok.ok, true);
+
+  // 남은 것은 0.5인데 0.8을 잡으려 한다.
+  const refused = budget.reserveStage(0.8, "plan-approval:implementation");
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    // 두 숫자를 함께 낸다 — "예산 부족"만 말하면 사용자는 상한을 조금씩 올리며 같은 실패를
+    // 반복한다.
+    assert.match(refused.reason, /0\.8000/);
+    assert.match(refused.reason, /상한/);
+  }
+});
+
+test("단계 예약을 닫으면 그 금액이 돌아온다 — released이지 settled가 아니다", async () => {
+  const { TaskBudget } = await import("../src/orchestrator/budget.js");
+  const events: { type: string }[] = [];
+  const created = TaskBudget.create(1, { taskId: "t", onEvent: (e) => events.push({ type: e.type }) });
+  assert.ok(created.ok);
+  const budget = created.budget;
+
+  const first = budget.reserveStage(0.9, "plan-approval:implementation");
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+  budget.releaseStage(first.reservation, "승인으로 되돌아갑니다");
+
+  // 다시 연다 — **다시 여는 금액이 달라질 수 있다**(B의 지적으로 분해나 등급이 바뀌면 그렇다).
+  const second = budget.reserveStage(0.9, "plan-approval:implementation");
+  assert.equal(second.ok, true);
+  assert.ok(events.some((e) => e.type === "reservation_released"), JSON.stringify(events));
+  // 이 예약으로는 아무 요청도 나가지 않았으므로 정산이 아니다.
+  assert.ok(!events.some((e) => e.type === "reservation_settled"), JSON.stringify(events));
+});
+
+test("상한이 없으면 단계 예약도 막지 않는다 — 없는 상한을 여기서 만들지 않는다", async () => {
+  const { TaskBudget } = await import("../src/orchestrator/budget.js");
+  const created = TaskBudget.create(null, { taskId: "t", onEvent: () => {} });
+  assert.ok(created.ok);
+  assert.equal(created.budget.reserveStage(1_000_000, "plan-approval:implementation").ok, true);
+});
+
+test("잡을 금액을 계산할 수 없으면 0으로 두지 않고 거부한다", async () => {
+  const { TaskBudget } = await import("../src/orchestrator/budget.js");
+  const created = TaskBudget.create(10, { taskId: "t", onEvent: () => {} });
+  assert.ok(created.ok);
+  // 0으로 예약하면 언제나 통과하고, 그 통과는 "확인했다"로 읽힌다 — 확인한 것이 없는데도.
+  assert.equal(created.budget.reserveStage(Number.NaN, "plan-approval:implementation").ok, false);
 });

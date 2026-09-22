@@ -50,6 +50,18 @@ export interface HostRunOptions {
    * `triageCalibration`의 전부이며, 규칙은 모델을 부르지 않으므로 유료 호출이 없다.
    */
   executionMode?: "fast" | "verified";
+  /**
+   * 어느 **파이프라인**을 태울 것인가 — state-machine 72.3절.
+   *
+   * 기본은 `"legacy"`다: Protocol v1의 arm C·D가 재는 대상이 72.3절에서 물러난
+   * `DRAFTING` 경로이고, 그 판정 기준은 `criteria.ts`에 해시로 봉인된 사전등록이므로
+   * **재는 대상이 조용히 바뀌면 봉인이 지키는 것이 없어진다.**
+   *
+   * `"rule"`을 주면 tier를 TRIAGE가 정한다 — **`triageCalibration`이 재는 것이 그
+   * 판정이므로** 거기서는 고정하면 안 된다. 고정하면 `appliedPolicies`가 비지 않아
+   * `observationFromEvents`가 "규칙이 돌지 않았습니다"로 읽고, 측정이 공허해진다.
+   */
+  pipeline?: "legacy" | "rule";
   taskId: string;
   timeoutMs: number;
   /** Arm C/D가 재생할 초안. Rust가 이 파일을 읽어 sidecar에 내용만 넘긴다. */
@@ -148,10 +160,21 @@ export function runHost(options: HostRunOptions): HostRunResult {
     options.workspaceRoot,
     "--message",
     options.taskPrompt,
-    // 기본은 verified = TRIAGE 결과와 무관하게 항상 standard(교차검증) 경로.
-    // arm A/B는 공급자가 하나뿐이라 라우터가 스스로 reviewer를 드롭한다 — 별도 분기가 아니다.
+    // 기본은 verified. **이제 그것이 tier를 정하지는 않는다**(state-machine 72.9절) —
+    // 모드가 켜는 것은 대조이고 tier는 TRIAGE가 정한다.
     "--mode",
     options.executionMode ?? "verified",
+    /**
+     * **물러난 교차검증 파이프라인을 명시한다** — state-machine 72.3절.
+     *
+     * 72절이 `standard`를 새 흐름(계획 → 승인 → B → 서브태스크 → C)으로 바꾸었는데,
+     * **Protocol v1의 arm C·D가 재는 대상은 그 이전의 `DRAFTING` 경로**다. 적지 않으면
+     * 하네스가 조용히 다른 것을 재게 되고, 그 판정 기준은 `criteria.ts`에 해시로 봉인된
+     * 사전등록이므로 그건 봉인이 지키는 것을 없애는 일이다.
+     *
+     * **새 흐름을 재려면 새 프로토콜이 필요하다** — 같은 봉인 아래에서 대상을 바꾸지 않는다.
+     */
+    ...(options.pipeline === "rule" ? [] : ["--pipeline", "legacy-cross-verification"]),
     "--approve",
     "auto",
     "--db",

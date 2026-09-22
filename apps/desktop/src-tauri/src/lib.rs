@@ -129,8 +129,15 @@ async fn start_task(
     // `timeout_secs`와 다르다: 저쪽은 기다리기를 그만두는 시각이다(39.2절).
     deadline_secs: Option<u64>,
     timeout_secs: Option<u64>,
+    // 어느 등급이 구현하는가 / 얼마나 깊게 굴리는가 (state-machine 72.9절).
+    // **둘 다 선택 인자다** — 화면이 빠뜨리면 기본값(`balanced`/`medium`)으로 돌고, 그
+    // 기본값은 항등에 가장 가까운 값이다.
+    profile: Option<String>,
+    effort: Option<String>,
 ) -> Result<Value, String> {
     let execution_mode = parse_mode(&mode)?;
+    let performance_profile = parse_profile(profile.as_deref())?;
+    let effort_level = parse_effort(effort.as_deref())?;
     let budget = tomverse_core::budget::resolve_budget(budget_usd, budget_unlimited)?;
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(900));
 
@@ -141,6 +148,8 @@ async fn start_task(
         session.start_task(
             &message,
             execution_mode,
+            performance_profile,
+            effort_level,
             allow_git_commit.unwrap_or(false),
             budget,
             model_pins.unwrap_or(Value::Null),
@@ -188,6 +197,9 @@ async fn start_fleet(
     auto_approve_writes: Option<bool>,
     deadline_secs: Option<u64>,
     timeout_secs: Option<u64>,
+    // 72.9절의 축 둘 — `start_task`와 같은 규칙이다.
+    profile: Option<String>,
+    effort: Option<String>,
 ) -> Result<Value, String> {
     let execution_mode = parse_mode(&mode)?;
     let per_task = tomverse_core::budget::resolve_budget(budget_usd, budget_unlimited)?;
@@ -201,6 +213,8 @@ async fn start_fleet(
         })
         .collect();
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(900));
+    let performance_profile = parse_profile(profile.as_deref())?;
+    let effort_level = parse_effort(effort.as_deref())?;
 
     // 태스크 실행은 승인 대기 때문에 오래 블록된다. 별도 스레드로 보내야 그 사이에
     // `respond_approval` command가 처리될 수 있다 — 같은 스레드면 교착된다.
@@ -210,6 +224,10 @@ async fn start_fleet(
             &app,
             specs,
             execution_mode,
+            // **구성원마다 다르게 주지 않는다** — Fleet은 같은 요청을 여러 브랜치에서
+            // 돌리는 장치이고, 축이 갈리면 구성원 간 비교가 성립하지 않는다.
+            performance_profile,
+            effort_level,
             allow_git_commit.unwrap_or(false),
             per_task,
             fleet_cap,
@@ -267,6 +285,28 @@ fn respond_approval(
     note: Option<String>,
 ) -> Result<Value, String> {
     state.respond_approval(&approval_id, granted, note)
+}
+
+/// 대기 중인 사용자 게이트 목록 (72절).
+#[tauri::command]
+fn pending_gates(state: tauri::State<'_, SessionState>) -> Value {
+    state.pending_gates()
+}
+
+/// 계획 승인 카드 / 검증 체크리스트의 답 — state-machine 72.4·72.8절.
+///
+/// `respond_approval`과 나누는 이유는 **답의 모양이 다르기 때문**이다: 도구 승인은
+/// 허용/거부 둘이고, 이쪽은 선택지 넷이다(카드마다 다른 넷). 한 명령으로 뭉치면
+/// `granted: bool`에 넷을 욱여넣게 되고, 그 순간 화면이 "승인 + 검토 생략"과
+/// "승인 + 독립 검토"를 구별해 보낼 수 없다.
+#[tauri::command]
+fn respond_gate(
+    state: tauri::State<'_, SessionState>,
+    task_id: String,
+    gate: String,
+    choice: String,
+) -> Result<Value, String> {
+    state.respond_gate(&task_id, &gate, &choice)
 }
 
 #[tauri::command]
@@ -451,6 +491,32 @@ fn withdraw_decision(
 
 /// 실행 정책 문자열을 값으로. **모르는 값은 기본값으로 접지 않는다** — 접으면 화면이 보낸
 /// 오타가 조용히 `verified`가 되고, 사용자는 자기가 고른 것과 다른 실행을 본다.
+/// 72.9절의 축 둘. **알 수 없는 값을 기본값으로 접지 않는다** — 접으면 오타 하나가
+/// 사용자가 고르지 않은 정책으로 조용히 돌게 되고, 그건 `parse_mode`가 막는 것과 같은
+/// 실패다. 화면이 보낸 값이 우리가 아는 값이 아니면 시작하지 않는 편이 정직하다.
+fn parse_profile(value: Option<&str>) -> Result<tomverse_core::types::PerformanceProfile, String> {
+    use tomverse_core::types::PerformanceProfile as P;
+    match value {
+        // 키가 없는 것은 **기본값을 쓰라**이다(72.9절: `balanced`가 항등이다).
+        None => Ok(P::Balanced),
+        Some("economy") => Ok(P::Economy),
+        Some("balanced") => Ok(P::Balanced),
+        Some("max") => Ok(P::Max),
+        Some(other) => Err(format!("알 수 없는 성능 프로파일: {other}")),
+    }
+}
+
+fn parse_effort(value: Option<&str>) -> Result<tomverse_core::types::EffortLevel, String> {
+    use tomverse_core::types::EffortLevel as E;
+    match value {
+        None => Ok(E::Medium),
+        Some("low") => Ok(E::Low),
+        Some("medium") => Ok(E::Medium),
+        Some("high") => Ok(E::High),
+        Some(other) => Err(format!("알 수 없는 실행 강도: {other}")),
+    }
+}
+
 fn parse_mode(mode: &str) -> Result<ExecutionMode, String> {
     match mode {
         "fast" => Ok(ExecutionMode::Fast),
@@ -496,9 +562,14 @@ fn autopilot_preview(
     // **`start_task`와 같은 값을 받아야 한다**(63절). 종류가 빠져 있던 동안 질문 태스크의
     // 예고는 변경 태스크의 답이었다 — 같은 함수를 쓰는 것만으로는 부족하다.
     kind: Option<String>,
+    // 72.9절의 축 둘 — **미리보기도 같은 값을 받아야 한다**(63절).
+    profile: Option<String>,
+    effort: Option<String>,
 ) -> Result<Value, String> {
     state.autopilot_preview(
         parse_mode(&mode)?,
+        parse_profile(profile.as_deref())?,
+        parse_effort(effort.as_deref())?,
         allow_git_commit.unwrap_or(false),
         unattended.unwrap_or(false),
         auto_approve_verification.unwrap_or(false),
@@ -692,6 +763,8 @@ pub fn run() {
             start_task,
             respond_approval,
             pending_approvals,
+            respond_gate,
+            pending_gates,
             start_fleet,
             cancel_fleet,
             cancel_fleet_member,
