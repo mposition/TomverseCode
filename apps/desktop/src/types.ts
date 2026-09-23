@@ -840,6 +840,13 @@ export interface TaskBudgetThreshold {
   usd: number;
   source: "measured" | "default_insufficient_samples";
   sampleCount: number;
+  /**
+   * 비용을 **숫자로 말할 수 없어** 표본에서 빠진 작업 수(72.12.3절).
+   *
+   * 표본 수만 보여주면 "관측이 적다"와 "관측은 있었는데 쓸 수 없었다"가 같아 보인다.
+   * 둘은 사용자가 다음에 할 일이 다르므로 화면이 구별해야 한다.
+   */
+  excludedCount: number;
   minSamples: number;
   /** 관측된 지출에 곱한 여유 배수. 예약은 최대 비용으로 열리고 확정은 실제 비용으로 되므로 필요하다. */
   headroomMultiplier: number;

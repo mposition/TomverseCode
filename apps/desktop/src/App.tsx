@@ -1657,6 +1657,10 @@ export default function App() {
                       (budgetSuggestion.source === "measured"
                         ? ` 제안값은 이 워크스페이스의 지난 작업 ${budgetSuggestion.sampleCount}건에서 유도했습니다(p90 × ${budgetSuggestion.headroomMultiplier}).`
                         : ` 제안값은 아직 관측이 부족해(${budgetSuggestion.sampleCount}/${budgetSuggestion.minSamples}건) 기본값입니다.`)}
+                    {/* **표본에서 빠진 것이 있으면 말한다.** 말하지 않으면 사용자는 관측이
+                        적은 것으로만 읽고, 고칠 곳이 따로 있다는 사실을 모른다(72.12.3절). */}
+                    {budgetSuggestion && budgetSuggestion.excludedCount > 0 &&
+                      ` 비용을 숫자로 말할 수 없어 ${budgetSuggestion.excludedCount}건은 표본에서 뺐습니다 — 관측이 적은 것과 다른 사실입니다.`}
                   </p>
                 )}
                 {/* **확실할 때만 말한다.** "비쌀 수도 있습니다"는 하지 않는다 — 틀릴 수 있는

@@ -539,6 +539,12 @@ pub struct TaskBudgetThreshold {
     pub source: &'static str,
     #[serde(rename = "sampleCount")]
     pub sample_count: u64,
+    /// 비용을 **숫자로 말할 수 없어** 이 표본에서 빠진 태스크 수(72.12.3절).
+    ///
+    /// 표본 수만 말하면 "관측이 적다"와 "관측은 있었는데 쓸 수 없었다"가 같아진다. 둘은
+    /// 사용자가 다음에 할 일이 다르다 — 앞은 더 써 보면 되고, 뒤는 고칠 곳이 따로 있다.
+    #[serde(rename = "excludedCount")]
+    pub excluded_count: u64,
     #[serde(rename = "minSamples")]
     pub min_samples: u64,
     /// 관측값에 곱한 여유 배수. 값만 넘기면 화면이 이걸 관측된 지출로 말하게 된다.
@@ -559,6 +565,7 @@ pub fn suggest_task_budget_usd(costs: &TaskCosts) -> TaskBudgetThreshold {
             usd: round_cents((p90 * TASK_BUDGET_HEADROOM).clamp(MIN_TASK_BUDGET_USD, MAX_TASK_BUDGET_USD)),
             source: "measured",
             sample_count: costs.tasks,
+            excluded_count: costs.tasks_with_unpriced_calls + costs.tasks_with_unreadable_cost,
             min_samples: MIN_TASK_COST_SAMPLES,
             headroom_multiplier: TASK_BUDGET_HEADROOM,
         },
@@ -566,6 +573,7 @@ pub fn suggest_task_budget_usd(costs: &TaskCosts) -> TaskBudgetThreshold {
             usd: DEFAULT_TASK_BUDGET_USD,
             source: "default_insufficient_samples",
             sample_count: costs.tasks,
+            excluded_count: costs.tasks_with_unpriced_calls + costs.tasks_with_unreadable_cost,
             min_samples: MIN_TASK_COST_SAMPLES,
             headroom_multiplier: TASK_BUDGET_HEADROOM,
         },
@@ -1846,6 +1854,12 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
                         metrics.task_costs.tasks_with_unpriced_calls += 1;
                     } else if sum.is_finite() && sum >= 0.0 {
                         task_cost_micros.push((sum * 1_000_000.0).round() as u64);
+                    } else {
+                        // **남는 바구니를 비워 두지 않는다.** 호출은 있었는데 합이 NaN이거나
+                        // 음수면 어느 카운터에도 들지 않았고, 그것이 바로 위 주석이 막으려는
+                        // “표본에서 조용히 사라진다”이다. 읽지 못한 것과 같은 칸에 넣는다 —
+                        // 둘 다 “이 태스크의 비용을 숫자로 말할 수 없다”이고, 고칠 곳도 저장소다.
+                        metrics.task_costs.tasks_with_unreadable_cost += 1;
                     }
                 }
             }
@@ -4545,6 +4559,30 @@ mod tests {
     /// 아무도 읽지 않는 숫자가 된다"고 경고하고 있었다. 경고는 잊혔고 — `budgetHeadroom`이
     /// 정확히 그렇게 빠져 있었다(문서는 "측정할 수 있다"고 적었는데 집계가 없었다).
     /// 이제 새 지표를 넣으면 질문을 붙이거나 면제 이유를 적어야 한다.
+    /// **비용을 숫자로 말할 수 없는 태스크는 표본에서 사라지지 않는다** — 72.12.3절.
+    ///
+    /// 사라지면 `p90`이 무엇에 대한 값인지 말할 수 없게 된다. 가격 미상 쪽은 이미 잠겨
+    /// 있었고, 이 검사는 **합이 숫자가 아닌 쪽**을 잠그어 둘 다 어느 칸에는 들게 한다.
+    #[test]
+    fn a_task_whose_cost_is_not_a_number_is_counted_not_dropped() {
+        let (_d, mut store) = seeded();
+        // **기준선을 먼저 재다.** 저장소에 무엇이 심겨 있는지에 의존하면 이웃 픽스처가
+        // 바뀔 때 간헐적으로 깨지고, 간헐적인 빨간색은 사람에게 "다시 돌려 보자"를 가르친다.
+        let before = collect(&store, None).unwrap().task_costs;
+
+        // 호출은 있지만 합이 숫자가 아니다(음수 비용은 데이터 결함이지 "공짜"가 아니다).
+        seed_task_with_cost(&mut store, "task-negative", &[Some(-1.0)]);
+
+        let costs = collect(&store, None).unwrap().task_costs;
+        assert_eq!(costs.tasks, before.tasks, "숫자가 아닌 합을 분포에 넣지 않는다");
+        let counted = (costs.tasks_with_unpriced_calls + costs.tasks_with_unreadable_cost)
+            - (before.tasks_with_unpriced_calls + before.tasks_with_unreadable_cost);
+        assert_eq!(
+            counted, 1,
+            "숫자로 말할 수 없는 태스크가 어느 칸에도 없습니다 — 표본에서 사라졌습니다: {costs:?}"
+        );
+    }
+
     #[test]
     fn every_metric_is_read_by_a_question_or_is_explicitly_exempt() {
         let (_d, store) = seeded();
