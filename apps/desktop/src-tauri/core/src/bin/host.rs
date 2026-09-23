@@ -1244,6 +1244,14 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
         unattended: bool,
     }
     impl tomverse_core::types::UserGateway for HeadlessGateway {
+        /// **깨울 대기가 없다.** 이 게이트웨이는 인자로 정해진 답을 즉시 내므로
+        /// `request_gate`가 막히는 일이 없고, 따라서 취소가 깨울 `recv()`도 없다.
+        /// 트레이트에 기본 구현을 두지 않는 이유가 이것이다 — 그 사실을 적게 해야
+        /// 기다리게 하는 게이트웨이가 조용히 빠뜨리지 않는다(72.12.2절 ①).
+        fn cancel_waiting(&self, _task_id: &str, _reason: &str) -> bool {
+            false
+        }
+
         fn request_gate(&self, request: &tomverse_core::types::UserGateRequest) -> UserGateOutcome {
             if self.unattended {
                 return UserGateOutcome::Unattended;
