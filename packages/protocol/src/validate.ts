@@ -12,7 +12,15 @@
  */
 
 import type { ReviewMode, Verdict } from "./common.js";
-import type { DraftProposal, PlanOutline, PlanStep, QuestionAnswer, ReviewDecision, SingleModelFixResult } from "./proposal.js";
+import type {
+  DraftProposal,
+  PlanOutline,
+  PlanStep,
+  PlanSubtask,
+  QuestionAnswer,
+  ReviewDecision,
+  SingleModelFixResult,
+} from "./proposal.js";
 import type { RunCommandArgs } from "./tools.js";
 
 export class ValidationError extends Error {
@@ -132,8 +140,30 @@ export function validateDraftProposal(
     mcpCalls: validateMcpCalls(o.mcpCalls),
     moves: validateMoves(o.moves, "draftProposal.moves"),
     deletions: validateDeletions(o.deletions, "draftProposal.deletions"),
+    escalationRequest: validateEscalationRequest(o.escalationRequest),
     model: ctx.model,
     createdAt: ctx.createdAt,
+  };
+}
+
+/**
+ * 구현 모델의 에스컬레이션 요청 — state-machine 72.10.2절.
+ *
+ * **형태가 틀리면 버리지 않고 오류로 만든다**(`mcpCalls`와 같은 이유). 조용히 버리면 모델이
+ * 요청했다는 사실이 사라지고, 72.14절의 계측이 "요청 수"를 셀 수 없게 된다 — 남발이
+ * 상한에 가려 보이지 않는 바로 그 상태다.
+ *
+ * `proposedGrade`는 `PlanSubtask`와 **같은 규칙**으로 읽는다: 모르는 값은 `unmeasured`다.
+ * `economy`로 접지 않는 이유는 21.4절에 있다 — 싸다는 것은 가격에 대한 사실이고 등급은
+ * 품질에 대한 사실이다.
+ */
+function validateEscalationRequest(raw: unknown): DraftProposal["escalationRequest"] {
+  if (raw === undefined || raw === null) return undefined;
+  const o = requireObject(raw, "draftProposal.escalationRequest");
+  const grade = o.proposedGrade;
+  return {
+    reason: requireNonEmptyString(o.reason, "draftProposal.escalationRequest.reason"),
+    proposedGrade: grade === "economy" || grade === "frontier" ? grade : "unmeasured",
   };
 }
 
@@ -382,9 +412,36 @@ export function assertRelativeWorkspacePath(value: unknown, path = "path"): stri
  * "계획했는데 할 일이 없다"는 답이 아니라 실패다. 통과시키면 화면이 빈 목록을 그리고
  * 사용자는 우리가 계획을 잃어버렸다고 읽는다 — 모델이 아무것도 못 냈다는 사실과 다르다.
  */
+/**
+ * 계획 산출물 검증 — 53절(계획 모드)과 72절(`standard` 실행 경로)이 **같은 타입**을 쓴다.
+ *
+ * # `requireSubtasks`가 왜 인자인가
+ *
+ * `PlanOutline.subtasks`는 **타입에서는 선택 필드이고 경로에서 필수**다(72.2.2절).
+ * 한 타입이 두 경로의 산출물이므로 타입만으로는 강제할 수 없다 — 계획 모드는 실행으로
+ * 이어지지 않아 실행 단위가 필요 없고, **없는 것을 내게 하면 그 모드가 아끼려는 토큰을
+ * 도로 쓴다.**
+ *
+ * 그래서 **부르는 쪽이 경로를 안다**는 사실에 기댄다. 기본값을 "필수"로 두지 않는 이유는
+ * 53절 경로가 그 기본값에 걸려 실패하게 되기 때문이고, 기본값을 "선택"으로 둔 채
+ * `standard` 경로가 넘기기를 잊으면 **빈 계획이 조용히 통과한다** — 그래서 `standard`
+ * 진입점이 이 인자를 넘기는지는 오케스트레이터 테스트가 따로 지킨다.
+ */
 export function validatePlanOutline(
   raw: unknown,
-  ctx: { taskId: string; model: string; createdAt: string }
+  ctx: {
+    taskId: string;
+    model: string;
+    createdAt: string;
+    /**
+     * `standard` 실행 경로인가. `true`면 `subtasks`가 비어 있는 것을 **실패로** 다룬다
+     * (53.5절이 빈 `steps`를 오류로 본 것과 같다: "계획했는데 할 일이 없다"는 답이 아니라
+     * 실패다). `maxSubtasks` 상한도 여기서 건다 — 계획이 선언한 개수를 **한 번 검사한다**.
+     */
+    requireSubtasks?: boolean;
+    /** `TaskLoopLimits.maxSubtasks`. `requireSubtasks`일 때만 쓰인다. */
+    maxSubtasks?: number;
+  }
 ): PlanOutline {
   const o = requireObject(raw, "planOutline");
   const rawSteps = o.steps;
@@ -398,10 +455,32 @@ export function validatePlanOutline(
       files: optionalStringArray(stepObj.files, `planOutline.steps[${i}].files`) ?? [],
     };
   });
+  const subtasks = parseSubtasks(o.subtasks);
+  if (ctx.requireSubtasks) {
+    if (subtasks.length === 0) {
+      throw new ValidationError(
+        "planOutline.subtasks",
+        "standard 경로에서는 비어 있을 수 없습니다 — 계획했는데 할 일이 없다는 것은 답이 아니라 실패입니다(72.2.2절)"
+      );
+    }
+    const max = ctx.maxSubtasks;
+    // **상한이 없으면 검사하지 않는 것이 아니라 검사할 수 없다.** 여기서 기본값을 지어내면
+    // 원칙 5의 "상한을 하드코딩하지 않는다"가 이 자리에서만 깨진다 — 상한의 정본은
+    // `TaskLoopLimits`다.
+    if (max !== undefined && subtasks.length > max) {
+      throw new ValidationError(
+        "planOutline.subtasks",
+        `${subtasks.length}개는 상한 ${max}개를 넘습니다 — 계획을 거부하고 쪼개 달라고 올립니다(72.11절)`
+      );
+    }
+  }
   return {
     taskId: ctx.taskId,
     summary: requireNonEmptyString(o.summary, "planOutline.summary"),
     steps,
+    ...(subtasks.length > 0 ? { subtasks } : {}),
+    doneCriteria: optionalStringArray(o.doneCriteria, "planOutline.doneCriteria") ?? [],
+    requiredTests: optionalStringArray(o.requiredTests, "planOutline.requiredTests") ?? [],
     filesToChange: optionalStringArray(o.filesToChange, "planOutline.filesToChange") ?? [],
     risks: optionalStringArray(o.risks, "planOutline.risks") ?? [],
     openQuestions: optionalStringArray(o.openQuestions, "planOutline.openQuestions") ?? [],
@@ -411,6 +490,29 @@ export function validatePlanOutline(
     model: ctx.model,
     createdAt: ctx.createdAt,
   };
+}
+
+/**
+ * 서브태스크 배열 파싱. **`proposedGrade`를 모델이 아무 문자열로 내지 못한다.**
+ *
+ * 등급은 우리 측정이 붙이는 값이고(21.4절), 모델이 새 등급 이름을 지어내면 clamp 계산이
+ * 그 값을 어느 쪽으로도 가두지 못한다. 알 수 없는 값은 **거부하지 않고 `unmeasured`로
+ * 읽는다** — 거부하면 계획 전체가 죽는데, 그 손해는 "등급 하나를 모른다"보다 크고
+ * 위험 하한선이 여전히 아래를 받친다(72.10절).
+ */
+function parseSubtasks(raw: unknown): PlanSubtask[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new ValidationError("planOutline.subtasks", "expected an array");
+  return raw.map((item, i) => {
+    const o = requireObject(item, `planOutline.subtasks[${i}]`);
+    const grade = o.proposedGrade;
+    return {
+      subtaskId: typeof o.subtaskId === "string" && o.subtaskId.length > 0 ? o.subtaskId : `subtask-${i + 1}`,
+      intent: requireNonEmptyString(o.intent, `planOutline.subtasks[${i}].intent`),
+      files: optionalStringArray(o.files, `planOutline.subtasks[${i}].files`) ?? [],
+      proposedGrade: grade === "economy" || grade === "frontier" ? grade : "unmeasured",
+    };
+  });
 }
 
 export function validateQuestionAnswer(

@@ -129,6 +129,31 @@ export interface ExperimentControls {
    * 구별되지 않는다. 켤 때는 하네스가 명시적으로 켠다.
    */
   contrast?: boolean;
+  /**
+   * 어느 **파이프라인**을 태울 것인가 — state-machine 72.3절.
+   *
+   * # 왜 축이 하나 더 필요했는가
+   *
+   * 72절이 `standard` 경로를 통째로 바꾼다: `DRAFTING → REVIEWING`이 물러나고
+   * `OUTLINING → 승인 → B → 서브태스크 → 검증 → C → 체크리스트`가 들어온다. 그런데
+   * **가설 게이트 Protocol v1의 arm C·D가 재는 대상이 바로 그 물러난 파이프라인**이다
+   * (교차검증 informed / blind).
+   *
+   * 축 없이 두면 하네스가 조용히 **다른 것을 재게 된다.** 그리고 그 판정 기준은
+   * `evals/hypothesis-gate/src/criteria.ts`에 **해시로 봉인된 사전등록**이라, 재는 대상이
+   * 바뀌면 봉인이 지키는 것이 없어진다 — 사전등록의 뜻이 사라지는 자리다.
+   *
+   * # 이것이 "production 경로를 그대로 탄다"를 깨는가
+   *
+   * 깬다. 그래서 **축을 만들되 그 사실을 기록에 남긴다**: 이 값으로 돈 실행은
+   * `appliedPolicies`에 그 사실이 남고, 하네스의 기록에도 남는다. 대안은 둘 다 더 나빴다 —
+   * 하네스를 그대로 두면 사전등록이 무의미해지고, 72절을 하네스에 맞춰 미루면 제품이
+   * 측정 도구에 인질이 된다.
+   *
+   * **production에서는 언제나 `undefined`다**(= 72절 흐름). 72.3절이 `REVIEWING`의 phase와
+   * 타입을 지우지 않기로 한 것이 이 축이 가리킬 대상을 남겨 두었다.
+   */
+  pipeline?: "legacy_cross_verification";
 }
 
 export interface TaskUserInputParams {

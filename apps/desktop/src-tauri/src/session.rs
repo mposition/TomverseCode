@@ -18,7 +18,10 @@ use tomverse_core::host::{ApprovalGateway, ApprovalOutcome, EventSink, TaskHost}
 use tomverse_core::sidecar::{RespawnOutcome, SidecarClient, SidecarSupervisor, MAX_SIDECAR_RESPAWNS};
 use tomverse_core::store::{Store, StoreIssue, StoreOp, TaskRow};
 use tomverse_core::uimsg::{UiMessage, UserFacing};
-use tomverse_core::types::{ApprovalRequest, ExecutionMode, TaskPolicy};
+use tomverse_core::types::{
+    ApprovalRequest, ExecutionMode, PlanApprovalChoice, TaskPolicy, UserGateOutcome, UserGateRequest, UserGateway,
+    VerificationChoice,
+};
 // `available_providers`(허용 목록을 적용하지 않는 판)는 **일부러 들여오지 않는다.**
 // 이 파일의 모든 자리는 `available_providers_for`로 워크스페이스 허용 목록을 적용한다 —
 // 목록 밖 공급자의 모델을 고를 수 있게 보여주면, 고른 뒤 "키가 없다"는 오류를 만나게 된다.
@@ -28,7 +31,7 @@ use tomverse_core::{
     available_providers_for, credential_injection_for, credential_presence, providers_blocked_by_policy,
     CancellationRegistry, WorkspaceRoot, PROTOCOL_VERSION,
 };
-use tomverse_core::approvals::PendingApprovals;
+use tomverse_core::approvals::{PendingApprovals, PendingGates};
 
 /// UI에 승인 요청을 emit하고 사용자 응답을 기다린다.
 ///
@@ -88,6 +91,68 @@ impl ApprovalGateway for UiApprovalGateway {
     }
 }
 
+/// 72절 **사용자 게이트 둘**의 UI 왕복 — state-machine 72.4·72.12절.
+///
+/// `UiApprovalGateway`와 나란히 두지만 **타임아웃이 없다.** 그 한 줄이 두 게이트웨이를
+/// 나눈 이유 전부다:
+///
+/// - 72.5절은 *"사용자가 계획을 승인하고 **자리를 비운 사이**"*를 명시적으로 전제하고,
+///   그 경우를 위해 지문 만료를 설계했다. 10분 뒤 자동 거부되면 그 설계가 걸릴 일이 없다.
+/// - 72.12절은 그 대기 동안 **구현 예산 예약을 잡아 둔다.** 10분마다 거부로 끝나면 예약과
+///   해제가 반복될 뿐이다.
+/// - **거부는 결말이다.** 도구 하나의 거부와 달리 계획 승인의 거부는 태스크를 `REJECTED`로
+///   끝낸다 — 점심 먹으러 간 사이에 작업이 사라지는 것은 사용자가 고른 적 없는 결말이다.
+///
+/// **그러면 상한 없는 대기가 아닌가**(원칙 5)? 아니다. 상한은 여기가 아니라 **사용자의
+/// 탈출구**가 진다: 취소는 새 다섯 phase 전부에서 들어오고(72.11절), 무인 실행에서는
+/// 39절의 시한이 그 정지를 다룬다. 그리고 앱을 닫으면 `PendingGates::drain`이 닫는다 —
+/// **거부가 아니라 `Unavailable`로** 닫는 것이 72.12절의 요점이다.
+pub struct UiUserGateway {
+    app: AppHandle,
+    pending: Arc<PendingGates>,
+}
+
+impl UiUserGateway {
+    pub fn new(app: AppHandle, pending: Arc<PendingGates>) -> Self {
+        Self { app, pending }
+    }
+}
+
+impl UserGateway for UiUserGateway {
+    /// 게이트에서 기다리는 태스크를 깨운다 — `TaskHost::cancel_task`가 부른다(72.12.2절).
+    ///
+    /// **여기 있는 이유**: 이 구현만 사람을 기다린다. 헤드리스 게이트웨이는 고정된 답을 즉시
+    /// 내므로 깨울 대기가 없고, 그래서 트레이트의 기본 구현은 `false`다.
+    fn cancel_waiting(&self, task_id: &str, reason: &str) -> bool {
+        self.pending.cancel_waiting(task_id, reason)
+    }
+
+    fn request_gate(&self, request: &UserGateRequest) -> UserGateOutcome {
+        let task_id = request.task_id().to_string();
+        let rx = self.pending.register(&task_id);
+        let channel = match request {
+            UserGateRequest::Plan { .. } => "plan-approval-required",
+            UserGateRequest::Verification { .. } => "verification-required",
+        };
+        if self
+            .app
+            .emit(channel, serde_json::to_value(request).unwrap_or(Value::Null))
+            .is_err()
+        {
+            self.pending.forget(&task_id);
+            // **거부가 아니다.** UI에 전달하지 못한 것은 오류이지 사용자의 판정이 아니며,
+            // 거부로 접으면 최종 보고가 "사용자가 거부했다"고 거짓말한다.
+            return UserGateOutcome::Unavailable("UI에 게이트 카드를 전달할 수 없었습니다".to_string());
+        }
+        // **`recv_timeout`이 아니다.** 시한을 여기 붙이는 순간 위 세 근거가 전부 무효가 된다.
+        let outcome = rx
+            .recv()
+            .unwrap_or_else(|_| UserGateOutcome::Unavailable("게이트 대기가 끊어졌습니다".to_string()));
+        self.pending.forget(&task_id);
+        outcome
+    }
+}
+
 /// Rust → UI 이벤트 릴레이. process-architecture.md 4절대로 내용을 해석하지 않고 그대로 emit한다.
 struct TauriSink {
     app: AppHandle,
@@ -125,6 +190,8 @@ pub struct ActiveWorkspace {
 pub struct SessionState {
     inner: Mutex<Option<ActiveWorkspace>>,
     pub pending_approvals: Arc<PendingApprovals>,
+    /// 대기 중인 **사용자 게이트**(72절). 도구 승인과 나누는 이유는 `PendingGates` 참조.
+    pub pending_gates: Arc<PendingGates>,
     /// 저장 계층은 **워크스페이스와 독립적으로** 살아 있어야 한다.
     ///
     /// 앱을 켜자마자(워크스페이스를 열기 전) 최근 작업 목록과 중단된 작업을 보여줘야 하기 때문이다.
@@ -206,6 +273,14 @@ fn is_read_only_kind(kind: &str) -> bool {
 /// (여기서는 `auto_approve_workspace_writes`가 그랬다) 불리언 행렬이 길어지는 것도 막는다.
 pub struct ScreenSwitches<'a> {
     pub mode: ExecutionMode,
+    /// 어느 **등급**이 구현하는가 (state-machine 72.9절).
+    ///
+    /// **`effort`와 함께 들어왔다.** 축을 하나만 먼저 넣으면 화면이 "나머지는 어디 있나"를
+    /// 묻는 상태로 커밋된다(72.15절).
+    pub profile: tomverse_core::types::PerformanceProfile,
+    /// 고른 모델을 **얼마나 깊게** 굴리는가 (72.9절). `profile`과 직교한다 —
+    /// `economy + high`는 "싼 모델에게 시간을 더 준다"이고 합치면 표현할 수 없다.
+    pub effort: tomverse_core::types::EffortLevel,
     pub allow_git_commit: bool,
     pub unattended: bool,
     pub auto_approve_verification: bool,
@@ -234,6 +309,8 @@ fn task_policy_from(switches: &ScreenSwitches<'_>) -> TaskPolicy {
     let narrowed = allowed_tools_for(switches.kind, switches.skill);
     TaskPolicy {
         execution_mode: switches.mode,
+        performance_profile: switches.profile,
+        effort_level: switches.effort,
         allow_git_commit: switches.allow_git_commit,
         unattended: switches.unattended,
         auto_approve_verification: switches.auto_approve_verification,
@@ -300,6 +377,19 @@ struct MemberDone {
     host: Option<Arc<TaskHost>>,
 }
 
+/// 스케줄러가 받는 소식 — 구성원이 끝났거나, **계획이 승인됐거나**(72.12절).
+///
+/// 채널을 둘로 나누지 않는다. 나누면 스케줄러가 둘 중 하나를 골라 기다려야 하고, 그 순간
+/// 한쪽이 오지 않으면 나머지도 들리지 않는다. 한 줄로 받으면 순서가 일어난 순서 그대로다.
+enum MemberSignal {
+    /// 이 구성원이 `PLAN_APPROVED`를 받았다 — **기록만 한다.**
+    ///
+    /// 예약은 움직이지 않는다(72.12.1절). 줄이면 합계 상한이 깨지고, 올리면 태스크당
+    /// 상한을 넘는다. 카드가 말한 금액은 관측으로만 실린다.
+    PlanApproved(tomverse_core::fleet::PlanApproved),
+    Done(Box<MemberDone>),
+}
+
 /// 구성원 전부가 공유하는 값들. **한 번 정해지고 바뀌지 않는다** — 태스크마다 다시 읽으면
 /// 구성원들이 서로 다른 설정으로 돌 수 있고, 그 차이는 기록에도 화면에도 남지 않는다.
 struct FleetContext {
@@ -314,6 +404,9 @@ struct FleetContext {
     fleet_size: usize,
     caps: tomverse_core::fleet::FleetCaps,
     mode: ExecutionMode,
+    /// 72.9절의 축 둘 — 구성원도 평범한 태스크이므로 같은 값을 받는다.
+    profile: tomverse_core::types::PerformanceProfile,
+    effort: tomverse_core::types::EffortLevel,
     allow_git_commit: bool,
     unattended: bool,
     auto_approve_verification: bool,
@@ -763,6 +856,12 @@ impl SessionState {
     pub fn autopilot_preview(
         &self,
         mode: ExecutionMode,
+        // 어느 등급이 구현하는가 / 얼마나 깊게 굴리는가 — state-machine 72.9절.
+        //
+        // **둘을 함께 받는다.** 직교하는 축이고(`economy + high`가 의미를 갖는다), 하나만
+        // 받으면 화면이 "나머지는 어디 있나"를 묻는 상태가 된다.
+        profile: tomverse_core::types::PerformanceProfile,
+        effort: tomverse_core::types::EffortLevel,
         allow_git_commit: bool,
         unattended: bool,
         auto_approve_verification: bool,
@@ -792,6 +891,8 @@ impl SessionState {
         };
         let policy = task_policy_from(&ScreenSwitches {
             mode,
+            profile,
+            effort,
             allow_git_commit,
             unattended,
             auto_approve_verification,
@@ -1057,6 +1158,7 @@ impl SessionState {
             .map_err(|e| format!("워크스페이스 설정: {e}"))?;
 
         let approvals = Arc::new(UiApprovalGateway::new(app.clone(), self.pending_approvals.clone()));
+        let gates = Arc::new(UiUserGateway::new(app.clone(), self.pending_gates.clone()));
         let sink = Arc::new(TauriSink { app: app.clone() });
         let mut task_host = TaskHost::new(
             root.clone(),
@@ -1066,7 +1168,8 @@ impl SessionState {
             approvals,
             sink,
             self.cancels.clone(),
-        );
+        )
+        .with_gates(gates);
         let mcp = if servers.is_empty() {
             None
         } else {
@@ -1362,6 +1465,11 @@ impl SessionState {
             },
             "policy": {
                 "executionMode": match switches.mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
+                // 72.9절의 축 둘. **Node가 읽는 쪽이다** — 등급 clamp와 프롬프트의 effort가
+                // sidecar에서 일어난다(`orchestrator/grade.ts`). 보내지 않으면 기본값으로
+                // 돌아가고, 그러면 사용자가 고른 것과 실행된 것이 조용히 갈린다.
+                "performanceProfile": switches.profile,
+                "effortLevel": switches.effort,
                 "allowGitCommit": switches.allow_git_commit,
                 // null은 "기본값을 쓰라"가 아니라 **"상한 없음"**이다. sidecar의 mergePolicy가
                 // 키의 부재와 null을 구별하므로 여기서 항상 키를 넣는다.
@@ -1485,6 +1593,12 @@ impl SessionState {
         &self,
         message: &str,
         mode: ExecutionMode,
+        // 어느 등급이 구현하는가 / 얼마나 깊게 굴리는가 — state-machine 72.9절.
+        //
+        // **둘을 함께 받는다.** 직교하는 축이고(`economy + high`가 의미를 갖는다), 하나만
+        // 받으면 화면이 "나머지는 어디 있나"를 묻는 상태가 된다.
+        profile: tomverse_core::types::PerformanceProfile,
+        effort: tomverse_core::types::EffortLevel,
         allow_git_commit: bool,
         budget_usd: Option<f64>,
         model_pins: Value,
@@ -1513,6 +1627,8 @@ impl SessionState {
         let skill = self.load_skill(&target, skill_path)?;
         let switches = ScreenSwitches {
             mode,
+            profile,
+            effort,
             allow_git_commit,
             unattended,
             auto_approve_verification,
@@ -1561,6 +1677,11 @@ impl SessionState {
     ///
     /// **아직 시작하지 않은 구성원에도 닿아야 한다.** 도는 것만 멈추고 대기열을 그대로 두면
     /// 취소를 누른 뒤에 새 태스크가 시작된다 — 사용자가 요청한 것의 정반대다.
+    ///
+    /// **그리고 게이트에서 기다리는 구성원에도 닿아야 한다.** 사용자 게이트 둘에는 타임아웃이
+    /// 없으므로(72.12절), 취소가 `PendingGates`에 닿지 않으면 그 구성원은 `recv()`에서 영원히
+    /// 기다린다 — `Done`을 보내지 않으니 **스케줄러도 멈추고 예약도 풀리지 않는다.** 독립
+    /// 검토가 이것을 P0로 잡았다: `cancel_task`에는 이 처리가 있었는데 Fleet 쪽 둘에는 없었다.
     pub fn cancel_fleet(&self) -> Result<Value, String> {
         let (members, fleet_id) = {
             let guard = self.fleet.lock().unwrap();
@@ -1575,11 +1696,19 @@ impl SessionState {
         // **어느 구성원에 닿았는지 말한다.** 개수만 주면 화면은 "3개 취소함"이라고 쓰고,
         // 사용자는 자기가 보고 있던 브랜치가 그 셋에 들었는지 알 수 없다.
         let mut reached: Vec<String> = Vec::new();
+        // 게이트에서 기다리다 깨어난 구성원. **개수가 아니라 브랜치로 남긴다** — 화면이
+        // "취소했는데 카드가 그대로다"와 "카드에서 기다리다 취소됐다"를 구별해야 한다.
+        let mut woken: Vec<String> = Vec::new();
         for member in &members {
             // 순서: Rust 먼저. 토큰이 켜져야 진행 중인 프로세스가 죽고 새 도구가 시작되지 않는다.
-            if member.host.cancel_task(&member.task_id).is_ok() {
+            if let Ok(outcome) = member.host.cancel_task(&member.task_id) {
                 reached.push(member.branch.clone());
+                if outcome.get("gateWoken").and_then(Value::as_bool).unwrap_or(false) {
+                    woken.push(member.branch.clone());
+                }
             }
+            // 게이트 대기를 깨우는 것은 `cancel_task` 안에서 일어난다 — 여기서는 **그 답을
+            // 읽기만 한다.** 규칙을 호출자마다 적으면 언젠가 한 곳이 빠진다(72.12.2절 ①).
             let _ = member
                 .sidecar
                 .request("task.cancel", json!({ "taskId": member.task_id }), Duration::from_secs(5));
@@ -1587,6 +1716,8 @@ impl SessionState {
         Ok(json!({
             "fleetId": fleet_id,
             "cancelledBranches": reached,
+            // 게이트에서 기다리다 깨어난 구성원들.
+            "gateWokenBranches": woken,
             // **대기열도 닫았다.** 닫지 않으면 취소를 누른 뒤에 새 태스크가 시작된다.
             "queueClosed": true,
         }))
@@ -1602,6 +1733,11 @@ impl SessionState {
                 .ok_or_else(|| "그 구성원은 지금 도는 Fleet에 없습니다.".to_string())?
         };
         let rust_outcome = member.host.cancel_task(task_id)?;
+        // 깨우는 것은 `cancel_task`가 한다 — 여기서는 그 답을 읽는다(72.12.2절 ①).
+        let gate_woken = rust_outcome
+            .get("gateWoken")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let node_outcome = member
             .sidecar
             .request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5))
@@ -1610,6 +1746,8 @@ impl SessionState {
             "accepted": rust_outcome.get("accepted").and_then(Value::as_bool).unwrap_or(false),
             "host": rust_outcome,
             "sidecar": node_outcome,
+            // 게이트에서 기다리던 구성원이었는가 — `cancel_task`와 같은 구별이 필요하다.
+            "gateWoken": gate_woken,
         }))
     }
 
@@ -1638,6 +1776,10 @@ impl SessionState {
         app: &AppHandle,
         members: Vec<tomverse_core::fleet::MemberSpec>,
         mode: ExecutionMode,
+        // 72.9절의 축 둘. **구성원마다 다르게 주지 않는다** — Fleet은 같은 요청을 여러
+        // 브랜치에서 돌리는 장치이고, 축이 갈리면 구성원 간 비교가 성립하지 않는다.
+        profile: tomverse_core::types::PerformanceProfile,
+        effort: tomverse_core::types::EffortLevel,
         allow_git_commit: bool,
         // **태스크당** 상한. 합계 상한을 걸려면 이것이 있어야 한다(`fleet::plan`이 강제한다).
         budget_usd: Option<f64>,
@@ -1695,7 +1837,7 @@ impl SessionState {
         let caps = plan.caps();
         let mut budget = FleetBudget::from_plan(&plan);
         let mut reports: Vec<Option<MemberReport>> = (0..size).map(|_| None).collect();
-        let (tx, rx) = std::sync::mpsc::channel::<MemberDone>();
+        let (tx, rx) = std::sync::mpsc::channel::<MemberSignal>();
 
         let context = FleetContext {
             app: app.clone(),
@@ -1708,6 +1850,8 @@ impl SessionState {
             fleet_size: size,
             caps,
             mode,
+            profile,
+            effort,
             allow_git_commit,
             unattended,
             auto_approve_verification,
@@ -1739,17 +1883,18 @@ impl SessionState {
                         ));
                         continue;
                     }
-                    match budget.try_admit() {
+                    match budget.try_admit(index) {
                         Admission::Admitted { reserved_usd } => {
                             next += 1;
                             running += 1;
                             let tx = tx.clone();
+                            let signal = tx.clone();
                             let context = &context;
                             scope.spawn(move || {
-                                let done = self.run_fleet_member(context, index, spec, reserved_usd);
+                                let done = self.run_fleet_member(context, index, spec, reserved_usd, signal);
                                 // **보내지 못하면 스케줄러가 영원히 기다린다.** 받는 쪽이
                                 // 사라지는 경우는 스케줄러가 이미 끝난 때뿐이다.
-                                let _ = tx.send(done);
+                                let _ = tx.send(MemberSignal::Done(Box::new(done)));
                             });
                         }
                         Admission::Refused {
@@ -1781,10 +1926,72 @@ impl SessionState {
                 if running == 0 {
                     break;
                 }
-                let done = rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))?;
+                let signal = rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))?;
+                let mut done = match signal {
+                    // **승인은 원장을 움직이지 않는다**(72.12.1절). 이 팔은 읽고 기록할
+                    // 뿐이다 — 여기서 줄이면 구성원의 `TaskBudget` 상한과 어긋나고,
+                    // 그 순간 합계 상한이 깨진다. 소스 검사가 그것을 지킨다.
+                    MemberSignal::PlanApproved(approved) => {
+                        let index = approved.index;
+                        if let tomverse_core::fleet::ImplementationStage::Staged {
+                            held_usd,
+                            card_usd,
+                            priced,
+                        } = budget.reserve_implementation(
+                            index,
+                            approved.estimated_cost_usd,
+                            approved.priced,
+                        ) {
+                            let branch = &plan.members[index].branch;
+                            let found = self
+                                .fleet
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .and_then(|f| f.members.iter().find(|m| &m.branch == branch).cloned());
+                            if let Some(member) = found {
+                                // **예약도 기록으로 남는다.** 남기지 않으면 "왜 상한이 밀렸는가"를
+                                // 나중에 대답할 수 없다.
+                                let _ = member.host.append_event(
+                                    &member.task_id,
+                                    "FLEET_IMPLEMENTATION_RESERVED",
+                                    json!({
+                                        "fleetId": fleet_id,
+                                        "branch": branch,
+                                        "memberIndex": index + 1,
+                                        "heldUsd": held_usd,
+                                        "cardUsd": card_usd,
+                                        // **카드가 금액으로 말했는가.** 거짓이면 줄이지 않았고,
+                                        // 그 사실이 없으면 "0이 열렸다"와 구별되지 않는다.
+                                        "priced": priced,
+                                        "estimatedCostUsd": approved.estimated_cost_usd,
+                                        "fleetReservedUsd": budget.reserved_usd(),
+                                    }),
+                                );
+                            }
+                        }
+                        // **도는 구성원 수는 그대로다.** 승인은 결말이 아니므로 여기서
+                        // `running`을 줄이면 끝나지 않은 구성원을 두고 루프가 빠져나간다.
+                        continue;
+                    }
+                    MemberSignal::Done(done) => *done,
+                };
                 running -= 1;
+                // **지금 잡고 있는 금액은 원장이 말한다.** 스케줄러가 금액을 들고 다니면
+                // 단계 분할 뒤로 화면과 헤드리스가 서로 다른 숫자를 쓰게 된다.
+                done.report.reserved_usd = budget.held_for(done.report.index).or(done.report.reserved_usd);
                 // **비용은 저장소가 말한다** — Node의 주장이 아니라 `provider_usage` 행이다.
-                budget.settle(done.report.reserved_usd, done.report.cost_usd);
+                // 읽지 못했으면 **예약만큼 썼다고 친다** — 0으로 접으면 자리가 열린다.
+                if done.report.cost_is_complete() {
+                    budget.settle(done.report.index, done.report.cost_usd);
+                } else {
+                    let assumed = budget.settle_with_unknown_cost(done.report.index);
+                    eprintln!(
+                        "[fleet] 구성원 지출이 전부가 아닙니다({}: 읽기 실패 {}, 가격 미상 {}건) \
+— 예약 ${assumed:.4}을 지출로 칩니다",
+                        done.report.branch, done.report.cost_read_failed, done.report.cost_unpriced_calls
+                    );
+                }
                 if let Some(host) = &done.host {
                     let _ = host.append_event(
                         &done.report.task_id,
@@ -1795,6 +2002,9 @@ impl SessionState {
                             "memberIndex": done.report.index + 1,
                             "status": done.report.status,
                             "costUsd": done.report.cost_usd,
+                            // **모르는 것을 아는 것처럼 적지 않는다.** 원인 둘을 구별해 남긴다.
+                            "costReadFailed": done.report.cost_read_failed,
+                            "costUnpricedCalls": done.report.cost_unpriced_calls,
                             "reservedUsd": done.report.reserved_usd,
                             "fleetCommittedUsd": budget.committed_usd(),
                         }),
@@ -1908,6 +2118,7 @@ impl SessionState {
         index: usize,
         spec: &tomverse_core::fleet::MemberSpec,
         reserved_usd: Option<f64>,
+        signal: std::sync::mpsc::Sender<MemberSignal>,
     ) -> MemberDone {
         let started_at = tomverse_core::time::now_iso();
         let failed = |summary: String| MemberDone {
@@ -1921,6 +2132,9 @@ impl SessionState {
                 status: "failed".to_string(),
                 summary,
                 cost_usd: 0.0,
+                // 시작조차 못 했으므로 **읽을 지출이 없다** — 못 읽은 것과 다르다.
+                cost_read_failed: false,
+                cost_unpriced_calls: 0,
                 // **예약을 돌려준다.** 돌려주지 않으면 남은 구성원들이 있지도 않은 지출에 막힌다.
                 reserved_usd,
                 started_at: Some(started_at.clone()),
@@ -1967,13 +2181,26 @@ impl SessionState {
             branch: spec.branch.clone(),
         };
         let approvals = Arc::new(UiApprovalGateway::new(context.app.clone(), self.pending_approvals.clone()));
+        let gates = Arc::new(UiUserGateway::new(context.app.clone(), self.pending_gates.clone()));
         // **구성원 이벤트는 화면의 다른 채널로 간다.** `task-event`로 흘리면 활성 태스크의
         // 로그와 단계 표시가 남의 태스크를 따라간다 — 화면이 조용히 거짓말하는 자리다.
-        let sink = Arc::new(FleetSink {
+        let fleet_sink: Arc<dyn tomverse_core::host::EventSink> = Arc::new(FleetSink {
             app: context.app.clone(),
             fleet_id: context.fleet_id.clone(),
             branch: spec.branch.clone(),
         });
+        // **계획 승인을 스케줄러에 알린다**(72.12절). 감시 코드는 `fleet.rs`에 하나뿐이고
+        // 헤드리스 루프도 같은 것을 쓴다 — 둘을 각자 적으면 예산이 갈린다(72.16절).
+        let signal_for_watch = std::sync::Mutex::new(signal);
+        let sink = Arc::new(tomverse_core::fleet::PlanApprovalWatch::new(
+            fleet_sink,
+            index,
+            Box::new(move |approved| {
+                if let Ok(tx) = signal_for_watch.lock() {
+                    let _ = tx.send(MemberSignal::PlanApproved(approved));
+                }
+            }),
+        ));
         let store = match self.store() {
             Ok(store) => store,
             Err(message) => return failed(message),
@@ -1986,6 +2213,10 @@ impl SessionState {
         // 고정하는 것이 같은 값이어야 한다 — 헤드리스 `start_member`도 같은 값을 두 자리에 넣는다.
         let switches = ScreenSwitches {
             mode: context.mode,
+            // **Fleet 구성원도 같은 축을 받는다.** 구성원은 평범한 태스크이므로(fleet.rs)
+            // 여기서 기본값으로 접으면 화면이 고른 것과 구성원이 도는 것이 갈린다.
+            profile: context.profile,
+            effort: context.effort,
             allow_git_commit: context.allow_git_commit,
             unattended: context.unattended,
             auto_approve_verification: context.auto_approve_verification,
@@ -2005,6 +2236,10 @@ impl SessionState {
                 sink,
                 self.cancels.clone(),
             )
+            // **Fleet 구성원마다 게이트 둘을 갖는다**(72.12절). 승인 큐가 이미 요청이 여러
+            // 개여도 덮이지 않게 하므로 큐 구조는 그대로 쓰지만, **타임아웃 정책은 그대로
+            // 쓸 수 없다** — 그래서 게이트 등록부가 따로 있다.
+            .with_gates(gates.clone())
             .with_isolation(isolation)
             .with_fleet_member(origin),
         );
@@ -2062,6 +2297,8 @@ impl SessionState {
             status: "failed".to_string(),
             summary: String::new(),
             cost_usd: 0.0,
+            cost_read_failed: false,
+            cost_unpriced_calls: 0,
             reserved_usd,
             started_at: Some(started_at.clone()),
             finished_at: None,
@@ -2138,12 +2375,25 @@ impl SessionState {
             }
         }
         // **비용은 저장소가 말한다** — Node의 주장이 아니라 `provider_usage` 행이다.
-        report.cost_usd = self
+        //
+        // **못 읽은 것을 $0으로 접지 않는다.** 접으면 원장에 자리가 열리고 합계 상한이
+        // 깨진다(`settle_with_unknown_cost`의 머리말 — 독립 검토가 P1으로 잡았다).
+        match self
             .with_store_prose("비용 집계", |s| s.task_cost_usd(&task_id))
             .ok()
             .and_then(|r| r.ok())
-            .map(|(cost, _, _)| cost)
-            .unwrap_or(0.0);
+        {
+            // **가격을 모르는 호출 수를 버리지 않는다.** 버리면 부분합이 전체합처럼 읽히고,
+            // 그 부분합으로 정산하면 나머지 예약이 풀려 다음 구성원이 들어간다(3차 검토).
+            Some((cost, _, unpriced)) => {
+                report.cost_usd = cost;
+                report.cost_unpriced_calls = unpriced;
+            }
+            None => {
+                report.cost_usd = 0.0;
+                report.cost_read_failed = true;
+            }
+        }
         report.finished_at = Some(tomverse_core::time::now_iso());
         MemberDone { report, host: Some(host) }
     }
@@ -2188,6 +2438,10 @@ impl SessionState {
         self.start_task(
             &task.user_message,
             mode,
+            // **다시 실행은 새 승인이다.** 축 둘도 물려받지 않고 기본값으로 시작한다 —
+            // 물려받게 하려면 화면이 그것을 **보여준 뒤**여야 한다(위 문단과 같은 규칙).
+            tomverse_core::types::PerformanceProfile::Balanced,
+            tomverse_core::types::EffortLevel::Medium,
             // allow_git_commit
             false,
             budget_usd,
@@ -2232,6 +2486,16 @@ impl SessionState {
 
         // 순서: Rust 먼저. 토큰이 켜져야 진행 중인 프로세스가 죽고 새 도구가 시작되지 않는다.
         let rust_outcome = host.cancel_task(task_id)?;
+
+        // **대기 중인 사용자 게이트를 깨운다** — state-machine 72.11절.
+        //
+        // **게이트 대기를 깨우는 것은 `TaskHost::cancel_task`가 한다**(72.12.2절). 한때
+        // 이 세 곳(태스크 취소·Fleet 취소·강제 포기)이 각자 기억해야 했고, 그러자 둘이
+        // 빠졌다 — 빠진 쪽은 **성공을 돌려주었다.** 화면은 이제 그 답을 읽어 전할 뿐이다.
+        let gate_woken = rust_outcome
+            .get("gateWoken")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let node_outcome = sidecar
             .request("task.cancel", json!({ "taskId": task_id }), Duration::from_secs(5))
             .unwrap_or(Value::Null);
@@ -2241,6 +2505,9 @@ impl SessionState {
             "outcome": rust_outcome.get("outcome"),
             "host": rust_outcome,
             "sidecar": node_outcome,
+            // 게이트에서 기다리던 태스크였는가. **화면이 이 사실을 구별해야** "취소를 눌렀는데
+            // 아무 일도 없었다"와 "카드를 닫고 취소했다"가 같아 보이지 않는다.
+            "gateWoken": gate_woken,
         }))
     }
 
@@ -2287,6 +2554,10 @@ impl SessionState {
         drop(guard);
 
         // 취소 토큰을 확실히 켠다. 이미 켜져 있으면 idempotent다.
+        //
+        // **게이트 대기도 여기서 깨어난다** — `cancel_task` 안에서 일어나므로 이 함수가
+        // 따로 기억할 것이 없다. 강제 포기는 마지막 탈출구이고, 카드 앞에서 기다리는
+        // 스레드를 깨우지 않으면 **포기한 뒤에도 영원히 서 있는다**(72.12.2절 ①).
         let _ = host.cancel_task(task_id);
         // sidecar 응답을 **기다리지 않는다** — 응답하지 않는 것이 이 경로의 전제다.
         // 짧은 타임아웃으로 한 번만 밀어 넣고, 실패해도 진행한다.
@@ -2320,6 +2591,33 @@ impl SessionState {
     /// 전환으로 정리된 항목이 화면에만 남는다. 그 목록은 **등록부가 정본이다.**
     pub fn pending_approvals(&self) -> Value {
         json!({ "pending": self.pending_approvals.pending() })
+    }
+
+    /// 대기 중인 사용자 게이트 목록. 화면이 "무엇을 기다리고 있는가"에 답할 수 있어야 한다.
+    pub fn pending_gates(&self) -> Value {
+        json!({ "waiting": self.pending_gates.waiting() })
+    }
+
+    /// 계획 승인 카드 / 검증 체크리스트의 답 — state-machine 72.4·72.8절.
+    ///
+    /// **Node를 거치지 않는다.** 승인 이벤트가 `NODE_MAY_NOT_EMIT`이므로 왕복 전체가 Rust
+    /// 소유이고, 기록은 `TaskHost::request_user_gate`가 남긴다.
+    pub fn respond_gate(&self, task_id: &str, gate: &str, choice: &str) -> Result<Value, String> {
+        let outcome = match (gate, choice) {
+            ("plan", "approve_with_review") => UserGateOutcome::Plan(PlanApprovalChoice::ApproveWithReview),
+            ("plan", "approve_skip_review") => UserGateOutcome::Plan(PlanApprovalChoice::ApproveSkipReview),
+            ("plan", "revise") => UserGateOutcome::Plan(PlanApprovalChoice::Revise),
+            ("plan", "reject") => UserGateOutcome::Plan(PlanApprovalChoice::Reject),
+            ("verification", "approve") => UserGateOutcome::Verification(VerificationChoice::Approve),
+            ("verification", "refix") => UserGateOutcome::Verification(VerificationChoice::Refix),
+            ("verification", "replan") => UserGateOutcome::Verification(VerificationChoice::Replan),
+            ("verification", "revert_and_stop") => UserGateOutcome::Verification(VerificationChoice::RevertAndStop),
+            _ => return Err(format!("알 수 없는 게이트 응답: {gate}/{choice}")),
+        };
+        // **전달 실패는 오류가 아니라 값이다.** 낡은 화면에서 누른 경우이고, 화면이
+        // "이미 지나갔습니다"라고 말할 수 있어야 한다 — 오류로 내면 그 문장이 스택 트레이스가 된다.
+        let delivered = self.pending_gates.respond(task_id, outcome);
+        Ok(json!({ "delivered": delivered }))
     }
 
     pub fn respond_approval(&self, approval_id: &str, granted: bool, note: Option<String>) -> Result<Value, String> {

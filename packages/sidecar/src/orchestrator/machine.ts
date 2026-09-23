@@ -21,7 +21,10 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
   // 질문에는 검증할 산출물이 없으므로 그 판정에 답이 없다.
   SNAPSHOTTING: ["TRIAGE", "ANSWERING", "OUTLINING", "CANCELLING", "CANCELLED", "FAILED"],
   // TRIAGE는 complexityTier에 따라 갈린다.
-  TRIAGE: ["DRAFTING", "SINGLE_MODEL_FIX", "CANCELLING", "CANCELLED", "FAILED"],
+  // **`standard`는 이제 `OUTLINING`으로 간다**(72.2절). `DRAFTING`은 남아 있지만 새 태스크가
+  // 그 phase에 진입하지 않는다 — 지우지 않는 이유는 72.3절과 같다: `task_events`는
+  // append-only이고 과거 태스크가 그 phase를 지났다는 기록이 남아 있다.
+  TRIAGE: ["OUTLINING", "DRAFTING", "SINGLE_MODEL_FIX", "CANCELLING", "CANCELLED", "FAILED"],
   /**
    * `AWAITING_USER_INPUT`이 추가된 이유 — state-machine-and-protocol.md 17.1절.
    *
@@ -106,11 +109,25 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
     "FAILED",
   ],
   AWAITING_APPROVAL: ["EXECUTING", "CANCELLING", "CANCELLED", "FAILED"],
-  // EXECUTING → EXECUTING은 "다음 ToolRequest"를 뜻한다.
-  EXECUTING: ["EXECUTING", "VERIFYING", "CANCELLING", "CANCELLED", "FAILED"],
-  // VERIFYING → COMPLETED(pass) 또는 FIX_LOOP(fail). CLAUDE.md 원칙 1에 따라
+  // EXECUTING → EXECUTING은 "다음 ToolRequest"를 뜻하고, → IMPLEMENTING은 **다음 서브태스크**다
+  // (72.2.2절). 둘을 한 간선으로 뭉개지 않는 이유는 반복의 단위가 다르기 때문이다 —
+  // 앞은 도구 하나, 뒤는 모델 호출 하나이고 상한도 다른 것이 진다(`maxSubtasks`).
+  EXECUTING: ["EXECUTING", "IMPLEMENTING", "VERIFYING", "CANCELLING", "CANCELLED", "FAILED"],
+  // VERIFYING → COMPLETED(pass, `simple`) 또는 FIX_LOOP(fail). CLAUDE.md 원칙 1에 따라
   // VERIFYING을 건너뛰고 COMPLETED로 가는 전이는 어디에도 없다.
-  VERIFYING: ["COMPLETED", "FIX_LOOP", "CANCELLING", "CANCELLED", "FAILED"],
+  //
+  // `standard`에서 통과하면 → `RESULT_REVIEWING`, **단 C가 드롭됐으면**
+  // → `AWAITING_USER_VERIFICATION` 직행이다(72.7절). 체크리스트의 결정론적 절반
+  // (계획에 없던 파일 목록)은 C 없이도 그대로 만들어지므로 건너뛸 것은 검토뿐이다.
+  VERIFYING: [
+    "COMPLETED",
+    "RESULT_REVIEWING",
+    "AWAITING_USER_VERIFICATION",
+    "FIX_LOOP",
+    "CANCELLING",
+    "CANCELLED",
+    "FAILED",
+  ],
   FIX_LOOP: ["PLANNING", "FAILED", "CANCELLING", "CANCELLED", "REJECTED"],
   // 정리만 하고 CANCELLED로 간다. 여기서 COMPLETED로 갈 수 없다 —
   // 취소를 요청한 뒤 성공으로 끝나면 사용자는 취소가 무시됐다고 느낀다.
@@ -127,7 +144,105 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
    * 계획 경로 — `ANSWERING`과 같은 모양이다(53절). `EXECUTING`도 `PLANNING`도 없다:
    * 계획 모드는 patch를 만들지 않으므로 쪼갤 것도 적용할 것도 없다.
    */
-  OUTLINING: ["OUTLINED", "CANCELLING", "CANCELLED", "FAILED"],
+  /**
+   * **두 경로가 이 phase를 공유한다**(72.2절).
+   *
+   * 계획 모드(53절)는 `OUTLINED`로 끝나고, `standard` 실행 경로는 승인 게이트로 간다.
+   * 새 이름을 만들지 않은 근거는 72.2절에 있다 — 하는 일이 같고 산출물 타입이 같으며,
+   * 이름을 나누면 프롬프트가 갈릴 여지가 생겨 "모델 차이"와 "프롬프트 차이"가 섞인다.
+   *
+   * **그 대신 이 표가 두 경로를 한 그래프에 담게 됐고**, 그래서 `PHASES_BY_KIND`가 생겼다 —
+   * 아래 주석 참조.
+   */
+  OUTLINING: ["OUTLINED", "AWAITING_PLAN_APPROVAL", "CANCELLING", "CANCELLED", "FAILED"],
+  /**
+   * 72.4절의 선택지 넷이 그대로 간선 넷이다.
+   *
+   * | 선택 | 다음 |
+   * |---|---|
+   * | 승인 + 독립 검토 | `PLAN_REVIEWING` |
+   * | 승인 + 검토 생략 | `IMPLEMENTING` |
+   * | 수정 요청 | `OUTLINING` 재진입 (`planRounds` 안에서) |
+   * | 거부 | `REJECTED` |
+   *
+   * **`AWAITING_USER_INPUT`으로 가는 간선이 없다**(72.11절). 모델이 올리는 쟁점은 둘 다
+   * (대조·B) 이 카드로 오고, 재질문이 필요한 모호함은 계획 단계 이전에 처리된다.
+   * 간선을 만들면 2.1절 표에 없는 전이(`OUTLINING → AWAITING_USER_INPUT`)를 만들게 된다.
+   */
+  AWAITING_PLAN_APPROVAL: [
+    /**
+     * **자기 자신으로의 전이** — 카드를 다시 묻는다.
+     *
+     * 계획 수정 상한을 다 쓴 뒤 "수정 요청"이 또 오면 계획을 다시 세우지 않고 같은 카드를
+     * 남은 선택지와 함께 다시 보여준다(72.11절: 막다른 길을 만들지 않는다). `EXECUTING →
+     * EXECUTING`이 "다음 ToolRequest"인 것과 같은 자리이고, **진행바가 뒤로 가지 않는다**
+     * — 72.2.3절이 금지한 것은 같은 칸을 두 번 *지나는* 것이지 머무는 것이 아니다.
+     */
+    "AWAITING_PLAN_APPROVAL",
+    "PLAN_REVIEWING",
+    "IMPLEMENTING",
+    "OUTLINING",
+    "REJECTED",
+    "CANCELLING",
+    "CANCELLED",
+    "FAILED",
+  ],
+  /**
+   * B의 결과는 **두 갈래만** 허용한다(72.4절).
+   *
+   * 1. 실행에 영향 없는 주석으로 남긴다 → `IMPLEMENTING`
+   * 2. 불일치 판정 카드로 사용자에게 되돌아간다 → `AWAITING_PLAN_APPROVAL`
+   *
+   * **검토자가 승인된 계획을 조용히 바꾸는 간선은 없다.** 사용자가 계획 X를 승인했는데
+   * 계획 Y가 실행되면 그 승인은 아무것도 뜻하지 않는다.
+   */
+  PLAN_REVIEWING: ["IMPLEMENTING", "AWAITING_PLAN_APPROVAL", "CANCELLING", "CANCELLED", "FAILED"],
+  /**
+   * 서브태스크 하나의 구현 모델 호출 (72.2.2절). 산출물을 `PLANNING`이 도구 호출로 쪼갠다.
+   *
+   * **자기 전이가 있다** — MCP 도구 라운드는 `DRAFTING`과 같은 모양으로 여기서도 일어난다.
+   * 상한은 표가 아니라 `mcpRounds`가 진다(위 `DRAFTING` 주석의 종료 논증 그대로).
+   */
+  IMPLEMENTING: ["IMPLEMENTING", "PLANNING", "CANCELLING", "CANCELLED", "FAILED"],
+  /**
+   * C는 **`AWAITING_USER_VERIFICATION`으로만** 간다 — 태스크를 실패시키지 못하기 때문이다.
+   *
+   * `VERIFYING`이 통과했는데 C가 반대하면 그건 사용자에게 올라가는 **쟁점이지 판정이 아니다**
+   * (원칙 1 + product-strategy 16절). `FAILED`로 가는 간선을 두면 모델 의견이 결정론적
+   * 검증을 뒤집을 수 있게 된다.
+   */
+  RESULT_REVIEWING: ["AWAITING_USER_VERIFICATION", "CANCELLING", "CANCELLED", "FAILED"],
+  /**
+   * 72.8절의 귀환 경로 셋 + 승인.
+   *
+   * | 사용자 선택 | 다음 |
+   * |---|---|
+   * | 승인 | (커밋) → `COMPLETED` |
+   * | 지적한 항목으로 재수정 | `FIX_LOOP` (**`fixLoopRounds` 안에서** — 72.11절) |
+   * | 계획으로 되돌아감 | `OUTLINING` (**`planRounds` 안에서**) |
+   * | 변경을 되돌리고 종료 | `REJECTED` |
+   *
+   * **`REJECTED`인 이유**: 사용자가 중단한 것이 아니라 **결과를 거부한 것**이라 `CANCELLED`가
+   * 아니고, 실패한 것이 없어 `FAILED`도 아니다. 이 경로는 **되돌릴 파일이 있다** — 10절이
+   * "`REJECTED`는 되돌릴 파일이 없다"고 적은 것이 그래서 낡았다.
+   */
+  AWAITING_USER_VERIFICATION: [
+    /**
+     * **자기 자신으로의 전이** — 체크리스트를 다시 묻는다.
+     *
+     * 귀환 경로의 상한을 다 쓴 뒤 그 선택지를 또 고르면, 실패시키지 않고 같은 카드를 남은
+     * 선택지와 함께 다시 보여준다(72.11절: **상한은 반복을 끊으려는 것이지 태스크를
+     * 가두려는 것이 아니다**). `AWAITING_PLAN_APPROVAL`의 자기 전이와 같은 자리다.
+     */
+    "AWAITING_USER_VERIFICATION",
+    "COMPLETED",
+    "FIX_LOOP",
+    "OUTLINING",
+    "REJECTED",
+    "CANCELLING",
+    "CANCELLED",
+    "FAILED",
+  ],
   COMPLETED: [],
   FAILED: [],
   CANCELLED: [],
@@ -145,6 +260,10 @@ export const TRANSITIONS: Record<TaskPhase, readonly TaskPhase[]> = {
  * 남길 수 있다. "읽기만 하는 경로"라는 주장은 그것까지 포함해야 참이다.
  */
 export const MUTATING_PHASES: readonly TaskPhase[] = [
+  // **`IMPLEMENTING`은 여기 없다.** 그 단계가 하는 일은 모델 호출이고 산출물은 텍스트다 —
+  // 파일을 바꾸는 것은 그 뒤의 `PLANNING → EXECUTING`이다. 넣으면 "파일을 건드릴 수 있는
+  // phase"라는 이 목록의 뜻이 "변경 경로에 속한 phase"로 넓어지고, 그러면 아래 불변식이
+  // 재는 것이 달라진다.
   "EXECUTING",
   "PLANNING",
   "AWAITING_APPROVAL",
@@ -161,6 +280,12 @@ export const MUTATING_PHASES: readonly TaskPhase[] = [
  * 확인한다: 새 종착지를 만들면 **분류하기 전까지 실패한다.**
  */
 export const READ_ONLY_TERMINALS: readonly TaskPhase[] = ["ANSWERED", "OUTLINED"];
+
+/** 각 읽기 전용 종착지가 **어느 종류의 경로**에 속하는가. 불변식을 그 그래프에서 잰다. */
+export const READ_ONLY_TERMINAL_KIND: Record<string, "question" | "plan"> = {
+  ANSWERED: "question",
+  OUTLINED: "plan",
+};
 
 /** 변경 경로의 종착지들. 위 목록과 합쳐 `TERMINAL_PHASES` 전체가 되어야 한다. */
 export const CHANGE_TERMINALS: readonly TaskPhase[] = [
@@ -196,7 +321,87 @@ export class InvalidTransitionError extends Error {
  * 도구 허용목록(26절)이 Rust 쪽에서 같은 것을 한 겹 더 막는다. 여기는 **경로**의 보장이고
  * 그쪽은 **권한**의 보장이다 — 뭉치면 한쪽이 뚫렸을 때 다른 쪽도 없는 것으로 여기게 된다.
  */
-export function canReachThroughMutation(target: TaskPhase): boolean {
+/**
+ * 어느 **요청의 종류**가 이 phase를 지날 수 있는가 — state-machine 51·53·72절.
+ *
+ * # 왜 이 표가 필요해졌는가
+ *
+ * 72.2절이 `standard` 실행 경로에 **`OUTLINING`을 재사용**하기로 했다. 하는 일이 같고
+ * 산출물 타입이 같으므로 옳은 결정이지만, 그 순간 `TRANSITIONS` 하나가 **두 경로를 한
+ * 그래프에 담게 된다.** 그러면 실재하지 않는 경로가 그래프에 나타난다:
+ *
+ * ```
+ * EXECUTING(변경) → VERIFYING → AWAITING_USER_VERIFICATION → OUTLINING → OUTLINED
+ * ```
+ *
+ * 마지막 간선은 **계획 모드의 것**이고 `standard` 태스크는 절대 그리로 가지 않는다.
+ * 그런데 종류를 모르는 그래프는 그 사실을 말할 수 없으므로,
+ * *"읽기 전용 경로는 파일을 바꾸지 않는다"*는 불변식이 **거짓으로 읽힌다.**
+ *
+ * # 간선을 빼는 대신 phase를 나눈다
+ *
+ * 제외할 간선을 손으로 적으면 목록이 하나 더 생기고, 그 목록은 낡는다. 대신 **종류별로
+ * 지날 수 있는 phase**를 적고 간선은 거기서 유도한다 — 양 끝이 모두 허용된 phase일 때만
+ * 그 종류의 그래프에 간선이 있다.
+ *
+ * `OUTLINING`이 `change`와 `plan` **양쪽에** 있고 `OUTLINED`는 `plan`에만 있는 것이
+ * 이 표의 요점이다.
+ */
+export const PHASES_BY_KIND: Record<"change" | "question" | "plan", readonly TaskPhase[]> = (() => {
+  /** 종류와 무관하게 지나거나 끝날 수 있는 자리들. */
+  const COMMON: readonly TaskPhase[] = [
+    "CREATED",
+    "SNAPSHOTTING",
+    "CANCELLING",
+    "CANCELLED",
+    "FAILED",
+    "INTERRUPTED",
+  ];
+  return {
+    change: [
+      ...COMMON,
+      "TRIAGE",
+      "DRAFTING",
+      "SINGLE_MODEL_FIX",
+      "REVIEWING",
+      "AWAITING_USER_INPUT",
+      // 72절 흐름이 재사용한다. **`OUTLINED`는 여기 없다** — 이 경로의 계획은 승인 게이트로
+      // 가지 종착지로 가지 않는다.
+      "OUTLINING",
+      "AWAITING_PLAN_APPROVAL",
+      "PLAN_REVIEWING",
+      "IMPLEMENTING",
+      "PLANNING",
+      "AWAITING_APPROVAL",
+      "EXECUTING",
+      "VERIFYING",
+      "FIX_LOOP",
+      "RESULT_REVIEWING",
+      "AWAITING_USER_VERIFICATION",
+      "COMPLETED",
+      "REJECTED",
+    ],
+    question: [...COMMON, "ANSWERING", "ANSWERED"],
+    plan: [...COMMON, "OUTLINING", "OUTLINED"],
+  };
+})();
+
+/** 이 종류의 그래프에서 `from`이 갈 수 있는 곳. 양 끝이 모두 허용된 간선만 남는다. */
+export function transitionsFor(kind: "change" | "question" | "plan", from: TaskPhase): readonly TaskPhase[] {
+  const allowed = new Set(PHASES_BY_KIND[kind]);
+  if (!allowed.has(from)) return [];
+  return TRANSITIONS[from].filter((to) => allowed.has(to));
+}
+
+/**
+ * 이 종류의 경로에서 **파일을 건드린 뒤** `target`에 닿을 수 있는가.
+ *
+ * `kind`를 받는 것이 이 함수의 전부다 — 받지 않으면 위 표가 설명한 가짜 경로를 참으로 읽는다.
+ */
+export function canReachThroughMutation(
+  target: TaskPhase,
+  kind: "change" | "question" | "plan" = "change"
+): boolean {
   const visited = new Set<string>();
   const stack: { phase: TaskPhase; touched: boolean }[] = [{ phase: "CREATED", touched: false }];
   while (stack.length > 0) {
@@ -206,7 +411,7 @@ export function canReachThroughMutation(target: TaskPhase): boolean {
     visited.add(key);
     if (phase === target && touched) return true;
     const nextTouched = touched || MUTATING_PHASES.includes(phase);
-    for (const next of TRANSITIONS[phase]) stack.push({ phase: next, touched: nextTouched });
+    for (const next of transitionsFor(kind, phase)) stack.push({ phase: next, touched: nextTouched });
   }
   return false;
 }
@@ -218,7 +423,7 @@ export function canReachThroughMutation(target: TaskPhase): boolean {
  * 더 적을 뻔했다. 두 벌이 되면 나중에 한쪽만 고쳐진다.
  */
 export function canReachAnsweredThroughMutation(): boolean {
-  return canReachThroughMutation("ANSWERED");
+  return canReachThroughMutation("ANSWERED", "question");
 }
 
 export function canReachCompletedWithoutVerifying(): boolean {

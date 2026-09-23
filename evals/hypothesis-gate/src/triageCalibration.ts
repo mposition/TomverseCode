@@ -302,8 +302,11 @@ export function observeTriage(task: LabeledTask, options: ObserveOptions = {}): 
       workspaceRoot: workspace.root,
       taskPrompt: task.taskPrompt,
       providers: [...(options.providers ?? FAKE_PROVIDERS)],
-      // **이 한 줄이 측정 대상이다.** verified를 주면 규칙이 아예 돌지 않는다.
+      // **이 두 줄이 측정 대상이다.** 모드는 이제 tier를 정하지 않지만(72.9절), 파이프라인
+      // 고정은 정한다 — 고정하면 `appliedPolicies`가 비지 않아 규칙이 돌지 않은 것으로
+      // 읽히고, 그러면 여기서 재려던 판정 자체가 사라진다.
       executionMode: "fast",
+      pipeline: "rule",
       taskId: `triage-${task.id}`,
       timeoutMs: options.timeoutMs ?? 180_000,
       fakeScript: options.fakeScript ?? FAKE_SCRIPT,

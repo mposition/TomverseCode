@@ -18,8 +18,9 @@ use crate::store::{AppendedEvent, Store, StoreError, TerminalOutcome};
 use crate::time::now_iso;
 use crate::tools::{ToolRuntime, MAX_INLINE_OUTPUT_BYTES};
 use crate::types::{
-    ApprovalRequest, ApprovalRequestItem, PolicyDecision, RiskTier, TaskPolicy, ToolName, ToolRequest, ToolResult,
-    ToolStatus, VerificationPhase, VerificationReport,
+    ApprovalRequest, ApprovalRequestItem, PlanApprovalChoice, PolicyDecision, RiskTier, TaskPolicy, ToolName,
+    ToolRequest, ToolResult, ToolStatus, UserGateOutcome, UserGateRequest, UserGateway, VerificationChoice,
+    VerificationPhase, VerificationReport,
 };
 use crate::verify::{CommandExecutor, VerificationRunner};
 use serde_json::{json, Value};
@@ -297,6 +298,15 @@ pub struct TaskHost {
     store: Arc<Mutex<Store>>,
     artifacts: ArtifactStore,
     approvals: Arc<dyn ApprovalGateway>,
+    /// 72절의 **사용자 게이트 둘**(계획 승인·검증 체크리스트).
+    ///
+    /// `approvals`와 나누는 이유는 `UserGateway` 주석에 있다 — 한 줄로 줄이면
+    /// **타임아웃이 없다**는 것이다(72.12절). 도구 승인의 600초/무응답=거부 정책을 여기
+    /// 가져오면 점심 먹으러 간 사이에 작업이 `REJECTED`로 끝난다.
+    ///
+    /// `None`이면 이 호스트에 물을 사람이 붙어 있지 않다 — **자동 승인하지 않고
+    /// `Unattended`를 낸다.** 승인을 만들어내는 기본값을 두면 그게 곧 게이트를 없애는 것이다.
+    gates: Option<Arc<dyn UserGateway>>,
     sink: Arc<dyn EventSink>,
     /// task_id별 취소 신호. M0에서는 호스트당 플래그 하나였으나, 작업 목록/재실행이 생기면서
     /// "어느 태스크를 취소하는가"를 구별해야 한다.
@@ -340,6 +350,13 @@ pub struct TaskHost {
 /// 셋은 사용자가 다음에 할 일이 서로 다르다.
 pub const UNANSWERED_REASON: &str = "백엔드 무응답";
 
+fn gate_name(request: &UserGateRequest) -> &'static str {
+    match request {
+        UserGateRequest::Plan { .. } => "plan",
+        UserGateRequest::Verification { .. } => "verification",
+    }
+}
+
 impl TaskHost {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -367,6 +384,7 @@ impl TaskHost {
             store,
             artifacts,
             approvals,
+            gates: None,
             sink,
             cancels,
             baseline: Mutex::new(None),
@@ -377,6 +395,200 @@ impl TaskHost {
             mcp: None,
             isolation: None,
             fleet_member: None,
+        }
+    }
+
+    /// 72절 사용자 게이트의 왕복 상대를 붙인다.
+    ///
+    /// 붙이지 않으면 게이트 요청은 `Unattended`가 된다 — 자동 승인이 아니다.
+    pub fn with_gates(mut self, gates: Arc<dyn UserGateway>) -> Self {
+        self.gates = Some(gates);
+        self
+    }
+
+    /// Node가 "사용자에게 물어 달라"고 요청한 것을 처리한다 — state-machine 72.4절.
+    ///
+    /// # 이 함수가 존재하는 이유가 승인 이벤트다
+    ///
+    /// `PLAN_APPROVED`와 `USER_VERIFICATION_APPROVED`는 `NODE_MAY_NOT_EMIT`이다. Node가
+    /// 낼 수 있으면 장악당한 sidecar가 **자기 계획을 스스로 승인**하고, 72.12절이 구현 예산
+    /// 예약을 그 승인에 묶은 뒤로는 구멍 하나가 둘을 뚫는다. 그래서 왕복 전체가 여기 있고,
+    /// **승인 이벤트는 사용자의 답을 받은 뒤 Rust가 기록한다.**
+    ///
+    /// # 승인이 아닌 답도 기록한다
+    ///
+    /// 거부·수정 요청·무인 정지도 남긴다. 남기지 않으면 "물어봤는데 답이 없었다"와 "묻지
+    /// 않았다"가 기록에서 같아진다 — `ESCALATION_REJECTED`를 남기기로 한 것과 같은 이유다.
+    pub fn request_user_gate(&self, request: &UserGateRequest) -> Result<Value, String> {
+        let task_id = request.task_id().to_string();
+        // **터미널 이후에는 묻지 않는다.** 끝난 태스크에 대한 승인 카드가 뜨면 사용자는
+        // 이미 끝난 일을 승인하게 되고, 그 승인은 아무것도 뜻하지 않는다.
+        if self.is_terminal(&task_id) {
+            return Ok(json!({ "outcome": "unavailable", "reason": "태스크가 이미 종료됨" }));
+        }
+        let Some(gates) = self.gates.clone() else {
+            // **자동 승인하지 않는다**(72.12절). Autopilot에서 멈추는 것이 정답이고,
+            // 그 정지를 사용자 거부로 기록하지도 않는다(24절).
+            let _ = self.append_event(
+                &task_id,
+                "APPROVAL_UNATTENDED",
+                json!({ "gate": gate_name(request), "note": "사용자 게이트에 물을 사람이 없습니다" }),
+            );
+            return Ok(json!({ "outcome": "unattended" }));
+        };
+
+        // **묻기 직전의 지문을 잡아 둔다** — state-machine 72.5절.
+        //
+        // 사용자가 계획을 승인하고 **자리를 비운 사이에** 파일을 고쳤거나 `git pull`을 했다면,
+        // 그 승인은 **다른 워크스페이스에 대한 승인**이다. 비교할 대상이 없으면 그 사실을
+        // 알 방법이 없으므로, 묻기 전과 답을 받은 뒤를 둘 다 찍는다.
+        //
+        // 착지 attestation이 이미 같은 규칙을 쓴다: *"커밋이 바뀌면 만료된다 — 옛 확인이
+        // 새 코드를 통과시키면 안 되기 때문이다."* 같은 문장이 여기서도 참이다.
+        let before = self
+            .workspace_fingerprint(&task_id)
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let outcome = gates.request_gate(request);
+
+        // **승인만 만료시킨다.** 거부·수정 요청·무인 정지는 워크스페이스가 바뀌었어도 그대로
+        // 유효하다 — 사용자가 "이건 아니다"라고 말한 것은 코드가 바뀌어도 여전히 참이다.
+        let approving = matches!(
+            (&outcome, request),
+            (UserGateOutcome::Plan(PlanApprovalChoice::ApproveWithReview), _)
+                | (UserGateOutcome::Plan(PlanApprovalChoice::ApproveSkipReview), _)
+                | (UserGateOutcome::Verification(VerificationChoice::Approve), _)
+        );
+        if approving {
+            let after = self
+                .workspace_fingerprint(&task_id)
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            // **지문을 낼 수 없는 워크스페이스에서는 만료시키지 않는다**(git 저장소가
+            // 아닌 경우). "모른다"를 "바뀌었다"로 읽으면 그 워크스페이스에서는 승인이
+            // 언제나 만료되어 태스크가 영영 진행되지 않는다.
+            if let (Some(before), Some(after)) = (&before, &after) {
+                if before != after {
+                    let _ = self.append_event(
+                        &task_id,
+                        "APPROVAL_EXPIRED",
+                        json!({
+                            "gate": gate_name(request),
+                            "before": before,
+                            "after": after,
+                            "note": "승인을 기다리는 동안 워크스페이스가 바뀌었습니다 — 이 승인은 다른 상태에 대한 것입니다",
+                        }),
+                    );
+                    // **승인으로 기록하지 않는다.** 기록하면 예산 예약이 그 승인에 묶이고
+                    // (72.12절), 낡은 계획이 새 코드 위에서 실행된다.
+                    return Ok(json!({
+                        "outcome": "unavailable",
+                        "reason": format!(
+                            "승인을 기다리는 동안 워크스페이스가 바뀌었습니다 ({} → {}). 다시 물어야 합니다.",
+                            &before[..before.len().min(12)],
+                            &after[..after.len().min(12)]
+                        ),
+                        "expired": true,
+                    }));
+                }
+            }
+        }
+
+        match (&outcome, request) {
+            (UserGateOutcome::Plan(choice), UserGateRequest::Plan { card, .. }) => {
+                let approved = matches!(
+                    choice,
+                    PlanApprovalChoice::ApproveWithReview | PlanApprovalChoice::ApproveSkipReview
+                );
+                if approved {
+                    // **Rust만 낼 수 있는 이벤트.** 승인 시점의 워크스페이스 지문을 함께
+                    // 남긴다(72.5절) — 사용자가 자리를 비운 사이에 코드가 바뀌었다면 그
+                    // 승인은 다른 워크스페이스에 대한 승인이다.
+                    self.append_event(
+                        &task_id,
+                        "PLAN_APPROVED",
+                        json!({
+                            "choice": choice,
+                            "reviewSkipped": matches!(choice, PlanApprovalChoice::ApproveSkipReview),
+                            "workspaceFingerprint": self.workspace_fingerprint(&task_id),
+                            "estimatedCostUsd": card.estimated_cost_usd,
+                            "unpricedAssignments": card.unpriced_assignments,
+                            "escalation": card.escalation,
+                            "subtaskCount": card.subtasks.len(),
+                        }),
+                    )?;
+                } else {
+                    self.append_event(
+                        &task_id,
+                        "APPROVAL_DENIED",
+                        json!({ "gate": "plan", "choice": choice }),
+                    )?;
+                }
+                Ok(json!({ "outcome": "plan", "choice": choice }))
+            }
+            (UserGateOutcome::Verification(choice), UserGateRequest::Verification { card, .. }) => {
+                // **"되돌리고 종료"는 실제로 되돌린다.** 이 선택지의 이름이 약속하는 것이
+                // 그것이고, 되돌리지 않은 채 `REJECTED`로 끝내면 사용자는 파일이 복원됐다고
+                // 믿은 채 바뀐 워크스페이스를 갖게 된다 — **화면이 더 좋은 소식을 말하는**
+                // 종류의 실패라 아무도 신고하지 않는다.
+                //
+                // # 왜 Node가 아니라 여기인가
+                //
+                // 파일을 되돌리는 것은 신뢰 경계의 일이다(원칙 2). Node가 "되돌렸다"를
+                // 만들어낼 수 없어야 하고, 롤백은 Policy Gate를 그대로 지나야 한다
+                // (`TaskHost::rollback`이 그 규칙을 이미 갖고 있다).
+                //
+                // # 실패해도 태스크는 끝난다 — 다만 **거짓말하지 않는다**
+                //
+                // 되돌리지 못한 파일이 있으면 그 사실을 응답에 실어 보낸다. 삼키면 Node의
+                // 최종 보고가 "되돌렸습니다"라고 말하게 되고, 그게 이 수정이 막는 바로 그것이다.
+                let rollback = if matches!(choice, VerificationChoice::RevertAndStop) {
+                    match self.rollback(&task_id) {
+                        Ok(value) => value,
+                        Err(reason) => json!({ "ok": false, "reason": reason }),
+                    }
+                } else {
+                    Value::Null
+                };
+                if matches!(choice, VerificationChoice::Approve) {
+                    self.append_event(
+                        &task_id,
+                        "USER_VERIFICATION_APPROVED",
+                        json!({
+                            "workspaceFingerprint": self.workspace_fingerprint(&task_id),
+                            "itemCount": card.items.len(),
+                            "unverifiedCount": card.items.iter().filter(|i| i.grade != "verified").count(),
+                            "unplannedPathCount": card.unplanned_paths.len(),
+                        }),
+                    )?;
+                } else {
+                    self.append_event(
+                        &task_id,
+                        "APPROVAL_DENIED",
+                        json!({ "gate": "verification", "choice": choice }),
+                    )?;
+                }
+                Ok(json!({ "outcome": "verification", "choice": choice, "rollback": rollback }))
+            }
+            (UserGateOutcome::Unattended, _) => {
+                let _ = self.append_event(
+                    &task_id,
+                    "APPROVAL_UNATTENDED",
+                    json!({ "gate": gate_name(request) }),
+                );
+                Ok(json!({ "outcome": "unattended" }))
+            }
+            (UserGateOutcome::Unavailable(reason), _) => {
+                Ok(json!({ "outcome": "unavailable", "reason": reason }))
+            }
+            // 게이트웨이가 요청과 다른 종류의 답을 냈다. **조용히 승인으로 읽지 않는다.**
+            (other, _) => Ok(json!({
+                "outcome": "unavailable",
+                "reason": format!("게이트 응답이 요청과 맞지 않습니다: {other:?}")
+            })),
         }
     }
 
@@ -721,6 +933,17 @@ impl TaskHost {
 
         let outcome = self.cancels.request(task_id, terminal.clone());
 
+        // **게이트에서 기다리는 태스크를 깨운다** — 72.12·72.12.2절.
+        //
+        // 취소가 지나는 길은 여기 하나다. 호출자들이 각자 기억하게 두었더니 셋 중 둘이
+        // 빠졌고, 빠진 쪽은 성공을 돌려주었다. 여기 두면 새 취소 진입점이 생겨도 따라온다.
+        // **돌려받은 값을 버리지 않는다** — "깨울 것이 없었다"와 "깨웠다"는 사용자가
+        // 다음에 할 일이 다른 사실이고, 화면이 그 둘을 구별해야 한다.
+        let gate_woken = self
+            .gates
+            .as_ref()
+            .is_some_and(|gates| gates.cancel_waiting(task_id, "취소되었습니다"));
+
         // 취소가 새로 확정된 경우에만 이벤트를 남긴다 (연타가 로그를 채우지 않게).
         if let CancelOutcome::Requested { .. } = &outcome {
             match self.with_store(|s| s.record_cancellation_request(task_id, "사용자 요청")) {
@@ -731,13 +954,16 @@ impl TaskHost {
                 Ok(None) => {}
                 // DB가 터미널이라고 하면 그쪽이 진실이다 — 메모리 토큰보다 DB를 믿는다.
                 Err(StoreError::TerminalAlreadySet { status }) => {
-                    return Ok(json!({ "accepted": true, "outcome": "already_terminal", "status": status }));
+                    return Ok(json!({
+                        "accepted": true, "outcome": "already_terminal",
+                        "status": status, "gateWoken": gate_woken
+                    }));
                 }
                 Err(e) => return Err(format!("취소 요청을 기록할 수 없습니다: {e}")),
             }
         }
 
-        Ok(match outcome {
+        let mut value = match outcome {
             CancelOutcome::Requested { requested_at } => {
                 json!({ "accepted": true, "outcome": "requested", "requestedAt": requested_at })
             }
@@ -748,7 +974,11 @@ impl TaskHost {
                 json!({ "accepted": true, "outcome": "already_terminal", "status": status })
             }
             CancelOutcome::UnknownTask => json!({ "accepted": false, "outcome": "unknown_task" }),
-        })
+        };
+        // **게이트에서 기다리던 태스크였는가.** 화면이 "취소를 눌렀는데 카드가
+        // 그대로다"와 "카드에서 기다리다 취소됐다"를 구별하는 데 쓴다.
+        value["gateWoken"] = Value::Bool(gate_woken);
+        Ok(value)
     }
 
     /// 백엔드가 시한 안에 답하지 않았다 (state-machine 39.2절).
@@ -2295,6 +2525,17 @@ impl SidecarHandler for TaskHost {
             // **Rust가 계산하고 Rust가 기록한다.** Node는 "지금 찍어라"만 말할 수 있고 값에는
             // 손대지 못한다 — `verify.run`과 같은 이유다(Node가 "검증했다"를 만들어낼 수 없어야
             // 하듯, "이 상태였다"도 만들어낼 수 없어야 한다).
+            // 72절 사용자 게이트 — **왕복 전체를 Rust가 소유한다**(72.4절).
+            //
+            // Node는 "이 카드로 물어 달라"고만 말할 수 있고, 승인 이벤트는 사용자의 답을
+            // 받은 뒤 Rust가 기록한다. `db.appendEvent`가 그 이벤트를 거절하는 것과 짝이다 —
+            // 거절만 있고 정당한 경로가 없으면 기능이 성립하지 않는다.
+            "gate.userDecision" => {
+                let request: UserGateRequest = serde_json::from_value(params.clone())
+                    .map_err(|e| format!("잘못된 UserGateRequest: {e}"))?;
+                self.request_user_gate(&request)
+            }
+
             "workspace.fingerprint" => {
                 let task_id = params
                     .get("taskId")
@@ -2536,6 +2777,14 @@ pub const NODE_MAY_NOT_EMIT: &[&str] = &[
     // 근거를 오염시킬 수 있다.
     "FLEET_ENROLLED",
     "FLEET_MEMBER_SETTLED",
+    // 72절 흐름의 **두 사용자 게이트**(72.4절). Node가 낼 수 있으면 장악당한 sidecar가
+    // 자기 계획을 스스로 승인하고, 흐름 전체가 모델이 혼자 도는 경로가 된다(원칙 2·3).
+    //
+    // 특히 72.12절이 구현 예산 예약을 계획 승인에 묶은 뒤로는 **구멍 하나가 둘을 뚫는다** —
+    // 승인을 지어낼 수 있으면 예산 상한도 함께 사라진다. 위 Fleet 항목과 같은 처방이고,
+    // 그 선례가 있으므로 새 장치가 필요하지도 않았다.
+    "PLAN_APPROVED",
+    "USER_VERIFICATION_APPROVED",
 ];
 
 fn redact_user_decision(event_type: &str, payload: Value) -> Value {

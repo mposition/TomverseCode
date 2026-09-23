@@ -101,7 +101,13 @@ export const DEFAULT_TRIAGE_POLICY: TriagePolicy = {
  * `token`이 `tokenizer.ts`에 걸린다. 잡음이 섞이면 이 신호는 "전부 standard"로 수렴하고,
  * 그건 TRIAGE를 죽이는 것과 같다.
  */
-function riskSegmentsIn(path: string, segments: readonly string[]): string[] {
+/**
+ * **오케스트레이터의 등급 하한선도 이 함수를 쓴다**(state-machine 72.10절).
+ *
+ * 목록을 복사하지 않는 이유와 같다 — 판정 규칙이 두 벌이 되면 갈리는 날
+ * "결제 코드는 올라간다"가 한쪽에서만 참이 된다.
+ */
+export function riskSegmentsIn(path: string, segments: readonly string[]): string[] {
   const normalized = path.replace(/\\/g, "/").toLowerCase();
   const parts = normalized.split("/").filter((p) => p.length > 0);
   const dirs = new Set(parts.slice(0, -1));

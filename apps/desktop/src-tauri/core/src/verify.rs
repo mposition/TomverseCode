@@ -977,9 +977,17 @@ mod tests {
             }
             // Python 갈래는 인터프리터를 찾아야 명령이 나온다. 워크스페이스 안에 가상환경을
             // 만들어 **PATH에 의존하지 않게** 한다 — CI에 python이 없어도 이 검사는 성립해야 한다.
-            let venv = dir.path().join(".venv").join("bin");
-            fs::create_dir_all(&venv).unwrap();
-            fs::write(venv.join("python"), "").unwrap();
+            //
+            // **자리를 손으로 적지 않는다.** 가상환경의 인터프리터 자리는 플랫폼마다 다르고
+            // (`bin/python` vs `Scripts\python.exe`), 한쪽을 적어 두면 **반대쪽 OS에서 이
+            // 갈래가 조용히 0개가 된다** — 실측으로 그랬다: Windows에서 이 검사가 8개만 세고
+            // 아래 `checked >= 10` 가드에 걸렸다(그 가드가 하는 일이 정확히 그것이다).
+            // 제품이 찾는 자리를 제품 함수에서 유도해 그 드리프트를 구조로 막는다.
+            let interpreter = dir
+                .path()
+                .join(crate::python::interpreter_in(".venv", crate::tools::program::Platform::current()));
+            fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+            fs::write(&interpreter, "").unwrap();
 
             let root = WorkspaceRoot::new(dir.path()).unwrap();
             let detected = detect_commands(&root);

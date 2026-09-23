@@ -476,3 +476,143 @@ mod tests {
         assert!(pending.is_empty());
     }
 }
+
+// ---- 72절 사용자 게이트의 등록부 ----
+
+/// 대기 중인 **사용자 게이트** 하나 — state-machine 72.4절.
+///
+/// # 왜 `PendingApprovals`를 그대로 쓰지 않는가
+///
+/// 답의 모양이 다르다. 도구 승인의 답은 허용/거부 둘인데 계획 승인은 **선택지 넷**이고
+/// 검증 체크리스트는 또 다른 넷이다(72.4·72.8절). `ApprovalOutcome`에 값을 더해 뭉치면
+/// 도구 승인 경로가 자기와 무관한 값을 받을 수 있게 되고, 그 자리에서 `_ => 거부`로
+/// 접히는 코드가 생긴다.
+///
+/// **타임아웃이 없다는 것도 여기서 구조가 된다**(72.12절): 이 등록부에는 시한을 거는 자리가
+/// 없다. `PendingApprovals`의 타임아웃은 호출자(`recv_timeout`)에 있으므로, 같은 구조를
+/// 빌리면 다음 사람이 거기에도 시한을 붙이기 쉽다.
+pub struct PendingGates {
+    inner: Mutex<HashMap<String, Sender<crate::types::UserGateOutcome>>>,
+}
+
+impl Default for PendingGates {
+    fn default() -> Self {
+        Self { inner: Mutex::new(HashMap::new()) }
+    }
+}
+
+impl PendingGates {
+    /// 이 게이트의 답을 기다릴 채널을 연다. 키는 태스크 id다 — 한 태스크에 게이트가 동시에
+    /// 둘 뜨는 일은 없다(흐름이 순차다).
+    pub fn register(&self, task_id: &str) -> Receiver<crate::types::UserGateOutcome> {
+        let (tx, rx) = channel();
+        self.inner.lock().expect("gates mutex").insert(task_id.to_string(), tx);
+        rx
+    }
+
+    pub fn forget(&self, task_id: &str) {
+        self.inner.lock().expect("gates mutex").remove(task_id);
+    }
+
+    /// 사용자의 답을 전달한다. **없는 게이트에 답하는 것은 오류가 아니라 값이다** —
+    /// 낡은 화면에서 누른 경우이고, 호출자가 "이미 지나갔습니다"라고 말할 수 있어야 한다.
+    pub fn respond(&self, task_id: &str, outcome: crate::types::UserGateOutcome) -> bool {
+        let sender = self.inner.lock().expect("gates mutex").remove(task_id);
+        match sender {
+            Some(tx) => tx.send(outcome).is_ok(),
+            None => false,
+        }
+    }
+
+    /// 대기 중인 게이트의 태스크 id들. 화면이 "무엇을 기다리고 있는가"에 답할 수 있어야 한다.
+    pub fn waiting(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.inner.lock().expect("gates mutex").keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /**
+     * **취소가 이 게이트를 빠져나오게 한다** — state-machine 72.11절.
+     *
+     * 게이트 둘에는 타임아웃이 없다(72.12절: 무응답은 거부가 아니라 대기다). 그러면 남는
+     * 탈출구는 **명시적 거부와 취소** 둘인데, 거부는 사용자가 카드를 **보고** 고르는 것이라
+     * 화면 앞에 없으면 쓸 수 없다 — **자리를 뜬 사용자에게 남는 것은 취소뿐이다.**
+     *
+     * 그 취소가 여기 닿지 않으면 `request_gate`의 `recv()`가 영원히 기다리고, 태스크는
+     * 터미널 이벤트 없이 매달린다. **타임아웃을 없앤 결정이 탈출구를 함께 없애면 안 된다.**
+     *
+     * `drain`과 나누는 이유는 범위다: 저쪽은 워크스페이스 전환·종료라 **전부**를 닫고,
+     * 이쪽은 취소된 태스크 **하나**만 닫는다. 같은 함수로 뭉치면 한 태스크를 취소했을 때
+     * 다른 Fleet 구성원의 게이트까지 닫힌다.
+     */
+    pub fn cancel_waiting(&self, task_id: &str, reason: &str) -> bool {
+        let Some(tx) = self.inner.lock().expect("gates mutex").remove(task_id) else {
+            return false;
+        };
+        // **거부가 아니라 `Unavailable`이다.** 거부는 태스크를 `REJECTED`로 끝내는 결말이고,
+        // 취소는 사용자가 그 결말을 고른 것이 아니다 — 부르는 쪽이 취소로 확정한다.
+        tx.send(crate::types::UserGateOutcome::Unavailable(reason.to_string())).is_ok()
+    }
+
+    /// 워크스페이스를 전환하거나 앱을 닫을 때 대기 중인 게이트를 정리한다.
+    ///
+    /// **거부가 아니라 `Unavailable`로 닫는다.** 도구 승인의 정리가 거부인 것과 다른 이유는
+    /// 72.12절 그대로다 — 계획 승인의 거부는 태스크를 `REJECTED`로 끝내는 **결말**이고,
+    /// 사용자가 워크스페이스를 옮겼다는 것은 그 결말을 고른 것이 아니다.
+    pub fn drain(&self, reason: &str) -> usize {
+        let drained: Vec<_> = self.inner.lock().expect("gates mutex").drain().collect();
+        let count = drained.len();
+        for (_, tx) in drained {
+            let _ = tx.send(crate::types::UserGateOutcome::Unavailable(reason.to_string()));
+        }
+        count
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::types::{PlanApprovalChoice, UserGateOutcome};
+
+    #[test]
+    fn a_gate_answer_reaches_the_waiter() {
+        let gates = PendingGates::default();
+        let rx = gates.register("task-1");
+        assert!(gates.respond("task-1", UserGateOutcome::Plan(PlanApprovalChoice::ApproveWithReview)));
+        assert_eq!(
+            rx.recv().unwrap(),
+            UserGateOutcome::Plan(PlanApprovalChoice::ApproveWithReview)
+        );
+    }
+
+    /// 낡은 화면에서 누른 경우. **오류가 아니라 값이다** — 호출자가 "이미 지나갔습니다"라고
+    /// 말할 수 있어야 하고, 오류로 내면 그 문장이 스택 트레이스가 된다.
+    #[test]
+    fn answering_a_gate_that_is_gone_is_a_value_not_an_error() {
+        let gates = PendingGates::default();
+        assert!(!gates.respond("task-1", UserGateOutcome::Plan(PlanApprovalChoice::Reject)));
+    }
+
+    /// 정리는 **거부가 아니다**(72.12절). 거부는 태스크를 끝내는 결말인데, 워크스페이스를
+    /// 옮긴 사용자는 그 결말을 고른 적이 없다.
+    #[test]
+    fn draining_does_not_reject() {
+        let gates = PendingGates::default();
+        let rx = gates.register("task-1");
+        assert_eq!(gates.drain("워크스페이스 전환"), 1);
+        match rx.recv().unwrap() {
+            UserGateOutcome::Unavailable(reason) => assert!(reason.contains("전환")),
+            other => panic!("거부로 닫혔습니다: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn waiting_lists_what_the_screen_must_answer_for() {
+        let gates = PendingGates::default();
+        let _a = gates.register("task-b");
+        let _b = gates.register("task-a");
+        assert_eq!(gates.waiting(), vec!["task-a", "task-b"]);
+        gates.forget("task-a");
+        assert_eq!(gates.waiting(), vec!["task-b"]);
+    }
+}

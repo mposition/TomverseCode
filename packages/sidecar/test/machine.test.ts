@@ -7,6 +7,10 @@ import {
   canReachCompletedWithoutVerifying,
   canReachThroughMutation,
   CHANGE_TERMINALS,
+  MUTATING_PHASES,
+  PHASES_BY_KIND,
+  READ_ONLY_TERMINAL_KIND,
+  transitionsFor,
   isValidTransition,
   READ_ONLY_TERMINALS,
   TRANSITIONS,
@@ -135,11 +139,106 @@ test("ANSWERED는 터미널이다", () => {
 test("읽기 전용 종착지에 도달하는 경로는 실행을 지나지 않는다", () => {
   assert.ok(READ_ONLY_TERMINALS.length >= 2, "목록이 하나뿐이면 이 일반화가 공허하다");
   for (const terminal of READ_ONLY_TERMINALS) {
-    assert.equal(canReachThroughMutation(terminal), false, `${terminal}에 실행을 지나 도달할 수 있습니다`);
+    // **그 종착지가 속한 경로의 그래프에서 잰다**(72절). 72.2절이 `standard` 실행 경로에
+    // `OUTLINING`을 재사용한 뒤로 종류를 모르는 그래프에는 실재하지 않는 경로가 생긴다:
+    // `EXECUTING → … → AWAITING_USER_VERIFICATION → OUTLINING → OUTLINED`. 마지막 간선은
+    // 계획 모드의 것이고 `standard` 태스크는 절대 그리로 가지 않는다.
+    const kind = READ_ONLY_TERMINAL_KIND[terminal]!;
+    assert.equal(
+      canReachThroughMutation(terminal, kind),
+      false,
+      `${terminal}에 실행을 지나 도달할 수 있습니다 (${kind} 경로)`
+    );
   }
   // **대조군.** 변경 종착지는 실행을 지나 도달할 수 있어야 한다 — 아니면 위 전칭 명제가
   // "아무 경로도 실행을 지나지 않는다"는 뜻이 되어 아무것도 지키지 않는다.
   assert.equal(canReachThroughMutation("COMPLETED"), true, "완료 경로가 실행을 지나지 않습니다");
+});
+
+/**
+ * **경로를 나눈 것이 불변식을 약하게 만들지 않았다는 증거.**
+ *
+ * 종류별 그래프로 재면 "그 종류에서는 도달 불가"가 쉬워진다 — 극단적으로 모든 phase를
+ * 각자의 종류에 가두면 전부 도달 불가가 되고 위 검사는 공허해진다. 그래서 두 가지를
+ * 더 확인한다: 계획 경로에는 **파일을 바꾸는 phase가 하나도 없고**, 변경 경로에는
+ * `OUTLINED`가 **아예 없다**(있는데 도달 못 하는 것이 아니다).
+ */
+test("계획 경로에는 변경 단계가 없고 변경 경로에는 계획 종착지가 없다", () => {
+  const planPhases = new Set(PHASES_BY_KIND.plan);
+  for (const phase of MUTATING_PHASES) {
+    assert.ok(!planPhases.has(phase), `계획 경로에 ${phase}가 있습니다 — 파일을 바꾸지 않는다는 보장이 깨집니다`);
+  }
+  assert.ok(!PHASES_BY_KIND.change.includes("OUTLINED"), "변경 경로가 계획 종착지로 끝날 수 있습니다");
+  // 그리고 **`OUTLINING`은 양쪽에 있어야 한다** — 한쪽에만 있으면 72.2절의 재사용이
+  // 그래프에서 사라진 것이고, 위 검사는 그 사실을 모른 채 통과한다.
+  assert.ok(PHASES_BY_KIND.change.includes("OUTLINING"));
+  assert.ok(PHASES_BY_KIND.plan.includes("OUTLINING"));
+});
+
+/**
+ * 종류별 목록이 `TaskPhase` 전체를 덮는가. 빠진 phase는 **어느 그래프에도 없으므로**
+ * 위 불변식들이 그것에 대해 아무 말도 하지 않는다 — 그리고 검사는 통과한다.
+ */
+test("모든 phase가 적어도 한 종류의 경로에 속한다", () => {
+  const covered = new Set([
+    ...PHASES_BY_KIND.change,
+    ...PHASES_BY_KIND.question,
+    ...PHASES_BY_KIND.plan,
+  ]);
+  const missing = (Object.keys(TRANSITIONS) as TaskPhase[]).filter((p) => !covered.has(p));
+  assert.deepEqual(missing, [], `어느 경로에도 속하지 않는 phase가 있습니다: ${missing.join(", ")}`);
+});
+
+/**
+ * 72절 흐름의 다섯이 실제로 배선되어 있다 — 표에 값만 더하고 간선을 잇지 않으면
+ * 그 phase는 **도달할 수 없는 채로** 존재한다.
+ */
+test("72절 흐름의 새 phase 다섯이 전부 도달 가능하고 전부 취소할 수 있다", () => {
+  const reachable = new Set<TaskPhase>();
+  const stack: TaskPhase[] = ["CREATED"];
+  while (stack.length > 0) {
+    const phase = stack.pop()!;
+    if (reachable.has(phase)) continue;
+    reachable.add(phase);
+    for (const next of transitionsFor("change", phase)) stack.push(next);
+  }
+  for (const phase of [
+    "AWAITING_PLAN_APPROVAL",
+    "PLAN_REVIEWING",
+    "IMPLEMENTING",
+    "RESULT_REVIEWING",
+    "AWAITING_USER_VERIFICATION",
+  ] as TaskPhase[]) {
+    assert.ok(reachable.has(phase), `${phase}에 도달할 수 없습니다`);
+    // 72.11절: **두 사용자 게이트를 타임아웃 없이 기다리게 만든 뒤로** 자리를 뜬 사용자에게
+    // 남는 탈출구는 취소뿐이다. "취소 가능한 모든 phase에서 들어온다"는 문장에만 의존하지
+    // 않고 간선으로 확인한다.
+    assert.ok(
+      TRANSITIONS[phase].includes("CANCELLING"),
+      `${phase}에서 취소할 수 없습니다 — 자리를 뜬 사용자에게 남는 탈출구가 없습니다`
+    );
+  }
+});
+
+/**
+ * **C는 태스크를 실패시키지 못한다**(72.7절).
+ *
+ * `VERIFYING`이 통과했는데 C가 반대하면 그건 사용자에게 올라가는 쟁점이지 판정이 아니다.
+ * `RESULT_REVIEWING → FAILED`가 생기면 모델 의견이 결정론적 검증을 뒤집을 수 있게 된다 —
+ * `FAILED`가 간선에 있는 것 자체는 오류·취소 경로라 정상이므로, **`REJECTED`로 가는 간선이
+ * 없다는 것**과 함께 본다.
+ */
+test("결과 검토는 태스크를 거부로 끝내지 못한다", () => {
+  assert.ok(!TRANSITIONS.RESULT_REVIEWING.includes("REJECTED"), TRANSITIONS.RESULT_REVIEWING.join(", "));
+  assert.ok(!TRANSITIONS.RESULT_REVIEWING.includes("COMPLETED"), "검토가 검증을 건너뛰고 완료시킵니다");
+  assert.deepEqual([...TRANSITIONS.RESULT_REVIEWING].filter((p) => p === "AWAITING_USER_VERIFICATION"), [
+    "AWAITING_USER_VERIFICATION",
+  ]);
+});
+
+/** 원칙 1은 새 경로에서도 성립해야 한다 — 게이트 둘이 생겼다고 우회로가 열리면 안 된다. */
+test("새 흐름에도 검증을 건너뛰고 완료하는 길이 없다", () => {
+  assert.equal(canReachCompletedWithoutVerifying(), false);
 });
 
 /**

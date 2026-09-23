@@ -164,7 +164,17 @@ pub const REPORTED_SECTIONS: &[&str] = &[
 
 /// **우리가 모델에게 주는 지시문.** 사용자 데이터가 들어 있지 않으므로 전송 목록에 올리지
 /// 않는다 — 올리면 진짜 데이터가 지시문 사이에 묻힌다.
-pub const INSTRUCTION_SECTIONS: &[&str] = &["Output rules", "Verdict rules", "Answer rules", "Plan rules"];
+pub const INSTRUCTION_SECTIONS: &[&str] = &[
+    "Output rules",
+    "Verdict rules",
+    "Answer rules",
+    "Plan rules",
+    // `standard` 실행 경로의 계획에만 붙는 문단(state-machine 72.2.2절). **우리 지시문이고
+    // 워크스페이스 내용이 들어가지 않는다** — 실리는 것은 완료 기준·서브태스크를 어떤 모양으로
+    // 내라는 요구와 서브태스크 개수 상한뿐이다. 상한은 우리 정책 값이지 저장소에서 온 것이
+    // 아니므로 위 칸(REPORTED)에 들어갈 성질이 아니다.
+    "This plan will be EXECUTED",
+];
 
 /// **나가지만 아직 세지 않는 것** (7.2절의 남은 과제).
 ///
@@ -195,6 +205,10 @@ pub const UNREPORTED_SECTIONS: &[&str] = &[
     // 붙고, 그 사유에는 **경로가 들어갈 수 있다**(경계 위반이면 그 경로가 문장에 있다).
     // 그래서 우리 지시문으로 접지 않고 여기 둔다.
     "Your previous plan was refused by the policy gate before anything ran",
+    // 구현 모델이 맡은 조각(state-machine 72.2.2절). **우리 지시문으로 접지 않는다** —
+    // 실리는 것은 계획 모델이 워크스페이스를 읽고 쓴 문장과 **경로 목록**이고, 그 경로는
+    // 사용자 저장소의 것이다. 위 칸의 게이트 거부 사유와 같은 가족이다.
+    "Your subtask from the approved plan",
 ];
 
 #[derive(Debug, Clone, Default, serde::Serialize)]

@@ -1,3 +1,4 @@
+import { providerKindOf } from "../routing/registry.js";
 import type { ModelEntry, RoleAssignment } from "@tomverse/protocol";
 import { AnthropicAdapter } from "./anthropic.js";
 import { resolveCredential } from "./credentials.js";
@@ -55,10 +56,25 @@ export function createAdapter(
 ): ProviderAdapter {
   const env = options.env ?? process.env;
 
-  // fake 공급자는 키를 요구하지 않는다. 레지스트리에서 apiBaseUrl로 구분한다 —
-  // providerId 문자열 비교보다 "이 엔트리가 로컬 가짜인가"라는 사실에 가깝다.
-  if (entry.apiBaseUrl.startsWith("local://")) {
+  // fake 공급자는 키를 요구하지 않는다. `providerKindOf`가 그 판정의 정본이다 —
+  // `local://` 규칙을 여기 복사하면 두 자리가 갈린다(21.5절이 그 함수를 판정 축으로 쓰지
+  // 말라고 한 것은 **`endpointRegion` 면제**에 대한 이야기이고, "로컬 가짜인가"는 정확히
+  // 이 함수가 답하는 질문이다).
+  const kind = providerKindOf(entry);
+  if (kind === "fake") {
     return new FakeProviderAdapter({ entry, apiKey: "" }, options.fake);
+  }
+
+  // **CLI 경로는 Node가 띄우지 않는다**(multi-engine-routing 21.7절 "누가 띄우는가").
+  // sidecar에는 애초에 자식 프로세스 생성 경로가 없고(원칙 2), 이 호출은 도구가 아니라
+  // 공급자 호출이라 Rust가 spawn한다. 그러므로 **여기서 조용히 HTTP로 대체하지 않는다** —
+  // 대체하면 사용자가 고른 것과 다른 경로로 돈이 나가고, 전송 화면이 거짓이 된다.
+  if (kind === "cli") {
+    throw new Error(
+      `${entry.modelId}(${entry.cliVendor ?? "cli"})는 CLI 전송 경로이고 Node가 띄우지 않습니다 — ` +
+        "Rust가 spawn하는 공급자 호출 경로가 아직 없습니다(multi-engine-routing 21.7절). " +
+        "HTTP 경로로 조용히 대체하지 않습니다."
+    );
   }
 
   // **공용 resolver를 지난다** (§2.10). preflight·준비성·evidence binding·이 factory가 같은
@@ -102,6 +118,26 @@ export interface RoleAdapters {
   reviewer?: ProviderAdapter;
   /** 검수자가 배정된 모델. 13.3절 절충에서 실제 검수자를 바꿔 끼울 때 비교 기준이 된다. */
   reviewerModelId?: string;
+  /**
+   * A — 주 계획자 (state-machine 72절). `standard`에서만 배정된다.
+   *
+   * **`executor`와 나눈다.** 72절 흐름에서 계획과 구현은 다른 호출이고 등급 요구도 다르다 —
+   * 계획은 프로파일과 무관하게 frontier이고(72.10절) 구현은 서브태스크 등급이 정한다.
+   * 한 필드에 두면 "계획 모델이 frontier인가"를 물을 자리가 없어진다.
+   */
+  planner?: ProviderAdapter;
+  /**
+   * A′ — 대조 계획자 (72.9절: **둘이 되는 것은 executor가 아니라 계획자다**).
+   *
+   * `coExecutor`와 같은 이유로 역할 이름이 아니라 두 번째 `planner` 배정이다: 하는 일이
+   * primary와 완전히 같으므로(같은 스냅샷, 같은 프롬프트, 같은 스키마) 별도 역할을
+   * 만들지 않는다.
+   */
+  coPlanner?: ProviderAdapter;
+  /** B — 계획 독립 검토자. 드롭됐으면 `undefined`이고 그건 정상이다(21.6절 사다리). */
+  planReviewer?: ProviderAdapter;
+  /** C — 결과 검토자. 드롭됐으면 `undefined`이고 체크리스트가 그 사실을 적는다(72.8절). */
+  resultReviewer?: ProviderAdapter;
 }
 
 export function createRoleAdapters(
@@ -122,10 +158,18 @@ export function createRoleAdapters(
   if (!executor) throw new Error("executor 역할이 배정되지 않았습니다");
 
   const reviewerAssignment = assignments.find((a) => a.role === "reviewer");
+  // **계획자도 순서가 의미를 갖는다** — 첫 번째 `planner` 배정이 A이고 두 번째가 A′다.
+  // 라우터가 그 순서로 push하며(21.6절 사다리), 여기서 뒤집으면 "살아남는 계획은
+  // primary"라는 17.8①의 규칙이 조용히 다른 모델을 가리킨다.
+  const planners = assignments.filter((a) => a.role === "planner");
   return {
     executor,
     coExecutor: buildFrom(executors[1]),
     reviewer: buildFrom(reviewerAssignment),
     reviewerModelId: reviewerAssignment?.modelId,
+    planner: buildFrom(planners[0]),
+    coPlanner: buildFrom(planners[1]),
+    planReviewer: buildFrom(assignments.find((a) => a.role === "planReviewer")),
+    resultReviewer: buildFrom(assignments.find((a) => a.role === "resultReviewer")),
   };
 }

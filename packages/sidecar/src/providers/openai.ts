@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { httpBaseUrlOf } from "../routing/registry.js";
 import type {
   DraftProposal,
   ModelEntry,
@@ -166,7 +167,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     this.modelId = deps.entry.modelId;
     this.client = new OpenAI({
       apiKey: deps.apiKey,
-      baseURL: deps.entry.apiBaseUrl,
+      baseURL: httpBaseUrlOf(deps.entry),
       // 재시도는 우리 정책(state-machine-and-protocol.md 9절)으로 관리하므로 SDK 재시도를 끈다.
       // 두 층이 각각 재시도하면 실제 시도 횟수가 곱해지고 카운터가 사실과 달라진다.
       maxRetries: 0,
@@ -326,6 +327,10 @@ export class OpenAIAdapter implements ProviderAdapter {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
+        // **경로를 입력이 말한다.** 여기서 기본값을 정하면 어댑터 넷이 각자 정하게 되고,
+        // 그중 하나가 `standard`에서 느슨하면 빈 계획이 조용히 통과한다(72.2.2절).
+        ...(input.forExecution ? { requireSubtasks: true } : {}),
+        ...(input.maxSubtasks !== undefined ? { maxSubtasks: input.maxSubtasks } : {}),
       }), { usage, latencyMs, meta }),
       usage,
       latencyMs,

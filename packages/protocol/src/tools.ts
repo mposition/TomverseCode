@@ -98,7 +98,14 @@ export interface ToolResult {
    * 없으면 그 실패에 대해 **더 말할 것이 없다**는 뜻이다 — "문제가 없다"가 아니다.
    */
   fileFailure?: {
-    kind: "locked" | "path_too_long" | "permission_denied";
+    /**
+     * **`invalid_name`은 `path_too_long`과 다른 사실이다.**
+     *
+     * Windows의 `ERROR_INVALID_NAME`은 길이·금지 문자·예약 이름에서 전부 온다. 길이는
+     * 우리가 직접 셀 수 있으므로 세서 가르고(`file_errors.rs`), 나머지는 **후보를 나열하되
+     * 단정하지 않는다** — 뭉개면 `a<b.ts`에 *"짧은 경로로 옮기세요"*라는 틀린 처방이 나간다.
+     */
+    kind: "locked" | "path_too_long" | "permission_denied" | "invalid_name";
     /** 무슨 일이 일어났는가. */
     fact: string;
     /** 사람이 해 볼 수 있는 일. **우리가 모르는 것은 모른다고 적혀 있다.** */

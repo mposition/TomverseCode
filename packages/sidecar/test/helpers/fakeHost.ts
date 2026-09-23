@@ -102,6 +102,28 @@ export interface FakeHostOptions {
    */
   preflight?: Record<string, { decision?: string; reason?: string; matchedRule?: string; redraftable?: boolean }>;
   /**
+   * 사용자 게이트 둘(`gate.userDecision`)의 답 — state-machine 72.4·72.8절.
+   *
+   * **기본값은 "승인 + 독립 검토" / "승인"이다.** 게이트가 기본으로 막히면 `standard` 경로를
+   * 태우는 모든 테스트가 승인 스크립트를 써야 하고, 그러면 승인 자체를 검사하는 테스트와
+   * 흐름을 검사하는 테스트가 구별되지 않는다.
+   *
+   * **실제 Rust는 여기서 `PLAN_APPROVED`를 기록한다**(`NODE_MAY_NOT_EMIT`). fake도 같은 자리에
+   * 이벤트를 남긴다 — 남기지 않으면 "Node가 내지 않는다"를 검사할 대상이 사라진다.
+   */
+  planGateChoices?: ("approve_with_review" | "approve_skip_review" | "revise" | "reject")[];
+  verificationGateChoices?: ("approve" | "refix" | "replan" | "revert_and_stop")[];
+  /** 게이트에 물을 사람이 없다(무인 실행) / UI에 닿지 않았다를 흉내낸다. */
+  gateOutcome?: "unattended" | { unavailable: string };
+  /**
+   * `revert_and_stop`을 골랐을 때 Rust가 실어 보내는 **되돌리기 결과** — 72.8절 귀환 경로 3.
+   *
+   * 실제 Rust는 게이트 왕복 안에서 `TaskHost::rollback`을 부르고 그 결과를 응답에 싣는다.
+   * fake가 이 값을 내지 않으면 **"되돌리기 결과를 받지 못했다"는 경로**를 태우게 되므로,
+   * 그 경로와 성공 경로를 검사가 구별할 수 있도록 값으로 둔다.
+   */
+  rollbackResult?: { restored?: unknown[]; failed?: unknown[]; ok?: boolean; reason?: string } | null;
+  /**
    * 호출마다 답을 바꿔야 하는 경우 — 되돌린 뒤 두 번째 계획은 지나가야 "되돌린 것이 쓸모
    * 있었다"가 성립한다. `undefined`를 주면 기본값(자동 승인)이다.
    */
@@ -138,6 +160,16 @@ export class FakeHost {
   private cachedIndex: { fingerprint: string; index: unknown; buildMs: number } | null = null;
   /** 캐시 RPC가 몇 번 불렸는지 — 테스트가 "저장하지 않았다"를 확인할 수 있어야 한다. */
   readonly indexSaves: { fingerprint: string; buildMs: number }[] = [];
+  /** 이 태스크가 사용자에게 물은 게이트들 — 카드 내용을 테스트가 직접 본다. */
+  readonly gateRequests: { gate: "plan" | "verification"; taskId: string; card: unknown }[] = [];
+  /** `workspace.fingerprint`를 몇 번 찍으라고 했는가 (72.5절). */
+  fingerprintRequests = 0;
+
+  /** 되돌리기를 몇 번 수행했는가 — 검사가 "실제로 되돌렸는가"를 물을 수 있어야 한다. */
+  rollbackCalls = 0;
+
+  private planGateCursor = 0;
+  private verificationGateCursor = 0;
   private eventSeq = 0;
   private toolCursor = 0;
   private mcpCursor = 0;
@@ -220,6 +252,48 @@ export class FakeHost {
         if (fingerprint !== this.indexFingerprint()) return { saved: false, reason: "그 사이 바뀜" };
         this.cachedIndex = { fingerprint, index, buildMs };
         return { saved: true, fingerprint };
+      }
+
+      // 72절 사용자 게이트 — **왕복 전체를 Rust가 소유한다.** 여기서 흉내내는 것은 그
+      // 계약이다: Node는 카드를 보내기만 하고, 승인 이벤트는 **답을 받은 뒤 이쪽이** 낸다.
+      case "gate.userDecision": {
+        const request = params as { gate: "plan" | "verification"; taskId: string; card: unknown };
+        this.gateRequests.push(request);
+        if (this.options.gateOutcome === "unattended") {
+          this.events.push({ type: "APPROVAL_UNATTENDED", payload: { gate: request.gate } });
+          return { outcome: "unattended" };
+        }
+        if (this.options.gateOutcome && typeof this.options.gateOutcome === "object") {
+          return { outcome: "unavailable", reason: this.options.gateOutcome.unavailable };
+        }
+        if (request.gate === "plan") {
+          const choice = this.options.planGateChoices?.[this.planGateCursor] ?? "approve_with_review";
+          this.planGateCursor += 1;
+          const approved = choice === "approve_with_review" || choice === "approve_skip_review";
+          this.events.push({
+            type: approved ? "PLAN_APPROVED" : "APPROVAL_DENIED",
+            payload: { gate: "plan", choice, reviewSkipped: choice === "approve_skip_review" },
+          });
+          return { outcome: "plan", choice };
+        }
+        const choice = this.options.verificationGateChoices?.[this.verificationGateCursor] ?? "approve";
+        this.verificationGateCursor += 1;
+        this.events.push({
+          type: choice === "approve" ? "USER_VERIFICATION_APPROVED" : "APPROVAL_DENIED",
+          payload: { gate: "verification", choice },
+        });
+        // 실제 Rust는 되돌리기를 **여기서** 수행하고 결과를 응답에 싣는다(신뢰 경계의 일이다).
+        if (choice === "revert_and_stop") {
+          this.rollbackCalls += 1;
+          return { outcome: "verification", choice, rollback: this.options.rollbackResult ?? null };
+        }
+        return { outcome: "verification", choice };
+      }
+
+      // Rust가 찍고 Rust가 기록한다 — Node는 "지금 찍어라"만 말할 수 있고 값에는 손대지 못한다.
+      case "workspace.fingerprint": {
+        this.fingerprintRequests += 1;
+        return { fingerprint: this.indexFingerprint() };
       }
 
       case "tool.execute": {

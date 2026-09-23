@@ -37,7 +37,10 @@ use tomverse_core::artifacts::ArtifactStore;
 use tomverse_core::host::{AlwaysDeny, ApprovalGateway, AutoApprove, EventSink, TaskHost};
 use tomverse_core::sidecar::SidecarClient;
 use tomverse_core::store::{Store, TerminalOutcome};
-use tomverse_core::types::{ExecutionMode, TaskPolicy};
+use tomverse_core::types::{
+    EffortLevel, ExecutionMode, PerformanceProfile, PlanApprovalChoice, TaskPolicy, UserGateOutcome,
+    VerificationChoice,
+};
 use tomverse_core::CancellationRegistry;
 use tomverse_core::{
     available_providers_for, credential_injection_for, credentials, WorkspaceRoot, PROTOCOL_VERSION,
@@ -81,7 +84,17 @@ struct Args {
     message: String,
     task_id: Option<String>,
     mode: ExecutionMode,
+    /// 어느 등급의 모델이 구현하는가 (72.9절). `--profile economy|balanced|max`.
+    profile: PerformanceProfile,
+    /// 고른 모델을 얼마나 깊게 굴리는가 (72.9절). `--effort low|medium|high`.
+    effort: EffortLevel,
     approve: String,
+    /// 72절 **사용자 게이트 둘**에 대한 헤드리스 응답 — `--gate`.
+    ///
+    /// **`--approve`와 나누는 이유가 72.12절이다.** 도구 승인과 사용자 게이트는 무응답의
+    /// 뜻이 다르고(거부 / 대기), 헤드리스에서도 그 구별이 필요하다 — `--approve auto`로
+    /// 게이트까지 자동 승인하면 "두 게이트에서 멈춘다"를 헤드리스에서 태워볼 수 없다.
+    gate: String,
     db: Option<PathBuf>,
     artifacts: Option<PathBuf>,
     sidecar: Option<PathBuf>,
@@ -169,6 +182,34 @@ struct Args {
     /// 초안을 새로 생성하지 않고 이 파일의 `DraftProposal`을 쓴다.
     /// **파일을 읽는 것은 Rust다** — sidecar는 경로를 받지도 않는다.
     replay_draft: Option<PathBuf>,
+    /// 어느 **파이프라인**을 태울 것인가 — state-machine 72.3절.
+    ///
+    /// 기본(지정 없음)은 72절의 `standard` 흐름이다. `legacy-cross-verification`을 주면
+    /// 물러난 `DRAFTING` 경로를 탄다 — **가설 게이트 Protocol v1의 arm C·D가 재는 대상이
+    /// 그것**이고, 그 판정 기준은 `criteria.ts`에 해시로 봉인된 사전등록이라 재는 대상이
+    /// 조용히 바뀌면 봉인이 지키는 것이 없어진다.
+    pipeline: Option<String>,
+    /// **이 실행이 측정 도구의 것임을 선언한다** — `--experiment-harness`.
+    ///
+    /// `--pipeline`은 72.3절에서 물러난 경로를 되살리는 스위치이고, 그것은 **제품 동작이
+    /// 아니다.** 선언 없이 켤 수 있으면 "production에 누출될 수 없다"는 말이 성립하지 않는다 —
+    /// 일반 사용자가 `run --pipeline ...`으로 은퇴한 경로를 탈 수 있기 때문이다.
+    ///
+    /// 권한이 아니라 **선언**이다(헤드리스에 권한 개념이 없다). 그러나 선언을 요구하면
+    /// 우연히 켜지는 일이 없어지고, 켠 실행은 그 사실을 기록에 남긴다.
+    experiment_harness: bool,
+    /// 대조(계획자 ×2)를 **명시적으로** 켠다 — `--contrast`.
+    ///
+    /// # 왜 플래그가 필요한가
+    ///
+    /// `ExperimentControls`가 하나라도 지정되면 대조는 **기본이 꺼짐**이다(하네스가 arm을
+    /// 고정하기 위한 규칙 — 호출이 하나 더 생기면 그게 arm 차이인지 대조 때문인지 구별되지
+    /// 않는다). 그런데 이 축에는 CLI 입구가 없어서, `--pipeline`을 주는 순간 대조가 조용히
+    /// 꺼지고 **그 경로를 e2e로 태워볼 수 없게 된다.**
+    ///
+    /// 켜는 입구를 만들되 **끄는 입구는 만들지 않는다**: 끄는 것은 이미 기본값이고, 플래그를
+    /// 둘 두면 "지정하지 않음"과 "꺼짐"이 명령줄에서 구별되지 않는다.
+    contrast: bool,
 
     // ---- reproduce 전용 ----
     /// 검사할 export 파일. **태스크 id가 아니라 파일이다** — 재현을 돌리는 사람에게는
@@ -451,7 +492,10 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         message: String::new(),
         task_id: None,
         mode: ExecutionMode::Verified,
+        profile: PerformanceProfile::Balanced,
+        effort: EffortLevel::Medium,
         approve: "auto".to_string(),
+        gate: "approve".to_string(),
         db: None,
         artifacts: None,
         sidecar: None,
@@ -484,6 +528,9 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         providers: None,
         review_mode: None,
         replay_draft: None,
+        pipeline: None,
+        experiment_harness: false,
+        contrast: false,
         file: None,
         accept_fingerprint: None,
         apply: false,
@@ -508,7 +555,26 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                     other => return Err(format!("알 수 없는 --mode: {other} (fast|verified)")),
                 }
             }
+            // 72.9절의 축 둘. **기본값이 있고 사용자가 고르는 값**이라 인자가 없어도 돈다 —
+            // 기본값이 없는 것은 축이 아니라 계획 승인 게이트의 선택지 넷이다(72.4절).
+            "--profile" => {
+                args.profile = match value()?.as_str() {
+                    "economy" => PerformanceProfile::Economy,
+                    "balanced" => PerformanceProfile::Balanced,
+                    "max" => PerformanceProfile::Max,
+                    other => return Err(format!("알 수 없는 --profile: {other} (economy|balanced|max)")),
+                }
+            }
+            "--effort" => {
+                args.effort = match value()?.as_str() {
+                    "low" => EffortLevel::Low,
+                    "medium" => EffortLevel::Medium,
+                    "high" => EffortLevel::High,
+                    other => return Err(format!("알 수 없는 --effort: {other} (low|medium|high)")),
+                }
+            }
             "--approve" => args.approve = value()?,
+            "--gate" => args.gate = value()?,
             "--worktree" => args.worktree = Some(value()?),
             "--member" => args.fleet_members.push(parse_member(&value()?)?),
             "--fleet" => args.fleet_id = Some(value()?),
@@ -595,6 +661,17 @@ fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                 args.review_mode = Some(mode);
             }
             "--replay-draft" => args.replay_draft = Some(PathBuf::from(value()?)),
+            "--contrast" => args.contrast = true,
+            "--pipeline" => {
+                let name = value()?;
+                if name != "legacy-cross-verification" {
+                    return Err(format!(
+                        "알 수 없는 --pipeline: {name} (legacy-cross-verification만 지정할 수 있습니다)"
+                    ));
+                }
+                args.pipeline = Some(name);
+            }
+            "--experiment-harness" => args.experiment_harness = true,
             "--file" => args.file = Some(PathBuf::from(value()?)),
             "--accept-fingerprint" => args.accept_fingerprint = Some(value()?),
             "--apply" => args.apply = true,
@@ -665,6 +742,9 @@ fn usage() -> String {
      [--budget-usd <n>] [--pin-executor <modelId>] [--pin-reviewer <modelId>] [--verbose]\n\
      \n\
      가설 게이트 전용: [--providers <csv>] [--review-mode blind|informed] [--replay-draft <file>]\n\
+                       [--pipeline legacy-cross-verification]\n\
+                       [--contrast]\n\
+                       [--experiment-harness]  (--pipeline에 필수)\n\
      \n\
      run --worktree <branch> — 격리 실행. 그 브랜치의 worktree를 만들고 **그 경로를 워크스페이스\n\
                  루트로 쓴다**. 브랜치가 없으면 만들고, 출발점은 [--worktree-base <ref>].\n\
@@ -1152,6 +1232,53 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
         "autopilot" => Arc::new(tomverse_core::host::UnattendedStop),
         other => return Err(format!("알 수 없는 --approve: {other} (auto|deny|autopilot)")),
     };
+    /// 헤드리스 실행의 사용자 게이트 응답 — state-machine 72.4·72.12절.
+    ///
+    /// **고정된 답을 낸다.** 사람이 없는 자리에서 "물어본다"는 것은 성립하지 않으므로,
+    /// 무엇을 답할지는 실행을 시작할 때 인자로 정해진다. `--approve autopilot`이면 그 인자와
+    /// 무관하게 `Unattended`다 — **Autopilot은 두 게이트에서 멈춘다**(72.12절). 자동
+    /// 승인하면 이 설계의 전부인 사용자 권위가 사라지고, 그 결과 Autopilot의 실질 범위가
+    /// `simple` 태스크로 좁아지는 것은 부작용이 아니라 정의에서 따라 나오는 것이다.
+    struct HeadlessGateway {
+        choice: String,
+        unattended: bool,
+    }
+    impl tomverse_core::types::UserGateway for HeadlessGateway {
+        /// **깨울 대기가 없다.** 이 게이트웨이는 인자로 정해진 답을 즉시 내므로
+        /// `request_gate`가 막히는 일이 없고, 따라서 취소가 깨울 `recv()`도 없다.
+        /// 트레이트에 기본 구현을 두지 않는 이유가 이것이다 — 그 사실을 적게 해야
+        /// 기다리게 하는 게이트웨이가 조용히 빠뜨리지 않는다(72.12.2절 ①).
+        fn cancel_waiting(&self, _task_id: &str, _reason: &str) -> bool {
+            false
+        }
+
+        fn request_gate(&self, request: &tomverse_core::types::UserGateRequest) -> UserGateOutcome {
+            if self.unattended {
+                return UserGateOutcome::Unattended;
+            }
+            match request {
+                tomverse_core::types::UserGateRequest::Plan { .. } => match self.choice.as_str() {
+                    "approve" => UserGateOutcome::Plan(PlanApprovalChoice::ApproveWithReview),
+                    "approve-skip-review" => UserGateOutcome::Plan(PlanApprovalChoice::ApproveSkipReview),
+                    "revise" => UserGateOutcome::Plan(PlanApprovalChoice::Revise),
+                    "reject" => UserGateOutcome::Plan(PlanApprovalChoice::Reject),
+                    other => UserGateOutcome::Unavailable(format!("알 수 없는 --gate: {other}")),
+                },
+                tomverse_core::types::UserGateRequest::Verification { .. } => match self.choice.as_str() {
+                    // 계획을 승인한 실행은 결과도 승인해야 끝까지 돈다 — e2e가 그 경로를
+                    // 태우는 것이 목적이고, 거부 경로는 `--gate reject`가 따로 있다.
+                    "approve" | "approve-skip-review" => UserGateOutcome::Verification(VerificationChoice::Approve),
+                    "revise" => UserGateOutcome::Verification(VerificationChoice::Replan),
+                    "reject" => UserGateOutcome::Verification(VerificationChoice::RevertAndStop),
+                    other => UserGateOutcome::Unavailable(format!("알 수 없는 --gate: {other}")),
+                },
+            }
+        }
+    }
+    let gates: Arc<dyn tomverse_core::types::UserGateway> = Arc::new(HeadlessGateway {
+        choice: args.gate.clone(),
+        unattended: args.approve == "autopilot",
+    });
     let sink = Arc::new(StderrSink { verbose: args.verbose });
 
     match args.command.as_str() {
@@ -1208,7 +1335,11 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
                 approvals,
                 sink,
                 Arc::new(CancellationRegistry::new()),
-            );
+            )
+            // **`run`/`ask`/`plan`에만 붙인다.** 되돌리기·재현 같은 명령은 태스크를 돌리지
+            // 않으므로 사용자 게이트에 닿을 일이 없고, 붙이면 "물을 사람이 있다"가 참이
+            // 아닌 자리에서 참이 된다.
+            .with_gates(gates.clone());
             if let Some(pool) = mcp.clone() {
                 eprintln!("MCP 서버 등록: {}", pool.names().join(", "));
                 task_host = task_host.with_mcp(pool);
@@ -1357,6 +1488,7 @@ fn run_with_store(args: Args, root: WorkspaceRoot, isolated: Option<tomverse_cor
             store,
             artifacts,
             approvals,
+            gates,
             sink,
             skill,
             policy_for_task,
@@ -1764,6 +1896,20 @@ fn run_task(
     if let Some(draft) = replay_draft {
         experiment.insert("replayDraft".to_string(), draft);
     }
+    if args.contrast {
+        experiment.insert("contrast".to_string(), json!(true));
+    }
+    if args.pipeline.is_some() && !args.experiment_harness {
+        return Err(
+            "--pipeline은 측정 도구 전용입니다. 물러난 경로(72.3절)를 제품 실행에서 켤 수 없으므로              --experiment-harness를 함께 지정하세요."
+                .to_string(),
+        );
+    }
+    if args.pipeline.is_some() {
+        // 프로토콜의 값은 snake_case다(`ExperimentControls.pipeline`). CLI 쪽은 대시를 쓰므로
+        // **여기서 한 번만** 옮긴다 — 두 곳에서 옮기면 언젠가 한쪽만 바뀐다.
+        experiment.insert("pipeline".to_string(), json!("legacy_cross_verification"));
+    }
 
     // 지정이 없으면 키 자체를 넣지 않는다 — 빈 객체를 넣으면 "지정했는데 비었다"와
     // "지정하지 않았다"가 같은 모양이 된다.
@@ -1839,6 +1985,19 @@ fn run_task(
             "budgetUsd": args.budget_usd,
             "modelPins": model_pins,
             "executionMode": match args.mode { ExecutionMode::Fast => "fast", ExecutionMode::Verified => "verified" },
+            // 72.9절의 축 둘. **함께 보낸다** — 하나만 도달하면 sidecar가 나머지에 대해
+            // 자기 기본값을 쓰게 되고, 그건 `unattended`가 "그럴듯한 기본값"으로 도착했던
+            // 것과 같은 실패다(아래 주석).
+            "performanceProfile": match args.profile {
+                PerformanceProfile::Economy => "economy",
+                PerformanceProfile::Balanced => "balanced",
+                PerformanceProfile::Max => "max",
+            },
+            "effortLevel": match args.effort {
+                EffortLevel::Low => "low",
+                EffortLevel::Medium => "medium",
+                EffortLevel::High => "high",
+            },
             // **이 map은 Rust의 `TaskPolicy`가 아니라 TS의 `TaskPolicy`를 향해 손으로 조립된다.**
             // 그래서 Rust 구조체에 필드를 더해도 여기 넣지 않으면 sidecar에 도달하지 않는다 —
             // 실제로 `unattended`를 추가하고 그렇게 빠뜨렸고, e2e가 잡았다.
@@ -1949,6 +2108,19 @@ struct MemberDone {
     finished_at: String,
 }
 
+/// 스케줄러가 받는 소식 — 구성원이 끝났거나, **계획이 승인됐거나**(72.12절).
+///
+/// `session.rs`의 같은 이름과 **같은 모양이어야 한다.** 둘이 갈리면 화면과 헤드리스의 예산이
+/// 갈리고, 갈린 예산은 화면에서 드러나지 않는다(72.16절이 한 번에 하라고 적은 이유).
+enum MemberSignal {
+    /// 이 구성원이 `PLAN_APPROVED`를 받았다 — **기록만 한다.**
+    ///
+    /// 예약은 움직이지 않는다(72.12.1절). 줄이면 합계 상한이 깨지고, 올리면 태스크당
+    /// 상한을 넘는다. 카드가 말한 금액은 관측으로만 실린다.
+    PlanApproved(tomverse_core::fleet::PlanApproved),
+    Done(MemberDone),
+}
+
 /// 도는 중인 구성원.
 struct RunningMember {
     branch: String,
@@ -1995,12 +2167,13 @@ fn run_fleet(
     store: Arc<Mutex<Store>>,
     artifacts: ArtifactStore,
     approvals: Arc<dyn ApprovalGateway>,
+    gates: Arc<dyn tomverse_core::types::UserGateway>,
     sink: Arc<dyn EventSink>,
     skill: Option<tomverse_core::skills::Skill>,
     policy: TaskPolicy,
     db_path: &Path,
 ) -> Result<i32, String> {
-    use tomverse_core::fleet::{Admission, FleetBudget, MemberReport};
+    use tomverse_core::fleet::{Admission, FleetBudget, ImplementationStage, MemberReport};
 
     if args.worktree.is_some() {
         // 격리 트리는 구성원마다 하나씩 만들어진다. 여기에 또 하나를 주면 "어느 트리에서
@@ -2053,7 +2226,7 @@ fn run_fleet(
         cap_usd.map(|v| format!("${v}")).unwrap_or_else(|| "없음".into()),
     );
 
-    let (tx, rx) = std::sync::mpsc::channel::<MemberDone>();
+    let (tx, rx) = std::sync::mpsc::channel::<MemberSignal>();
     let mut reports: Vec<Option<MemberReport>> = (0..size).map(|_| None).collect();
     let mut running: std::collections::HashMap<usize, RunningMember> = std::collections::HashMap::new();
     let mut next = 0usize;
@@ -2108,7 +2281,7 @@ fn run_fleet(
                 reports[index] = Some(MemberReport::not_started(index, &spec.branch, &task_id, reason));
                 continue;
             }
-            match budget.try_admit() {
+            match budget.try_admit(next) {
                 Admission::Admitted { reserved_usd } => {
                     let index = next;
                     next += 1;
@@ -2120,6 +2293,7 @@ fn run_fleet(
                         &store,
                         &artifacts,
                         &approvals,
+                        &gates,
                         &sink,
                         &cancels,
                         skill.clone(),
@@ -2160,7 +2334,7 @@ fn run_fleet(
                         Err(message) => {
                             // **시작에 실패한 것도 결말이다.** 예약을 돌려주지 않으면 남은
                             // 구성원들이 있지도 않은 지출에 막힌다.
-                            budget.settle(reserved_usd, 0.0);
+                            budget.settle(index, 0.0);
                             eprintln!("구성원 시작 실패({}): {message}", spec.branch);
                             reports[index] = Some(MemberReport {
                                 index,
@@ -2171,6 +2345,9 @@ fn run_fleet(
                                 status: "failed".to_string(),
                                 summary: message,
                                 cost_usd: 0.0,
+                                // 시작조차 못 했으므로 **읽을 지출이 없다.**
+                                cost_read_failed: false,
+                                cost_unpriced_calls: 0,
                                 reserved_usd: None,
                                 started_at: None,
                                 finished_at: Some(tomverse_core::time::now_iso()),
@@ -2214,17 +2391,65 @@ fn run_fleet(
         }
 
         // ---- 하나가 끝나기를 기다린다 ----
-        let done = rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))?;
+        let done = match rx.recv().map_err(|e| format!("구성원 결과를 받지 못했습니다: {e}"))? {
+            // **승인은 원장을 움직이지 않는다**(72.12.1절). 이 팔은 읽고 기록할 뿐이다 —
+            // 여기서 줄이면 구성원의 `TaskBudget` 상한과 어긋나고 합계 상한이 깨진다.
+            MemberSignal::PlanApproved(approved) => {
+                let index = approved.index;
+                if let ImplementationStage::Staged { held_usd, card_usd, priced } = budget
+                    .reserve_implementation(index, approved.estimated_cost_usd, approved.priced)
+                {
+                    if let Some(member) = running.get(&index) {
+                        // **예약도 기록으로 남는다.** 남기지 않으면 "왜 상한이 밀렸는가"를
+                        // 나중에 대답할 수 없다.
+                        let _ = member.host.append_event(
+                            &member.task_id,
+                            "FLEET_IMPLEMENTATION_RESERVED",
+                            json!({
+                                "fleetId": fleet_id,
+                                "branch": member.branch,
+                                "memberIndex": index + 1,
+                                "heldUsd": held_usd,
+                                "cardUsd": card_usd,
+                                // **카드가 금액으로 말했는가.** 거짓이면 줄이지 않았고,
+                                // 그 사실이 없으면 "0이 열렸다"와 구별되지 않는다.
+                                "priced": priced,
+                                "estimatedCostUsd": approved.estimated_cost_usd,
+                                "fleetReservedUsd": budget.reserved_usd(),
+                            }),
+                        );
+                    }
+                }
+                // **끝난 것이 아니다.** 여기서 `running`에서 빼면 도는 구성원을 잃는다.
+                continue;
+            }
+            MemberSignal::Done(done) => done,
+        };
         let member = running.remove(&done.index).expect("도는 구성원");
         let _ = member.handle.join();
         // **비용은 저장소가 말한다.** Node의 주장이 아니라 `provider_usage` 행이다 —
         // 합계 상한의 근거가 sidecar에 있으면 장악당한 sidecar가 상한을 지웠다고 말할 수 있다.
-        let (cost_usd, _, _) = store
-            .lock()
-            .unwrap()
-            .task_cost_usd(&member.task_id)
-            .unwrap_or((0.0, 0, 0));
-        budget.settle(member.reserved_usd, cost_usd);
+        // **못 읽은 것을 $0으로 접지 않는다** — 접으면 원장에 자리가 열리고 합계 상한이
+        // 깨진다(`settle_with_unknown_cost`의 머리말 — 독립 검토가 P1으로 잡았다).
+        // **가격을 모르는 호출 수를 버리지 않는다** — 부분합으로 정산하면 나머지 예약이
+        // 풀려 다음 구성원이 들어간다(3차 검토). 조회 실패와 같은 결말이다.
+        let read = store.lock().unwrap().task_cost_usd(&member.task_id);
+        let cost_read_failed = read.is_err();
+        let (cost_usd, _, cost_unpriced_calls) = read.unwrap_or((0.0, 0, 0));
+        let cost_is_complete = !cost_read_failed && cost_unpriced_calls == 0;
+        // **지금 잡고 있는 금액은 원장이 말한다** — 단계 분할 뒤로 입장 시점의 값은
+        // 계획 몫뿐이라, 그것을 정산 기록에 쓰면 구현 예약이 없었던 것처럼 읽힌다.
+        let held_usd = budget.held_for(done.index).or(member.reserved_usd);
+        if cost_is_complete {
+            budget.settle(done.index, cost_usd);
+        } else {
+            let assumed = budget.settle_with_unknown_cost(done.index);
+            eprintln!(
+                "구성원 지출이 전부가 아닙니다({}: 읽기 실패 {cost_read_failed}, 가격 미상 \
+{cost_unpriced_calls}건) — 예약 ${assumed:.4}을 지출로 칩니다",
+                member.branch
+            );
+        }
         let _ = member.host.append_event(
             &member.task_id,
             "FLEET_MEMBER_SETTLED",
@@ -2234,7 +2459,10 @@ fn run_fleet(
                 "memberIndex": done.index + 1,
                 "status": done.status,
                 "costUsd": cost_usd,
-                "reservedUsd": member.reserved_usd,
+                // **모르는 것을 아는 것처럼 적지 않는다.** 원인 둘을 구별해 남긴다.
+                "costReadFailed": cost_read_failed,
+                "costUnpricedCalls": cost_unpriced_calls,
+                "reservedUsd": held_usd,
                 "fleetCommittedUsd": budget.committed_usd(),
             }),
         );
@@ -2253,7 +2481,9 @@ fn run_fleet(
             status: done.status,
             summary: done.summary,
             cost_usd,
-            reserved_usd: member.reserved_usd,
+            cost_read_failed,
+            cost_unpriced_calls,
+            reserved_usd: held_usd,
             started_at: Some(member.started_at),
             finished_at: Some(done.finished_at),
         });
@@ -2362,6 +2592,7 @@ fn start_member(
     store: &Arc<Mutex<Store>>,
     artifacts: &ArtifactStore,
     approvals: &Arc<dyn ApprovalGateway>,
+    gates: &Arc<dyn tomverse_core::types::UserGateway>,
     sink: &Arc<dyn EventSink>,
     cancels: &Arc<CancellationRegistry>,
     skill: Option<tomverse_core::skills::Skill>,
@@ -2373,7 +2604,7 @@ fn start_member(
     session_id: &str,
     caps: tomverse_core::fleet::FleetCaps,
     reserved_usd: Option<f64>,
-    tx: std::sync::mpsc::Sender<MemberDone>,
+    tx: std::sync::mpsc::Sender<MemberSignal>,
 ) -> Result<RunningMember, String> {
     // **격리는 루트를 바꾸는 것이 전부다**(22.1절). 구성원은 자기 트리를 루트로 받는
     // 평범한 태스크가 된다.
@@ -2424,6 +2655,18 @@ fn start_member(
         inner: sink.clone(),
         label: spec.branch.clone(),
     });
+    // **계획 승인을 스케줄러에 알린다**(72.12절). 감시는 `MemberSink` **바깥**에 있어야
+    // 한다 — 안쪽에 두면 채널 이름이 이미 `<branch>·task-event`로 바뀐 뒤라 걸리지 않는다.
+    let signal_tx = std::sync::Mutex::new(tx.clone());
+    let member_sink: Arc<dyn EventSink> = Arc::new(tomverse_core::fleet::PlanApprovalWatch::new(
+        member_sink,
+        index,
+        Box::new(move |approved| {
+            if let Ok(tx) = signal_tx.lock() {
+                let _ = tx.send(MemberSignal::PlanApproved(approved));
+            }
+        }),
+    ));
     let host = Arc::new(
         TaskHost::new(
             member_root,
@@ -2437,7 +2680,11 @@ fn start_member(
         .with_isolation(isolation)
         // **승인 화면이 어느 트리의 것인지 말할 수 있어야 한다**(11.6①). 게이트는 이 값을
         // 보지 않는다 — 보게 되면 "Fleet일 때만 다른 규칙"이 생긴다.
-        .with_fleet_member(origin),
+        .with_fleet_member(origin)
+        // **구성원도 사용자 게이트 둘을 갖는다**(72.12절). 빠뜨리면 `standard`로 분류된
+        // 구성원이 전부 계획 승인 앞에서 `unattended_stop`으로 죽는다 — 물을 사람이
+        // 있는데도 없다고 말하는 상태고, 화면 쪽은 이미 붙여 있었으므로 **둘이 갈라져 있었다.**
+        .with_gates(gates.clone()),
     );
     host.begin_task(&task_id, policy, skill.as_ref())?;
     // **등록을 이벤트로 남긴다**(원칙 7). Fleet 단위 상태를 메모리에만 두면 크래시 후
@@ -2493,12 +2740,12 @@ fn start_member(
         };
         // **보내지 못하면 스케줄러가 영원히 기다린다.** 받는 쪽이 사라지는 경우는 스케줄러가
         // 이미 끝난 때뿐이고, 그때는 보낼 곳이 없는 것이 맞다.
-        let _ = tx.send(MemberDone {
+        let _ = tx.send(MemberSignal::Done(MemberDone {
             index,
             status,
             summary,
             finished_at: tomverse_core::time::now_iso(),
-        });
+        }));
     });
 
     Ok(RunningMember {

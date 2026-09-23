@@ -64,8 +64,10 @@ test("질문의 단계 목록에는 실행도 검증도 없다", () => {
   assert.ok(!stages.includes("실행"));
   assert.ok(!stages.includes("검증"));
   assert.ok(!stages.includes("승인 대기"));
-  // 변경 경로는 그대로다.
-  assert.ok(stagesFor("change").includes("검증"));
+  // 변경 경로는 그대로다. **tier를 함께 준다** — 72.2.3절에서 선택자가
+  // `(kind, complexityTier)`가 됐고, tier가 `null`인 동안에는 공통 접두사만 그린다.
+  assert.ok(stagesFor("change", "simple").includes("검증"));
+  assert.ok(stagesFor("change", "standard").includes("검증"));
 });
 
 /** 화면이 `ANSWERED`를 터미널로 알아야 한다 — 모르면 끝난 태스크를 "진행 중"으로 그린다. */

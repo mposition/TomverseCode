@@ -5,6 +5,7 @@ import type {
   DisagreementReport,
   DraftNarrative,
   DraftProposal,
+  PlanOutline,
   NarrativeField,
 } from "@tomverse/protocol";
 import { DISAGREEMENT_FIELD_RANK, NARRATIVE_FIELD_ORDER } from "@tomverse/protocol";
@@ -42,21 +43,82 @@ export interface ContrastInput {
   round: number;
 }
 
-/** 필드별로 각 초안이 내놓은 값. 자유 서술도 1개짜리 배열로 정규화해 한 형태로 다룬다. */
-type FieldExtractor = (proposal: DraftProposal) => string[];
+/**
+ * 대조의 **한 참가자** — 초안이든 계획이든 여기로 정규화된다.
+ *
+ * # 왜 `DisagreementField`를 갈라 두지 않는가
+ *
+ * 72.2.1절: *"`DisagreementField`는 질문의 이름이지 소스 필드의 이름이 아니다."* 계획용
+ * 세트를 새로 만들면 `DISAGREEMENT_FIELD_RANK`와 17.4절 질문 예산이 경로마다 달라지고,
+ * 그 둘은 "무엇을 먼저 물을 것인가"를 정하는 규칙이라 경로별로 다르면 사용자가 받는 질문의
+ * 순서가 이유 없이 갈린다.
+ *
+ * | 질문 | 초안 경로의 소스 | 계획 경로의 소스 |
+ * |---|---|---|
+ * | `doneCriteria` | `DraftProposal.doneCriteria` | `PlanOutline.doneCriteria` |
+ * | `requiredTests` | `DraftProposal.requiredTests` | `PlanOutline.requiredTests` |
+ * | `targetPaths` | `DraftProposal.plan[].targetPaths` | **`PlanOutline.filesToChange`** |
+ *
+ * `PlanOutlineStep.files`를 쓰지 않는 이유: 독립으로 만든 두 계획은 **단계가 정렬되지
+ * 않는다.** step 단위로 비교하면 "다르다"가 거의 언제나 참이 되고, 그건 17.12절이 자유
+ * 서술을 뺀 것과 같은 이유다 — **아무것도 발견하지 못하면서 발견을 주장하는 축**이 된다.
+ */
+export interface ContrastParticipant {
+  /** `Disagreement.positions[].proposalId`가 된다 — 추적용이며 라벨에는 쓰이지 않는다. */
+  id: string;
+  doneCriteria: string[];
+  requiredTests: string[];
+  targetPaths: string[];
+  /**
+   * 이 참가자가 요구를 **어떻게 읽었는가**.
+   *
+   * 계획 경로에는 `interpretation` 필드가 없으므로 `summary`가 그 자리에 온다 — 둘 다
+   * "모델이 요구를 이렇게 읽었다"는 한 문장이고, 비교하지 않고 나란히 싣기만 하는 값이라
+   * (17.12절) 자리를 빌려도 판정이 달라지지 않는다.
+   */
+  interpretation: string;
+  risks: string[];
+}
+
+/** 필드별로 각 참가자가 내놓은 값. 자유 서술도 1개짜리 배열로 정규화해 한 형태로 다룬다. */
+type FieldExtractor = (p: ContrastParticipant) => string[];
 
 const EXTRACTORS: Record<DisagreementField, FieldExtractor> = {
   doneCriteria: (p) => p.doneCriteria,
   requiredTests: (p) => p.requiredTests,
-  // **patch가 아니라 plan에서 뽑는다.** patch를 파싱하면 diff 형식 해석이 끼어들고, 그건
-  // "모델이 어디를 고치려 했는가"가 아니라 "우리 파서가 무엇을 읽었는가"를 재는 것이 된다.
-  targetPaths: (p) => p.plan.flatMap((step) => step.targetPaths ?? []),
+  targetPaths: (p) => p.targetPaths,
 };
 
 const NARRATIVE_EXTRACTORS: Record<NarrativeField, FieldExtractor> = {
   interpretation: (p) => [p.interpretation],
   risks: (p) => p.risks,
 };
+
+/** 초안 → 참가자. */
+export function participantFromDraft(p: DraftProposal): ContrastParticipant {
+  return {
+    id: p.proposalId,
+    doneCriteria: p.doneCriteria,
+    requiredTests: p.requiredTests,
+    // **patch가 아니라 plan에서 뽑는다.** patch를 파싱하면 diff 형식 해석이 끼어들고, 그건
+    // "모델이 어디를 고치려 했는가"가 아니라 "우리 파서가 무엇을 읽었는가"를 재는 것이 된다.
+    targetPaths: p.plan.flatMap((step) => step.targetPaths ?? []),
+    interpretation: p.interpretation,
+    risks: p.risks,
+  };
+}
+
+/** 계획 → 참가자 (72.2.1절 소스 표). `id`는 계획에 없으므로 호출자가 준다. */
+export function participantFromPlan(plan: PlanOutline, id: string): ContrastParticipant {
+  return {
+    id,
+    doneCriteria: plan.doneCriteria ?? [],
+    requiredTests: plan.requiredTests ?? [],
+    targetPaths: plan.filesToChange,
+    interpretation: plan.summary,
+    risks: plan.risks,
+  };
+}
 
 const FIELD_LABEL: Record<DisagreementField | NarrativeField, string> = {
   doneCriteria: "완료 기준",
@@ -81,7 +143,44 @@ const QUESTION_TEXT: Record<DisagreementField, string> = {
  * 구별하려면 `proposalIds`의 개수가 보여야 한다.
  */
 export function contrastDrafts(input: ContrastInput): DisagreementReport {
-  const { taskId, proposals, complexityTier, round } = input;
+  return contrastParticipants({
+    taskId: input.taskId,
+    participants: input.proposals.map(participantFromDraft),
+    complexityTier: input.complexityTier,
+    round: input.round,
+  });
+}
+
+/**
+ * 계획 대조 — 72.9절. *"대조(executor ×2)가 계획 단계로 옮겨온다."*
+ *
+ * 연산은 초안 대조와 **같은 것 하나**다. 옮겨온 것은 대조가 일어나는 **자리**이지 대조
+ * 자체가 아니므로, 함수를 나누면 두 경로의 blocking 규칙이 갈릴 자리가 하나 생긴다.
+ */
+export function contrastPlans(input: {
+  taskId: string;
+  plans: readonly PlanOutline[];
+  complexityTier: ComplexityTier;
+  round: number;
+}): DisagreementReport {
+  return contrastParticipants({
+    taskId: input.taskId,
+    // 계획에는 `proposalId`가 없다. 순번으로 만들되 **모델 id를 섞지 않는다** —
+    // 선택지 라벨에 모델 이름을 넣지 않는 규칙(ui-wireframes 3.9절)과 같은 이유이고,
+    // `fromProposalId`가 화면에 새어 나가도 모델 선호를 유도하지 않아야 한다.
+    participants: input.plans.map((p, i) => participantFromPlan(p, `plan-${i + 1}`)),
+    complexityTier: input.complexityTier,
+    round: input.round,
+  });
+}
+
+export function contrastParticipants(input: {
+  taskId: string;
+  participants: readonly ContrastParticipant[];
+  complexityTier: ComplexityTier;
+  round: number;
+}): DisagreementReport {
+  const { taskId, participants: proposals, complexityTier, round } = input;
   const disagreements: Disagreement[] = [];
   const narratives: DraftNarrative[] = [];
   const agreedFields: DisagreementField[] = [];
@@ -90,7 +189,7 @@ export function contrastDrafts(input: ContrastInput): DisagreementReport {
     // 랭킹 순서대로 만든다 — 예산에 맞춰 자를 때 앞에서부터 자르면 되도록.
     for (const field of DISAGREEMENT_FIELD_RANK) {
       const positions = proposals.map((p) => ({
-        proposalId: p.proposalId,
+        proposalId: p.id,
         value: normalizeValues(EXTRACTORS[field](p)),
       }));
 
@@ -125,7 +224,7 @@ export function contrastDrafts(input: ContrastInput): DisagreementReport {
     // 참이라 아무것도 구별해주지 않는다. 어느 쪽으로도 주장하지 않는 것이 유일하게 정직하다.
     for (const field of NARRATIVE_FIELD_ORDER) {
       const positions = proposals.map((p) => ({
-        proposalId: p.proposalId,
+        proposalId: p.id,
         value: normalizeValues(NARRATIVE_EXTRACTORS[field](p)),
       }));
       if (positions.every((p) => p.value.length === 0)) continue;
@@ -136,7 +235,7 @@ export function contrastDrafts(input: ContrastInput): DisagreementReport {
   return {
     taskId,
     reportId: `${taskId}-contrast-${round}`,
-    proposalIds: proposals.map((p) => p.proposalId),
+    proposalIds: proposals.map((p) => p.id),
     disagreements,
     narratives,
     agreedFields,

@@ -105,7 +105,9 @@ test("계획의 단계 목록에는 실행도 검증도 없다", () => {
   assert.ok(!stages.includes("승인 대기"));
   // 질문과도 다르다 — 같은 목록을 쓰면 화면이 둘을 같은 것으로 그린다.
   assert.notDeepEqual(stages, stagesFor("question"));
-  assert.ok(stagesFor("change").includes("검증"));
+  // **tier를 함께 준다**(72.2.3절). tier가 `null`이면 아직 순서가 확정되지 않은 것이고,
+  // 그때 화면은 공통 접두사만 그린다 — 어느 순서를 골라도 그 칸은 같기 때문이다.
+  assert.ok(stagesFor("change", "simple").includes("검증"));
 });
 
 /** 화면이 `OUTLINED`를 터미널로 알아야 한다 — 모르면 끝난 태스크를 "진행 중"으로 그린다. */

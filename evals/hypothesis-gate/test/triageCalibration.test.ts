@@ -74,18 +74,24 @@ test("근거가 빠진 이유는 어느 필드인지까지 말한다", () => {
   assert.doesNotMatch(observed.notObservedReason ?? "", /workFileCount/);
 });
 
-test("모드가 강제한 판정은 관측이 아니다 — 세면 분모가 부푼다", () => {
+test("강제된 판정은 관측이 아니다 — 세면 분모가 부푼다", () => {
+  // **문자열이 바뀌었다.** 종전 fixture는 `executionMode=verified — 항상 교차검증 경로`였는데
+  // state-machine 72.9절이 그 규칙을 없앴다 — 모드는 더 이상 tier를 정하지 않으므로
+  // production이 그 정책을 다시는 내지 않는다. 옛 문자열을 그대로 두면 이 검사는
+  // **아무도 만들지 않는 입력**에 대해 통과한다(초록색이지만 지키는 것이 없다).
+  //
+  // 강제가 남아 있는 축은 `forceComplexityTier` 하나다.
   const observed = observationFromEvents(
     TASK,
     [
       ev(1, "TRIAGE_COMPLETED", {
         complexityTier: "standard",
-        appliedPolicies: ["executionMode=verified — 항상 교차검증 경로"],
+        appliedPolicies: ["forceComplexityTier=standard"],
       }),
     ],
     10
   );
-  // tier가 standard로 **찍혀 있는데도** 관측이 아니다. 이 구별이 없으면 verified로 돌린
+  // tier가 standard로 **찍혀 있는데도** 관측이 아니다. 이 구별이 없으면 강제로 돌린
   // 실행 전부가 "규칙이 standard로 보냈다"로 집계된다.
   assert.equal(observed.tier, null);
   assert.match(observed.notObservedReason ?? "", /규칙이 돌지 않았습니다/);

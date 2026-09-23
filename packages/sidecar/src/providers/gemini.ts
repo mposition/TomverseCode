@@ -1,3 +1,4 @@
+import { httpBaseUrlOf } from "../routing/registry.js";
 import type {
   DraftProposal,
   ModelEntry,
@@ -225,6 +226,10 @@ export class GeminiAdapter implements ProviderAdapter {
         taskId: ctx.taskId,
         model: this.modelId,
         createdAt: new Date().toISOString(),
+        // **경로를 입력이 말한다.** 여기서 기본값을 정하면 어댑터 넷이 각자 정하게 되고,
+        // 그중 하나가 `standard`에서 느슨하면 빈 계획이 조용히 통과한다(72.2.2절).
+        ...(input.forExecution ? { requireSubtasks: true } : {}),
+        ...(input.maxSubtasks !== undefined ? { maxSubtasks: input.maxSubtasks } : {}),
       }), { usage, latencyMs, meta }),
       usage,
       latencyMs,
@@ -255,7 +260,8 @@ export class GeminiAdapter implements ProviderAdapter {
   }
 
   private modelUrl(suffix = ""): string {
-    const base = this.entry.apiBaseUrl.replace(/\/+$/, "");
+    // `apiBaseUrl`은 `transport: "http"`에만 있다(21.4절). 판정을 여기 복사하지 않는다.
+    const base = httpBaseUrlOf(this.entry).replace(/\/+$/, "");
     return `${base}/models/${this.modelId}${suffix}`;
   }
 
