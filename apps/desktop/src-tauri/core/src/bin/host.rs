@@ -2347,6 +2347,7 @@ fn run_fleet(
                                 cost_usd: 0.0,
                                 // 시작조차 못 했으므로 **읽을 지출이 없다.**
                                 cost_read_failed: false,
+                                cost_unpriced_calls: 0,
                                 reserved_usd: None,
                                 started_at: None,
                                 finished_at: Some(tomverse_core::time::now_iso()),
@@ -2430,20 +2431,24 @@ fn run_fleet(
         // 합계 상한의 근거가 sidecar에 있으면 장악당한 sidecar가 상한을 지웠다고 말할 수 있다.
         // **못 읽은 것을 $0으로 접지 않는다** — 접으면 원장에 자리가 열리고 합계 상한이
         // 깨진다(`settle_with_unknown_cost`의 머리말 — 독립 검토가 P1으로 잡았다).
+        // **가격을 모르는 호출 수를 버리지 않는다** — 부분합으로 정산하면 나머지 예약이
+        // 풀려 다음 구성원이 들어간다(3차 검토). 조회 실패와 같은 결말이다.
         let read = store.lock().unwrap().task_cost_usd(&member.task_id);
         let cost_read_failed = read.is_err();
-        let (cost_usd, _, _) = read.unwrap_or((0.0, 0, 0));
+        let (cost_usd, _, cost_unpriced_calls) = read.unwrap_or((0.0, 0, 0));
+        let cost_is_complete = !cost_read_failed && cost_unpriced_calls == 0;
         // **지금 잡고 있는 금액은 원장이 말한다** — 단계 분할 뒤로 입장 시점의 값은
         // 계획 몫뿐이라, 그것을 정산 기록에 쓰면 구현 예약이 없었던 것처럼 읽힌다.
         let held_usd = budget.held_for(done.index).or(member.reserved_usd);
-        if cost_read_failed {
+        if cost_is_complete {
+            budget.settle(done.index, cost_usd);
+        } else {
             let assumed = budget.settle_with_unknown_cost(done.index);
             eprintln!(
-                "구성원 지출을 읽지 못했습니다({}) — 예약 ${assumed:.4}을 지출로 칩니다",
+                "구성원 지출이 전부가 아닙니다({}: 읽기 실패 {cost_read_failed}, 가격 미상 \
+{cost_unpriced_calls}건) — 예약 ${assumed:.4}을 지출로 칩니다",
                 member.branch
             );
-        } else {
-            budget.settle(done.index, cost_usd);
         }
         let _ = member.host.append_event(
             &member.task_id,
@@ -2454,8 +2459,9 @@ fn run_fleet(
                 "memberIndex": done.index + 1,
                 "status": done.status,
                 "costUsd": cost_usd,
-                // **모르는 것을 아는 것처럼 적지 않는다.**
+                // **모르는 것을 아는 것처럼 적지 않는다.** 원인 둘을 구별해 남긴다.
                 "costReadFailed": cost_read_failed,
+                "costUnpricedCalls": cost_unpriced_calls,
                 "reservedUsd": held_usd,
                 "fleetCommittedUsd": budget.committed_usd(),
             }),
@@ -2476,6 +2482,7 @@ fn run_fleet(
             summary: done.summary,
             cost_usd,
             cost_read_failed,
+            cost_unpriced_calls,
             reserved_usd: held_usd,
             started_at: Some(member.started_at),
             finished_at: Some(done.finished_at),

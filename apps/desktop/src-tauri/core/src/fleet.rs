@@ -642,6 +642,19 @@ pub struct MemberReport {
     /// 조회 실패를 $0으로 접으면 원장에 자리가 열리고 합계 상한이 깨진다.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub cost_read_failed: bool,
+    /// 가격을 **모르는** 공급자 호출의 수(`provider_usage.cost_usd IS NULL`).
+    ///
+    /// # 왜 따로 세는가 — 상태가 셋이다
+    ///
+    /// "읽었다 / 못 읽었다"로 나누면 **읽었지만 그 숫자가 전부가 아닌** 경우가 앞쪽에 섞인다.
+    /// 가격을 모르는 모델을 부르면 합은 정상적으로 나오는데 그 합에 그 호출이 빠져 있고,
+    /// 그 부분합으로 정산하면 나머지 예약이 풀려 **다음 구성원이 들어간다** — 조회 실패를
+    /// $0으로 접었을 때와 정확히 같은 결말이다(3차 검토가 잡았다).
+    ///
+    /// 그래서 원장에 대해서는 둘을 같게 다루고([`MemberReport::cost_is_complete`]),
+    /// **원인은 구별해 남긴다** — 사용자가 다음에 할 일이 다르다(저장소 문제 / 모델 단가 미상).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cost_unpriced_calls: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -662,11 +675,24 @@ impl MemberReport {
             summary: reason,
             cost_usd: 0.0,
             cost_read_failed: false,
+            cost_unpriced_calls: 0,
             reserved_usd: None,
             started_at: None,
             finished_at: None,
         }
     }
+
+    /// `cost_usd`가 **이 구성원이 쓴 전부**인가.
+    ///
+    /// 거짓인 이유가 둘이고(못 읽었다 / 가격을 모르는 호출이 있다) **원장에게는 같은 뜻**이다:
+    /// 이 숫자로 정산하면 모자란 만큼의 예약이 풀리고, 그 자리에 다음 구성원이 들어간다.
+    pub fn cost_is_complete(&self) -> bool {
+        !self.cost_read_failed && self.cost_unpriced_calls == 0
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// **합계는 합계라고 말한다.** 필드 이름에 `fleet`이 들어가는 이유가 그것이다 — 태스크 하나의
@@ -732,7 +758,7 @@ impl FleetReport {
             per_task_cap_usd: budget.per_task_usd(),
             cap_enforced: budget.enforced(),
             staged_members: budget.staged_members(),
-            cost_unknown_members: members.iter().filter(|m| m.cost_read_failed).count(),
+            cost_unknown_members: members.iter().filter(|m| !m.cost_is_complete()).count(),
         };
         Self {
             fleet_id: fleet_id.to_string(),
@@ -766,7 +792,7 @@ impl FleetReport {
         }
         if t.cost_unknown_members > 0 {
             out.push(format!(
-                "{}개 구성원의 지출을 **저장소에서 읽지 못했습니다.** 위의 합계는 집계가 아니라 **하한**이며, 예산 원장은 그 구성원이 예약된 금액을 전부 썼다고 치고 닫았습니다 — 상한을 지키는 방향으로 틀리기 위해서입니다.",
+                "{}개 구성원의 지출은 **전부가 아닙니다** — 저장소에서 읽지 못했거나 가격을 \n모르는 호출이 섞여 있습니다. 위의 합계는 집계가 아니라 **하한**이며, 예산 원장은 그 구성원에게 \n예약된 금액을 전부 썼다고 치고 닫았습니다 — 상한을 지키는 방향으로 틀리기 위해서입니다.",
                 t.cost_unknown_members
             ));
         }
@@ -1500,6 +1526,36 @@ mod tests {
         );
     }
 
+    /// **가격을 모르는 호출이 섞인 합도 "전부"가 아니다** — 3차 검토가 잡은 자리다.
+    ///
+    /// 조회는 성공하므로 앞 테스트의 경로에 걸리지 않는다. 그 부분합으로 정산하면 나머지
+    /// 예약이 풀리고, 그 자리에 다음 구성원이 들어간다 — 조회 실패와 같은 결말이다.
+    #[test]
+    fn a_partial_sum_is_not_a_complete_cost() {
+        let mut complete = MemberReport::not_started(0, "a", "t0", "".into());
+        complete.cost_usd = 1.0;
+        assert!(complete.cost_is_complete());
+
+        // 원인이 둘이고, **원장에게는 같은 뜻**이다.
+        let mut unreadable = complete.clone();
+        unreadable.cost_read_failed = true;
+        assert!(!unreadable.cost_is_complete());
+
+        let mut unpriced = complete.clone();
+        unpriced.cost_unpriced_calls = 1;
+        assert!(!unpriced.cost_is_complete(), "가격 미상 호출이 섞인 합은 전부가 아니다");
+
+        // 그리고 보고서가 둘 다 센다 — 한쪽만 세면 나머지가 조용해진다.
+        let budget = FleetBudget::new(Some(10.0), Some(3.0));
+        let report = FleetReport::build(
+            "f",
+            vec![unreadable, unpriced],
+            &budget,
+            crate::verify::LaneStats::default(),
+        );
+        assert_eq!(report.totals.cost_unknown_members, 2, "{:?}", report.totals);
+    }
+
     /// **보고서가 그 사실을 말한다.** 말하지 않으면 화면이 하한을 집계로 읽는다.
     #[test]
     fn a_report_says_when_a_members_cost_could_not_be_read() {
@@ -1511,7 +1567,7 @@ mod tests {
         let report = FleetReport::build("f", vec![member], &budget, crate::verify::LaneStats::default());
         assert_eq!(report.totals.cost_unknown_members, 1);
         assert!(
-            report.notices().iter().any(|n| n.contains("읽지 못했습니다")),
+            report.notices().iter().any(|n| n.contains("전부가 아닙니다")),
             "{:?}",
             report.notices()
         );
@@ -1565,6 +1621,7 @@ mod tests {
                 summary: "됨".into(),
                 cost_usd: 1.0,
                 cost_read_failed: false,
+                cost_unpriced_calls: 0,
                 reserved_usd: Some(3.0),
                 started_at: None,
                 finished_at: None,
@@ -1579,6 +1636,7 @@ mod tests {
                 summary: "안 됨".into(),
                 cost_usd: 2.0,
                 cost_read_failed: false,
+                cost_unpriced_calls: 0,
                 reserved_usd: Some(3.0),
                 started_at: None,
                 finished_at: None,

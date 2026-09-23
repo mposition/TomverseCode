@@ -489,6 +489,15 @@ pub struct TaskCosts {
     /// 고칠 곳은 표본이 아니라 레지스트리의 단가다.
     #[serde(rename = "tasksWithUnpricedCalls")]
     pub tasks_with_unpriced_calls: u64,
+    /// 지출을 **읽지 못해** 분포에서 빠진 태스크 수.
+    ///
+    /// 옛 코드는 `if let Ok(..)`으로 조회 실패를 통째로 흘려보냈다 — 그 태스크는 분포에도,
+    /// 위의 "가격 미상" 수에도 없었다. **표본에서 조용히 사라진 것**이고, 그러면 p90이
+    /// 무엇에 대한 p90인지 말할 수 없다. 3차 독립 검토가 잡았다.
+    ///
+    /// 위와 나누는 이유는 고칠 곳이 다르기 때문이다: 저쪽은 레지스트리의 단가, 이쪽은 저장소.
+    #[serde(rename = "tasksWithUnreadableCost")]
+    pub tasks_with_unreadable_cost: u64,
     #[serde(rename = "p50Usd")]
     pub p50_usd: Option<f64>,
     #[serde(rename = "p90Usd")]
@@ -1828,14 +1837,19 @@ pub fn collect(store: &Store, workspace_path: Option<&str>) -> Result<Metrics, S
             metrics.token_estimate.calls_without_estimate += without_estimate;
         }
 
-        if let Ok((sum, calls, unpriced)) = store.task_cost_usd(task_id) {
-            if calls > 0 {
-                if unpriced > 0 {
-                    metrics.task_costs.tasks_with_unpriced_calls += 1;
-                } else if sum.is_finite() && sum >= 0.0 {
-                    task_cost_micros.push((sum * 1_000_000.0).round() as u64);
+        // **읽지 못한 것을 흘려보내지 않는다.** 흘려보내면 그 태스크는 분포에도 "가격 미상"
+        // 수에도 없어 표본에서 조용히 사라지고, p90이 무엇에 대한 값인지 말할 수 없게 된다.
+        match store.task_cost_usd(task_id) {
+            Ok((sum, calls, unpriced)) => {
+                if calls > 0 {
+                    if unpriced > 0 {
+                        metrics.task_costs.tasks_with_unpriced_calls += 1;
+                    } else if sum.is_finite() && sum >= 0.0 {
+                        task_cost_micros.push((sum * 1_000_000.0).round() as u64);
+                    }
                 }
             }
+            Err(_) => metrics.task_costs.tasks_with_unreadable_cost += 1,
         }
 
         let events = store

@@ -1982,14 +1982,15 @@ impl SessionState {
                 done.report.reserved_usd = budget.held_for(done.report.index).or(done.report.reserved_usd);
                 // **비용은 저장소가 말한다** — Node의 주장이 아니라 `provider_usage` 행이다.
                 // 읽지 못했으면 **예약만큼 썼다고 친다** — 0으로 접으면 자리가 열린다.
-                if done.report.cost_read_failed {
+                if done.report.cost_is_complete() {
+                    budget.settle(done.report.index, done.report.cost_usd);
+                } else {
                     let assumed = budget.settle_with_unknown_cost(done.report.index);
                     eprintln!(
-                        "[fleet] 구성원 지출을 읽지 못했습니다({}) — 예약 ${assumed:.4}을 지출로 칩니다",
-                        done.report.branch
+                        "[fleet] 구성원 지출이 전부가 아닙니다({}: 읽기 실패 {}, 가격 미상 {}건) \
+— 예약 ${assumed:.4}을 지출로 칩니다",
+                        done.report.branch, done.report.cost_read_failed, done.report.cost_unpriced_calls
                     );
-                } else {
-                    budget.settle(done.report.index, done.report.cost_usd);
                 }
                 if let Some(host) = &done.host {
                     let _ = host.append_event(
@@ -2001,8 +2002,9 @@ impl SessionState {
                             "memberIndex": done.report.index + 1,
                             "status": done.report.status,
                             "costUsd": done.report.cost_usd,
-                            // **모르는 것을 아는 것처럼 적지 않는다.**
+                            // **모르는 것을 아는 것처럼 적지 않는다.** 원인 둘을 구별해 남긴다.
                             "costReadFailed": done.report.cost_read_failed,
+                            "costUnpricedCalls": done.report.cost_unpriced_calls,
                             "reservedUsd": done.report.reserved_usd,
                             "fleetCommittedUsd": budget.committed_usd(),
                         }),
@@ -2132,6 +2134,7 @@ impl SessionState {
                 cost_usd: 0.0,
                 // 시작조차 못 했으므로 **읽을 지출이 없다** — 못 읽은 것과 다르다.
                 cost_read_failed: false,
+                cost_unpriced_calls: 0,
                 // **예약을 돌려준다.** 돌려주지 않으면 남은 구성원들이 있지도 않은 지출에 막힌다.
                 reserved_usd,
                 started_at: Some(started_at.clone()),
@@ -2295,6 +2298,7 @@ impl SessionState {
             summary: String::new(),
             cost_usd: 0.0,
             cost_read_failed: false,
+            cost_unpriced_calls: 0,
             reserved_usd,
             started_at: Some(started_at.clone()),
             finished_at: None,
@@ -2379,7 +2383,12 @@ impl SessionState {
             .ok()
             .and_then(|r| r.ok())
         {
-            Some((cost, _, _)) => report.cost_usd = cost,
+            // **가격을 모르는 호출 수를 버리지 않는다.** 버리면 부분합이 전체합처럼 읽히고,
+            // 그 부분합으로 정산하면 나머지 예약이 풀려 다음 구성원이 들어간다(3차 검토).
+            Some((cost, _, unpriced)) => {
+                report.cost_usd = cost;
+                report.cost_unpriced_calls = unpriced;
+            }
             None => {
                 report.cost_usd = 0.0;
                 report.cost_read_failed = true;
