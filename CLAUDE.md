@@ -620,10 +620,10 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 
 ## 관련 프로젝트
 
-**Tomverse Insight** (`H:\Project\ai-chat-hub`, 리포 `mposition/Tomverse`) — 같은 사용자의 첫 제품, Next.js 클라우드 SaaS. **별도 리포지토리이고 합치지 않는다.** 관리형 카탈로그 경로(product-strategy 17절)가 생겨도 이 경계는 그대로다 — Insight의 크레딧 백엔드는 HTTP 계약으로만 부른다.
+**Tomverse 웹** (`H:\Project\ai-chat-hub`, 리포 `mposition/Tomverse`) — 같은 사용자의 첫 제품군, Next.js 클라우드 SaaS(Chat·Review·Studio). **옛 문서가 부르던 "Tomverse Insight"는 지금의 Tomverse Review의 옛 이름이다** — 이 저장소의 문서는 그 이름으로 웹 저장소 전체를 가리켰으므로 "Tomverse 웹"으로 읽을 것. 웹 저장소에는 그 이름을 막는 검사(`check-retired-product-name`)가 있다. **별도 리포지토리이고 합치지 않는다.** 관리형 카탈로그 경로(product-strategy 17절)가 생겨도 이 경계는 그대로다 — 웹 저장소의 크레딧 백엔드는 HTTP 계약으로만 부른다.
 
-- Insight의 `lib/modelRegistryShared.ts`에 11개 공급자 레지스트리가 프로덕션에서 돌고 있다. **카탈로그 데이터는 재사용**하되(복사 + 출처 주석), `modelRegistry.ts`(server-only + Prisma)나 크레딧 과금 로직은 재사용하지 않는다 — Insight는 크레딧 SaaS, Code는 BYOK라서 "이 모델을 쓸 수 있나"가 서로 다른 질문이다.
-- 라이선스·구독 백엔드는 나중에 **HTTP 계약**으로 연결한다. Insight 모듈을 import하지 않는다.
+- 웹 저장소의 `lib/modelRegistryShared.ts`에 11개 공급자 레지스트리가 프로덕션에서 돌고 있다. **카탈로그 데이터는 재사용**하되(복사 + 출처 주석), `modelRegistry.ts`(server-only + Prisma)나 크레딧 과금 로직은 재사용하지 않는다 — 웹 제품은 크레딧 SaaS, Code는 BYOK(관리형 경로 제외)라서 "이 모델을 쓸 수 있나"가 서로 다른 질문이다.
+- 라이선스·구독 백엔드는 나중에 **HTTP 계약**으로 연결한다. 웹 저장소 모듈을 import하지 않는다.
 - 자세한 경계는 [multi-engine-routing.md 11절](./docs/design/multi-engine-routing.md).
 
 ## 작업 방식

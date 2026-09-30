@@ -11,7 +11,7 @@ status: **accepted** — 방향 승인됨(2026-07-25). 9절 0단계부터 구현
 
 | 구분 | 항목 | 판단 근거 |
 |---|---|---|
-| **지금 채택** | 능력(capability) 기반 Model Registry | provider를 타입이 아닌 런타임 값으로. 지금 2곳 수정이면 끝나지만, 나중엔 DB 마이그레이션. **Tomverse Insight에 이미 11개 공급자 레지스트리가 있어 카탈로그는 재사용 가능(11절)** |
+| **지금 채택** | 능력(capability) 기반 Model Registry | provider를 타입이 아닌 런타임 값으로. 지금 2곳 수정이면 끝나지만, 나중엔 DB 마이그레이션. **Tomverse 웹에 이미 11개 공급자 레지스트리가 있어 카탈로그는 재사용 가능(11절)** |
 | **지금 채택** | Role 추상화 (planner/executor/reviewer) | 상태 머신은 거의 안 바뀜(6절) — 이미 잘 분리돼 있었음 |
 | **지금 채택** | 검수자 독립성 불변식 | 제안서가 과소평가한 안전 속성. 코드로 강제해야 함(5절) |
 | **지금 채택** | 라우팅 결정의 이벤트 로그 기록 | 데이터 기반 라우터의 부트스트랩 전제조건(8절) |
@@ -53,7 +53,7 @@ type StructuredOutputMode =
   | "forced_tool_use"    // Anthropic tool_choice: { type: "tool" }
   | "response_schema";   // Gemini responseSchema 계열
 
-// Insight의 실증된 구분을 그대로 채택 (11절) — 어댑터를 모델별로 두지 않고
+// Tomverse 웹의 실증된 구분을 그대로 채택 (11절) — 어댑터를 모델별로 두지 않고
 // "공급자 전용 SDK가 필요한가"로 나눈다.
 type WireProtocol = "native" | "openai-compatible";
 
@@ -315,7 +315,7 @@ SQLite 스키마에는 `routing_decisions` 테이블과 `task_events`의 새 이
 | 0 (지금) | Model Registry + Role 추상화 + 독립성 불변식 + 라우팅 기록. **엔진은 여전히 OpenAI/Anthropic 2개.** | 없음 — 지금이 최저 비용 시점 |
 | 1 | 핵심 루프 완성 (Tool Runtime, Policy Gate, FIX_LOOP, Context Engine) | 0단계 |
 | 2 | **어려운 픽스처로 스파이크 재실행** — 교차검증이 실제로 이득인지 검증 | 1단계 |
-| 3 | Gemini 어댑터 추가 (+ 11.4절 AI SDK 채택 여부 결정) | 2단계에서 교차검증 가치가 확인될 것. 세 번째 구조화 출력 방식이라 레지스트리 추상화 검증용으로 최적. Insight가 `@ai-sdk/google`을 이미 프로덕션에서 쓰고 있어 위험이 일부 해소됨(11절) |
+| 3 | Gemini 어댑터 추가 (+ 11.4절 AI SDK 채택 여부 결정) | 2단계에서 교차검증 가치가 확인될 것. 세 번째 구조화 출력 방식이라 레지스트리 추상화 검증용으로 최적. Tomverse 웹이 `@ai-sdk/google`을 이미 프로덕션에서 쓰고 있어 위험이 일부 해소됨(11절) |
 | 4 | 평가 데이터 기반 라우터 전환 | 표본 축적 |
 | 5+ | 추가 공급자(Qwen/Mistral/기타) | 각각 구체적 사용 사례가 있을 때만 |
 
@@ -677,34 +677,36 @@ credential binding의 HMAC은 **API 키를 HMAC 키로** 쓰고 salt/purpose/pro
 메시지로 쓴다. 예전에는 반대(salt가 키, API 키가 메시지)였고, salt가 공개값이므로 HMAC의
 "키를 모르면 다이제스트를 만들 수 없다"는 성질이 성립하지 않았다.
 
-## 11. Tomverse Insight의 기존 자산 재사용
+## 11. Tomverse 웹(`mposition/Tomverse`)의 기존 자산 재사용
 
-**3절의 Model Registry를 백지에서 만들 필요가 없다.** Tomverse Insight(`H:\Project\ai-chat-hub`, 리포지토리 `mposition/Tomverse`)에 이미 동등한 구조가 프로덕션에서 돌고 있다.
+> **이름 주의(2026-09-30).** 이 절이 쓰일 때의 "Tomverse Insight"는 지금 **Tomverse Review**의 옛 이름이고, 이 문서는 그 이름으로 웹 저장소 전체(현재 Chat·Review·Studio)를 가리켰다. 아래에서는 "Tomverse 웹"으로 바꿔 적는다.
 
-- `lib/modelRegistryShared.ts` — **11개 공급자**(openai, anthropic, google, groq, xai, deepseek, mistral, moonshot, qwen, zhipu, perplexity)의 `baseUrl` / `apiKeyEnvName` / **`protocol: "native" | "openai-compatible"`** 매핑. 제안서가 경고한 "OpenAI 호환이라고 진짜 호환은 아니다"를 Insight는 이미 타입 수준에서 구분하고 있다.
+**3절의 Model Registry를 백지에서 만들 필요가 없다.** Tomverse 웹(`H:\Project\ai-chat-hub`, 리포지토리 `mposition/Tomverse`)에 이미 동등한 구조가 프로덕션에서 돌고 있다.
+
+- `lib/modelRegistryShared.ts` — **11개 공급자**(openai, anthropic, google, groq, xai, deepseek, mistral, moonshot, qwen, zhipu, perplexity)의 `baseUrl` / `apiKeyEnvName` / **`protocol: "native" | "openai-compatible"`** 매핑. 제안서가 경고한 "OpenAI 호환이라고 진짜 호환은 아니다"를 Tomverse 웹은 이미 타입 수준에서 구분하고 있다.
 - `lib/models.ts` — 모델 카탈로그, `ModelInputCapabilities`(image/nativePdf/maxImages/payload 상한), 상태(`enabled`/`limited`/`disabled`/`coming-soon`).
 - `lib/providerModelCatalogMonitor.ts`, `lib/providerHealthPolicyCore.ts` — 공급자 카탈로그 변화 감시, 헬스 정책.
 
-**따라서 3절의 `adapterKind`를 Insight의 `protocol` 개념으로 대체한다** — 어댑터를 모델마다 두는 게 아니라, `native`(공급자 전용 SDK 필요)와 `openai-compatible`(공용 어댑터 + baseUrl 교체)로 나누는 편이 실증된 구분이다.
+**따라서 3절의 `adapterKind`를 Tomverse 웹의 `protocol` 개념으로 대체한다** — 어댑터를 모델마다 두는 게 아니라, `native`(공급자 전용 SDK 필요)와 `openai-compatible`(공용 어댑터 + baseUrl 교체)로 나누는 편이 실증된 구분이다.
 
 ### 11.1 무엇을 재사용하고 무엇을 재사용하지 않는가
 
-**두 제품의 과금 모델이 근본적으로 다르다는 점이 경계선이다.** Insight는 Tomverse가 API 키를 보유하고 사용자는 크레딧을 구매하는 클라우드 SaaS다. Tomverse Code는 사용자가 자기 키를 가져오는 로컬 우선 BYOK다.
+**두 제품의 과금 모델이 근본적으로 다르다는 점이 경계선이다.** Tomverse 웹은 Tomverse가 API 키를 보유하고 사용자는 크레딧을 구매하는 클라우드 SaaS다. Tomverse Code는 사용자가 자기 키를 가져오는 로컬 우선 BYOK다.
 
-| Insight 자산 | Code에서 | 이유 |
+| Tomverse 웹 자산 | Code에서 | 이유 |
 |---|---|---|
 | `modelRegistryShared.ts`의 공급자 표 | **재사용(데이터로 복사)** | 순수 상수. Prisma/Next 의존 없음 |
 | `models.ts`의 카탈로그·capability 정의 | **재사용(데이터로 복사)** | "이 모델이 이미지를 받는가"는 두 제품에 동일한 사실 |
 | `modelRegistry.ts` | **재사용 안 함** | `server-only` + Prisma. Code는 DB가 아니라 로컬 설정에서 해석 |
-| `MODEL_USAGE_CREDIT_WEIGHTS`, `ModelTier`, `ModelMinimumPlan` | **재사용 안 함** | Insight의 크레딧 과금 개념. BYOK엔 크레딧이 없다 |
-| `modelAvailability.ts` | **재사용 안 함 (질문이 다름)** | Insight: "이 요금제에서 이 모델이 켜져 있나". Code: "사용자 *본인의* 키로 이 모델이 실제로 호출되나"(gpt-5 org verification 사건). 같은 이름의 다른 문제다 |
+| `MODEL_USAGE_CREDIT_WEIGHTS`, `ModelTier`, `ModelMinimumPlan` | **재사용 안 함** | Tomverse 웹의 크레딧 과금 개념. BYOK엔 크레딧이 없다 |
+| `modelAvailability.ts` | **재사용 안 함 (질문이 다름)** | 웹: "이 요금제에서 이 모델이 켜져 있나". Code: "사용자 *본인의* 키로 이 모델이 실제로 호출되나"(gpt-5 org verification 사건). 같은 이름의 다른 문제다 |
 
 > **product-strategy 17절(2026-09-30)이 이 경계의 전제를 바꾼다** — Code에 BYOK와 나란히 **관리형
 > 카탈로그 경로**(Tomverse 크레딧)가 생긴다. 위 표의 "재사용 안 함" 중 크레딧 가중치·요금제별
 > 가용성은 **관리형 경로에 한해** 다시 검토 대상이다(17.4-⑥). 재사용하더라도 모듈 import가 아니라
 > 11.3절의 HTTP 계약으로 받는다는 규칙은 그대로다. BYOK 경로에는 아래 문장이 그대로 적용된다.
 
-즉 **공유되는 것은 카탈로그 사실이지 자격 판정 로직이 아니다.** 3절의 `availability.requiresOrgVerification`은 Insight엔 없는 Code 고유 축이고, 반대로 Insight의 크레딧 가중치는 Code에 무의미하다.
+즉 **공유되는 것은 카탈로그 사실이지 자격 판정 로직이 아니다.** 3절의 `availability.requiresOrgVerification`은 Tomverse 웹엔 없는 Code 고유 축이고, 반대로 Tomverse 웹의 크레딧 가중치는 Code에 무의미하다.
 
 ### 11.2 코드 공유 방식 — 지금은 복사, 나중에 추출
 
@@ -715,19 +717,19 @@ credential binding의 HMAC은 **API 키를 HMAC 키로** 쓰고 salt/purpose/pro
 
 ### 11.3 별도 축: 라이선스·구독 백엔드 (런타임 의존)
 
-Code의 설계 문서가 말하는 "선택적 Tomverse 백엔드"(라이선스·구독·팀 정책·사용량 집계)는 Insight가 이미 갖고 있다(Stripe, NextAuth, Prisma 사용자, `billingEntitlements.ts`, `adminAudit*`).
+Code의 설계 문서가 말하는 "선택적 Tomverse 백엔드"(라이선스·구독·팀 정책·사용량 집계)는 Tomverse 웹이 이미 갖고 있다(Stripe, NextAuth, Prisma 사용자, `billingEntitlements.ts`, `adminAudit*`).
 
 **이건 코드 공유가 아니라 런타임 HTTP 계약 의존이다.** 11.2의 카탈로그 복사와 완전히 다른 종류이며, 다르게 다뤄야 한다:
-- Code는 Insight의 내부 모듈을 import하지 않는다. 버전이 명시된 HTTP API만 호출한다.
+- Code는 Tomverse 웹의 내부 모듈을 import하지 않는다. 버전이 명시된 HTTP API만 호출한다.
 - 이 경계는 Code의 로컬 우선 원칙과도 맞다 — 라이선스 확인은 네트워크가 끊겨도 유예 기간 동안 동작해야 하며, 소스 코드는 절대 이 경로로 나가지 않는다.
 - 계약이 실제로 필요해지는 시점(유료화 시점)에 별도 설계 문서로 다룬다. MVP에서는 불필요.
 - **그 시점이 앞당겨졌다(product-strategy 17절)** — v1 뒤 접근 트랙의 선행 조건이다(product-strategy 13절). 관리형 카탈로그와 웹 원격 접속이 둘 다 이 계약 위에 선다 — 인증, 크레딧 잔액, 게이트웨이, 중계. 계약의 범위가 "라이선스 확인"에서 **"요청 경로"**로 넓어진다는 점이 다르다: 라이선스 확인은 코드를 싣지 않지만 게이트웨이는 싣는다. 그래서 위의 "소스 코드는 절대 이 경로로 나가지 않는다"는 **라이선스 확인 경로에 한해** 유지되고, 게이트웨이는 별도 경로로 설계한다 — 한 계약에 섞으면 "코드가 나가지 않는 경로"를 코드가 나가는 경로와 구별할 수 없게 된다.
 
 ### 11.4 미결정: Vercel AI SDK 채택 여부
 
-Insight는 `ai` + `@ai-sdk/{openai,anthropic,google}`를 쓰고, Code는 공급자 공식 SDK(`openai`, `@anthropic-ai/sdk`)를 직접 쓴다. 멀티엔진으로 가면서 이 분기를 유지할지 결정해야 한다.
+Tomverse 웹은 `ai` + `@ai-sdk/{openai,anthropic,google}`를 쓰고, Code는 공급자 공식 SDK(`openai`, `@anthropic-ai/sdk`)를 직접 쓴다. 멀티엔진으로 가면서 이 분기를 유지할지 결정해야 한다.
 
-- **AI SDK 채택 근거**: 11개 공급자 통합 인터페이스가 이미 Insight 프로덕션에서 검증됨. 어댑터 작성 비용 대폭 절감.
+- **AI SDK 채택 근거**: 11개 공급자 통합 인터페이스가 이미 Tomverse 웹 프로덕션에서 검증됨. 어댑터 작성 비용 대폭 절감.
 - **직접 SDK 유지 근거**: 13.3절에서 우리가 검증한 건 *공급자별* 구조화 출력 메커니즘(OpenAI `json_schema` strict, Anthropic 강제 `tool_choice`)이다. AI SDK는 이걸 추상화하는데, 제안서가 경고한 "추상화 누수"가 정확히 이 지점에서 발생한다. 도구 루프와 스트리밍을 정밀 제어해야 하는 Code의 요구와 충돌할 수 있다.
 
 **결정 시점**: 3번째 엔진(Gemini)을 추가하는 9절 3단계. 그때 두 방식으로 같은 어댑터를 짜보고 구조화 출력·도구 호출 충실도를 비교한다. 그 전에 미리 정할 필요 없다.
@@ -1199,7 +1201,7 @@ BYOK 데스크톱에서 **사용자가 곧 관리자**다. 자기가 건 제한�
 
 ### 19.1 구조화 출력은 세 번째 메커니즘을 쓴다
 
-`StructuredOutputMode`에는 처음부터 `response_schema`가 있었다 — Insight 카탈로그에서 온 구분이고
+`StructuredOutputMode`에는 처음부터 `response_schema`가 있었다 — Tomverse 웹 카탈로그에서 온 구분이고
 주석도 "Gemini responseSchema 계열"이라고 적어두었다. **축은 설계에 있었고 쓰는 어댑터가 없었을
 뿐이다.** 그래서 openai-compatible 엔드포인트로 우회하지 않고 native로 만들었다: 우회하면
 `strict_schema`인 척하게 되는데, 그건 실제로 강제되는 것과 다른 값을 레지스트리에 적는 것이다.

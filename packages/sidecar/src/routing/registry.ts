@@ -5,7 +5,7 @@ import { modelPathKey } from "@tomverse/protocol";
 /**
  * Model Registry — docs/design/multi-engine-routing.md 3절, 9절 0단계.
  *
- * 카탈로그 출처: Tomverse Insight(`mposition/Tomverse`)의 `lib/modelRegistryShared.ts` 및
+ * 카탈로그 출처: Tomverse 웹 저장소(`mposition/Tomverse`)의 `lib/modelRegistryShared.ts` 및
  * `lib/models.ts`. 11.2절 결정대로 **코드가 아니라 데이터로 복사**했다 —
  * `protocol: "native" | "openai-compatible"` 구분과 baseUrl/apiKeyEnvName 매핑이 그것이다.
  * 크레딧 과금 관련 축(MODEL_USAGE_CREDIT_WEIGHTS, ModelTier)은 BYOK에 무의미하므로 가져오지 않았다(11.1절).
@@ -137,7 +137,7 @@ export const BUILTIN_MODELS: ModelEntry[] = [
    * Google Gemini — M2 커버리지("멀티프로바이더 3사", product-strategy 8.2절).
    *
    * `structuredOutput`이 셋째 값 `response_schema`인 첫 항목이다. 그 축은 처음부터 있었고
-   * (Insight 카탈로그에서 온 구분) 쓰는 어댑터가 없었을 뿐이다.
+   * (Tomverse 웹 카탈로그에서 온 구분) 쓰는 어댑터가 없었을 뿐이다.
    *
    * **이 엔트리는 실측으로 확인되지 않았다** — 이 저장소의 개발 환경에는 Google 자격증명이
    * 없고 egress도 막혀 있다. 가격·컨텍스트 한도는 공개 문서 기준이며 `pricingAsOf`가 그
