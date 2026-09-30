@@ -1,6 +1,6 @@
 # Tomverse Code — 작업 지침
 
-Windows 데스크톱 AI 코딩 어시스턴트.
+Windows 데스크톱 AI 코딩 어시스턴트. 기본은 BYOK + 로컬 실행이며, **관리형 모델 카탈로그(Tomverse 크레딧)와 웹 원격 접속(중계 방식 — 코어는 여전히 사용자 PC에서 돈다)을 더하기로 했다**(product-strategy.md 17절, 아직 구현 없음). 이 두 경로는 Tomverse 서버를 지나므로 **"Tomverse가 코드를 중계하지 않는다"를 경로 없이 말하지 말 것.**
 
 **두 가지를 동시에 만족해야 한다** — 자세한 근거는 [docs/design/product-strategy.md](./docs/design/product-strategy.md).
 
@@ -15,7 +15,7 @@ Windows 데스크톱 AI 코딩 어시스턴트.
 
 | 문서 | 다루는 것 |
 |---|---|
-| [product-strategy.md](./docs/design/product-strategy.md) | 제품 포지셔닝, **기능 커버 범위와 출시 기준(8절)**, 로드맵(M0~M6), 북극성 지표, **가설 게이트**, **판정 권위의 계층(16절)** |
+| [product-strategy.md](./docs/design/product-strategy.md) | 제품 포지셔닝, **기능 커버 범위와 출시 기준(8절)**, 로드맵(M0~M6), 북극성 지표, **가설 게이트**, **판정 권위의 계층(16절)**, **접근 경로 전환 — 관리형 카탈로그·웹 중계(17절)** |
 | [state-machine-and-protocol.md](./docs/design/state-machine-and-protocol.md) | 태스크 상태 머신, 공통 프로토콜 타입, Policy Gate, `run_command` allowlist, SQLite 스키마, 롤백, **사용자 판정의 고정과 수명(17절)** |
 | [context-engine.md](./docs/design/context-engine.md) | `WorkspaceIndex`(세션) vs `WorkspaceSnapshot`(태스크), 관련 파일 선정, 토큰 예산, secret 제외 |
 | [multi-engine-routing.md](./docs/design/multi-engine-routing.md) | Model Registry, Role 추상화, 검수자 독립성 불변식, 라우터 부트스트랩, **co-executor 배정(13절)** |
@@ -40,15 +40,64 @@ Windows 데스크톱 AI 코딩 어시스턴트.
    구조를 확인할 수 없으면 추측해서 실행하지 않고 실패한다.
 7. **`task_events`는 append-only 진실의 원천이다.** `tasks.phase`는 파생 캐시다. 이벤트를 남기지 않고 상태를 바꾸지 말 것.
 
-## 미검증 가설 — 큰 투자 전에 확인할 것
+## 가설의 현재 상태 — 무엇을 품질 주장으로 쓸 수 없는가
 
-Phase 0 스파이크 실측: 쉬운 버그 5건에서 **교차검증은 정확도 이득 0%, 비용 1.63배, 지연 1.70배**였다(단일 모델도 5/5 통과).
+이 절은 한때 *"가설 게이트 G를 통과하기 전에 교차검증 기반 차별화 기능에 크게 투자하지 말
+것"*이었다. **G는 2026-08-27에 답을 냈다 — Protocol v1 FAIL**(288건, `netQualityImprovement`
+−15.3%p, 95% CI 전체가 0 미만, 검수 harm 0 / 실패 초안 67건 중 61건 무력). 판정의 범위와
+인용 형태는 product-strategy.md 13.0절이 정본이다 — **넓게 읽지 말 것**: 이 결과는 "약한 실행자 +
+강한 검수자"를 쟀지 교차검증 일반을 잰 것이 아니다.
 
-이 결과 때문에 `TRIAGE`가 도입됐다. 하지만 **어려운 태스크에서 교차검증이 이득인지는 아직 검증되지 않았다.** 제품 전략의 상당 부분이 이 가설 위에 서 있으므로, **가설 게이트 G를 통과하기 전에 교차검증 기반 차별화 기능에 크게 투자하지 말 것.**
+그 결과로 정해진 것(13.0.2절)과, 그 뒤 state-machine 72절이 **일부러 뒤집은 것**을 함께 알아야 한다:
 
-(이 문단은 한때 "M2(차별화) 이전에 M1(가설 게이트)"이라고 적혀 있었는데, 옛 로드맵 기준이라 지금과 어긋난다. product-strategy.md 13절이 정본이다: **G = 가설 게이트**(병렬 과제), **M1 = 차별화(깊게)**, **M2 = 커버리지 A**.)
+- **M1은 `Evidence-first Adaptive Verification`으로 재정의됐다.** 게이트 결과와 무관하게 살아남는
+  축 — 결정론적 검증, Windows 특화, 전송 투명성, 커버리지 전반 — 은 계속 투자해도 된다.
+- **72절의 standard 흐름은 모델 검토 둘(B 계획 검토, C 계획 일치 확인)을 기본 경로에서 돌리고,
+  기본값 `verified`는 계획자를 둘 부른다.** 13.0.2절의 보류 두 항목을 뒤집은 것이며, 그 근거와
+  한계가 그 절에 적혀 있다. 해석으로 비켜가지 않고 "뒤집었다"고 적은 것이 요점이다.
+- **뒤집히지 않은 것: 교차검증·대조·검토·`EffortLevel`을 품질 주장으로 쓰지 않는다.** Protocol v2
+  (`evals/hypothesis-gate/PROTOCOL-V2-DRAFT.md`, 상태 `DRAFT_NON_EXECUTABLE`)가 통과하거나
+  72.14절 계측이 답을 내기 전까지다. 화면 문구·README·커밋 메시지에서도 마찬가지다.
+- **기본값(`verified`, standard 흐름)을 바꾸는 근거는 계측이다.** 표본이 `minSamples`에 못
+  미친 비율을 보고 바꾸지 말 것(product-strategy 14.1절 — `enough_to_look`은 "답"이 아니다).
 
-**게이트가 실패해도 살아남는 차별화**가 무엇인지는 13절이 미리 정해두었다 — 결정론적 검증, Windows 특화, **전송 투명성**(7절), 커버리지 전반. 게이트를 못 돌리는 동안 차별화를 진행해야 하면 이 목록에서 고를 것.
+## 다음 계획 — 정본이 어디 있고, 무엇이 막고 있는가
+
+**이 절은 목록의 사본이 아니라 지도다.** 로드맵의 정본은 product-strategy.md 13절, 기능별
+상태는 8.2절 표, 미해결의 정본은 각 문서의 "다음으로 구체화할 것" 절이다. 여기 적은 상태가 그
+문서들과 다르면 **그 문서가 맞고 이 절이 낡은 것**이다(2026-09-29, `215d3bd` 기준으로 정리).
+
+**위치.** M0~M3이 들어왔다(v1 출시 기준 대부분 충족 — 행별 판정은 8.2절). G는 완료(FAIL).
+M4는 standard 흐름(72절, PR #31)과 Fleet이 들어왔고 **Arena는 미착수**다. M5는 집계만 있고
+라우터가 그 값을 쓰지 않는다. M6은 미착수. Windows 특화는 마일스톤이 아니라 상시 트랙이다.
+
+**열린 항목은 막고 있는 것의 종류로 먼저 가를 것** — 종류마다 해도 되는 일이 다르다.
+
+| 막힘 | 뜻 | 할 수 있는 것 / 하면 안 되는 것 |
+|---|---|---|
+| **데이터 대기** | 계측은 이미 있고 실사용 표본이 없다 | `tomverse-host metrics`의 `openQuestions`가 `enough_to_look`이 되기 전에 **상수·임계값·기본값을 조정하지 않는다.** 새 기능으로 "앞당기지" 않는다 |
+| **Windows 실기** | 리눅스에서 판정할 수 없다 | 리눅스 통과를 착지로 적지 않는다. 사람이 태운 결과만 attestation으로 들어간다(`windows-landing-record.md` 14절) |
+| **유료 실행** | 모델 호출과 예산 승인이 필요하다 | Run Card 없이 시작할 수 없다(아래 가설 게이트 절). 우회 플래그를 만들지 않는다 |
+| **사람 결정** | 설계가 일부러 비워 둔 자리 | 구현이 먼저 값을 골랐다면 **문서에 "구현이 정했고 추인 대기"로 적는다.** 조용히 확정으로 쓰지 않는다 |
+
+**지금 열려 있는 큰 줄기** (세부는 정본으로):
+
+| 줄기 | 남은 것 | 막힘 | 정본 |
+|---|---|---|---|
+| M4 standard 흐름 — 사람 추인 | `FIX_LOOP` 등급·공급자(구현: 최고 등급, C의 구현자 집합에 포함), 서브태스크 N개일 때 `tasks.phase`(구현: 순차, 진행 중인 서브태스크의 phase), `FleetMemberStatus`에 `kind`/`complexityTier`(구현: 싣는다). **코드는 정했는데 72.16절은 아직 미결로 적고 있다** | 사람 결정 | state-machine 72.16 |
+| M4 문서 정리 | 72.15의 "아직 바꾸지 않았고…" 목록 대부분이 이미 코드에 들어갔다. product-strategy 13절 표에 72절 흐름이 없다. `docs/handoff/m4-standard-flow.md`는 완료된 이관이다 | 없음(문서 작업) | 72.15, 72.16, product-strategy 13 |
+| Fleet 게이트 대기 중 예산 점유 | 합계 예약은 단계로 나눌 수 있어도 **줄일 수 없다** — 72.12절의 Fleet 목표 미달성 | 데이터(계획/구현 비용 비) | 72.12.1, 72.16 |
+| M4 Arena | 선택만(결합 없음, 9.2.2), 탐침 실행기를 따로 만들지 않는다(9.2.1). 판정자 유지/순위 보조 격하는 실측 후 | 착수 전 | product-strategy 9절 |
+| CLI 전송(codex/claude/cursor-agent) | 타입 축(`transport`/`cliVendor`/`ProviderKind="cli"`)만 있고 **어댑터와 레지스트리 행이 없다.** 실행 파일 이름·약관·effort 파라미터·중개 CLI의 실제 모델이 미확인 | 외부 사실 확인 | multi-engine 21.9, 이관 문서 4절 |
+| Protocol v2 | 새 fixture 세트, 표본 수, `regressionRate` 상한, 비용 상한, 동결 커밋이 미기입 | 사람 결정 + 유료 실행 | PROTOCOL-V2-DRAFT §3.3, §5 |
+| Windows 착지 | 설치본(node 없는 머신)·`pythonEnv`·강제 포기 경로의 job 핸들·`processGroup` | Windows 실기 | windows-landing-record 14절 |
+| 8.2 "부분" 두 행 | Git 브랜치 생성, Windows 특화 나머지(PowerShell 의미 분석 등) | 없음 / Windows 실기 | product-strategy 8.2, 12절 |
+| Google 어댑터 실측 | 코드는 있고 실측 미확인 | 유료 실행 | multi-engine 19.4 |
+| M5 학습 라우터 | 대조 실행에서 판정이 **갈린** 쌍이 쌓이기 전에는 라우팅을 바꾸지 않는다 | 데이터 | multi-engine 8.1, 21.9 |
+| 관리형 카탈로그 · 웹 원격 접속(중계) | v1 뒤 접근 트랙(A1 관리형 → A2 웹 중계, product-strategy 13절). 정해진 것: 게이트웨이 무보존, 중계는 평문(Claude Code와 같음), 웹 승인 가능·실행은 로컬(해시 대조로 시작, 승인 서명은 후속), 첫 실행에서 모드 선택 — 100% BYOK / 100% 관리형 / 하이브리드, 웹에 연결한 세션만 서버에 기록 저장(도중 연결 시 그 세션의 이전 기록 포함, 첫 연결 때 한 번 알리고 동의), 역할별 경로 고정은 A1에 없음(17.5). 웹 세션 서버 사본은 90일·삭제 시 즉시 영구 삭제, 로컬 `task_events`는 자동 정리 없음(원칙 7). 남은 것: 예산 권위, 게이트웨이 경유 exact-model 검증, 약관 | 사람 결정 | product-strategy 17.4·17.5 |
+| IDE 확장 · M6 | v1 이후. 확장은 키·게이트·승인을 갖지 않는다 / 조직 정책은 HTTP 계약으로 | 착수 전 | product-strategy 8.5, multi-engine 11 |
+
+항목이 해결되면 이 표가 아니라 **정본 문서에 취소선과 링크**를 남기고, 이 표에서는 줄을 지운다.
 
 ## 저장소 구조
 
@@ -272,15 +321,11 @@ npm run gate:g:run        # confirmatory (기본 반복 3회). 실제 API 키가
 
 **exact-model 검증은 호출별 응답 envelope만 본다.** `DraftProposal.model`/`ReviewDecision.model`은
 어댑터가 `this.modelId`를 넣은 값이라 비교하면 항상 통과한다 — 조용한 대체를 잡지 못한다.
-기록의 `providerCalls[*].providerReportedModelId`를 쓰고, alias는 prefix 비교가 아니라
+기록의 `providerCalls[*].providerReportedModelId`를 쓰고(그 값의 출처는 어댑터가 채우는
+`ProviderResponse.meta.providerReportedModelId`다), alias는 prefix 비교가 아니라
 `ModelEntry.acceptedProviderModelIds` 목록으로 다룬다(10.8절). 역할 배정은 arm마다 다르므로
 (Arm B는 anthropic 하나뿐이라 reviewer 모델이 executor 자리에 앉는다) 배정 규칙은
 `arms.ts`의 `modelForRole` 하나에만 둔다.
-
-**exact-model 검증은 응답 envelope만 본다.** `DraftProposal.model`/`ReviewDecision.model`은
-어댑터가 `this.modelId`를 넣은 값이라 비교하면 항상 통과한다 — 조용한 대체를 잡지 못한다.
-`ProviderResponse.meta.providerReportedModelId`를 쓰고, alias는 prefix 비교가 아니라
-`ModelEntry.acceptedProviderModelIds` 목록으로 다룬다(10.8절).
 
 **fake provider 결과로 가설을 판정하지 않는다** — 모든 기록에 `providerKind`가 남고, 집계가
 `fake` 기록만 있으면 무조건 `INCONCLUSIVE`를 낸다. 자세한 것은
@@ -575,7 +620,7 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 
 ## 관련 프로젝트
 
-**Tomverse Insight** (`H:\Project\ai-chat-hub`, 리포 `mposition/Tomverse`) — 같은 사용자의 첫 제품, Next.js 클라우드 SaaS. **별도 리포지토리이고 합치지 않는다.**
+**Tomverse Insight** (`H:\Project\ai-chat-hub`, 리포 `mposition/Tomverse`) — 같은 사용자의 첫 제품, Next.js 클라우드 SaaS. **별도 리포지토리이고 합치지 않는다.** 관리형 카탈로그 경로(product-strategy 17절)가 생겨도 이 경계는 그대로다 — Insight의 크레딧 백엔드는 HTTP 계약으로만 부른다.
 
 - Insight의 `lib/modelRegistryShared.ts`에 11개 공급자 레지스트리가 프로덕션에서 돌고 있다. **카탈로그 데이터는 재사용**하되(복사 + 출처 주석), `modelRegistry.ts`(server-only + Prisma)나 크레딧 과금 로직은 재사용하지 않는다 — Insight는 크레딧 SaaS, Code는 BYOK라서 "이 모델을 쓸 수 있나"가 서로 다른 질문이다.
 - 라이선스·구독 백엔드는 나중에 **HTTP 계약**으로 연결한다. Insight 모듈을 import하지 않는다.

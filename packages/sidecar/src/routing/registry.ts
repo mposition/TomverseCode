@@ -9,6 +9,7 @@ import { modelPathKey } from "@tomverse/protocol";
  * `lib/models.ts`. 11.2절 결정대로 **코드가 아니라 데이터로 복사**했다 —
  * `protocol: "native" | "openai-compatible"` 구분과 baseUrl/apiKeyEnvName 매핑이 그것이다.
  * 크레딧 과금 관련 축(MODEL_USAGE_CREDIT_WEIGHTS, ModelTier)은 BYOK에 무의미하므로 가져오지 않았다(11.1절).
+ * 관리형 카탈로그 경로(product-strategy 17절)가 생기면 다시 볼 자리다 — 17.4-⑥.
  *
  * 가격은 spike/src/config.ts의 2026-07 스냅샷을 승계했다. `pricingAsOf`가 있는 이유가 이것이다 —
  * 가격은 빠르게 낡으므로 언제 기준인지 없이는 비용 표시를 신뢰할 수 없다.
