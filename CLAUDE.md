@@ -1,6 +1,6 @@
 # Tomverse Code — 작업 지침
 
-Windows 데스크톱 AI 코딩 어시스턴트.
+Windows 데스크톱 AI 코딩 어시스턴트. 기본은 BYOK + 로컬 실행이며, **관리형 모델 카탈로그(Tomverse 크레딧)와 웹 원격 접속(중계 방식 — 코어는 여전히 사용자 PC에서 돈다)을 더하기로 했다**(product-strategy.md 17절, 아직 구현 없음). 이 두 경로는 Tomverse 서버를 지나므로 **"Tomverse가 코드를 중계하지 않는다"를 경로 없이 말하지 말 것.**
 
 **두 가지를 동시에 만족해야 한다** — 자세한 근거는 [docs/design/product-strategy.md](./docs/design/product-strategy.md).
 
@@ -15,7 +15,7 @@ Windows 데스크톱 AI 코딩 어시스턴트.
 
 | 문서 | 다루는 것 |
 |---|---|
-| [product-strategy.md](./docs/design/product-strategy.md) | 제품 포지셔닝, **기능 커버 범위와 출시 기준(8절)**, 로드맵(M0~M6), 북극성 지표, **가설 게이트**, **판정 권위의 계층(16절)** |
+| [product-strategy.md](./docs/design/product-strategy.md) | 제품 포지셔닝, **기능 커버 범위와 출시 기준(8절)**, 로드맵(M0~M6), 북극성 지표, **가설 게이트**, **판정 권위의 계층(16절)**, **접근 경로 전환 — 관리형 카탈로그·웹 중계(17절)** |
 | [state-machine-and-protocol.md](./docs/design/state-machine-and-protocol.md) | 태스크 상태 머신, 공통 프로토콜 타입, Policy Gate, `run_command` allowlist, SQLite 스키마, 롤백, **사용자 판정의 고정과 수명(17절)** |
 | [context-engine.md](./docs/design/context-engine.md) | `WorkspaceIndex`(세션) vs `WorkspaceSnapshot`(태스크), 관련 파일 선정, 토큰 예산, secret 제외 |
 | [multi-engine-routing.md](./docs/design/multi-engine-routing.md) | Model Registry, Role 추상화, 검수자 독립성 불변식, 라우터 부트스트랩, **co-executor 배정(13절)** |
@@ -94,6 +94,7 @@ M4는 standard 흐름(72절, PR #31)과 Fleet이 들어왔고 **Arena는 미착�
 | 8.2 "부분" 두 행 | Git 브랜치 생성, Windows 특화 나머지(PowerShell 의미 분석 등) | 없음 / Windows 실기 | product-strategy 8.2, 12절 |
 | Google 어댑터 실측 | 코드는 있고 실측 미확인 | 유료 실행 | multi-engine 19.4 |
 | M5 학습 라우터 | 대조 실행에서 판정이 **갈린** 쌍이 쌓이기 전에는 라우팅을 바꾸지 않는다 | 데이터 | multi-engine 8.1, 21.9 |
+| 관리형 카탈로그 · 웹 원격 접속(중계) | 방향만 정했다. 게이트웨이 보존 정책, 중계의 종단 간 암호화 여부, 웹 승인 범위, 예산 권위(서버 잔액 vs `TaskBudget`), 게이트웨이를 지나는 exact-model 검증, 약관, 로드맵 위치 | 사람 결정 | product-strategy 17.4 |
 | IDE 확장 · M6 | v1 이후. 확장은 키·게이트·승인을 갖지 않는다 / 조직 정책은 HTTP 계약으로 | 착수 전 | product-strategy 8.5, multi-engine 11 |
 
 항목이 해결되면 이 표가 아니라 **정본 문서에 취소선과 링크**를 남기고, 이 표에서는 줄을 지운다.
@@ -619,7 +620,7 @@ cargo fmt   --manifest-path apps/desktop/src-tauri/core/Cargo.toml --check
 
 ## 관련 프로젝트
 
-**Tomverse Insight** (`H:\Project\ai-chat-hub`, 리포 `mposition/Tomverse`) — 같은 사용자의 첫 제품, Next.js 클라우드 SaaS. **별도 리포지토리이고 합치지 않는다.**
+**Tomverse Insight** (`H:\Project\ai-chat-hub`, 리포 `mposition/Tomverse`) — 같은 사용자의 첫 제품, Next.js 클라우드 SaaS. **별도 리포지토리이고 합치지 않는다.** 관리형 카탈로그 경로(product-strategy 17절)가 생겨도 이 경계는 그대로다 — Insight의 크레딧 백엔드는 HTTP 계약으로만 부른다.
 
 - Insight의 `lib/modelRegistryShared.ts`에 11개 공급자 레지스트리가 프로덕션에서 돌고 있다. **카탈로그 데이터는 재사용**하되(복사 + 출처 주석), `modelRegistry.ts`(server-only + Prisma)나 크레딧 과금 로직은 재사용하지 않는다 — Insight는 크레딧 SaaS, Code는 BYOK라서 "이 모델을 쓸 수 있나"가 서로 다른 질문이다.
 - 라이선스·구독 백엔드는 나중에 **HTTP 계약**으로 연결한다. Insight 모듈을 import하지 않는다.

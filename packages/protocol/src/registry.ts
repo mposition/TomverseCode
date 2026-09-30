@@ -11,6 +11,7 @@ import type {
 // docs/design/multi-engine-routing.md 3절 — Model Registry.
 // 카탈로그 데이터의 출처는 Tomverse Insight의 lib/modelRegistryShared.ts이며(11절),
 // 코드가 아니라 데이터로 복사한다. 크레딧 과금 관련 축은 가져오지 않는다(BYOK).
+// 관리형 카탈로그 경로(product-strategy 17절)가 생기면 다시 볼 자리다 — 17.4-⑥.
 
 export type StructuredOutputMode =
   | "none"
