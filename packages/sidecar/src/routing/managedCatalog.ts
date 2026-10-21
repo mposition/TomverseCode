@@ -68,7 +68,12 @@ export interface ManagedCatalogSnapshot {
 
 export interface ManagedCatalogStore {
   load(): Promise<unknown>;
-  save(snapshot: ManagedCatalogSnapshot): Promise<void>;
+  save(snapshot: ManagedCatalogCache): Promise<void>;
+}
+
+/** 저장용 메타데이터. 걸러낸 행의 경고도 unchanged·오프라인 재사용 때 보존한다. */
+export interface ManagedCatalogCache extends ManagedCatalogSnapshot {
+  rejectedModelIds?: string[];
 }
 
 export type ManagedCatalogUnavailableReason =
@@ -163,36 +168,44 @@ export const isWithinCoverage = (snapshot: ManagedCatalogSnapshot, now: Date): b
 const ready = (
   source: "network" | "unchanged" | "offline-cache",
   snapshot: ManagedCatalogSnapshot,
-  rejectedModelIds: string[]
+  rejectedModelIds: string[],
+  now: Date
 ): ManagedCatalogResult =>
-  snapshot.models.length === 0
+  !isWithinCoverage(snapshot, now)
+    ? { status: "unavailable", reason: "stale", detail: "coverage elapsed" }
+    : snapshot.models.length === 0
     ? { status: "unavailable", reason: "no_usable_models" }
     : { status: "ready", source, snapshot, rejectedModelIds };
 
 export async function loadManagedCatalog(options: LoadManagedCatalogOptions): Promise<ManagedCatalogResult> {
   const doFetch = options.fetch ?? fetch;
-  const now = (options.now ?? (() => new Date()))();
+  const now = options.now ?? (() => new Date());
 
   let cached: ManagedCatalogSnapshot | null = null;
   let cachedRejected: string[] = [];
   try {
-    const parsed = parseManagedSnapshot(await options.store.load());
+    const stored = await options.store.load();
+    const parsed = parseManagedSnapshot(stored);
     if (parsed) {
       cached = parsed.snapshot;
-      cachedRejected = parsed.rejectedModelIds;
+      const storedRejected = isRecord(stored) && Array.isArray(stored.rejectedModelIds)
+        ? stored.rejectedModelIds.filter(isStr)
+        : [];
+      cachedRejected = [...new Set([...parsed.rejectedModelIds, ...storedRejected])];
     }
   } catch {
     cached = null; // 읽지 못한 저장본은 없는 것이다.
   }
-  const usableCache = cached && isWithinCoverage(cached, now) ? cached : null;
+  // 저장소 읽기 자체도 지연될 수 있다. 요청 시작 때의 시각을 고정하지 않는다.
+  const usableCache = cached && isWithinCoverage(cached, now()) ? cached : null;
 
   const url = new URL(CATALOG_PATH, options.baseUrl.replace(/\/+$/, "") + "/");
   // 지난 저장본의 version은 보내지 않는다 — unchanged가 와도 쓸 수 없기 때문이다.
   if (usableCache) url.searchParams.set("version", String(usableCache.version));
 
   const offline = (detail: string): ManagedCatalogResult =>
-    usableCache
-      ? ready("offline-cache", usableCache, cachedRejected)
+    usableCache && isWithinCoverage(usableCache, now())
+      ? ready("offline-cache", usableCache, cachedRejected, now())
       : { status: "unavailable", reason: "offline", detail };
 
   let response: Response;
@@ -221,14 +234,14 @@ export async function loadManagedCatalog(options: LoadManagedCatalogOptions): Pr
   if (!response.ok) return { status: "unavailable", reason: "invalid_response", detail: `HTTP ${response.status}` };
 
   if (isRecord(body) && body.unchanged === true) {
-    if (usableCache && body.version === usableCache.version) return ready("unchanged", usableCache, cachedRejected);
+    if (usableCache && body.version === usableCache.version) return ready("unchanged", usableCache, cachedRejected, now());
     return { status: "unavailable", reason: "invalid_response", detail: "unchanged without a matching cached version" };
   }
 
   const parsed = parseManagedSnapshot(body);
   if (!parsed) return { status: "unavailable", reason: "invalid_response", detail: "malformed snapshot" };
   const { snapshot, rejectedModelIds } = parsed;
-  if (!isWithinCoverage(snapshot, now)) return { status: "unavailable", reason: "stale", detail: "coverage elapsed" };
+  if (!isWithinCoverage(snapshot, now())) return { status: "unavailable", reason: "stale", detail: "coverage elapsed" };
   // 스냅샷은 불변·단조 증가다. 후퇴나 같은 version의 다른 내용은 서버 결함이거나 변조다.
   if (cached && snapshot.version < cached.version)
     return { status: "unavailable", reason: "invalid_response", detail: "version went backwards" };
@@ -236,9 +249,10 @@ export async function loadManagedCatalog(options: LoadManagedCatalogOptions): Pr
     return { status: "unavailable", reason: "invalid_response", detail: "same version, different contentHash" };
 
   try {
-    await options.store.save(snapshot);
+    await options.store.save({ ...snapshot, rejectedModelIds });
   } catch {
     // 저장 실패는 이번 실행을 막지 않는다. 다음 실행이 다시 받는다.
   }
-  return ready("network", snapshot, rejectedModelIds);
+  // fetch/json/save와 인증 헤더 준비 중 coverage가 지날 수 있으므로 반환 직전에 재판정한다.
+  return ready("network", snapshot, rejectedModelIds, now());
 }

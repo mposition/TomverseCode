@@ -268,3 +268,125 @@ test("인증 헤더는 요청에만 실리고 결과·저장본에 남지 않는
   assert.equal(JSON.stringify(result).includes("test-token"), false);
   assert.equal(JSON.stringify(current()).includes("test-token"), false);
 });
+
+const EXPIRES = new Date("2026-10-21T00:00:01Z");
+const shortSnapshot = (version: number) => snapshot(version, { coverageUntil: EXPIRES.toISOString() });
+
+test("네트워크 응답을 기다리는 사이 coverage가 지나면 저장하거나 반환하지 않는다", async () => {
+  let current = NOW;
+  const { store, saves } = memoryStore();
+  const { impl } = mockFetch(() => {
+    current = EXPIRES;
+    return json(200, shortSnapshot(1));
+  });
+  const result = await loadManagedCatalog({ baseUrl: BASE, store, fetch: impl, now: () => current });
+  assert.equal(result.status === "unavailable" && result.reason, "stale");
+  assert.equal(saves.length, 0);
+});
+
+test("JSON 해석을 기다리는 사이 coverage가 지나도 새 스냅샷을 쓰지 않는다", async () => {
+  let current = NOW;
+  const { store, saves } = memoryStore();
+  const response = json(200, shortSnapshot(1));
+  response.json = async () => {
+    current = EXPIRES;
+    return shortSnapshot(1);
+  };
+  const result = await loadManagedCatalog({
+    baseUrl: BASE, store, fetch: mockFetch(() => response).impl, now: () => current,
+  });
+  assert.equal(result.status === "unavailable" && result.reason, "stale");
+  assert.equal(saves.length, 0);
+});
+
+test("저장 성공·실패를 기다리는 사이 coverage가 지나면 ready를 반환하지 않는다", async () => {
+  for (const failSave of [false, true]) {
+    let current = NOW;
+    const store: ManagedCatalogStore = {
+      load: async () => null,
+      save: async () => {
+        current = EXPIRES;
+        if (failSave) throw new Error("disk full");
+      },
+    };
+    const result = await loadManagedCatalog({
+      baseUrl: BASE, store, fetch: mockFetch(() => json(200, shortSnapshot(1))).impl, now: () => current,
+    });
+    assert.equal(result.status === "unavailable" && result.reason, "stale", `save failure: ${failSave}`);
+  }
+});
+
+test("unchanged 응답 대기 중 만료된 저장본을 반환하지 않는다", async () => {
+  let current = NOW;
+  const { store, saves } = memoryStore(shortSnapshot(3));
+  const { impl, calls } = mockFetch(() => {
+    current = EXPIRES;
+    return json(200, { unchanged: true, version: 3 });
+  });
+  const result = await loadManagedCatalog({ baseUrl: BASE, store, fetch: impl, now: () => current });
+  assert.equal(calls[0].searchParams.get("version"), "3");
+  assert.equal(result.status === "unavailable" && result.reason, "stale");
+  assert.equal(saves.length, 0);
+});
+
+test("오프라인·5xx 응답 대기 중 만료된 저장본은 fallback으로 쓰지 않는다", async () => {
+  for (const failure of ["network", "http"] as const) {
+    let current = NOW;
+    const { store } = memoryStore(shortSnapshot(3));
+    const { impl } = mockFetch(() => {
+      current = EXPIRES;
+      if (failure === "network") throw new TypeError("fetch failed");
+      return json(500, { error: "temporary" });
+    });
+    const result = await loadManagedCatalog({ baseUrl: BASE, store, fetch: impl, now: () => current });
+    assert.equal(result.status === "unavailable" && result.reason, "offline", failure);
+  }
+});
+
+test("저장본 읽기 중 만료되면 version을 보내지 않고 새 스냅샷을 요청한다", async () => {
+  let current = NOW;
+  const store: ManagedCatalogStore = {
+    load: async () => {
+      current = EXPIRES;
+      return shortSnapshot(3);
+    },
+    save: async () => {},
+  };
+  const { impl, calls } = mockFetch(() => json(200, snapshot(4)));
+  const result = await loadManagedCatalog({ baseUrl: BASE, store, fetch: impl, now: () => current });
+  assert.equal(calls[0].searchParams.has("version"), false);
+  assert.ok(result.status === "ready" && result.snapshot.version === 4);
+});
+
+test("인증 헤더 준비 중 만료된 저장본은 오프라인 fallback으로 쓰지 않는다", async () => {
+  let current = NOW;
+  const { store } = memoryStore(shortSnapshot(3));
+  const result = await loadManagedCatalog({
+    baseUrl: BASE, store, now: () => current,
+    headers: async () => {
+      current = EXPIRES;
+      return { Authorization: "Bearer test-token" };
+    },
+    fetch: mockFetch(() => { throw new TypeError("fetch failed"); }).impl,
+  });
+  assert.equal(result.status === "unavailable" && result.reason, "offline");
+});
+
+test("걸러낸 모델 경고는 저장 뒤 unchanged·오프라인에서도 보존한다", async () => {
+  for (const source of ["unchanged", "offline"] as const) {
+    const { store, current } = memoryStore();
+    const first = await load(store, mockFetch(() => json(200, snapshot(2, {
+      models: [row("ok"), row("denied", { terms: undefined })],
+    }))).impl);
+    assert.ok(first.status === "ready");
+    assert.deepEqual(first.rejectedModelIds, ["denied"]);
+    const second = await load(store, mockFetch(() => {
+      if (source === "offline") throw new TypeError("fetch failed");
+      return json(200, { unchanged: true, version: 2 });
+    }).impl);
+    assert.ok(second.status === "ready");
+    assert.deepEqual(second.rejectedModelIds, ["denied"], source);
+    assert.deepEqual((current() as { rejectedModelIds: string[] }).rejectedModelIds, ["denied"]);
+    assert.equal("rejectedModelIds" in second.snapshot, false);
+  }
+});
